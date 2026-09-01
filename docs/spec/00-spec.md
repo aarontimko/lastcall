@@ -137,7 +137,7 @@ macOS is the primary and only fully supported target. Linux should work by const
 
 - Public GitHub repo under the author's account. Layout follows house conventions: `src/`, `scripts/`, `tests/`, concise `README.md` with the bulk of documentation in `docs/`, plus an `AGENTS.md` stub-index per the progressive-disclosure convention.
 - Conventional commits, first line under 60–80 characters; branches `feat/...`, `fix/...`, `chore/...`, `docs/...`; PRs to `main`. One phase = one branch (`feat/phaseN-<slug>`) = one PR, carrying its kickoff spec as an early commit.
-- **Build/test entry points:** a `justfile` with at minimum `just build`, `just lint`, `just test-unit`, `just test-integration`, `just test-e2e`. Test files follow `test_unit_*` / `test_integration_*` naming. These exact invocations are the canonical suite commands cited in every kickoff spec and every gate.
+- **Build/test entry points:** a `justfile` with at minimum `just build`, `just lint`, `just test-unit`, `just test-integration`, `just test-e2e`. Unit tests are in-module (`#[cfg(test)]`, run by `cargo test --lib --bins`); integration and e2e test files follow `test_integration_*` / `test_e2e_*` naming (Phase 1 kickoff review, F17: a `test_unit_*.rs` file would not be counted by the unit command). These exact invocations are the canonical suite commands cited in every kickoff spec and every gate.
 
 ### 4.4 Environment contract (adapted from the phased-program defaults)
 
