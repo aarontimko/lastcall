@@ -1,0 +1,839 @@
+//! The engine: roots, ledgers, scans, head inspection and ops in one place (kickoff
+//! deliverable 12). No terminal code, no process environment: everything comes through the
+//! injected [`Env`] and the loaded config.
+//!
+//! Opening a root performs **first sight** (docs/spec/00-spec.md §6.2) when it has no
+//! ledger: a git root's seen tree is `HEAD^{tree}` (`null` before the first commit) and
+//! `seen_at` records HEAD; a draft root follows `draft_initial`. An unreadable ledger is
+//! moved aside and the root opens with a `null` seen tree — over-show, never hide. A seen
+//! tree that no longer resolves in the store (the user ran `git gc`) is treated as `null`
+//! with a notice.
+
+use std::collections::BTreeMap;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
+
+use crate::config::{Config, DraftInitial, Loaded, Resolved};
+use crate::env::Env;
+use crate::git::{self, GitError, Oid, RepoGit};
+use crate::headstate::{self, HeadState, TransitionFacts};
+use crate::index::{IndexError, PrivateIndex};
+use crate::ledger::{
+    self, Clock, Ledger, LedgerError, LoadResult, SeenAt, SystemClock, TreeEntries,
+};
+use crate::ops::{Ops, OpsError};
+use crate::paths::{Layout, ParentId, ParentMeta, RepoPaths, RootId};
+use crate::roots::{self, Badge, DiscoverInputs, Discovery, RootsChanged};
+use crate::scan::{self, Pile, ScanError, ScanInputs};
+use crate::store::{RootKind, Store, StoreError};
+use crate::upstream::{self, Classifier};
+
+/// The oldest git the engine accepts (`--path-format=absolute`, `ls-files --others -z`
+/// semantics we rely on).
+pub const MIN_GIT: (u32, u32) = git::MIN_GIT_VERSION;
+
+#[derive(Debug, thiserror::Error)]
+pub enum EngineError {
+    #[error("io error at {}: {source}", path.display())]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("git {found} is too old; lastcall needs {}.{} or newer", MIN_GIT.0, MIN_GIT.1)]
+    GitTooOld { found: String },
+    #[error("git is not available: {0}")]
+    NoGit(String),
+    #[error(transparent)]
+    Git(#[from] GitError),
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    #[error(transparent)]
+    Ledger(#[from] LedgerError),
+    #[error(transparent)]
+    Index(#[from] IndexError),
+    #[error(transparent)]
+    Scan(#[from] ScanError),
+    #[error(transparent)]
+    Ops(#[from] OpsError),
+    #[error("no such root: {}", .0.display())]
+    NoSuchRoot(PathBuf),
+}
+
+fn io_err(path: &Path, source: std::io::Error) -> EngineError {
+    EngineError::Io {
+        path: path.to_path_buf(),
+        source,
+    }
+}
+
+/// Injectable knobs.
+#[derive(Clone)]
+pub struct EngineOptions {
+    /// Compaction runs after a ledger write when more overrides than this carry a blob.
+    pub compaction_threshold: usize,
+    pub clock: Arc<dyn Clock + Send + Sync>,
+}
+
+impl Default for EngineOptions {
+    fn default() -> Self {
+        Self {
+            compaction_threshold: 500,
+            clock: Arc::new(SystemClock),
+        }
+    }
+}
+
+impl std::fmt::Debug for EngineOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EngineOptions")
+            .field("compaction_threshold", &self.compaction_threshold)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Everything the engine holds for one root.
+pub struct RootState {
+    pub path: PathBuf,
+    pub kind: RootKind,
+    pub parent: PathBuf,
+    pub badge: Option<Badge>,
+    pub paths: RepoPaths,
+    pub store: Store,
+    pub index: PrivateIndex,
+    pub repo: Option<RepoGit>,
+    pub ledger: Ledger,
+    /// `ls-tree -r` of the effective seen tree.
+    pub tree: TreeEntries,
+    pub head: HeadState,
+    pub classifier: Classifier,
+    pub case_insensitive: bool,
+    /// Root-relative draft roots inside this git root (their untracked files are theirs).
+    pub excluded_dirs: Vec<Vec<u8>>,
+    /// Notices from open (kept until the root is reopened).
+    pub notices: Vec<String>,
+    pub last_pile: Option<Pile>,
+    pub nested_repos: Vec<Vec<u8>>,
+    pub user_email: Option<String>,
+}
+
+impl RootState {
+    pub fn seen_head(&self) -> Option<&Oid> {
+        self.ledger.seen_at.head_commit.as_ref()
+    }
+
+    pub fn name(&self) -> String {
+        self.path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.path.to_string_lossy().into_owned())
+    }
+}
+
+/// What a head inspection found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadChange {
+    pub root: PathBuf,
+    pub from: Option<Oid>,
+    pub to: Option<Oid>,
+    pub branch: Option<String>,
+    pub notice: Option<String>,
+    /// The pile from the scan that followed.
+    pub pile: Pile,
+}
+
+pub struct Engine {
+    env: Env,
+    config: Config,
+    resolved: Resolved,
+    layout: Layout,
+    options: EngineOptions,
+    roots: BTreeMap<PathBuf, RootState>,
+    discovery: Discovery,
+    collapsed: GlobSet,
+    ignore: GlobSet,
+    /// Engine-level notices (config resolution, discovery).
+    notices: Vec<String>,
+    pending_nested: Vec<(PathBuf, PathBuf)>,
+    git_version: String,
+}
+
+impl Engine {
+    /// Open the engine: check git, prepare the state dir, discover roots, open ledgers.
+    pub fn open(
+        loaded: &Loaded,
+        resolved: &Resolved,
+        env: &Env,
+        options: EngineOptions,
+    ) -> Result<Engine, EngineError> {
+        let git_version = check_git(env)?;
+        let layout = Layout::new(&loaded.state_dir);
+        std::fs::create_dir_all(layout.roots_dir()).map_err(|e| io_err(&layout.roots_dir(), e))?;
+        let collapsed = build_globs(&loaded.config.collapsed_globs);
+        let ignore = build_globs(&loaded.config.ignore_globs);
+        let mut engine = Engine {
+            env: env.clone(),
+            config: loaded.config.clone(),
+            resolved: resolved.clone(),
+            layout,
+            options,
+            roots: BTreeMap::new(),
+            discovery: Discovery::default(),
+            collapsed,
+            ignore,
+            notices: resolved.notices.clone(),
+            pending_nested: Vec::new(),
+            git_version,
+        };
+        engine.rescan()?;
+        Ok(engine)
+    }
+
+    pub fn env(&self) -> &Env {
+        &self.env
+    }
+
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    pub fn resolved(&self) -> &Resolved {
+        &self.resolved
+    }
+
+    pub fn layout(&self) -> &Layout {
+        &self.layout
+    }
+
+    pub fn options(&self) -> &EngineOptions {
+        &self.options
+    }
+
+    pub fn git_version(&self) -> &str {
+        &self.git_version
+    }
+
+    pub fn ignore_globs(&self) -> &GlobSet {
+        &self.ignore
+    }
+
+    pub fn notices(&self) -> &[String] {
+        &self.notices
+    }
+
+    /// Roots sorted by path bytes.
+    pub fn roots(&self) -> Vec<&RootState> {
+        let mut v: Vec<&RootState> = self.roots.values().collect();
+        v.sort_by(|a, b| a.path.as_os_str().cmp(b.path.as_os_str()));
+        v
+    }
+
+    pub fn root_paths(&self) -> Vec<PathBuf> {
+        self.roots().into_iter().map(|r| r.path.clone()).collect()
+    }
+
+    pub fn root(&self, path: &Path) -> Option<&RootState> {
+        self.roots.get(path)
+    }
+
+    pub fn root_mut(&mut self, path: &Path) -> Option<&mut RootState> {
+        self.roots.get_mut(path)
+    }
+
+    /// Resolve a user-supplied path (any directory inside a root) to the root's key.
+    pub fn resolve_root(&self, path: &Path) -> Option<PathBuf> {
+        let canon = std::fs::canonicalize(path).ok()?;
+        self.roots
+            .keys()
+            .filter(|r| canon.starts_with(r))
+            .max_by_key(|r| r.as_os_str().len())
+            .cloned()
+    }
+
+    /// Re-run discovery; open new roots, drop removed ones (ledgers kept on disk).
+    pub fn rescan(&mut self) -> Result<RootsChanged, EngineError> {
+        let mut nested = std::mem::take(&mut self.pending_nested);
+        for root in self.roots.values() {
+            for n in &root.nested_repos {
+                nested.push((
+                    root.path.clone(),
+                    root.path.join(std::ffi::OsStr::from_bytes(n)),
+                ));
+            }
+        }
+        let next = roots::discover(&DiscoverInputs {
+            env: &self.env,
+            parent_dirs: &self.resolved.parent_dirs,
+            draft_dirs: &self.config.draft_dirs,
+            nested: &nested,
+        });
+        let changed = roots::diff(&self.discovery, &next);
+        for n in &next.notices {
+            if !self.notices.contains(n) {
+                self.notices.push(n.clone());
+            }
+        }
+        for removed in &changed.removed {
+            self.roots.remove(removed);
+        }
+        self.discovery = next;
+        let to_open: Vec<roots::DiscoveredRoot> = self
+            .discovery
+            .roots
+            .iter()
+            .filter(|r| !self.roots.contains_key(&r.path))
+            .cloned()
+            .collect();
+        for d in to_open {
+            match self.open_root(&d) {
+                Ok(state) => {
+                    self.roots.insert(d.path.clone(), state);
+                }
+                Err(e) => self
+                    .notices
+                    .push(format!("{}: cannot open: {e}", d.path.display())),
+            }
+        }
+        // Badges and excluded draft dirs can change with the root set.
+        let discovery = self.discovery.clone();
+        for root in self.roots.values_mut() {
+            if let Some(d) = discovery.get(&root.path) {
+                root.badge = d.badge.clone();
+            }
+            root.excluded_dirs = if root.kind == RootKind::Git {
+                discovery.draft_dirs_inside(&root.path)
+            } else {
+                Vec::new()
+            };
+        }
+        Ok(changed)
+    }
+
+    fn open_root(&self, d: &roots::DiscoveredRoot) -> Result<RootState, EngineError> {
+        let parent_id = ParentId::of(&d.parent);
+        let root_id = RootId::of(&d.path);
+        let paths = self.layout.repo_paths(&parent_id, &root_id);
+        std::fs::create_dir_all(&paths.repo_dir).map_err(|e| io_err(&paths.repo_dir, e))?;
+        let meta = self.layout.meta_path(&parent_id);
+        if !meta.exists() {
+            let m = ParentMeta {
+                schema_version: ledger::SCHEMA_VERSION.to_string(),
+                parent: d.parent.to_string_lossy().into_owned(),
+                created_at: self.options.clock.now_iso8601(),
+            };
+            let text = serde_json::to_string_pretty(&m).unwrap_or_default();
+            std::fs::write(&meta, text).map_err(|e| io_err(&meta, e))?;
+        }
+        let repo = (d.kind == RootKind::Git).then(|| RepoGit::new(&self.env, &d.path));
+        let (store, mut notices) = Store::open(&self.env, &d.path, d.kind, &paths, repo.as_ref())?;
+        let exclude_from = repo
+            .as_ref()
+            .and_then(|rg| rg.git_path("info/exclude").ok());
+        let index = PrivateIndex::new(store.git().clone(), &paths, d.kind, exclude_from);
+        let head = match &repo {
+            Some(rg) => headstate::inspect(rg)?,
+            None => HeadState::none(),
+        };
+        let user_email = repo
+            .as_ref()
+            .and_then(|rg| rg.config_get("user.email").ok().flatten())
+            .filter(|e| !e.is_empty());
+
+        let clock: &dyn Clock = self.options.clock.as_ref();
+        let mut ledger = match ledger::load(&paths, clock)? {
+            LoadResult::Loaded { ledger, notices: n } => {
+                notices.extend(n);
+                ledger
+            }
+            LoadResult::Missing => {
+                let l = first_sight(
+                    &d.path,
+                    d.kind,
+                    &store,
+                    &head,
+                    self.config.draft_initial,
+                    clock,
+                )?;
+                ledger::save(&paths, &l)?;
+                l
+            }
+            LoadResult::Unreadable { moved_to, reason } => {
+                notices.push(format!(
+                    "ledger unreadable ({reason}); moved to {} and reopened with nothing seen",
+                    moved_to.display()
+                ));
+                Ledger::new(
+                    &d.path,
+                    d.kind,
+                    None,
+                    SeenAt {
+                        head_commit: head.head.clone(),
+                        branch: head.branch.clone(),
+                        at: clock.now_iso8601(),
+                    },
+                )
+            }
+        };
+        if let Some(t) = ledger.seen_tree.clone()
+            && !store.exists(&t)
+        {
+            notices.push(format!(
+                "seen tree {t} no longer exists in the object store (git gc?); treating everything as unseen"
+            ));
+            ledger.seen_tree = None;
+        }
+        let tree = match &ledger.seen_tree {
+            Some(t) => store.ls_tree(t)?,
+            None => TreeEntries::new(),
+        };
+        Ok(RootState {
+            path: d.path.clone(),
+            kind: d.kind,
+            parent: d.parent.clone(),
+            badge: d.badge.clone(),
+            case_insensitive: scan::probe_case_insensitive(&d.path),
+            paths,
+            store,
+            index,
+            repo,
+            ledger,
+            tree,
+            head,
+            classifier: Classifier::default(),
+            excluded_dirs: Vec::new(),
+            notices,
+            last_pile: None,
+            nested_repos: Vec::new(),
+            user_email,
+        })
+    }
+
+    /// Scan one root: candidates → rows → annotation.
+    pub fn scan(&mut self, root: &Path) -> Result<Pile, EngineError> {
+        let collapsed = self.collapsed.clone();
+        let collapse_size = self.config.collapse_size_bytes;
+        let state = self
+            .roots
+            .get_mut(root)
+            .ok_or_else(|| EngineError::NoSuchRoot(root.to_path_buf()))?;
+        let out = scan::scan(&ScanInputs {
+            store: &state.store,
+            index: &state.index,
+            repo: state.repo.as_ref(),
+            ledger: &state.ledger,
+            seen_tree: state.ledger.seen_tree.as_ref(),
+            tree: &state.tree,
+            case_insensitive: state.case_insensitive,
+            collapsed_globs: &collapsed,
+            collapse_size_bytes: collapse_size,
+            excluded_dirs: &state.excluded_dirs,
+            index_tmp: &state.paths.index_tmp,
+        })?;
+        let mut pile = out.pile;
+        if out.nested_repos != state.nested_repos {
+            state.nested_repos = out.nested_repos;
+        }
+        if let Some(rg) = &state.repo {
+            let seen_head = state.ledger.seen_at.head_commit.clone();
+            match state.classifier.get(
+                rg,
+                seen_head.as_ref(),
+                &state.head,
+                state.user_email.as_deref(),
+            ) {
+                Ok(class) => {
+                    if let Err(e) = upstream::annotate(&mut pile, class, rg) {
+                        pile.notices
+                            .push(format!("upstream annotation skipped: {e}"));
+                    }
+                }
+                Err(e) => pile
+                    .notices
+                    .push(format!("upstream classification skipped: {e}")),
+            }
+        }
+        state.last_pile = Some(pile.clone());
+        Ok(pile)
+    }
+
+    /// Scan every root (opening nested repositories discovered on the way).
+    pub fn scan_all(&mut self) -> Vec<(PathBuf, Result<Pile, EngineError>)> {
+        let mut results: BTreeMap<PathBuf, Result<Pile, EngineError>> = BTreeMap::new();
+        for _ in 0..3 {
+            let todo: Vec<PathBuf> = self
+                .root_paths()
+                .into_iter()
+                .filter(|p| !results.contains_key(p))
+                .collect();
+            if todo.is_empty() {
+                break;
+            }
+            for p in todo {
+                let r = self.scan(&p);
+                results.insert(p, r);
+            }
+            let has_new_nested = self.roots.values().any(|r| !r.nested_repos.is_empty());
+            if !has_new_nested {
+                break;
+            }
+            match self.rescan() {
+                Ok(changed) if !changed.added.is_empty() => continue,
+                _ => break,
+            }
+        }
+        let mut v: Vec<(PathBuf, Result<Pile, EngineError>)> = results.into_iter().collect();
+        v.sort_by(|a, b| a.0.as_os_str().cmp(b.0.as_os_str()));
+        v
+    }
+
+    /// Re-inspect HEAD; when it moved (or an operation finished), scan and describe it.
+    pub fn inspect_head(&mut self, root: &Path) -> Result<Option<HeadChange>, EngineError> {
+        let state = self
+            .roots
+            .get(root)
+            .ok_or_else(|| EngineError::NoSuchRoot(root.to_path_buf()))?;
+        let Some(rg) = &state.repo else {
+            return Ok(None);
+        };
+        let next = headstate::inspect(rg)?;
+        let prev = state.head.clone();
+        if next == prev {
+            return Ok(None);
+        }
+        let commits = match (&prev.head, &next.head) {
+            (Some(a), Some(b)) if a != b => rg
+                .run(&["rev-list", "--count", &format!("{a}..{b}")])
+                .ok()
+                .and_then(|o| String::from_utf8_lossy(&o).trim().parse::<u64>().ok()),
+            _ => None,
+        };
+        let hint = headstate::last_reflog(&next.git_dir);
+        self.roots.get_mut(root).expect("checked").head = next.clone();
+        let pile = self.scan(root)?;
+        let facts = TransitionFacts {
+            commits,
+            files_differ: pile.rows.len(),
+        };
+        let notice = headstate::transition(&prev, &next, hint.as_ref(), &facts);
+        Ok(Some(HeadChange {
+            root: root.to_path_buf(),
+            from: prev.head,
+            to: next.head.clone(),
+            branch: next.branch.clone(),
+            notice,
+            pile,
+        }))
+    }
+
+    /// The accept operations for one root.
+    pub fn ops(&mut self, root: &Path) -> Result<Ops<'_>, EngineError> {
+        let threshold = self.options.compaction_threshold;
+        let clock: &dyn Clock = self.options.clock.as_ref();
+        let state = self
+            .roots
+            .get_mut(root)
+            .ok_or_else(|| EngineError::NoSuchRoot(root.to_path_buf()))?;
+        Ok(Ops {
+            store: &state.store,
+            index: &state.index,
+            repo: state.repo.as_ref(),
+            paths: &state.paths,
+            ledger: &mut state.ledger,
+            tree: &mut state.tree,
+            clock,
+            compaction_threshold: threshold,
+        })
+    }
+}
+
+/// `git --version` must be ≥ [`MIN_GIT`].
+pub fn check_git(env: &Env) -> Result<String, EngineError> {
+    let v = git::git_version(env).map_err(|e| EngineError::NoGit(e.to_string()))?;
+    let found = format!("{}.{}.{}", v.0, v.1, v.2);
+    if !git::version_supported(v) {
+        return Err(EngineError::GitTooOld { found });
+    }
+    Ok(found)
+}
+
+/// Build a glob set where a bare name (no `/`) also matches at any depth.
+pub fn build_globs(patterns: &[String]) -> GlobSet {
+    let mut b = GlobSetBuilder::new();
+    for p in patterns {
+        let add = |b: &mut GlobSetBuilder, pat: &str| {
+            if let Ok(g) = GlobBuilder::new(pat).literal_separator(false).build() {
+                b.add(g);
+            }
+        };
+        add(&mut b, p);
+        if !p.contains('/') {
+            add(&mut b, &format!("**/{p}"));
+        }
+    }
+    b.build().unwrap_or_else(|_| GlobSet::empty())
+}
+
+/// §6.2 first sight.
+fn first_sight(
+    root: &Path,
+    kind: RootKind,
+    store: &Store,
+    head: &HeadState,
+    draft_initial: DraftInitial,
+    clock: &dyn Clock,
+) -> Result<Ledger, EngineError> {
+    let seen_tree = match kind {
+        RootKind::Git => match &head.head {
+            Some(h) => {
+                let spec = format!("{h}^{{tree}}");
+                store
+                    .git()
+                    .run(&["rev-parse", "--verify", &spec])
+                    .ok()
+                    .and_then(|o| Oid::parse(String::from_utf8_lossy(&o).trim()))
+            }
+            None => None,
+        },
+        RootKind::Draft => match draft_initial {
+            DraftInitial::Seen => Some(store.tree_of_disk()?),
+            DraftInitial::Pending => None,
+        },
+    };
+    Ok(Ledger::new(
+        root,
+        kind,
+        seen_tree,
+        SeenAt {
+            head_commit: head.head.clone(),
+            branch: head.branch.clone(),
+            at: clock.now_iso8601(),
+        },
+    ))
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::config::ConfigSource;
+    use crate::ops::{NoFault, Rendered};
+    use crate::status::StatusReport;
+    use crate::store::tests::fixture_env;
+    use lastcall_testkit::fixture_repo::FixtureRepo;
+    use lastcall_testkit::tmp::TempDir;
+
+    /// A `Loaded`/`Resolved` pair watching the fixture's parent dir.
+    pub(crate) fn loaded_for(
+        repo: &FixtureRepo,
+        state: &TempDir,
+        config: Config,
+    ) -> (Loaded, Resolved) {
+        let parent = std::fs::canonicalize(repo.parent_dir()).unwrap();
+        let loaded = Loaded {
+            config: Config {
+                parent_dirs: vec![parent.clone()],
+                ..config
+            },
+            source: ConfigSource::Defaults { searched: vec![] },
+            state_dir: state.path().to_path_buf(),
+        };
+        let resolved = Resolved {
+            parent_dirs: vec![parent],
+            notices: vec![],
+        };
+        (loaded, resolved)
+    }
+
+    pub(crate) fn open_engine(repo: &FixtureRepo, state: &TempDir, config: Config) -> Engine {
+        let (loaded, resolved) = loaded_for(repo, state, config);
+        let env = fixture_env(repo, state);
+        Engine::open(&loaded, &resolved, &env, EngineOptions::default()).unwrap()
+    }
+
+    fn only_root(engine: &Engine) -> PathBuf {
+        let roots = engine.roots();
+        assert_eq!(roots.len(), 1, "{:?}", engine.root_paths());
+        roots[0].path.clone()
+    }
+
+    #[test]
+    fn engine_open_first_sight_scan_and_stable_status() {
+        let repo = FixtureRepo::new("eng").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let root = only_root(&engine);
+        let r = engine.root(&root).unwrap();
+        assert_eq!(r.kind, RootKind::Git);
+        let head = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_owned();
+        let tree = repo
+            .git(&["rev-parse", "HEAD^{tree}"])
+            .unwrap()
+            .trim()
+            .to_owned();
+        assert_eq!(
+            r.ledger.seen_at.head_commit.as_ref().map(Oid::as_str),
+            Some(head.as_str())
+        );
+        assert_eq!(
+            r.ledger.seen_tree.as_ref().map(Oid::as_str),
+            Some(tree.as_str())
+        );
+        assert!(
+            engine.scan(&root).unwrap().is_empty(),
+            "clean after first sight"
+        );
+
+        repo.write("f1", "changed\n");
+        repo.write("new.txt", "hello\n");
+        let pile = engine.scan(&root).unwrap();
+        assert_eq!(scan::pile_lines(&pile), vec!["f1", "new.txt"]);
+
+        let a = StatusReport::build(&mut engine, None).to_json();
+        let b = StatusReport::build(&mut engine, None).to_json();
+        assert_eq!(a, b, "status is byte-stable across scans");
+        assert!(a.contains("\"status_version\": 1"));
+        assert!(!a.contains("\"at\""), "no timestamps in status: {a}");
+        let v: serde_json::Value = serde_json::from_str(&a).unwrap();
+        assert_eq!(v["roots"][0]["pending"][0]["path"], "f1");
+        assert_eq!(v["roots"][0]["pending"][0]["change"], "modified");
+        assert_eq!(v["roots"][0]["pending"][1]["change"], "added");
+        assert_eq!(v["roots"][0]["branch"], "main");
+        let human = StatusReport::build(&mut engine, None).render_human();
+        assert!(human.starts_with("eng (main)  2 pending\n"), "{human}");
+        assert!(human.contains("  M f1  +1 −"), "{human}");
+        assert!(human.contains("  A new.txt  +1 −0"), "{human}");
+    }
+
+    #[test]
+    fn engine_ops_accept_clears_the_row_and_persists() {
+        let repo = FixtureRepo::new("eng-ops").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let root = only_root(&engine);
+        repo.write("f1", "changed\n");
+        let pile = engine.scan(&root).unwrap();
+        let rendered = Rendered::of(pile.row(b"f1").unwrap());
+        let out = engine
+            .ops(&root)
+            .unwrap()
+            .accept_file(&rendered, &NoFault)
+            .unwrap();
+        assert!(out.refused.is_empty());
+        assert!(engine.scan(&root).unwrap().is_empty());
+        drop(engine);
+        // A fresh engine reads the same ledger.
+        let mut engine = open_engine(&repo, &state, Config::default());
+        assert!(engine.scan(&root).unwrap().is_empty());
+    }
+
+    #[test]
+    fn engine_inspect_head_reports_a_commit_notice() {
+        let mut repo = FixtureRepo::new("eng-head").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let root = only_root(&engine);
+        assert!(
+            engine.inspect_head(&root).unwrap().is_none(),
+            "nothing moved"
+        );
+        let before = engine.root(&root).unwrap().head.head.clone();
+        repo.commit_files(&[("f1", "committed\n")], "B1").unwrap();
+        let change = engine.inspect_head(&root).unwrap().expect("HEAD moved");
+        assert_eq!(change.from, before);
+        assert_eq!(change.branch.as_deref(), Some("main"));
+        let notice = change.notice.expect("a notice");
+        assert!(notice.starts_with("committed on main"), "{notice}");
+        assert!(
+            change.pile.row(b"f1").is_some(),
+            "the committed edit stays pending (B1)"
+        );
+    }
+
+    #[test]
+    fn engine_unreadable_ledger_and_missing_seen_tree_fail_open() {
+        let repo = FixtureRepo::new("eng-open").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let engine = open_engine(&repo, &state, Config::default());
+        let root = only_root(&engine);
+        let ledger_path = engine.root(&root).unwrap().paths.ledger.clone();
+        drop(engine);
+        std::fs::write(&ledger_path, b"{ not json").unwrap();
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let r = engine.root(&root).unwrap();
+        assert!(r.ledger.seen_tree.is_none(), "reopened with nothing seen");
+        assert!(
+            r.notices.iter().any(|n| n.contains("ledger unreadable")),
+            "{:?}",
+            r.notices
+        );
+        let pile = engine.scan(&root).unwrap();
+        assert!(
+            pile.rows.len() >= 3,
+            "every tracked file is pending: {:?}",
+            scan::pile_lines(&pile)
+        );
+
+        // A seen tree that vanished from the store (gc) is treated the same way.
+        let mut ledger = engine.root(&root).unwrap().ledger.clone();
+        ledger.seen_tree = Oid::parse(&"a".repeat(40));
+        ledger::save(&engine.root(&root).unwrap().paths, &ledger).unwrap();
+        drop(engine);
+        let engine = open_engine(&repo, &state, Config::default());
+        let r = engine.root(&root).unwrap();
+        assert!(r.ledger.seen_tree.is_none());
+        assert!(
+            r.notices.iter().any(|n| n.contains("no longer exists")),
+            "{:?}",
+            r.notices
+        );
+    }
+
+    #[test]
+    fn engine_draft_root_follows_draft_initial() {
+        let repo = FixtureRepo::new("eng-draft").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let drafts = repo.parent_dir().join("_drafts");
+        std::fs::create_dir_all(&drafts).unwrap();
+        std::fs::write(drafts.join("n1.md"), "one\n").unwrap();
+        let config = Config {
+            draft_dirs: vec!["_drafts".to_owned()],
+            draft_initial: DraftInitial::Pending,
+            ..Config::default()
+        };
+        let mut engine = open_engine(&repo, &state, config.clone());
+        let draft = engine
+            .roots()
+            .iter()
+            .find(|r| r.kind == RootKind::Draft)
+            .map(|r| r.path.clone())
+            .expect("a draft root");
+        assert!(engine.root(&draft).unwrap().ledger.seen_tree.is_none());
+        assert_eq!(
+            scan::pile_lines(&engine.scan(&draft).unwrap()),
+            vec!["n1.md"]
+        );
+
+        let state2 = TempDir::new("lc-eng-state");
+        let mut engine = open_engine(
+            &repo,
+            &state2,
+            Config {
+                draft_initial: DraftInitial::Seen,
+                ..config
+            },
+        );
+        assert!(engine.root(&draft).unwrap().ledger.seen_tree.is_some());
+        assert!(engine.scan(&draft).unwrap().is_empty());
+    }
+
+    #[test]
+    fn engine_build_globs_matches_bare_names_at_any_depth() {
+        let g = build_globs(&["Cargo.lock".to_owned(), "vendor/**".to_owned()]);
+        assert!(g.is_match("Cargo.lock"));
+        assert!(g.is_match("sub/dir/Cargo.lock"));
+        assert!(g.is_match("vendor/x/y"));
+        assert!(!g.is_match("src/main.rs"));
+    }
+}
