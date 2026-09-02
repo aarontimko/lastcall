@@ -25,6 +25,7 @@
       "Bash(git ls-files:*)",
       "Bash(git worktree list:*)",
       "Bash(git stash list:*)",
+      "Bash(git merge --ff-only:*)",
       "Bash(bash scripts/harness/scenarios.sh:*)",
       "Bash(git config core.hooksPath:*)",
       "Bash(chmod +x:*)",
