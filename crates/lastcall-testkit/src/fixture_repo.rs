@@ -89,6 +89,10 @@ impl FixtureRepo {
         )?;
         let origin = repo.origin.to_string_lossy().to_string();
         repo.git(&["remote", "add", "origin", &origin])?;
+        // Local identity: the engine's upstream classifier reads `user.email` from the repo
+        // config (docs/spec/00-spec.md §6.4), and the child env below is not what it sees.
+        repo.git(&["config", "user.name", AUTHOR_NAME])?;
+        repo.git(&["config", "user.email", AUTHOR_EMAIL])?;
         repo.commit_files(SEED_FILES, "init")?;
         repo.git(&["push", "-q", "-u", "origin", "main"])?;
         Ok(repo)
@@ -188,6 +192,75 @@ impl FixtureRepo {
     /// Run `git` in the working repo with the fixed environment.
     pub fn git(&self, args: &[&str]) -> Result<String, GitError> {
         self.git_in(&self.work, args)
+    }
+
+    /// Write a file under the working repo (creating parents) without committing.
+    pub fn write(&self, rel: &str, contents: impl AsRef<[u8]>) -> PathBuf {
+        let full = self.work.join(rel);
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent).expect("create parent");
+        }
+        std::fs::write(&full, contents).expect("write fixture file");
+        full
+    }
+
+    /// Remove a file (or an empty directory) under the working repo.
+    pub fn remove(&self, rel: &str) {
+        let full = self.work.join(rel);
+        if full.is_dir() {
+            std::fs::remove_dir(&full).expect("remove fixture dir");
+        } else {
+            std::fs::remove_file(&full).expect("remove fixture file");
+        }
+    }
+
+    /// Create a symlink at `rel` pointing at `target` (link text as given).
+    pub fn symlink(&self, target: &str, rel: &str) {
+        std::os::unix::fs::symlink(target, self.work.join(rel)).expect("symlink");
+    }
+
+    /// `chmod +x` (or `-x`) a file under the working repo.
+    pub fn chmod_x(&self, rel: &str, executable: bool) {
+        use std::os::unix::fs::PermissionsExt;
+        let full = self.work.join(rel);
+        let mut perms = std::fs::metadata(&full).expect("stat").permissions();
+        let mode = if executable {
+            perms.mode() | 0o111
+        } else {
+            perms.mode() & !0o111
+        };
+        perms.set_mode(mode);
+        std::fs::set_permissions(&full, perms).expect("chmod");
+    }
+
+    /// `git checkout -q -b <branch>`.
+    pub fn checkout_b(&self, branch: &str) -> Result<(), GitError> {
+        self.git(&["checkout", "-q", "-b", branch]).map(|_| ())
+    }
+
+    /// `git checkout -q <target>`.
+    pub fn checkout(&self, target: &str) -> Result<(), GitError> {
+        self.git(&["checkout", "-q", target]).map(|_| ())
+    }
+
+    /// The engine's injected environment for this fixture: the same git isolation as the
+    /// fixture's own commands (`GIT_CONFIG_GLOBAL=/dev/null` etc.), `LASTCALL_STATE_DIR` set
+    /// to `state_dir`, a home directory inside the fixture's temp dir, and `cwd` = the
+    /// working repo. No test may reach the real home.
+    pub fn engine_env(&self, state_dir: &Path) -> lastcall_engine::env::Env {
+        let home = self._dir.join("home");
+        std::fs::create_dir_all(&home).expect("create fixture home");
+        lastcall_engine::env::Env::empty(self.work.clone())
+            .with_home(home)
+            .with_var("GIT_CONFIG_GLOBAL", "/dev/null")
+            .with_var("GIT_CONFIG_SYSTEM", "/dev/null")
+            .with_var("GIT_CONFIG_NOSYSTEM", "1")
+            .with_var("LASTCALL_STATE_DIR", state_dir.to_string_lossy())
+    }
+
+    /// The fixture's temp dir (the parent of the working repo and `origin`).
+    pub fn parent_dir(&self) -> &Path {
+        self._dir.path()
     }
 
     fn next_date(&mut self) -> String {
