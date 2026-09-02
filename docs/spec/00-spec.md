@@ -489,7 +489,7 @@ Gate items marked **[sponsor]** require a human at a real terminal/herdr session
 - [x] Crash recovery `scenario_e1_kill9_between_object_write_and_ledger_rename`: re-exec'd child SIGKILLs itself at `AfterObjectWrite` and at `AfterLedgerTmpWrite`; ledger bytes identical, novel orphan blob present, reopened pile equals the pre-kill oracle, accept succeeds after reopen.
 - [x] HEAD-movement detection: `watcher_commit_without_file_activity_triggers_head_inspection` (integration tier, `head_poll` 250 ms) and the sponsor-visible `just probe-watch` line `alpha  committed on main (1 commit)` with the committed file still pending (invariant 5).
 - [x] `status --json` golden: `status_json_multi_repo_matches_golden` against `crates/lastcall/tests/golden/status_multi_repo.json` from the built binary (three roots: B1 repo, C2/C6 repo, F3 draft dir); byte-stable under `TZ`/`LANG` changes and a different cwd; `just probe-status` prints the same document.
-- [x] Unit-test floor recorded: **181** (engine 165, testkit 16, bin 0) — the Phase 3 floor. One deliberate dip inside the phase (162 → 159) moved three FS-live watcher tests to the integration tier where `docs/dev/testing.md` says they belong; the tier now runs in ~5 s.
+- [x] Unit-test floor recorded: **182** (engine 166, testkit 16, bin 0) — the Phase 3 floor. PR #2 CI (Linux integration tier) then caught a Linux-only scan loop — `notify`'s inotify backend reports `IN_OPEN`, so the scan's own reads re-triggered it; fixed on the branch before merge with one unit test (181 → 182). One deliberate dip inside the phase (162 → 159) moved three FS-live watcher tests to the integration tier where `docs/dev/testing.md` says they belong; the tier now runs in ~5 s.
 - [ ] **[sponsor]** CI green on both OSes after push (run links on PR #2), and `just probe-watch` seen once on the sponsor's machine (the `committed on main` notice). Host note: this Mac's `fseventsd` delivered no filesystem events during most of the build (137 days up, ~7 GB RSS); the engine's polling backstops covered it and the one event-delivery test self-skips visibly when that happens.
 
 ### Phase 3 — Read-only TUI
@@ -601,7 +601,7 @@ No question is left `[OPEN]`-pending-data. Items 5 and 6 are re-examined at the 
   - **`open` reads a present ledger without the lock** `[LEANING]`: `status` never blocks behind a long fold; writes still lock, re-load and merge. Alternative: lock-first open with a longer retry. Two-way door.
   - **`watch` publishes a pile per root per scan even when unchanged** `[LEANING]`: per the kickoff ("Pile after every scan"); Phase 3 may publish only on change. Two-way door.
   - **Informational, no ruling needed:** D6 hides a *deleted* skip-worktree file (git semantics; the filter can only suppress absent paths); the B8 best-effort "stashed" notice is not implemented (reset/checkout notices cover the observable transitions); `--poll <secs>` sets both polling backstops; worker spend projected above the $3 flag and below the $5 stop (two verifier passes plus a filesystem-event investigation; no meter available to the worker).
-  - **Phase 3 unit-test floor: 181** (engine 165, testkit 16, bin 0), recorded here; ratchets only upward.
+  - **Phase 3 unit-test floor: 182** (engine 166, testkit 16, bin 0), recorded here; ratchets only upward.
 
 ## 11. Deferral ledger
 

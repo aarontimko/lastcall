@@ -6,6 +6,9 @@
 //!
 //! `ignore_globs` scope the watcher only: an ignored path never wakes a scan, but the next
 //! scan (manual, or the `rescan` backstop) still shows the tracked edit.
+//!
+//! `Access` events (opens, reads, read-only closes) never schedule work: on Linux they are
+//! the scan's own reads coming back through inotify ([`actionable`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -131,6 +134,20 @@ pub fn git_dir_allowlisted(rel: &Path) -> bool {
         | "packed-refs" => single,
         "refs" | "rebase-merge" | "rebase-apply" | "logs" => true,
         _ => false,
+    }
+}
+
+/// Whether a filesystem event can mean the tree changed. `notify`'s inotify backend also
+/// subscribes to `IN_OPEN` and `IN_CLOSE_NOWRITE`, so on Linux every file and directory git
+/// opens *during a scan* comes back as an `Access` event under the root; scheduling a scan
+/// on those made each scan trigger the next one. A close-after-write is the one access
+/// that signals a change (the write itself already arrived as `Modify`).
+pub fn actionable(kind: &notify::EventKind) -> bool {
+    use notify::event::{AccessKind, AccessMode, EventKind};
+    match kind {
+        EventKind::Access(AccessKind::Close(AccessMode::Write)) => true,
+        EventKind::Access(_) => false,
+        _ => true,
     }
 }
 
@@ -475,11 +492,13 @@ async fn run_loop(
                             let now = Instant::now();
                             for r in &roots { due.insert(r.path.clone(), now); }
                         }
-                        for p in &ev.paths {
-                            match classify_path(p, &roots, &ignore) {
-                                Scheduled::Scan(root) => { due.insert(root, Instant::now() + timings.debounce); }
-                                Scheduled::Head(root) => { head_due.insert(root); }
-                                Scheduled::Ignore => {}
+                        if actionable(&ev.kind) {
+                            for p in &ev.paths {
+                                match classify_path(p, &roots, &ignore) {
+                                    Scheduled::Scan(root) => { due.insert(root, Instant::now() + timings.debounce); }
+                                    Scheduled::Head(root) => { head_due.insert(root); }
+                                    Scheduled::Ignore => {}
+                                }
                             }
                         }
                     }
@@ -572,6 +591,34 @@ mod tests {
                 PathBuf::from("/w"),
             ]
         );
+    }
+
+    #[test]
+    fn watcher_access_events_never_schedule_work() {
+        use notify::event::{
+            AccessKind, AccessMode, CreateKind, DataChange, EventKind, ModifyKind,
+        };
+        // What inotify reports for the scan's own reads.
+        assert!(!actionable(&EventKind::Access(AccessKind::Open(
+            AccessMode::Any
+        ))));
+        assert!(!actionable(&EventKind::Access(AccessKind::Close(
+            AccessMode::Read
+        ))));
+        assert!(!actionable(&EventKind::Access(AccessKind::Read)));
+        assert!(!actionable(&EventKind::Access(AccessKind::Any)));
+        // What a change looks like.
+        assert!(actionable(&EventKind::Access(AccessKind::Close(
+            AccessMode::Write
+        ))));
+        assert!(actionable(&EventKind::Modify(ModifyKind::Data(
+            DataChange::Any
+        ))));
+        assert!(actionable(&EventKind::Create(CreateKind::File)));
+        assert!(actionable(&EventKind::Remove(
+            notify::event::RemoveKind::Any
+        )));
+        assert!(actionable(&EventKind::Any));
     }
 
     #[test]
