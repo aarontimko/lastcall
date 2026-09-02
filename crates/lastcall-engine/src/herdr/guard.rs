@@ -6,8 +6,17 @@
 use super::transport::{Transport, TransportError};
 use super::wire::{self, Pong};
 
-/// The one wire protocol we speak in v1 (herdr v0.8.2).
+/// The wire protocol the consumed surface (§5) was hand-checked against: herdr `master` @
+/// `5158ada` (2026-08-31), whose embedded schema says `"protocol": 21`.
 pub const SUPPORTED_PROTOCOL: u32 = 21;
+
+/// Every protocol the client accepts. **Construction finding (Phase 1):** the published
+/// v0.8.2 release asset (`just herdr-fetch`) answers `ping` with `protocol: 20`, while the
+/// spec's §5.2 "v0.8.2 = protocol 21" was verified against a post-release `master` whose
+/// `Cargo.toml` still said 0.8.2. The real-herdr integration test proves the consumed surface
+/// works on 20, so both are accepted. Additive to §5.2 (proposed v1.1); anything outside this
+/// set degrades to standalone with a notice.
+pub const SUPPORTED_PROTOCOLS: &[u32] = &[20, SUPPORTED_PROTOCOL];
 
 /// The verdict of a ping.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,9 +48,9 @@ impl Compat {
     }
 }
 
-/// Pure comparison of a pong against [`SUPPORTED_PROTOCOL`].
+/// Pure comparison of a pong against [`SUPPORTED_PROTOCOLS`].
 pub fn compare(pong: &Pong) -> Compat {
-    if pong.protocol == SUPPORTED_PROTOCOL {
+    if SUPPORTED_PROTOCOLS.contains(&pong.protocol) {
         return Compat::Ok {
             version: pong.version.clone(),
             protocol: pong.protocol,
@@ -52,8 +61,13 @@ pub fn compare(pong: &Pong) -> Compat {
     } else {
         "older than"
     };
+    let supported = SUPPORTED_PROTOCOLS
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join("/");
     let notice = format!(
-        "herdr {} speaks protocol {}, {relation} the supported protocol {SUPPORTED_PROTOCOL}; \
+        "herdr {} speaks protocol {}, {relation} the supported protocol {supported}; \
          running standalone (upgrade lastcall or herdr so they match)",
         pong.version, pong.protocol
     );
@@ -114,6 +128,19 @@ mod tests {
     }
 
     #[test]
+    fn guard_release_protocol_20_is_ok_too() {
+        // The published v0.8.2 asset answers 20 (see SUPPORTED_PROTOCOLS).
+        assert_eq!(
+            compare(&pong(20)),
+            Compat::Ok {
+                version: "0.8.2".into(),
+                protocol: 20
+            }
+        );
+        assert!(SUPPORTED_PROTOCOLS.contains(&SUPPORTED_PROTOCOL));
+    }
+
+    #[test]
     fn guard_newer_server_mismatch_has_notice_and_no_panic() {
         let c = compare(&pong(22));
         match &c {
@@ -134,8 +161,17 @@ mod tests {
 
     #[test]
     fn guard_older_server_mismatch_says_older() {
-        let c = compare(&pong(20));
-        assert!(c.notice().unwrap().contains("older than"));
+        let c = compare(&pong(19));
+        assert!(matches!(
+            c,
+            Compat::Mismatch {
+                server_protocol: 19,
+                ..
+            }
+        ));
+        let notice = c.notice().unwrap();
+        assert!(notice.contains("older than"), "{notice}");
+        assert!(notice.contains("20/21"), "{notice}");
     }
 
     #[test]
