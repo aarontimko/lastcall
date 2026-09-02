@@ -176,7 +176,7 @@ impl Shutdown for RealShutdown {
 
     fn join_watcher(&mut self) {
         if let (Some(w), Some(rt)) = (self.watcher.take(), self.runtime.as_ref()) {
-            let _ = rt.block_on(tokio::time::timeout(SHUTDOWN_BUDGET, w.join()));
+            block_bounded(rt, SHUTDOWN_BUDGET, w.join());
         }
     }
 
@@ -185,6 +185,18 @@ impl Shutdown for RealShutdown {
             rt.shutdown_timeout(SHUTDOWN_BUDGET);
         }
     }
+}
+
+/// Block on `fut` for at most `budget`; `None` when it did not finish. The timeout is
+/// created *inside* `block_on`: `tokio::time::timeout` arms its timer at construction and
+/// panics ("no reactor running") when built outside a runtime context, which the first
+/// pty run of the quit path hit.
+fn block_bounded<F: Future>(
+    rt: &tokio::runtime::Runtime,
+    budget: Duration,
+    fut: F,
+) -> Option<F::Output> {
+    rt.block_on(async { tokio::time::timeout(budget, fut).await.ok() })
 }
 
 /// The detached reader thread: `poll(INPUT_POLL)` + `read()` under a stop flag, forwarding
@@ -639,5 +651,25 @@ mod tests {
         assert!(!term::is_active());
         assert_eq!(SHUTDOWN_BUDGET, Duration::from_millis(500));
         assert!(INPUT_POLL <= Duration::from_millis(50));
+    }
+
+    #[test]
+    fn run_bounded_join_works_from_outside_the_runtime_and_gives_up_on_time() {
+        // Regression: the first pty run panicked with "no reactor running" because the
+        // timeout was built before `block_on` entered the runtime. The helper is called
+        // exactly as `RealShutdown::join_watcher` calls it: from a plain thread.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        assert_eq!(
+            block_bounded(&rt, Duration::from_millis(20), async { 7 }),
+            Some(7)
+        );
+        let started = std::time::Instant::now();
+        let hung = block_bounded(&rt, Duration::from_millis(20), std::future::pending::<()>());
+        assert_eq!(hung, None);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        rt.shutdown_timeout(Duration::from_millis(20));
     }
 }
