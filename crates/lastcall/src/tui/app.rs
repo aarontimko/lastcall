@@ -202,6 +202,9 @@ pub enum Effect {
     Quit,
 }
 
+/// How long a status notice stays on the status line before the key hints return.
+pub const STATUS_TTL: Duration = Duration::from_secs(30);
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct App {
     pub roots: BTreeMap<PathBuf, RootView>,
@@ -651,10 +654,13 @@ impl App {
             }
             Tick => {
                 self.now += Duration::from_secs(1);
-                if self.status.is_some() {
-                    Changed::Yes
-                } else {
-                    Changed::No
+                match &self.status {
+                    Some(s) if self.now.duration_since(s.at) >= STATUS_TTL => {
+                        self.status = None; // the hints come back
+                        Changed::Yes
+                    }
+                    Some(_) => Changed::Yes,
+                    None => Changed::No,
                 }
             }
         };
@@ -1044,10 +1050,25 @@ mod tests {
         app.set_status("hello");
         assert_eq!(app.handle(Action::Tick).0, Changed::Yes);
         assert_eq!(app.status_age().as_deref(), Some("1s"));
-        for _ in 0..70 {
-            app.handle(Action::Tick);
-        }
+        // formatting past a minute, without waiting for the TTL
+        app.status.as_mut().unwrap().at = app.now - Duration::from_secs(60);
         assert_eq!(app.status_age().as_deref(), Some("1m"));
+    }
+
+    #[test]
+    fn app_status_line_expires_after_the_ttl_and_the_hints_return() {
+        let mut app = three_roots();
+        app.set_status("watching /somewhere (3 roots)");
+        let ttl = STATUS_TTL.as_secs();
+        for _ in 0..ttl - 1 {
+            assert_eq!(app.handle(Action::Tick).0, Changed::Yes);
+        }
+        assert!(app.status.is_some(), "still shown one tick before the TTL");
+        assert_eq!(app.handle(Action::Tick), (Changed::Yes, None));
+        assert_eq!(app.status, None, "cleared at the TTL");
+        assert_eq!(app.handle(Action::Tick).0, Changed::No);
+        app.set_status("again");
+        assert!(app.status.is_some(), "a new notice starts a new TTL");
     }
 
     #[test]

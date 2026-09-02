@@ -22,7 +22,6 @@
 
 use std::io;
 use std::path::PathBuf;
-use std::pin::pin;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -59,6 +58,9 @@ pub enum Local {
     RefreshDone,
     /// A root's scan failed during a `Refresh`; its previous pile stays.
     Notice(Option<PathBuf>, String),
+    /// An engine task died (panicked): the panic hook has already restored the terminal,
+    /// so the loop must end. `run` reports the text on stderr and fails.
+    Fatal(String),
 }
 
 /// The terminal-free core of the loop: the app, the keymap, and the hit map of the last
@@ -129,6 +131,10 @@ impl Ui {
             Local::Roots(metas) => (self.app.sync_roots(metas), None),
             Local::RefreshDone => (self.app.refresh_done(), None),
             Local::Notice(root, text) => self.app.apply(EngineEvent::Notice { root, text }),
+            Local::Fatal(text) => {
+                self.app.set_status(text);
+                (Changed::No, Some(Effect::Quit))
+            }
         }
     }
 
@@ -234,7 +240,10 @@ fn root_metas(engine: &mut Engine) -> Vec<RootMeta> {
 fn spawn_refresh(engine: &Arc<Mutex<Engine>>, tx: mpsc::UnboundedSender<Local>) {
     let engine = engine.clone();
     tokio::spawn(async move {
-        let results = blocking(&engine, |e| e.scan_all()).await;
+        let scan = tokio::spawn(async move { blocking(&engine, |e| e.scan_all()).await });
+        let Some(results) = joined(scan, &tx, "refresh").await else {
+            return;
+        };
         for (root, result) in results {
             let local = match result {
                 Ok(pile) => Local::Pile(root, pile),
@@ -252,9 +261,28 @@ fn spawn_refresh(engine: &Arc<Mutex<Engine>>, tx: mpsc::UnboundedSender<Local>) 
 fn spawn_sync_roots(engine: &Arc<Mutex<Engine>>, tx: mpsc::UnboundedSender<Local>) {
     let engine = engine.clone();
     tokio::spawn(async move {
-        let metas = blocking(&engine, root_metas).await;
-        let _ = tx.send(Local::Roots(metas));
+        let read = tokio::spawn(async move { blocking(&engine, root_metas).await });
+        if let Some(metas) = joined(read, &tx, "root sync").await {
+            let _ = tx.send(Local::Roots(metas));
+        }
     });
+}
+
+/// Await an engine task; if it died (`blocking` re-panics a panicking closure, and the panic
+/// hook has already restored the terminal) tell the loop to stop instead of leaving it
+/// drawing onto a cooked terminal with `refreshing` stuck.
+async fn joined<T>(
+    task: tokio::task::JoinHandle<T>,
+    tx: &mpsc::UnboundedSender<Local>,
+    what: &str,
+) -> Option<T> {
+    match task.await {
+        Ok(value) => Some(value),
+        Err(e) => {
+            let _ = tx.send(Local::Fatal(format!("{what} failed: {e}")));
+            None
+        }
+    }
 }
 
 fn draw(terminal: &mut Screen, ui: &mut Ui) -> io::Result<()> {
@@ -264,16 +292,54 @@ fn draw(terminal: &mut Screen, ui: &mut Ui) -> io::Result<()> {
     Ok(())
 }
 
-async fn sigterm() {
+/// SIGINT and SIGTERM, registered *before* the terminal is taken so a signal in the gap
+/// between `term::enter()` and the first `select!` still goes through the restore path
+/// instead of the default disposition (which would leave raw mode and the alternate
+/// screen on).
+struct Signals {
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        if let Ok(mut stream) = signal(SignalKind::terminate()) {
-            stream.recv().await;
-            return;
+    int: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    term: Option<tokio::signal::unix::Signal>,
+}
+
+impl Signals {
+    /// Needs a runtime context (`Runtime::enter`).
+    fn register() -> Signals {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Signals {
+                int: signal(SignalKind::interrupt()).ok(),
+                term: signal(SignalKind::terminate()).ok(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Signals {}
         }
     }
-    std::future::pending::<()>().await
+
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        match (&mut self.int, &mut self.term) {
+            (Some(int), Some(term)) => tokio::select! {
+                _ = int.recv() => {}
+                _ = term.recv() => {}
+            },
+            (Some(int), None) => {
+                int.recv().await;
+            }
+            (None, Some(term)) => {
+                term.recv().await;
+            }
+            (None, None) => std::future::pending::<()>().await,
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    }
 }
 
 /// Take the terminal and run the TUI until `q`/Ctrl-C/SIGTERM (exit 0) or the watcher
@@ -287,6 +353,10 @@ pub fn run(
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
+    let mut signals = {
+        let _ctx = runtime.enter();
+        Signals::register()
+    };
     let guard = term::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut ui = Ui::new(App::new(), keymap);
@@ -312,11 +382,10 @@ pub fn run(
             let mut tick = tokio::time::interval(TICK);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             tick.tick().await; // the immediate first tick
-            let mut sigterm = pin!(sigterm());
+            let mut fatal: Option<String> = None;
             loop {
                 let (changed, effect) = tokio::select! {
-                    _ = tokio::signal::ctrl_c() => break,
-                    _ = sigterm.as_mut() => break,
+                    _ = signals.recv() => break,
                     event = watcher.events.recv() => match event {
                         Some(event) => ui.engine(event),
                         None => {
@@ -331,6 +400,10 @@ pub fn run(
                         None => break, // the reader thread died
                     },
                     local = local_rx.recv() => match local {
+                        Some(Local::Fatal(text)) => {
+                            fatal = Some(text);
+                            break;
+                        }
                         Some(local) => ui.local(local),
                         None => (Changed::No, None),
                     },
@@ -346,7 +419,10 @@ pub fn run(
                     draw(&mut terminal, &mut ui)?;
                 }
             }
-            Ok(ExitCode::SUCCESS)
+            match fatal {
+                Some(text) => Err(io::Error::other(text)),
+                None => Ok(ExitCode::SUCCESS),
+            }
         }
         .await;
         (outcome, watcher)
@@ -411,6 +487,35 @@ mod tests {
         let mut app = three_roots();
         app.handle(Action::Resize(100, 30));
         Ui::new(app, Keymap::defaults())
+    }
+
+    #[test]
+    fn run_fatal_local_quits_and_a_dead_engine_task_becomes_fatal() {
+        let mut ui = ui();
+        assert_eq!(
+            ui.local(Local::Fatal("refresh failed: boom".into())),
+            (Changed::No, Some(Effect::Quit))
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Local>();
+        let got = rt.block_on(async {
+            let task = tokio::spawn(async { panic!("engine work does not panic") });
+            joined(task, &tx, "refresh").await
+        });
+        assert_eq!(got, None);
+        match rx.try_recv() {
+            Ok(Local::Fatal(text)) => assert!(text.starts_with("refresh failed: "), "{text}"),
+            other => panic!("expected Fatal, got {other:?}"),
+        }
+        let ok = rt.block_on(async {
+            let task = tokio::spawn(async { 7 });
+            joined(task, &tx, "refresh").await
+        });
+        assert_eq!(ok, Some(7));
+        assert!(rx.try_recv().is_err(), "a successful join sends nothing");
     }
 
     #[test]

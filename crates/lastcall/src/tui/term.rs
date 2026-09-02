@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crossterm::cursor::Show;
 use crossterm::event::{DisableBracketedPaste, DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -73,7 +74,9 @@ pub fn restore() {
     let mut out = io::stdout();
     // Errors are ignored on purpose: this runs while unwinding and there is no better place
     // to report them; the disables are independent so each is attempted.
-    let _ = execute!(out, DisableMouseCapture, DisableBracketedPaste);
+    // `Show` too: ratatui hides the cursor on every draw and only the normal quit path
+    // calls `Terminal::show_cursor`; the panic and `Drop` paths come through here alone.
+    let _ = execute!(out, DisableMouseCapture, DisableBracketedPaste, Show);
     let _ = execute!(out, LeaveAlternateScreen);
     let _ = disable_raw_mode();
     let _ = out.flush();
