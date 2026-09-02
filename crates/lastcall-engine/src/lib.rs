@@ -13,4 +13,5 @@ pub mod hunks;
 pub mod index;
 pub mod ledger;
 pub mod paths;
+pub mod scan;
 pub mod store;
