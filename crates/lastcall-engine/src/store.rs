@@ -503,7 +503,7 @@ fn walk_files(root: &Path, rel: &Path, out: &mut Vec<Vec<u8>>) -> Result<(), Sto
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use lastcall_testkit::fixture_repo::FixtureRepo;
     use lastcall_testkit::tmp::TempDir;
