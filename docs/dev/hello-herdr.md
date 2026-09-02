@@ -63,7 +63,7 @@ happened in a tab you were not looking at (`src/app/api_helpers.rs:96-104`). The
 integration test (`just test-integration-herdr`) asserts this derivation on the pinned
 binary.
 
-**Step 3 — focus tab B.** Switch to tab B. Expected within the fallback interval (30 s; in
+**Step 3 — focus tab B.** Switch to tab B. Expected within the fallback interval plus the coalesce window (30.5 s; in
 practice within a second): **`[<B>] demo done → idle`**. herdr emits *no* global event for the
 flip itself, so hello-herdr can learn it two ways, and the transcript tells you which:
 

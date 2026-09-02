@@ -44,9 +44,12 @@ pub const SKIP_MESSAGE: &str =
 
 /// The herdr binary from `LASTCALL_TEST_HERDR_BIN`, if set and non-empty.
 pub fn herdr_bin_from_env() -> Option<PathBuf> {
-    std::env::var_os(BIN_ENV)
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
+    herdr_bin_from(std::env::var_os(BIN_ENV))
+}
+
+/// The filtering behind [`herdr_bin_from_env`]: empty means unset.
+pub fn herdr_bin_from(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    value.filter(|v| !v.is_empty()).map(PathBuf::from)
 }
 
 /// Write the skip notice so it is visible even for a passing test.
@@ -73,6 +76,12 @@ pub struct HerdrIsolation {
     pub config_home: PathBuf,
     pub runtime_dir: PathBuf,
     pub home: PathBuf,
+    /// Private `XDG_STATE_HOME` / `XDG_DATA_HOME` / `XDG_CACHE_HOME`: herdr's `state_dir()`
+    /// prefers `XDG_STATE_HOME` (plugins, manifest cache, announcements), so an inherited
+    /// value would let a test server write into the sponsor's real state (review F1).
+    pub state_home: PathBuf,
+    pub data_home: PathBuf,
+    pub cache_home: PathBuf,
     pub socket_path: PathBuf,
 }
 
@@ -83,6 +92,9 @@ impl HerdrIsolation {
         let config_home = base.join("config");
         let runtime_dir = base.join("runtime");
         let home = base.join("home");
+        let state_home = base.join("state");
+        let data_home = base.join("data");
+        let cache_home = base.join("cache");
         let socket_path = runtime_dir.join("herdr.sock");
         let len = socket_path.as_os_str().len();
         if len >= 100 {
@@ -94,6 +106,9 @@ impl HerdrIsolation {
         std::fs::create_dir_all(config_home.join("herdr"))?;
         std::fs::create_dir_all(&runtime_dir)?;
         std::fs::create_dir_all(&home)?;
+        std::fs::create_dir_all(&state_home)?;
+        std::fs::create_dir_all(&data_home)?;
+        std::fs::create_dir_all(&cache_home)?;
         std::fs::write(
             config_home.join("herdr/config.toml"),
             "onboarding = false\n",
@@ -103,6 +118,9 @@ impl HerdrIsolation {
             config_home,
             runtime_dir,
             home,
+            state_home,
+            data_home,
+            cache_home,
             socket_path,
         })
     }
@@ -154,6 +172,9 @@ impl SpawnedHerdr {
         cmd.env("XDG_CONFIG_HOME", &isolation.config_home);
         cmd.env("XDG_RUNTIME_DIR", &isolation.runtime_dir);
         cmd.env("HOME", &isolation.home);
+        cmd.env("XDG_STATE_HOME", &isolation.state_home);
+        cmd.env("XDG_DATA_HOME", &isolation.data_home);
+        cmd.env("XDG_CACHE_HOME", &isolation.cache_home);
         cmd.env("HERDR_SOCKET_PATH", &isolation.socket_path);
         cmd.env("SHELL", "/bin/sh");
         cmd.cwd(&isolation.base);
@@ -319,7 +340,22 @@ pub fn process_matches_binary(pid: u32, bin: &Path) -> bool {
         .map(|c| c == bin)
         .unwrap_or(comm_path == bin);
     let same_name = comm_path.file_name().is_some() && comm_path.file_name() == bin.file_name();
-    same_path || same_name
+    // A name match alone is not enough: a recycled PID could belong to the sponsor's live
+    // `herdr`. Every process we may kill was spawned by this process, so also require the
+    // parent pid to be ours (review F2).
+    (same_path || same_name) && parent_pid(pid) == Some(std::process::id())
+}
+
+/// `ps -o ppid= -p <pid>`; `None` when the process is gone or `ps` fails.
+pub fn parent_pid(pid: u32) -> Option<u32> {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "ppid=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
 }
 
 /// Kill one registered PID, refusing anything the matcher does not recognise.
@@ -390,7 +426,33 @@ mod tests {
 
     #[test]
     fn herdr_spawn_bin_env_must_be_non_empty() {
-        // Only checks the accessor's filtering; the real variable is set by `just`.
-        assert!(herdr_bin_from_env().is_none_or(|p| !p.as_os_str().is_empty()));
+        // Unset and empty both mean "no binary"; anything else is the path verbatim.
+        assert_eq!(herdr_bin_from(None), None);
+        assert_eq!(herdr_bin_from(Some(std::ffi::OsString::new())), None);
+        assert_eq!(
+            herdr_bin_from(Some(std::ffi::OsString::from("/x/herdr"))),
+            Some(PathBuf::from("/x/herdr"))
+        );
+    }
+
+    #[test]
+    fn herdr_spawn_matcher_requires_our_own_child() {
+        // A real child of ours whose name matches: accepted. The same name under a
+        // different parent (our own parent process): refused.
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        assert_eq!(parent_pid(pid), Some(std::process::id()));
+        assert!(process_matches_binary(pid, Path::new("/bin/sleep")));
+        assert!(!process_matches_binary(pid, Path::new("/bin/zsh")));
+        let _ = child.kill();
+        let _ = child.wait();
+        let me = std::process::id();
+        assert!(!process_matches_binary(
+            me,
+            Path::new(&std::env::current_exe().unwrap())
+        ));
     }
 }

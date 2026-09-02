@@ -913,6 +913,10 @@ impl<T: Transport> Actor<T> {
                     foreground_cwd: pane.foreground_cwd.clone(),
                 });
                 if let Some(cache) = &mut self.cache {
+                    // Keep the snapshot-shaped `agents` view coherent with `panes` (review F4).
+                    if let Some(agent) = cache.agents.get_mut(pane_id) {
+                        agent.agent_status = new_status.clone();
+                    }
                     cache.panes.insert(
                         pane_id.to_string(),
                         PaneRecord {
@@ -1208,9 +1212,12 @@ impl<T: Transport> Actor<T> {
                 pane_id, reason, ..
             } => {
                 // Server-side close of a status stream we still want: drop it and let the next
-                // snapshot reopen it if the pane still exists.
+                // focus or fallback resync reopen it if the pane still exists. Deliberately no
+                // snapshot here: a server that closes the stream on every reopen would otherwise
+                // drive one snapshot per coalesce window (review F3); herdr only closes per-pane
+                // streams on slow-consumer kill or restart, which also drops the lifecycle
+                // stream and triggers a full reconnect anyway.
                 self.close_status_task(&pane_id);
-                self.schedule_snapshot();
                 Ok(self
                     .emit(HerdrEvent::StatusStreamClosed { pane_id, reason })
                     .await)
@@ -2025,6 +2032,47 @@ mod tests {
             e,
             HerdrEvent::StatusStreamClosed { pane_id, reason } if pane_id == P1 && reason.contains("orphan")
         )));
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn client_status_stream_close_does_not_storm_snapshots() {
+        // Review F3: a server that closes a per-pane stream must not drive one snapshot per
+        // coalesce window. The close is reported, nothing is scheduled, and the next fallback
+        // (or focus) resync reopens the stream.
+        let mock = builder().in_memory();
+        let (handle, mut rx, _) = boot(&mock).await;
+        assert_eq!(mock.count("session.snapshot"), 1);
+        assert_eq!(mock.status_streams_open(P1), 1);
+        mock.close_status_streams(P1);
+        assert!(
+            mock.wait_until(50, |m| m.status_streams_open(P1) == 0)
+                .await
+        );
+        for _ in 0..4 {
+            advance(timings().coalesce).await;
+        }
+        assert_eq!(
+            mock.count("session.snapshot"),
+            1,
+            "no snapshot from the close alone"
+        );
+        assert_eq!(
+            mock.status_streams_open(P1),
+            0,
+            "not reopened before a resync"
+        );
+        let events = drain(&mut rx);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            HerdrEvent::StatusStreamClosed { pane_id, .. } if pane_id == P1
+        )));
+        advance(timings().fallback + timings().coalesce).await;
+        assert_eq!(mock.count("session.snapshot"), 2, "fallback resync");
+        assert!(
+            mock.wait_until(50, |m| m.status_streams_open(P1) == 1)
+                .await
+        );
         handle.shutdown().await;
     }
 
