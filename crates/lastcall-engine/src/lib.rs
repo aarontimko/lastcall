@@ -6,5 +6,6 @@
 
 pub mod config;
 pub mod env;
+pub mod git;
 #[cfg(feature = "herdr")]
 pub mod herdr;
