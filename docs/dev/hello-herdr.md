@@ -96,3 +96,8 @@ paths a real session exercises.
 
 `--socket` also makes the command exit on `disconnected:` instead of reconnecting, and
 `--exit-after <secs>` ends the stream cleanly (exit 0), so the probe terminates on its own.
+
+Exit codes: 0 after `--exit-after`, Ctrl-C, or (with `--socket`) a peer disconnect — the
+session ended, nothing was wrong on our side; 1 for every standalone outcome (no session,
+ambiguous sessions, ping failure, protocol mismatch, unreadable snapshot); 2 for a config
+error.

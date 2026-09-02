@@ -170,13 +170,14 @@ mod tests {
         let listener = UnixListener::bind(&path).unwrap();
         let server = std::thread::spawn(move || {
             let (conn, _) = listener.accept().unwrap();
-            std::thread::sleep(Duration::from_millis(80));
+            // Under the unit tier's 50 ms budget (docs/dev/testing.md).
+            std::thread::sleep(Duration::from_millis(40));
             drop(conn);
         });
         let mut reader = JsonLineReader::connect(&path).unwrap();
         assert!(
             reader
-                .read_raw_line(Duration::from_millis(30))
+                .read_raw_line(Duration::from_millis(15))
                 .unwrap()
                 .is_none()
         );
