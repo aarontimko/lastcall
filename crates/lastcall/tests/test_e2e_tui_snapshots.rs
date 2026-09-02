@@ -248,21 +248,27 @@ fn tui_diff_view_hunks() {
     let mut engine = scene.engine();
     let alpha = root_named(&engine, "alpha");
     mark_seen(&mut engine, &alpha);
+    // Three one-line edits → three hunks of 3-context each (+3 −3). With git's 3-line
+    // context hunk 2's header is diff line 9, so the cursor on it scrolls hunk 1 away.
     let mut edited = lines.clone();
-    for i in 5..=25 {
+    for i in [5, 45, 78] {
         edited[i - 1] = format!("LINE {i} (edited)");
     }
-    edited[44] = "LINE 45 (edited)".into();
-    edited[77] = "LINE 78 (edited)".into();
     alpha_repo.write("f1", format!("{}\n", edited.join("\n")));
     let mut app = app_of(&mut engine);
     let row = app.roots[&alpha].row(b"f1").expect("f1 pending").clone();
     assert_eq!(row.hunks.len(), 3, "{row:?}");
+    assert_eq!((row.added, row.deleted), (3, 3));
     select_row(&mut app, &alpha, "f1");
     app.handle(Action::Open);
     app.handle(Action::HunkNext);
     assert_eq!(app.diff.hunk, 1);
-    assert!(app.diff.scroll > 28, "hunk 2 starts at {}", app.diff.scroll);
+    let offsets = lastcall::tui::app::hunk_offsets(&row.hunks);
+    assert_eq!(
+        app.diff.scroll, offsets[1],
+        "header is the first visible line"
+    );
+    assert!(app.diff.scroll > 0, "view scrolled");
     snapshot("tui_diff_view_hunks", &app, W, H);
 }
 

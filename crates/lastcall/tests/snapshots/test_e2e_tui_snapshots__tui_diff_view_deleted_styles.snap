@@ -11,7 +11,7 @@ expression: style
 2 38..40 Red Reset -
 2 99..100 Cyan Reset -
 3 27..28 Cyan Reset -
-3 28..43 Reset Reset REVERSED
+3 28..41 Reset Reset REVERSED
 3 99..100 Cyan Reset -
 4 9..11 Green Reset -
 4 12..14 Red Reset -

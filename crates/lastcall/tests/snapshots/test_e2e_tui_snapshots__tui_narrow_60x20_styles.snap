@@ -43,4 +43,4 @@ expression: style
 17 0..1 Cyan Reset -
 17 59..60 Cyan Reset -
 18 0..60 Cyan Reset -
-19 0..60 Reset Reset DIM
+19 0..43 Reset Reset DIM

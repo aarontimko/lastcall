@@ -23,11 +23,19 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use super::app::{
     App, Focus, MIN_SIZE, NAV_MIN_COLS, RootView, Selection, Target, diff_len, hunk_offsets,
 };
-use super::input::DEFAULT_KEYMAP;
+use super::input::Action;
 
-pub const TOO_SMALL: &str = "terminal too small (40×10 minimum)";
-pub const HINTS: &str = "↑↓ select  ⏎ open  n/p hunk  Tab focus  r refresh  ? help  q quit";
+pub const TOO_SMALL: &str = "too small: 40×10 min";
 pub const NO_SELECTION: &str = "select a file (↑↓ or click) · ? for help";
+
+/// `1 file`, `2 files`.
+fn plural(n: usize, noun: &str) -> String {
+    if n == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{n} {noun}s")
+    }
+}
 
 /// Which pane a screen position belongs to (the wheel scrolls the pane under the pointer).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,7 +152,7 @@ pub fn render(app: &App, frame: &mut Frame<'_>) -> HitMap {
     }
 
     if app.help {
-        render_help(buf, area);
+        render_help(app, buf, area);
     }
     hits
 }
@@ -158,8 +166,10 @@ fn render_header(app: &App, buf: &mut Buffer, area: Rect) {
         .map(|r| r.hunks.len())
         .sum();
     let left = format!(
-        "lastcall  {} repos · {files} files · {hunks} hunks",
-        listed.len()
+        "lastcall  {} · {} · {}",
+        plural(listed.len(), "repo"),
+        plural(files, "file"),
+        plural(hunks, "hunk")
     );
     let parents: BTreeSet<String> = app
         .roots
@@ -188,9 +198,39 @@ fn render_status(app: &App, buf: &mut Buffer, area: Rect) {
             Span::raw(s.text.clone()),
             Span::styled(format!(" · {age}"), dim()),
         ]),
-        _ => Line::from(Span::styled(HINTS, dim())),
+        _ => Line::from(Span::styled(hints(app, area.width), dim())),
     };
     buf.set_line(area.x, area.y, &line, area.width);
+}
+
+/// The hint line from the app's own keymap: `↑↓ select  ⏎ open  n/p hunk  Tab focus  r
+/// refresh  ? help  q quit`; below `NAV_MIN_COLS` the `focus` and `refresh` hints are
+/// dropped so the rest fits.
+pub fn hints(app: &App, width: u16) -> String {
+    let first = |action: &str| app.keys_for(action).first().map(|s| key_label(s));
+    let pair = |a: &str, b: &str| -> Option<String> {
+        let (a, b) = (first(a)?, first(b)?);
+        if (a.as_str(), b.as_str()) == ("↑", "↓") {
+            Some("↑↓".to_owned())
+        } else {
+            Some(format!("{a}/{b}"))
+        }
+    };
+    let narrow = width < NAV_MIN_COLS;
+    let items = [
+        (pair("nav_up", "nav_down"), "select"),
+        (first("open"), "open"),
+        (pair("hunk_next", "hunk_prev"), "hunk"),
+        ((!narrow).then(|| first("focus_toggle")).flatten(), "focus"),
+        ((!narrow).then(|| first("refresh")).flatten(), "refresh"),
+        (first("help"), "help"),
+        (first("quit"), "quit"),
+    ];
+    items
+        .into_iter()
+        .filter_map(|(key, what)| key.map(|k| format!("{k} {what}")))
+        .collect::<Vec<_>>()
+        .join("  ")
 }
 
 // ---- nav ---------------------------------------------------------------------------------
@@ -248,9 +288,9 @@ fn render_nav(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
         });
         lines.push(NavLine {
             line: Line::from(format!(
-                "  {} · {} files",
+                "  {} · {}",
                 view.meta.branch_label(),
-                view.rows.len()
+                plural(view.rows.len(), "file")
             )),
             target: None,
             selected: false,
@@ -275,9 +315,9 @@ fn render_nav(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
             }
             lines.push(NavLine {
                 line: Line::from(format!(
-                    "  {} · {} files",
+                    "  {} · {}",
                     annotation_name(group.kind),
-                    group.paths.len()
+                    plural(group.paths.len(), "file")
                 )),
                 target: Some(Target::NavGroup(path.clone(), group.kind)),
                 selected: is_sel,
@@ -377,8 +417,8 @@ fn render_main(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
         None => {
             if app.listed_roots().next().is_none() {
                 lines.push(Line::from(format!(
-                    "nothing pending across {} roots",
-                    app.roots.len()
+                    "nothing pending across {}",
+                    plural(app.roots.len(), "root")
                 )));
                 for view in app.roots.values() {
                     let mut text = format!("  {}  {}", view.meta.name, view.meta.branch_label());
@@ -400,9 +440,9 @@ fn render_main(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
                 let mut spans = vec![
                     Span::styled(view.meta.name.clone(), bold()),
                     Span::raw(format!(
-                        "  {} · {} files",
+                        "  {} · {}",
                         view.meta.branch_label(),
-                        view.rows.len()
+                        plural(view.rows.len(), "file")
                     )),
                 ];
                 for label in [view.meta.badge_label(), view.meta.in_progress_label()]
@@ -422,7 +462,7 @@ fn render_main(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
             if let Some(group) = app.roots.get(root).and_then(|v| v.group(*kind)) {
                 lines.push(Line::from(vec![
                     Span::styled(annotation_name(*kind).to_owned(), bold()),
-                    Span::raw(format!(" · {} files", group.paths.len())),
+                    Span::raw(format!(" · {}", plural(group.paths.len(), "file"))),
                 ]));
                 for p in &group.paths {
                     lines.push(Line::from(format!("  {}", String::from_utf8_lossy(p))));
@@ -446,15 +486,17 @@ fn render_main(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
                     .cloned()
                     .collect();
                 push_notices(&mut lines, &others);
-                let fixed = lines.len();
-                for (i, line) in lines.iter().enumerate() {
+                // Header and notices are bounded by the pane: a root with more notices than
+                // rows must not write past the buffer.
+                let fixed = lines.len().min(area.height as usize);
+                for (i, line) in lines.iter().take(fixed).enumerate() {
                     buf.set_line(area.x, area.y + i as u16, line, area.width);
                 }
                 let rest = Rect::new(
                     area.x,
-                    area.y + fixed.min(area.height as usize) as u16,
+                    area.y + fixed as u16,
                     area.width,
-                    area.height.saturating_sub(fixed as u16),
+                    area.height - fixed as u16,
                 );
                 render_row_body(app, buf, rest, view, row, &path.clone(), hits);
                 return;
@@ -619,12 +661,13 @@ fn mode_of(line: &[u8]) -> String {
         .to_owned()
 }
 
-/// git's `start,len`: 1-based start for a non-empty range, the preceding line for an empty one.
+/// git's `start[,len]`: 1-based start for a non-empty range, the preceding line for an
+/// empty one, and `,len` omitted when it is 1 (as `git diff` prints it).
 fn range_label(start: usize, len: usize) -> String {
-    if len == 0 {
-        format!("{start},0")
-    } else {
-        format!("{},{len}", start + 1)
+    match len {
+        0 => format!("{start},0"),
+        1 => format!("{}", start + 1),
+        _ => format!("{},{len}", start + 1),
     }
 }
 
@@ -653,8 +696,9 @@ fn key_label(spec: &str) -> String {
     }
 }
 
-fn render_help(buf: &mut Buffer, area: Rect) {
-    let rows: Vec<String> = DEFAULT_KEYMAP
+fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
+    let rows: Vec<String> = app
+        .keymap
         .iter()
         .map(|(name, specs)| {
             let keys = specs
@@ -662,7 +706,7 @@ fn render_help(buf: &mut Buffer, area: Rect) {
                 .map(|s| key_label(s))
                 .collect::<Vec<_>>()
                 .join(" / ");
-            format!("{keys:<14} {}", super::input::Action::describe(name))
+            format!("{keys:<14} {}", Action::describe(name))
         })
         .collect();
     let width = (rows.iter().map(|r| r.width()).max().unwrap_or(0) + 4).min(area.width as usize);
@@ -784,6 +828,7 @@ fn modifier_names(m: Modifier) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::app::testfix::*;
     use super::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -814,7 +859,66 @@ mod tests {
         assert_eq!(range_label(0, 3), "1,3");
         assert_eq!(range_label(0, 0), "0,0");
         assert_eq!(range_label(4, 0), "4,0");
-        assert_eq!(range_label(9, 1), "10,1");
+        assert_eq!(range_label(9, 1), "10", "git omits `,1`");
+    }
+
+    #[test]
+    fn render_plural() {
+        assert_eq!(plural(0, "file"), "0 files");
+        assert_eq!(plural(1, "file"), "1 file");
+        assert_eq!(plural(2, "root"), "2 roots");
+    }
+
+    #[test]
+    fn render_hints_and_help_follow_the_app_keymap() {
+        let mut app = App::new();
+        assert_eq!(
+            hints(&app, 100),
+            "↑↓ select  ⏎ open  n/p hunk  Tab focus  r refresh  ? help  q quit"
+        );
+        assert_eq!(
+            hints(&app, 60),
+            "↑↓ select  ⏎ open  n/p hunk  ? help  q quit",
+            "narrow drops focus and refresh"
+        );
+        for (name, specs) in &mut app.keymap {
+            if name == "quit" {
+                *specs = vec!["x".to_owned()];
+            }
+        }
+        let (frame, _) = frame_of(&app, 80, 12);
+        assert!(frame.contains("? help  x quit"), "{frame}");
+        assert!(!frame.contains("q quit"), "{frame}");
+        app.help = true;
+        let (frame, _) = frame_of(&app, 80, 24);
+        assert!(frame.contains("x              quit"), "{frame}");
+        assert!(!frame.contains("q / Ctrl-C"), "{frame}");
+    }
+
+    #[test]
+    fn render_in_progress_tag_decorates_a_listed_root() {
+        let mut app = three_roots();
+        let mut alpha = meta("alpha");
+        alpha.in_progress = Some(lastcall_engine::headstate::InProgress::Merge);
+        app.sync_roots(vec![alpha, meta("beta"), meta("notes")]);
+        let (frame, _) = frame_of(&app, 100, 30);
+        assert!(frame.contains("│alpha  [merge in progress]"), "{frame}");
+        assert!(frame.contains("│  M f1  +1 −1"), "{frame}");
+    }
+
+    #[test]
+    fn render_many_notices_do_not_overflow_a_small_pane() {
+        let mut app = three_roots();
+        app.roots.get_mut(&root("alpha")).unwrap().notices =
+            (0..12).map(|i| format!("notice {i}")).collect();
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Open);
+        for (w, h) in [(40, 10), (70, 10), (40, 12)] {
+            let (frame, _) = frame_of(&app, w, h);
+            assert!(frame.contains("notice 0"), "{frame}");
+        }
+        app.select(Some(Selection::Root(root("alpha"))));
+        frame_of(&app, 40, 10);
     }
 
     #[test]
@@ -835,7 +939,7 @@ mod tests {
     fn render_too_small_is_one_line() {
         let app = App::new();
         let (frame, styles) = frame_of(&app, 30, 8);
-        assert!(frame.contains("terminal too small (40×10 mini"), "{frame}");
+        assert!(frame.contains("too small: 40×10 min"), "{frame}");
         assert_eq!(styles, "");
     }
 

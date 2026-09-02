@@ -22,7 +22,7 @@ use lastcall_engine::scan::{Annotation, Group, Pile, Row};
 use lastcall_engine::store::RootKind;
 use lastcall_engine::watcher::EngineEvent;
 
-use super::input::Action;
+use super::input::{Action, DEFAULT_KEYMAP};
 
 pub const NAV_WIDTH_DEFAULT: u16 = 28;
 pub const NAV_WIDTH_MIN: u16 = 16;
@@ -112,9 +112,10 @@ impl RootView {
         }
     }
 
-    /// Listed in the nav iff the pile has rows and no in-progress operation is under way.
+    /// Listed in the nav iff the pile has rows (kickoff ruling 2). An in-progress operation
+    /// is a tag shown on a listed root, never a reason to list or unlist one.
     pub fn listed(&self) -> bool {
-        !self.rows.is_empty() && self.meta.in_progress.is_none()
+        !self.rows.is_empty()
     }
 
     pub fn row(&self, path: &[u8]) -> Option<&Row> {
@@ -222,6 +223,10 @@ pub struct App {
     pub refreshing: bool,
     /// Piles that arrived before `sync_roots` delivered their root's meta; adopted then.
     pub orphan_piles: BTreeMap<PathBuf, Pile>,
+    /// The effective key bindings, `(action name, key specs)` in `DEFAULT_KEYMAP` order.
+    /// Seeded from the defaults; worker 3b replaces it after `Keymap::from_config` so the
+    /// hint line and the help overlay show the user's own bindings.
+    pub keymap: Vec<(String, Vec<String>)>,
 }
 
 impl Default for App {
@@ -247,6 +252,23 @@ impl App {
             size: (80, 24),
             refreshing: false,
             orphan_piles: BTreeMap::new(),
+            keymap: DEFAULT_KEYMAP
+                .iter()
+                .map(|(name, specs)| {
+                    (
+                        (*name).to_owned(),
+                        specs.iter().map(|s| (*s).to_owned()).collect(),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// The key specs bound to `action` (empty when unbound).
+    pub fn keys_for(&self, action: &str) -> &[String] {
+        match self.keymap.iter().find(|(n, _)| n == action) {
+            Some((_, specs)) => specs.as_slice(),
+            None => &[],
         }
     }
 
@@ -653,10 +675,16 @@ impl App {
                 .select(Some(Selection::Group(root, kind)))
                 .or(self.set_focus(Focus::Diff)),
             Target::DiffHunk(i) => {
+                // Same cursor as `HunkNext`/`HunkPrev` landing on hunk `i`: the header
+                // becomes the first visible line, so a click and a key yield equal `App`s.
                 let focus = self.set_focus(Focus::Diff);
-                let hunks = self.selected_row().map_or(0, |r| r.hunks.len());
-                if i < hunks && i != self.diff.hunk {
+                let offsets = self
+                    .selected_row()
+                    .map(|r| hunk_offsets(&r.hunks))
+                    .unwrap_or_default();
+                if i < offsets.len() && i != self.diff.hunk {
                     self.diff.hunk = i;
+                    self.diff.scroll = offsets[i];
                     Changed::Yes
                 } else {
                     focus
@@ -740,10 +768,11 @@ pub fn basename(p: &Path) -> String {
         .unwrap_or_else(|| p.to_string_lossy().into_owned())
 }
 
+/// Deterministic three-root fixture for the binary crate's unit tests (no git, no files:
+/// the piles are the recorded JSON that the engine's serde derives enable).
 #[cfg(test)]
-mod tests {
+pub(crate) mod testfix {
     use super::*;
-    use lastcall_engine::roots::RootsChanged;
 
     /// Piles recorded from `fixture_parent::build` (re-record with the ignored
     /// `record_pile_fixture` test in `tests/test_e2e_tui_snapshots.rs`).
@@ -753,11 +782,11 @@ mod tests {
         serde_json::from_str(PILES).expect("fixture parses")
     }
 
-    fn root(name: &str) -> PathBuf {
+    pub fn root(name: &str) -> PathBuf {
         PathBuf::from("/W").join(name)
     }
 
-    fn meta(name: &str) -> RootMeta {
+    pub fn meta(name: &str) -> RootMeta {
         let draft = name == "notes";
         RootMeta {
             path: root(name),
@@ -776,18 +805,19 @@ mod tests {
         }
     }
 
-    fn pile(name: &str) -> Pile {
+    pub fn pile(name: &str) -> Pile {
         piles().remove(name).expect("fixture root")
     }
 
-    fn pile_event(name: &str, pile: Pile) -> EngineEvent {
+    pub fn pile_event(name: &str, pile: Pile) -> EngineEvent {
         EngineEvent::Pile {
             root: root(name),
             pile,
         }
     }
 
-    fn three_roots() -> App {
+    /// alpha (f1, f2), beta (u1, u2, upstream group), notes (n2.md); nothing selected.
+    pub fn three_roots() -> App {
         let mut app = App::new();
         assert_eq!(
             app.sync_roots(vec![meta("alpha"), meta("beta"), meta("notes")]),
@@ -799,9 +829,25 @@ mod tests {
         app
     }
 
-    fn row(root: &str, path: &str) -> Selection {
+    /// alpha's pile with `f1` given a second (cloned) hunk, for hunk-cursor tests.
+    pub fn alpha_two_hunks() -> Pile {
+        let mut p = pile("alpha");
+        let mut extra = p.rows[0].hunks[0].clone();
+        extra.index = 1;
+        p.rows[0].hunks.push(extra);
+        p
+    }
+
+    pub fn row(root: &str, path: &str) -> Selection {
         Selection::Row(self::root(root), path.as_bytes().to_vec())
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testfix::*;
+    use super::*;
+    use lastcall_engine::roots::RootsChanged;
 
     #[test]
     fn app_fixture_lists_three_roots_in_nav_order() {
@@ -880,13 +926,7 @@ mod tests {
     #[test]
     fn app_hunk_cursor_clamps_when_pile_shrinks_row() {
         let mut app = three_roots();
-        let mut p = pile("alpha");
-        let extra = {
-            let mut h = p.rows[0].hunks[0].clone();
-            h.index = 1;
-            h
-        };
-        p.rows[0].hunks.push(extra);
+        let p = alpha_two_hunks();
         app.apply(pile_event("alpha", p.clone()));
         app.select(Some(row("alpha", "f1")));
         assert_eq!(app.handle(Action::HunkNext).0, Changed::Yes);
@@ -914,15 +954,26 @@ mod tests {
     }
 
     #[test]
-    fn app_in_progress_tag_never_lists_a_root() {
+    fn app_in_progress_tag_never_lists_or_unlists_a_root() {
         let mut app = three_roots();
-        let mut m = meta("alpha");
-        m.in_progress = Some(InProgress::Merge);
+        // beta's pile is empty → hidden; the tag alone must not list it.
+        app.apply(pile_event("beta", Pile::default()));
+        let mut alpha = meta("alpha");
+        alpha.in_progress = Some(InProgress::Merge);
+        let mut beta = meta("beta");
+        beta.in_progress = Some(InProgress::Rebase);
         assert_eq!(
-            app.sync_roots(vec![m, meta("beta"), meta("notes")]),
+            app.sync_roots(vec![alpha, beta, meta("notes")]),
             Changed::Yes
         );
-        assert!(app.nav_entries().iter().all(|e| e.root() != root("alpha")));
+        assert!(
+            app.nav_entries().iter().all(|e| e.root() != root("beta")),
+            "empty pile + tag stays hidden"
+        );
+        assert!(!app.roots[&root("beta")].listed());
+        // alpha has rows → still listed, tag decorates it.
+        assert!(app.roots[&root("alpha")].listed());
+        assert_eq!(app.nav_entries()[0], Selection::Root(root("alpha")));
         assert_eq!(
             app.roots[&root("alpha")]
                 .meta
@@ -930,6 +981,34 @@ mod tests {
                 .as_deref(),
             Some("[merge in progress]")
         );
+    }
+
+    #[test]
+    fn app_hunk_click_equals_hunk_key() {
+        let mut by_key = three_roots();
+        by_key.apply(pile_event("alpha", alpha_two_hunks()));
+        by_key.select(Some(row("alpha", "f1")));
+        by_key.handle(Action::Open);
+        assert_eq!(by_key.diff, DiffCursor::default());
+        let mut by_click = by_key.clone();
+
+        assert_eq!(by_key.handle(Action::HunkNext).0, Changed::Yes);
+        assert_eq!(by_click.hit(Target::DiffHunk(1)).0, Changed::Yes);
+        assert_eq!(by_key, by_click, "n and a click on hunk 2 yield equal Apps");
+        assert_eq!(by_key.diff.hunk, 1);
+        assert!(by_key.diff.scroll > 0, "scrolled so the header is visible");
+
+        assert_eq!(
+            by_click.hit(Target::DiffHunk(1)).0,
+            Changed::No,
+            "same hunk"
+        );
+        assert_eq!(
+            by_click.hit(Target::DiffHunk(7)).0,
+            Changed::No,
+            "out of range"
+        );
+        assert_eq!(by_key, by_click);
     }
 
     #[test]
@@ -1047,14 +1126,7 @@ mod tests {
     #[test]
     fn app_reselecting_same_row_keeps_hunk_but_a_different_row_resets() {
         let mut app = three_roots();
-        let mut p = pile("alpha");
-        let extra = {
-            let mut h = p.rows[0].hunks[0].clone();
-            h.index = 1;
-            h
-        };
-        p.rows[0].hunks.push(extra);
-        app.apply(pile_event("alpha", p));
+        app.apply(pile_event("alpha", alpha_two_hunks()));
         app.hit(Target::NavRow(root("alpha"), b"f1".to_vec()));
         assert_eq!(app.focus, Focus::Diff, "a click on a row focuses the diff");
         app.handle(Action::HunkNext);
