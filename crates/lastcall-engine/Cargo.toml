@@ -1,0 +1,30 @@
+[package]
+name = "lastcall-engine"
+description = "lastcall review engine: config, herdr client, and (from Phase 2) the review ledger. No terminal code."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["herdr"]
+# The herdr client is optional by construction: nothing in the review engine depends on it
+# (docs/spec/00-spec.md §6.6). `cargo check -p lastcall-engine --no-default-features` proves it.
+herdr = []
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+notify.workspace = true
+
+[dev-dependencies]
+lastcall-testkit.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true
