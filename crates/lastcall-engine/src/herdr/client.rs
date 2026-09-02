@@ -777,10 +777,12 @@ impl<T: Transport> Actor<T> {
                 return Ok(true);
             }
         };
-        if !self.install_snapshot(snapshot).await {
+        // The marker precedes what the resync changed, so a transcript reads
+        // `resync: snapshot` then `[pane] agent done → idle`.
+        if !self.emit(HerdrEvent::Resync(ResyncTarget::Snapshot)).await {
             return Ok(false);
         }
-        Ok(self.emit(HerdrEvent::Resync(ResyncTarget::Snapshot)).await)
+        Ok(self.install_snapshot(snapshot).await)
     }
 
     /// Install a snapshot as truth: replace the cache, emit deduplicated status changes and a
@@ -888,7 +890,10 @@ impl<T: Transport> Actor<T> {
                     .as_ref()
                     .and_then(|c| c.status_of(pane_id).cloned());
                 let new_status = pane.agent_status.clone();
-                let mut emits = Vec::new();
+                // The marker first, then what the resync changed.
+                let mut emits = vec![HerdrEvent::Resync(ResyncTarget::PaneGet(
+                    pane_id.to_string(),
+                ))];
                 let agent_bearing = pane.is_agent_bearing();
                 if (agent_bearing || old_status.is_some())
                     && old_status.as_ref() != Some(&new_status)
@@ -934,13 +939,17 @@ impl<T: Transport> Actor<T> {
                 if agent_bearing && !self.status_tasks.contains_key(pane_id) {
                     self.open_status_task(pane_id);
                 }
-                Ok(self
+                Ok(true)
+            }
+            Err(err) if err.is_pane_not_found() => {
+                if !self
                     .emit(HerdrEvent::Resync(ResyncTarget::PaneGet(
                         pane_id.to_string(),
                     )))
-                    .await)
-            }
-            Err(err) if err.is_pane_not_found() => {
+                    .await
+                {
+                    return Ok(false);
+                }
                 if let Some(cache) = &mut self.cache {
                     cache.panes.remove(pane_id);
                     cache.agents.remove(pane_id);
@@ -962,11 +971,7 @@ impl<T: Transport> Actor<T> {
                         return Ok(false);
                     }
                 }
-                Ok(self
-                    .emit(HerdrEvent::Resync(ResyncTarget::PaneGet(
-                        pane_id.to_string(),
-                    )))
-                    .await)
+                Ok(true)
             }
             Err(err) if err.is_transport_failure() => Err(format!("pane.get failed: {err}")),
             Err(err) => {
