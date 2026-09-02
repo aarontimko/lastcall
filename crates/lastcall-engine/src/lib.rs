@@ -12,6 +12,7 @@ pub mod herdr;
 pub mod hunks;
 pub mod index;
 pub mod ledger;
+pub mod ops;
 pub mod paths;
 pub mod scan;
 pub mod store;

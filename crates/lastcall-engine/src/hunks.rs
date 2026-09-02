@@ -46,6 +46,14 @@ impl Hunk {
         }
     }
 
+    /// Whether this is the synthetic D1 mode hunk (empty ranges, `mode …` lines).
+    pub fn is_mode_change(&self) -> bool {
+        self.old_range.is_empty()
+            && self.new_range.is_empty()
+            && self.lines.len() == 2
+            && self.lines.iter().all(|(_, l)| l.starts_with(b"mode "))
+    }
+
     /// (added, deleted) for this hunk.
     pub fn counts(&self) -> (usize, usize) {
         let added = self.lines.iter().filter(|(t, _)| *t == Tag::Insert).count();

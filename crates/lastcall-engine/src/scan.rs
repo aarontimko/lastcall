@@ -703,30 +703,48 @@ mod tests {
     }
 }
 
+/// A one-root harness shared by the scan and ops unit tests (integration tests use the
+/// engine itself).
 #[cfg(test)]
-mod fixture_tests {
+pub(crate) mod fixture_tests {
     use super::*;
     use crate::git::RepoGit;
-    use crate::ledger::{Override, SeenAt};
+    use crate::ledger::{FixedClock, Override, SeenAt};
+    use crate::ops::Ops;
     use crate::paths::RepoPaths;
     use crate::store::tests::fixture_env;
     use crate::store::{RootKind, TreeWrite};
     use lastcall_testkit::fixture_repo::FixtureRepo;
     use lastcall_testkit::tmp::TempDir;
 
-    struct Harness {
-        store: Store,
-        index: PrivateIndex,
-        repo_git: RepoGit,
-        ledger: Ledger,
-        tree_entries: TreeEntries,
-        globs: GlobSet,
-        paths: RepoPaths,
-        case_insensitive: bool,
+    pub(crate) struct Harness {
+        pub(crate) store: Store,
+        pub(crate) index: PrivateIndex,
+        pub(crate) repo_git: RepoGit,
+        pub(crate) ledger: Ledger,
+        pub(crate) tree_entries: TreeEntries,
+        pub(crate) globs: GlobSet,
+        pub(crate) paths: RepoPaths,
+        pub(crate) case_insensitive: bool,
+        pub(crate) clock: FixedClock,
+        pub(crate) compaction_threshold: usize,
     }
 
     impl Harness {
-        fn new(repo: &FixtureRepo, state: &TempDir) -> Self {
+        pub(crate) fn ops(&mut self) -> Ops<'_> {
+            Ops {
+                store: &self.store,
+                index: &self.index,
+                repo: Some(&self.repo_git),
+                paths: &self.paths,
+                ledger: &mut self.ledger,
+                tree: &mut self.tree_entries,
+                clock: &self.clock,
+                compaction_threshold: self.compaction_threshold,
+            }
+        }
+
+        pub(crate) fn new(repo: &FixtureRepo, state: &TempDir) -> Self {
             let env = fixture_env(repo, state);
             let paths = RepoPaths::under(state.join("repo"));
             let repo_git = RepoGit::new(&env, repo.path());
@@ -759,17 +777,19 @@ mod fixture_tests {
                 tree_entries,
                 globs: b.build().unwrap(),
                 paths,
+                clock: FixedClock::at_unix(1_800_000_000),
+                compaction_threshold: 500,
             }
         }
 
         /// Make the current disk state the seen tree.
-        fn mark_seen(&mut self) {
+        pub(crate) fn mark_seen(&mut self) {
             let seen = self.store.tree_of_disk().unwrap();
             self.tree_entries = self.store.ls_tree(&seen).unwrap();
             self.ledger.seen_tree = Some(seen);
         }
 
-        fn scan(&self) -> ScanOutput {
+        pub(crate) fn scan(&self) -> ScanOutput {
             let inputs = ScanInputs {
                 store: &self.store,
                 index: &self.index,
