@@ -577,6 +577,15 @@ impl Core {
                 config.faults.close_without_response,
             )
         };
+        // Record at receipt (before any fault), so a test can observe an in-flight request.
+        if let Ok(req) = serde_json::from_str::<Request>(raw_line)
+            && serde_json::from_str::<Value>(raw_line)
+                .ok()
+                .and_then(|v| v.get("params").cloned())
+                .is_some()
+        {
+            self.record(&req);
+        }
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
@@ -621,7 +630,6 @@ impl Core {
                 ));
             }
         };
-        self.record(&req);
         self.dispatch(req)
     }
 
@@ -1008,6 +1016,29 @@ pub struct InMemoryHerdr {
     control: MockControl,
 }
 
+/// What [`InMemoryHerdr::raw_call`] yields: the wire outcome of one request line, expressed
+/// only in `serde_json` and `tokio::io` types.
+///
+/// This exists because of the dev-dependency cycle: `lastcall-engine`'s own `--lib` tests are
+/// a second compilation of the engine, so the [`Transport`] this crate implements is a
+/// different trait from the one those tests see. The engine's client tests wrap this raw
+/// surface in a local adapter; every other consumer uses the [`Transport`] impl directly.
+pub enum RawOutcome {
+    /// One response line; the connection is then closed.
+    Line(String),
+    /// The server accepted the connection and will never write.
+    Stall,
+    /// The server closed without a response line.
+    ClosedSilently,
+    /// One error line instead of the ack; the connection is then closed.
+    Refused(String),
+    /// The `subscription_started` ack line, then the connection the event lines arrive on.
+    Stream {
+        ack_line: String,
+        conn: Box<dyn AsyncRead + Send + Unpin>,
+    },
+}
+
 impl InMemoryHerdr {
     pub fn builder() -> MockHerdrBuilder {
         MockHerdrBuilder::new()
@@ -1015,6 +1046,31 @@ impl InMemoryHerdr {
 
     pub fn control(&self) -> MockControl {
         self.control.clone()
+    }
+
+    /// Dispatch one request line exactly as the socket face would.
+    pub async fn raw_call(&self, request_line: &str) -> RawOutcome {
+        let core = Arc::clone(&self.control.core);
+        match core.dispatch_line(request_line.trim_end()).await {
+            Reply::Line(out) => RawOutcome::Line(out),
+            Reply::Stall => RawOutcome::Stall,
+            Reply::CloseSilently => RawOutcome::ClosedSilently,
+            Reply::Refuse(body) => {
+                RawOutcome::Refused(json!({ "id": null, "error": body }).to_string())
+            }
+            Reply::Ack(feed) => {
+                let (client_half, server_half) = tokio::io::duplex(256 * 1024);
+                let (server_reader, server_writer) = tokio::io::split(server_half);
+                core.feed_opened(&feed.kind);
+                tokio::spawn(async move {
+                    run_feed(&core, feed, server_writer, server_reader).await;
+                });
+                RawOutcome::Stream {
+                    ack_line: result_line(None, json!({ "type": SUBSCRIPTION_STARTED })),
+                    conn: Box::new(client_half),
+                }
+            }
+        }
     }
 }
 
@@ -1031,18 +1087,15 @@ impl Transport for InMemoryHerdr {
         method: &str,
         params: Value,
     ) -> impl Future<Output = Result<Value, TransportError>> + Send {
-        let core = Arc::clone(&self.control.core);
-        let line = Request::new("mem", method, params)
-            .to_line()
-            .map(|l| l.trim_end().to_string());
+        let this = self.clone();
+        let line = Request::new("mem", method, params).to_line();
         async move {
             let line = line.map_err(wire::WireError::from)?;
-            match core.dispatch_line(&line).await {
-                Reply::Line(out) => interpret_response(&out),
-                Reply::Stall => std::future::pending().await,
-                Reply::CloseSilently => Err(TransportError::ClosedBeforeResponse),
-                Reply::Refuse(body) => Err(TransportError::Server(body)),
-                Reply::Ack(_) => Err(TransportError::UnexpectedAck(
+            match this.raw_call(&line).await {
+                RawOutcome::Line(out) | RawOutcome::Refused(out) => interpret_response(&out),
+                RawOutcome::Stall => std::future::pending().await,
+                RawOutcome::ClosedSilently => Err(TransportError::ClosedBeforeResponse),
+                RawOutcome::Stream { .. } => Err(TransportError::UnexpectedAck(
                     "ack on a one-shot request".into(),
                 )),
             }
@@ -1053,31 +1106,31 @@ impl Transport for InMemoryHerdr {
         &self,
         subscriptions: Vec<Subscription>,
     ) -> impl Future<Output = Result<EventStream, TransportError>> + Send {
-        let core = Arc::clone(&self.control.core);
+        let this = self.clone();
         let params = serde_json::to_value(wire::EventsSubscribeParams { subscriptions });
         async move {
             let params = params.map_err(wire::WireError::from)?;
             let line = Request::new("mem", wire::method::EVENTS_SUBSCRIBE, params)
                 .to_line()
                 .map_err(wire::WireError::from)?;
-            match core.dispatch_line(line.trim_end()).await {
-                Reply::Line(out) => {
+            match this.raw_call(&line).await {
+                RawOutcome::Line(out) => {
                     interpret_ack(&out)?;
                     Err(TransportError::UnexpectedAck(
                         "plain line on subscribe".into(),
                     ))
                 }
-                Reply::Stall => std::future::pending().await,
-                Reply::CloseSilently => Err(TransportError::ClosedBeforeResponse),
-                Reply::Refuse(body) => Err(TransportError::SubscribeRefused(body)),
-                Reply::Ack(feed) => {
-                    let (client_half, server_half) = tokio::io::duplex(256 * 1024);
-                    let (server_reader, server_writer) = tokio::io::split(server_half);
-                    core.feed_opened(&feed.kind);
-                    tokio::spawn(async move {
-                        run_feed(&core, feed, server_writer, server_reader).await;
-                    });
-                    Ok(EventStream::new(Box::new(client_half)))
+                RawOutcome::Stall => std::future::pending().await,
+                RawOutcome::ClosedSilently => Err(TransportError::ClosedBeforeResponse),
+                RawOutcome::Refused(out) => {
+                    interpret_ack(&out)?;
+                    Err(TransportError::UnexpectedAck(
+                        "refusal without error".into(),
+                    ))
+                }
+                RawOutcome::Stream { ack_line, conn } => {
+                    interpret_ack(&ack_line)?;
+                    Ok(EventStream::new(conn))
                 }
             }
         }
