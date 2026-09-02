@@ -64,7 +64,13 @@ impl FixtureRepo {
     /// `mk_repo NAME`: init `NAME` (branch `main`) and bare `NAME.git`, add the remote, commit
     /// the seed files, push `-u origin main`.
     pub fn new(name: &str) -> Result<Self, GitError> {
-        let dir = TempDir::new("lc-fixture");
+        Self::new_in(TempDir::new("lc-fixture"), name)
+    }
+
+    /// [`Self::new`] inside a caller-supplied directory: `<dir>/<name>` and
+    /// `<dir>/<name>.git`. With [`TempDir::adopt`] the fixture outlives the value (the
+    /// golden's parent dir holds several).
+    pub fn new_in(dir: TempDir, name: &str) -> Result<Self, GitError> {
         let work = dir.join(name);
         let origin = dir.join(format!("{name}.git"));
         let mut repo = Self {
@@ -96,6 +102,20 @@ impl FixtureRepo {
         repo.commit_files(SEED_FILES, "init")?;
         repo.git(&["push", "-q", "-u", "origin", "main"])?;
         Ok(repo)
+    }
+
+    /// Attach to a fixture that [`Self::new_in`] built earlier in `dir` (another process,
+    /// typically). No git runs; later commits get dates well past the originals.
+    pub fn open_in(dir: TempDir, name: &str) -> Self {
+        let work = dir.join(name);
+        let origin = dir.join(format!("{name}.git"));
+        Self {
+            _dir: dir,
+            name: name.to_string(),
+            work,
+            origin,
+            ticks: 1_000,
+        }
     }
 
     /// The working repo.
@@ -173,6 +193,7 @@ impl FixtureRepo {
         )?;
         self.git_in(&clone, &["push", "-q", "origin", "main"])?;
         let sha = self.git_in(&clone, &["rev-parse", "HEAD"])?;
+        let _ = std::fs::remove_dir_all(&clone);
         Ok(sha.trim().to_string())
     }
 
@@ -228,6 +249,7 @@ impl FixtureRepo {
         )?;
         self.git_in(&clone, &["push", "-q", "origin", branch])?;
         let sha = self.git_in(&clone, &["rev-parse", "HEAD"])?;
+        let _ = std::fs::remove_dir_all(&clone);
         Ok(sha.trim().to_string())
     }
 
