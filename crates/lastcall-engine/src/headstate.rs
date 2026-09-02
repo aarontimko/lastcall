@@ -175,10 +175,9 @@ pub fn classify(message: &str) -> Transition {
         Transition::Commit
     } else if m.starts_with("checkout:") {
         Transition::Checkout
-    } else if m.starts_with("rebase (finish)")
-        || m.starts_with("rebase -i (finish)")
-        || m.starts_with("rebase finished")
-    {
+    } else if m.starts_with("rebase") && (m.contains("(finish)") || m.contains("finished")) {
+        // "rebase (finish)", "rebase -i (finish)", "rebase (continue) (finish)",
+        // "rebase finished" (older git).
         Transition::Rebase
     } else if let Some(t) = m.strip_prefix("reset: moving to ") {
         Transition::Reset {

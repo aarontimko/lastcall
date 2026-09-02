@@ -342,6 +342,13 @@ impl Engine {
             .and_then(|rg| rg.config_get("user.email").ok().flatten())
             .filter(|e| !e.is_empty());
 
+        // A `ledger.json.tmp` left by a crash between write and rename (E1) is garbage:
+        // the rename never happened, so `ledger.json` is still the previous version.
+        let stale_tmp = paths.ledger.with_extension("json.tmp");
+        if stale_tmp.exists() {
+            let _ = std::fs::remove_file(&stale_tmp);
+            notices.push("removed a stale ledger.json.tmp from an interrupted write".to_owned());
+        }
         let clock: &dyn Clock = self.options.clock.as_ref();
         let mut ledger = match ledger::load(&paths, clock)? {
             LoadResult::Loaded { ledger, notices: n } => {
@@ -349,6 +356,14 @@ impl Engine {
                 ledger
             }
             LoadResult::Missing => {
+                // E4: a sibling ledger whose root no longer exists is probably this root
+                // under its old name. First-sight rules apply; say where the old state is.
+                for (old_root, dir) in orphaned_ledgers(&self.layout.repos_dir(&parent_id)) {
+                    notices.push(format!(
+                        "first sight; previous state for {old_root} (no longer on disk) is kept at {}",
+                        dir.display()
+                    ));
+                }
                 let l = first_sight(
                     &d.path,
                     d.kind,
@@ -437,13 +452,17 @@ impl Engine {
             state.nested_repos = out.nested_repos;
         }
         if let Some(rg) = &state.repo {
+            // Classify against the *live* HEAD, not the last inspected one: a pull or
+            // rebase changes files before (or without) a git-dir event reaching
+            // `inspect_head`, and the pile must never depend on that ordering.
+            // `state.head` stays the last *reported* state so the transition notice
+            // is still emitted exactly once by `inspect_head`.
+            let live = headstate::inspect(rg)?;
             let seen_head = state.ledger.seen_at.head_commit.clone();
-            match state.classifier.get(
-                rg,
-                seen_head.as_ref(),
-                &state.head,
-                state.user_email.as_deref(),
-            ) {
+            match state
+                .classifier
+                .get(rg, seen_head.as_ref(), &live, state.user_email.as_deref())
+            {
                 Ok(class) => {
                     if let Err(e) = upstream::annotate(&mut pile, class, rg) {
                         pile.notices
@@ -574,6 +593,28 @@ pub fn build_globs(patterns: &[String]) -> GlobSet {
         }
     }
     b.build().unwrap_or_else(|_| GlobSet::empty())
+}
+
+/// Ledgers under a parent's `repos/` whose `root` path no longer exists on disk (E4).
+fn orphaned_ledgers(repos_dir: &Path) -> Vec<(String, PathBuf)> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(repos_dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        let Ok(bytes) = std::fs::read(dir.join("ledger.json")) else {
+            continue;
+        };
+        let Ok((ledger, _)) = ledger::parse(&bytes) else {
+            continue;
+        };
+        if !Path::new(&ledger.root).exists() {
+            out.push((ledger.root.clone(), dir));
+        }
+    }
+    out.sort();
+    out
 }
 
 /// §6.2 first sight.
