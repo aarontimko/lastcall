@@ -116,7 +116,7 @@ A gate is a checklist, not a vibe. An item that genuinely cannot be met in its p
 ### 3.5 Scheduled circle-backs
 
 - After Phase 4 (product moment): re-review the G0 rulings on ack semantics and accept-all confirmation against real usage.
-- After Phase 5 (herdr in UI): re-verify §5 against the then-current herdr release; run the schema-diff job manually if the scheduled Action doesn't exist yet.
+- After Phase 5 (herdr in UI): re-verify §5 against the then-current herdr **release tag** (never master); the scheduled schema-diff job now lands in Phase 5 itself (amended 2026-09-01, §10), so the circle-back reads its first run rather than doing the diff by hand.
 - Before Phase 9 (release): review the deferral ledger in full; derive the release checklist from it.
 
 ---
@@ -155,7 +155,7 @@ GitHub Actions:
 
 - **PR workflow:** lint + unit + integration on macOS and Linux runners. Note from herdr's own suite: its server-spawn test helper is gated `#[cfg(target_os = "linux")]` (`tests/api_ping.rs:106`) and several event helpers are compiled out on macOS — timing-sensitive PTY/socket tests are treated as Linux-first upstream. herdr publishes `x86_64`/`aarch64-unknown-linux-musl` release binaries, so pinning a herdr version in Linux CI is straightforward. Budget for the same: e2e/PTY tier runs on Linux in CI, on macOS locally, with macOS CI e2e as best-effort non-blocking.
 - **Release workflow:** signed release binaries on tag push, GitHub Releases (Homebrew tap is a later phase).
-- **Scheduled herdr-compat workflow** (Phase 9): install latest herdr release, run the real-server integration subset, diff `herdr api schema --json` against our consumed-surface fixture (§5.9), open an issue on drift.
+- **Scheduled herdr-compat workflow** (Phase 5; moved from Phase 9 on 2026-09-01, §10): install latest herdr release, run the real-server integration subset, diff `herdr api schema --json` against our consumed-surface fixture (§5.9), open an issue on drift.
 
 ### 4.6 herdr support policy
 
@@ -454,7 +454,7 @@ Two layers. First, Ratatui's `TestBackend` with `insta` snapshot assertions rend
 
 ### 7.5 herdr compatibility
 
-The scheduled Action (Phase 9) installs the latest herdr release, runs the real-server integration subset, diffs `herdr api schema --json` against our committed consumed-surface fixture, and opens an issue on drift. Until it exists, the Phase 5 circle-back (§3.5) covers this manually.
+The scheduled Action (Phase 5, moved from Phase 9 on 2026-09-01) installs the latest herdr release, runs the real-server integration subset, diffs `herdr api schema --json` against our committed consumed-surface fixture, and opens an issue on drift. Until it exists, the Phase 5 circle-back (§3.5) covers this manually.
 
 ---
 
@@ -516,7 +516,8 @@ Gate items marked **[sponsor]** require a human at a real terminal/herdr session
 - [ ] Disconnect mid-session → standalone badge → reconnect → state converges with snapshot (integration test).
 - [ ] Orphan status connections reconciled: pane closed with its `pane_closed` event suppressed → connection torn down at next resync (mock-server test).
 - [ ] Mock-server unit tests cover both envelope shapes, subscription-failure-closes-connection, resync coalescing, and event dedupe (test names).
-- [ ] Manual §5 re-verification against current herdr release recorded in PR (circle-back §3.5).
+- [ ] Manual §5 re-verification against the current herdr **release tag** recorded in PR (circle-back §3.5).
+- [ ] **Scheduled herdr-compat workflow live** (moved here from Phase 9 by the 2026-09-01 protocol ruling, §10): installs the latest herdr release, runs the real-server integration subset, diffs `herdr api schema --json` against our committed consumed-surface fixture, opens an issue on drift; has run green at least once (run link).
 
 ### Phase 6 — Draft dirs + collapsed classes
 **Deliverable:** draft-dir ledger (watch, snapshot, review non-git files with the same flow); collapsed classes (binary, size threshold, lockfile globs with single-row accept).
@@ -541,10 +542,10 @@ Gate items marked **[sponsor]** require a human at a real terminal/herdr session
 - [ ] `$EDITOR` launch lands at the correct line (integration test with a probe editor script).
 
 ### Phase 9 — Hardening and release
-**Deliverable:** PTY e2e suite complete, scheduled herdr-compat workflow live, release Actions with signed binaries, `docs/` filled, README, deferral-ledger review.
+**Deliverable:** PTY e2e suite complete, release Actions with signed binaries, `docs/` filled, README, deferral-ledger review.
 **Gate:**
 - [ ] **[sponsor]** Tagged v0.1.0 installable from GitHub Releases on a clean machine (install transcript); worker provides a scripted fresh-container install smoke as the automated proxy.
-- [ ] Scheduled compat job has run green at least once against latest herdr (run link).
+- [ ] Scheduled compat job (live since Phase 5) still green on the release's herdr pin; any drift issues it opened are closed or ledgered.
 - [ ] Deferral ledger reviewed; every open entry re-affirmed or scheduled (decision-log entry).
 - [ ] Docs: install, config reference, herdr setup (incl. sidebar-token snippet), review-loop walkthrough.
 
@@ -585,7 +586,7 @@ No question is left `[OPEN]`-pending-data. Items 5 and 6 are re-examined at the 
   - **Editorial fixes made while stamping** (orchestrator, no semantic change): `[herdr]` became a TOML table with `mode`/`session` (§6.1); fixture repos are script-generated rather than vendored tarballs (§8 Phase 1); Phase 1's CI gate item carries its split interpretation; toolchain and herdr-fetch facts recorded in §4.1/§4.4; `lastcall-testkit` named as the third crate (§4.1).
   - **§11 deferral ledger:** the seven seeded candidates are confirmed as standing entries under this stamp.
 - **2026-09-01 — Phase 1 rulings** (presented at close-out; each `[LEANING]` becomes `[DECIDED]` when the sponsor merges the Phase 1 PR or replies otherwise):
-  - **Protocol 20 vs 21** `[LEANING]`: accept both (Amendment v1.1) rather than pin 20 only — the consumed surface is byte-identical on both and the next herdr release will ship 21. Alternative on record: pin 20 and bump at the Phase 5 circle-back. Two-way door.
+  - **Protocol 20 vs 21** `[DECIDED]` (sponsor, 2026-09-01, verbatim: "rec plz", after a full rec-vs-alt impact walk-through): accept both (Amendment v1.1) rather than pin 20 only — the consumed surface is byte-identical on both and the next herdr release will ship 21; the engine never depends on the socket, so the worst case is degraded herdr extras, never review correctness. Alternative on record: pin 20 and bump at the Phase 5 circle-back. **Attached roadmap amendment (§3.4):** the scheduled herdr-compat workflow moves from Phase 9 to Phase 5, so a 21 release is diffed against our consumed-surface fixture within a day of shipping — this closes rec's one blind spot (a herdr upgrade on the sponsor's machine ahead of our pin). Two-way door.
   - **Status-connection teardown on agent release** `[LEANING]`: accept the worker's additive extension (Amendment v1.1 item 3). Alternative: keep the stream for the pane's lifetime. Two-way door.
   - **Informational, no ruling needed:** the worker fast-forwarded its harness-created branch from `main` onto `feat/phase1-scaffold` (pure ff, verified); per-pane generation counters (a `pane.get` invalidates only that pane's in-flight status events); `hello-herdr --socket` exits 0 on peer disconnect (documented); XDG resolution is hand-rolled through the injected `Env`.
   - **Phase 2 unit-test floor: 101** (engine 85, testkit 16, bin 0), recorded here; ratchets only upward.
