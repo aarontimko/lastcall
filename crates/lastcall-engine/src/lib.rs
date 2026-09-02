@@ -7,6 +7,7 @@
 pub mod config;
 pub mod env;
 pub mod git;
+pub mod headstate;
 #[cfg(feature = "herdr")]
 pub mod herdr;
 pub mod hunks;
@@ -16,3 +17,4 @@ pub mod ops;
 pub mod paths;
 pub mod scan;
 pub mod store;
+pub mod upstream;
