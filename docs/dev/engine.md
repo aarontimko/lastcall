@@ -75,11 +75,20 @@ safe).
 injected `Env`, set `GIT_OPTIONAL_LOCKS=0`, `GIT_TERMINAL_PROMPT=0`, `LC_ALL=C`, run every
 path-producing command with `-z`, and scrub `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`,
 `GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_COMMON_DIR`,
-`GIT_CEILING_DIRECTORIES` from the child after the overlay.
+`GIT_CEILING_DIRECTORIES`, `GIT_NAMESPACE`, `GIT_PREFIX`, `GIT_INDEX_VERSION`,
+`GIT_CONFIG_PARAMETERS` and `GIT_CONFIG_COUNT` (which disarms every `GIT_CONFIG_KEY_n`)
+from the child after the overlay (`git::SCRUBBED_VARS`). Every child also gets
+`-c core.fsmonitor=false -c core.untrackedCache=false -c core.splitIndex=false`
+(`git::NEUTRALIZED_CONFIG`), and the store's own config carries the same three keys, written
+at every open beside the copied `core.autocrlf`/`eol`/`filemode`/`ignorecase`: a user's global
+`core.fsmonitor = true` otherwise makes `update-index --refresh` under our `GIT_DIR` wait on a
+daemon that never answers (and starts `fsmonitor--daemon`s as a side effect), and the other
+two would put index extensions into the private index that the seed/refresh path does not
+manage.
 
 | runner | cwd | env | may write? | used for |
 |---|---|---|---|---|
-| `StoreGit` | the root | `GIT_DIR=<store>`, `GIT_WORK_TREE=<root>`, `GIT_INDEX_FILE=<index>` explicit on every call | yes, to **our** store and index only | `hash-object -w --stdin-paths`, `read-tree`, `write-tree`, `ls-tree`, `cat-file --batch-check`, `diff-files`, `ls-files --others`, `update-index --refresh` |
+| `StoreGit` | the root | `GIT_DIR=<store>`, `GIT_WORK_TREE=<root>`, `GIT_INDEX_FILE=<index>` explicit on every call | yes, to **our** store and index only | `hash-object -w --stdin-paths`, `read-tree`, `write-tree`, `ls-tree`, `cat-file --batch-check`, `cat-file --batch` (one call per scan for every rendered blob), `diff-files`, `ls-files --others`, `update-index --refresh`, `config` (the neutralized keys) |
 | `RepoGit` | the root | the three variables removed | **never** | read-only inspection of the user's repository |
 
 `RepoGit::allowed` is a closed allowlist; `git.rs` unit tests are the guard:
@@ -99,13 +108,14 @@ Refused by construction: `status`, `diff`, `add`, `update-index`, `checkout`, `s
 
 ## Scan pipeline in ten lines
 
-1. Refresh the private index (`update-index --refresh`); a held `index.lock` is retried 3 × 50 ms, then the scan proceeds unrefreshed (over-report at worst).
+0. Re-read `ledger.json` if its (mtime, length, inode) changed since it was loaded — another process accepted or folded — so a long-running engine never scans against a stale baseline (the read is unlocked; writes are rename-atomic). A file that no longer parses leaves the loaded ledger in place.
+1. Refresh the private index (`update-index --refresh`); a held `index.lock` is retried 3 × 50 ms, then the scan proceeds unrefreshed (over-report at worst; also when git cannot be spawned).
 2. Candidates = `diff-files` paths ∪ `ls-files --others` files ∪ every override path ∪ (case-insensitive roots) seen-tree names absent byte-exactly from their directory.
 3. Minus paths tagged skip-worktree in the **user's** index *that are absent from the worktree* (D6: a sparse cone; a present one is a real edit and stays); minus `others` entries under a nested repo (D9) or a sibling draft root. The skip-worktree filter applies to every candidate whichever list it came from: an absent cone path is a cone even when an override or `diff-files` names it.
 4. `current` per path = `lstat` → `Absent` | `Unhashable(reason)` | `{oid, mode}`; all hashed in one `hash-object -w --stdin-paths` call from the root (so `text=auto` and clean filters apply). `Unhashable` is always a row.
 5. `baseline` per path from the ledger (override blob → override null → seen tree → empty); a missing override blob or an unparsable override falls to the tree with a notice (E2).
 6. Row iff baseline ≠ current by oid or mode (D1); on `core.filemode=false` roots the executable bit is normalized away on both sides, so a mode-only row cannot appear there.
-7. Hunks from a byte diff of the two blobs (`hunks.rs`); binary (NUL in the first 8000 bytes) or ≥ `collapse_size_bytes` or matching `collapsed_globs` → collapsed (D7/D8).
+7. Every baseline and current blob of every row fetched in **one** `cat-file --batch` (2,000 unseen files cost 16 git processes per scan, not 2,000); hunks from a byte diff of the two blobs (`hunks.rs`); binary (NUL in the first 8000 bytes) or ≥ `collapse_size_bytes` or matching `collapsed_globs` → collapsed (D7/D8). A blob the batch cannot produce renders that row without content and a notice.
 8. Conflict state from the user's `ls-files -u` (C4); the override's flag; rename pairing (D5) — presentation only, the ledger stores delete + add.
 9. Annotation (`upstream.rs`): heads = HEAD (+ `MERGE_HEAD`); range `seen_head..head` or from the merge-base; commits reachable from a remote ref by someone else are upstream; a pending path whose content equals a head's blob is `upstream`, touched upstream but different is `mixed`, otherwise plain. No merge-base, detached with no upstream, shallow, or no remotes → nothing annotated (C7).
 10. Notices from every step ride along in `pile.notices`; nothing after step 6 removes a row.
@@ -119,6 +129,8 @@ Every rung shows *more* than the truth, never less, and says why in a notice:
 | no ledger | first sight: seen tree = `HEAD^{tree}` (`null` before the first commit); drafts follow `draft_initial` (`seen` snapshots the dir, `pending` anchors to no tree) |
 | a sibling ledger whose recorded root is gone (the repo was moved, E4) | first sight for the new path, a notice naming the old root; old state is kept |
 | unreadable ledger / unknown schema major | moved aside, `seen_tree = null`, every path pending |
+| a ledger whose recorded `root` is another path (copied state, a moved `LASTCALL_STATE_DIR` entry) | the same: another root's state is never adopted; moved aside, `seen_tree = null`, notice `recorded root <old> is not <root>` |
+| `ledger.json` rewritten by another process while this engine runs | adopted at the next scan (stamp compare + re-read); a seen tree the store no longer has is treated as `null` |
 | stale `ledger.json.tmp` | removed at open, notice (E1) |
 | seen tree not resolvable in the store (user ran `git gc`) | treated as `null`, notice; the next accept persists `null` and accept-all seeds from the empty tree |
 | HEAD cannot be inspected (corrupt `.git/HEAD`, git-dir unreadable) | rows unchanged, no annotation, notice `head inspection skipped` |
@@ -126,7 +138,7 @@ Every rung shows *more* than the truth, never less, and says why in a notice:
 | `index` / `index.tree` missing, mismatched, or unreadable (empty, garbage, truncated) | reseeded from the seen tree; the pile is identical |
 | `index.lock` held by another process | scan runs unrefreshed |
 | a path that cannot be hashed (unreadable, a socket, `git-lfs` missing) | an `Unhashable` row |
-| accept whose rendered oid/mode/baseline no longer matches the live file | refused, nothing written; the next scan shows the new state (A5/A6) |
+| accept whose rendered oid/mode/baseline (oid **and** mode for hunks, so a stale mode hunk cannot apply twice) no longer matches the live file | refused, nothing written; the next scan shows the new state (A5/A6) |
 | ledger lock busy after 20 × 50 ms | the op errors; nothing is written unlocked |
 
 ## `status --json` schema (`status_version: 1`)
@@ -167,6 +179,12 @@ renders with U+FFFD but is still a row). The committed example is
 `crates/lastcall/tests/golden/status_multi_repo.json` (two repos and a draft dir, produced by
 `lastcall_testkit::fixture_parent`; `just golden-update` rewrites it).
 
+`lastcall status [--root <path>]...` scans only the roots the given paths resolve to (a path
+inside a root selects that root) and nothing else; a path that is not inside any watched root
+is `lastcall: --root <path>: not a watched root` on stderr and exit 1, never an empty report.
+Without `--root`, exit 1 means only that the engine could not open (a per-root scan failure
+is a notice).
+
 ## Watching
 
 `Engine::run` (`watcher.rs`) puts one recursive `notify` watch on each **parent dir** (plus
@@ -175,17 +193,22 @@ watches are installed on a blocking task while the initial scans run: on macOS e
 call re-registers the FSEvents stream, which took ~1.8 s per call on the development machine,
 and the first pile must not wait for that. When the watch goes live every root is scanned
 and inspected once more (nothing from the gap is missed) and a `watching <dirs> (N roots)`
-notice is emitted; the rescan backstop counts from there. Git-dir events are filtered to an
-allowlist (`HEAD`, `index`, `ORIG_HEAD`, `MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`,
-`refs/`, `rebase-merge/`, `rebase-apply/`, `logs/`), worktree events are debounced on the
-trailing edge (750 ms), and two polling backstops remain (HEAD every 10 s, root discovery
-every 30 s). Events only *schedule* work: every scan, head inspection and rescan runs on
+notice is emitted; the rescan backstop counts from there. Git-dir events are routed to the root whose
+git dir (or common dir) is the *longest* prefix of the path — a linked worktree's git dir is a
+subdirectory of the main worktree's (`<main>/.git/worktrees/<name>`), and at equal length a
+root's own git dir beats another root's common dir — then filtered to an allowlist (`HEAD`,
+`index`, `ORIG_HEAD`, `MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`, `refs/`,
+`rebase-merge/`, `rebase-apply/`, `logs/`), worktree events are debounced on the trailing
+edge (750 ms), and two polling backstops remain (HEAD every 10 s, root discovery every 30 s).
+`scan_all` re-runs discovery only when a scan saw a root's set of nested repositories change,
+not on every tick while one exists. Events only *schedule* work: every scan, head inspection and rescan runs on
 `spawn_blocking` under the engine's mutex, and the result is published as an `EngineEvent`
 (`Pile`, `Head` with its transition notice, `RootsChanged`, `Notice`). `ignore_globs` scope
 the watcher only — an ignored path never wakes a scan, but the next scan still shows the
 tracked edit. `lastcall watch [--json] [--exit-after N] [--poll N]` prints one line per
 event; `--poll N` shortens both backstops to `N` s for hosts whose filesystem events are late
 or missing (the development machine's fseventsd delivered nothing during Phase 2; the
-`watcher_worktree_edit_schedules_a_scan_without_polling` unit test proves delivery where it
-works and skips with a reason where it does not). `just probe-watch` demonstrates the B1
+`watcher_worktree_edit_schedules_a_scan_without_polling` test in
+`crates/lastcall-engine/tests/test_integration_watcher.rs` proves delivery where it works and
+skips with a reason where it does not). `just probe-watch` demonstrates the B1
 notice (`committed on main (1 commit)`) arriving while the pending row stays.

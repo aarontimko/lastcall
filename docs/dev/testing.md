@@ -17,8 +17,12 @@ child and never falls back to a `herdr` on `PATH`.
 
 `just test` runs the three in order. **`just test-unit` is the canonical suite**; its count is
 the ratchet floor from Phase 2 on (Phase 1 close: 85 engine + 16 testkit + 0 binary = 101, the
-Phase 2 floor; Phase 2 close: 162 engine + 16 testkit + 0 binary = 178, the Phase 3 floor; one engine test self-skips where filesystem events are not delivered).
-The suite never shrinks across commits.
+Phase 2 floor; Phase 2 close: 165 engine + 16 testkit + 0 binary = 181, the Phase 3 floor).
+The suite never shrinks across commits. One recorded exception: at the Phase 2 code review
+the three filesystem-live watcher tests (up to 30 s waits, real FSEvents) left the unit tier
+for `crates/lastcall-engine/tests/test_integration_watcher.rs` because they contradicted the
+determinism rules below (162 → 159 engine), and the same review added six engine unit tests
+(159 → 165). The pure routing/allowlist watcher tests stay in `watcher.rs`.
 
 ## Scenario suites (`just test-scenarios`)
 
@@ -64,7 +68,22 @@ and commit the file.
   socket — the clock auto-advances whenever the runtime idles on the read and every timer
   fires "instantly".
 - Transport tests use the socket mock with real time and timeouts ≤ 50 ms.
-- No sleeps longer than 50 ms anywhere in the unit tier.
+- No sleeps longer than 50 ms anywhere in the unit tier. Anything that waits on a real
+  filesystem watch or a polling backstop is an integration test.
+- A test that guards against a hang (`engine_scan_returns_under_a_global_fsmonitor_config`)
+  runs the engine on a thread and bounds it with `recv_timeout` (5 s) — the bound is a
+  failure, never a wait the passing path takes.
+
+## Not a gate: `test_perf_scan`
+
+`crates/lastcall-engine/tests/test_perf_scan.rs` is `#[ignore]`d evidence, not a tier: 2,000
+tracked files, an unreadable ledger (so every file is a row), and `PERF` lines with the
+process-wide git spawn count (`lastcall_engine::git::spawn_count`) and wall time per scan,
+then accept-all and a no-change scan that must hash nothing. Run it by hand with
+`cargo test -p lastcall-engine --test test_perf_scan -- --ignored --nocapture` when touching
+the scan pipeline; at the Phase 2 close a scan of everything-unseen was 16 git processes and
+under 0.5 s (it was 2,018 processes and 25 s before blobs were fetched in one
+`cat-file --batch`).
 
 ## How skips are reported
 
