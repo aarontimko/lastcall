@@ -709,7 +709,10 @@ mod tests {
             "{err}"
         );
         drop(held);
-        LedgerLock::acquire_with(&paths, 0, Duration::ZERO).unwrap();
+        // Bounded retry, not a single attempt: a sibling test may be between fork and
+        // exec of a git child at this instant, and the child still shares the flock'd
+        // description until its CLOEXEC fds close at exec.
+        LedgerLock::acquire(&paths).unwrap();
     }
 
     #[test]
