@@ -7,6 +7,7 @@
 //!
 //! Every environment read goes through the injected [`Env`]; nothing here touches `std::env`.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -61,6 +62,11 @@ pub struct Config {
     pub ignore_globs: Vec<String>,
     /// The `[herdr]` table.
     pub herdr: HerdrConfig,
+    /// The `[keys]` table (Amendment v1.3): `<action> = "<key>"` or `["<key>", …]`, each
+    /// entry replacing that action's default bindings. Opaque here — only the TUI knows the
+    /// action names and key grammar, so `lastcall config` and `lastcall tui` validate it
+    /// (§11 "Keybinding config validated in the binary, not the engine").
+    pub keys: BTreeMap<String, KeySpecs>,
 }
 
 impl Default for Config {
@@ -79,6 +85,25 @@ impl Default for Config {
                 .map(|s| (*s).to_string())
                 .collect(),
             herdr: HerdrConfig::default(),
+            keys: BTreeMap::new(),
+        }
+    }
+}
+
+/// One `[keys]` entry: a single key spec or a list of them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum KeySpecs {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl KeySpecs {
+    /// The specs in order, one or many.
+    pub fn specs(&self) -> Vec<&str> {
+        match self {
+            KeySpecs::One(s) => vec![s.as_str()],
+            KeySpecs::Many(v) => v.iter().map(String::as_str).collect(),
         }
     }
 }
@@ -384,6 +409,10 @@ ignore_globs = [".git/**"]
 [herdr]
 mode = "on"
 session = "work"
+
+[keys]
+quit = "q"
+nav_down = ["down", "j", "ctrl-n"]
 "#;
 
     fn env_with_config(dir: &TempDir, contents: &str) -> (Env, PathBuf) {
@@ -412,6 +441,40 @@ session = "work"
         assert_eq!(c.ignore_globs, vec![".git/**"]);
         assert_eq!(c.herdr.mode, HerdrMode::On);
         assert_eq!(c.herdr.session.as_deref(), Some("work"));
+        assert_eq!(c.keys.len(), 2);
+        assert_eq!(c.keys["quit"], KeySpecs::One("q".into()));
+        assert_eq!(c.keys["quit"].specs(), vec!["q"]);
+        assert_eq!(
+            c.keys["nav_down"],
+            KeySpecs::Many(vec!["down".into(), "j".into(), "ctrl-n".into()])
+        );
+        assert_eq!(c.keys["nav_down"].specs(), vec!["down", "j", "ctrl-n"]);
+    }
+
+    #[test]
+    fn config_keys_table_is_opaque_and_string_or_list() {
+        // Unknown action names are the binary's problem (§11): the engine keeps them.
+        let c: Config = toml::from_str("[keys]\nfrobnicate = \"x\"\n").unwrap();
+        assert_eq!(c.keys["frobnicate"].specs(), vec!["x"]);
+        // Default: empty.
+        assert!(Config::default().keys.is_empty());
+        let c: Config = toml::from_str("").unwrap();
+        assert!(c.keys.is_empty());
+        // Neither a string nor a list of strings is a parse error naming the key.
+        let dir = TempDir::new("lc-config");
+        let (env, _) = env_with_config(&dir, "[keys]\nquit = 7\n");
+        let err = load(&env).unwrap_err();
+        assert!(matches!(err, ConfigError::Parse { .. }), "{err}");
+        let (env, _) = env_with_config(&dir, "[keys]\nquit = [\"q\", 3]\n");
+        let err = load(&env).unwrap_err();
+        assert!(matches!(err, ConfigError::Parse { .. }), "{err}");
+        // A nested table under [keys] is not a spec either.
+        let (env, _) = env_with_config(&dir, "[keys.quit]\nkey = \"q\"\n");
+        assert!(load(&env).is_err());
+        // Unknown top-level keys are still a load error alongside a valid [keys] table.
+        let (env, _) = env_with_config(&dir, "[keys]\nquit = \"q\"\n\n[bogus]\nx = 1\n");
+        let err = load(&env).unwrap_err();
+        assert!(err.to_string().contains("bogus"), "{err}");
     }
 
     #[test]

@@ -45,13 +45,13 @@ pub enum ScanError {
 }
 
 /// An (oid, mode) pair as rendered.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Entry {
     pub oid: Oid,
     pub mode: Mode,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Change {
     Modified,
@@ -62,14 +62,14 @@ pub enum Change {
     Unreadable,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Annotation {
     Upstream,
     Mixed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Collapsed {
     Glob,
@@ -78,14 +78,16 @@ pub enum Collapsed {
 }
 
 /// D5 pairing: the added row carries `From`, the deleted row carries `To`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Rename {
     From { from: Vec<u8>, similarity: u8 },
     To { to: Vec<u8>, similarity: u8 },
 }
 
-/// One pending row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One pending row. Serde is for recorded-pile fixtures (the TUI's unit tests), not a wire
+/// format: `status --json` has its own stable schema.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Row {
     pub path: Vec<u8>,
     pub change: Change,
@@ -108,14 +110,14 @@ impl Row {
 }
 
 /// A derived group row (§6.7 "upstream · N files").
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Group {
     pub kind: Annotation,
     pub paths: Vec<Vec<u8>>,
 }
 
 /// The pending set of one root after a scan.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Pile {
     /// Sorted by path bytes.
     pub rows: Vec<Row>,

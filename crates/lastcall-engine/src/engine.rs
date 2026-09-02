@@ -120,6 +120,9 @@ pub struct RootState {
     /// Set when a scan changed `nested_repos`; `scan_all` re-runs discovery only then.
     pub nested_changed: bool,
     pub user_email: Option<String>,
+    /// `org/repo` from `remote.origin.url` ([`remote_slug`]); `None` for no remote, a
+    /// local-path or `file://` origin, or anything unparsable. Presentation only (§6.7).
+    pub remote: Option<String>,
     /// Identity of `ledger.json` when `ledger` was read; a scan re-reads on change.
     pub ledger_stamp: Option<ledger::Stamp>,
 }
@@ -389,6 +392,12 @@ impl Engine {
             .as_ref()
             .and_then(|rg| rg.config_get("user.email").ok().flatten())
             .filter(|e| !e.is_empty());
+        // `config --get` is allowlisted; `remote get-url origin` (§6.7) is not, and the two
+        // differ only under `url.<base>.insteadOf` rewriting.
+        let remote = repo
+            .as_ref()
+            .and_then(|rg| rg.config_get("remote.origin.url").ok().flatten())
+            .and_then(|url| remote_slug(&url));
 
         // A `ledger.json.tmp` left by a crash between write and rename (E1) is garbage:
         // the rename never happened, so `ledger.json` is still the previous version. A
@@ -529,6 +538,7 @@ impl Engine {
             nested_repos: Vec::new(),
             nested_changed: false,
             user_email,
+            remote,
             ledger_stamp,
         })
     }
@@ -694,6 +704,40 @@ pub fn check_git(env: &Env) -> Result<String, EngineError> {
         return Err(EngineError::GitTooOld { found });
     }
     Ok(found)
+}
+
+/// The `org/repo` slug of a remote URL for the nav's dimmed remote label (§6.7):
+/// `git@host:org/repo(.git)`, `ssh://git@host/org/repo(.git)`, `https://host/org/repo(.git)`
+/// and scp-like `host:org/repo` all give `org/repo` (the last two path segments). A local
+/// path or a `file://` URL gives `None` — the fixture repos' origins are temp-dir paths, so
+/// anything else would leak a per-run name into the golden and every snapshot — as does
+/// anything unparsable.
+pub fn remote_slug(url: &str) -> Option<String> {
+    let url = url.trim();
+    let path = if let Some((scheme, rest)) = url.split_once("://") {
+        if scheme.eq_ignore_ascii_case("file") || scheme.is_empty() {
+            return None;
+        }
+        // `[user@]host[:port]/path`
+        rest.split_once('/')?.1
+    } else if url.starts_with('/') || url.starts_with('.') || url.starts_with('~') {
+        return None;
+    } else {
+        // scp-like `[user@]host:path`; a `/` before the colon means a local path.
+        let (host, path) = url.split_once(':')?;
+        if host.is_empty() || host.contains('/') {
+            return None;
+        }
+        path
+    };
+    let path = path.trim_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let n = segments.len();
+    if n < 2 {
+        return None;
+    }
+    Some(format!("{}/{}", segments[n - 2], segments[n - 1]))
 }
 
 /// Build a glob set where a bare name (no `/`) also matches at any depth.
@@ -1278,6 +1322,42 @@ pub(crate) mod tests {
         );
         assert!(engine.root(&draft).unwrap().ledger.seen_tree.is_some());
         assert!(engine.scan(&draft).unwrap().is_empty());
+    }
+
+    #[test]
+    fn engine_remote_slug_on_every_url_form() {
+        for (url, want) in [
+            ("git@github.com:acme/alpha.git", Some("acme/alpha")),
+            ("git@github.com:acme/alpha", Some("acme/alpha")),
+            ("ssh://git@github.com/acme/alpha.git", Some("acme/alpha")),
+            ("ssh://git@github.com:2222/acme/alpha", Some("acme/alpha")),
+            ("https://github.com/acme/alpha.git", Some("acme/alpha")),
+            ("https://github.com/acme/alpha/", Some("acme/alpha")),
+            (
+                "http://gitlab.example.com/group/sub/alpha.git",
+                Some("sub/alpha"),
+            ),
+            ("github.com:acme/alpha", Some("acme/alpha")),
+            ("  git@github.com:acme/alpha.git\n", Some("acme/alpha")),
+            // Local paths and file URLs: no remote label, ever.
+            ("/tmp/lc-w-123/alpha.git", None),
+            ("/tmp/lc-w-123/alpha", None),
+            ("./alpha.git", None),
+            ("../alpha.git", None),
+            ("~/repos/alpha.git", None),
+            ("file:///tmp/lc-w-123/alpha.git", None),
+            ("FILE:///tmp/alpha.git", None),
+            ("/tmp/with:colon/alpha.git", None),
+            // Unparsable.
+            ("", None),
+            ("alpha", None),
+            ("https://github.com/", None),
+            ("https://github.com/alpha.git", None),
+            ("git@github.com:alpha.git", None),
+            (":alpha/beta", None),
+        ] {
+            assert_eq!(remote_slug(url).as_deref(), want, "{url:?}");
+        }
     }
 
     #[test]

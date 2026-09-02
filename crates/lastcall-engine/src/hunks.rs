@@ -14,7 +14,9 @@ use similar::{Algorithm, DiffOp, capture_diff_slices, group_diff_ops};
 /// Unified-diff context lines (git's default).
 pub const CONTEXT: usize = 3;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Tag {
     Context,
@@ -23,7 +25,7 @@ pub enum Tag {
 }
 
 /// One unified hunk. `old_range`/`new_range` are line indexes into the two buffers.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Hunk {
     pub index: usize,
     pub old_range: Range<usize>,
