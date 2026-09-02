@@ -38,6 +38,38 @@ use tokio::net::UnixListener;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+/// Every subscription `type` herdr v0.8.2 accepts, verbatim from the error message the
+/// release emits for an unknown one (`fixtures/herdr/recorded/subscribe_failure.jsonl`).
+pub const KNOWN_SUBSCRIPTION_TYPES: &[&str] = &[
+    "workspace.created",
+    "workspace.updated",
+    "workspace.metadata_updated",
+    "workspace.renamed",
+    "workspace.moved",
+    "workspace.reordered",
+    "workspace.closed",
+    "workspace.focused",
+    "worktree.created",
+    "worktree.opened",
+    "worktree.removed",
+    "tab.created",
+    "tab.closed",
+    "tab.focused",
+    "tab.renamed",
+    "tab.moved",
+    "pane.created",
+    "pane.closed",
+    "pane.updated",
+    "pane.focused",
+    "pane.moved",
+    "pane.exited",
+    "pane.agent_detected",
+    "pane.output_matched",
+    "pane.agent_status_changed",
+    "pane.scroll_changed",
+    "layout.updated",
+];
+
 /// One request the mock received, in order.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecordedRequest {
@@ -694,6 +726,25 @@ impl Core {
                     }
                 };
                 self.subscriptions.lock().unwrap().push(subs.clone());
+                // herdr rejects the whole set on the first unknown `type` (recorded:
+                // fixtures/herdr/subscribe_failure.jsonl), before any subscription is built.
+                if let Some(unknown) = subs
+                    .iter()
+                    .find(|s| !KNOWN_SUBSCRIPTION_TYPES.contains(&s.kind.as_str()))
+                {
+                    return Reply::Refuse(ErrorBody {
+                        code: "invalid_request".into(),
+                        message: format!(
+                            "invalid request: unknown variant `{}`, expected one of {}",
+                            unknown.kind,
+                            KNOWN_SUBSCRIPTION_TYPES
+                                .iter()
+                                .map(|t| format!("`{t}`"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    });
+                }
                 let per_pane = subs.iter().find(|s| s.kind == PANE_AGENT_STATUS_CHANGED);
                 if let Some(sub) = per_pane {
                     let Some(pane_id) = sub.pane_id.clone() else {
