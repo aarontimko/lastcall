@@ -62,6 +62,11 @@ test-scenarios:
 golden-update:
     LASTCALL_UPDATE_GOLDEN=1 cargo test -p lastcall --test test_integration_status_golden
 
+# Rewrite the Phase 3 TUI snapshots (crates/lastcall/tests/snapshots/), then prove they pass.
+snapshots-update:
+    INSTA_UPDATE=always cargo test -p lastcall --test test_e2e_tui_snapshots || true
+    cargo test -p lastcall --test test_e2e_tui_snapshots
+
 test: test-unit test-integration test-e2e
 
 # The Phase 0 shell scenario harness (docs/spec/01-scenarios.md).

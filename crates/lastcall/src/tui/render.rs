@@ -436,7 +436,16 @@ fn render_main(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
                 .and_then(|v| v.row(path).map(|r| (v, r)))
             {
                 lines.push(row_header(row));
-                push_notices(&mut lines, &view.notices);
+                // The row's own `<path>: …` notice is the body of an unreadable row, so the
+                // dimmed list above it carries only the root's other notices.
+                let own = format!("{}: ", row.path_lossy());
+                let others: Vec<String> = view
+                    .notices
+                    .iter()
+                    .filter(|n| !n.starts_with(&own))
+                    .cloned()
+                    .collect();
+                push_notices(&mut lines, &others);
                 let fixed = lines.len();
                 for (i, line) in lines.iter().enumerate() {
                     buf.set_line(area.x, area.y + i as u16, line, area.width);
