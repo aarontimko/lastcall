@@ -1035,9 +1035,12 @@ mod tests {
         let text = fixture("snapshot_two_panes.json");
         let result: SnapshotResult = serde_json::from_str(&text).unwrap();
         let s = result.snapshot;
-        assert_eq!(s.protocol, 21);
+        // Recorded from the published v0.8.2 asset, which answers protocol 20 (see guard.rs).
+        assert_eq!(s.protocol, 20);
+        assert_eq!(s.version, "0.8.2");
         assert_eq!(s.workspaces.len(), 1);
         assert_eq!(s.panes.len(), 2);
+        assert_eq!(s.agents.len(), 1);
         assert!(s.panes.iter().any(|p| p.is_agent_bearing()));
         assert!(s.panes.iter().any(|p| !p.is_agent_bearing()));
 
@@ -1098,17 +1101,32 @@ mod tests {
 
     #[test]
     fn wire_status_fixture_ends_in_done() {
+        // Recorded per-pane lines (dotted, untagged), followed by the recorded tab_focused
+        // lifecycle hint that `just probe-hello` uses to trigger the done → idle resync.
         let text = fixture("status_working_to_done.jsonl");
-        let statuses: Vec<AgentStatus> = text
+        let events: Vec<Event> = text
             .lines()
             .filter(|l| !l.trim().is_empty())
-            .map(|l| match Event::parse_line(l).unwrap() {
-                Event::PaneAgentStatusChanged(e) => e.agent_status,
-                other => panic!("{other:?}"),
+            .map(|l| Event::parse_line(l).unwrap())
+            .collect();
+        let statuses: Vec<AgentStatus> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::PaneAgentStatusChanged(s) => Some(s.agent_status.clone()),
+                _ => None,
             })
             .collect();
         assert_eq!(statuses.first(), Some(&AgentStatus::Working));
         assert_eq!(statuses.last(), Some(&AgentStatus::Done));
+        assert!(
+            matches!(events.last(), Some(Event::TabFocused { tab_id, .. }) if tab_id == "w1:t1"),
+            "{events:?}"
+        );
+        for e in &events {
+            if let Event::PaneAgentStatusChanged(s) = e {
+                assert_eq!(s.pane_id, "w1:p1");
+            }
+        }
     }
 
     #[test]

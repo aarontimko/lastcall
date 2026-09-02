@@ -104,15 +104,35 @@ test-integration-herdr:
     bin="$(just herdr-fetch | tail -n 1)"
     LASTCALL_TEST_HERDR_BIN="$bin" just test-integration
 
-# Re-record the herdr fixtures from the real pinned binary (deliverable 6 provenance rule).
+# Re-record the herdr fixtures from the real pinned binary (deliverable 6 provenance rule)
+# into crates/lastcall-testkit/fixtures/herdr/recorded/ (committed; see the provenance files).
 herdr-record:
     #!/usr/bin/env bash
     set -euo pipefail
     bin="$(just herdr-fetch | tail -n 1)"
-    mkdir -p target/herdr-recordings
-    LASTCALL_TEST_HERDR_BIN="$bin" LASTCALL_RECORD_DIR="$PWD/target/herdr-recordings" \
+    dir="$PWD/crates/lastcall-testkit/fixtures/herdr/recorded"
+    mkdir -p "$dir"
+    LASTCALL_TEST_HERDR_BIN="$bin" LASTCALL_RECORD_DIR="$dir" \
         cargo test -p lastcall-engine --test test_integration_herdr_real -- --nocapture
-    ls -la target/herdr-recordings
+    ls -la "$dir"
+    just fixtures-sync
+
+# Derive the named fixtures from the recordings (each <name>.provenance.md documents the rule).
+fixtures-sync:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    f="crates/lastcall-testkit/fixtures/herdr"
+    r="$f/recorded"
+    cat "$r/snapshot_two_panes.json" > "$f/snapshot_two_panes.json"
+    cat "$r/snapshot_two_panes_after_focus.json" > "$f/snapshot_two_panes_after_focus.json"
+    cat "$r/subscribe_failure.jsonl" > "$f/subscribe_failure.jsonl"
+    # status_working_to_done: the two recorded per-pane lines, then the recorded tab_focused
+    # for the agent's tab (the focus that flips done -> idle), so `just probe-hello` replays
+    # both transitions through the client's real code paths.
+    cat "$r/status_working_to_done.jsonl" > "$f/status_working_to_done.jsonl"
+    grep '"tab_focused"' "$r/lifecycle.jsonl" | grep '"tab_id":"w1:t1"' | tail -n 1 >> "$f/status_working_to_done.jsonl"
+    echo "fixtures synced from $r:"
+    ls -la "$f"
 
 # ---------------------------------------------------------------------------------------
 # Repo hygiene
@@ -168,6 +188,7 @@ probe-hello:
     echo "--- mock_herdr --socket $sock ---"
     ./target/debug/examples/mock_herdr --socket "$sock" \
         --snapshot "$fixtures/snapshot_two_panes.json" \
+        --snapshot-after "$fixtures/snapshot_two_panes_after_focus.json" \
         --events "$fixtures/status_working_to_done.jsonl" > "$dir/mock.log" 2>&1 &
     mock_pid=$!
     for _ in $(seq 1 200); do [ -S "$sock" ] && break; sleep 0.025; done

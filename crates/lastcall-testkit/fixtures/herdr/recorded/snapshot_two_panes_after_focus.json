@@ -3,20 +3,20 @@
     "agents": [
       {
         "agent": "demo",
-        "agent_status": "working",
+        "agent_status": "idle",
         "cwd": "/private/tmp/lc-69774-1788310123104141000",
-        "focused": false,
+        "focused": true,
         "foreground_cwd": "/private/tmp/lc-69774-1788310123104141000",
         "pane_id": "w1:p1",
         "revision": 0,
-        "state_change_seq": 1,
+        "state_change_seq": 2,
         "tab_id": "w1:t1",
         "terminal_id": "term_65a7565a51ca01",
         "workspace_id": "w1"
       }
     ],
-    "focused_pane_id": "w1:p2",
-    "focused_tab_id": "w1:t2",
+    "focused_pane_id": "w1:p1",
+    "focused_tab_id": "w1:t1",
     "focused_workspace_id": "w1",
     "layouts": [
       {
@@ -73,9 +73,9 @@
     "panes": [
       {
         "agent": "demo",
-        "agent_status": "working",
+        "agent_status": "idle",
         "cwd": "/private/tmp/lc-69774-1788310123104141000",
-        "focused": false,
+        "focused": true,
         "foreground_cwd": "/private/tmp/lc-69774-1788310123104141000",
         "pane_id": "w1:p1",
         "revision": 0,
@@ -91,7 +91,7 @@
       {
         "agent_status": "unknown",
         "cwd": "/private/tmp/lc-69774-1788310123104141000",
-        "focused": true,
+        "focused": false,
         "foreground_cwd": "/private/tmp/lc-69774-1788310123104141000",
         "pane_id": "w1:p2",
         "revision": 0,
@@ -108,8 +108,8 @@
     "protocol": 20,
     "tabs": [
       {
-        "agent_status": "working",
-        "focused": false,
+        "agent_status": "idle",
+        "focused": true,
         "label": "1",
         "number": 1,
         "pane_count": 1,
@@ -118,7 +118,7 @@
       },
       {
         "agent_status": "unknown",
-        "focused": true,
+        "focused": false,
         "label": "2",
         "number": 2,
         "pane_count": 1,
@@ -129,8 +129,8 @@
     "version": "0.8.2",
     "workspaces": [
       {
-        "active_tab_id": "w1:t2",
-        "agent_status": "working",
+        "active_tab_id": "w1:t1",
+        "agent_status": "idle",
         "focused": true,
         "label": "lc-69774-1788310123104141000",
         "number": 1,

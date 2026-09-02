@@ -451,11 +451,13 @@ impl<T: Transport> Actor<T> {
     /// §5.3: ping → subscribe → ack → snapshot on a second connection → install → if any event
     /// was buffered during setup, schedule one resync → stream.
     async fn bootstrap(&mut self) -> Result<mpsc::UnboundedReceiver<LifecycleMsg>, BootstrapError> {
-        match guard::probe(&*self.transport).await {
-            Compat::Ok { .. } => {}
+        // `Connected` reports what `ping` answered (the identity the guard verified), not a
+        // field copied from the snapshot.
+        let (version, protocol) = match guard::probe(&*self.transport).await {
+            Compat::Ok { version, protocol } => (version, protocol),
             Compat::Mismatch { notice, .. } => return Err(BootstrapError::Standalone(notice)),
             Compat::Absent { reason } => return Err(BootstrapError::Disconnected(reason)),
-        }
+        };
         let stream = self
             .transport
             .subscribe(wire::lifecycle_subscriptions())
@@ -497,8 +499,6 @@ impl<T: Transport> Actor<T> {
         let snapshot = self.request_snapshot().await.map_err(|err| {
             BootstrapError::Disconnected(format!("session.snapshot failed: {err}"))
         })?;
-        let version = snapshot.version.clone();
-        let protocol = snapshot.protocol;
         if !self.emit(HerdrEvent::Connected { version, protocol }).await {
             return Err(BootstrapError::Disconnected("consumer gone".into()));
         }
@@ -1294,10 +1294,12 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/../lastcall-testkit/fixtures/herdr"
     );
-    const P1: &str = "ws_demo1:p1"; // agent-bearing (demo, working), non-active tab
-    const P2: &str = "ws_demo1:p2"; // bare shell, active tab
-    const P3: &str = "ws_demo1:p3"; // not in the snapshot
-    const WS: &str = "ws_demo1";
+    // Ids as recorded from the real v0.8.2 binary (fixtures/herdr/recorded).
+    const P1: &str = "w1:p1"; // agent-bearing (demo, working), non-active tab t1
+    const P2: &str = "w1:p2"; // bare shell, active tab t2
+    const P3: &str = "w1:p3"; // not in the snapshot
+    const WS: &str = "w1";
+    const T1: &str = "w1:t1";
 
     fn fixture(name: &str) -> String {
         std::fs::read_to_string(format!("{FIXTURES}/{name}")).unwrap()
@@ -1338,7 +1340,7 @@ mod tests {
     fn snapshot_with_extra_pane(pane_id: &str, agent: Option<&str>, status: &str) -> Value {
         let mut v = snapshot();
         v["snapshot"]["panes"].as_array_mut().unwrap().push(json!({
-            "pane_id": pane_id, "terminal_id": "term_x", "workspace_id": WS, "tab_id": "ws_demo1:t1",
+            "pane_id": pane_id, "terminal_id": "term_x", "workspace_id": WS, "tab_id": T1,
             "focused": false, "agent_status": status, "revision": 0, "agent": agent,
             "cwd": "/Users/demo/dev/git/lastcall"
         }));
@@ -1347,7 +1349,7 @@ mod tests {
 
     fn pane_created_line(pane_id: &str, agent: Option<&str>, status: &str) -> String {
         json!({"event": "pane_created", "data": {"type": "pane_created", "pane": {
-            "pane_id": pane_id, "terminal_id": "term_x", "workspace_id": WS, "tab_id": "ws_demo1:t1",
+            "pane_id": pane_id, "terminal_id": "term_x", "workspace_id": WS, "tab_id": T1,
             "focused": false, "agent_status": status, "revision": 0, "agent": agent
         }}})
         .to_string()
@@ -1355,7 +1357,7 @@ mod tests {
 
     fn pane_updated_line(pane_id: &str, agent: Option<&str>, status: &str) -> String {
         json!({"event": "pane_updated", "data": {"type": "pane_updated", "pane": {
-            "pane_id": pane_id, "terminal_id": "term_x", "workspace_id": WS, "tab_id": "ws_demo1:t1",
+            "pane_id": pane_id, "terminal_id": "term_x", "workspace_id": WS, "tab_id": T1,
             "focused": false, "agent_status": status, "revision": 7, "agent": agent
         }}})
         .to_string()
@@ -1367,7 +1369,7 @@ mod tests {
     }
 
     fn tab_focused_line() -> String {
-        json!({"event": "tab_focused", "data": {"type": "tab_focused", "tab_id": "ws_demo1:t1", "workspace_id": WS}})
+        json!({"event": "tab_focused", "data": {"type": "tab_focused", "tab_id": T1, "workspace_id": WS}})
             .to_string()
     }
 
@@ -1828,9 +1830,16 @@ mod tests {
             handle.snapshot().unwrap().status_of(P1),
             Some(&AgentStatus::Done)
         );
+        let fixture_revision = snapshot()["snapshot"]["panes"][0]["revision"]
+            .as_u64()
+            .unwrap();
+        assert_ne!(
+            fixture_revision, 7,
+            "the event uses a revision the fixture does not"
+        );
         assert_eq!(
             handle.snapshot().unwrap().panes[P1].info.revision,
-            3,
+            fixture_revision,
             "snapshot's PaneInfo, not the event's"
         );
         handle.shutdown().await;
@@ -1989,22 +1998,22 @@ mod tests {
                 })
                 .collect()
         };
+        // The recorded snapshot's panes share one cwd; read it rather than hard-code it.
+        let cwd = snapshot()["snapshot"]["panes"][0]["cwd"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(cwd.starts_with('/'), "{cwd}");
         assert_eq!(
             assoc(&boot_events),
-            vec![
-                format!("{P1}=/Users/demo/dev/git/lastcall"),
-                format!("{P2}=/Users/demo/dev/git/lastcall")
-            ]
+            vec![format!("{P1}={cwd}"), format!("{P2}={cwd}")]
         );
         mock.push_lifecycle(tab_focused_line());
         advance(timings().coalesce).await;
         assert_eq!(assoc(&drain(&mut rx)).len(), 2);
         mock.push_lifecycle(pane_ref_line("pane_focused", P2));
         advance(timings().coalesce).await;
-        assert_eq!(
-            assoc(&drain(&mut rx)),
-            vec![format!("{P2}=/Users/demo/dev/git/lastcall")]
-        );
+        assert_eq!(assoc(&drain(&mut rx)), vec![format!("{P2}={cwd}")]);
         handle.shutdown().await;
     }
 

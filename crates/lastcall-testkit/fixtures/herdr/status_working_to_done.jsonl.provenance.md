@@ -1,13 +1,19 @@
 # Provenance: status_working_to_done.jsonl
 
-Hand-written from the herdr v0.8.2 schema (`docs/next/api/herdr-api.schema.json`, commit `5158ada`):
-`PaneAgentStatusChangedEvent` at line 5936 (`pane_id`, `workspace_id`, `agent_status` required;
-`agent`, `title`, `display_agent`, `state_labels` optional), the dotted untagged shape a per-pane
-`pane.agent_status_changed` subscription emits.
+**Recorded from the real pinned herdr (v0.8.2 release asset)** by
+`crates/lastcall-engine/tests/test_integration_herdr_real.rs` via `just herdr-record`, assembled
+by `just fixtures-sync`:
 
-The sequence `working` → `done` is what herdr derives for a completion in a non-active tab
-(`src/app/api_helpers.rs:96-104`: `(Idle, seen=false) => Done`). The pane id matches
-`snapshot_two_panes.json` so `just probe-hello` shows `[ws_demo1:p1] demo working → done`.
+- lines 1–2: `recorded/status_working_to_done.jsonl` verbatim — the dotted, untagged
+  `pane.agent_status_changed` lines a per-pane subscription for `w1:p1` emitted for
+  `pane.report_agent --state working` then `--state idle` while `w1:t1` was **not** the active
+  tab. herdr derives `done` from that completion (`src/app/api_helpers.rs:96-104`:
+  `(Idle, seen=false) => Done`); the reporting enum has no `done`.
+- line 3: the recorded snake_case `tab_focused` for `w1:t1` from `recorded/lifecycle.jsonl`
+  (the `tab.focus` that flips done → idle). The mock example routes it to the lifecycle stream
+  (`ScriptedEvent::route`), so `just probe-hello` shows both `working → done` (per-pane
+  stream) and `done → idle` (focus-driven snapshot resync against
+  `snapshot_two_panes_after_focus.json`).
 
-Recording status: `just herdr-record` captures the real per-pane lines produced by
-`pane.report_agent` working → idle on a pane in a non-active tab; see `recorded/` once recorded.
+Schema cross-check: `PaneAgentStatusChangedEvent` line 5936 (the release omits `title`,
+`display_agent`, `state_labels` when absent); `EventEnvelope` line 1220.

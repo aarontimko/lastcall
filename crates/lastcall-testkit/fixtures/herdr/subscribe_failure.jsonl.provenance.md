@@ -1,13 +1,11 @@
 # Provenance: subscribe_failure.jsonl
 
-Hand-written from the herdr v0.8.2 schema (`docs/next/api/herdr-api.schema.json`, commit `5158ada`):
-the error response envelope (`{"id","error":{"code","message"}}`, spec §5.1). Error codes are
-plain strings, not a schema enum; `invalid_params` is the code herdr uses when the request
-params fail to deserialize (an unknown subscription `type`).
+**Recorded from the real pinned herdr (v0.8.2 release asset)** by
+`crates/lastcall-engine/tests/test_integration_herdr_real.rs` via `just herdr-record`, copied
+verbatim by `just fixtures-sync` from `recorded/subscribe_failure.jsonl`.
 
-Semantics under test (spec §5.3 step 1): when any subscription in the set fails to construct
-the server sends exactly this one error line and closes the connection — there are no partial
-subscriptions. The mock replays this line and closes.
-
-Recording status: `just herdr-record` captures the real error line for a bogus subscription set
-into `target/herdr-recordings/`; see `recorded/` once recorded.
+The one line herdr writes for `events.subscribe` with `{"type":"bogus.event"}` in the set,
+after which it closes the connection (spec §5.3 step 1: no partial subscriptions; the
+integration test asserts EOF right after this line). Two facts a schema reading would not have
+given: the code is `invalid_request` (not `invalid_params`) and the echoed `id` is `""`.
+Error codes are plain strings (§5.1); the client handles unknown codes as a generic failure.
