@@ -296,35 +296,65 @@ impl Client {
 /// What the lifecycle reader task sends.
 enum LifecycleMsg {
     Event(Box<Event>),
+    /// A line that did not parse (garbage, or a known event whose data lacks a field we
+    /// require). A hint like any other: schedule a resync, keep streaming (invariant 9).
+    Malformed(String),
     End(StreamEnd),
     Error(TransportError),
 }
 
-/// What a per-pane status task sends.
+/// What a per-pane status task sends. Every message carries the task's `instance` tag.
 enum StatusMsg {
     Opened {
         pane_id: String,
+        instance: u64,
     },
     Event {
         pane_id: String,
+        instance: u64,
         event: Box<PaneAgentStatusChangedEvent>,
         stamp: u64,
     },
     Closed {
         pane_id: String,
+        instance: u64,
         reason: String,
     },
     /// Construction refused by the server (`pane_not_found` or another server code): the pane
     /// is gone, do not retry.
     Refused {
         pane_id: String,
+        instance: u64,
         code: String,
     },
     /// Construction failed at the transport level: the reconnect path.
     Failed {
         pane_id: String,
+        instance: u64,
         reason: String,
     },
+}
+
+impl StatusMsg {
+    fn pane_and_instance(&self) -> (&str, u64) {
+        match self {
+            StatusMsg::Opened {
+                pane_id, instance, ..
+            }
+            | StatusMsg::Event {
+                pane_id, instance, ..
+            }
+            | StatusMsg::Closed {
+                pane_id, instance, ..
+            }
+            | StatusMsg::Refused {
+                pane_id, instance, ..
+            }
+            | StatusMsg::Failed {
+                pane_id, instance, ..
+            } => (pane_id, *instance),
+        }
+    }
 }
 
 enum SessionEnd {
@@ -352,10 +382,35 @@ struct Actor<T: Transport> {
     pane_gens: PaneGens,
     status_tx: mpsc::UnboundedSender<StatusMsg>,
     status_rx: mpsc::UnboundedReceiver<StatusMsg>,
-    status_tasks: HashMap<String, JoinHandle<()>>,
+    status_tasks: HashMap<String, StatusTask>,
+    /// Monotonic per-task tag: a message from an older task instance for the same pane is
+    /// ignored (a stale `Closed` after a reconnect must not steal the new task's handle).
+    next_status_instance: u64,
     lifecycle_task: Option<JoinHandle<()>>,
     pending_snapshot: Option<Instant>,
     pending_pane_gets: BTreeMap<String, Instant>,
+    /// The last `Standalone` notice emitted; identical consecutive notices are not repeated.
+    last_notice: Option<String>,
+}
+
+/// One per-pane status connection task, tagged with its instance.
+struct StatusTask {
+    instance: u64,
+    task: JoinHandle<()>,
+}
+
+impl<T: Transport> Drop for Actor<T> {
+    /// The actor owns every connection: if its task is aborted (a dropped `ClientHandle`, or
+    /// the shutdown grace period expiring) the reader tasks must not outlive it. A dropped
+    /// `JoinHandle` only detaches; abort explicitly.
+    fn drop(&mut self) {
+        if let Some(task) = self.lifecycle_task.take() {
+            task.abort();
+        }
+        for (_, status) in self.status_tasks.drain() {
+            status.task.abort();
+        }
+    }
 }
 
 impl<T: Transport> Actor<T> {
@@ -381,7 +436,9 @@ impl<T: Transport> Actor<T> {
             status_tx,
             status_rx,
             status_tasks: HashMap::new(),
+            next_status_instance: 1,
             lifecycle_task: None,
+            last_notice: None,
             pending_snapshot: None,
             pending_pane_gets: BTreeMap::new(),
         }
@@ -396,17 +453,27 @@ impl<T: Transport> Actor<T> {
     }
 
     /// The reconnect loop: bootstrap, run the session, tear down, back off, repeat.
+    ///
+    /// Backoff is exponential from `reconnect_initial` to `reconnect_max` and resets only after
+    /// a session that lasted at least `reconnect_max` (a server that acks and drops keeps
+    /// backing off). A standalone verdict (protocol mismatch, unreadable snapshot) is announced
+    /// once per distinct notice and re-probed every `reconnect_max`.
     async fn run(mut self) {
         let mut attempt: u32 = 0;
         loop {
             if *self.shutdown.borrow() {
                 break;
             }
+            let mut standalone = false;
             match self.bootstrap().await {
                 Ok(life_rx) => {
-                    attempt = 0;
+                    self.last_notice = None;
+                    let started = Instant::now();
                     let end = self.session(life_rx).await;
                     self.teardown_status_tasks();
+                    if started.elapsed() >= self.timings.reconnect_max {
+                        attempt = 0;
+                    }
                     match end {
                         SessionEnd::Shutdown | SessionEnd::ConsumerGone => break,
                         SessionEnd::Disconnected(reason) => {
@@ -418,8 +485,12 @@ impl<T: Transport> Actor<T> {
                 }
                 Err(BootstrapError::Standalone(notice)) => {
                     self.teardown_status_tasks();
-                    if !self.emit(HerdrEvent::Standalone { notice }).await {
-                        break;
+                    standalone = true;
+                    if self.last_notice.as_deref() != Some(notice.as_str()) {
+                        self.last_notice = Some(notice.clone());
+                        if !self.emit(HerdrEvent::Standalone { notice }).await {
+                            break;
+                        }
                     }
                 }
                 Err(BootstrapError::Disconnected(reason)) => {
@@ -432,8 +503,13 @@ impl<T: Transport> Actor<T> {
             if !self.options.reconnect {
                 break;
             }
-            let delay = self.backoff(attempt);
-            attempt = attempt.saturating_add(1);
+            let delay = if standalone {
+                self.timings.reconnect_max
+            } else {
+                let delay = self.backoff(attempt);
+                attempt = attempt.saturating_add(1);
+                delay
+            };
             tokio::select! {
                 _ = tokio::time::sleep(delay) => {}
                 _ = self.shutdown.changed() => break,
@@ -443,9 +519,10 @@ impl<T: Transport> Actor<T> {
     }
 
     fn backoff(&self, attempt: u32) -> Duration {
-        let initial = self.timings.reconnect_initial;
+        // Never hot-loop: a zero initial delay still yields at least a millisecond.
+        let initial = self.timings.reconnect_initial.max(Duration::from_millis(1));
         let scaled = initial.saturating_mul(2u32.saturating_pow(attempt.min(16)));
-        scaled.min(self.timings.reconnect_max)
+        scaled.min(self.timings.reconnect_max.max(initial))
     }
 
     /// §5.3: ping → subscribe → ack → snapshot on a second connection → install → if any event
@@ -489,6 +566,15 @@ impl<T: Transport> Actor<T> {
                         let _ = life_tx.send(LifecycleMsg::End(end));
                         break;
                     }
+                    Err(TransportError::Wire(err)) => {
+                        // One bad line is not a dead connection.
+                        if life_tx
+                            .send(LifecycleMsg::Malformed(err.to_string()))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
                     Err(err) => {
                         let _ = life_tx.send(LifecycleMsg::Error(err));
                         break;
@@ -496,8 +582,13 @@ impl<T: Transport> Actor<T> {
                 }
             }
         }));
-        let snapshot = self.request_snapshot().await.map_err(|err| {
-            BootstrapError::Disconnected(format!("session.snapshot failed: {err}"))
+        let snapshot = self.request_snapshot().await.map_err(|err| match err {
+            // The server answered but we cannot read it: that is a compatibility problem,
+            // not a dead connection. Standalone with a notice, not a reconnect storm.
+            TransportError::Wire(err) => BootstrapError::Standalone(format!(
+                "herdr answered an unreadable session.snapshot ({err}); running standalone"
+            )),
+            other => BootstrapError::Disconnected(format!("session.snapshot failed: {other}")),
         })?;
         if !self.emit(HerdrEvent::Connected { version, protocol }).await {
             return Err(BootstrapError::Disconnected("consumer gone".into()));
@@ -510,7 +601,7 @@ impl<T: Transport> Actor<T> {
         let mut buffered = 0usize;
         while let Ok(msg) = life_rx.try_recv() {
             match msg {
-                LifecycleMsg::Event(_) => buffered += 1,
+                LifecycleMsg::Event(_) | LifecycleMsg::Malformed(_) => buffered += 1,
                 LifecycleMsg::End(_) | LifecycleMsg::Error(_) => {
                     return Err(BootstrapError::Disconnected(
                         "lifecycle stream ended during bootstrap".into(),
@@ -581,6 +672,10 @@ impl<T: Transport> Actor<T> {
                         if !self.handle_lifecycle(*event).await {
                             return SessionEnd::ConsumerGone;
                         }
+                    }
+                    Some(LifecycleMsg::Malformed(what)) => {
+                        tracing::warn!(%what, "malformed lifecycle line; scheduling a snapshot resync");
+                        self.schedule_snapshot();
                     }
                     Some(LifecycleMsg::End(StreamEnd::ClosedByPeer)) | None => {
                         return SessionEnd::Disconnected("lifecycle stream closed by peer".into());
@@ -671,7 +766,9 @@ impl<T: Transport> Actor<T> {
     async fn resync_snapshot(&mut self) -> Result<bool, String> {
         let snapshot = match self.request_snapshot().await {
             Ok(s) => s,
-            Err(err) if err.is_transport_failure() => {
+            // A dead connection, or a snapshot we cannot read: both go through the reconnect
+            // path, where bootstrap turns an unreadable snapshot into a standalone notice.
+            Err(err) if err.is_transport_failure() || matches!(err, TransportError::Wire(_)) => {
                 return Err(format!("session.snapshot failed: {err}"));
             }
             Err(err) => {
@@ -734,7 +831,8 @@ impl<T: Transport> Actor<T> {
         self.reconcile_status_tasks().await
     }
 
-    /// Tear down status connections whose pane is absent from the cache; open the missing ones.
+    /// Tear down status connections whose pane is absent from the cache (F9) or no longer
+    /// agent-bearing (one connection per *agent-bearing* pane, §5.4); open the missing ones.
     async fn reconcile_status_tasks(&mut self) -> bool {
         let Some(cache) = &self.cache else {
             return true;
@@ -742,7 +840,9 @@ impl<T: Transport> Actor<T> {
         let orphans: Vec<String> = self
             .status_tasks
             .keys()
-            .filter(|pane_id| !cache.panes.contains_key(*pane_id))
+            .filter(|pane_id| {
+                !cache.panes.contains_key(*pane_id) || !cache.is_agent_bearing(pane_id)
+            })
             .cloned()
             .collect();
         let wanted: Vec<String> = cache
@@ -755,10 +855,19 @@ impl<T: Transport> Actor<T> {
             .collect();
         for pane_id in orphans {
             self.close_status_task(&pane_id);
+            let reason = if self
+                .cache
+                .as_ref()
+                .is_some_and(|c| c.panes.contains_key(&pane_id))
+            {
+                "pane no longer agent-bearing (torn down at resync)"
+            } else {
+                "pane absent from snapshot (orphan torn down at resync)"
+            };
             if !self
                 .emit(HerdrEvent::StatusStreamClosed {
                     pane_id,
-                    reason: "pane absent from snapshot (orphan torn down at resync)".into(),
+                    reason: reason.into(),
                 })
                 .await
             {
@@ -1011,14 +1120,33 @@ impl<T: Transport> Actor<T> {
     /// Rules 3 and 6 for per-pane status connections. `Ok(false)` = consumer gone;
     /// `Err` = transport failure (reconnect path).
     async fn handle_status(&mut self, msg: StatusMsg) -> Result<bool, String> {
+        // Only the current task instance for a pane may speak for it: a message queued by a
+        // task that was already replaced (e.g. a `Closed` racing a reconnect on a multi-thread
+        // runtime) must not touch the new task's entry.
+        {
+            let (pane_id, instance) = msg.pane_and_instance();
+            let current = self
+                .status_tasks
+                .get(pane_id)
+                .is_some_and(|t| t.instance == instance);
+            if !current {
+                tracing::debug!(
+                    pane_id,
+                    instance,
+                    "status message from a stale task; ignored"
+                );
+                return Ok(true);
+            }
+        }
         match msg {
-            StatusMsg::Opened { pane_id } => {
+            StatusMsg::Opened { pane_id, .. } => {
                 Ok(self.emit(HerdrEvent::StatusStreamOpened { pane_id }).await)
             }
             StatusMsg::Event {
                 pane_id,
                 event,
                 stamp,
+                ..
             } => {
                 let current = self
                     .pane_gens
@@ -1071,20 +1199,20 @@ impl<T: Transport> Actor<T> {
                     })
                     .await)
             }
-            StatusMsg::Closed { pane_id, reason } => {
+            StatusMsg::Closed {
+                pane_id, reason, ..
+            } => {
                 // Server-side close of a status stream we still want: drop it and let the next
                 // snapshot reopen it if the pane still exists.
-                if self.status_tasks.remove(&pane_id).is_some() {
-                    self.schedule_snapshot();
-                    return Ok(self
-                        .emit(HerdrEvent::StatusStreamClosed { pane_id, reason })
-                        .await);
-                }
-                Ok(true)
+                self.close_status_task(&pane_id);
+                self.schedule_snapshot();
+                Ok(self
+                    .emit(HerdrEvent::StatusStreamClosed { pane_id, reason })
+                    .await)
             }
-            StatusMsg::Refused { pane_id, code } => {
+            StatusMsg::Refused { pane_id, code, .. } => {
                 // Rule 3: pane gone, do not retry. The next snapshot drops the cache entry.
-                self.status_tasks.remove(&pane_id);
+                self.close_status_task(&pane_id);
                 self.schedule_snapshot();
                 Ok(self
                     .emit(HerdrEvent::StatusStreamClosed {
@@ -1093,8 +1221,10 @@ impl<T: Transport> Actor<T> {
                     })
                     .await)
             }
-            StatusMsg::Failed { pane_id, reason } => {
-                self.status_tasks.remove(&pane_id);
+            StatusMsg::Failed {
+                pane_id, reason, ..
+            } => {
+                self.close_status_task(&pane_id);
                 Err(format!(
                     "status subscription for {pane_id} failed: {reason}"
                 ))
@@ -1111,6 +1241,8 @@ impl<T: Transport> Actor<T> {
         let gens = Arc::clone(&self.pane_gens);
         let pane = pane_id.to_string();
         let timeout = self.timings.request_timeout;
+        let instance = self.next_status_instance;
+        self.next_status_instance += 1;
         let task = tokio::spawn(async move {
             let subscribe =
                 transport.subscribe(vec![Subscription::pane_agent_status_changed(&pane)]);
@@ -1119,6 +1251,7 @@ impl<T: Transport> Actor<T> {
                 Ok(Err(TransportError::SubscribeRefused(body))) => {
                     let _ = tx.send(StatusMsg::Refused {
                         pane_id: pane,
+                        instance,
                         code: body.code,
                     });
                     return;
@@ -1126,6 +1259,7 @@ impl<T: Transport> Actor<T> {
                 Ok(Err(err)) => {
                     let _ = tx.send(StatusMsg::Failed {
                         pane_id: pane,
+                        instance,
                         reason: err.to_string(),
                     });
                     return;
@@ -1133,6 +1267,7 @@ impl<T: Transport> Actor<T> {
                 Err(_) => {
                     let _ = tx.send(StatusMsg::Failed {
                         pane_id: pane,
+                        instance,
                         reason: format!(
                             "timed out after {timeout:?} waiting for the subscription ack"
                         ),
@@ -1143,6 +1278,7 @@ impl<T: Transport> Actor<T> {
             if tx
                 .send(StatusMsg::Opened {
                     pane_id: pane.clone(),
+                    instance,
                 })
                 .is_err()
             {
@@ -1165,6 +1301,7 @@ impl<T: Transport> Actor<T> {
                             if tx
                                 .send(StatusMsg::Event {
                                     pane_id: pane.clone(),
+                                    instance,
                                     event: Box::new(e),
                                     stamp,
                                 })
@@ -1183,13 +1320,19 @@ impl<T: Transport> Actor<T> {
                         };
                         let _ = tx.send(StatusMsg::Closed {
                             pane_id: pane,
+                            instance,
                             reason,
                         });
                         break;
                     }
+                    Err(TransportError::Wire(err)) => {
+                        // One bad line is a hint, not a dead stream; the next resync covers it.
+                        tracing::warn!(pane, %err, "malformed status line; skipped");
+                    }
                     Err(err) => {
                         let _ = tx.send(StatusMsg::Closed {
                             pane_id: pane,
+                            instance,
                             reason: format!("stream error: {err}"),
                         });
                         break;
@@ -1197,13 +1340,14 @@ impl<T: Transport> Actor<T> {
                 }
             }
         });
-        self.status_tasks.insert(pane_id.to_string(), task);
+        self.status_tasks
+            .insert(pane_id.to_string(), StatusTask { instance, task });
     }
 
     fn close_status_task(&mut self, pane_id: &str) {
-        if let Some(task) = self.status_tasks.remove(pane_id) {
+        if let Some(status) = self.status_tasks.remove(pane_id) {
             // Dropping the task drops its stream, which closes the connection.
-            task.abort();
+            status.task.abort();
         }
     }
 
@@ -1212,11 +1356,11 @@ impl<T: Transport> Actor<T> {
             // Dropping the reader task drops the lifecycle stream: the connection closes.
             task.abort();
         }
-        for (_, task) in self.status_tasks.drain() {
-            task.abort();
+        for (_, status) in self.status_tasks.drain() {
+            status.task.abort();
         }
-        // Messages from aborted tasks may still be queued; they are ignored by the handlers
-        // because their pane has no entry any more.
+        // Messages from aborted tasks may still be queued; their instance tags no longer
+        // match any entry, so the handler ignores them.
         while self.status_rx.try_recv().is_ok() {}
     }
 }
@@ -1442,6 +1586,203 @@ mod tests {
 
     fn timings() -> ClientTimings {
         ClientTimings::default() // production values; free under paused time
+    }
+
+    // ---- fix(review) regression tests (verifier (a) findings 1, 2, 4, 5, 6) ----
+
+    #[tokio::test(start_paused = true)]
+    async fn client_dropping_handle_closes_every_connection() {
+        // Finding 1: the non-cooperative teardown path (a dropped handle aborts the actor)
+        // must not leak the lifecycle or status connections.
+        let mock = builder().in_memory();
+        let (handle, _rx, _) = boot(&mock).await;
+        assert_eq!(mock.lifecycle_streams_open(), 1);
+        assert_eq!(mock.status_streams_open(P1), 1);
+        drop(handle);
+        assert!(
+            mock.wait_until(50, |m| m.lifecycle_streams_open() == 0
+                && m.status_streams_open(P1) == 0)
+                .await,
+            "lifecycle {} / status {} still open after drop",
+            mock.lifecycle_streams_open(),
+            mock.status_streams_open(P1)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn client_malformed_lifecycle_line_is_a_hint_not_a_disconnect() {
+        // Finding 2: garbage, or a known event missing a required field, schedules a resync
+        // and keeps streaming; it never tears the session down.
+        let mock = builder().in_memory();
+        let (handle, mut rx, _) = boot(&mock).await;
+        mock.push_lifecycle("this is not json");
+        mock.push_lifecycle(r#"{"event":"pane_created","data":{"type":"pane_created"}}"#);
+        mock.push_lifecycle(r#"{"nothing":"here"}"#);
+        settle().await;
+        let events = drain(&mut rx);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, HerdrEvent::Disconnected { .. })),
+            "{events:?}"
+        );
+        assert_eq!(mock.lifecycle_streams_opened_total(), 1, "no reconnect");
+        assert_eq!(mock.lifecycle_streams_open(), 1);
+        // The stream still delivers, and the hints coalesced into one resync.
+        mock.push_lifecycle(pane_ref_line("pane_focused", P2));
+        advance(timings().coalesce).await;
+        let events = drain(&mut rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, HerdrEvent::Lifecycle(ev) if ev.pane_id() == Some(P2)))
+        );
+        assert_eq!(
+            mock.count("session.snapshot"),
+            2,
+            "exactly one resync for the bad lines"
+        );
+        assert_eq!(mock.count("ping"), 1);
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn client_unreadable_snapshot_is_standalone_not_a_reconnect_storm() {
+        // Finding 2 (bootstrap half) + finding 4: an answer we cannot read degrades to one
+        // Standalone notice, re-probed slowly, not a 250 ms reconnect loop.
+        let mock = builder()
+            .snapshot(json!({ "snapshot": { "panes": "not-an-array" } }))
+            .in_memory();
+        let (handle, mut rx) =
+            Client::spawn(Mem(mock.clone()), timings(), ClientOptions::default());
+        advance(Duration::from_secs(60)).await;
+        let events = drain(&mut rx);
+        let notices: Vec<&HerdrEvent> = events
+            .iter()
+            .filter(|e| matches!(e, HerdrEvent::Standalone { .. }))
+            .collect();
+        assert_eq!(notices.len(), 1, "{events:?}");
+        assert!(matches!(
+            notices[0],
+            HerdrEvent::Standalone { notice } if notice.contains("session.snapshot")
+        ));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, HerdrEvent::Disconnected { .. })),
+            "{events:?}"
+        );
+        // Re-probed every reconnect_max (10 s): 1 + 60/10 = 7 pings in 60 s, not ~240.
+        assert!(mock.count("ping") <= 7, "{} pings", mock.count("ping"));
+        assert_eq!(
+            mock.lifecycle_streams_open(),
+            0,
+            "no stream left open between probes"
+        );
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn client_protocol_mismatch_with_reconnect_announces_once_then_connects_when_fixed() {
+        // Finding 4: with reconnect on, a mismatch is one notice and a slow re-probe; when the
+        // server comes back with a supported protocol the client connects.
+        let mock = builder().protocol(22).in_memory();
+        let (handle, mut rx) =
+            Client::spawn(Mem(mock.clone()), timings(), ClientOptions::default());
+        advance(Duration::from_secs(45)).await;
+        let events = drain(&mut rx);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, HerdrEvent::Standalone { .. }))
+                .count(),
+            1,
+            "{events:?}"
+        );
+        let pings = mock.count("ping");
+        assert!((2..=6).contains(&pings), "{pings} pings in 45 s");
+        mock.set_protocol(21);
+        advance(timings().reconnect_max).await;
+        let events = drain(&mut rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, HerdrEvent::Connected { protocol: 21, .. })),
+            "{events:?}"
+        );
+        assert_eq!(mock.lifecycle_streams_open(), 1);
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn client_flapping_server_keeps_backing_off() {
+        // Finding 5: a server that acks and immediately drops must not reconnect every
+        // reconnect_initial forever; the attempt counter resets only after a stable session.
+        let mock = builder().in_memory();
+        let (handle, _rx, _) = boot(&mock).await;
+        let start = Instant::now();
+        for _ in 0..4 {
+            assert!(
+                mock.wait_until(20_000, |m| m.lifecycle_streams_open() > 0)
+                    .await
+            );
+            mock.close_lifecycle_streams();
+            settle().await;
+        }
+        // Four flaps: reconnect delays 250, 500, 1000, 2000 ms → at least 1750 ms elapsed
+        // before the fourth reopen; a constant 250 ms would take ~750 ms.
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(1750),
+            "reconnected too eagerly: {elapsed:?}"
+        );
+        // Boot + three reconnects were observed open (the fourth reopen is still backing off).
+        assert_eq!(mock.lifecycle_streams_opened_total(), 4);
+        assert_eq!(mock.count("ping"), 4);
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn client_released_agent_closes_status_subscription_at_resync() {
+        // Finding 6: one connection per *agent-bearing* pane — a pane whose agent went away
+        // loses its status connection at the next resync (and regains it on detection).
+        let mock = builder().in_memory();
+        let (handle, mut rx, _) = boot(&mock).await;
+        assert_eq!(mock.status_streams_open(P1), 1);
+        let mut released = snapshot();
+        for pane in released["snapshot"]["panes"].as_array_mut().unwrap() {
+            if pane["pane_id"] == P1 {
+                pane.as_object_mut().unwrap().remove("agent");
+                pane["agent_status"] = json!("unknown");
+            }
+        }
+        released["snapshot"]["agents"] = json!([]);
+        mock.set_snapshot(released);
+        mock.push_lifecycle(tab_focused_line());
+        advance(timings().coalesce).await;
+        assert!(
+            mock.wait_until(50, |m| m.status_streams_open(P1) == 0)
+                .await
+        );
+        let events = drain(&mut rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                HerdrEvent::StatusStreamClosed { pane_id, reason }
+                    if pane_id == P1 && reason.contains("no longer agent-bearing")
+            )),
+            "{events:?}"
+        );
+        assert!(
+            handle.snapshot().unwrap().panes.contains_key(P1),
+            "the pane itself stays"
+        );
+        // The agent comes back: detection reopens the subscription.
+        mock.set_snapshot(snapshot());
+        mock.push_lifecycle(agent_detected_line(P1, "demo"));
+        settle().await;
+        assert_eq!(mock.status_streams_open(P1), 1);
+        handle.shutdown().await;
     }
 
     async fn boot(
