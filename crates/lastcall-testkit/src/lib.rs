@@ -8,9 +8,15 @@
 //!   `just probe-hello`).
 //! - [`herdr_spawn`]: the isolated real-herdr spawner (docs/spec/00-spec.md §5.10).
 //! - [`fixture_repo`]: deterministic fixture git repositories with a local bare origin.
+//! - [`fixture_parent`]: the golden's three-root parent dir (two repos + a draft dir) with
+//!   first sight done before the history operations; `just probe-status` / `probe-watch`.
+//! - [`engine`]: open an engine over a fixture, `assert_pile!` in the harness's format, and
+//!   the SIGKILL fault injector for E1.
 //! - [`json_lines`]: a small synchronous newline-JSON reader over `UnixStream`, adapted from
 //!   herdr's test suite (see NOTICE).
 
+pub mod engine;
+pub mod fixture_parent;
 pub mod fixture_repo;
 pub mod herdr_spawn;
 pub mod json_lines;

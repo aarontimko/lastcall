@@ -1,0 +1,152 @@
+{
+  "status_version": 1,
+  "notices": [],
+  "roots": [
+    {
+      "root": "<W>/alpha",
+      "kind": "git",
+      "parent": "<W>",
+      "badge": null,
+      "head": "f1919ce9f906630aa6d3fc25b55cd030df21b529",
+      "branch": "main",
+      "in_progress": null,
+      "seen_tree": "ca2391dfaaa5b99135e687f93d88a46b143ccb16",
+      "seen_head": "2d06521f7566830cbcde5b3753f450dc35d6dbba",
+      "pending": [
+        {
+          "path": "f1",
+          "change": "modified",
+          "baseline": {
+            "oid": "4f11e054809c30868055c451effdb05bb024d500",
+            "mode": "100644"
+          },
+          "current": {
+            "oid": "84cb987fc4d289b9079793c5d283caaae39ef225",
+            "mode": "100644"
+          },
+          "added": 1,
+          "deleted": 1,
+          "hunks": 1,
+          "annotation": null,
+          "conflicted": false,
+          "collapsed": null,
+          "flag": null,
+          "rename": null
+        },
+        {
+          "path": "f2",
+          "change": "modified",
+          "baseline": {
+            "oid": "61780798228d17af2d34fce4cfbdf35556832472",
+            "mode": "100644"
+          },
+          "current": {
+            "oid": "5345dd10f5f2ba20925579971aefeb6d3ecf022b",
+            "mode": "100644"
+          },
+          "added": 1,
+          "deleted": 0,
+          "hunks": 1,
+          "annotation": null,
+          "conflicted": false,
+          "collapsed": null,
+          "flag": null,
+          "rename": null
+        }
+      ],
+      "groups": [],
+      "notices": []
+    },
+    {
+      "root": "<W>/beta",
+      "kind": "git",
+      "parent": "<W>",
+      "badge": null,
+      "head": "44348065daa941064a11b6e73af4f6ae8ec125b6",
+      "branch": "main",
+      "in_progress": null,
+      "seen_tree": "ca2391dfaaa5b99135e687f93d88a46b143ccb16",
+      "seen_head": "2d06521f7566830cbcde5b3753f450dc35d6dbba",
+      "pending": [
+        {
+          "path": "u1",
+          "change": "added",
+          "baseline": null,
+          "current": {
+            "oid": "424efd3b19b8c12d4d833bb6189f8a003d94b568",
+            "mode": "100644"
+          },
+          "added": 1,
+          "deleted": 0,
+          "hunks": 1,
+          "annotation": "upstream",
+          "conflicted": false,
+          "collapsed": null,
+          "flag": null,
+          "rename": null
+        },
+        {
+          "path": "u2",
+          "change": "added",
+          "baseline": null,
+          "current": {
+            "oid": "1ea56b6e60e652c8f8c1212de4554ffa0d1c9ff0",
+            "mode": "100644"
+          },
+          "added": 2,
+          "deleted": 0,
+          "hunks": 1,
+          "annotation": "mixed",
+          "conflicted": false,
+          "collapsed": null,
+          "flag": null,
+          "rename": null
+        }
+      ],
+      "groups": [
+        {
+          "kind": "upstream",
+          "paths": [
+            "u1"
+          ]
+        }
+      ],
+      "notices": []
+    },
+    {
+      "root": "<W>/notes",
+      "kind": "draft",
+      "parent": "<W>",
+      "badge": null,
+      "head": null,
+      "branch": null,
+      "in_progress": null,
+      "seen_tree": "06d3a4e06722f8463c85f088c0056a9bde816c39",
+      "seen_head": null,
+      "pending": [
+        {
+          "path": "n2.md",
+          "change": "modified",
+          "baseline": {
+            "oid": "9dd8315a6916a44700d5e9398abff5b8f99e9aa4",
+            "mode": "100644"
+          },
+          "current": {
+            "oid": "6b87b7abcda354532431a045e52e9a592f62fc94",
+            "mode": "100644"
+          },
+          "added": 2,
+          "deleted": 0,
+          "hunks": 1,
+          "annotation": null,
+          "conflicted": false,
+          "collapsed": null,
+          "flag": null,
+          "rename": null
+        }
+      ],
+      "groups": [],
+      "notices": []
+    }
+  ]
+}

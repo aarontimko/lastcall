@@ -17,12 +17,15 @@ just test-integration       # real git; real herdr only when LASTCALL_TEST_HERDR
 just test-integration-herdr # just herdr-fetch (pinned v0.8.2) then the integration tier
 just test-e2e               # placeholder until Phase 3
 just test                   # the three tiers in order
+just test-scenarios         # the docs/spec/01-scenarios.md suites (real git, temp fixtures)
+just probe-status           # release binary: status + status --json over a three-root fixture
 just hooks-install          # pre-commit = just lint && just test-unit
 ```
 
-Probes against the built binary: `just probe-config`, `just probe-hello`. The herdr demo for a
-human: `just hello-herdr` (see `docs/dev/hello-herdr.md`). Fixture upkeep: `just herdr-record`
-then `just fixtures-sync`.
+Probes against the built binary: `just probe-config`, `just probe-hello`, `just probe-status`,
+`just probe-watch` (the B1 notice arriving live). The herdr demo for a human: `just hello-herdr`
+(see `docs/dev/hello-herdr.md`). Fixture upkeep: `just herdr-record` then `just fixtures-sync`;
+`just golden-update` rewrites the `status --json` golden.
 
 Crates: `crates/lastcall-engine` (library: config, herdr client; the review engine from
 Phase 2; no terminal code), `crates/lastcall` (the binary), `crates/lastcall-testkit`
@@ -50,6 +53,13 @@ turns each into a named integration test.
 
 The operational spec for each phase (deliverables, gate checklist, traps). Read the current
 phase's kickoff before building anything in that phase.
+
+### The review engine: `docs/dev/engine.md`
+
+How a root's state is laid out on disk and how to inspect it with `jq`/`GIT_DIR=store git`,
+the two git runners and the read-only allowlist, the scan pipeline, the fail-open ladder, and
+the `status --json` schema. Read it before touching `crates/lastcall-engine/src/{store,ledger,
+index,scan,ops,engine,watcher}.rs`.
 
 ### hello-herdr demo: `docs/dev/hello-herdr.md`
 

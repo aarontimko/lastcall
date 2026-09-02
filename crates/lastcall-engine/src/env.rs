@@ -70,6 +70,12 @@ impl Env {
             .filter(|v| !v.is_empty())
     }
 
+    /// Every variable, in key order. Additive (Phase 2): the git runners overlay `GIT_*`,
+    /// `XDG_*` and `HOME` from here onto their children so tests can isolate git config.
+    pub fn vars(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.vars.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+    }
+
     /// The home directory, if known.
     pub fn home(&self) -> Option<&Path> {
         self.home.as_deref()
@@ -133,6 +139,15 @@ mod tests {
             env.xdg_state_home(),
             Some(PathBuf::from("/home/u/.local/state"))
         );
+    }
+
+    #[test]
+    fn env_vars_enumerates_in_key_order() {
+        let env = Env::empty("/work")
+            .with_var("GIT_CONFIG_GLOBAL", "/dev/null")
+            .with_var("A", "1");
+        let vars: Vec<(&str, &str)> = env.vars().collect();
+        assert_eq!(vars, vec![("A", "1"), ("GIT_CONFIG_GLOBAL", "/dev/null")]);
     }
 
     #[test]

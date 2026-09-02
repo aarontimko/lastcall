@@ -64,7 +64,13 @@ impl FixtureRepo {
     /// `mk_repo NAME`: init `NAME` (branch `main`) and bare `NAME.git`, add the remote, commit
     /// the seed files, push `-u origin main`.
     pub fn new(name: &str) -> Result<Self, GitError> {
-        let dir = TempDir::new("lc-fixture");
+        Self::new_in(TempDir::new("lc-fixture"), name)
+    }
+
+    /// [`Self::new`] inside a caller-supplied directory: `<dir>/<name>` and
+    /// `<dir>/<name>.git`. With [`TempDir::adopt`] the fixture outlives the value (the
+    /// golden's parent dir holds several).
+    pub fn new_in(dir: TempDir, name: &str) -> Result<Self, GitError> {
         let work = dir.join(name);
         let origin = dir.join(format!("{name}.git"));
         let mut repo = Self {
@@ -89,9 +95,27 @@ impl FixtureRepo {
         )?;
         let origin = repo.origin.to_string_lossy().to_string();
         repo.git(&["remote", "add", "origin", &origin])?;
+        // Local identity: the engine's upstream classifier reads `user.email` from the repo
+        // config (docs/spec/00-spec.md §6.4), and the child env below is not what it sees.
+        repo.git(&["config", "user.name", AUTHOR_NAME])?;
+        repo.git(&["config", "user.email", AUTHOR_EMAIL])?;
         repo.commit_files(SEED_FILES, "init")?;
         repo.git(&["push", "-q", "-u", "origin", "main"])?;
         Ok(repo)
+    }
+
+    /// Attach to a fixture that [`Self::new_in`] built earlier in `dir` (another process,
+    /// typically). No git runs; later commits get dates well past the originals.
+    pub fn open_in(dir: TempDir, name: &str) -> Self {
+        let work = dir.join(name);
+        let origin = dir.join(format!("{name}.git"));
+        Self {
+            _dir: dir,
+            name: name.to_string(),
+            work,
+            origin,
+            ticks: 1_000,
+        }
     }
 
     /// The working repo.
@@ -169,6 +193,63 @@ impl FixtureRepo {
         )?;
         self.git_in(&clone, &["push", "-q", "origin", "main"])?;
         let sha = self.git_in(&clone, &["rev-parse", "HEAD"])?;
+        let _ = std::fs::remove_dir_all(&clone);
+        Ok(sha.trim().to_string())
+    }
+
+    /// Commit the working tree as the fixed author (`git add -A && git commit`).
+    pub fn commit(&mut self, message: &str) -> Result<String, GitError> {
+        self.commit_files(&[], message)
+    }
+
+    /// From a fresh clone of `origin`, write `files`, commit as the coworker, push to
+    /// `origin main`. Returns the pushed commit hash. For scenarios where the coworker's
+    /// change must touch specific paths (C4, C5).
+    pub fn coworker_commit(
+        &mut self,
+        files: &[(&str, &str)],
+        message: &str,
+    ) -> Result<String, GitError> {
+        self.coworker_commit_to("main", files, message)
+    }
+
+    /// [`Self::coworker_commit`] onto `branch` (created from `origin/main` when it does not
+    /// exist yet) and pushed as `origin/<branch>` (C8).
+    pub fn coworker_commit_to(
+        &mut self,
+        branch: &str,
+        files: &[(&str, &str)],
+        message: &str,
+    ) -> Result<String, GitError> {
+        let clone = self._dir.join(format!("{}.cw", self.name));
+        let _ = std::fs::remove_dir_all(&clone);
+        let origin = self.origin.to_string_lossy().to_string();
+        self.git_in(
+            self._dir.path(),
+            &["clone", "-q", &origin, clone.to_str().unwrap()],
+        )?;
+        if branch != "main" {
+            self.git_in(&clone, &["checkout", "-q", "-b", branch])?;
+        }
+        for (path, contents) in files {
+            let full = clone.join(path);
+            if let Some(parent) = full.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| self.io_error(&e))?;
+            }
+            std::fs::write(&full, contents).map_err(|e| self.io_error(&e))?;
+        }
+        self.git_in(&clone, &["add", "-A"])?;
+        let date = self.next_date();
+        self.git_with_identity(
+            &clone,
+            COWORKER_NAME,
+            COWORKER_EMAIL,
+            &date,
+            &["commit", "-q", "-m", message],
+        )?;
+        self.git_in(&clone, &["push", "-q", "origin", branch])?;
+        let sha = self.git_in(&clone, &["rev-parse", "HEAD"])?;
+        let _ = std::fs::remove_dir_all(&clone);
         Ok(sha.trim().to_string())
     }
 
@@ -188,6 +269,74 @@ impl FixtureRepo {
     /// Run `git` in the working repo with the fixed environment.
     pub fn git(&self, args: &[&str]) -> Result<String, GitError> {
         self.git_in(&self.work, args)
+    }
+
+    /// Run `git` in another directory (a linked worktree, a nested repo) with the fixed
+    /// environment and identity.
+    pub fn git_at(&self, cwd: &Path, args: &[&str]) -> Result<String, GitError> {
+        self.git_in(cwd, args)
+    }
+
+    /// Write a file under the working repo (creating parents) without committing.
+    pub fn write(&self, rel: &str, contents: impl AsRef<[u8]>) -> PathBuf {
+        let full = self.work.join(rel);
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent).expect("create parent");
+        }
+        std::fs::write(&full, contents).expect("write fixture file");
+        full
+    }
+
+    /// Remove a file (or an empty directory) under the working repo.
+    pub fn remove(&self, rel: &str) {
+        let full = self.work.join(rel);
+        if full.is_dir() {
+            std::fs::remove_dir(&full).expect("remove fixture dir");
+        } else {
+            std::fs::remove_file(&full).expect("remove fixture file");
+        }
+    }
+
+    /// Create a symlink at `rel` pointing at `target` (link text as given).
+    pub fn symlink(&self, target: &str, rel: &str) {
+        std::os::unix::fs::symlink(target, self.work.join(rel)).expect("symlink");
+    }
+
+    /// `chmod +x` (or `-x`) a file under the working repo.
+    pub fn chmod_x(&self, rel: &str, executable: bool) {
+        use std::os::unix::fs::PermissionsExt;
+        let full = self.work.join(rel);
+        let mut perms = std::fs::metadata(&full).expect("stat").permissions();
+        let mode = if executable {
+            perms.mode() | 0o111
+        } else {
+            perms.mode() & !0o111
+        };
+        perms.set_mode(mode);
+        std::fs::set_permissions(&full, perms).expect("chmod");
+    }
+
+    /// `git checkout -q -b <branch>`.
+    pub fn checkout_b(&self, branch: &str) -> Result<(), GitError> {
+        self.git(&["checkout", "-q", "-b", branch]).map(|_| ())
+    }
+
+    /// `git checkout -q <target>`.
+    pub fn checkout(&self, target: &str) -> Result<(), GitError> {
+        self.git(&["checkout", "-q", target]).map(|_| ())
+    }
+
+    /// The engine's injected environment for this fixture: the same git isolation as the
+    /// fixture's own commands (`GIT_CONFIG_GLOBAL=/dev/null` etc.), `LASTCALL_STATE_DIR` set
+    /// to `state_dir`, a home directory inside the fixture's temp dir, and `cwd` = the
+    /// working repo. No test may reach the real home.
+    pub fn engine_env(&self, state_dir: &Path) -> lastcall_engine::env::Env {
+        engine_env_for(&self.work, &self._dir.join("home"), state_dir)
+    }
+
+    /// The fixture's temp dir (the parent of the working repo and `origin`).
+    pub fn parent_dir(&self) -> &Path {
+        self._dir.path()
     }
 
     fn next_date(&mut self) -> String {
@@ -250,6 +399,20 @@ impl FixtureRepo {
             stderr: err.to_string(),
         }
     }
+}
+
+/// The engine's injected environment for an arbitrary work dir: `cwd` = `work`, `HOME` =
+/// `home` (created, must be inside a temp dir), `LASTCALL_STATE_DIR` = `state_dir`, and
+/// the three git-config isolation variables. Used by [`FixtureRepo::engine_env`] and by
+/// re-executed child roles (E1) that cannot hold the fixture.
+pub fn engine_env_for(work: &Path, home: &Path, state_dir: &Path) -> lastcall_engine::env::Env {
+    std::fs::create_dir_all(home).expect("create fixture home");
+    lastcall_engine::env::Env::empty(work.to_path_buf())
+        .with_home(home.to_path_buf())
+        .with_var("GIT_CONFIG_GLOBAL", "/dev/null")
+        .with_var("GIT_CONFIG_SYSTEM", "/dev/null")
+        .with_var("GIT_CONFIG_NOSYSTEM", "1")
+        .with_var("LASTCALL_STATE_DIR", state_dir.to_string_lossy())
 }
 
 #[cfg(test)]

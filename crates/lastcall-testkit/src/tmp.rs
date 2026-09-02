@@ -28,6 +28,8 @@ fn unique_suffix() -> String {
 #[derive(Debug)]
 pub struct TempDir {
     path: PathBuf,
+    /// `false` for an adopted directory the caller owns (never removed).
+    owned: bool,
 }
 
 impl TempDir {
@@ -35,14 +37,22 @@ impl TempDir {
     pub fn new(prefix: &str) -> Self {
         let path = std::env::temp_dir().join(format!("{prefix}-{}", unique_suffix()));
         std::fs::create_dir_all(&path).expect("create temp dir");
-        Self { path }
+        Self { path, owned: true }
+    }
+
+    /// Wrap a directory the caller owns (created if missing); it is **not** removed on
+    /// drop. For fixtures built at a caller-chosen path (the golden's parent dir).
+    pub fn adopt(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        std::fs::create_dir_all(&path).expect("create adopted dir");
+        Self { path, owned: false }
     }
 
     /// A fresh directory at `/tmp/lc-<pid>-<nanos>-<n>/`, short enough for a Unix socket path.
     pub fn socket_dir() -> Self {
         let path = PathBuf::from(format!("/tmp/lc-{}", unique_suffix()));
         std::fs::create_dir_all(&path).expect("create socket temp dir");
-        let dir = Self { path };
+        let dir = Self { path, owned: true };
         let probe = dir.path().join("herdr.sock");
         assert!(
             probe.as_os_str().len() < 100,
@@ -86,7 +96,7 @@ impl TempDir {
 
 impl Drop for TempDir {
     fn drop(&mut self) {
-        if !self.path.as_os_str().is_empty() {
+        if self.owned && !self.path.as_os_str().is_empty() {
             let _ = std::fs::remove_dir_all(&self.path);
         }
     }

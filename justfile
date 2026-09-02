@@ -54,6 +54,14 @@ test-e2e:
     cargo test --workspace --test 'test_e2e_*'
 
 # All three tiers, in order.
+# The scenario suites (docs/spec/01-scenarios.md, one test per ID) against real git.
+test-scenarios:
+    cargo test -p lastcall-engine --test 'test_integration_scenarios*'
+
+# Rewrite crates/lastcall/tests/golden/status_multi_repo.json from the built binary.
+golden-update:
+    LASTCALL_UPDATE_GOLDEN=1 cargo test -p lastcall --test test_integration_status_golden
+
 test: test-unit test-integration test-e2e
 
 # The Phase 0 shell scenario harness (docs/spec/01-scenarios.md).
@@ -209,3 +217,44 @@ probe-hello:
 # Run hello-herdr from the dev checkout against the discovered session.
 hello-herdr *ARGS:
     cargo run -p lastcall -- hello-herdr {{ARGS}}
+
+# Release binary over the golden's three-root fixture: `status`, then `status --json`.
+probe-status:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --release -p lastcall
+    cargo build -p lastcall-testkit --example fixture_parent
+    dir="/tmp/lc-probe-$$"
+    trap 'rm -rf "$dir"' EXIT
+    mkdir -p "$dir/parent" "$dir/state"
+    echo "--- fixture_parent --parent $dir/parent --state-dir $dir/state ---"
+    ./target/debug/examples/fixture_parent --parent "$dir/parent" --state-dir "$dir/state"
+    export LASTCALL_CONFIG="$dir/state/config.toml" LASTCALL_STATE_DIR="$dir/state"
+    export HOME="$dir/state/home" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_NOSYSTEM=1
+    echo "--- (cd $dir/parent) lastcall status ---"
+    (cd "$dir/parent" && "$OLDPWD/target/release/lastcall" status)
+    echo "--- (cd $dir/parent) lastcall status --json ---"
+    (cd "$dir/parent" && "$OLDPWD/target/release/lastcall" status --json)
+
+# Release binary `watch --exit-after 8` over the same fixture while the example commits in
+# repo A at t+2 s and edits there at t+4 s: the B1 notice must appear. `--poll 2` is the
+# backstop for hosts whose filesystem events are late or missing (a wedged fseventsd): the
+# notice then arrives through the HEAD poll instead of the watch.
+probe-watch:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --release -p lastcall
+    cargo build -p lastcall-testkit --example fixture_parent
+    dir="/tmp/lc-probe-$$"
+    trap 'rm -rf "$dir"' EXIT
+    mkdir -p "$dir/parent" "$dir/state"
+    ./target/debug/examples/fixture_parent --parent "$dir/parent" --state-dir "$dir/state"
+    export LASTCALL_CONFIG="$dir/state/config.toml" LASTCALL_STATE_DIR="$dir/state"
+    export HOME="$dir/state/home" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_NOSYSTEM=1
+    ./target/debug/examples/fixture_parent --parent "$dir/parent" --state-dir "$dir/state" --late-ops > "$dir/late.log" 2>&1 &
+    late_pid=$!
+    echo "--- (cd $dir/parent) lastcall watch --exit-after 8 --poll 2 ---"
+    (cd "$dir/parent" && "$OLDPWD/target/release/lastcall" watch --exit-after 8 --poll 2)
+    wait "$late_pid"
+    echo "--- late-ops ---"
+    cat "$dir/late.log"
