@@ -47,7 +47,7 @@ herdr pane report-agent "$HERDR_PANE_ID" --source demo --agent demo --state work
 ```
 
 hello-herdr (in tab A) prints `event: event=pane_agent_detected ...`, `status: subscribed
-<B>`, and `[<B>] demo (none) → working` (or `unknown → working`) — the pane is now
+<B>`, and `[<B>] demo unknown → working` (a bare shell pane reports `unknown` on the released 0.8.2; a pane with no prior report at all shows `(none)`) — the pane is now
 agent-bearing and has its own status subscription.
 
 **Step 2 — complete the work while tab B is *not* focused.** Switch to tab A (hello-herdr's
