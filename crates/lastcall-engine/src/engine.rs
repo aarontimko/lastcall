@@ -183,6 +183,8 @@ pub struct HeadChange {
     pub to: Option<Oid>,
     pub branch: Option<String>,
     pub notice: Option<String>,
+    /// The engine-global number of the scan that produced `pile` ([`Engine::scan_seq`]).
+    pub seq: u64,
     /// The pile from the scan that followed.
     pub pile: Pile,
 }
@@ -203,6 +205,10 @@ pub struct Engine {
     /// How many times discovery re-ran after open (a budget probe for tests).
     discovery_runs: u64,
     git_version: String,
+    /// Engine-global scan sequence number: `+1` per pile [`Engine::scan`] produces, whichever
+    /// root; every publisher of a pile carries it so a consumer can drop a pile older than
+    /// one it already holds (a `scan_all` result arriving after an accept's rescan).
+    scan_seq: u64,
 }
 
 impl Engine {
@@ -232,6 +238,7 @@ impl Engine {
             pending_nested: Vec::new(),
             discovery_runs: 0,
             git_version,
+            scan_seq: 0,
         };
         engine.rescan()?;
         Ok(engine)
@@ -292,6 +299,13 @@ impl Engine {
     /// Discovery re-runs since open (`rescan`, including those `scan_all` triggers).
     pub fn discovery_runs(&self) -> u64 {
         self.discovery_runs
+    }
+
+    /// The number of the most recent scan that produced a pile (engine-global, strictly
+    /// increasing across roots, `0` before the first). Read it under the same lock as the
+    /// [`Engine::scan`] it describes.
+    pub fn scan_seq(&self) -> u64 {
+        self.scan_seq
     }
 
     pub fn resolve_root(&self, path: &Path) -> Option<PathBuf> {
@@ -597,12 +611,15 @@ impl Engine {
             }
         }
         state.last_pile = Some(pile.clone());
+        self.scan_seq += 1;
         Ok(pile)
     }
 
-    /// Scan every root (opening nested repositories discovered on the way).
-    pub fn scan_all(&mut self) -> Vec<(PathBuf, Result<Pile, EngineError>)> {
-        let mut results: BTreeMap<PathBuf, Result<Pile, EngineError>> = BTreeMap::new();
+    /// Scan every root (opening nested repositories discovered on the way). Each entry
+    /// carries the [`Engine::scan_seq`] of the scan that produced it (a failed scan reports
+    /// the number of the last one that succeeded; its pile is the error).
+    pub fn scan_all(&mut self) -> Vec<(PathBuf, u64, Result<Pile, EngineError>)> {
+        let mut results: BTreeMap<PathBuf, (u64, Result<Pile, EngineError>)> = BTreeMap::new();
         for _ in 0..3 {
             let todo: Vec<PathBuf> = self
                 .root_paths()
@@ -614,7 +631,7 @@ impl Engine {
             }
             for p in todo {
                 let r = self.scan(&p);
-                results.insert(p, r);
+                results.insert(p, (self.scan_seq, r));
             }
             // Discovery re-runs only when a scan saw the set of nested repos change (a
             // new `dir/` in `ls-files --others`), not on every call while one exists.
@@ -630,7 +647,10 @@ impl Engine {
                 _ => break,
             }
         }
-        let mut v: Vec<(PathBuf, Result<Pile, EngineError>)> = results.into_iter().collect();
+        let mut v: Vec<(PathBuf, u64, Result<Pile, EngineError>)> = results
+            .into_iter()
+            .map(|(p, (seq, r))| (p, seq, r))
+            .collect();
         v.sort_by(|a, b| a.0.as_os_str().cmp(b.0.as_os_str()));
         v
     }
@@ -659,6 +679,7 @@ impl Engine {
         let hint = headstate::last_reflog(&next.git_dir);
         self.roots.get_mut(root).expect("checked").head = next.clone();
         let pile = self.scan(root)?;
+        let seq = self.scan_seq;
         let facts = TransitionFacts {
             commits,
             files_differ: pile.rows.len(),
@@ -670,6 +691,7 @@ impl Engine {
             to: next.head.clone(),
             branch: next.branch.clone(),
             notice,
+            seq,
             pile,
         }))
     }
@@ -932,6 +954,35 @@ pub(crate) mod tests {
         // A fresh engine reads the same ledger.
         let mut engine = open_engine(&repo, &state, Config::default());
         assert!(engine.scan(&root).unwrap().is_empty());
+    }
+
+    #[test]
+    fn engine_scan_seq_is_monotone_across_scan_scan_all_and_inspect_head() {
+        let mut repo = FixtureRepo::new("eng-seq").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let root = only_root(&engine);
+        let s0 = engine.scan_seq();
+        engine.scan(&root).unwrap();
+        assert_eq!(engine.scan_seq(), s0 + 1, "one scan, one step");
+        assert!(
+            engine.scan(Path::new("/no/such/root")).is_err() && engine.scan_seq() == s0 + 1,
+            "a scan that produced no pile takes no number"
+        );
+        let all = engine.scan_all();
+        assert_eq!(all.len(), 1);
+        let (_, seq, pile) = &all[0];
+        assert!(pile.is_ok());
+        assert_eq!(*seq, s0 + 2, "scan_all numbers each pile it returns");
+        assert_eq!(
+            engine.scan_seq(),
+            *seq,
+            "the engine's counter is the last pile's number"
+        );
+        repo.commit_files(&[("f1", "committed\n")], "B1").unwrap();
+        let change = engine.inspect_head(&root).unwrap().expect("HEAD moved");
+        assert_eq!(change.seq, s0 + 3, "inspect_head's scan is numbered too");
+        assert_eq!(engine.scan_seq(), change.seq);
     }
 
     #[test]

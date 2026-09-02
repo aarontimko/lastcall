@@ -236,7 +236,7 @@ fn scenario_d9_nested_repo_is_its_own_root() {
         .unwrap();
     // The outer scan discovers the nested repo; scan_all rescans to open it.
     let results = s.engine.scan_all();
-    assert!(results.iter().all(|(_, r)| r.is_ok()), "{results:?}");
+    assert!(results.iter().all(|(_, _, r)| r.is_ok()), "{results:?}");
     let nested_canon = std::fs::canonicalize(&nested).unwrap();
     let root = s
         .engine

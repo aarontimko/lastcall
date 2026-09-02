@@ -92,9 +92,9 @@ fn app_of(engine: &mut Engine) -> App {
     app.handle(Action::Resize(W, H));
     let metas = engine.roots().into_iter().map(RootMeta::of).collect();
     app.sync_roots(metas);
-    for (root, result) in engine.scan_all() {
+    for (root, seq, result) in engine.scan_all() {
         let pile = result.expect("scan succeeds");
-        app.apply(EngineEvent::Pile { root, pile });
+        app.apply(EngineEvent::Pile { root, seq, pile });
     }
     app
 }
@@ -103,6 +103,7 @@ fn rescan(app: &mut App, engine: &mut Engine, root: &Path) -> Pile {
     let pile = engine.scan(root).expect("scan succeeds");
     app.apply(EngineEvent::Pile {
         root: root.to_path_buf(),
+        seq: engine.scan_seq(),
         pile: pile.clone(),
     });
     pile
@@ -177,7 +178,12 @@ fn tui_nav_three_roots() {
     // An unchanged pile changes nothing: same selection, same cursor, same bytes.
     let before = app.clone();
     let pile = engine.scan(&alpha).expect("scan");
-    let (changed, _) = app.apply(EngineEvent::Pile { root: alpha, pile });
+    let seq = engine.scan_seq();
+    let (changed, _) = app.apply(EngineEvent::Pile {
+        root: alpha,
+        seq,
+        pile,
+    });
     assert_eq!(changed, lastcall::tui::app::Changed::No);
     assert_eq!(app, before);
     assert_eq!(draw(&app, W, H).0, frame);
@@ -431,7 +437,7 @@ fn record_pile_fixture() {
     let scene = Scene::build();
     let mut engine = scene.engine();
     let mut piles: BTreeMap<String, Pile> = BTreeMap::new();
-    for (root, result) in engine.scan_all() {
+    for (root, _seq, result) in engine.scan_all() {
         let name = root.file_name().unwrap().to_string_lossy().into_owned();
         piles.insert(name, result.expect("scan ok"));
     }

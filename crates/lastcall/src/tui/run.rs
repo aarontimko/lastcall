@@ -127,7 +127,9 @@ impl Ui {
     /// Fold one finished piece of the loop's own engine work in.
     pub fn local(&mut self, local: Local) -> (Changed, Option<Effect>) {
         match local {
-            Local::Pile(root, pile) => self.app.apply(EngineEvent::Pile { root, pile }),
+            // Phase 4b (kickoff deliverable 5) threads the scan seq through `Local::Pile`;
+            // until then the reducer ignores it.
+            Local::Pile(root, pile) => self.app.apply(EngineEvent::Pile { root, seq: 0, pile }),
             Local::Roots(metas) => (self.app.sync_roots(metas), None),
             Local::RefreshDone => (self.app.refresh_done(), None),
             Local::Notice(root, text) => self.app.apply(EngineEvent::Notice { root, text }),
@@ -244,7 +246,7 @@ fn spawn_refresh(engine: &Arc<Mutex<Engine>>, tx: mpsc::UnboundedSender<Local>) 
         let Some(results) = joined(scan, &tx, "refresh").await else {
             return;
         };
-        for (root, result) in results {
+        for (root, _seq, result) in results {
             let local = match result {
                 Ok(pile) => Local::Pile(root, pile),
                 Err(e) => Local::Notice(Some(root), format!("scan failed: {e}")),

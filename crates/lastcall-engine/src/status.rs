@@ -202,14 +202,14 @@ impl StatusReport {
                     .into_iter()
                     .map(|r| {
                         let result = engine.scan(&r);
-                        (r, result)
+                        (r, engine.scan_seq(), result)
                     })
                     .collect()
             }
             None => engine.scan_all(),
         };
         let mut roots = Vec::new();
-        for (path, result) in results {
+        for (path, _seq, result) in results {
             let Some(root) = engine.root(&path) else {
                 continue;
             };

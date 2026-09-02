@@ -330,7 +330,7 @@ impl App {
     /// Fold one engine event in. `Head` and `RootsChanged` ask the loop for `SyncRoots`.
     pub fn apply(&mut self, event: EngineEvent) -> (Changed, Option<Effect>) {
         match event {
-            EngineEvent::Pile { root, pile } => (self.apply_pile(root, pile), None),
+            EngineEvent::Pile { root, pile, .. } => (self.apply_pile(root, pile), None),
             EngineEvent::Head {
                 root,
                 from,
@@ -821,6 +821,7 @@ pub(crate) mod testfix {
     pub fn pile_event(name: &str, pile: Pile) -> EngineEvent {
         EngineEvent::Pile {
             root: root(name),
+            seq: 0,
             pile,
         }
     }

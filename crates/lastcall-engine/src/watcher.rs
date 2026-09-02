@@ -49,9 +49,11 @@ impl Default for EngineTimings {
 /// What the watcher publishes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EngineEvent {
-    /// A root was scanned.
+    /// A root was scanned. `seq` is the engine-global number of that scan
+    /// ([`Engine::scan_seq`]): a consumer holding a newer pile for `root` drops an older one.
     Pile {
         root: PathBuf,
+        seq: u64,
         pile: Pile,
     },
     /// A root's HEAD moved (or an in-progress operation finished).
@@ -324,8 +326,9 @@ async fn scan_root(
     root: PathBuf,
 ) -> bool {
     let r = root.clone();
-    match blocking(engine, move |e| e.scan(&r)).await {
-        Ok(pile) => emit(tx, EngineEvent::Pile { root, pile }).await,
+    // The seq is read under the same lock as the scan it numbers.
+    match blocking(engine, move |e| e.scan(&r).map(|pile| (e.scan_seq(), pile))).await {
+        Ok((seq, pile)) => emit(tx, EngineEvent::Pile { root, seq, pile }).await,
         Err(e) => {
             emit(
                 tx,
@@ -352,6 +355,7 @@ async fn inspect_root(
             to,
             branch,
             notice,
+            seq,
             pile,
         })) => {
             emit(
@@ -365,7 +369,7 @@ async fn inspect_root(
                 },
             )
             .await
-                && emit(tx, EngineEvent::Pile { root, pile }).await
+                && emit(tx, EngineEvent::Pile { root, seq, pile }).await
         }
         Ok(None) => true,
         Err(e) => {
