@@ -112,6 +112,8 @@ impl Engine {
 #[derive(Debug, Clone)]
 struct RootWatch {
     path: PathBuf,
+    /// The parent dir the root was discovered under; the unit of watching.
+    parent: PathBuf,
     git_dir: Option<PathBuf>,
     common_dir: Option<PathBuf>,
 }
@@ -179,6 +181,7 @@ fn root_watches(engine: &Engine) -> Vec<RootWatch> {
         .into_iter()
         .map(|r| RootWatch {
             path: r.path.clone(),
+            parent: r.parent.clone(),
             git_dir: r.repo.as_ref().map(|_| r.head.git_dir.clone()),
             common_dir: r
                 .repo
@@ -189,7 +192,52 @@ fn root_watches(engine: &Engine) -> Vec<RootWatch> {
         .collect()
 }
 
-/// (Re)install recursive watches: every root, plus git dirs that live outside every root.
+/// The recursive watches a set of roots needs: each root's **parent dir** (one watch covers
+/// every root under it — on macOS each `watch` call re-registers the FSEvents stream, which
+/// can take seconds), plus any root not under one of those, plus every git dir that lives
+/// outside them (a linked worktree's common dir, D10).
+fn wanted_watches(roots: &[RootWatch]) -> BTreeSet<PathBuf> {
+    let mut wanted: BTreeSet<PathBuf> = roots.iter().map(|r| r.parent.clone()).collect();
+    let covered = |p: &Path, w: &BTreeSet<PathBuf>| w.iter().any(|d| p.starts_with(d));
+    for r in roots {
+        if !covered(&r.path, &wanted) {
+            wanted.insert(r.path.clone());
+        }
+    }
+    for r in roots {
+        for dir in [&r.git_dir, &r.common_dir].into_iter().flatten() {
+            if !covered(dir, &wanted) {
+                wanted.insert(dir.clone());
+            }
+        }
+    }
+    wanted
+}
+
+/// What a finished [`spawn_install`] hands back.
+type Installed = (
+    Option<notify::RecommendedWatcher>,
+    BTreeSet<PathBuf>,
+    Vec<String>,
+);
+
+/// Run [`install_watches`] off the runtime: `notify`'s `watch` blocks until the platform
+/// stream is registered, seconds on some macOS hosts, and the initial scans must not wait
+/// for it. The watcher and the watched set travel with the task and come back with it.
+fn spawn_install(
+    watcher: Option<notify::RecommendedWatcher>,
+    watched: BTreeSet<PathBuf>,
+    roots: Vec<RootWatch>,
+) -> JoinHandle<Installed> {
+    tokio::task::spawn_blocking(move || {
+        let mut watcher = watcher;
+        let mut watched = watched;
+        let notices = install_watches(&mut watcher, &mut watched, &roots);
+        (watcher, watched, notices)
+    })
+}
+
+/// (Re)install the recursive watches of [`wanted_watches`]. Blocking; see [`spawn_install`].
 fn install_watches(
     watcher: &mut Option<notify::RecommendedWatcher>,
     watched: &mut BTreeSet<PathBuf>,
@@ -199,14 +247,7 @@ fn install_watches(
     let Some(w) = watcher.as_mut() else {
         return notices;
     };
-    let mut wanted: BTreeSet<PathBuf> = roots.iter().map(|r| r.path.clone()).collect();
-    for r in roots {
-        for dir in [&r.git_dir, &r.common_dir].into_iter().flatten() {
-            if !roots.iter().any(|x| dir.starts_with(&x.path)) {
-                wanted.insert(dir.clone());
-            }
-        }
-    }
+    let wanted = wanted_watches(roots);
     for gone in watched.difference(&wanted).cloned().collect::<Vec<_>>() {
         let _ = w.unwatch(&gone);
         watched.remove(&gone);
@@ -333,19 +374,14 @@ async fn run_loop(
         let g = lock(&engine);
         (root_watches(&g), g.ignore_globs().clone())
     };
-    for n in install_watches(&mut watcher, &mut watched, &roots) {
-        if !emit(
-            &tx,
-            EngineEvent::Notice {
-                root: None,
-                text: n,
-            },
-        )
-        .await
-        {
-            return;
-        }
-    }
+    // Watches install off the runtime while the initial scans run; when they land, every
+    // root is scanned and inspected once more so nothing from the gap is missed.
+    let mut install: Option<JoinHandle<Installed>> = Some(spawn_install(
+        watcher.take(),
+        std::mem::take(&mut watched),
+        roots.clone(),
+    ));
+    let mut reinstall = false;
     // Initial scans.
     for r in roots.iter().map(|r| r.path.clone()).collect::<Vec<_>>() {
         if !scan_root(&engine, &tx, r).await {
@@ -369,6 +405,45 @@ async fn run_loop(
         );
         tokio::select! {
             _ = stop.changed() => break,
+            done = async { install.as_mut().expect("guarded by the branch condition").await }, if install.is_some() => {
+                install = None;
+                match done {
+                    Ok((w, set, notices)) => {
+                        watcher = w;
+                        watched = set;
+                        for n in notices {
+                            if !emit(&tx, EngineEvent::Notice { root: None, text: n }).await { return; }
+                        }
+                        if reinstall {
+                            reinstall = false;
+                            install = Some(spawn_install(watcher.take(), std::mem::take(&mut watched), roots.clone()));
+                        } else {
+                            // Close the gap between the initial scans and the live watch,
+                            // then say the watch is live; the rescan backstop counts from
+                            // here.
+                            for r in roots.clone() {
+                                let ok = if r.git_dir.is_some() {
+                                    inspect_root(&engine, &tx, r.path).await
+                                } else {
+                                    scan_root(&engine, &tx, r.path).await
+                                };
+                                if !ok { return; }
+                            }
+                            rescan.reset();
+                            let text = format!(
+                                "watching {} ({} root{})",
+                                watched.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", "),
+                                roots.len(),
+                                if roots.len() == 1 { "" } else { "s" }
+                            );
+                            if !emit(&tx, EngineEvent::Notice { root: None, text }).await { return; }
+                        }
+                    }
+                    Err(e) => {
+                        if !emit(&tx, EngineEvent::Notice { root: None, text: format!("watch installation failed, polling only: {e}") }).await { return; }
+                    }
+                }
+            }
             res = fs_rx.recv() => {
                 let Some(res) = res else { break };
                 match res {
@@ -403,8 +478,10 @@ async fn run_loop(
                     Ok(changed) => {
                         if !changed.is_empty() {
                             roots = { let g = lock(&engine); root_watches(&g) };
-                            for n in install_watches(&mut watcher, &mut watched, &roots) {
-                                if !emit(&tx, EngineEvent::Notice { root: None, text: n }).await { return; }
+                            if install.is_some() {
+                                reinstall = true;
+                            } else {
+                                install = Some(spawn_install(watcher.take(), std::mem::take(&mut watched), roots.clone()));
                             }
                             if !emit(&tx, EngineEvent::RootsChanged(changed)).await { return; }
                         }
@@ -445,6 +522,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn watcher_wanted_watches_are_parent_dirs_plus_external_git_dirs() {
+        let rw =
+            |path: &str, parent: &str, git_dir: Option<&str>, common: Option<&str>| RootWatch {
+                path: PathBuf::from(path),
+                parent: PathBuf::from(parent),
+                git_dir: git_dir.map(PathBuf::from),
+                common_dir: common.map(PathBuf::from),
+            };
+        let roots = vec![
+            rw("/w/alpha", "/w", Some("/w/alpha/.git"), None),
+            rw("/w/beta", "/w", Some("/w/beta/.git"), None),
+            rw("/w/notes", "/w", None, None),
+            // A linked worktree whose common dir lives outside every parent dir.
+            rw(
+                "/w/wt",
+                "/w",
+                Some("/elsewhere/main/.git/worktrees/wt"),
+                Some("/elsewhere/main/.git"),
+            ),
+            // An ad-hoc root that is its own parent.
+            rw("/adhoc", "/adhoc", Some("/adhoc/.git"), None),
+        ];
+        let wanted: Vec<PathBuf> = wanted_watches(&roots).into_iter().collect();
+        assert_eq!(
+            wanted,
+            vec![
+                PathBuf::from("/adhoc"),
+                PathBuf::from("/elsewhere/main/.git"),
+                PathBuf::from("/elsewhere/main/.git/worktrees/wt"),
+                PathBuf::from("/w"),
+            ]
+        );
+    }
+
+    #[test]
     fn watcher_git_dir_allowlist() {
         for ok in [
             "HEAD",
@@ -477,16 +589,19 @@ mod tests {
         let roots = vec![
             RootWatch {
                 path: PathBuf::from("/w/a"),
+                parent: PathBuf::from("/w"),
                 git_dir: Some(PathBuf::from("/w/a/.git")),
                 common_dir: None,
             },
             RootWatch {
                 path: PathBuf::from("/w/a/inner"),
+                parent: PathBuf::from("/w/a"),
                 git_dir: Some(PathBuf::from("/w/a/inner/.git")),
                 common_dir: None,
             },
             RootWatch {
                 path: PathBuf::from("/w/wt"),
+                parent: PathBuf::from("/w"),
                 git_dir: Some(PathBuf::from("/w/main/.git/worktrees/wt")),
                 common_dir: Some(PathBuf::from("/w/main/.git")),
             },
@@ -521,6 +636,24 @@ mod live_tests {
             .await
             .ok()
             .flatten()
+    }
+
+    /// Consume events until the watch is live (registering an FSEvents stream can take
+    /// seconds on macOS); the gap-closing scans precede the notice.
+    async fn wait_live(w: &mut Watcher) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no 'watching' notice within 30 s"
+            );
+            if let Some(EngineEvent::Notice { text, .. }) =
+                next_event(&mut *w, Duration::from_secs(5)).await
+                && text.starts_with("watching ")
+            {
+                return;
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -580,6 +713,7 @@ mod live_tests {
             matches!(first, EngineEvent::Pile { ref pile, .. } if pile.is_empty()),
             "{first:?}"
         );
+        wait_live(&mut w).await;
 
         repo.write("vendor/x", "v2\n");
         // Nothing wakes a scan for an ignored path within the debounce window.

@@ -31,7 +31,7 @@ pub fn run(json: bool, exit_after: Option<u64>) -> Result<ExitCode, Box<dyn std:
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(async move {
+    let outcome = runtime.block_on(async move {
         let mut watcher = engine.run(EngineTimings::default());
         let deadline = exit_after.map(|secs| tokio::time::sleep(Duration::from_secs(secs)));
         tokio::pin!(deadline);
@@ -63,7 +63,10 @@ pub fn run(json: bool, exit_after: Option<u64>) -> Result<ExitCode, Box<dyn std:
         };
         watcher.join().await;
         Ok(code)
-    })
+    });
+    // A watch installation still registering its platform stream must not hold the exit.
+    runtime.shutdown_timeout(Duration::from_millis(500));
+    outcome
 }
 
 fn print_line(json: bool, value: &serde_json::Value, human: impl FnOnce() -> String) {
