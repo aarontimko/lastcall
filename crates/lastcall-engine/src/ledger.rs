@@ -331,6 +331,23 @@ pub fn load(paths: &RepoPaths, clock: &dyn Clock) -> Result<LoadResult, LedgerEr
 }
 
 /// Rename `ledger.json` to `ledger.json.unreadable-<secs>-<n>`, never clobbering.
+/// Identity of `ledger.json` on disk: (mtime, length, inode). Writes are rename-atomic,
+/// so any write yields a new inode; engines compare stamps between scans to notice a
+/// ledger written by another process. `None` when the file is absent.
+pub type Stamp = (SystemTime, u64, u64);
+
+pub fn stamp(paths: &RepoPaths) -> Option<Stamp> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(&paths.ledger).ok()?;
+    Some((m.modified().ok()?, m.len(), m.ino()))
+}
+
+/// Move the ledger aside (to `ledger.json.unreadable-<secs>-<n>`) without parsing it: the
+/// open path's answer to a ledger that belongs to another root.
+pub fn move_aside_ledger(paths: &RepoPaths, clock: &dyn Clock) -> Result<PathBuf, LedgerError> {
+    move_aside(&paths.ledger, clock)
+}
+
 /// The newest `ledger.json.unreadable-*` beside the ledger, if any. With no `ledger.json`
 /// next to it, it means another process moved a corrupt ledger aside and has not written
 /// its replacement yet (the open path treats that as unreadable, never as first sight).

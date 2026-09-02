@@ -168,23 +168,44 @@ impl RootStatus {
     }
 }
 
+/// Why a report could not be built.
+#[derive(Debug, thiserror::Error)]
+pub enum StatusError {
+    #[error("--root {}: not a watched root", .0.display())]
+    UnknownRoot(PathBuf),
+}
+
 impl StatusReport {
-    /// Scan every root (or only `only`, when given) and build the report.
-    pub fn build(engine: &mut Engine, only: Option<&[PathBuf]>) -> StatusReport {
-        let results = engine.scan_all();
-        let wanted: Option<Vec<PathBuf>> = only.map(|paths| {
-            paths
-                .iter()
-                .filter_map(|p| engine.resolve_root(p))
-                .collect()
-        });
+    /// Scan every root — or only the roots `only` resolves to (a path inside a root
+    /// selects it), scanning nothing else — and build the report. A path that resolves to
+    /// no root is an error, never an empty report.
+    pub fn build(
+        engine: &mut Engine,
+        only: Option<&[PathBuf]>,
+    ) -> Result<StatusReport, StatusError> {
+        let results = match only {
+            Some(paths) => {
+                let mut selected: Vec<PathBuf> = Vec::new();
+                for p in paths {
+                    let root = engine
+                        .resolve_root(p)
+                        .ok_or_else(|| StatusError::UnknownRoot(p.clone()))?;
+                    if !selected.contains(&root) {
+                        selected.push(root);
+                    }
+                }
+                selected
+                    .into_iter()
+                    .map(|r| {
+                        let result = engine.scan(&r);
+                        (r, result)
+                    })
+                    .collect()
+            }
+            None => engine.scan_all(),
+        };
         let mut roots = Vec::new();
         for (path, result) in results {
-            if let Some(w) = &wanted
-                && !w.contains(&path)
-            {
-                continue;
-            }
             let Some(root) = engine.root(&path) else {
                 continue;
             };
@@ -195,11 +216,11 @@ impl StatusReport {
             roots.push(status);
         }
         roots.sort_by(|a, b| a.root.as_bytes().cmp(b.root.as_bytes()));
-        StatusReport {
+        Ok(StatusReport {
             status_version: STATUS_VERSION,
             notices: engine.notices().to_vec(),
             roots,
-        }
+        })
     }
 
     pub fn to_json(&self) -> String {

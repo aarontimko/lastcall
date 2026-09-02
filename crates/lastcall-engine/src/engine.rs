@@ -117,10 +117,49 @@ pub struct RootState {
     pub notices: Vec<String>,
     pub last_pile: Option<Pile>,
     pub nested_repos: Vec<Vec<u8>>,
+    /// Set when a scan changed `nested_repos`; `scan_all` re-runs discovery only then.
+    pub nested_changed: bool,
     pub user_email: Option<String>,
+    /// Identity of `ledger.json` when `ledger` was read; a scan re-reads on change.
+    pub ledger_stamp: Option<ledger::Stamp>,
 }
 
 impl RootState {
+    /// Adopt a ledger another process wrote since this one was read (an accept in a second
+    /// `lastcall`, a fold) so a long-running engine never shows a stale baseline. The read
+    /// is unlocked: writes are rename-atomic, so it sees either the old or the new file.
+    /// Content that does not parse is left to `open`'s rules; the loaded ledger stays.
+    fn reload_ledger_if_changed(&mut self) {
+        let now = ledger::stamp(&self.paths);
+        if now == self.ledger_stamp {
+            return;
+        }
+        self.ledger_stamp = now;
+        let Ok(bytes) = std::fs::read(&self.paths.ledger) else {
+            return;
+        };
+        let Ok((mut fresh, _)) = ledger::parse(&bytes) else {
+            return;
+        };
+        if fresh.seen_tree != self.ledger.seen_tree {
+            self.tree = match &fresh.seen_tree {
+                Some(t) if self.store.exists(t) => match self.store.ls_tree(t) {
+                    Ok(entries) => entries,
+                    Err(_) => {
+                        fresh.seen_tree = None;
+                        TreeEntries::new()
+                    }
+                },
+                Some(_) => {
+                    fresh.seen_tree = None;
+                    TreeEntries::new()
+                }
+                None => TreeEntries::new(),
+            };
+        }
+        self.ledger = fresh;
+    }
+
     pub fn seen_head(&self) -> Option<&Oid> {
         self.ledger.seen_at.head_commit.as_ref()
     }
@@ -158,6 +197,8 @@ pub struct Engine {
     /// Engine-level notices (config resolution, discovery).
     notices: Vec<String>,
     pending_nested: Vec<(PathBuf, PathBuf)>,
+    /// How many times discovery re-ran after open (a budget probe for tests).
+    discovery_runs: u64,
     git_version: String,
 }
 
@@ -186,6 +227,7 @@ impl Engine {
             ignore,
             notices: resolved.notices.clone(),
             pending_nested: Vec::new(),
+            discovery_runs: 0,
             git_version,
         };
         engine.rescan()?;
@@ -244,6 +286,11 @@ impl Engine {
     }
 
     /// Resolve a user-supplied path (any directory inside a root) to the root's key.
+    /// Discovery re-runs since open (`rescan`, including those `scan_all` triggers).
+    pub fn discovery_runs(&self) -> u64 {
+        self.discovery_runs
+    }
+
     pub fn resolve_root(&self, path: &Path) -> Option<PathBuf> {
         let canon = std::fs::canonicalize(path).ok()?;
         self.roots
@@ -255,6 +302,7 @@ impl Engine {
 
     /// Re-run discovery; open new roots, drop removed ones (ledgers kept on disk).
     pub fn rescan(&mut self) -> Result<RootsChanged, EngineError> {
+        self.discovery_runs += 1;
         let mut nested = std::mem::take(&mut self.pending_nested);
         for root in self.roots.values() {
             for n in &root.nested_repos {
@@ -356,7 +404,20 @@ impl Engine {
             }
         }
         let clock: &dyn Clock = self.options.clock.as_ref();
-        let mut ledger = match ledger::load(&paths, clock)? {
+        let expected_root = d.path.to_string_lossy();
+        let first = match ledger::load(&paths, clock)? {
+            LoadResult::Loaded { ledger, .. } if ledger.root != expected_root => {
+                // A ledger recorded for another path is another root's state, however it
+                // got here (kickoff deliverable 2): exactly an unreadable ledger.
+                let moved_to = ledger::move_aside_ledger(&paths, clock)?;
+                LoadResult::Unreadable {
+                    moved_to,
+                    reason: format!("recorded root {} is not {expected_root}", ledger.root),
+                }
+            }
+            other => other,
+        };
+        let mut ledger = match first {
             LoadResult::Loaded { ledger, notices: n } => {
                 notices.extend(n);
                 ledger
@@ -447,6 +508,7 @@ impl Engine {
             Some(t) => store.ls_tree(t)?,
             None => TreeEntries::new(),
         };
+        let ledger_stamp = ledger::stamp(&paths);
         Ok(RootState {
             path: d.path.clone(),
             kind: d.kind,
@@ -465,7 +527,9 @@ impl Engine {
             notices,
             last_pile: None,
             nested_repos: Vec::new(),
+            nested_changed: false,
             user_email,
+            ledger_stamp,
         })
     }
 
@@ -477,6 +541,7 @@ impl Engine {
             .roots
             .get_mut(root)
             .ok_or_else(|| EngineError::NoSuchRoot(root.to_path_buf()))?;
+        state.reload_ledger_if_changed();
         let out = scan::scan(&ScanInputs {
             store: &state.store,
             index: &state.index,
@@ -493,6 +558,7 @@ impl Engine {
         let mut pile = out.pile;
         if out.nested_repos != state.nested_repos {
             state.nested_repos = out.nested_repos;
+            state.nested_changed = true;
         }
         if let Some(rg) = &state.repo {
             // Classify against the *live* HEAD, not the last inspected one: a pull or
@@ -540,8 +606,13 @@ impl Engine {
                 let r = self.scan(&p);
                 results.insert(p, r);
             }
-            let has_new_nested = self.roots.values().any(|r| !r.nested_repos.is_empty());
-            if !has_new_nested {
+            // Discovery re-runs only when a scan saw the set of nested repos change (a
+            // new `dir/` in `ls-files --others`), not on every call while one exists.
+            let mut nested_changed = false;
+            for r in self.roots.values_mut() {
+                nested_changed |= std::mem::take(&mut r.nested_changed);
+            }
+            if !nested_changed {
                 break;
             }
             match self.rescan() {
@@ -711,6 +782,7 @@ pub(crate) mod tests {
     use crate::store::tests::fixture_env;
     use lastcall_testkit::fixture_repo::FixtureRepo;
     use lastcall_testkit::tmp::TempDir;
+    use std::time::Duration;
 
     /// A `Loaded`/`Resolved` pair watching the fixture's parent dir.
     pub(crate) fn loaded_for(
@@ -778,8 +850,8 @@ pub(crate) mod tests {
         let pile = engine.scan(&root).unwrap();
         assert_eq!(scan::pile_lines(&pile), vec!["f1", "new.txt"]);
 
-        let a = StatusReport::build(&mut engine, None).to_json();
-        let b = StatusReport::build(&mut engine, None).to_json();
+        let a = StatusReport::build(&mut engine, None).unwrap().to_json();
+        let b = StatusReport::build(&mut engine, None).unwrap().to_json();
         assert_eq!(a, b, "status is byte-stable across scans");
         assert!(a.contains("\"status_version\": 1"));
         assert!(!a.contains("\"at\""), "no timestamps in status: {a}");
@@ -788,7 +860,9 @@ pub(crate) mod tests {
         assert_eq!(v["roots"][0]["pending"][0]["change"], "modified");
         assert_eq!(v["roots"][0]["pending"][1]["change"], "added");
         assert_eq!(v["roots"][0]["branch"], "main");
-        let human = StatusReport::build(&mut engine, None).render_human();
+        let human = StatusReport::build(&mut engine, None)
+            .unwrap()
+            .render_human();
         assert!(human.starts_with("eng (main)  2 pending\n"), "{human}");
         assert!(human.contains("  M f1  +1 −"), "{human}");
         assert!(human.contains("  A new.txt  +1 −0"), "{human}");
@@ -1012,6 +1086,160 @@ pub(crate) mod tests {
             scan::pile_lines(&engine.scan(&root).unwrap()),
             ["f1 upstream"]
         );
+    }
+
+    /// R1/R6: a global `core.fsmonitor = true` (file or env-injected) must neither hang the
+    /// scan (`update-index --refresh` under our GIT_DIR waited on a daemon forever) nor
+    /// start an `fsmonitor--daemon` anywhere.
+    #[test]
+    fn engine_scan_returns_under_a_global_fsmonitor_config() {
+        let repo = FixtureRepo::new("eng-fsmon").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let global = state.path().join("gitconfig");
+        std::fs::write(
+            &global,
+            "[core]\n\tfsmonitor = true\n\tuntrackedCache = true\n",
+        )
+        .unwrap();
+        let env = fixture_env(&repo, &state)
+            .with_var("GIT_CONFIG_GLOBAL", global.to_string_lossy().into_owned())
+            .with_var("GIT_CONFIG_PARAMETERS", "'core.fsmonitor=true'");
+        let (loaded, resolved) = loaded_for(&repo, &state, Config::default());
+        repo.write("f1", "edited\n");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_env = env.clone();
+        std::thread::spawn(move || {
+            let mut engine =
+                Engine::open(&loaded, &resolved, &worker_env, EngineOptions::default()).unwrap();
+            let root = engine.root_paths()[0].clone();
+            let store = engine.root(&root).unwrap().paths.store.clone();
+            let pile = engine.scan(&root).map(|p| scan::pile_lines(&p));
+            let _ = tx.send((pile, store));
+        });
+        let (pile, store) = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the scan returned within 5 s (an fsmonitor hang otherwise)");
+        assert_eq!(pile.unwrap(), ["f1"]);
+        // No daemon for the user's repository nor for the store.
+        for (dir, git_dir) in [(repo.path(), None), (repo.path(), Some(store.as_path()))] {
+            let mut cmd = crate::git::base_command(&env, dir);
+            if let Some(g) = git_dir {
+                cmd.env("GIT_DIR", g);
+            }
+            let status = cmd.args(["fsmonitor--daemon", "status"]).output().unwrap();
+            if status.status.success() {
+                let _ = crate::git::base_command(&env, dir)
+                    .args(["fsmonitor--daemon", "stop"])
+                    .output();
+                panic!("an fsmonitor daemon was started for {dir:?} (git_dir {git_dir:?})");
+            }
+        }
+    }
+
+    /// R2: a long-running engine adopts an accept made by another process. A and B open
+    /// the same root; A accepts f1@v1; the user restores the committed content; B must
+    /// show f1 pending (against A's baseline) exactly as a fresh engine does.
+    #[test]
+    fn engine_scan_reloads_a_ledger_written_by_another_engine() {
+        let repo = FixtureRepo::new("eng-two").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let mut a = open_engine(&repo, &state, Config::default());
+        let mut b = open_engine(&repo, &state, Config::default());
+        let root = only_root(&a);
+        let committed = std::fs::read(repo.path().join("f1")).unwrap();
+        repo.write("f1", "v1\n");
+        assert_eq!(scan::pile_lines(&b.scan(&root).unwrap()), ["f1"]);
+        let pile = a.scan(&root).unwrap();
+        let rendered = Rendered::of(pile.row(b"f1").unwrap());
+        assert!(
+            a.ops(&root)
+                .unwrap()
+                .accept_file(&rendered, &NoFault)
+                .unwrap()
+                .ok()
+        );
+        assert!(a.scan(&root).unwrap().is_empty());
+        repo.write("f1", committed);
+        let mut fresh = open_engine(&repo, &state, Config::default());
+        assert_eq!(scan::pile_lines(&fresh.scan(&root).unwrap()), ["f1"]);
+        assert_eq!(
+            scan::pile_lines(&b.scan(&root).unwrap()),
+            ["f1"],
+            "B adopted A's accept instead of its stale in-memory ledger"
+        );
+    }
+
+    /// R5: discovery re-runs when a scan first sees a nested repo, not on every
+    /// `scan_all` while one exists.
+    #[test]
+    fn engine_scan_all_rediscovers_only_when_nested_repos_change() {
+        let repo = FixtureRepo::new("eng-nested").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let nested = repo.path().join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        repo.git_at(&nested, &["init", "-q", "-b", "main"]).unwrap();
+        std::fs::write(nested.join("n"), "n\n").unwrap();
+        let mut engine = open_engine(&repo, &state, Config::default());
+        assert_eq!(engine.roots().len(), 1);
+        let runs0 = engine.discovery_runs();
+        let first = engine.scan_all();
+        assert_eq!(engine.roots().len(), 2, "the nested repo became a root");
+        assert_eq!(first.len(), 2);
+        let runs1 = engine.discovery_runs();
+        assert!(runs1 > runs0);
+        let second = engine.scan_all();
+        assert_eq!(second.len(), 2);
+        assert_eq!(
+            engine.discovery_runs(),
+            runs1,
+            "no rediscovery while the nested set is unchanged"
+        );
+    }
+
+    /// R7: `--root` outside every root (or nonexistent) is an error, not an empty report.
+    #[test]
+    fn status_root_outside_any_root_is_an_error() {
+        let repo = FixtureRepo::new("eng-root").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let root = only_root(&engine);
+        let bad = vec![PathBuf::from("/nonexistent/lastcall/root")];
+        let err = StatusReport::build(&mut engine, Some(&bad)).unwrap_err();
+        assert!(err.to_string().contains("not a watched root"), "{err}");
+        let outside = vec![state.path().to_path_buf()];
+        assert!(StatusReport::build(&mut engine, Some(&outside)).is_err());
+        let good = vec![root.join("f1"), root.clone()];
+        let report = StatusReport::build(&mut engine, Some(&good)).unwrap();
+        assert_eq!(report.roots.len(), 1, "one report per selected root");
+    }
+
+    /// R8: a ledger whose recorded root is another path is another root's state and is
+    /// handled like an unreadable ledger (moved aside, nothing seen, a notice).
+    #[test]
+    fn engine_open_treats_a_ledger_for_another_root_as_unreadable() {
+        let repo = FixtureRepo::new("eng-otherroot").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let engine = open_engine(&repo, &state, Config::default());
+        let root = only_root(&engine);
+        let paths = engine.root(&root).unwrap().paths.clone();
+        drop(engine);
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&paths.ledger).unwrap()).unwrap();
+        json["root"] = serde_json::Value::String("/somewhere/else".to_owned());
+        std::fs::write(&paths.ledger, serde_json::to_vec(&json).unwrap()).unwrap();
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let r = engine.root(&root).unwrap();
+        assert!(r.ledger.seen_tree.is_none(), "{:?}", r.notices);
+        assert!(
+            r.notices
+                .iter()
+                .any(|n| n.contains("recorded root /somewhere/else")),
+            "{:?}",
+            r.notices
+        );
+        assert!(ledger::moved_aside_sibling(&paths).is_some());
+        assert_eq!(r.ledger.root, root.to_string_lossy());
+        assert!(engine.scan(&root).unwrap().rows.len() >= 3);
     }
 
     #[test]

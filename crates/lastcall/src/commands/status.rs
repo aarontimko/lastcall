@@ -1,7 +1,8 @@
 //! `lastcall status [--json] [--root <path>…]`: open the engine, scan, print the report.
 //!
 //! Exit 0 on success (a scan failure for one root is a notice, not an exit code); exit 1
-//! when the engine cannot open at all (unwritable state dir, git too old, no git).
+//! when the engine cannot open at all (unwritable state dir, git too old, no git) or a
+//! `--root` is not inside any watched root. `--root` scans only the roots it names.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -23,7 +24,13 @@ pub fn run(json: bool, roots: Vec<PathBuf>) -> Result<ExitCode, Box<dyn std::err
         }
     };
     let only = (!roots.is_empty()).then_some(roots.as_slice());
-    let report = StatusReport::build(&mut engine, only);
+    let report = match StatusReport::build(&mut engine, only) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("lastcall: {e}");
+            return Ok(ExitCode::from(1));
+        }
+    };
     if json {
         println!("{}", report.to_json());
     } else {
