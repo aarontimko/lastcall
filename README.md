@@ -35,6 +35,7 @@ echo hi >> README.md
 ~/path/to/lastcall/target/release/lastcall status          # README.md, 1 hunk
 ~/path/to/lastcall/target/release/lastcall status --json   # the stable status_version 1 report
 ~/path/to/lastcall/target/release/lastcall watch --exit-after 30   # one line per event
+~/path/to/lastcall/target/release/lastcall watch --poll 2           # if events are late/missing
 ```
 
 Without a config file the launch directory is the parent dir; with one, a launch directory

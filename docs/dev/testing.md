@@ -17,7 +17,7 @@ child and never falls back to a `herdr` on `PATH`.
 
 `just test` runs the three in order. **`just test-unit` is the canonical suite**; its count is
 the ratchet floor from Phase 2 on (Phase 1 close: 85 engine + 16 testkit + 0 binary = 101, the
-Phase 2 floor; Phase 2 close: 158 engine + 16 testkit + 0 binary = 174, the Phase 3 floor).
+Phase 2 floor; Phase 2 close: 159 engine + 16 testkit + 0 binary = 175, the Phase 3 floor; one engine test self-skips where filesystem events are not delivered).
 The suite never shrinks across commits.
 
 ## Scenario suites (`just test-scenarios`)

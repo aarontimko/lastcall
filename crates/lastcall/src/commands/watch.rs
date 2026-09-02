@@ -1,5 +1,7 @@
-//! `lastcall watch [--json] [--exit-after <secs>]`: run the engine's watcher loop and
-//! print one line per [`EngineEvent`] until Ctrl-C or the deadline.
+//! `lastcall watch [--json] [--exit-after <secs>] [--poll <secs>]`: run the engine's
+//! watcher loop and print one line per [`EngineEvent`] until Ctrl-C or the deadline.
+//! `--poll` shortens both polling backstops (HEAD every 10 s, rescan every 30 s by
+//! default) for hosts whose filesystem events are late or missing.
 
 use std::process::ExitCode;
 use std::time::Duration;
@@ -10,7 +12,11 @@ use lastcall_engine::env::Env;
 use lastcall_engine::status::{RowStatus, row_line};
 use lastcall_engine::watcher::{EngineEvent, EngineTimings};
 
-pub fn run(json: bool, exit_after: Option<u64>) -> Result<ExitCode, Box<dyn std::error::Error>> {
+pub fn run(
+    json: bool,
+    exit_after: Option<u64>,
+    poll: Option<u64>,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let env = Env::from_process();
     let loaded = config::load(&env)?;
     let resolved = loaded.resolve(env.cwd());
@@ -31,8 +37,14 @@ pub fn run(json: bool, exit_after: Option<u64>) -> Result<ExitCode, Box<dyn std:
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
+    let mut timings = EngineTimings::default();
+    if let Some(secs) = poll {
+        let every = Duration::from_secs(secs.max(1));
+        timings.head_poll = every;
+        timings.rescan = every;
+    }
     let outcome = runtime.block_on(async move {
-        let mut watcher = engine.run(EngineTimings::default());
+        let mut watcher = engine.run(timings);
         let deadline = exit_after.map(|secs| tokio::time::sleep(Duration::from_secs(secs)));
         tokio::pin!(deadline);
         let code = loop {

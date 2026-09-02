@@ -692,6 +692,67 @@ mod live_tests {
         w.join().await;
     }
 
+    /// Whether the platform delivers a filesystem event for a write under `dir` within
+    /// two seconds (a wedged fseventsd delivers nothing; the watcher then lives on its
+    /// polling backstops and the delivery test skips with a reason).
+    fn fs_events_delivered(dir: &Path) -> bool {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let Ok(mut w) = notify::recommended_watcher(move |res: Result<notify::Event, _>| {
+            let _ = tx.send(res.is_ok());
+        }) else {
+            return false;
+        };
+        if w.watch(dir, RecursiveMode::Recursive).is_err() {
+            return false;
+        }
+        std::fs::write(dir.join(".lc-fs-probe"), b"x").expect("probe write");
+        let got = rx.recv_timeout(Duration::from_secs(2)).is_ok();
+        let _ = std::fs::remove_file(dir.join(".lc-fs-probe"));
+        got
+    }
+
+    /// The only test that proves filesystem events are delivered: both polling backstops
+    /// are out of reach, so the pile after the edit can only come from the watch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watcher_worktree_edit_schedules_a_scan_without_polling() {
+        let repo = FixtureRepo::new("watch-edit").unwrap();
+        if !fs_events_delivered(repo.path()) {
+            use std::io::Write as _;
+            let _ = std::io::stderr().write_all(
+                b"SKIP: no filesystem event within 2 s here (fseventsd?); the watcher runs on its polling backstops\n",
+            );
+            return;
+        }
+        let state = TempDir::new("lc-watch-state");
+        let engine = open_engine(&repo, &state, Config::default());
+        let mut w = engine.run(EngineTimings {
+            debounce: Duration::from_millis(100),
+            head_poll: Duration::from_secs(60),
+            rescan: Duration::from_secs(60),
+        });
+        let first = next_event(&mut w, Duration::from_secs(5))
+            .await
+            .expect("initial pile");
+        assert!(matches!(first, EngineEvent::Pile { .. }), "{first:?}");
+        wait_live(&mut w).await;
+        let started = tokio::time::Instant::now();
+        repo.write("f1", "edited under watch\n");
+        let deadline = started + Duration::from_secs(5);
+        let mut shown = None;
+        while tokio::time::Instant::now() < deadline {
+            if let Some(EngineEvent::Pile { pile, .. }) =
+                next_event(&mut w, Duration::from_millis(500)).await
+                && pile.row(b"f1").is_some()
+            {
+                shown = Some(started.elapsed());
+                break;
+            }
+        }
+        let took = shown.expect("the edit reached the pile through the watch within 5 s");
+        assert!(took < Duration::from_secs(5), "{took:?}");
+        w.join().await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn watcher_ignore_globs_do_not_hide_tracked_edits() {
         let mut repo = FixtureRepo::new("watch-ignore").unwrap();

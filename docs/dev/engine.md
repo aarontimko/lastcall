@@ -177,6 +177,9 @@ every 30 s). Events only *schedule* work: every scan, head inspection and rescan
 `spawn_blocking` under the engine's mutex, and the result is published as an `EngineEvent`
 (`Pile`, `Head` with its transition notice, `RootsChanged`, `Notice`). `ignore_globs` scope
 the watcher only — an ignored path never wakes a scan, but the next scan still shows the
-tracked edit. `lastcall watch [--json] [--exit-after N]` prints one line per event;
-`just probe-watch` demonstrates the B1 notice (`committed on main (1 commit)`) arriving while
-the pending row stays.
+tracked edit. `lastcall watch [--json] [--exit-after N] [--poll N]` prints one line per
+event; `--poll N` shortens both backstops to `N` s for hosts whose filesystem events are late
+or missing (the development machine's fseventsd delivered nothing during Phase 2; the
+`watcher_worktree_edit_schedules_a_scan_without_polling` unit test proves delivery where it
+works and skips with a reason where it does not). `just probe-watch` demonstrates the B1
+notice (`committed on main (1 commit)`) arriving while the pending row stays.

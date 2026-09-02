@@ -237,7 +237,9 @@ probe-status:
     (cd "$dir/parent" && "$OLDPWD/target/release/lastcall" status --json)
 
 # Release binary `watch --exit-after 8` over the same fixture while the example commits in
-# repo A at t+2 s and edits there at t+4 s: the B1 notice must appear.
+# repo A at t+2 s and edits there at t+4 s: the B1 notice must appear. `--poll 2` is the
+# backstop for hosts whose filesystem events are late or missing (a wedged fseventsd): the
+# notice then arrives through the HEAD poll instead of the watch.
 probe-watch:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -251,8 +253,8 @@ probe-watch:
     export HOME="$dir/state/home" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_NOSYSTEM=1
     ./target/debug/examples/fixture_parent --parent "$dir/parent" --state-dir "$dir/state" --late-ops > "$dir/late.log" 2>&1 &
     late_pid=$!
-    echo "--- (cd $dir/parent) lastcall watch --exit-after 8 ---"
-    (cd "$dir/parent" && "$OLDPWD/target/release/lastcall" watch --exit-after 8)
+    echo "--- (cd $dir/parent) lastcall watch --exit-after 8 --poll 2 ---"
+    (cd "$dir/parent" && "$OLDPWD/target/release/lastcall" watch --exit-after 8 --poll 2)
     wait "$late_pid"
     echo "--- late-ops ---"
     cat "$dir/late.log"

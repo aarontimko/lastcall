@@ -46,6 +46,10 @@ enum Command {
         /// Exit cleanly after this many seconds (exit 0).
         #[arg(long)]
         exit_after: Option<u64>,
+        /// Poll HEAD and rescan every N seconds instead of 10 s / 30 s: the backstop for
+        /// hosts whose filesystem events are late or missing.
+        #[arg(long, value_name = "SECS")]
+        poll: Option<u64>,
     },
 }
 
@@ -57,7 +61,11 @@ fn main() -> std::process::ExitCode {
             commands::hello_herdr::run(socket, exit_after)
         }
         Command::Status { json, roots } => commands::status::run(json, roots),
-        Command::Watch { json, exit_after } => commands::watch::run(json, exit_after),
+        Command::Watch {
+            json,
+            exit_after,
+            poll,
+        } => commands::watch::run(json, exit_after, poll),
     };
     match result {
         Ok(code) => code,
