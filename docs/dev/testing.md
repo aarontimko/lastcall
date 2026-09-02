@@ -18,7 +18,7 @@ child and never falls back to a `herdr` on `PATH`.
 `just test` runs the three in order. **`just test-unit` is the canonical suite**; its count is
 the ratchet floor from Phase 2 on (Phase 1 close: 85 engine + 16 testkit + 0 binary = 101, the
 Phase 2 floor; Phase 2 close: 166 engine + 16 testkit + 0 binary = 182, the Phase 3 floor; Phase 3 close: 168
-engine + 19 testkit + 61 binary lib + 4 binary main = 252, the Phase 4 floor).
+engine + 19 testkit + 64 binary lib + 4 binary main = 255, the Phase 4 floor).
 The suite never shrinks across commits. One recorded exception: at the Phase 2 code review
 the three filesystem-live watcher tests (up to 30 s waits, real FSEvents) left the unit tier
 for `crates/lastcall-engine/tests/test_integration_watcher.rs` because they contradicted the
