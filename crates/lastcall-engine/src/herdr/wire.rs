@@ -2,10 +2,10 @@
 //! `docs/next/api/herdr-api.schema.json` in herdr v0.8.2 (commit `5158ada`).
 //!
 //! Rules that apply to every type in this file (§5.2):
-//! - **No `deny_unknown_fields`, anywhere.** herdr adds fields between releases and the server
+//! - **Never deny unknown fields, anywhere.** herdr adds fields between releases and the server
 //!   never rejects a mismatched client; we must ignore what we do not know. (The opposite rule
-//!   holds for our own config types, `crate::config`, where `deny_unknown_fields` is required —
-//!   the two are opposite on purpose.)
+//!   holds for our own config types, `crate::config`, where the serde deny-unknown-fields
+//!   attribute is required — the two are opposite on purpose.)
 //! - Every optional field is an `Option` (or a map that defaults to empty).
 //! - Unknown `event` strings and unknown `AgentStatus` values deserialize to an
 //!   `Unknown(String)` variant; they never fail the parse.
@@ -642,7 +642,7 @@ pub enum Event {
     },
 }
 
-// Private helpers: one per data shape, no deny_unknown_fields (the `type` tag is ignored).
+// Private helpers: one per data shape, unknown fields tolerated (the `type` tag is ignored).
 #[derive(Deserialize)]
 struct PaneData {
     pane: PaneInfo,
