@@ -1,0 +1,3 @@
+{"data":{"agent":"demo","agent_status":"working","pane_id":"w1:p1","workspace_id":"w1"},"event":"pane.agent_status_changed"}
+{"data":{"agent":"demo","agent_status":"done","pane_id":"w1:p1","workspace_id":"w1"},"event":"pane.agent_status_changed"}
+{"data":{"tab_id":"w1:t1","type":"tab_focused","workspace_id":"w1"},"event":"tab_focused"}

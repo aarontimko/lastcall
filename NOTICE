@@ -1,0 +1,21 @@
+lastcall
+Copyright 2026 lastcall contributors
+
+Licensed under MIT OR Apache-2.0 (see LICENSE-MIT and LICENSE-APACHE).
+
+This product includes test-support code adapted from herdr
+(https://github.com/herdrdev/herdr), Copyright the herdr authors,
+licensed under the Apache License, Version 2.0:
+
+  - the newline-delimited JSON socket reader pattern (`JsonLineReader`,
+    `send_request`, `open_subscription` in herdr's `tests/api_ping.rs`),
+    adapted in `crates/lastcall-testkit/src/json_lines.rs` and echoed by the
+    async reader in `crates/lastcall-engine/src/herdr/transport.rs`;
+  - the spawn-in-PTY server isolation pattern (`unique_test_dir`,
+    `SpawnedHerdr` with kill-on-drop, `wait_for_socket`,
+    `spawn_herdr_with_options`, and the spawned-PID registry in
+    `tests/support/mod.rs`), adapted in
+    `crates/lastcall-testkit/src/herdr_spawn.rs` using safe wrappers only.
+
+herdr's own copy of the Apache License, Version 2.0 is available at the
+repository above; the same license text is reproduced in LICENSE-APACHE.

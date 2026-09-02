@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Every commit must be green under exactly the gate's lint and unit commands.
+# Enable with `just hooks-install`.
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+just lint
+just test-unit
