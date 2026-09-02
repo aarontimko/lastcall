@@ -13,11 +13,12 @@ child and never falls back to a `herdr` on `PATH`.
 |---|---|---|---|
 | unit | `just test-unit` = `cargo test --workspace --lib --bins` | in-module `#[cfg(test)]` only | everywhere, incl. macOS CI |
 | integration | `just test-integration` = `cargo test --workspace --test 'test_integration_*'` | real git; the pinned herdr when `LASTCALL_TEST_HERDR_BIN` is set | CI via `just test-integration-herdr`; Linux blocking, macOS best-effort |
-| e2e | `just test-e2e` = `cargo test --workspace --test 'test_e2e_*'` | placeholder until Phase 3 (Ratatui `TestBackend`) / Phase 9 (PTY) | — |
+| e2e | `just test-e2e` = `cargo test --workspace --test 'test_e2e_*'` | the TUI: sixteen `TestBackend` snapshot scenes and the PTY scenes against the built binary (`docs/dev/tui.md`) | everywhere; the PTY file skips with a visible reason only where no pseudo-terminal can be opened |
 
 `just test` runs the three in order. **`just test-unit` is the canonical suite**; its count is
 the ratchet floor from Phase 2 on (Phase 1 close: 85 engine + 16 testkit + 0 binary = 101, the
-Phase 2 floor; Phase 2 close: 166 engine + 16 testkit + 0 binary = 182, the Phase 3 floor).
+Phase 2 floor; Phase 2 close: 166 engine + 16 testkit + 0 binary = 182, the Phase 3 floor; Phase 3 close: 168
+engine + 19 testkit + 64 binary lib + 4 binary main = 255, the Phase 4 floor).
 The suite never shrinks across commits. One recorded exception: at the Phase 2 code review
 the three filesystem-live watcher tests (up to 30 s waits, real FSEvents) left the unit tier
 for `crates/lastcall-engine/tests/test_integration_watcher.rs` because they contradicted the
@@ -50,6 +51,35 @@ compares byte-for-byte to `crates/lastcall/tests/golden/status_multi_repo.json`.
 are stable because fixtures use fixed identities and dates. To update after an intentional
 schema change: `just golden-update` (sets `LASTCALL_UPDATE_GOLDEN=1`), then review the diff
 and commit the file.
+
+## The e2e tier: snapshots and the PTY
+
+Both files live in `crates/lastcall/tests/`; `docs/dev/tui.md` has the how-to.
+
+`test_e2e_tui_snapshots.rs` renders sixteen scenes through `ratatui::backend::TestBackend`
+from an `App` fed by a real engine over the shared `fixture_parent` (each scene builds its
+own fixture and state dir under a temp dir) and pins each as two `insta` snapshots under
+`crates/lastcall/tests/snapshots/`: `<scene>_frame` (the symbols, exactly as a 100×30 — or
+the scene's own size — terminal would show them) and `<scene>_styles` (the non-default style
+runs: `<row> <from>..<to> <fg> <bg> <modifiers>`, which is where an inverted hunk header or a
+focused border is visible). A failing snapshot test prints insta's unified diff: `-` lines
+are the committed frame, `+` lines the new one; a moved column or a changed count is a
+real change, a temp path is a leak (frames must show basenames and root-relative paths
+only). To accept an intentional change: `just snapshots-update`, read every rewritten
+`.snap` in the diff, commit them with the code change. Never regenerate to make red go
+green.
+
+`test_e2e_tui_pty.rs` spawns the built binary (`env!("CARGO_BIN_EXE_lastcall")`) with `tui
+--poll 1` inside a real pseudo-terminal (`lastcall_testkit::pty_tui`; `portable-pty` +
+`vt100`) over a fresh fixture parent, with `HOME`, `LASTCALL_CONFIG` and
+`LASTCALL_STATE_DIR` injected per scene, and asserts on the parsed screen: first frame,
+live update after an edit (the clock starts after the write returns; the minimum of two
+tries must be ≤ 1.75 s and both are printed), hunk keys, a mouse click, a resize, and the
+restored terminal after `q` / Ctrl-C (the raw transcript must carry the mouse-off and
+alternate-screen-off sequences and no log line). The scenes are serialized (one mutex); the
+whole file is about 20 s. Timing lines go to `stderr().write_all` so they survive libtest's
+capture — run it with `-- --nocapture` to see them. If the live-update assertion fails on a
+loaded host, report the measured numbers; do not loosen the budget.
 
 ## Naming
 

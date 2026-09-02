@@ -152,6 +152,7 @@ Every rung shows *more* than the truth, never less, and says why in a notice:
       "root": "/abs/path", "kind": "git | draft", "parent": "/abs/parent-dir",
       "badge": null | {"worktree_of": "/abs/main"} | {"nested_in": "/abs/outer"},
       "head": "<oid> | null", "branch": "main | null",
+      "remote": "org/repo | null",
       "in_progress": null | "merge" | "rebase" | "cherry-pick" | "revert",
       "seen_tree": "<oid> | null", "seen_head": "<oid> | null",
       "pending": [
@@ -175,7 +176,13 @@ Every rung shows *more* than the truth, never less, and says why in a notice:
 ```
 
 Roots are sorted by path bytes, rows by path bytes; paths are lossy UTF-8 (a non-UTF-8 path
-renders with U+FFFD but is still a row). The committed example is
+renders with U+FFFD but is still a row). `remote` (additive, Phase 3 / Amendment v1.3;
+`status_version` stays 1) is the `org/repo` slug of `remote.origin.url` — read with the
+allowlisted `git config --get`, not `git remote get-url origin`, which differs only under
+`url.<base>.insteadOf` — normalized by `lastcall_engine::engine::remote_slug`: `git@host:org/repo(.git)`,
+`ssh://…/org/repo`, `https://host/org/repo` and scp-like `host:org/repo` give `org/repo`;
+no remote, a local-path or `file://` origin (the fixtures' origins), and anything unparsable
+give `null`. The committed example is
 `crates/lastcall/tests/golden/status_multi_repo.json` (two repos and a draft dir, produced by
 `lastcall_testkit::fixture_parent`; `just golden-update` rewrites it).
 

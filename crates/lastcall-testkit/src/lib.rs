@@ -14,6 +14,8 @@
 //!   the SIGKILL fault injector for E1.
 //! - [`json_lines`]: a small synchronous newline-JSON reader over `UnixStream`, adapted from
 //!   herdr's test suite (see NOTICE).
+//! - [`pty_tui`]: the TUI PTY harness (Phase 3): a binary inside a real pseudo-terminal, a
+//!   `vt100` screen plus a raw transcript, `wait_for` polling, clicks and resizes.
 
 pub mod engine;
 pub mod fixture_parent;
@@ -21,4 +23,5 @@ pub mod fixture_repo;
 pub mod herdr_spawn;
 pub mod json_lines;
 pub mod mock_herdr;
+pub mod pty_tui;
 pub mod tmp;

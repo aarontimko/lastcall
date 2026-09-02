@@ -21,8 +21,10 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
+unicode-width = "0.2"
 
 [dev-dependencies]
+insta = "1.48"
 lastcall-testkit.workspace = true
 
 [lints]

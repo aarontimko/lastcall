@@ -62,6 +62,11 @@ test-scenarios:
 golden-update:
     LASTCALL_UPDATE_GOLDEN=1 cargo test -p lastcall --test test_integration_status_golden
 
+# Rewrite the Phase 3 TUI snapshots (crates/lastcall/tests/snapshots/), then prove they pass.
+snapshots-update:
+    INSTA_UPDATE=always cargo test -p lastcall --test test_e2e_tui_snapshots || true
+    cargo test -p lastcall --test test_e2e_tui_snapshots
+
 test: test-unit test-integration test-e2e
 
 # The Phase 0 shell scenario harness (docs/spec/01-scenarios.md).
@@ -258,3 +263,38 @@ probe-watch:
     wait "$late_pid"
     echo "--- late-ops ---"
     cat "$dir/late.log"
+
+# The sponsor's interactive look: the release binary's `tui --poll 1` over the fixture
+# parent, with a temp state dir it creates (never `~/.local/state/lastcall`; HOME and the
+# git config locations are pointed away exactly as `probe-watch` does). The two env lines
+# are printed first so the same screen can be re-run by hand; edit a file under the printed
+# parent from another shell and watch the counts change. `q` quits. The fixture is left in
+# place for that re-run — remove it with the `rm -rf` printed at the end.
+probe-tui:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --release -p lastcall
+    cargo build -p lastcall-testkit --example fixture_parent
+    dir="/tmp/lc-probe-$$"
+    mkdir -p "$dir/parent" "$dir/state"
+    echo "--- fixture_parent --parent $dir/parent --state-dir $dir/state ---"
+    ./target/debug/examples/fixture_parent --parent "$dir/parent" --state-dir "$dir/state"
+    export LASTCALL_CONFIG="$dir/state/config.toml" LASTCALL_STATE_DIR="$dir/state"
+    export HOME="$dir/state/home" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_NOSYSTEM=1
+    echo "export LASTCALL_CONFIG=$LASTCALL_CONFIG"
+    echo "export LASTCALL_STATE_DIR=$LASTCALL_STATE_DIR"
+    echo "--- (cd $dir/parent) lastcall tui --poll 1   [q quits; edit under $dir/parent from another shell] ---"
+    (cd "$dir/parent" && "$OLDPWD/target/release/lastcall" tui --poll 1)
+    echo "--- fixture left at $dir (rm -rf $dir when done) ---"
+
+# The transcript form of the live-update demo, for a human without a second terminal: the
+# PTY harness (crates/lastcall-testkit/src/pty_tui.rs) drives the release binary's
+# `tui --poll 1` over a fresh fixture parent in a 100×30 pseudo-terminal, appends a line to
+# alpha/f1, waits for the row's counts to change on screen, opens the diff, prints the vt100
+# screen as text and the exit code after `q`. About three seconds; nothing is left behind.
+probe-tui-screen:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --release -p lastcall
+    LASTCALL_PROBE_BIN="$PWD/target/release/lastcall" \
+        cargo test -p lastcall --test test_e2e_tui_pty probe_tui_screen -- --ignored --nocapture

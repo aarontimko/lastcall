@@ -1,0 +1,5 @@
+---
+source: crates/lastcall/tests/test_e2e_tui_snapshots.rs
+expression: style
+---
+

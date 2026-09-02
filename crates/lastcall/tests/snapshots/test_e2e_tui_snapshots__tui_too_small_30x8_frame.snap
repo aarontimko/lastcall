@@ -1,0 +1,12 @@
+---
+source: crates/lastcall/tests/test_e2e_tui_snapshots.rs
+expression: frame
+---
+"too small: 40×10 min          "
+"                              "
+"                              "
+"                              "
+"                              "
+"                              "
+"                              "
+"                              "

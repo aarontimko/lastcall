@@ -15,10 +15,13 @@ just lint                   # fmt --check, clippy -D warnings, engine without th
 just test-unit              # THE canonical suite: cargo test --workspace --lib --bins
 just test-integration       # real git; real herdr only when LASTCALL_TEST_HERDR_BIN is set
 just test-integration-herdr # just herdr-fetch (pinned v0.8.2) then the integration tier
-just test-e2e               # placeholder until Phase 3
+just test-e2e               # the TUI: TestBackend snapshots + PTY scenes on the built binary
 just test                   # the three tiers in order
 just test-scenarios         # the docs/spec/01-scenarios.md suites (real git, temp fixtures)
 just probe-status           # release binary: status + status --json over a three-root fixture
+just probe-tui              # release binary: the interactive TUI over the same fixture (--poll 1)
+just probe-tui-screen       # the PTY harness's transcript of the live-update demo (3 s)
+just snapshots-update       # rewrite the TUI snapshots, then prove they pass; read every diff
 just hooks-install          # pre-commit = just lint && just test-unit
 ```
 
@@ -28,8 +31,9 @@ Probes against the built binary: `just probe-config`, `just probe-hello`, `just 
 `just golden-update` rewrites the `status --json` golden.
 
 Crates: `crates/lastcall-engine` (library: config, herdr client; the review engine from
-Phase 2; no terminal code), `crates/lastcall` (the binary), `crates/lastcall-testkit`
-(test-only: mock herdr, PTY spawner, fixture repos — dev-dependency only).
+Phase 2; no terminal code), `crates/lastcall` (the binary and the Ratatui TUI under
+`src/tui/`), `crates/lastcall-testkit` (test-only: mock herdr, PTY spawner, fixture repos,
+the TUI PTY harness — dev-dependency only).
 
 Rules that are enforced by grep or test: no `deny_unknown_fields` on herdr-facing types
 (`crates/lastcall-engine/src/herdr`), `deny_unknown_fields` required on config types;
@@ -65,6 +69,13 @@ index,scan,ops,engine,watcher}.rs`.
 
 The one-command-plus-three-steps sponsor recipe for the Gate 1 `[sponsor]` item, the
 `just probe-hello` automated proxy, and the protocol-20/21 note.
+
+### The TUI: `docs/dev/tui.md`
+
+How the screen is a pure function of `App` (reducers `apply` / `handle` / `sync_roots`,
+`render(&App) -> HitMap`, the loop and its quit order), the key table and the `[keys]`
+grammar, the hit-map rule, how to add a widget with a snapshot, and the PTY harness. Read it
+before touching `crates/lastcall/src/tui/` or either e2e test.
 
 ### Testing: `docs/dev/testing.md`
 

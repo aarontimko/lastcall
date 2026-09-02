@@ -1,0 +1,462 @@
+//! The TUI PTY harness (Phase 3 kickoff deliverable 10): spawn a binary inside a real
+//! pseudo-terminal of a fixed size, feed everything it writes to a `vt100` screen *and* to a
+//! raw byte transcript, and poll the screen for what a test expects.
+//!
+//! Two views of the same output, on purpose: the [`vt100::Screen`] answers "what is on the
+//! screen now" (text, per-cell attributes such as inversion, the alternate-screen and mouse
+//! modes), while the raw transcript answers "which bytes were written" — the parser consumes
+//! escape sequences, so the mouse-off / alternate-screen-exit assertions read the raw log.
+//!
+//! Imitates [`crate::herdr_spawn`]: `portable-pty` spawn, poll-for-ready (never
+//! sleep-and-hope), the shared PID registry with kill-on-drop and kill-on-panic, safe
+//! wrappers only (`unsafe_code = "forbid"`, no `libc`). The reader thread owns a clone of
+//! the master; it ends when the child exits and the slave side closes.
+
+use std::ffi::{OsStr, OsString};
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use portable_pty::{Child, CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
+
+pub use vt100;
+
+use crate::herdr_spawn::{register_spawned_pid, unregister_spawned_pid};
+
+/// The default terminal size: `(cols, rows)`, the snapshot suite's 100×30.
+pub const SIZE: (u16, u16) = (100, 30);
+/// How often [`PtyTui::wait_for`] and [`PtyTui::wait_exit`] look again.
+pub const POLL: Duration = Duration::from_millis(10);
+
+/// What the reader thread fills: the parsed screen and the raw bytes, in order.
+struct Shared {
+    parser: vt100::Parser,
+    raw: Vec<u8>,
+    eof: bool,
+}
+
+/// A command to run inside a PTY; [`PtyCommand::spawn`] starts it.
+#[derive(Debug, Clone)]
+pub struct PtyCommand {
+    bin: PathBuf,
+    args: Vec<OsString>,
+    cwd: Option<PathBuf>,
+    env: Vec<(OsString, OsString)>,
+    env_remove: Vec<OsString>,
+    size: (u16, u16),
+}
+
+impl PtyCommand {
+    pub fn new(bin: impl Into<PathBuf>) -> Self {
+        Self {
+            bin: bin.into(),
+            args: Vec::new(),
+            cwd: None,
+            env: Vec::new(),
+            env_remove: Vec::new(),
+            size: SIZE,
+        }
+    }
+
+    pub fn arg(mut self, arg: impl AsRef<OsStr>) -> Self {
+        self.args.push(arg.as_ref().to_owned());
+        self
+    }
+
+    pub fn args<I: IntoIterator<Item = S>, S: AsRef<OsStr>>(mut self, args: I) -> Self {
+        for a in args {
+            self.args.push(a.as_ref().to_owned());
+        }
+        self
+    }
+
+    pub fn cwd(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.cwd = Some(dir.into());
+        self
+    }
+
+    pub fn env(mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> Self {
+        self.env
+            .push((key.as_ref().to_owned(), value.as_ref().to_owned()));
+        self
+    }
+
+    pub fn env_remove(mut self, key: impl AsRef<OsStr>) -> Self {
+        self.env_remove.push(key.as_ref().to_owned());
+        self
+    }
+
+    /// `(cols, rows)`; the default is [`SIZE`].
+    pub fn size(mut self, cols: u16, rows: u16) -> Self {
+        self.size = (cols, rows);
+        self
+    }
+
+    /// The isolation every `lastcall` child gets in the e2e tier, exactly as the
+    /// `status --json` golden spawns the binary: a private `HOME`, `LASTCALL_CONFIG`,
+    /// `LASTCALL_STATE_DIR`, null global/system git config, no inherited XDG dirs, no
+    /// inherited `LASTCALL_LOG*` (the transcript must carry no tracing) and no inherited
+    /// `HERDR_*`; `TERM=xterm-256color` so crossterm sees a capable terminal.
+    pub fn isolated_lastcall(self, home: &Path, config: &Path, state_dir: &Path) -> Self {
+        let mut cmd = self
+            .env("HOME", home)
+            .env("LASTCALL_CONFIG", config)
+            .env("LASTCALL_STATE_DIR", state_dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("TERM", "xterm-256color")
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_STATE_HOME")
+            .env_remove("LASTCALL_LOG_FILE")
+            .env_remove("LASTCALL_LOG");
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("HERDR_") {
+                cmd = cmd.env_remove(key);
+            }
+        }
+        cmd
+    }
+
+    /// Open the PTY and start the child. `ErrorKind::Unsupported` means this host cannot
+    /// open a PTY at all (the only reason a PTY test may skip); anything else is a failure.
+    pub fn spawn(self) -> io::Result<PtyTui> {
+        let (cols, rows) = self.size;
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| io::Error::new(io::ErrorKind::Unsupported, e.to_string()))?;
+
+        let mut cmd = CommandBuilder::new(&self.bin);
+        cmd.args(&self.args);
+        if let Some(dir) = &self.cwd {
+            cmd.cwd(dir);
+        }
+        for key in &self.env_remove {
+            cmd.env_remove(key);
+        }
+        for (key, value) in &self.env {
+            cmd.env(key, value);
+        }
+        let child = pair.slave.spawn_command(cmd).map_err(io::Error::other)?;
+        // The slave is dropped here (end of scope through `pair.slave`): the master reads
+        // EOF once the child and its descendants have closed their copies.
+        let pid = child.process_id();
+        register_spawned_pid(pid, &self.bin);
+
+        let writer = pair.master.take_writer().map_err(io::Error::other)?;
+        let mut reader = pair.master.try_clone_reader().map_err(io::Error::other)?;
+        let shared = Arc::new(Mutex::new(Shared {
+            parser: vt100::Parser::new(rows, cols, 0),
+            raw: Vec::new(),
+            eof: false,
+        }));
+        let feed = shared.clone();
+        std::thread::Builder::new()
+            .name("lastcall-pty-reader".to_owned())
+            .spawn(move || {
+                let mut buf = [0u8; 8192];
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) | Err(_) => {
+                            lock(&feed).eof = true;
+                            return;
+                        }
+                        Ok(n) => {
+                            let mut s = lock(&feed);
+                            s.raw.extend_from_slice(&buf[..n]);
+                            s.parser.process(&buf[..n]);
+                        }
+                    }
+                }
+            })?;
+
+        Ok(PtyTui {
+            master: pair.master,
+            writer,
+            child,
+            pid,
+            shared,
+            bin: self.bin,
+        })
+    }
+}
+
+fn lock(shared: &Mutex<Shared>) -> std::sync::MutexGuard<'_, Shared> {
+    shared.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A child running inside a PTY. Killed on drop.
+pub struct PtyTui {
+    master: Box<dyn MasterPty + Send>,
+    writer: Box<dyn Write + Send>,
+    child: Box<dyn Child + Send + Sync>,
+    pid: Option<u32>,
+    shared: Arc<Mutex<Shared>>,
+    bin: PathBuf,
+}
+
+impl std::fmt::Debug for PtyTui {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PtyTui")
+            .field("pid", &self.pid)
+            .field("bin", &self.bin)
+            .finish()
+    }
+}
+
+impl PtyTui {
+    pub fn pid(&self) -> Option<u32> {
+        self.pid
+    }
+
+    /// Look at the parsed screen.
+    pub fn screen<R>(&self, f: impl FnOnce(&vt100::Screen) -> R) -> R {
+        f(lock(&self.shared).parser.screen())
+    }
+
+    /// The screen as plain text, rows joined by `\n` (trailing blanks trimmed by vt100).
+    pub fn screen_text(&self) -> String {
+        self.screen(|s| s.contents())
+    }
+
+    /// The screen row by row, every column.
+    pub fn rows(&self) -> Vec<String> {
+        self.screen(|s| {
+            let (_, cols) = s.size();
+            s.rows(0, cols).collect()
+        })
+    }
+
+    /// The first row (0-based) whose text satisfies `pred`.
+    pub fn find_row(&self, mut pred: impl FnMut(&str) -> bool) -> Option<u16> {
+        self.rows().iter().position(|r| pred(r)).map(|i| i as u16)
+    }
+
+    /// Whether the cell at `(row, col)` (0-based) is drawn inverted.
+    pub fn inverse_at(&self, row: u16, col: u16) -> bool {
+        self.screen(|s| s.cell(row, col).is_some_and(vt100::Cell::inverse))
+    }
+
+    /// Every byte the child wrote so far, escape sequences included.
+    pub fn raw(&self) -> Vec<u8> {
+        lock(&self.shared).raw.clone()
+    }
+
+    /// True once the reader saw EOF (the child and its descendants closed the slave).
+    pub fn eof(&self) -> bool {
+        lock(&self.shared).eof
+    }
+
+    /// Poll the screen every [`POLL`] until `pred` holds; returns how long that took.
+    /// Fails at once (with the screen) if the child exits first, and at `timeout`.
+    pub fn wait_for(
+        &mut self,
+        timeout: Duration,
+        mut pred: impl FnMut(&vt100::Screen) -> bool,
+    ) -> Result<Duration, String> {
+        let start = Instant::now();
+        loop {
+            if self.screen(&mut pred) {
+                return Ok(start.elapsed());
+            }
+            if let Ok(Some(status)) = self.child.try_wait() {
+                // One last look: the final bytes may land after the exit is observed.
+                std::thread::sleep(POLL);
+                if self.screen(&mut pred) {
+                    return Ok(start.elapsed());
+                }
+                return Err(format!(
+                    "child exited ({status:?}) before the screen matched; screen:\n{}",
+                    self.screen_text()
+                ));
+            }
+            if start.elapsed() >= timeout {
+                return Err(format!(
+                    "screen did not match within {timeout:?}; screen:\n{}",
+                    self.screen_text()
+                ));
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+
+    /// [`wait_for`](Self::wait_for) on "some row contains `needle`".
+    pub fn wait_for_text(&mut self, needle: &str, timeout: Duration) -> Result<Duration, String> {
+        let needle = needle.to_owned();
+        self.wait_for(timeout, |s| s.contents().contains(&needle))
+    }
+
+    /// Wait for the reader to see EOF (after an exit, so the transcript is complete).
+    pub fn wait_eof(&self, timeout: Duration) -> bool {
+        let start = Instant::now();
+        while !self.eof() {
+            if start.elapsed() >= timeout {
+                return false;
+            }
+            std::thread::sleep(POLL);
+        }
+        true
+    }
+
+    /// Write bytes to the child's terminal (keys, mouse reports).
+    pub fn send(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.writer.write_all(bytes)?;
+        self.writer.flush()
+    }
+
+    /// A left click (SGR press then release) at `(col, row)`, 0-based screen coordinates.
+    pub fn click(&mut self, col: u16, row: u16) -> io::Result<()> {
+        self.send(&sgr_click(col, row))
+    }
+
+    /// Change the terminal size (`(cols, rows)`); the child receives `SIGWINCH` and the
+    /// parsed screen is resized to match.
+    pub fn resize(&mut self, cols: u16, rows: u16) -> io::Result<()> {
+        self.master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(io::Error::other)?;
+        lock(&self.shared).parser.screen_mut().set_size(rows, cols);
+        Ok(())
+    }
+
+    /// Poll for the child's exit every [`POLL`], up to `timeout`.
+    pub fn wait_exit(&mut self, timeout: Duration) -> io::Result<ExitStatus> {
+        let start = Instant::now();
+        loop {
+            if let Some(status) = self.child.try_wait()? {
+                return Ok(status);
+            }
+            if start.elapsed() >= timeout {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("child still running after {timeout:?}"),
+                ));
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+}
+
+impl Drop for PtyTui {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            match self.child.try_wait() {
+                Ok(Some(_)) | Err(_) => break,
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        unregister_spawned_pid(self.pid);
+    }
+}
+
+/// The SGR (`?1006`) left-button press and release for `(col, row)`, 0-based: what a
+/// terminal sends for a click once crossterm has enabled mouse capture.
+pub fn sgr_click(col: u16, row: u16) -> Vec<u8> {
+    format!(
+        "\x1b[<0;{};{}M\x1b[<0;{};{}m",
+        col + 1,
+        row + 1,
+        col + 1,
+        row + 1
+    )
+    .into_bytes()
+}
+
+/// The column (0-based, in cells) at which `needle` starts in a screen row, counting
+/// characters rather than bytes — right for rows of single-width characters.
+pub fn col_of(row: &str, needle: &str) -> Option<u16> {
+    let byte = row.find(needle)?;
+    Some(row[..byte].chars().count() as u16)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SH: &str = "/bin/sh";
+
+    fn skip_if_no_pty(err: &io::Error) -> bool {
+        if err.kind() == io::ErrorKind::Unsupported {
+            let mut e = io::stderr();
+            let _ = e.write_all(format!("SKIP: cannot open a pty here: {err}\n").as_bytes());
+            true
+        } else {
+            false
+        }
+    }
+
+    #[test]
+    fn pty_tui_sgr_click_is_one_based_press_then_release() {
+        assert_eq!(sgr_click(0, 0), b"\x1b[<0;1;1M\x1b[<0;1;1m");
+        assert_eq!(sgr_click(2, 7), b"\x1b[<0;3;8M\x1b[<0;3;8m");
+        assert_eq!(col_of("│beta  main", "main"), Some(7));
+        assert_eq!(col_of("  M f1  +1 −1", "−1"), Some(11));
+        assert_eq!(col_of("abc", "zzz"), None);
+    }
+
+    #[test]
+    fn pty_tui_parses_the_screen_the_attributes_the_raw_bytes_and_the_exit_code() {
+        let spawned = PtyCommand::new(SH)
+            .arg("-c")
+            .arg("printf 'hello \\033[7mINV\\033[0m'; exit 3")
+            .size(40, 5)
+            .spawn();
+        let mut pty = match spawned {
+            Ok(p) => p,
+            Err(e) if skip_if_no_pty(&e) => return,
+            Err(e) => panic!("spawn: {e}"),
+        };
+        pty.wait_for_text("INV", Duration::from_secs(5))
+            .expect("the shell's output reaches the screen");
+        assert_eq!(pty.rows()[0].trim_end(), "hello INV");
+        assert!(!pty.inverse_at(0, 0), "plain text");
+        assert!(pty.inverse_at(0, 6), "INV is inverted");
+        assert_eq!(pty.find_row(|r| r.contains("INV")), Some(0));
+        let status = pty.wait_exit(Duration::from_secs(5)).expect("exits");
+        assert_eq!(status.exit_code(), 3);
+        assert!(pty.wait_eof(Duration::from_secs(2)));
+        let raw = pty.raw();
+        assert!(
+            raw.windows(4).any(|w| w == b"\x1b[7m"),
+            "the raw transcript keeps the escape sequence: {raw:?}"
+        );
+        assert!(pty.screen(|s| !s.alternate_screen()));
+    }
+
+    #[test]
+    fn pty_tui_resize_reaches_the_child_as_sigwinch() {
+        let spawned = PtyCommand::new(SH)
+            .arg("-c")
+            .arg("trap 'stty size' WINCH; stty size; while :; do sleep 0.02; done")
+            .size(100, 30)
+            .spawn();
+        let mut pty = match spawned {
+            Ok(p) => p,
+            Err(e) if skip_if_no_pty(&e) => return,
+            Err(e) => panic!("spawn: {e}"),
+        };
+        pty.wait_for_text("30 100", Duration::from_secs(5))
+            .expect("initial size printed");
+        pty.resize(40, 12).expect("resize");
+        assert_eq!(pty.screen(|s| s.size()), (12, 40));
+        pty.wait_for_text("12 40", Duration::from_secs(5))
+            .expect("the child saw SIGWINCH and the new size");
+        // Dropping kills the loop; the registry forgets the pid.
+        let pid = pty.pid().expect("pid");
+        drop(pty);
+        assert!(!crate::herdr_spawn::kill_registered(pid));
+    }
+}

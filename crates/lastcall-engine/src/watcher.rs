@@ -298,7 +298,10 @@ fn install_watches(
     notices
 }
 
-async fn blocking<T: Send + 'static>(
+/// Run one engine call on `spawn_blocking` under the mutex and hand back its result: the
+/// only way a task on the runtime should touch the engine (a guard held across an
+/// `.await` stalls every scan). The UI runs every engine call through this.
+pub async fn blocking<T: Send + 'static>(
     engine: &Arc<Mutex<Engine>>,
     f: impl FnOnce(&mut Engine) -> T + Send + 'static,
 ) -> T {

@@ -37,6 +37,9 @@ pub struct RootStatus {
     pub badge: Option<BadgeStatus>,
     pub head: Option<Oid>,
     pub branch: Option<String>,
+    /// `org/repo` of `remote.origin.url`; `null` for no remote or a local-path origin.
+    /// Additive in v1.3 (`status_version` stays 1).
+    pub remote: Option<String>,
     pub in_progress: Option<InProgress>,
     pub seen_tree: Option<Oid>,
     pub seen_head: Option<Oid>,
@@ -151,6 +154,7 @@ impl RootStatus {
             }),
             head: root.head.head.clone(),
             branch: root.head.branch.clone(),
+            remote: root.remote.clone(),
             in_progress: root.head.in_progress,
             seen_tree: root.ledger.seen_tree.clone(),
             seen_head: root.ledger.seen_at.head_commit.clone(),
