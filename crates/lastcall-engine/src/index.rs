@@ -143,7 +143,8 @@ impl PrivateIndex {
     }
 
     /// `update-index -q --refresh --ignore-submodules`; the exit status is ignored (non-zero
-    /// when files differ). Returns `false` when the refresh was skipped (lock contention).
+    /// when files differ). Returns `false` when the refresh did not run (lock contention,
+    /// or git could not be spawned): the scan then proceeds unrefreshed and over-shows.
     pub fn refresh(&self) -> bool {
         for attempt in 0..=LOCK_RETRIES {
             match self.git.run_raw(
@@ -156,7 +157,8 @@ impl PrivateIndex {
                         std::thread::sleep(LOCK_BACKOFF);
                     }
                 }
-                Ok(_) | Err(_) => return true,
+                Ok(_) => return true,
+                Err(_) => return false,
             }
         }
         false

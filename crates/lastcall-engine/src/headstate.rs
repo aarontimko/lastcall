@@ -68,6 +68,19 @@ impl HeadState {
 }
 
 /// Inspect the root now.
+/// `(HEAD commit, short branch)` right now; `(None, None)` before the first commit or
+/// when detached (branch only). Accept-all stamps `seen_at` with it — an annotation
+/// input, never a baseline.
+pub fn current_head(rg: &RepoGit) -> (Option<Oid>, Option<String>) {
+    let head = rg.rev_parse_verify("HEAD").ok().flatten();
+    let branch = rg
+        .run(&["symbolic-ref", "-q", "--short", "HEAD"])
+        .ok()
+        .map(|b| String::from_utf8_lossy(&b).trim().to_owned())
+        .filter(|s| !s.is_empty());
+    (head, branch)
+}
+
 pub fn inspect(rg: &RepoGit) -> Result<HeadState, GitError> {
     let head = rg.rev_parse_verify("HEAD")?;
     let branch = {

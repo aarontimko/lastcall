@@ -446,7 +446,7 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
             }
         };
 
-        let mut row = Row {
+        let row = Row {
             path: path.clone(),
             change,
             baseline: base_entry,
@@ -460,10 +460,33 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
             flag,
             rename: None,
         };
-        render_content(store, inputs, &mut row, &mut notices)?;
         rows.push(row);
     }
     notices.append(&mut resolver.notices);
+
+    // 4b. Content for every row through one `cat-file --batch`: rendering must not cost a
+    // process per row (2,000 unseen files are 2,000 rows on every rescan tick).
+    let mut wanted: Vec<Oid> = rows
+        .iter()
+        .filter(|r| !matches!(r.change, Change::Typechange | Change::Unreadable))
+        .flat_map(|r| [&r.baseline, &r.current])
+        .flatten()
+        .map(|e| e.oid.clone())
+        .collect();
+    wanted.sort();
+    wanted.dedup();
+    let blobs = match store.cat_blobs(&wanted) {
+        Ok(b) => Some(b),
+        Err(e) => {
+            notices.push(format!(
+                "blob contents unreadable ({e}); rows shown without counts or hunks"
+            ));
+            None
+        }
+    };
+    for row in &mut rows {
+        render_content(store, inputs, blobs.as_ref(), row, &mut notices)?;
+    }
 
     // 5. D5 rename pairing: only when the pile has both deletions and additions.
     let has_del = rows.iter().any(|r| r.change == Change::Deleted);
@@ -509,10 +532,12 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
     })
 }
 
-/// Hunks, counts and the collapse decision for one row.
+/// Hunks, counts and the collapse decision for one row, from the batch-fetched blobs
+/// (`None`: the batch failed; the row keeps its change kind and nothing else).
 fn render_content(
     store: &Store,
     inputs: &ScanInputs<'_>,
+    blobs: Option<&HashMap<Oid, Vec<u8>>>,
     row: &mut Row,
     notices: &mut Vec<String>,
 ) -> Result<(), ScanError> {
@@ -525,26 +550,27 @@ fn render_content(
     if matches!(row.change, Change::Typechange | Change::Unreadable) {
         return Ok(());
     }
-    let read = |e: &Option<Entry>| -> Result<Vec<u8>, ScanError> {
+    let Some(blobs) = blobs else {
+        return Ok(());
+    };
+    let mut read = |e: &Option<Entry>, what: &str| -> Vec<u8> {
         match e {
-            Some(entry) => Ok(store.cat_blob(&entry.oid)?),
-            None => Ok(Vec::new()),
+            Some(entry) => match blobs.get(&entry.oid) {
+                Some(b) => b.clone(),
+                None => {
+                    notices.push(format!(
+                        "{}: {what} unreadable (object {} not in the store)",
+                        row.path_lossy(),
+                        entry.oid
+                    ));
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
         }
     };
-    let old = match read(&row.baseline) {
-        Ok(b) => b,
-        Err(e) => {
-            notices.push(format!("{}: baseline unreadable ({e})", row.path_lossy()));
-            Vec::new()
-        }
-    };
-    let new = match read(&row.current) {
-        Ok(b) => b,
-        Err(e) => {
-            notices.push(format!("{}: current unreadable ({e})", row.path_lossy()));
-            Vec::new()
-        }
-    };
+    let old = read(&row.baseline, "baseline");
+    let new = read(&row.current, "current");
     let same_content = row
         .baseline
         .as_ref()

@@ -19,6 +19,7 @@ use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 
 use crate::git::{GitError, Mode, Oid, RepoGit};
+use crate::headstate::current_head;
 use crate::hunks::{self, Hunk};
 use crate::index::{IndexError, PrivateIndex};
 use crate::ledger::{
@@ -60,6 +61,9 @@ pub struct Rendered {
     pub mode: Option<Mode>,
     /// The baseline oid the row's hunks were computed against (`None` = absent/empty).
     pub baseline: Option<Oid>,
+    /// The baseline mode alongside it: a mode-only hunk (D1) moves the mode and not the
+    /// oid, so the hunk CAS must cover both.
+    pub baseline_mode: Option<Mode>,
 }
 
 impl Rendered {
@@ -69,6 +73,7 @@ impl Rendered {
             oid: row.current.as_ref().map(|e| e.oid.clone()),
             mode: row.current.as_ref().map(|e| e.mode),
             baseline: row.baseline.as_ref().map(|e| e.oid.clone()),
+            baseline_mode: row.baseline.as_ref().map(|e| e.mode),
         }
     }
 }
@@ -155,7 +160,7 @@ impl Outcome {
 pub struct Ops<'a> {
     pub store: &'a Store,
     pub index: &'a PrivateIndex,
-    /// `Some` for git roots (accept-all records HEAD).
+    /// `Some` for git roots (accept-all records the current commit in `seen_at`).
     pub repo: Option<&'a RepoGit>,
     pub paths: &'a RepoPaths,
     pub ledger: &'a mut Ledger,
@@ -437,15 +442,16 @@ impl Ops<'_> {
             );
             resolver.baseline(&rendered.path)
         };
-        if baseline.oid() != rendered.baseline.as_ref() {
-            return refuse(Refused::BaselineMoved {
-                path: rendered.path.clone(),
-            });
-        }
         let (base_oid, base_mode) = match &baseline {
             Baseline::Present { oid, mode } => (Some(oid.clone()), Some(*mode)),
             Baseline::Absent | Baseline::Empty => (None, None),
         };
+        // Baseline CAS over (oid, mode): a stale mode hunk must not apply twice.
+        if base_oid != rendered.baseline || base_mode != rendered.baseline_mode {
+            return refuse(Refused::BaselineMoved {
+                path: rendered.path.clone(),
+            });
+        }
         let (blob, mode) = if hunk.is_mode_change() {
             // D1: the synthetic mode hunk moves only the mode.
             (base_oid, Some(live.mode))
@@ -475,8 +481,8 @@ impl Ops<'_> {
         })
     }
 
-    /// Accept everything in `snapshot` at its rendered content (A5), move `seen_at` to
-    /// HEAD, and reseed the index.
+    /// Accept everything in `snapshot` at its rendered content (A5), stamp `seen_at`
+    /// with the current commit, and reseed the index.
     pub fn accept_all(
         &mut self,
         snapshot: &Pile,
@@ -657,18 +663,6 @@ impl Ops<'_> {
     }
 }
 
-/// `(HEAD commit, short branch)` right now; `(None, None)` before the first commit or
-/// when detached (branch only).
-pub fn current_head(rg: &RepoGit) -> (Option<Oid>, Option<String>) {
-    let head = rg.rev_parse_verify("HEAD").ok().flatten();
-    let branch = rg
-        .run(&["symbolic-ref", "-q", "--short", "HEAD"])
-        .ok()
-        .map(|b| String::from_utf8_lossy(&b).trim().to_owned())
-        .filter(|s| !s.is_empty());
-    (head, branch)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -784,6 +778,7 @@ mod tests {
             oid: None,
             mode: None,
             baseline: h.tree_entries.get(&b"f2"[..]).map(|(_, o)| o.clone()),
+            baseline_mode: h.tree_entries.get(&b"f2"[..]).map(|(m, _)| *m),
         };
         let out = h.ops().accept_deletion(&r2, &NoFault).unwrap();
         assert!(matches!(out.refused[0], Refused::StillPresent { .. }), "A7");
@@ -852,6 +847,13 @@ mod tests {
         assert!(row.hunks[1].is_mode_change());
         let r = Rendered::of(&row);
         h.ops().accept_hunk(&r, &row.hunks, 1, &NoFault).unwrap();
+        // The same rendered mode hunk again: the baseline oid is unchanged, the mode
+        // moved — refused, never re-applied (R12).
+        let stale = h.ops().accept_hunk(&r, &row.hunks, 1, &NoFault).unwrap();
+        assert!(
+            matches!(stale.refused.first(), Some(Refused::BaselineMoved { .. })),
+            "{stale:?}"
+        );
         let after = h.scan().pile.row(b"f1").unwrap().clone();
         assert_eq!(after.change, Change::Modified);
         assert_eq!(after.hunks.len(), 1, "content hunk remains, mode accepted");

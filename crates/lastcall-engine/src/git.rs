@@ -41,7 +41,32 @@ pub const SCRUBBED_VARS: &[&str] = &[
     "GIT_NAMESPACE",
     "GIT_PREFIX",
     "GIT_INDEX_VERSION",
+    // Env-injected configuration (`git -c` in a parent, a hook's environment) would reach
+    // every child otherwise; `GIT_CONFIG_KEY_<n>`/`VALUE_<n>` are inert without
+    // `GIT_CONFIG_COUNT`, so removing the count neutralizes the whole set.
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
 ];
+
+/// Configuration pinned with `-c` on every child of both runners (and written into the
+/// store's config at every open). A user's `core.fsmonitor = true` makes `update-index
+/// --refresh` under a foreign `GIT_DIR` wait on a daemon that never answers, and starts
+/// `fsmonitor--daemon`s as a side effect; the untracked cache and split index would put
+/// extensions into our private index that the seed/refresh path does not manage.
+pub const NEUTRALIZED_CONFIG: &[(&str, &str)] = &[
+    ("core.fsmonitor", "false"),
+    ("core.untrackedCache", "false"),
+    ("core.splitIndex", "false"),
+];
+
+/// Process-wide count of git children spawned by both runners (a budget probe for tests
+/// and `tests/test_perf_scan.rs`; never a product input).
+static SPAWNS: AtomicU64 = AtomicU64::new(0);
+
+/// How many git processes this process has spawned so far.
+pub fn spawn_count() -> u64 {
+    SPAWNS.load(Ordering::Relaxed)
+}
 
 /// The minimum git version every plumbing flag we use exists in (`--path-format=absolute`
 /// is 2.31).
@@ -191,6 +216,9 @@ fn argv_strings(args: &[OsString]) -> Vec<String> {
 pub(crate) fn base_command(env: &Env, cwd: &Path) -> Command {
     let mut cmd = Command::new("git");
     cmd.current_dir(cwd);
+    for (key, value) in NEUTRALIZED_CONFIG {
+        cmd.arg("-c").arg(format!("{key}={value}"));
+    }
     for (k, v) in env.vars() {
         if k.starts_with("GIT_") || k.starts_with("XDG_") || k == "HOME" {
             cmd.env(k, v);
@@ -211,6 +239,7 @@ fn run_command(
     stdin: Option<&[u8]>,
 ) -> Result<GitOutput, GitError> {
     use std::io::Write;
+    SPAWNS.fetch_add(1, Ordering::Relaxed);
     let cwd = cmd
         .get_current_dir()
         .map(Path::to_path_buf)
@@ -846,6 +875,10 @@ mod tests {
             .with_var("GIT_CONFIG_GLOBAL", "/dev/null")
             .with_var("GIT_DIR", "/leaked")
             .with_var("GIT_OBJECT_DIRECTORY", "/leaked-objects")
+            .with_var("GIT_CONFIG_PARAMETERS", "'core.fsmonitor=true'")
+            .with_var("GIT_CONFIG_COUNT", "1")
+            .with_var("GIT_CONFIG_KEY_0", "core.fsmonitor")
+            .with_var("GIT_CONFIG_VALUE_0", "true")
             .with_var("XDG_CONFIG_HOME", "/xdg")
             .with_var("HOME", "/home/t")
             .with_var("LASTCALL_STATE_DIR", "/not-overlaid");
@@ -869,7 +902,26 @@ mod tests {
         for k in SCRUBBED_VARS {
             assert_eq!(envs.get(*k), Some(&None), "{k} must be removed");
         }
+        // Named explicitly so a shrinking list cannot pass by iterating over itself.
+        for k in ["GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"] {
+            assert_eq!(envs.get(k), Some(&None), "{k} must be removed");
+        }
         assert_eq!(cmd.get_current_dir(), Some(Path::new("/work")));
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.untrackedCache=false",
+                "-c",
+                "core.splitIndex=false"
+            ]
+        );
     }
 
     #[test]

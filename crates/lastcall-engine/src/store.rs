@@ -21,7 +21,7 @@
 //! attribute executes `git-lfs clean` (writes under `<store>/lfs/` or fails when git-lfs is
 //! missing, which surfaces as [`Current::Unhashable`]). Informational deferral.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -129,6 +129,14 @@ impl Store {
         };
         let git =
             StoreGit::new(env, root, &paths.store, &paths.index).with_excludes_file(excludes_file);
+        // The store's own config pins the monitor/cache keys as well (a `git` run by hand
+        // against the store must not start a daemon either). A failure is a notice: the
+        // `-c` on every command still holds.
+        for (key, value) in git::NEUTRALIZED_CONFIG {
+            if let Err(e) = git.run(&["config", key, value]) {
+                notices.push(format!("cannot set {key} in the store: {e}"));
+            }
+        }
 
         if let Some(rg) = repo_git {
             // Alternates → the user's object dir (the common dir for a linked worktree).
@@ -358,6 +366,48 @@ impl Store {
     /// `cat-file blob <oid>`.
     pub fn cat_blob(&self, oid: &Oid) -> Result<Vec<u8>, StoreError> {
         Ok(self.git.run(&["cat-file", "blob", oid.as_str()])?)
+    }
+
+    /// Every blob in one `cat-file --batch` (one process for a whole scan, not one per
+    /// row). Missing, ambiguous and non-blob objects are simply absent from the map.
+    pub fn cat_blobs(&self, oids: &[Oid]) -> Result<HashMap<Oid, Vec<u8>>, StoreError> {
+        let mut out = HashMap::new();
+        if oids.is_empty() {
+            return Ok(out);
+        }
+        let mut stdin = Vec::new();
+        for oid in oids {
+            stdin.extend_from_slice(oid.as_str().as_bytes());
+            stdin.push(b'\n');
+        }
+        let bytes = self.git.run_stdin(None, &["cat-file", "--batch"], &stdin)?;
+        // `<oid> <type> <size>\n<content>\n` per found object; `<obj> missing\n` otherwise.
+        let mut rest: &[u8] = &bytes;
+        while let Some(nl) = rest.iter().position(|b| *b == b'\n') {
+            let header = String::from_utf8_lossy(&rest[..nl]).into_owned();
+            rest = &rest[nl + 1..];
+            let fields: Vec<&str> = header.split(' ').collect();
+            let (Some(oid), Some(kind), Some(size)) = (
+                fields.first().and_then(|o| Oid::parse(o)),
+                fields.get(1),
+                fields.get(2).and_then(|s| s.parse::<usize>().ok()),
+            ) else {
+                continue; // `missing` / `ambiguous`: nothing follows the header
+            };
+            if rest.len() < size {
+                return Err(StoreError::Other(format!(
+                    "cat-file --batch: truncated content for {oid}"
+                )));
+            }
+            if *kind == "blob" {
+                out.insert(oid, rest[..size].to_vec());
+            }
+            rest = &rest[size..];
+            if rest.first() == Some(&b'\n') {
+                rest = &rest[1..];
+            }
+        }
+        Ok(out)
     }
 
     /// Whether `oid` resolves through the store (own objects or the alternate).
