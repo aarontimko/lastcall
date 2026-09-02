@@ -188,7 +188,7 @@ fn argv_strings(args: &[OsString]) -> Vec<String> {
 /// The base command: inherit the process env, overlay the injected `Env`'s `GIT_*` /
 /// `XDG_*` / `HOME`, pin the three safety variables, then scrub the repository-location
 /// variables. Callers set their own `GIT_DIR` etc. afterwards.
-fn base_command(env: &Env, cwd: &Path) -> Command {
+pub(crate) fn base_command(env: &Env, cwd: &Path) -> Command {
     let mut cmd = Command::new("git");
     cmd.current_dir(cwd);
     for (k, v) in env.vars() {

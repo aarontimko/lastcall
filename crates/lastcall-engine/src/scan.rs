@@ -319,13 +319,10 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
 
     // 2. Candidates.
     let mut candidates: BTreeSet<Vec<u8>> = BTreeSet::new();
-    let mut anchored: HashSet<Vec<u8>> = HashSet::new(); // never excluded
     for d in &diff {
         candidates.insert(d.path.clone());
-        anchored.insert(d.path.clone());
         if let Some(dest) = &d.dest {
             candidates.insert(dest.clone());
-            anchored.insert(dest.clone());
         }
     }
     for key in inputs
@@ -335,7 +332,6 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
         .chain(inputs.ledger.unparsable.keys())
     {
         candidates.insert(key.as_bytes().to_vec());
-        anchored.insert(key.as_bytes().to_vec());
     }
     let mut listings = DirListings::default();
     let mut forced_absent: HashSet<Vec<u8>> = HashSet::new();
@@ -344,7 +340,6 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
         for path in inputs.tree.keys() {
             if !listings.exact_exists(root, path) {
                 candidates.insert(path.clone());
-                anchored.insert(path.clone());
                 forced_absent.insert(path.clone());
             }
         }
@@ -364,7 +359,9 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
         }
     }
     // D6: a skip-worktree path is excluded only while it is absent from the worktree (the
-    // sparse cone); one that is present is a real file and stays a candidate.
+    // sparse cone); one that is present is a real file and stays a candidate. The filter
+    // applies to every candidate whichever list it came from: an absent cone path is a
+    // cone even when an override or `diff-files` names it.
     let root_dir = inputs.store.root();
     let candidates: Vec<Vec<u8>> = candidates
         .into_iter()

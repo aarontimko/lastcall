@@ -343,11 +343,17 @@ impl Engine {
             .filter(|e| !e.is_empty());
 
         // A `ledger.json.tmp` left by a crash between write and rename (E1) is garbage:
-        // the rename never happened, so `ledger.json` is still the previous version.
+        // the rename never happened, so `ledger.json` is still the previous version. A
+        // live writer holds the lock between its write and rename, so the tmp is judged
+        // under the lock: once we hold it, any tmp still there is stale.
         let stale_tmp = paths.ledger.with_extension("json.tmp");
         if stale_tmp.exists() {
-            let _ = std::fs::remove_file(&stale_tmp);
-            notices.push("removed a stale ledger.json.tmp from an interrupted write".to_owned());
+            let _lock = LedgerLock::acquire(&paths)?;
+            if stale_tmp.exists() {
+                let _ = std::fs::remove_file(&stale_tmp);
+                notices
+                    .push("removed a stale ledger.json.tmp from an interrupted write".to_owned());
+            }
         }
         let clock: &dyn Clock = self.options.clock.as_ref();
         let mut ledger = match ledger::load(&paths, clock)? {
@@ -355,52 +361,78 @@ impl Engine {
                 notices.extend(n);
                 ledger
             }
-            LoadResult::Missing => {
-                // E4: a sibling ledger whose root no longer exists is probably this root
-                // under its old name. First-sight rules apply; say where the old state is.
-                for (old_root, dir) in orphaned_ledgers(&self.layout.repos_dir(&parent_id)) {
-                    notices.push(format!(
-                        "first sight; previous state for {old_root} (no longer on disk) is kept at {}",
-                        dir.display()
-                    ));
+            first => {
+                // Nothing usable on disk. Whatever is written now is written under the
+                // lock after a second look, so two processes opening the same never-seen
+                // root cannot clobber each other's first sight (or an accept in between),
+                // and a corrupt ledger moved aside by one of them is never mistaken for
+                // "never seen" by the other: a moved-aside sibling with no ledger beside
+                // it can only mean that, and it opens with nothing seen (over-shows).
+                let _lock = LedgerLock::acquire(&paths)?;
+                match ledger::load(&paths, clock)? {
+                    LoadResult::Loaded { ledger, notices: n } => {
+                        notices.extend(n);
+                        notices.push("ledger written by another process while opening".to_owned());
+                        ledger
+                    }
+                    second => {
+                        let unreadable = match (first, second) {
+                            (LoadResult::Unreadable { moved_to, reason }, _)
+                            | (_, LoadResult::Unreadable { moved_to, reason }) => {
+                                Some((moved_to, reason))
+                            }
+                            _ => ledger::moved_aside_sibling(&paths)
+                                .map(|p| (p, "moved aside by another process".to_owned())),
+                        };
+                        match unreadable {
+                            Some((moved_to, reason)) => {
+                                notices.push(format!(
+                                    "ledger unreadable ({reason}); moved to {} and reopened with nothing seen",
+                                    moved_to.display()
+                                ));
+                                // Persisted at once, with no `seen_at`: the next open must
+                                // find *this* ledger, not fall to first sight at the current
+                                // HEAD (which would hide everything committed since the old
+                                // ledger was last good).
+                                let l = Ledger::new(
+                                    &d.path,
+                                    d.kind,
+                                    None,
+                                    SeenAt {
+                                        head_commit: None,
+                                        branch: None,
+                                        at: clock.now_iso8601(),
+                                    },
+                                );
+                                ledger::save(&paths, &l)?;
+                                l
+                            }
+                            None => {
+                                // E4: a sibling ledger whose root no longer exists is
+                                // probably this root under its old name. First-sight rules
+                                // apply; say where the old state is.
+                                for (old_root, dir) in
+                                    orphaned_ledgers(&self.layout.repos_dir(&parent_id))
+                                {
+                                    notices.push(format!(
+                                        "first sight; previous state for {old_root} (no longer on disk) is kept at {}",
+                                        dir.display()
+                                    ));
+                                }
+                                let l = first_sight(
+                                    &d.path,
+                                    d.kind,
+                                    &store,
+                                    &head,
+                                    self.config.draft_initial,
+                                    clock,
+                                )?;
+                                ledger::save(&paths, &l)?;
+                                l
+                            }
+                        }
+                    }
                 }
-                let l = first_sight(
-                    &d.path,
-                    d.kind,
-                    &store,
-                    &head,
-                    self.config.draft_initial,
-                    clock,
-                )?;
-                {
-                    let _lock = LedgerLock::acquire(&paths)?;
-                    ledger::save(&paths, &l)?;
-                }
-                l
-            }
-            LoadResult::Unreadable { moved_to, reason } => {
-                notices.push(format!(
-                    "ledger unreadable ({reason}); moved to {} and reopened with nothing seen",
-                    moved_to.display()
-                ));
-                // Persisted at once, with no `seen_at`: the next open must find *this*
-                // ledger, not fall to first sight at the current HEAD (which would hide
-                // everything committed since the old ledger was last good).
-                let l = Ledger::new(
-                    &d.path,
-                    d.kind,
-                    None,
-                    SeenAt {
-                        head_commit: None,
-                        branch: None,
-                        at: clock.now_iso8601(),
-                    },
-                );
-                {
-                    let _lock = LedgerLock::acquire(&paths)?;
-                    ledger::save(&paths, &l)?;
-                }
-                l
             }
         };
         if let Some(t) = ledger.seen_tree.clone()
@@ -468,21 +500,24 @@ impl Engine {
             // `inspect_head`, and the pile must never depend on that ordering.
             // `state.head` stays the last *reported* state so the transition notice
             // is still emitted exactly once by `inspect_head`.
-            let live = headstate::inspect(rg)?;
+            // Annotation is a label layer: none of its inputs failing may drop a row.
             let seen_head = state.ledger.seen_at.head_commit.clone();
-            match state
-                .classifier
-                .get(rg, seen_head.as_ref(), &live, state.user_email.as_deref())
-            {
-                Ok(class) => {
-                    if let Err(e) = upstream::annotate(&mut pile, class, rg) {
-                        pile.notices
-                            .push(format!("upstream annotation skipped: {e}"));
-                    }
-                }
-                Err(e) => pile
-                    .notices
-                    .push(format!("upstream classification skipped: {e}")),
+            let skipped = match headstate::inspect(rg) {
+                Err(e) => Some(format!("head inspection skipped: {e}")),
+                Ok(live) => match state.classifier.get(
+                    rg,
+                    seen_head.as_ref(),
+                    &live,
+                    state.user_email.as_deref(),
+                ) {
+                    Err(e) => Some(format!("upstream classification skipped: {e}")),
+                    Ok(class) => upstream::annotate(&mut pile, class, rg)
+                        .err()
+                        .map(|e| format!("upstream annotation skipped: {e}")),
+                },
+            };
+            if let Some(n) = skipped {
+                pile.notices.push(n);
             }
         }
         state.last_pile = Some(pile.clone());
@@ -852,13 +887,130 @@ pub(crate) mod tests {
         ledger.seen_tree = Oid::parse(&"a".repeat(40));
         ledger::save(&engine.root(&root).unwrap().paths, &ledger).unwrap();
         drop(engine);
-        let engine = open_engine(&repo, &state, Config::default());
+        let mut engine = open_engine(&repo, &state, Config::default());
         let r = engine.root(&root).unwrap();
         assert!(r.ledger.seen_tree.is_none());
         assert!(
             r.notices.iter().any(|n| n.contains("no longer exists")),
             "{:?}",
             r.notices
+        );
+
+        // The disk still names the pruned tree; accepting must merge with that ledger
+        // without resolving it, and accept-all must write a fresh seen tree.
+        let pile = engine.scan(&root).unwrap();
+        let rendered = Rendered::of(pile.row(b"f1").unwrap());
+        let out = engine
+            .ops(&root)
+            .unwrap()
+            .accept_file(&rendered, &NoFault)
+            .unwrap();
+        assert!(out.ok(), "accept over a pruned seen tree: {out:?}");
+        let on_disk = std::fs::read_to_string(&ledger_path).unwrap();
+        assert!(
+            !on_disk.contains(&"a".repeat(40)),
+            "the pruned tree is not written back: {on_disk}"
+        );
+        let pile = engine.scan(&root).unwrap();
+        assert!(pile.row(b"f1").is_none(), "{:?}", scan::pile_lines(&pile));
+        let out = engine
+            .ops(&root)
+            .unwrap()
+            .accept_all(&pile, &NoFault)
+            .unwrap();
+        assert!(out.ok(), "{out:?}");
+        let seen = engine.root(&root).unwrap().ledger.seen_tree.clone();
+        assert!(
+            seen.as_ref().is_some_and(|t| t.as_str() != "a".repeat(40)),
+            "{seen:?}"
+        );
+        assert_eq!(
+            scan::pile_lines(&engine.scan(&root).unwrap()),
+            Vec::<String>::new()
+        );
+    }
+
+    /// The interleaving that must never first-sight: process A found the ledger
+    /// unreadable and moved it aside (but has not written its null ledger yet) when
+    /// process B opens the same root and finds no ledger at all.
+    #[test]
+    fn engine_open_treats_a_ledger_moved_aside_by_another_process_as_unreadable() {
+        let repo = FixtureRepo::new("eng-race").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let engine = open_engine(&repo, &state, Config::default());
+        let root = only_root(&engine);
+        let paths = engine.root(&root).unwrap().paths.clone();
+        drop(engine);
+        std::fs::write(&paths.ledger, b"{ not json").unwrap();
+        let a = ledger::load(&paths, EngineOptions::default().clock.as_ref()).unwrap();
+        assert!(matches!(a, LoadResult::Unreadable { .. }));
+        assert!(!paths.ledger.exists(), "A moved the ledger aside");
+
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let r = engine.root(&root).unwrap();
+        assert!(
+            r.ledger.seen_tree.is_none() && r.ledger.seen_at.head_commit.is_none(),
+            "B opened with nothing seen, not first sight: {:?}",
+            r.notices
+        );
+        assert!(
+            r.notices
+                .iter()
+                .any(|n| n.contains("moved aside by another process")),
+            "{:?}",
+            r.notices
+        );
+        assert!(engine.scan(&root).unwrap().rows.len() >= 3);
+        assert!(paths.ledger.exists(), "the null ledger was persisted");
+    }
+
+    /// The rung of the ladder where HEAD cannot be inspected at all: rows still come
+    /// through, with a notice instead of an annotation.
+    #[test]
+    fn engine_scan_survives_a_head_that_cannot_be_inspected() {
+        let repo = FixtureRepo::new("eng-nohead").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let root = only_root(&engine);
+        repo.write("f1", "a1\na2\na3\na4\na5\na6\na7\na8\na9\na10\nedit\n");
+        assert_eq!(scan::pile_lines(&engine.scan(&root).unwrap()), ["f1"]);
+        let head_file = repo.path().join(".git/HEAD");
+        let keep = std::fs::read(&head_file).unwrap();
+        std::fs::write(&head_file, b"garbage\n").unwrap();
+        let pile = engine.scan(&root).unwrap();
+        std::fs::write(&head_file, keep).unwrap();
+        assert_eq!(scan::pile_lines(&pile), ["f1"], "{:?}", pile.notices);
+        assert!(
+            pile.notices
+                .iter()
+                .any(|n| n.contains("head inspection skipped")),
+            "{:?}",
+            pile.notices
+        );
+    }
+
+    /// Remote reachability is a classification input: a fetch that moves `refs/remotes`
+    /// without moving HEAD must relabel.
+    #[test]
+    fn engine_upstream_labels_follow_remote_refs_without_head_moving() {
+        let mut repo = FixtureRepo::new("eng-remotes").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let root = only_root(&engine);
+        // The coworker's commit reaches HEAD by URL (FETCH_HEAD), so no remote-tracking
+        // ref knows it yet: neither mine nor remote-reachable, hence plain.
+        repo.coworker_commit(&[("f1", "a1\ncoworker\n")], "cw")
+            .unwrap();
+        let origin = repo.origin().to_string_lossy().into_owned();
+        repo.git(&["fetch", "-q", &origin, "main"]).unwrap();
+        repo.git(&["merge", "-q", "--ff-only", "FETCH_HEAD"])
+            .unwrap();
+        assert_eq!(scan::pile_lines(&engine.scan(&root).unwrap()), ["f1"]);
+        // `origin/main` catches up; HEAD is unchanged.
+        repo.git(&["fetch", "-q", "origin"]).unwrap();
+        assert_eq!(
+            scan::pile_lines(&engine.scan(&root).unwrap()),
+            ["f1 upstream"]
         );
     }
 

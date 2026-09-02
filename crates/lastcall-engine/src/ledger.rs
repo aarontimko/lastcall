@@ -331,6 +331,25 @@ pub fn load(paths: &RepoPaths, clock: &dyn Clock) -> Result<LoadResult, LedgerEr
 }
 
 /// Rename `ledger.json` to `ledger.json.unreadable-<secs>-<n>`, never clobbering.
+/// The newest `ledger.json.unreadable-*` beside the ledger, if any. With no `ledger.json`
+/// next to it, it means another process moved a corrupt ledger aside and has not written
+/// its replacement yet (the open path treats that as unreadable, never as first sight).
+pub fn moved_aside_sibling(paths: &RepoPaths) -> Option<PathBuf> {
+    let dir = paths.ledger.parent()?;
+    let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("ledger.json.unreadable-"))
+        })
+        .collect();
+    found.sort();
+    found.pop()
+}
+
 fn move_aside(ledger: &Path, clock: &dyn Clock) -> Result<PathBuf, LedgerError> {
     let secs = clock
         .now()

@@ -51,11 +51,16 @@ GIT_DIR=store git ls-tree -r "$(cat index.tree)" | head                # what th
 ```
 
 `ledger.json` is written as `ledger.json.tmp` + `fsync` + `rename` under `lock`. A stale
-`ledger.json.tmp` found at open (a crash between the two steps, E1) is removed with a notice.
+`ledger.json.tmp` found at open (a crash between the two steps, E1) is removed with a notice
+— judged under the lock, so a live writer's tmp is never mistaken for a stale one.
 An unreadable ledger is moved aside to `ledger.json.unreadable-<secs>-<n>` and the root
 opens with `seen_tree = null` (every path pending); that ledger is written at once so the next
 open finds it — it is *not* first sight, because first sight at the current HEAD would hide
-everything committed since.
+everything committed since. Open reads a present ledger without the lock; when there is none
+it takes the lock and looks again before writing anything, so two processes opening the same
+never-seen root cannot clobber each other, and a moved-aside sibling with no ledger beside it
+(the other process has not written its replacement yet) opens as unreadable, never as first
+sight.
 
 The store is never garbage-collected. Nothing in it is anchored by a ref, so `gc`, `prune`,
 `repack -d` or `fsck --lost-found` would delete the seen tree and every override blob. It
@@ -96,7 +101,7 @@ Refused by construction: `status`, `diff`, `add`, `update-index`, `checkout`, `s
 
 1. Refresh the private index (`update-index --refresh`); a held `index.lock` is retried 3 × 50 ms, then the scan proceeds unrefreshed (over-report at worst).
 2. Candidates = `diff-files` paths ∪ `ls-files --others` files ∪ every override path ∪ (case-insensitive roots) seen-tree names absent byte-exactly from their directory.
-3. Minus paths tagged skip-worktree in the **user's** index *that are absent from the worktree* (D6: a sparse cone; a present one is a real edit and stays); minus `others` entries under a nested repo (D9) or a sibling draft root. `diff-files`/override/case paths are never excluded.
+3. Minus paths tagged skip-worktree in the **user's** index *that are absent from the worktree* (D6: a sparse cone; a present one is a real edit and stays); minus `others` entries under a nested repo (D9) or a sibling draft root. The skip-worktree filter applies to every candidate whichever list it came from: an absent cone path is a cone even when an override or `diff-files` names it.
 4. `current` per path = `lstat` → `Absent` | `Unhashable(reason)` | `{oid, mode}`; all hashed in one `hash-object -w --stdin-paths` call from the root (so `text=auto` and clean filters apply). `Unhashable` is always a row.
 5. `baseline` per path from the ledger (override blob → override null → seen tree → empty); a missing override blob or an unparsable override falls to the tree with a notice (E2).
 6. Row iff baseline ≠ current by oid or mode (D1); on `core.filemode=false` roots the executable bit is normalized away on both sides, so a mode-only row cannot appear there.
@@ -115,7 +120,8 @@ Every rung shows *more* than the truth, never less, and says why in a notice:
 | a sibling ledger whose recorded root is gone (the repo was moved, E4) | first sight for the new path, a notice naming the old root; old state is kept |
 | unreadable ledger / unknown schema major | moved aside, `seen_tree = null`, every path pending |
 | stale `ledger.json.tmp` | removed at open, notice (E1) |
-| seen tree not resolvable in the store (user ran `git gc`) | treated as `null`, notice |
+| seen tree not resolvable in the store (user ran `git gc`) | treated as `null`, notice; the next accept persists `null` and accept-all seeds from the empty tree |
+| HEAD cannot be inspected (corrupt `.git/HEAD`, git-dir unreadable) | rows unchanged, no annotation, notice `head inspection skipped` |
 | override blob missing (E3) or override unparsable (E2) | that path resolves to the seen-tree entry |
 | `index` / `index.tree` missing, mismatched, or unreadable (empty, garbage, truncated) | reseeded from the seen tree; the pile is identical |
 | `index.lock` held by another process | scan runs unrefreshed |

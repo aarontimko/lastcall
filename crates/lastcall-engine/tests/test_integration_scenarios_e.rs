@@ -130,6 +130,20 @@ fn e1_case(name: &str, point: &str) -> String {
         oracle.row(b"f1").unwrap().hunks
     );
     assert!(engine.root(&root).unwrap().ledger.overrides.is_empty());
+    // The lock died with the process: an accept goes through on the reopened engine at
+    // both fault points.
+    let rendered = Rendered::of(pile.row(b"f1").unwrap());
+    let out = engine
+        .ops(&root)
+        .unwrap()
+        .accept_file(&rendered, &lastcall_engine::ops::NoFault)
+        .unwrap();
+    assert!(out.ok(), "{point}: accept after the kill: {out:?}");
+    assert_eq!(
+        pile_string(&engine.scan(&root).unwrap()),
+        "",
+        "{point}: accepted"
+    );
     point.to_owned()
 }
 

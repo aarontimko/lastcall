@@ -230,6 +230,9 @@ impl Ops<'_> {
     /// what the other side wrote. The seen-tree cache follows an on-disk seen tree that
     /// moved (the other side compacted).
     fn merge_from_disk(&mut self) -> Result<(), OpsError> {
+        // `Missing` (the file was removed) and `Unreadable` (garbage, moved aside by
+        // `load`) both mean the disk holds nothing worth merging: this engine's ledger is
+        // written as is.
         let LoadResult::Loaded { ledger: disk, .. } = ledger::load(self.paths, self.clock)? else {
             return Ok(());
         };
@@ -246,7 +249,14 @@ impl Ops<'_> {
         }
         if merged.seen_tree != self.ledger.seen_tree {
             *self.tree = match &merged.seen_tree {
-                Some(t) => self.store.ls_tree(t)?,
+                Some(t) if self.store.exists(t) => self.store.ls_tree(t)?,
+                Some(_) => {
+                    // The on-disk seen tree is gone (gc?): the same rule as open — nothing
+                    // seen — so this write persists `null` and the next fold seeds from
+                    // the empty tree instead of failing on every accept.
+                    merged.seen_tree = None;
+                    TreeEntries::new()
+                }
                 None => TreeEntries::new(),
             };
         }

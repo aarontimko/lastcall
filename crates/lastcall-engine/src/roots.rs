@@ -336,13 +336,10 @@ mod tests {
     use lastcall_testkit::tmp::TempDir;
 
     fn git(env: &Env, cwd: &Path, args: &[&str]) {
-        let mut cmd = std::process::Command::new("git");
-        cmd.args(args).current_dir(cwd).env_clear();
-        for (k, v) in env.vars() {
-            cmd.env(k, v);
-        }
-        cmd.env("PATH", std::env::var_os("PATH").unwrap_or_default());
-        let out = cmd.output().expect("git runs");
+        let out = crate::git::base_command(env, cwd)
+            .args(args)
+            .output()
+            .expect("git runs");
         assert!(
             out.status.success(),
             "git {args:?} failed: {}",

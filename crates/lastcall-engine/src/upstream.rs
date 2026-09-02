@@ -17,22 +17,37 @@ use crate::git::{GitError, Oid, RepoGit};
 use crate::headstate::HeadState;
 use crate::scan::{Annotation, Pile};
 
-/// What the classification was computed for; recomputed only when it changes.
+/// What the classification was computed for; recomputed only when it changes. Remote
+/// reachability is an input too, so the remote-tracking refs are part of the key: a fetch
+/// or push that moves `refs/remotes` without moving HEAD relabels.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ClassifyKey {
     pub seen_head: Option<Oid>,
     pub head: Option<Oid>,
     pub merge_head: Option<Oid>,
+    /// `for-each-ref refs/remotes` (object name and ref name per line).
+    pub remotes: String,
 }
 
 impl ClassifyKey {
-    pub fn of(seen_head: Option<&Oid>, state: &HeadState) -> Self {
+    pub fn of(seen_head: Option<&Oid>, state: &HeadState, remotes: String) -> Self {
         Self {
             seen_head: seen_head.cloned(),
             head: state.head.clone(),
             merge_head: state.merge_head.clone(),
+            remotes,
         }
     }
+}
+
+/// The remote-tracking refs right now, one `<oid> <refname>` per line.
+pub fn remote_refs(rg: &RepoGit) -> Result<String, GitError> {
+    let out = rg.run(&[
+        "for-each-ref",
+        "--format=%(objectname) %(refname)",
+        "refs/remotes",
+    ])?;
+    Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
 /// Path sets for one `(seen_head, heads)` combination.
@@ -67,7 +82,7 @@ impl Classifier {
         state: &HeadState,
         user_email: Option<&str>,
     ) -> Result<&Classification, GitError> {
-        let key = ClassifyKey::of(seen_head, state);
+        let key = ClassifyKey::of(seen_head, state, remote_refs(rg)?);
         if self.cached.as_ref().is_none_or(|c| c.key != key) {
             self.cached = Some(classify(rg, seen_head, state, user_email)?);
         }
@@ -136,7 +151,7 @@ pub fn classify(
     state: &HeadState,
     user_email: Option<&str>,
 ) -> Result<Classification, GitError> {
-    let key = ClassifyKey::of(seen_head, state);
+    let key = ClassifyKey::of(seen_head, state, remote_refs(rg)?);
     let mut heads: Vec<Oid> = Vec::new();
     heads.extend(state.head.clone());
     heads.extend(state.merge_head.clone());
