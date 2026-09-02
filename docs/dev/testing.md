@@ -16,7 +16,7 @@ child and never falls back to a `herdr` on `PATH`.
 | e2e | `just test-e2e` = `cargo test --workspace --test 'test_e2e_*'` | placeholder until Phase 3 (Ratatui `TestBackend`) / Phase 9 (PTY) | — |
 
 `just test` runs the three in order. **`just test-unit` is the canonical suite**; its count is
-the ratchet floor from Phase 2 on (Phase 1 close: 84 engine + 15 testkit + 0 binary = 99).
+the ratchet floor from Phase 2 on (Phase 1 close: 85 engine + 16 testkit + 0 binary = 101, the Phase 2 floor).
 
 ## Naming
 
