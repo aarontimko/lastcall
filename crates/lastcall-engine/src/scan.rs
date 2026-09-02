@@ -5,7 +5,8 @@
 //!
 //! 1. candidates = `diff_files` paths ∪ `others` files ∪ every override path ∪ (on
 //!    case-insensitive roots) seen-tree entries whose exact name is absent from their
-//!    directory, minus paths tagged `S` in the **user's** index (D6), minus `others`
+//!    directory, minus paths tagged `S` in the **user's** index *and absent from the
+//!    worktree* (D6: a sparse cone, never a present file), minus `others`
 //!    entries under a nested repository (D9) or a draft root owned by another root. Paths
 //!    that come from `diff_files`, an override, or the case rule are **never** excluded.
 //! 2. `current = lstat` → `Absent` | `Unhashable(reason)` | `{oid, mode}`, hashed in one
@@ -272,7 +273,16 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
     if !refreshed {
         notices.push("index.lock held by another process; scanned without refresh".into());
     }
-    let diff = inputs.index.diff_files()?;
+    let diff = match inputs.index.diff_files() {
+        Ok(d) => d,
+        Err(e) => {
+            // The private index is a cache: a torn or truncated file is rebuilt from the
+            // seen tree and the scan tries once more.
+            notices.push(format!("private index unreadable ({e}); reseeded"));
+            inputs.index.seed(inputs.seen_tree)?;
+            inputs.index.diff_files()?
+        }
+    };
     let others = inputs.index.others()?;
     let mut nested_repos: Vec<Vec<u8>> = others
         .iter()
@@ -353,9 +363,18 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
             candidates.insert(p.clone());
         }
     }
+    // D6: a skip-worktree path is excluded only while it is absent from the worktree (the
+    // sparse cone); one that is present is a real file and stays a candidate.
+    let root_dir = inputs.store.root();
     let candidates: Vec<Vec<u8>> = candidates
         .into_iter()
-        .filter(|p| !skip.contains(p))
+        .filter(|p| {
+            !skip.contains(p)
+                || root_dir
+                    .join(OsStr::from_bytes(p))
+                    .symlink_metadata()
+                    .is_ok()
+        })
         .collect();
 
     // 3. Current side, hashed in one batch.
@@ -741,6 +760,7 @@ pub(crate) mod fixture_tests {
                 tree: &mut self.tree_entries,
                 clock: &self.clock,
                 compaction_threshold: self.compaction_threshold,
+                staged: std::collections::BTreeMap::new(),
             }
         }
 
@@ -936,7 +956,7 @@ pub(crate) mod fixture_tests {
     }
 
     #[test]
-    fn scan_override_paths_are_candidates_and_skip_worktree_is_not() {
+    fn scan_override_paths_are_candidates_and_absent_skip_worktree_is_not() {
         let repo = FixtureRepo::new("scan-ovr").unwrap();
         let state = TempDir::new("lc-scan");
         let mut h = Harness::new(&repo, &state);
@@ -955,15 +975,18 @@ pub(crate) mod fixture_tests {
                 updated_at: "t".into(),
             },
         );
-        // f2 edited but skip-worktree in the user's index (D6).
+        // f2 edited and skip-worktree in the user's index: present, so it is a real edit
+        // and is shown (over-show); once absent it is a sparse cone, not a deletion (D6).
         repo.write("f2", "edited\n");
         repo.git(&["update-index", "--skip-worktree", "f2"])
             .unwrap();
         let pile = h.scan().pile;
-        assert_eq!(pile_lines(&pile), vec!["f1"]);
+        assert_eq!(pile_lines(&pile), vec!["f1", "f2"]);
         let f1 = pile.row(b"f1").unwrap();
         assert_eq!(f1.change, Change::Modified);
         assert_eq!(f1.flag.as_ref().unwrap().note, "look");
+        repo.remove("f2");
+        assert_eq!(pile_lines(&h.scan().pile), vec!["f1"]);
     }
 
     #[test]

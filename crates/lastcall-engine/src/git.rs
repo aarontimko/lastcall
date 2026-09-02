@@ -477,12 +477,19 @@ impl RepoGit {
             return false;
         };
         let rest = &strs[1..];
+        // `--output=<file>` writes wherever it points, for every verb that accepts it.
+        if rest.iter().any(|a| a.starts_with("--output")) {
+            return false;
+        }
         match sub.as_str() {
             "--version" => rest.is_empty(),
             "rev-parse" | "rev-list" | "merge-base" | "diff-tree" | "cat-file" | "for-each-ref" => {
                 true
             }
-            "symbolic-ref" => rest.iter().filter(|a| !a.starts_with('-')).count() == 1,
+            "symbolic-ref" => {
+                rest.iter().filter(|a| !a.starts_with('-')).count() == 1
+                    && !rest.iter().any(|a| a == "-d" || a == "--delete")
+            }
             "config" => rest.first().is_some_and(|a| a == "--get"),
             "ls-files" => rest
                 .iter()
@@ -810,6 +817,11 @@ mod tests {
             vec!["config", "user.email", "x@y"],
             vec!["config", "--unset", "user.email"],
             vec!["symbolic-ref", "HEAD", "refs/heads/x"],
+            vec!["symbolic-ref", "--delete", "refs/heads/x"],
+            vec!["symbolic-ref", "-d", "refs/heads/x"],
+            vec!["log", "--format=%H", "--output=/elsewhere/x"],
+            vec!["diff-tree", "--output=/elsewhere/x", "HEAD"],
+            vec!["rev-list", "--output", "/elsewhere/x", "HEAD"],
             vec!["log"],
             vec!["worktree", "add", "../x"],
             vec!["worktree", "prune"],

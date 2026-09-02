@@ -22,7 +22,7 @@ use crate::git::{self, GitError, Oid, RepoGit};
 use crate::headstate::{self, HeadState, TransitionFacts};
 use crate::index::{IndexError, PrivateIndex};
 use crate::ledger::{
-    self, Clock, Ledger, LedgerError, LoadResult, SeenAt, SystemClock, TreeEntries,
+    self, Clock, Ledger, LedgerError, LedgerLock, LoadResult, SeenAt, SystemClock, TreeEntries,
 };
 use crate::ops::{Ops, OpsError};
 use crate::paths::{Layout, ParentId, ParentMeta, RepoPaths, RootId};
@@ -372,7 +372,10 @@ impl Engine {
                     self.config.draft_initial,
                     clock,
                 )?;
-                ledger::save(&paths, &l)?;
+                {
+                    let _lock = LedgerLock::acquire(&paths)?;
+                    ledger::save(&paths, &l)?;
+                }
                 l
             }
             LoadResult::Unreadable { moved_to, reason } => {
@@ -380,16 +383,24 @@ impl Engine {
                     "ledger unreadable ({reason}); moved to {} and reopened with nothing seen",
                     moved_to.display()
                 ));
-                Ledger::new(
+                // Persisted at once, with no `seen_at`: the next open must find *this*
+                // ledger, not fall to first sight at the current HEAD (which would hide
+                // everything committed since the old ledger was last good).
+                let l = Ledger::new(
                     &d.path,
                     d.kind,
                     None,
                     SeenAt {
-                        head_commit: head.head.clone(),
-                        branch: head.branch.clone(),
+                        head_commit: None,
+                        branch: None,
                         at: clock.now_iso8601(),
                     },
-                )
+                );
+                {
+                    let _lock = LedgerLock::acquire(&paths)?;
+                    ledger::save(&paths, &l)?;
+                }
+                l
             }
         };
         if let Some(t) = ledger.seen_tree.clone()
@@ -564,6 +575,7 @@ impl Engine {
             tree: &mut state.tree,
             clock,
             compaction_threshold: threshold,
+            staged: BTreeMap::new(),
         })
     }
 }
@@ -815,6 +827,25 @@ pub(crate) mod tests {
             "every tracked file is pending: {:?}",
             scan::pile_lines(&pile)
         );
+
+        // The null-seen-tree ledger was persisted: a further reopen is not first sight at
+        // the current HEAD (which would hide everything committed since).
+        drop(engine);
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let r = engine.root(&root).unwrap();
+        assert!(
+            r.ledger.seen_tree.is_none(),
+            "still nothing seen after a second reopen"
+        );
+        assert!(r.ledger.seen_at.head_commit.is_none());
+        assert!(
+            !r.notices
+                .iter()
+                .any(|n| n.contains("unreadable") || n.contains("first sight")),
+            "{:?}",
+            r.notices
+        );
+        assert!(engine.scan(&root).unwrap().rows.len() >= 3);
 
         // A seen tree that vanished from the store (gc) is treated the same way.
         let mut ledger = engine.root(&root).unwrap().ledger.clone();

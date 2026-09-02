@@ -22,8 +22,8 @@ use crate::git::{GitError, Mode, Oid, RepoGit};
 use crate::hunks::{self, Hunk};
 use crate::index::{IndexError, PrivateIndex};
 use crate::ledger::{
-    self, Baseline, BaselineResolver, Clock, Flag, Ledger, LedgerError, LedgerLock, Override,
-    SeenAt, TreeEntries,
+    self, Baseline, BaselineResolver, Clock, Flag, Ledger, LedgerError, LedgerLock, LoadResult,
+    Override, SeenAt, TreeEntries,
 };
 use crate::paths::RepoPaths;
 use crate::scan::{Entry, Pile, Row};
@@ -164,6 +164,10 @@ pub struct Ops<'a> {
     pub clock: &'a dyn Clock,
     /// Compaction runs after a write when more overrides than this carry a `blob`.
     pub compaction_threshold: usize,
+    /// Override changes made in memory since the last commit, keyed by path (`None` =
+    /// removed). Start empty: `commit` replays them onto the on-disk ledger under the lock
+    /// and clears them, so two engines over one root never lose each other's writes.
+    pub staged: BTreeMap<String, Option<Override>>,
 }
 
 impl Ops<'_> {
@@ -216,16 +220,51 @@ impl Ops<'_> {
         if entry.is_empty() {
             self.ledger.overrides.remove(key);
         }
+        self.staged
+            .insert(key.to_owned(), self.ledger.overrides.get(key).cloned());
     }
 
-    /// Lock, tmp-write, (fault), rename; then compact when over the threshold.
+    /// Under the lock: reload the on-disk ledger (another process may have written since
+    /// this one was loaded), replay the staged override changes onto it, and adopt it. A
+    /// change to the same path by both sides is last-writer-wins; every other path keeps
+    /// what the other side wrote. The seen-tree cache follows an on-disk seen tree that
+    /// moved (the other side compacted).
+    fn merge_from_disk(&mut self) -> Result<(), OpsError> {
+        let LoadResult::Loaded { ledger: disk, .. } = ledger::load(self.paths, self.clock)? else {
+            return Ok(());
+        };
+        let mut merged = disk;
+        for (key, o) in &self.staged {
+            match o {
+                Some(o) => {
+                    merged.overrides.insert(key.clone(), o.clone());
+                }
+                None => {
+                    merged.overrides.remove(key);
+                }
+            }
+        }
+        if merged.seen_tree != self.ledger.seen_tree {
+            *self.tree = match &merged.seen_tree {
+                Some(t) => self.store.ls_tree(t)?,
+                None => TreeEntries::new(),
+            };
+        }
+        *self.ledger = merged;
+        Ok(())
+    }
+
+    /// Lock, merge with disk, tmp-write, (fault), rename; then compact when over the
+    /// threshold.
     fn commit(&mut self, fault: &dyn FaultInjector) -> Result<bool, OpsError> {
         {
             let _lock = LedgerLock::acquire(self.paths)?;
+            self.merge_from_disk()?;
             let tmp = ledger::write_tmp(self.paths, self.ledger)?;
             fault.at(FaultPoint::AfterLedgerTmpWrite);
             ledger::commit_tmp(self.paths, &tmp)?;
         }
+        self.staged.clear();
         if self.ledger.blob_override_count() > self.compaction_threshold {
             self.compact(fault)?;
             return Ok(true);
@@ -466,6 +505,10 @@ impl Ops<'_> {
         seen_at: Option<SeenAt>,
         fault: &dyn FaultInjector,
     ) -> Result<(), OpsError> {
+        // The lock spans the whole fold: the tree is built from the on-disk ledger's
+        // overrides, so another process's accepts are folded in, never dropped.
+        let _lock = LedgerLock::acquire(self.paths)?;
+        self.merge_from_disk()?;
         // Order matters: later writes win. Overrides first, then the snapshot's rows.
         let mut writes: BTreeMap<Vec<u8>, TreeWrite> = BTreeMap::new();
         for (key, o) in &self.ledger.overrides {
@@ -522,12 +565,11 @@ impl Ops<'_> {
         if let Some(sa) = seen_at {
             self.ledger.seen_at = sa;
         }
-        {
-            let _lock = LedgerLock::acquire(self.paths)?;
-            let tmp = ledger::write_tmp(self.paths, self.ledger)?;
-            fault.at(FaultPoint::AfterLedgerTmpWrite);
-            ledger::commit_tmp(self.paths, &tmp)?;
-        }
+        let tmp = ledger::write_tmp(self.paths, self.ledger)?;
+        fault.at(FaultPoint::AfterLedgerTmpWrite);
+        ledger::commit_tmp(self.paths, &tmp)?;
+        drop(_lock);
+        self.staged.clear();
         *self.tree = self.store.ls_tree(&new_tree)?;
         self.index.seed(Some(&new_tree))?;
         Ok(())
@@ -550,17 +592,23 @@ impl Ops<'_> {
             }
         };
         let now = self.clock.now_iso8601();
-        let entry = self.ledger.overrides.entry(key).or_insert(Override {
-            blob: None,
-            mode: None,
-            flag: None,
-            updated_at: now.clone(),
-        });
+        let entry = self
+            .ledger
+            .overrides
+            .entry(key.clone())
+            .or_insert(Override {
+                blob: None,
+                mode: None,
+                flag: None,
+                updated_at: now.clone(),
+            });
         entry.flag = Some(Flag {
             note: note.to_owned(),
             created_at: now.clone(),
         });
         entry.updated_at = now;
+        let staged = entry.clone();
+        self.staged.insert(key, Some(staged));
         let compacted = self.commit(fault)?;
         Ok(Outcome {
             refused: Vec::new(),
@@ -588,6 +636,8 @@ impl Ops<'_> {
         if entry.is_empty() {
             self.ledger.overrides.remove(&key);
         }
+        self.staged
+            .insert(key.clone(), self.ledger.overrides.get(&key).cloned());
         let compacted = self.commit(fault)?;
         Ok(Outcome {
             refused: Vec::new(),
@@ -619,6 +669,42 @@ mod tests {
 
     fn rendered(h: &Harness, path: &[u8]) -> Rendered {
         Rendered::of(h.scan().pile.row(path).expect("row is pending"))
+    }
+
+    #[test]
+    fn ops_commit_merges_with_a_ledger_written_by_another_engine() {
+        let repo = FixtureRepo::new("ops-merge").unwrap();
+        let state = TempDir::new("lc-ops");
+        // Two engines over one root: each holds its own (soon stale) copy of the ledger.
+        let mut a = Harness::new(&repo, &state);
+        let mut b = Harness::new(&repo, &state);
+        repo.write("f1", "one\n");
+        repo.write("f2", "two\n");
+        let r1 = rendered(&a, b"f1");
+        let r2 = rendered(&b, b"f2");
+        assert!(a.ops().accept_file(&r1, &NoFault).unwrap().ok());
+        assert!(b.ops().accept_file(&r2, &NoFault).unwrap().ok());
+        let disk = match ledger::load(&b.paths, &b.clock).unwrap() {
+            LoadResult::Loaded { ledger, .. } => ledger,
+            other => panic!("{other:?}"),
+        };
+        assert!(
+            disk.overrides.contains_key("f1") && disk.overrides.contains_key("f2"),
+            "b's write kept a's accept: {:?}",
+            disk.overrides.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(b.ledger, disk, "b adopted the merged ledger");
+        assert!(b.scan().pile.is_empty());
+        // A fold by the stale engine folds both accepts.
+        a.ops().compact(&NoFault).unwrap();
+        assert!(a.ledger.overrides.is_empty());
+        assert!(a.scan().pile.is_empty(), "f2's accept survived a's fold");
+        // A flag set by one side survives an accept by the other.
+        assert!(b.ops().flag(b"f3", "look", &NoFault).unwrap().ok());
+        repo.write("f1", "one more\n");
+        let r1 = rendered(&a, b"f1");
+        assert!(a.ops().accept_file(&r1, &NoFault).unwrap().ok());
+        assert!(a.ledger.overrides["f3"].flag.is_some());
     }
 
     #[test]

@@ -166,6 +166,15 @@ fn scenario_d6_sparse_checkout_is_not_deletion() {
         "src/a",
         "D6 sparse: real edits still pending"
     );
+    // A skip-worktree path that is present (and modified) is a real file, not a cone.
+    std::fs::create_dir_all(s.repo.path().join("other")).unwrap();
+    s.repo.write("other/o", "O\n");
+    let pile = s.engine.scan(&s.root).unwrap();
+    assert!(
+        pile.row(b"other/o").is_some() && pile.row(b"src/a").is_some(),
+        "D6 sparse: a present skip-worktree edit is shown: {:?}",
+        pile.rows.iter().map(|r| r.path.clone()).collect::<Vec<_>>()
+    );
 }
 
 #[test]

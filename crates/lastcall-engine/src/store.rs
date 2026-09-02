@@ -269,8 +269,15 @@ impl Store {
         }
     }
 
+    /// Whether `--stdin-paths` reads a name back verbatim: it C-unquotes a line that starts
+    /// with `"` and treats control bytes (`\n`, `\r`, …) as line structure.
+    fn batchable(rel: &[u8]) -> bool {
+        rel.first() != Some(&b'"') && !rel.iter().any(|b| *b < 0x20)
+    }
+
     /// Hash many paths: regular files go through one `hash-object -w --stdin-paths` call;
-    /// symlinks, directories and paths containing a newline take the single-path route.
+    /// symlinks, directories and names `--stdin-paths` would misread take the single-path
+    /// route.
     pub fn hash_paths(&self, rels: &[Vec<u8>]) -> Vec<Current> {
         let mut out: Vec<Option<Current>> = vec![None; rels.len()];
         let mut batch: Vec<usize> = Vec::new();
@@ -279,7 +286,7 @@ impl Store {
             let full = self.git.root().join(OsStr::from_bytes(rel));
             match std::fs::symlink_metadata(&full) {
                 Ok(m) => {
-                    if m.file_type().is_file() && !rel.contains(&b'\n') {
+                    if m.file_type().is_file() && Self::batchable(rel) {
                         batch.push(i);
                     }
                     metas.push(Some(m));
@@ -623,6 +630,41 @@ pub(crate) mod tests {
             2,
             "one --stdin-paths batch for f1+f2, one --stdin for the link"
         );
+    }
+
+    #[test]
+    fn store_hash_paths_routes_quoted_and_control_names_around_the_batch() {
+        let repo = FixtureRepo::new("hash-quote").unwrap();
+        let state = TempDir::new("lc-store");
+        let (store, _) = open_git(&repo, &state);
+        let odd: [(&[u8], &[u8]); 3] = [
+            (b"\"quoted", b"starts with a double quote\n"),
+            (b"cr\rname", b"carriage return\n"),
+            (b"nl\nname", b"newline\n"),
+        ];
+        for (name, content) in odd {
+            std::fs::write(repo.path().join(OsStr::from_bytes(name)), content).unwrap();
+        }
+        let calls_before = store.git().hash_object_calls();
+        let rels: Vec<Vec<u8>> = std::iter::once(b"f1".to_vec())
+            .chain(odd.iter().map(|(n, _)| n.to_vec()))
+            .collect();
+        let batch = store.hash_paths(&rels);
+        assert_eq!(
+            store.git().hash_object_calls() - calls_before,
+            4,
+            "one batch for f1, one single call per odd name"
+        );
+        for (k, (name, content)) in odd.iter().enumerate() {
+            let got = &batch[k + 1];
+            assert_eq!(*got, store.hash_path(name), "{name:?}");
+            match got {
+                Current::Present { oid, .. } => {
+                    assert_eq!(store.cat_blob(oid).unwrap(), *content, "{name:?}")
+                }
+                other => panic!("{name:?}: {other:?}"),
+            }
+        }
     }
 
     #[test]

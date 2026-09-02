@@ -101,10 +101,22 @@ impl PrivateIndex {
         }
     }
 
-    /// Reseed unless the index exists and `index.tree` matches `seen_tree`.
+    /// A quick sanity check of the cache file: the `DIRC` magic and room for the header
+    /// and the trailing checksum. An empty or garbage file fails it and is reseeded.
+    fn looks_like_an_index(&self) -> bool {
+        let Ok(mut f) = std::fs::File::open(&self.index) else {
+            return false;
+        };
+        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        let mut magic = [0u8; 4];
+        len >= 32 && std::io::Read::read_exact(&mut f, &mut magic).is_ok() && &magic == b"DIRC"
+    }
+
+    /// Reseed unless the index exists, looks like an index, and `index.tree` matches
+    /// `seen_tree`.
     pub fn ensure(&self, seen_tree: Option<&Oid>) -> Result<bool, IndexError> {
-        let fresh =
-            self.index.is_file() && self.recorded_tree().as_ref() == Some(&seen_tree.cloned());
+        let fresh = self.looks_like_an_index()
+            && self.recorded_tree().as_ref() == Some(&seen_tree.cloned());
         if fresh {
             return Ok(false);
         }
@@ -267,6 +279,13 @@ mod tests {
         assert!(index.ensure(None).unwrap(), "missing index: reseed");
         index.seed(Some(&tree)).unwrap();
         assert_eq!(index.entries().unwrap().len(), 3);
+        for garbage in [&b""[..], b"not an index at all, but long enough to pass"] {
+            std::fs::write(index.path(), garbage).unwrap();
+            assert!(index.ensure(Some(&tree)).unwrap(), "garbage index: reseed");
+            assert_eq!(index.entries().unwrap().len(), 3);
+            index.refresh();
+            assert!(index.diff_files().unwrap().is_empty());
+        }
     }
 
     #[test]

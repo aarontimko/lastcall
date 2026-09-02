@@ -45,7 +45,7 @@ fn e1_child() {
     panic!("the fault injector should have killed this process");
 }
 
-fn e1_case(name: &str, point: &str) {
+fn e1_case(name: &str, point: &str) -> String {
     let repo = FixtureRepo::new(name).unwrap();
     let state = TempDir::new("lc-e1-state");
     let config = Config::default();
@@ -130,6 +130,7 @@ fn e1_case(name: &str, point: &str) {
         oracle.row(b"f1").unwrap().hunks
     );
     assert!(engine.root(&root).unwrap().ledger.overrides.is_empty());
+    point.to_owned()
 }
 
 #[test]
@@ -137,8 +138,8 @@ fn scenario_e1_kill9_between_object_write_and_ledger_rename() {
     if std::env::var_os("LC_E1_ROLE").as_deref() == Some(std::ffi::OsStr::new("child")) {
         e1_child();
     }
-    e1_case("e1-object", "object");
-    e1_case("e1-tmp", "tmp");
+    let ran = [e1_case("e1-object", "object"), e1_case("e1-tmp", "tmp")];
+    assert_eq!(ran, ["object", "tmp"], "both fault points were exercised");
 }
 
 #[test]
