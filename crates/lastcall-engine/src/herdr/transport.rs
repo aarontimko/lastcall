@@ -549,11 +549,11 @@ mod tests {
     #[tokio::test]
     async fn transport_connect_failure_is_a_transport_failure() {
         let dir = TempDir::socket_dir();
-        let t = SocketTransport::new(dir.join("absent.sock"), Duration::from_millis(200));
+        let t = SocketTransport::new(dir.join("absent.sock"), Duration::from_millis(50));
         let err = t.request("ping", serde_json::json!({})).await.unwrap_err();
         assert!(matches!(err, TransportError::Connect { .. }));
         assert!(err.is_transport_failure());
-        assert!(!socket_answers_ping(&dir.join("absent.sock"), Duration::from_millis(100)).await);
+        assert!(!socket_answers_ping(&dir.join("absent.sock"), Duration::from_millis(50)).await);
     }
 
     #[tokio::test]
@@ -566,7 +566,8 @@ mod tests {
             .serve(&sock)
             .await
             .unwrap();
-        let t = SocketTransport::new(&sock, Duration::from_millis(100));
+        // The only real-time wait in the unit tier; kept under the 50 ms budget.
+        let t = SocketTransport::new(&sock, Duration::from_millis(40));
         let err = t.request("ping", serde_json::json!({})).await.unwrap_err();
         assert!(
             matches!(
