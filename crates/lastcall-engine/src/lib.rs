@@ -15,6 +15,7 @@ pub mod index;
 pub mod ledger;
 pub mod ops;
 pub mod paths;
+pub mod roots;
 pub mod scan;
 pub mod store;
 pub mod upstream;
