@@ -510,7 +510,10 @@ impl App {
         self.diff.scroll = self.diff.scroll.min(lines.saturating_sub(1));
     }
 
-    fn move_selection(&mut self, delta: isize) -> Changed {
+    /// Move the nav cursor `delta` entries (clamped). `handle` uses it for the nav keys;
+    /// the loop calls it directly for the wheel over the nav, which moves the selection
+    /// whichever pane has focus.
+    pub fn move_selection(&mut self, delta: isize) -> Changed {
         let entries = self.nav_entries();
         if entries.is_empty() {
             return self.select(None);
