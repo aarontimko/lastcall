@@ -286,3 +286,15 @@ probe-tui:
     echo "--- (cd $dir/parent) lastcall tui --poll 1   [q quits; edit under $dir/parent from another shell] ---"
     (cd "$dir/parent" && "$OLDPWD/target/release/lastcall" tui --poll 1)
     echo "--- fixture left at $dir (rm -rf $dir when done) ---"
+
+# The transcript form of the live-update demo, for a human without a second terminal: the
+# PTY harness (crates/lastcall-testkit/src/pty_tui.rs) drives the release binary's
+# `tui --poll 1` over a fresh fixture parent in a 100×30 pseudo-terminal, appends a line to
+# alpha/f1, waits for the row's counts to change on screen, opens the diff, prints the vt100
+# screen as text and the exit code after `q`. About three seconds; nothing is left behind.
+probe-tui-screen:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --release -p lastcall
+    LASTCALL_PROBE_BIN="$PWD/target/release/lastcall" \
+        cargo test -p lastcall --test test_e2e_tui_pty probe_tui_screen -- --ignored --nocapture
