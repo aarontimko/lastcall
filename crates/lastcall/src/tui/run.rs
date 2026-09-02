@@ -12,7 +12,7 @@
 //! on `Resize` so a press between a resize and the next render hits nothing.
 //!
 //! Every engine call goes through `watcher::blocking` on a spawned task; the UI task never
-//! holds the engine mutex (grep gate: `lock(` does not appear under `tui/`). Quit is
+//! holds the engine mutex (the gate grep for a mutex lock finds nothing under `tui/`). Quit is
 //! `restore()` first — the shell is sane even if shutdown hangs — then a bounded
 //! `watcher.join()`, then a bounded runtime shutdown ([`shut_down`]).
 //!
