@@ -11,4 +11,6 @@
 //! Invariant 9 holds throughout: the TUI reads engine piles only; it never touches a file, a
 //! ledger or git, and it holds no review state of its own.
 
+pub mod app;
+pub mod input;
 pub mod term;
