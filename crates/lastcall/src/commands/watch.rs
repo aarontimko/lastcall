@@ -10,7 +10,7 @@ use lastcall_engine::config;
 use lastcall_engine::engine::{Engine, EngineOptions};
 use lastcall_engine::env::Env;
 use lastcall_engine::status::{RowStatus, row_line};
-use lastcall_engine::watcher::{EngineEvent, EngineTimings};
+use lastcall_engine::watcher::EngineEvent;
 
 pub fn run(
     json: bool,
@@ -37,12 +37,7 @@ pub fn run(
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    let mut timings = EngineTimings::default();
-    if let Some(secs) = poll {
-        let every = Duration::from_secs(secs.max(1));
-        timings.head_poll = every;
-        timings.rescan = every;
-    }
+    let timings = super::poll_timings(poll);
     let outcome = runtime.block_on(async move {
         let mut watcher = engine.run(timings);
         let deadline = exit_after.map(|secs| tokio::time::sleep(Duration::from_secs(secs)));

@@ -1,13 +1,20 @@
-//! `lastcall config [--json]`: print the effective resolved config and notices.
+//! `lastcall config [--json]`: print the effective resolved config and notices. The
+//! `[keys]` table is validated the way the TUI will read it, so a bad binding fails here
+//! (stderr, exit 2) rather than at the next `lastcall` launch.
 
 use std::process::ExitCode;
 
+use lastcall::tui::input::Keymap;
 use lastcall_engine::config::{self, Loaded, Resolved};
 use lastcall_engine::env::Env;
 
 pub fn run(json: bool) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let env = Env::from_process();
     let loaded = config::load(&env)?;
+    if let Err(e) = Keymap::from_config(&loaded.config.keys) {
+        eprintln!("lastcall: {e}");
+        return Ok(ExitCode::from(2));
+    }
     let resolved = loaded.resolve(env.cwd());
     if json {
         print_json(&loaded, &resolved)?;
