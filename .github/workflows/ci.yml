@@ -1,0 +1,83 @@
+# Every step invokes a `just` target so CI and the gate commands cannot drift
+# (docs/spec/90-phase1-kickoff.md, deliverable 3).
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read the toolchain pin
+        id: pin
+        # dtolnay/rust-toolchain does not read rust-toolchain.toml; extract the channel here
+        # so there is one pin in the repo.
+        run: echo "channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.pin.outputs.channel }}
+          components: clippy, rustfmt
+      - uses: extractions/setup-just@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: just lint
+
+  unit:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read the toolchain pin
+        id: pin
+        run: echo "channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.pin.outputs.channel }}
+          components: clippy, rustfmt
+      - uses: extractions/setup-just@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: just build
+      - run: just test-unit
+
+  integration:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    # Linux is the blocking OS for the real-herdr subset (docs/spec/00-spec.md §4.5); macOS is
+    # expected green too but is non-blocking.
+    continue-on-error: ${{ matrix.os == 'macos-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read the toolchain pin
+        id: pin
+        run: echo "channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.pin.outputs.channel }}
+          components: clippy, rustfmt
+      - uses: extractions/setup-just@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Fetch the pinned herdr release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: just herdr-fetch
+      - name: Integration tier against the pinned herdr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: just test-integration-herdr
+      - run: just test-e2e
