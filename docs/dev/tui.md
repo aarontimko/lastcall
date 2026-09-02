@@ -38,7 +38,8 @@ gate greps at the end of this page are how that is enforced).
   repos · N files · N hunks` plus the watch notice on the right), the body — a nav pane
   (outer width `App.nav_width`, 16..=60, default 28; hidden below `NAV_MIN_COLS` = 70
   columns, when the diff takes the whole body and has focus) sharing its right border with a
-  bordered main pane — and a one-line status bar. Below `MIN_SIZE` (40×10) the whole frame
+  bordered main pane — and a one-line status bar (the latest engine notice with its age for
+  `app::STATUS_TTL` = 30 s, then the key hints). Below `MIN_SIZE` (40×10) the whole frame
   is `render::TOO_SMALL` (`too small: 40×10 min`) and the hit map is empty. Only the visible
   window of nav entries and diff lines is built, so a 50 000-line diff costs the same as a
   50-line one. The help overlay (`?`) is drawn last over everything.
@@ -79,8 +80,8 @@ shortens the HEAD-poll and rescan backstops exactly as for `watch` (`just probe-
 `watcher.join()` (500 ms) and a bounded runtime shutdown (500 ms). The reader thread is never
 joined: `crossterm::event::read()` blocks in `mio` on the tty, so it polls with a 50 ms
 timeout under a stop flag and exits on its own. `run_shutdown_restores_before_joining_before_runtime_shutdown`
-pins the order; the PTY scenes measure it (about 0.6 s after `q`, 0.25 s after Ctrl-C on the
-fixture).
+pins the order; the PTY scenes measure and print it (a few hundred milliseconds after `q`
+or Ctrl-C on the fixture).
 
 ## Keys
 
@@ -177,7 +178,8 @@ command inside a `portable-pty` terminal (100×30 by default) and feeds a `vt100
 **and** a raw byte transcript from a reader thread (the parser eats escape sequences; the
 off-sequence assertions read the raw log). `PtyCommand::new(bin).isolated_lastcall(home,
 config, state_dir)` sets `HOME`, `LASTCALL_CONFIG`, `LASTCALL_STATE_DIR`, the null git
-configs and `TERM=xterm-256color`, and strips `XDG_*`, `LASTCALL_LOG*` and `HERDR_*`, so the
+configs and `TERM=xterm-256color`, and strips `XDG_CONFIG_HOME`, `XDG_STATE_HOME`,
+`LASTCALL_LOG*` and `HERDR_*`, so the
 child never sees the real state dir. On a `PtyTui`: `wait_for(timeout, |screen| …)` polls the
 screen every 10 ms and fails early if the child exits; `screen_text()` / `rows()` /
 `inverse_at(row, col)` (cell attributes); `send(bytes)`, `click(col, row)` (an SGR mouse

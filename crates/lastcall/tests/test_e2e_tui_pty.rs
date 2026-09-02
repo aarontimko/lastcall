@@ -66,19 +66,58 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-/// Where `words` first appear in order in the transcript (the offset of the first). A
-/// frame's text is not contiguous in the raw bytes: ratatui skips cells equal to the
-/// previous buffer, so every blank between two words of a fresh frame becomes a cursor
-/// move.
-fn find_words(hay: &[u8], words: &[&str]) -> Option<usize> {
-    let mut at = 0;
-    let mut first = None;
-    for word in words {
-        let i = at + find(&hay[at..], word.as_bytes())?;
-        first.get_or_insert(i);
-        at = i + word.len();
+/// Skip CSI escape sequences (`ESC [ … final`) starting at `at`.
+fn skip_escapes(hay: &[u8], mut at: usize) -> usize {
+    while hay[at..].starts_with(b"\x1b[") {
+        match hay[at + 2..].iter().position(|b| (0x40..=0x7e).contains(b)) {
+            Some(i) => at += 2 + i + 1,
+            None => break,
+        }
     }
-    first
+    at
+}
+
+/// Where `words` first appear in order with nothing but escape sequences between them: one
+/// rendered line. A frame's text is not contiguous in the raw bytes — ratatui skips cells
+/// equal to the previous buffer, so every blank of a fresh line becomes a cursor move — but
+/// no other text may sit between two words of the same line, and a CSI parameter (`3;1H`)
+/// cannot pass for a word.
+fn find_words(hay: &[u8], words: &[&str]) -> Option<usize> {
+    let (head, rest) = words.split_first()?;
+    let mut start = 0;
+    'candidates: loop {
+        let first = start + find(&hay[start..], head.as_bytes())?;
+        let mut at = first + head.len();
+        for word in rest {
+            at = skip_escapes(hay, at);
+            if hay[at..].starts_with(word.as_bytes()) {
+                at += word.len();
+            } else {
+                start = first + 1;
+                continue 'candidates;
+            }
+        }
+        return Some(first);
+    }
+}
+
+#[test]
+fn find_words_needs_one_line_not_a_csi_parameter() {
+    let one_line = b"scanning\x1b[12C3\x1b[1C\x1b[0mroots\xe2\x80\xa6";
+    assert_eq!(find_words(one_line, &["scanning", "3", "roots…"]), Some(0));
+    // blanks are cursor moves; the `3` of the `3;1H` cursor move is not a word
+    let other_line = b"scanning\x1b[1C4\x1b[1Croots\xe2\x80\xa6\x1b[3;1Hnothing\x1b[1Cpending\x1b[1Cacross\x1b[1C4\x1b[1Croots";
+    assert_eq!(find_words(other_line, &["scanning", "3", "roots…"]), None);
+    assert_eq!(
+        find_words(other_line, &["scanning", "4", "roots…"]),
+        Some(0)
+    );
+    assert!(find_words(other_line, &["pending", "across", "4"]).is_some_and(|i| i > 0));
+    assert_eq!(
+        find_words(other_line, &["scanning", "roots…"]),
+        None,
+        "no word may be skipped"
+    );
 }
 
 struct Fixture {
