@@ -1,1 +1,18 @@
-//! herdr client (docs/spec/00-spec.md §5, §6.6). Filled in by Phase 1 deliverable 5.
+//! The herdr client (docs/spec/00-spec.md §5 frozen v1.0, §6.6).
+//!
+//! Nothing in the review engine depends on this module; it compiles out behind the `herdr`
+//! feature and is referenced only by the binary.
+//!
+//! - [`wire`]: every request, response, event, and payload type we consume, hand-checked
+//!   against herdr's `herdr-api.schema.json`. No `deny_unknown_fields` anywhere here.
+//! - [`transport`]: newline-JSON over a Unix socket behind the [`transport::Transport`] trait.
+//! - [`discovery`]: session discovery in herdr's own precedence.
+//! - [`guard`]: the ping-then-compare protocol guard.
+
+pub mod discovery;
+pub mod guard;
+pub mod transport;
+pub mod wire;
+
+pub use guard::{Compat, SUPPORTED_PROTOCOL};
+pub use transport::{EventStream, SocketTransport, Transport, TransportError};

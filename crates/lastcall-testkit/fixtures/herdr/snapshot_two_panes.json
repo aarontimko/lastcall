@@ -1,0 +1,99 @@
+{
+  "type": "session_snapshot",
+  "snapshot": {
+    "version": "0.8.2",
+    "protocol": 21,
+    "focused_workspace_id": "ws_demo1",
+    "focused_tab_id": "ws_demo1:t2",
+    "focused_pane_id": "ws_demo1:p2",
+    "workspaces": [
+      {
+        "workspace_id": "ws_demo1",
+        "number": 1,
+        "label": "lastcall",
+        "focused": true,
+        "pane_count": 2,
+        "tab_count": 2,
+        "active_tab_id": "ws_demo1:t2",
+        "agent_status": "working",
+        "tokens": {},
+        "worktree": {
+          "repo_key": "github.com/aarontimko/lastcall",
+          "repo_name": "lastcall",
+          "repo_root": "/Users/demo/dev/git/lastcall",
+          "checkout_path": "/Users/demo/dev/git/lastcall",
+          "is_linked_worktree": false
+        }
+      }
+    ],
+    "tabs": [
+      {
+        "tab_id": "ws_demo1:t1",
+        "workspace_id": "ws_demo1",
+        "number": 1,
+        "label": "agent",
+        "focused": false,
+        "pane_count": 1,
+        "agent_status": "working"
+      },
+      {
+        "tab_id": "ws_demo1:t2",
+        "workspace_id": "ws_demo1",
+        "number": 2,
+        "label": "shell",
+        "focused": true,
+        "pane_count": 1,
+        "agent_status": "idle"
+      }
+    ],
+    "panes": [
+      {
+        "pane_id": "ws_demo1:p1",
+        "terminal_id": "term_1",
+        "workspace_id": "ws_demo1",
+        "tab_id": "ws_demo1:t1",
+        "focused": false,
+        "agent_status": "working",
+        "revision": 3,
+        "cwd": "/Users/demo/dev/git/lastcall",
+        "foreground_cwd": "/Users/demo/dev/git/lastcall",
+        "agent": "demo",
+        "display_agent": "demo",
+        "title": "demo agent",
+        "state_labels": {},
+        "tokens": {}
+      },
+      {
+        "pane_id": "ws_demo1:p2",
+        "terminal_id": "term_2",
+        "workspace_id": "ws_demo1",
+        "tab_id": "ws_demo1:t2",
+        "focused": true,
+        "agent_status": "idle",
+        "revision": 0,
+        "cwd": "/Users/demo/dev/git/lastcall",
+        "foreground_cwd": "/Users/demo/dev/git/lastcall",
+        "agent": null,
+        "state_labels": {},
+        "tokens": {}
+      }
+    ],
+    "layouts": [],
+    "agents": [
+      {
+        "pane_id": "ws_demo1:p1",
+        "workspace_id": "ws_demo1",
+        "agent_status": "working",
+        "agent": "demo",
+        "name": "demo",
+        "display_agent": "demo",
+        "cwd": "/Users/demo/dev/git/lastcall",
+        "foreground_cwd": "/Users/demo/dev/git/lastcall",
+        "focused": false,
+        "interactive_ready": true,
+        "launch_pending": false,
+        "revision": 3
+      }
+    ]
+  }
+}
