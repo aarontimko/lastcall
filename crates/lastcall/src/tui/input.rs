@@ -123,6 +123,8 @@ impl Action {
             "refresh" => "rescan now",
             "help" => "this help",
             "quit" => "quit",
+            "scroll_up" => "scroll the diff up",
+            "scroll_down" => "scroll the diff down",
             _ => "",
         }
     }
@@ -232,6 +234,35 @@ impl Key {
             alt,
             shift,
         })
+    }
+
+    /// The canonical spelling of this key in the spec grammar: what [`Key::parse`] folded
+    /// (`Q` → `q`, `shift-k` → `K`, `ctrl-C` → `ctrl-c`, `shift-tab` → `backtab`), so the
+    /// help overlay shows the key that is bound, not the spec as typed.
+    pub fn spec(&self) -> String {
+        let mut s = String::new();
+        if self.ctrl {
+            s.push_str("ctrl-");
+        }
+        if self.alt {
+            s.push_str("alt-");
+        }
+        if self.shift {
+            s.push_str("shift-");
+        }
+        match self.code {
+            KeyCode::Char(' ') => s.push_str("space"),
+            KeyCode::Char(c) => s.push(c),
+            KeyCode::F(n) => s.push_str(&format!("f{n}")),
+            code => s.push_str(
+                NAMED_KEYS
+                    .iter()
+                    .find(|(_, c)| *c == code)
+                    .map(|(n, _)| *n)
+                    .unwrap_or("?"),
+            ),
+        }
+        s
     }
 
     /// Normalize a terminal key event the way [`Key::parse`] normalizes a spec. `None` for
@@ -363,14 +394,15 @@ impl Keymap {
         }
         let mut bindings: Vec<(Key, Action)> = Vec::new();
         let mut owners: Vec<(Key, String)> = Vec::new();
-        for (name, specs) in &table {
+        for (name, specs) in &mut table {
             let action = Action::from_name(name).expect("every table entry was validated");
-            for spec in specs {
+            for spec in specs.iter_mut() {
                 let key = Key::parse(spec).map_err(|reason| KeymapError::BadSpec {
                     action: name.clone(),
                     spec: spec.clone(),
                     reason,
                 })?;
+                *spec = key.spec(); // the table shows the canonical spelling
                 if let Some((_, first)) = owners.iter().find(|(k, _)| *k == key) {
                     if first != name {
                         return Err(KeymapError::Duplicate {
@@ -842,6 +874,39 @@ mod tests {
     // ---- mouse ⇄ keyboard parity (kickoff deliverable 9) ----------------------------
 
     /// `↓`×4 to beta's repo row vs a click on it.
+    #[test]
+    fn keymap_table_shows_the_canonical_spelling_of_an_override() {
+        for (_, specs) in DEFAULT_KEYMAP {
+            for spec in *specs {
+                assert_eq!(
+                    Key::parse(spec).unwrap().spec(),
+                    *spec,
+                    "default {spec} is canonical"
+                );
+            }
+        }
+        let keys: BTreeMap<String, KeySpecs> = [
+            ("quit".to_owned(), KeySpecs::One("Q".to_owned())),
+            (
+                "hunk_next".to_owned(),
+                KeySpecs::Many(vec![
+                    "shift-k".to_owned(),
+                    "Ctrl-N".to_owned(),
+                    "Shift-Tab".to_owned(),
+                ]),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let km = Keymap::from_config(&keys).unwrap();
+        let table = km.table();
+        let row = |n: &str| table.iter().find(|(name, _)| name == n).unwrap().1.clone();
+        assert_eq!(row("quit"), vec!["q"]);
+        assert_eq!(row("hunk_next"), vec!["K", "ctrl-n", "backtab"]);
+        assert_eq!(Action::describe("scroll_up"), "scroll the diff up");
+        assert_eq!(Action::describe("scroll_down"), "scroll the diff down");
+    }
+
     #[test]
     fn input_parity_select_repo() {
         let km = Keymap::defaults();

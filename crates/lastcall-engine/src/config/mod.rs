@@ -90,12 +90,33 @@ impl Default for Config {
     }
 }
 
-/// One `[keys]` entry: a single key spec or a list of them.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// One `[keys]` entry: a single key spec or a list of them. The shape is checked here (a
+/// wrong type fails every command, like any other config field); what the specs mean is
+/// the binary's business.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum KeySpecs {
     One(String),
     Many(Vec<String>),
+}
+
+impl<'de> Deserialize<'de> for KeySpecs {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            One(String),
+            Many(Vec<String>),
+        }
+        match Raw::deserialize(d) {
+            Ok(Raw::One(s)) => Ok(KeySpecs::One(s)),
+            Ok(Raw::Many(v)) => Ok(KeySpecs::Many(v)),
+            // serde's untagged message ("data did not match any variant…") names nothing
+            Err(_) => Err(serde::de::Error::custom(
+                "a [keys] entry must be a key spec (a string) or a list of them",
+            )),
+        }
+    }
 }
 
 impl KeySpecs {
@@ -465,6 +486,11 @@ nav_down = ["down", "j", "ctrl-n"]
         let (env, _) = env_with_config(&dir, "[keys]\nquit = 7\n");
         let err = load(&env).unwrap_err();
         assert!(matches!(err, ConfigError::Parse { .. }), "{err}");
+        assert!(
+            err.to_string()
+                .contains("a [keys] entry must be a key spec (a string) or a list of them"),
+            "the shape error names the rule, not serde's untagged variants: {err}"
+        );
         let (env, _) = env_with_config(&dir, "[keys]\nquit = [\"q\", 3]\n");
         let err = load(&env).unwrap_err();
         assert!(matches!(err, ConfigError::Parse { .. }), "{err}");
