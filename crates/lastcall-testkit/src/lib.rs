@@ -15,3 +15,4 @@ pub mod fixture_repo;
 pub mod herdr_spawn;
 pub mod json_lines;
 pub mod mock_herdr;
+pub mod tmp;
