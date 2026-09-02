@@ -284,7 +284,8 @@ fn ensure_cleanup_hooks() {
     });
 }
 
-fn register_spawned_pid(pid: Option<u32>, bin: &Path) {
+/// Shared with [`crate::pty_tui`]: every PTY child of this process is registered here.
+pub(crate) fn register_spawned_pid(pid: Option<u32>, bin: &Path) {
     let Some(pid) = pid else {
         return;
     };
@@ -295,7 +296,7 @@ fn register_spawned_pid(pid: Option<u32>, bin: &Path) {
         .insert(pid, bin.to_path_buf());
 }
 
-fn unregister_spawned_pid(pid: Option<u32>) {
+pub(crate) fn unregister_spawned_pid(pid: Option<u32>) {
     if let Some(pid) = pid {
         registry()
             .lock()
