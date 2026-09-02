@@ -158,6 +158,7 @@ probe-config:
     set -euo pipefail
     cargo build --release -p lastcall
     dir="/tmp/lc-probe-$$"
+    trap 'rm -rf "$dir"' EXIT
     mkdir -p "$dir/parent"
     cat > "$dir/config.toml" <<EOF
     parent_dirs = ["$dir/parent"]
@@ -182,6 +183,7 @@ probe-hello:
     cargo build --release -p lastcall
     cargo build -p lastcall-testkit --example mock_herdr
     dir="/tmp/lc-probe-$$"
+    trap 'rm -rf "$dir"' EXIT
     mkdir -p "$dir"
     sock="$dir/herdr.sock"
     fixtures="crates/lastcall-testkit/fixtures/herdr"
