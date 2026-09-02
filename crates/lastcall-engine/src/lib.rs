@@ -9,6 +9,7 @@ pub mod env;
 pub mod git;
 #[cfg(feature = "herdr")]
 pub mod herdr;
+pub mod hunks;
 pub mod index;
 pub mod ledger;
 pub mod paths;
