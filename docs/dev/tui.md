@@ -117,8 +117,10 @@ from what the user is looking at:
   is running (`Confirm` re-checks, so a confirm is never silently dropped or doubled).
 - **Completion** (`App::accepted(Vec<(root, Result<Accepted, String>)>)`): each root's
   pile goes through the same `apply_pile` path as a watcher pile (seq included); then the
-  advance rule; then one status line — `accepted f1 · hunk 2 of 3` (the index and count
-  are the row's at the moment the accept was asked; each rescan shrinks the count),
+  advance rule; then one status line — `accepted f1 · 2 hunks left` (one fewer than the
+  row showed when the accept was asked; the cursor's slot is always 1 again once the
+  accepted hunk slides out, so it is not quoted), `accepted f1 · file complete` when that
+  was the file's last hunk,
   `accepted f1`, `accepted f3 (deleted)`, `accepted upstream · 4 files`, `accepted 12 files
   in alpha`, `accepted 30 files in 3 repos`; on refusals the `Refused` texts joined by
   ` · ` (the first only plus ` (+N more)` beyond two); an `Err` for one root is reported as
@@ -291,7 +293,7 @@ The two Phase 4 scenes drive the accept loop through the same binary:
 - `pty_accept_loop_and_restart` — a fixture "agent" (`FixtureRepo::open_in` on the
   scene's `alpha`) writes `f1` with two hunks, `f2`, `f3` (committed) and six added files
   before the reviewer looks; the screen shows `3 repos · 12 files`; `a` on `f1`'s first
-  hunk → `accepted f1 · hunk 1 of 2` and the row reads `+1 −1`; `A` → `accepted f1`, the
+  hunk → `accepted f1 · 1 hunk left` and the row reads `+1 −1`; `A` → `accepted f1`, the
   selection lands on `f2`; `ctrl-a` → `Accept all 11 files across 3 repos?` with `1
   grouped upstream · 0 collapsed`, `y` → `nothing pending across 3 roots` and `accepted 11
   files in 3 repos`. Then the scene reads the three `ledger.json` files from the state dir
@@ -307,7 +309,7 @@ The two Phase 4 scenes drive the accept loop through the same binary:
   shows `M f1  +2 −1`, `A` accepts.
 
 Both print `PTY accept …` timing lines. The status bar is asserted as `<text> · <age>`
-exactly, so `accepted f1` cannot pass for `accepted f1 · hunk 1 of 2`.
+exactly, so `accepted f1` cannot pass for `accepted f1 · 1 hunk left`.
 
 ## Probes and logging
 

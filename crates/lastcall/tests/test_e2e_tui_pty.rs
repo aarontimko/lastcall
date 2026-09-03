@@ -248,7 +248,7 @@ impl Fixture {
 }
 
 /// The status bar reads `<text> · <age>` for exactly `text` (an `accepted f1` status must
-/// not pass for `accepted f1 · hunk 1 of 2`).
+/// not pass for `accepted f1 · 1 hunk left`).
 fn status_is(s: &vt100::Screen, text: &str) -> bool {
     let (_, cols) = s.size();
     s.rows(0, cols).last().is_some_and(|r| {
@@ -695,7 +695,7 @@ fn pty_accept_loop_and_restart() {
     let t = Instant::now();
     pty.send(b"a").expect("a");
     pty.wait_for(OVERLOADED, |s| {
-        status_is(s, "accepted f1 · hunk 1 of 2") && s.contents().contains("M f1  +1 −1")
+        status_is(s, "accepted f1 · 1 hunk left") && s.contents().contains("M f1  +1 −1")
     })
     .unwrap_or_else(|e| panic!("accept hunk: {e}"));
     note(&format!(

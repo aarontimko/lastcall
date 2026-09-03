@@ -536,7 +536,7 @@ fn tui_accept_last_hunk_advances() {
 
     let (_, effect) = app.handle(Action::Accept);
     run_accept(&mut app, &mut engine, effect);
-    assert_eq!(status_text(&app), "accepted f1 · hunk 1 of 3");
+    assert_eq!(status_text(&app), "accepted f1 · 2 hunks left");
     assert_eq!(app.roots[&alpha].row(b"f1").unwrap().hunks.len(), 2);
     assert_eq!(
         app.selection,
@@ -547,12 +547,12 @@ fn tui_accept_last_hunk_advances() {
 
     let (_, effect) = app.handle(Action::Accept);
     run_accept(&mut app, &mut engine, effect);
-    assert_eq!(status_text(&app), "accepted f1 · hunk 1 of 2");
+    assert_eq!(status_text(&app), "accepted f1 · 1 hunk left");
     assert_eq!(app.roots[&alpha].row(b"f1").unwrap().hunks.len(), 1);
 
     let (_, effect) = app.handle(Action::Accept);
     run_accept(&mut app, &mut engine, effect);
-    assert_eq!(status_text(&app), "accepted f1 · hunk 1 of 1");
+    assert_eq!(status_text(&app), "accepted f1 · file complete");
     assert!(app.roots[&alpha].row(b"f1").is_none(), "f1 is clean");
     assert_eq!(
         app.selection,

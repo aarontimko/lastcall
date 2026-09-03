@@ -785,9 +785,13 @@ impl App {
     fn accepted_text(&self, scope: &AcceptScope, files: usize, ok_roots: &[PathBuf]) -> String {
         let lossy = |p: &[u8]| String::from_utf8_lossy(p).into_owned();
         match scope {
-            AcceptScope::Hunk {
-                path, index, hunks, ..
-            } => format!("accepted {} · hunk {} of {}", lossy(path), index + 1, hunks),
+            // The ruling: say what is left, not the cursor's slot (which is 1 again once
+            // the accepted hunk slides out). `hunks` is the count the row showed when the
+            // accept was asked, so one fewer remains.
+            AcceptScope::Hunk { path, hunks, .. } => match hunks.saturating_sub(1) {
+                0 => format!("accepted {} · file complete", lossy(path)),
+                left => format!("accepted {} · {} left", lossy(path), plural(left, "hunk")),
+            },
             AcceptScope::File { path, deleted, .. } => {
                 let suffix = if *deleted { " (deleted)" } else { "" };
                 format!("accepted {}{suffix}", lossy(path))
@@ -1837,7 +1841,7 @@ mod tests {
         // The engine rescans: hunks 1 and 3 remain, re-indexed.
         let two = alpha_hunks(2);
         app.accepted(vec![accepted_ok("alpha", 2, two.clone())]);
-        assert_eq!(status(&app), "accepted f1 · hunk 2 of 3");
+        assert_eq!(status(&app), "accepted f1 · 2 hunks left");
         assert_eq!(app.selection, Some(row("alpha", "f1")));
         assert_eq!(app.diff.hunk, 1, "the next hunk slid into the cursor");
         assert_eq!(app.diff.scroll, hunk_offsets(&two.rows[0].hunks)[1]);
@@ -1847,7 +1851,7 @@ mod tests {
         app.handle(Action::Accept);
         let one = alpha_hunks(1);
         app.accepted(vec![accepted_ok("alpha", 3, one)]);
-        assert_eq!(status(&app), "accepted f1 · hunk 2 of 2");
+        assert_eq!(status(&app), "accepted f1 · 1 hunk left");
         assert_eq!(app.diff, DiffCursor { hunk: 0, scroll: 0 }, "clamped");
 
         app.handle(Action::Accept);
@@ -1856,7 +1860,7 @@ mod tests {
             4,
             without(pile("alpha"), &["f1"]),
         )]);
-        assert_eq!(status(&app), "accepted f1 · hunk 1 of 1");
+        assert_eq!(status(&app), "accepted f1 · file complete");
         assert_eq!(
             app.selection,
             Some(row("alpha", "f2")),
