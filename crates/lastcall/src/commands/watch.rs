@@ -101,6 +101,7 @@ fn print_event(json: bool, event: &EngineEvent) {
                     "root": root,
                     "seq": seq,
                     "pending": rows,
+                    "omitted": pile.omitted,
                     "notices": pile.notices,
                 }),
                 || {

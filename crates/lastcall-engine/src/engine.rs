@@ -71,12 +71,19 @@ fn io_err(path: &Path, source: std::io::Error) -> EngineError {
     }
 }
 
+/// The default [`EngineOptions::row_cap`]: rows materialised per scan beyond the override
+/// paths (kickoff ruling; not a config key).
+pub const DEFAULT_ROW_CAP: usize = 10_000;
+
 /// Injectable knobs.
 #[derive(Clone)]
 pub struct EngineOptions {
     /// Compaction runs after a ledger write when more overrides than this carry a blob.
     pub compaction_threshold: usize,
     pub clock: Arc<dyn Clock + Send + Sync>,
+    /// Rows materialised per scan beyond the priority set (override paths); further
+    /// changed paths are counted in [`Pile::omitted`] with a notice, never hashed.
+    pub row_cap: usize,
 }
 
 impl Default for EngineOptions {
@@ -84,6 +91,7 @@ impl Default for EngineOptions {
         Self {
             compaction_threshold: 500,
             clock: Arc::new(SystemClock),
+            row_cap: DEFAULT_ROW_CAP,
         }
     }
 }
@@ -92,6 +100,7 @@ impl std::fmt::Debug for EngineOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EngineOptions")
             .field("compaction_threshold", &self.compaction_threshold)
+            .field("row_cap", &self.row_cap)
             .finish_non_exhaustive()
     }
 }
@@ -589,6 +598,7 @@ impl Engine {
     pub fn scan(&mut self, root: &Path) -> Result<Pile, EngineError> {
         let collapsed = self.collapsed.clone();
         let collapse_size = self.config.collapse_size_bytes;
+        let row_cap = self.options.row_cap;
         let state = self
             .roots
             .get_mut(root)
@@ -606,6 +616,7 @@ impl Engine {
             collapse_size_bytes: collapse_size,
             excluded_dirs: &state.excluded_dirs,
             index_tmp: &state.paths.index_tmp,
+            row_cap,
         })?;
         let mut pile = out.pile;
         if out.nested_repos != state.nested_repos {
@@ -952,9 +963,18 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn open_engine(repo: &FixtureRepo, state: &TempDir, config: Config) -> Engine {
+        open_engine_with(repo, state, config, EngineOptions::default())
+    }
+
+    pub(crate) fn open_engine_with(
+        repo: &FixtureRepo,
+        state: &TempDir,
+        config: Config,
+        options: EngineOptions,
+    ) -> Engine {
         let (loaded, resolved) = loaded_for(repo, state, config);
         let env = fixture_env(repo, state);
-        Engine::open(&loaded, &resolved, &env, EngineOptions::default()).unwrap()
+        Engine::open(&loaded, &resolved, &env, options).unwrap()
     }
 
     fn only_root(engine: &Engine) -> PathBuf {
@@ -1252,6 +1272,73 @@ pub(crate) mod tests {
                 .overrides
                 .contains_key("f1"),
             "the staged override did not survive the failure"
+        );
+    }
+
+    fn cap3(repo: &FixtureRepo, state: &TempDir) -> Engine {
+        let options = EngineOptions {
+            row_cap: 3,
+            ..EngineOptions::default()
+        };
+        open_engine_with(repo, state, Config::default(), options)
+    }
+
+    #[test]
+    fn engine_row_cap_shows_the_first_cap_paths_counts_the_rest_and_accept_all_folds_the_shown() {
+        let repo = FixtureRepo::new("eng-cap").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let mut engine = cap3(&repo, &state);
+        let root = only_root(&engine);
+        for n in ["n1", "n2", "n3", "n4", "n5"] {
+            repo.write(n, "new\n");
+        }
+        let pile = engine.scan(&root).unwrap();
+        assert_eq!(scan::pile_lines(&pile), ["n1", "n2", "n3"]);
+        assert_eq!(pile.omitted, 2);
+        assert_eq!(
+            pile.notices,
+            vec!["3 files shown · 2 more changed paths not scanned (first 3 by path)".to_owned()]
+        );
+        let acc = engine.accept(&root, AcceptRequest::All(pile)).unwrap();
+        assert!(acc.outcome.ok());
+        assert_eq!(
+            scan::pile_lines(&acc.pile),
+            ["n4", "n5"],
+            "the shown rows folded"
+        );
+        assert_eq!(acc.pile.omitted, 0);
+        assert!(acc.pile.notices.is_empty(), "{:?}", acc.pile.notices);
+    }
+
+    #[test]
+    fn engine_row_cap_override_row_is_priority_over_path_order() {
+        let repo = FixtureRepo::new("eng-cap-prio").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let mut engine = cap3(&repo, &state);
+        let root = only_root(&engine);
+        repo.write("zzz/late", "v1\n");
+        let (rendered, _) = rendered_row(&mut engine, &root, b"zzz/late");
+        let acc = engine.accept(&root, AcceptRequest::File(rendered)).unwrap();
+        assert!(acc.outcome.ok() && acc.pile.is_empty());
+        repo.write("zzz/late", "v2\n");
+        for n in ["aaa/1", "aaa/2", "aaa/3", "aaa/4"] {
+            repo.write(n, "new\n");
+        }
+        let pile = engine.scan(&root).unwrap();
+        assert!(
+            pile.row(b"zzz/late").is_some(),
+            "{:?}",
+            scan::pile_lines(&pile)
+        );
+        assert_eq!(
+            scan::pile_lines(&pile),
+            ["aaa/1", "aaa/2", "aaa/3", "zzz/late"],
+            "priority beats path order"
+        );
+        assert_eq!(pile.omitted, 1);
+        assert_eq!(
+            pile.notices,
+            vec!["4 files shown · 1 more changed paths not scanned (first 3 by path)".to_owned()]
         );
     }
 

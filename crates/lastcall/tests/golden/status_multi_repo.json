@@ -55,6 +55,7 @@
           "rename": null
         }
       ],
+      "omitted": 0,
       "groups": [],
       "notices": []
     },
@@ -105,6 +106,7 @@
           "rename": null
         }
       ],
+      "omitted": 0,
       "groups": [
         {
           "kind": "upstream",
@@ -148,6 +150,7 @@
           "rename": null
         }
       ],
+      "omitted": 0,
       "groups": [],
       "notices": []
     }

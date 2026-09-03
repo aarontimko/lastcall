@@ -123,6 +123,10 @@ pub struct Pile {
     pub rows: Vec<Row>,
     /// Root-level notices produced by this scan.
     pub notices: Vec<String>,
+    /// Changed paths the row cap left unscanned (`0` when nothing was cut). Additive:
+    /// older JSON without it reads as `0`.
+    #[serde(default)]
+    pub omitted: usize,
 }
 
 impl Pile {
@@ -171,6 +175,10 @@ pub struct ScanInputs<'a> {
     pub case_insensitive: bool,
     pub collapsed_globs: &'a GlobSet,
     pub collapse_size_bytes: u64,
+    /// Rows materialised per scan beyond the priority set (override paths, where flags
+    /// live): the rest of the candidates, in path order, are neither hashed nor diffed,
+    /// only counted in [`Pile::omitted`].
+    pub row_cap: usize,
     /// Root-relative directories owned by other roots (draft roots inside this one); only
     /// `others` entries beneath them are excluded.
     pub excluded_dirs: &'a [Vec<u8>],
@@ -376,15 +384,22 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
         })
         .collect();
 
-    // 3. Current side, hashed in one batch.
-    let currents = store.hash_paths(&candidates);
+    // 3. The row cap, decided before any hashing: override paths (flags live there) are
+    // always materialised; every other candidate — diff-files, others, case-rule and
+    // unparsable paths alike — is taken in path order until `row_cap` rows exist, and
+    // what remains is only counted. `candidates` is path-ordered (it was a BTreeSet).
+    let (priority, rest): (Vec<Vec<u8>>, Vec<Vec<u8>>) = candidates.into_iter().partition(|p| {
+        std::str::from_utf8(p)
+            .ok()
+            .is_some_and(|s| inputs.ledger.overrides.contains_key(s))
+    });
 
     // 4. Baselines.
     let mut resolver = BaselineResolver::new(
         inputs.ledger,
         inputs.tree,
         store,
-        candidates.iter().map(Vec::as_slice),
+        priority.iter().chain(rest.iter()).map(Vec::as_slice),
     );
 
     let filemode = store.filemode();
@@ -396,74 +411,91 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
         }
     };
 
-    let mut rows: Vec<Row> = Vec::new();
-    for (path, current) in candidates.iter().zip(currents) {
-        let current = if forced_absent.contains(path) {
-            Current::Absent
-        } else {
-            current
-        };
-        let baseline = resolver.baseline(path);
-        let base_entry = match &baseline {
-            Baseline::Present { oid, mode } => Some(Entry {
-                oid: oid.clone(),
-                mode: *mode,
-            }),
-            Baseline::Absent | Baseline::Empty => None,
-        };
-        let flag = std::str::from_utf8(path)
-            .ok()
-            .and_then(|s| inputs.ledger.overrides.get(s))
-            .and_then(|o| o.flag.clone());
-        let is_conflicted = conflicted.contains(path);
-        let lossy = String::from_utf8_lossy(path).into_owned();
-        if std::str::from_utf8(path).is_err() {
-            notices.push(format!(
-                "{lossy}: non-UTF-8 path; shown pending, accept is refused in v1"
-            ));
-        }
-
-        let (change, cur_entry) = match current {
-            Current::Absent => match &base_entry {
-                Some(_) => (Change::Deleted, None),
-                None => continue, // nothing on either side
-            },
-            Current::Unhashable(reason) => {
-                notices.push(format!("{lossy}: cannot hash ({reason}); shown pending"));
-                let change = if reason.starts_with("typechange") {
-                    Change::Typechange
-                } else {
-                    Change::Unreadable
-                };
-                (change, None)
+    // Current side hashed in one batch per call; a row per path whose sides differ.
+    let mut materialise = |paths: &[Vec<u8>], rows: &mut Vec<Row>| {
+        let currents = store.hash_paths(paths);
+        for (path, current) in paths.iter().zip(currents) {
+            let current = if forced_absent.contains(path) {
+                Current::Absent
+            } else {
+                current
+            };
+            let baseline = resolver.baseline(path);
+            let base_entry = match &baseline {
+                Baseline::Present { oid, mode } => Some(Entry {
+                    oid: oid.clone(),
+                    mode: *mode,
+                }),
+                Baseline::Absent | Baseline::Empty => None,
+            };
+            let flag = std::str::from_utf8(path)
+                .ok()
+                .and_then(|s| inputs.ledger.overrides.get(s))
+                .and_then(|o| o.flag.clone());
+            let is_conflicted = conflicted.contains(path);
+            let lossy = String::from_utf8_lossy(path).into_owned();
+            if std::str::from_utf8(path).is_err() {
+                notices.push(format!(
+                    "{lossy}: non-UTF-8 path; shown pending, accept is refused in v1"
+                ));
             }
-            Current::Present { oid, mode } => {
-                let cur = Entry { oid, mode };
-                match &base_entry {
-                    None => (Change::Added, Some(cur)),
-                    Some(b) if b.oid != cur.oid => (Change::Modified, Some(cur)),
-                    Some(b) if norm(b.mode) != norm(cur.mode) => (Change::Mode, Some(cur)),
-                    Some(_) => continue, // equal: not pending
+
+            let (change, cur_entry) = match current {
+                Current::Absent => match &base_entry {
+                    Some(_) => (Change::Deleted, None),
+                    None => continue, // nothing on either side
+                },
+                Current::Unhashable(reason) => {
+                    notices.push(format!("{lossy}: cannot hash ({reason}); shown pending"));
+                    let change = if reason.starts_with("typechange") {
+                        Change::Typechange
+                    } else {
+                        Change::Unreadable
+                    };
+                    (change, None)
                 }
-            }
-        };
+                Current::Present { oid, mode } => {
+                    let cur = Entry { oid, mode };
+                    match &base_entry {
+                        None => (Change::Added, Some(cur)),
+                        Some(b) if b.oid != cur.oid => (Change::Modified, Some(cur)),
+                        Some(b) if norm(b.mode) != norm(cur.mode) => (Change::Mode, Some(cur)),
+                        Some(_) => continue, // equal: not pending
+                    }
+                }
+            };
 
-        let row = Row {
-            path: path.clone(),
-            change,
-            baseline: base_entry,
-            current: cur_entry,
-            added: 0,
-            deleted: 0,
-            hunks: Vec::new(),
-            annotation: None,
-            conflicted: is_conflicted,
-            collapsed: None,
-            flag,
-            rename: None,
-        };
-        rows.push(row);
+            let row = Row {
+                path: path.clone(),
+                change,
+                baseline: base_entry,
+                current: cur_entry,
+                added: 0,
+                deleted: 0,
+                hunks: Vec::new(),
+                annotation: None,
+                conflicted: is_conflicted,
+                collapsed: None,
+                flag,
+                rename: None,
+            };
+            rows.push(row);
+        }
+    };
+    let mut rows: Vec<Row> = Vec::new();
+    materialise(&priority, &mut rows);
+    let priority_rows = rows.len();
+    let mut taken = 0usize;
+    loop {
+        let room = inputs.row_cap.saturating_sub(rows.len() - priority_rows);
+        if room == 0 || taken == rest.len() {
+            break;
+        }
+        let end = (taken + room).min(rest.len());
+        materialise(&rest[taken..end], &mut rows);
+        taken = end;
     }
+    let omitted = rest.len() - taken;
     notices.append(&mut resolver.notices);
 
     // 4b. Content for every row through one `cat-file --batch`: rendering must not cost a
@@ -526,8 +558,19 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
     }
 
     rows.sort_by(|a, b| a.path.cmp(&b.path));
+    if omitted > 0 {
+        notices.push(format!(
+            "{} files shown · {omitted} more changed paths not scanned (first {} by path)",
+            rows.len(),
+            inputs.row_cap
+        ));
+    }
     Ok(ScanOutput {
-        pile: Pile { rows, notices },
+        pile: Pile {
+            rows,
+            notices,
+            omitted,
+        },
         nested_repos,
         hash_calls: store.git().hash_object_calls() - calls_before,
         refreshed,
@@ -847,6 +890,7 @@ pub(crate) mod fixture_tests {
                 collapse_size_bytes: 1024,
                 excluded_dirs: &[],
                 index_tmp: &self.paths.index_tmp,
+                row_cap: crate::engine::DEFAULT_ROW_CAP,
             };
             super::scan(&inputs).unwrap()
         }
