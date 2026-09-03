@@ -19,6 +19,7 @@
 //! `probe_tui_screen` (ignored) is `just probe-tui-screen`: the same flow against the
 //! release binary, printing the final screen and the exit code.
 
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -212,6 +213,11 @@ impl Fixture {
     /// `<state>/roots/<parent-id>/repos/<root-id>/` by its `root` field (the canonical
     /// path) — read from disk, exactly what the next process will load.
     fn ledger(&self, name: &str) -> serde_json::Value {
+        self.ledger_in(name).1
+    }
+
+    /// The root's state dir (`ledger.json`, `store/`, `index`) and its ledger.
+    fn ledger_in(&self, name: &str) -> (PathBuf, serde_json::Value) {
         let root = std::fs::canonicalize(self.parent.join(name)).expect("root exists");
         let root = root.to_string_lossy().into_owned();
         let roots = self.state.join("roots");
@@ -232,7 +238,7 @@ impl Fixture {
                 let value: serde_json::Value = serde_json::from_str(&text)
                     .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
                 if value["root"].as_str() == Some(root.as_str()) {
-                    found.push(value);
+                    found.push((repo.path(), value));
                 }
             }
         }
@@ -734,7 +740,7 @@ fn pty_accept_loop_and_restart() {
         .unwrap_or_else(|e| panic!("empty header: {e}"));
 
     // The fold persisted: what the next process will load.
-    let after = fx.ledger("alpha");
+    let (alpha_state, after) = fx.ledger_in("alpha");
     assert_eq!(after["overrides"], serde_json::json!({}), "{after}");
     assert_ne!(
         after["seen_tree"], before["seen_tree"],
@@ -744,6 +750,59 @@ fn pty_accept_loop_and_restart() {
         after["seen_at"]["head_commit"].as_str(),
         Some(f3_commit.as_str()),
         "seen_at is the agent's commit the fold happened on: {after}"
+    );
+    // The seen tree itself, listed from the root's store: one entry per path of alpha's
+    // working tree as accepted and nothing else — f1 and f2 at the blobs the agent left
+    // (hashed here from the same files: f1 is the whole edit, hunk then file), f3 as the
+    // agent's commit has it, the six added files.
+    let store = alpha_state.join("store");
+    let seen_tree = after["seen_tree"].as_str().expect("seen_tree is an oid");
+    let listing = alpha
+        .git_at(
+            &fx.parent,
+            &[
+                "--git-dir",
+                store.to_str().expect("utf-8 store path"),
+                "ls-tree",
+                "-r",
+                seen_tree,
+            ],
+        )
+        .expect("ls-tree of the seen tree in the store");
+    let entries: BTreeMap<&str, &str> = listing
+        .lines()
+        .map(|line| {
+            let (meta, path) = line.split_once('\t').expect("mode type oid\\tpath");
+            (path, meta.split_whitespace().nth(2).expect("oid"))
+        })
+        .collect();
+    let mut expected = vec!["f1", "f2", "f3"];
+    expected.extend(ADDED);
+    assert_eq!(
+        entries.keys().copied().collect::<Vec<_>>(),
+        expected,
+        "the seen tree is alpha's working tree, path for path:\n{listing}"
+    );
+    let blob = |rel: &str| {
+        alpha
+            .git(&["hash-object", rel])
+            .expect("hash-object")
+            .trim()
+            .to_owned()
+    };
+    assert_eq!(
+        entries["f1"],
+        blob("f1"),
+        "f1 seen as the agent's whole edit"
+    );
+    assert_eq!(entries["f2"], blob("f2"), "f2 seen as the agent's edit");
+    assert_eq!(
+        entries["f3"],
+        alpha
+            .git(&["rev-parse", "HEAD:f3"])
+            .expect("HEAD:f3")
+            .trim(),
+        "f3 seen as the agent committed it"
     );
     for name in ["beta", "notes"] {
         let ledger = fx.ledger(name);
