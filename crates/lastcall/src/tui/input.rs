@@ -60,6 +60,17 @@ pub enum Action {
     Resize(u16, u16),
     /// One second passed (the loop's 1 s timer): status-line ages advance.
     Tick,
+    /// Accept what the cursor is on (§6.7): the hunk under the diff cursor, else the
+    /// selected entry — a row whole, a group, every row of a root.
+    Accept,
+    /// Accept the selected row whole, whichever pane has focus.
+    AcceptFile,
+    /// Accept every row of every listed root.
+    AcceptAll,
+    /// Answer the confirm modal (`y` / `Enter`); nothing outside it.
+    Confirm,
+    /// Dismiss the confirm modal (`n` / `Esc`); nothing outside it.
+    Cancel,
 }
 
 /// Action name (the `[keys]` config key) → default key specs, in help-overlay order.
@@ -75,10 +86,33 @@ pub const DEFAULT_KEYMAP: &[(&str, &[&str])] = &[
     ("hunk_prev", &["p", "["]),
     ("toggle_full_paths", &["f"]),
     ("toggle_remote", &["o"]),
+    ("accept", &["a"]),
+    ("accept_file", &["shift-a"]),
+    ("accept_all", &["ctrl-a"]),
     ("refresh", &["r"]),
     ("help", &["?"]),
     ("quit", &["q", "ctrl-c"]),
 ];
+
+/// The confirm modal's keys, consulted before the keymap while `App::confirm` is open and
+/// nowhere else. Not rebindable in v1 (kickoff deliverable 4), so they live outside
+/// [`DEFAULT_KEYMAP`]; the help overlay appends them after the bindable rows.
+pub const MODAL_KEYS: &[(&str, &[&str])] =
+    &[("confirm", &["y", "enter"]), ("cancel", &["n", "esc"])];
+
+/// The modal action for a key while the confirm is open: `Confirm`, `Cancel`, or nothing
+/// (every other key is swallowed, like the help overlay swallows keys).
+pub fn modal_action(key: Key) -> Option<Action> {
+    for (name, specs) in MODAL_KEYS {
+        if specs.iter().any(|s| Key::parse(s).ok() == Some(key)) {
+            return Some(match *name {
+                "confirm" => Action::Confirm,
+                _ => Action::Cancel,
+            });
+        }
+    }
+    None
+}
 
 impl Action {
     /// The key-bindable action for a `[keys]` name (`nav_up`, `quit`, …). `scroll_up` /
@@ -99,6 +133,9 @@ impl Action {
             "scroll_down" => Action::ScrollDown(1),
             "toggle_full_paths" => Action::ToggleFullPaths,
             "toggle_remote" => Action::ToggleRemote,
+            "accept" => Action::Accept,
+            "accept_file" => Action::AcceptFile,
+            "accept_all" => Action::AcceptAll,
             "refresh" => Action::Refresh,
             "help" => Action::Help,
             "quit" => Action::Quit,
@@ -120,11 +157,16 @@ impl Action {
             "hunk_prev" => "previous hunk",
             "toggle_full_paths" => "full paths",
             "toggle_remote" => "show org/repo",
+            "accept" => "accept the hunk or the selected entry",
+            "accept_file" => "accept the whole file",
+            "accept_all" => "accept everything listed",
             "refresh" => "rescan now",
             "help" => "this help",
             "quit" => "quit",
             "scroll_up" => "scroll the diff up",
             "scroll_down" => "scroll the diff down",
+            "confirm" => "confirm",
+            "cancel" => "cancel",
             _ => "",
         }
     }
@@ -374,6 +416,7 @@ impl Keymap {
             })
             .collect();
         for (name, specs) in keys {
+            // `confirm` / `cancel` are not in `from_name`, so `[keys]` refuses them too.
             if Action::from_name(name).is_none() {
                 return Err(KeymapError::UnknownAction {
                     action: name.clone(),
@@ -878,13 +921,20 @@ mod tests {
     fn keymap_table_shows_the_canonical_spelling_of_an_override() {
         for (_, specs) in DEFAULT_KEYMAP {
             for spec in *specs {
-                assert_eq!(
-                    Key::parse(spec).unwrap().spec(),
-                    *spec,
-                    "default {spec} is canonical"
-                );
+                let key = Key::parse(spec).unwrap();
+                // `shift-a` is the one default spelled by its modifier (a bare `A` would
+                // case-fold onto `a`); its canonical form is `A`, and it round-trips.
+                let canonical = if *spec == "shift-a" { "A" } else { *spec };
+                assert_eq!(key.spec(), canonical, "default {spec} is canonical");
             }
         }
+        assert!(
+            App::new()
+                .keymap
+                .iter()
+                .any(|(n, s)| n == "accept_file" && s == &["A".to_owned()]),
+            "App seeds the canonical table: shift-a shows as A"
+        );
         let keys: BTreeMap<String, KeySpecs> = [
             ("quit".to_owned(), KeySpecs::One("Q".to_owned())),
             (
@@ -1068,15 +1118,29 @@ mod tests {
             (Action::Refresh, "key"),
             (Action::Help, "key"),
             (Action::Quit, "key"),
+            (Action::Accept, "key"),
+            (Action::AcceptFile, "key"),
+            (Action::AcceptAll, "key"),
+            (Action::Confirm, "modal"),
+            (Action::Cancel, "modal"),
             (Action::Press(1, 1), "mouse"),
             (Action::Drag(1, 1), "mouse"),
             (Action::Release, "mouse"),
             (Action::Resize(80, 24), "terminal"),
             (Action::Tick, "timer"),
         ];
+        let by_modal: Vec<Action> = MODAL_KEYS
+            .iter()
+            .flat_map(|(_, specs)| specs.iter())
+            .filter_map(|s| modal_action(Key::parse(s).unwrap()))
+            .collect();
         for (action, source) in table {
             match *source {
                 "key" => assert!(by_key.contains(action), "{action:?} has no default key"),
+                "modal" => {
+                    assert!(by_modal.contains(action), "{action:?} has no modal key");
+                    assert!(!by_key.contains(action), "{action:?} must not be key-bound");
+                }
                 _ => assert!(!by_key.contains(action), "{action:?} must not be key-bound"),
             }
         }
@@ -1102,8 +1166,63 @@ mod tests {
             | Action::Drag(_, _)
             | Action::Release
             | Action::Resize(_, _)
-            | Action::Tick => 21,
+            | Action::Tick
+            | Action::Accept
+            | Action::AcceptFile
+            | Action::AcceptAll
+            | Action::Confirm
+            | Action::Cancel => 26,
         };
-        assert_eq!(table.len(), 21);
+        assert_eq!(table.len(), 26);
+    }
+
+    #[test]
+    fn input_modal_keys_resolve_only_through_modal_action() {
+        let km = Keymap::defaults();
+        let y = Key::parse("y").unwrap();
+        let enter = Key::parse("enter").unwrap();
+        let n = Key::parse("n").unwrap();
+        let esc = Key::parse("esc").unwrap();
+        assert_eq!(modal_action(y), Some(Action::Confirm));
+        assert_eq!(modal_action(enter), Some(Action::Confirm));
+        assert_eq!(modal_action(n), Some(Action::Cancel));
+        assert_eq!(modal_action(esc), Some(Action::Cancel));
+        assert_eq!(modal_action(Key::parse("a").unwrap()), None);
+        // Outside the modal the same keys keep their keymap meaning (or none).
+        assert_eq!(to_action(&key('n'), &km), Some(Action::HunkNext));
+        assert_eq!(to_action(&key('y'), &km), None);
+        assert!(
+            km.bindings()
+                .iter()
+                .all(|(_, a)| !matches!(a, Action::Confirm | Action::Cancel)),
+            "confirm/cancel are never in the keymap"
+        );
+        // …and `[keys]` cannot bind them in v1.
+        for name in ["confirm", "cancel"] {
+            assert!(matches!(
+                Keymap::from_config(&keys(&[(name, &["x"])])),
+                Err(KeymapError::UnknownAction { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn input_accept_keys_by_default() {
+        let km = Keymap::defaults();
+        assert_eq!(to_action(&key('a'), &km), Some(Action::Accept));
+        assert_eq!(
+            to_action(&key_code(KeyCode::Char('A'), KeyModifiers::SHIFT), &km),
+            Some(Action::AcceptFile)
+        );
+        assert_eq!(
+            to_action(&key_code(KeyCode::Char('a'), KeyModifiers::CONTROL), &km),
+            Some(Action::AcceptAll)
+        );
+        // `[keys]` overrides cover the three accept actions.
+        let km = Keymap::from_config(&keys(&[("accept", &["x"]), ("accept_all", &["shift-x"])]))
+            .unwrap();
+        assert_eq!(to_action(&key('x'), &km), Some(Action::Accept));
+        assert_eq!(to_action(&key('a'), &km), None);
+        assert_eq!(to_action(&key('X'), &km), Some(Action::AcceptAll));
     }
 }

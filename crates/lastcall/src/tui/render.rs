@@ -11,7 +11,7 @@
 use std::collections::BTreeSet;
 
 use lastcall_engine::hunks::{Hunk, Tag};
-use lastcall_engine::scan::{Annotation, Change, Collapsed, Rename, Row};
+use lastcall_engine::scan::{Change, Collapsed, Rename, Row};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
@@ -21,21 +21,13 @@ use ratatui::widgets::{Block, Clear, Widget};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::app::{
-    App, Focus, MIN_SIZE, NAV_MIN_COLS, RootView, Selection, Target, diff_len, hunk_offsets,
+    App, Focus, MIN_SIZE, NAV_MIN_COLS, RootView, Selection, Target, annotation_name, diff_len,
+    hunk_offsets, plural,
 };
 use super::input::Action;
 
 pub const TOO_SMALL: &str = "too small: 40×10 min";
 pub const NO_SELECTION: &str = "select a file (↑↓ or click) · ? for help";
-
-/// `1 file`, `2 files`.
-fn plural(n: usize, noun: &str) -> String {
-    if n == 1 {
-        format!("1 {noun}")
-    } else {
-        format!("{n} {noun}s")
-    }
-}
 
 /// Which pane a screen position belongs to (the wheel scrolls the pane under the pointer).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,10 +151,10 @@ pub fn render(app: &App, frame: &mut Frame<'_>) -> HitMap {
 
 fn render_header(app: &App, buf: &mut Buffer, area: Rect) {
     let listed: Vec<&RootView> = app.listed_roots().collect();
-    let files: usize = listed.iter().map(|v| v.rows.len()).sum();
+    let files: usize = listed.iter().map(|v| v.rows().len()).sum();
     let hunks: usize = listed
         .iter()
-        .flat_map(|v| v.rows.iter())
+        .flat_map(|v| v.rows().iter())
         .map(|r| r.hunks.len())
         .sum();
     let left = format!(
@@ -290,12 +282,12 @@ fn render_nav(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
             line: Line::from(format!(
                 "  {} · {}",
                 view.meta.branch_label(),
-                plural(view.rows.len(), "file")
+                plural(view.rows().len(), "file")
             )),
             target: None,
             selected: false,
         });
-        for row in &view.rows {
+        for row in view.rows() {
             let sel = Selection::Row(path.clone(), row.path.clone());
             let is_sel = app.selection.as_ref() == Some(&sel);
             if is_sel {
@@ -351,13 +343,6 @@ fn letter(change: Change) -> char {
         Change::Mode => 'X',
         Change::Typechange => 'T',
         Change::Unreadable => '?',
-    }
-}
-
-fn annotation_name(a: Annotation) -> &'static str {
-    match a {
-        Annotation::Upstream => "upstream",
-        Annotation::Mixed => "mixed",
     }
 }
 
@@ -442,7 +427,7 @@ fn render_main(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
                     Span::raw(format!(
                         "  {} · {}",
                         view.meta.branch_label(),
-                        plural(view.rows.len(), "file")
+                        plural(view.rows().len(), "file")
                     )),
                 ];
                 for label in [view.meta.badge_label(), view.meta.in_progress_label()]
@@ -452,8 +437,8 @@ fn render_main(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
                     spans.push(Span::raw(format!("  {label}")));
                 }
                 lines.push(Line::from(spans));
-                push_notices(&mut lines, &view.notices);
-                for row in &view.rows {
+                push_notices(&mut lines, view.notices());
+                for row in view.rows() {
                     lines.push(nav_row_line(row, true, usize::MAX));
                 }
             }
@@ -480,7 +465,7 @@ fn render_main(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
                 // dimmed list above it carries only the root's other notices.
                 let own = format!("{}: ", row.path_lossy());
                 let others: Vec<String> = view
-                    .notices
+                    .notices()
                     .iter()
                     .filter(|n| !n.starts_with(&own))
                     .cloned()
@@ -563,7 +548,7 @@ fn render_row_body(
         (Change::Unreadable | Change::Typechange, _) => {
             let prefix = format!("{}: ", String::from_utf8_lossy(path));
             let text = view
-                .notices
+                .notices()
                 .iter()
                 .find(|n| n.starts_with(&prefix))
                 .cloned()
@@ -909,7 +894,7 @@ mod tests {
     #[test]
     fn render_many_notices_do_not_overflow_a_small_pane() {
         let mut app = three_roots();
-        app.roots.get_mut(&root("alpha")).unwrap().notices =
+        app.roots.get_mut(&root("alpha")).unwrap().pile.notices =
             (0..12).map(|i| format!("notice {i}")).collect();
         app.select(Some(row("alpha", "f1")));
         app.handle(Action::Open);

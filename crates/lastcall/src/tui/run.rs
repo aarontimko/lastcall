@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crossterm::event::Event;
-use lastcall_engine::engine::Engine;
+use lastcall_engine::engine::{AcceptRequest, Accepted, Engine};
 use lastcall_engine::scan::Pile;
 use lastcall_engine::watcher::{EngineEvent, EngineTimings, Watcher, blocking};
 use ratatui::Terminal;
@@ -36,7 +36,7 @@ use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 
 use super::app::{App, Changed, Effect, RootMeta};
-use super::input::{Action, Keymap, pointer, to_action};
+use super::input::{Action, Key, Keymap, modal_action, pointer, to_action};
 use super::render::{HitMap, Pane, render};
 use super::term;
 
@@ -50,8 +50,11 @@ pub const TICK: Duration = Duration::from_secs(1);
 /// Results of the engine work the loop spawned on the app's behalf.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Local {
-    /// One root's pile from a `Refresh` (`Engine::scan_all`).
-    Pile(PathBuf, Pile),
+    /// One root's pile from a `Refresh` (`Engine::scan_all`), with the seq of that scan so
+    /// the reducer can drop an older watcher pile that lands after it.
+    Pile(PathBuf, u64, Pile),
+    /// An `Effect::Accept` finished: one result per root it covered.
+    Accepted(Vec<(PathBuf, Result<Accepted, String>)>),
     /// The engine's roots after a `SyncRoots`.
     Roots(Vec<RootMeta>),
     /// The `Refresh` finished (all its piles were sent first).
@@ -89,6 +92,16 @@ impl Ui {
     /// selection when the pointer is over the nav and scrolls the diff otherwise; a resize
     /// invalidates the hit map before the app sees it.
     pub fn event(&mut self, event: &Event) -> (Changed, Option<Effect>) {
+        // The confirm modal answers only to its own keys (`y`/`Enter`, `n`/`Esc`), consulted
+        // before the keymap and swallowing every other key, as the help overlay does.
+        if self.app.confirm.is_some()
+            && let Event::Key(k) = event
+        {
+            return match Key::of(k).and_then(modal_action) {
+                Some(action) => self.app.handle(action),
+                None => (Changed::No, None),
+            };
+        }
         let Some(action) = to_action(event, &self.keymap) else {
             return (Changed::No, None);
         };
@@ -127,9 +140,8 @@ impl Ui {
     /// Fold one finished piece of the loop's own engine work in.
     pub fn local(&mut self, local: Local) -> (Changed, Option<Effect>) {
         match local {
-            // Phase 4b (kickoff deliverable 5) threads the scan seq through `Local::Pile`;
-            // until then the reducer ignores it.
-            Local::Pile(root, pile) => self.app.apply(EngineEvent::Pile { root, seq: 0, pile }),
+            Local::Pile(root, seq, pile) => self.app.apply(EngineEvent::Pile { root, seq, pile }),
+            Local::Accepted(results) => (self.app.accepted(results), None),
             Local::Roots(metas) => (self.app.sync_roots(metas), None),
             Local::RefreshDone => (self.app.refresh_done(), None),
             Local::Notice(root, text) => self.app.apply(EngineEvent::Notice { root, text }),
@@ -246,9 +258,9 @@ fn spawn_refresh(engine: &Arc<Mutex<Engine>>, tx: mpsc::UnboundedSender<Local>) 
         let Some(results) = joined(scan, &tx, "refresh").await else {
             return;
         };
-        for (root, _seq, result) in results {
+        for (root, seq, result) in results {
             let local = match result {
-                Ok(pile) => Local::Pile(root, pile),
+                Ok(pile) => Local::Pile(root, seq, pile),
                 Err(e) => Local::Notice(Some(root), format!("scan failed: {e}")),
             };
             if tx.send(local).is_err() {
@@ -256,6 +268,33 @@ fn spawn_refresh(engine: &Arc<Mutex<Engine>>, tx: mpsc::UnboundedSender<Local>) 
             }
         }
         let _ = tx.send(Local::RefreshDone);
+    });
+}
+
+/// `Effect::Accept`: every root's `Engine::accept` (the op and its rescan) in one
+/// `blocking` closure, so one critical section covers the whole request and no watcher scan
+/// interleaves; the results come back as one `Local::Accepted`.
+fn spawn_accept(
+    engine: &Arc<Mutex<Engine>>,
+    tx: mpsc::UnboundedSender<Local>,
+    reqs: Vec<(PathBuf, AcceptRequest)>,
+) {
+    let engine = engine.clone();
+    tokio::spawn(async move {
+        let accept = tokio::spawn(async move {
+            blocking(&engine, move |e| {
+                reqs.into_iter()
+                    .map(|(root, req)| {
+                        let result = e.accept(&root, req).map_err(|e| e.to_string());
+                        (root, result)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+        });
+        if let Some(results) = joined(accept, &tx, "accept").await {
+            let _ = tx.send(Local::Accepted(results));
+        }
     });
 }
 
@@ -415,6 +454,9 @@ pub fn run(
                     Some(Effect::Quit) => break,
                     Some(Effect::Refresh) => spawn_refresh(&watcher.engine, local_tx.clone()),
                     Some(Effect::SyncRoots) => spawn_sync_roots(&watcher.engine, local_tx.clone()),
+                    Some(Effect::Accept(reqs)) => {
+                        spawn_accept(&watcher.engine, local_tx.clone(), reqs)
+                    }
                     None => {}
                 }
                 if changed == Changed::Yes {
@@ -685,12 +727,12 @@ mod tests {
         assert_eq!(ui.event(&key(KeyCode::Char('r'))).1, Some(Effect::Refresh));
         assert!(ui.app.refreshing);
         assert_eq!(
-            ui.local(Local::Pile(root("alpha"), pile("alpha"))),
+            ui.local(Local::Pile(root("alpha"), 1, pile("alpha"))),
             (Changed::Yes, None)
         );
         assert!(ui.app.roots[&root("alpha")].listed());
         assert_eq!(
-            ui.local(Local::Pile(root("alpha"), pile("alpha"))),
+            ui.local(Local::Pile(root("alpha"), 1, pile("alpha"))),
             (Changed::No, None),
             "an unchanged pile is no change"
         );

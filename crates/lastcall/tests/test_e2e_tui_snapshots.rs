@@ -175,10 +175,12 @@ fn tui_nav_three_roots() {
         Some(Selection::Row(alpha.clone(), b"f1".to_vec()))
     );
     let (frame, _) = draw(&app, W, H);
-    // An unchanged pile changes nothing: same selection, same cursor, same bytes.
-    let before = app.clone();
+    // An unchanged pile changes nothing: same selection, same cursor, same bytes. Only
+    // the seq bookkeeping moves forward (the pile was current as of that scan).
+    let mut before = app.clone();
     let pile = engine.scan(&alpha).expect("scan");
     let seq = engine.scan_seq();
+    before.seq.insert(alpha.clone(), seq);
     let (changed, _) = app.apply(EngineEvent::Pile {
         root: alpha,
         seq,
