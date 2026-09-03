@@ -975,4 +975,380 @@ mod tests {
         let out = h.ops().flag(b"bad\xff", "n", &NoFault).unwrap();
         assert!(matches!(out.refused[0], Refused::NonUtf8Path { .. }));
     }
+
+    /// Kickoff deliverable 8 (ii)/(iii): property tests over one draft root per test — a
+    /// private store on a temp dir, no user repo, the `RootKind::Draft` plumbing exactly as
+    /// the engine opens one. Each case rewrites the file set and resets the ledger to first
+    /// sight before running its ops. Driven through `TestRunner` (not `proptest!`) so the
+    /// fixture is built once per test and shared across cases; failure persistence is off
+    /// because a manual runner has no source file to write beside, and a case is fully
+    /// determined by its inputs anyway.
+    mod proptests {
+        use std::cell::RefCell;
+        use std::path::PathBuf;
+
+        use globset::GlobSet;
+        use lastcall_testkit::tmp::TempDir;
+        use proptest::prelude::*;
+        use proptest::test_runner::{TestCaseError, TestRunner};
+
+        use super::*;
+        use crate::engine::DEFAULT_ROW_CAP;
+        use crate::env::Env;
+        use crate::hunks::Tag;
+        use crate::ledger::FixedClock;
+        use crate::scan::{Change, ScanInputs};
+
+        struct Draft {
+            _dir: TempDir,
+            root: PathBuf,
+            store: Store,
+            index: PrivateIndex,
+            ledger: Ledger,
+            tree: TreeEntries,
+            paths: RepoPaths,
+            globs: GlobSet,
+            clock: FixedClock,
+        }
+
+        impl Draft {
+            fn new(name: &str) -> Self {
+                let dir = TempDir::new(name);
+                let root = dir.mkdir("draft");
+                let state = dir.mkdir("state");
+                let env = Env::empty(dir.path())
+                    .with_home(dir.mkdir("home"))
+                    .with_var("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .with_var("GIT_CONFIG_SYSTEM", "/dev/null")
+                    .with_var("GIT_CONFIG_NOSYSTEM", "1")
+                    .with_var("LASTCALL_STATE_DIR", state.to_string_lossy());
+                let paths = RepoPaths::under(state.join("repo"));
+                let (store, notices) =
+                    Store::open(&env, &root, RootKind::Draft, &paths, None).unwrap();
+                assert!(notices.is_empty(), "{notices:?}");
+                let index = PrivateIndex::new(store.git().clone(), &paths, RootKind::Draft, None);
+                let ledger = Ledger::new(&root, RootKind::Draft, None, Self::seen_at());
+                Self {
+                    _dir: dir,
+                    root,
+                    store,
+                    index,
+                    ledger,
+                    tree: TreeEntries::new(),
+                    paths,
+                    globs: GlobSet::empty(),
+                    clock: FixedClock::at_unix(1_800_000_000),
+                }
+            }
+
+            fn seen_at() -> SeenAt {
+                SeenAt {
+                    head_commit: None,
+                    branch: None,
+                    at: "2026-01-01T00:00:00Z".into(),
+                }
+            }
+
+            /// Make `files` the whole worktree and the ledger a first sight of it.
+            fn reset(&mut self, files: &BTreeMap<String, Vec<u8>>) {
+                for entry in std::fs::read_dir(&self.root).unwrap() {
+                    std::fs::remove_file(entry.unwrap().path()).unwrap();
+                }
+                for (name, bytes) in files {
+                    self.write(name, bytes);
+                }
+                let seen = self.store.tree_of_disk().unwrap();
+                self.tree = self.store.ls_tree(&seen).unwrap();
+                self.ledger = Ledger::new(&self.root, RootKind::Draft, Some(seen), Self::seen_at());
+                ledger::save(&self.paths, &self.ledger).unwrap();
+            }
+
+            fn write(&self, name: &str, bytes: &[u8]) {
+                std::fs::write(self.root.join(name), bytes).unwrap();
+            }
+
+            fn set(&self, name: &str, content: Option<&[u8]>) {
+                match content {
+                    Some(b) => self.write(name, b),
+                    None => {
+                        let _ = std::fs::remove_file(self.root.join(name));
+                    }
+                }
+            }
+
+            /// Disk content per name (`None` = absent).
+            fn disk(&self, names: &[&str]) -> BTreeMap<String, Option<Vec<u8>>> {
+                names
+                    .iter()
+                    .map(|n| ((*n).to_owned(), std::fs::read(self.root.join(n)).ok()))
+                    .collect()
+            }
+
+            fn scan(&self) -> Pile {
+                crate::scan::scan(&ScanInputs {
+                    store: &self.store,
+                    index: &self.index,
+                    repo: None,
+                    ledger: &self.ledger,
+                    seen_tree: self.ledger.seen_tree.as_ref(),
+                    tree: &self.tree,
+                    case_insensitive: false,
+                    collapsed_globs: &self.globs,
+                    collapse_size_bytes: 1 << 20,
+                    excluded_dirs: &[],
+                    index_tmp: &self.paths.index_tmp,
+                    row_cap: DEFAULT_ROW_CAP,
+                })
+                .unwrap()
+                .pile
+            }
+
+            fn ops(&mut self) -> Ops<'_> {
+                Ops {
+                    store: &self.store,
+                    index: &self.index,
+                    repo: None,
+                    paths: &self.paths,
+                    ledger: &mut self.ledger,
+                    tree: &mut self.tree,
+                    clock: &self.clock,
+                    compaction_threshold: 500,
+                    staged: BTreeMap::new(),
+                }
+            }
+        }
+
+        fn config() -> ProptestConfig {
+            ProptestConfig {
+                cases: 32,
+                failure_persistence: None,
+                ..ProptestConfig::default()
+            }
+        }
+
+        const NAMES: [&str; 5] = ["f0", "f1", "f2", "f3", "f4"];
+
+        /// Short line-based content from a six-letter alphabet, so diffs have context.
+        fn content() -> impl Strategy<Value = Vec<u8>> {
+            prop::collection::vec(0..6u8, 0..8).prop_map(|v| {
+                v.iter()
+                    .map(|b| format!("l{b}\n"))
+                    .collect::<String>()
+                    .into_bytes()
+            })
+        }
+
+        fn name() -> impl Strategy<Value = String> {
+            (0..NAMES.len()).prop_map(|i| NAMES[i].to_owned())
+        }
+
+        fn file_set() -> impl Strategy<Value = BTreeMap<String, Vec<u8>>> {
+            prop::collection::btree_map(name(), content(), 0..NAMES.len())
+        }
+
+        /// A batch of edits: set a name to content, or remove it.
+        fn edits() -> impl Strategy<Value = Vec<(String, Option<Vec<u8>>)>> {
+            prop::collection::vec((name(), prop::option::of(content())), 0..5)
+        }
+
+        fn sorted_changes(hunks: &[Hunk]) -> Vec<(Tag, Vec<u8>)> {
+            let mut v: Vec<(Tag, Vec<u8>)> = hunks.iter().flat_map(Hunk::change_lines).collect();
+            v.sort();
+            v
+        }
+
+        #[test]
+        fn ops_accept_all_then_edits_pends_exactly_the_post_snapshot_delta_and_compact_never_changes_the_pile()
+         {
+            let d = RefCell::new(Draft::new("lc-prop-all"));
+            let mut runner = TestRunner::new(config());
+            let result = runner.run(
+                &(file_set(), edits(), edits(), 0..8usize),
+                |(files, first, second, pick)| {
+                    let mut d = d.borrow_mut();
+                    d.reset(&files);
+                    for (name, c) in &first {
+                        d.set(name, c.as_deref());
+                    }
+                    let snapshot = d.scan();
+                    let out = d.ops().accept_all(&snapshot, &NoFault).unwrap();
+                    prop_assert!(out.ok());
+                    // (A file `second` leaves alone must show no row below: accept-all
+                    // cleared it.)
+                    let post = d.disk(&NAMES);
+                    for (name, c) in &second {
+                        d.set(name, c.as_deref());
+                    }
+                    let now = d.disk(&NAMES);
+                    let pile = d.scan();
+                    prop_assert_eq!(pile.omitted, 0);
+                    let changed = NAMES.iter().filter(|n| post[**n] != now[**n]).count();
+                    prop_assert_eq!(pile.rows.len(), changed, "rows: {:?}", pile_lines(&pile));
+                    for name in NAMES {
+                        let (was, is) = (&post[name], &now[name]);
+                        let row = pile.row(name.as_bytes());
+                        if was == is {
+                            prop_assert!(
+                                row.is_none(),
+                                "{name}: unchanged since the snapshot, yet pending"
+                            );
+                            continue;
+                        }
+                        prop_assert!(
+                            row.is_some(),
+                            "{name}: changed since the snapshot, yet not pending"
+                        );
+                        let row = row.unwrap();
+                        let expected = match (was, is) {
+                            (None, Some(_)) => Change::Added,
+                            (Some(_), None) => Change::Deleted,
+                            _ => Change::Modified,
+                        };
+                        prop_assert_eq!(row.change, expected, "{}", name);
+                        if let (Some(w), Some(i)) = (was, is) {
+                            prop_assert_eq!(
+                                &row.hunks,
+                                &hunks::diff(w, i),
+                                "{}: not exactly the post-snapshot delta",
+                                name
+                            );
+                        }
+                    }
+                    // A fold never changes the pile — with a fresh override in the mix too.
+                    if !pile.rows.is_empty() {
+                        let r = Rendered::of(&pile.rows[pick % pile.rows.len()]);
+                        let out = d.ops().accept_file(&r, &NoFault).unwrap();
+                        prop_assert!(out.ok(), "{:?}", out);
+                    }
+                    let before = d.scan();
+                    d.ops().compact(&NoFault).unwrap();
+                    prop_assert!(
+                        d.ledger.overrides.values().all(|o| o.blob.is_none()),
+                        "folded"
+                    );
+                    prop_assert_eq!(d.scan(), before, "compact changed the pile");
+                    Ok(())
+                },
+            );
+            if let Err(e) = result {
+                panic!("{e}");
+            }
+        }
+
+        /// A baseline of unique lines and a current side with a few separated edits
+        /// (delete / insert / replace at distinct spots), so every change line names its
+        /// hunk and the hunks proptest's oracle applies.
+        fn hunky_file(tag: &'static str) -> impl Strategy<Value = (Vec<u8>, Vec<u8>)> {
+            (
+                6..24usize,
+                prop::collection::btree_set(0..24usize, 1..5),
+                prop::collection::vec(0..3u8, 5),
+            )
+                .prop_map(move |(n, spots, kinds)| {
+                    let base: Vec<String> = (0..n).map(|i| format!("{tag}{i}\n")).collect();
+                    let mut cur = base.clone();
+                    for (k, spot) in spots.into_iter().filter(|s| *s < n).rev().enumerate() {
+                        match kinds[k % kinds.len()] {
+                            0 => {
+                                cur.remove(spot);
+                            }
+                            1 => cur.insert(spot + 1, format!("{tag}new{spot}\n")),
+                            _ => cur[spot] = format!("{tag}rep{spot}\n"),
+                        }
+                    }
+                    (base.concat().into_bytes(), cur.concat().into_bytes())
+                })
+        }
+
+        /// One op: `(file b?, accept the whole file?, hunk pick)`.
+        fn ops_seq() -> impl Strategy<Value = Vec<(bool, bool, usize)>> {
+            prop::collection::vec((any::<bool>(), any::<bool>(), 0..8usize), 1..5)
+        }
+
+        fn remove_all(
+            remaining: &mut Vec<(Tag, Vec<u8>)>,
+            accepted: Vec<(Tag, Vec<u8>)>,
+        ) -> Result<(), TestCaseError> {
+            for line in accepted {
+                let pos = remaining.iter().position(|x| *x == line);
+                prop_assert!(pos.is_some(), "accepted line {:?} was not pending", line);
+                remaining.remove(pos.unwrap());
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn ops_interleaved_hunk_and_file_accepts_never_show_an_accepted_hunk_and_every_unaccepted_hunk_survives()
+         {
+            let d = RefCell::new(Draft::new("lc-prop-hunks"));
+            let mut runner = TestRunner::new(config());
+            let names = ["a", "b"];
+            let result = runner.run(
+                &(hunky_file("a"), hunky_file("b"), ops_seq()),
+                |(a, b, ops)| {
+                    let mut d = d.borrow_mut();
+                    let pair = [a, b];
+                    let seed: BTreeMap<String, Vec<u8>> = names
+                        .iter()
+                        .zip(&pair)
+                        .map(|(n, (base, _))| ((*n).to_owned(), base.clone()))
+                        .collect();
+                    d.reset(&seed);
+                    for (n, (_, cur)) in names.iter().zip(&pair) {
+                        d.write(n, cur);
+                    }
+                    // The oracle: per file, the change lines of the initial diff, minus the
+                    // accepted ones.
+                    let mut remaining: Vec<Vec<(Tag, Vec<u8>)>> = pair
+                        .iter()
+                        .map(|(base, cur)| sorted_changes(&hunks::diff(base, cur)))
+                        .collect();
+                    // One scan per op: the pile checked after an accept is the one the
+                    // next op renders from.
+                    let mut pile = d.scan();
+                    for (file_b, whole_file, pick) in ops {
+                        let f = usize::from(file_b);
+                        let Some(row) = pile.row(names[f].as_bytes()).cloned() else {
+                            prop_assert!(
+                                remaining[f].is_empty(),
+                                "{}: no row, {} change lines left",
+                                names[f],
+                                remaining[f].len()
+                            );
+                            continue;
+                        };
+                        let rendered = Rendered::of(&row);
+                        let out = if whole_file || row.hunks.is_empty() {
+                            remaining[f].clear();
+                            d.ops().accept_file(&rendered, &NoFault).unwrap()
+                        } else {
+                            let i = pick % row.hunks.len();
+                            remove_all(&mut remaining[f], row.hunks[i].change_lines())?;
+                            d.ops()
+                                .accept_hunk(&rendered, &row.hunks, i, &NoFault)
+                                .unwrap()
+                        };
+                        prop_assert!(out.ok(), "{:?}", out);
+                        pile = d.scan();
+                        for (g, name) in names.iter().enumerate() {
+                            let shown = pile
+                                .row(name.as_bytes())
+                                .map(|r| sorted_changes(&r.hunks))
+                                .unwrap_or_default();
+                            prop_assert_eq!(
+                                &shown,
+                                &remaining[g],
+                                "{}: shown change lines are not the unaccepted ones",
+                                name
+                            );
+                        }
+                    }
+                    Ok(())
+                },
+            );
+            if let Err(e) = result {
+                panic!("{e}");
+            }
+        }
+    }
 }
