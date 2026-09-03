@@ -219,7 +219,10 @@ stale (`run_press_resolves_through_the_hit_map_and_resize_invalidates_it`). A pr
 `NavGroup`, `DiffHunk(i)`, `DiffBody`, `Divider`, `HeaderAcceptAll`, `FileAccept`,
 `HunkAccept(i)`) and calls `App::hit`, which is the same reducer path the equivalent key
 takes (`app_hunk_click_equals_hunk_key`, `app_accept_hunk_by_keys_equals_hunk_accept_click`).
-While the confirm modal is open `hit` ignores every target.
+While the confirm modal is open `hit` ignores every target, and `Ui::event` drops every
+mouse event — press, drag, release, wheel — before it reaches the app at all (the wheel over
+the nav otherwise calls `move_selection` directly, around `handle`'s gate); only its keys,
+the `quit` keys and `Resize` get through (`run_mouse_is_dropped_under_the_modal_but_resize_passes`).
 
 ## Adding a widget, with a snapshot
 

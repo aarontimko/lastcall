@@ -90,22 +90,29 @@ impl Ui {
     /// Fold one terminal event in. Keys resolve through the keymap; a press resolves
     /// through the last hit map (nothing when there is none); the wheel moves the nav
     /// selection when the pointer is over the nav and scrolls the diff otherwise; a resize
-    /// invalidates the hit map before the app sees it.
+    /// invalidates the hit map before the app sees it. While the confirm modal is open only
+    /// its own keys, the `quit` keys and a resize get through; the mouse is dropped here
+    /// (the wheel over the nav would otherwise reach `move_selection` around the gate).
     pub fn event(&mut self, event: &Event) -> (Changed, Option<Effect>) {
         // The confirm modal answers to its own keys (`y`/`Enter`, `n`/`Esc`), consulted
         // before the keymap, and to the keymap's `quit` keys (`q` and ctrl-c quit by
         // default, everywhere — the help overlay lets `Quit` through the same way); every
         // other key is swallowed. `Esc` is the modal's cancel first, so it never quits.
-        if self.app.confirm.is_some()
-            && let Event::Key(k) = event
-        {
-            return match Key::of(k).and_then(modal_action) {
-                Some(action) => self.app.handle(action),
-                None => match to_action(event, &self.keymap) {
-                    Some(Action::Quit) => self.app.handle(Action::Quit),
-                    _ => (Changed::No, None),
-                },
-            };
+        // Every non-key event but `Resize` is dropped before it can touch the app.
+        if self.app.confirm.is_some() {
+            match event {
+                Event::Key(k) => {
+                    return match Key::of(k).and_then(modal_action) {
+                        Some(action) => self.app.handle(action),
+                        None => match to_action(event, &self.keymap) {
+                            Some(Action::Quit) => self.app.handle(Action::Quit),
+                            _ => (Changed::No, None),
+                        },
+                    };
+                }
+                Event::Resize(..) => {}
+                _ => return (Changed::No, None),
+            }
         }
         let Some(action) = to_action(event, &self.keymap) else {
             return (Changed::No, None);
@@ -836,6 +843,41 @@ mod tests {
         );
         assert!(ui.app.confirm.is_none());
         assert!(ui.app.accepting.is_none());
+    }
+
+    /// Under the modal the mouse is dropped before the app: the wheel over the nav (which
+    /// otherwise reaches `move_selection` directly), a press on a nav row, a drag and a
+    /// release all leave the app untouched; a resize still goes through and still
+    /// invalidates the hit map.
+    #[test]
+    fn run_mouse_is_dropped_under_the_modal_but_resize_passes() {
+        let mut ui = ui();
+        ui.app.apply(pile_event("alpha", rows_n(11, 0, 0)));
+        ui.app.select(Some(Selection::Root(root("alpha"))));
+        render_into(&mut ui);
+        let nav = ui.hits.as_ref().unwrap().nav.unwrap();
+        let main = ui.hits.as_ref().unwrap().main.unwrap();
+        assert_eq!(ui.event(&key(KeyCode::Char('a'))), (Changed::Yes, None));
+        assert!(ui.app.confirm.is_some(), "11 files ask first");
+        let open = ui.app.clone();
+        let (nx, ny) = (nav.x + 1, nav.y + 1);
+        for ev in [
+            mouse(MouseEventKind::ScrollDown, nx, ny),
+            mouse(MouseEventKind::ScrollUp, nx, ny),
+            mouse(MouseEventKind::ScrollDown, main.x + 1, main.y + 1),
+            mouse(MouseEventKind::Down(MouseButton::Left), nx, ny + 1),
+            mouse(MouseEventKind::Drag(MouseButton::Left), nx + 3, ny + 1),
+            mouse(MouseEventKind::Up(MouseButton::Left), nx + 3, ny + 1),
+            Event::FocusGained,
+        ] {
+            assert_eq!(ui.event(&ev), (Changed::No, None), "{ev:?} dropped");
+            assert_eq!(ui.app, open, "{ev:?} touched the app");
+        }
+        assert!(ui.hits.is_some(), "the hit map survives dropped events");
+        assert_eq!(ui.event(&Event::Resize(120, 40)), (Changed::Yes, None));
+        assert!(ui.hits.is_none(), "a resize still invalidates the hit map");
+        assert_eq!(ui.app.size, (120, 40));
+        assert!(ui.app.confirm.is_some(), "the modal is still open");
     }
 
     #[test]
