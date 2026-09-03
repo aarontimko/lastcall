@@ -170,6 +170,21 @@ disk, so a write that died after staging (E1's `AfterLedgerTmpWrite`) leaves the
 the committed ledger. `accept_with(root, req, &dyn FaultInjector)` is the same method with
 the E1 fault seam; production passes `NoFault`.
 
+**`Err` after a committed op.** The two halves of the critical section fail differently.
+An `Err` from the op itself (`EngineError::Ops`) means the ledger's rename did not land:
+nothing was accepted. But the rescan that follows can fail too (`self.scan(root)?` — a git
+or io error, or the root gone from the engine), and *that* `Err` arrives after the op
+committed: the ledger on disk already holds the accept, and the engine's in-memory ledger
+is the committed one (`Ops::commit` merges it with disk and tmp-writes it under the lock,
+then renames; the next `scan` reloads from disk anyway). A client that reports the
+`Err` as "the accept failed" is therefore wrong about the op and right only about the
+pile: the op is durable; the next successful scan of that root — the watcher's, a
+refresh, `status` — shows the post-accept pile; and a retry with the same request is
+harmless, since it re-folds the same rendered bytes onto the same ledger (a hunk retry is
+CAS-refused as `BaselineMoved`, a file/group/all retry re-blesses what is already
+blessed). No engine change is planned for this: the `Err` is honest about what the caller
+did not get (a pile), and the ledger is the truth either way.
+
 **Scan seq.** `Engine::scan_seq()` is an engine-global counter stepped once per successful
 `scan` (a failed scan does not step it) and read under the same lock as the scan it
 numbers. Every publisher of a pile carries it: `EngineEvent::Pile { root, seq, pile }`,
