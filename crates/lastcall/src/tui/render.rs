@@ -246,9 +246,25 @@ fn render_status(app: &App, buf: &mut Buffer, area: Rect) {
 /// file` on a file row otherwise, `a accept group` on a group entry, `a accept all in
 /// <root>` on a root entry (how the per-repo fold is told from the header's global one).
 /// Below `NAV_MIN_COLS`, or when the line would not fit, the `focus` and `refresh` hints
-/// are dropped.
+/// are dropped. While the confirm modal is open the line is `y confirm  n cancel  q quit`:
+/// exactly the keys that work there (the modal's own, fixed, and the keymap's `quit`).
 pub fn hints(app: &App, width: u16) -> String {
     let first = |action: &str| app.keys_for(action).first().map(|s| hint_label(s));
+    if app.confirm.is_some() {
+        let modal = |name: &str| {
+            MODAL_KEYS
+                .iter()
+                .find(|(n, _)| *n == name)
+                .and_then(|(_, specs)| specs.first())
+                .map(|s| hint_label(s))
+        };
+        let items = [
+            modal("confirm").map(|k| format!("{k} confirm")),
+            modal("cancel").map(|k| format!("{k} cancel")),
+            first("quit").map(|k| format!("{k} quit")),
+        ];
+        return items.into_iter().flatten().collect::<Vec<_>>().join("  ");
+    }
     let pair = |a: &str, b: &str| -> Option<String> {
         let (a, b) = (first(a)?, first(b)?);
         if (a.as_str(), b.as_str()) == ("↑", "↓") {
@@ -1086,6 +1102,40 @@ mod tests {
         );
         assert!(frame.contains("y / ⏎          confirm"), "{frame}");
         assert!(frame.contains("n / Esc        cancel"), "{frame}");
+    }
+
+    /// Under the modal the hint line names only the keys that work there: the modal's
+    /// own (fixed) and the keymap's `quit` key — not the accepts and the help.
+    #[test]
+    fn render_hint_line_under_the_modal_names_only_its_keys() {
+        let mut app = three_roots();
+        app.apply(pile_event("alpha", rows_n(11, 0, 0)));
+        app.select(Some(Selection::Root(root("alpha"))));
+        assert_eq!(app.handle(Action::Accept), (Changed::Yes, None));
+        assert!(app.confirm.is_some());
+        assert_eq!(hints(&app, 100), "y confirm  n cancel  q quit");
+        assert_eq!(
+            hints(&app, 40),
+            "y confirm  n cancel  q quit",
+            "never shrinks"
+        );
+        let (frame, _) = frame_of(&app, 100, 30);
+        let last = frame.lines().last().unwrap();
+        assert!(last.contains("y confirm  n cancel  q quit"), "{last}");
+        assert!(!last.contains("accept all"), "{last}");
+        // The quit key is the user's own; the modal keys are fixed.
+        for (name, specs) in &mut app.keymap {
+            if name == "quit" {
+                *specs = vec!["ctrl-x".to_owned()];
+            }
+        }
+        assert_eq!(hints(&app, 100), "y confirm  n cancel  ^X quit");
+        app.handle(Action::Cancel);
+        assert!(
+            hints(&app, 100).contains("a accept all in alpha  ^A accept all"),
+            "{}",
+            hints(&app, 100)
+        );
     }
 
     #[test]

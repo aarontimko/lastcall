@@ -150,7 +150,9 @@ from what the user is looking at:
   `a accept hunk  A accept file` on a file row with the diff focused, `a/A accept file`
   otherwise, `a accept group`, `a accept all in <root>`, and `^A accept all` always. When
   the line would not fit it drops `Tab focus  r refresh` first (always below 70 columns),
-  then the file and global accept hints.
+  then the file and global accept hints. While the confirm modal is open the line is
+  `y confirm  n cancel  q quit` — exactly the keys that work there, the `quit` label being
+  the user's own binding (`render_hint_line_under_the_modal_names_only_its_keys`).
 
 ## Keys
 
