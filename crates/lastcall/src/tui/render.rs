@@ -21,10 +21,10 @@ use ratatui::widgets::{Block, Clear, Widget};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::app::{
-    App, Focus, MIN_SIZE, NAV_MIN_COLS, RootView, Selection, Target, annotation_name, diff_len,
-    hunk_offsets, plural,
+    AcceptScope, App, Focus, MIN_SIZE, NAV_MIN_COLS, RootView, Selection, Target, annotation_name,
+    diff_len, hunk_offsets, plural,
 };
-use super::input::Action;
+use super::input::{Action, MODAL_KEYS};
 
 pub const TOO_SMALL: &str = "too small: 40×10 min";
 pub const NO_SELECTION: &str = "select a file (↑↓ or click) · ? for help";
@@ -96,7 +96,7 @@ pub fn render(app: &App, frame: &mut Frame<'_>) -> HitMap {
     let header = Rect::new(area.x, area.y, area.width, 1);
     let status = Rect::new(area.x, area.bottom() - 1, area.width, 1);
     let body = Rect::new(area.x, area.y + 1, area.width, area.height - 2);
-    render_header(app, buf, header);
+    render_header(app, buf, header, &mut hits);
     render_status(app, buf, status);
 
     let nav_visible = area.width >= NAV_MIN_COLS;
@@ -146,10 +146,16 @@ pub fn render(app: &App, frame: &mut Frame<'_>) -> HitMap {
     if app.help {
         render_help(app, buf, area);
     }
+    if app.confirm.is_some() {
+        render_confirm(app, buf, area);
+    }
     hits
 }
 
-fn render_header(app: &App, buf: &mut Buffer, area: Rect) {
+/// `lastcall  <repos> · <files> · <hunks>  [Accept All]` … `watching <parents>`. The file
+/// count carries `+` when any listed root's pile stopped at the row cap; the control is
+/// dim when nothing is listed and is the `HeaderAcceptAll` target either way.
+fn render_header(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
     let listed: Vec<&RootView> = app.listed_roots().collect();
     let files: usize = listed.iter().map(|v| v.rows().len()).sum();
     let hunks: usize = listed
@@ -160,9 +166,11 @@ fn render_header(app: &App, buf: &mut Buffer, area: Rect) {
     let left = format!(
         "lastcall  {} · {} · {}",
         plural(listed.len(), "repo"),
-        plural(files, "file"),
+        count_plus(files, app.any_truncated(), "file"),
         plural(hunks, "hunk")
     );
+    let control = "[Accept All]";
+    let control_x = area.x + (left.width() + 2) as u16;
     let parents: BTreeSet<String> = app
         .roots
         .values()
@@ -176,12 +184,39 @@ fn render_header(app: &App, buf: &mut Buffer, area: Rect) {
             parents.into_iter().collect::<Vec<_>>().join(", ")
         )
     };
-    let pad = (area.width as usize).saturating_sub(left.width() + right.width());
-    let mut spans = vec![Span::styled(left, bold())];
+    let used = left.width() + 2 + control.width();
+    let pad = (area.width as usize).saturating_sub(used + right.width());
+    let mut spans = vec![
+        Span::styled(left, bold()),
+        Span::raw("  "),
+        Span::styled(
+            control,
+            if listed.is_empty() {
+                dim()
+            } else {
+                Style::new()
+            },
+        ),
+    ];
     if pad >= 2 {
         spans.push(Span::raw(format!("{}{right}", " ".repeat(pad))));
     }
     buf.set_line(area.x, area.y, &Line::from(spans), area.width);
+    if used <= area.width as usize {
+        hits.targets.push((
+            Rect::new(control_x, area.y, control.width() as u16, 1),
+            Target::HeaderAcceptAll,
+        ));
+    }
+}
+
+/// `plural`, with `+` after the number when the count is a truncated one (`4+ files`).
+fn count_plus(n: usize, plus: bool, noun: &str) -> String {
+    if plus {
+        format!("{n}+ {noun}s")
+    } else {
+        plural(n, noun)
+    }
 }
 
 fn render_status(app: &App, buf: &mut Buffer, area: Rect) {
@@ -195,11 +230,15 @@ fn render_status(app: &App, buf: &mut Buffer, area: Rect) {
     buf.set_line(area.x, area.y, &line, area.width);
 }
 
-/// The hint line from the app's own keymap: `↑↓ select  ⏎ open  n/p hunk  Tab focus  r
-/// refresh  ? help  q quit`; below `NAV_MIN_COLS` the `focus` and `refresh` hints are
-/// dropped so the rest fits.
+/// The hint line from the app's own keymap: `↑↓ select  ⏎ open  n/p hunk  <accept>  ^A
+/// accept all  Tab focus  r refresh  ? help  q quit`, where `<accept>` follows the
+/// selection — `a accept hunk  A accept file` on a file row with diff focus, `a/A accept
+/// file` on a file row otherwise, `a accept group` on a group entry, `a accept all in
+/// <root>` on a root entry (how the per-repo fold is told from the header's global one).
+/// Below `NAV_MIN_COLS`, or when the line would not fit, the `focus` and `refresh` hints
+/// are dropped.
 pub fn hints(app: &App, width: u16) -> String {
-    let first = |action: &str| app.keys_for(action).first().map(|s| key_label(s));
+    let first = |action: &str| app.keys_for(action).first().map(|s| hint_label(s));
     let pair = |a: &str, b: &str| -> Option<String> {
         let (a, b) = (first(a)?, first(b)?);
         if (a.as_str(), b.as_str()) == ("↑", "↓") {
@@ -208,21 +247,67 @@ pub fn hints(app: &App, width: u16) -> String {
             Some(format!("{a}/{b}"))
         }
     };
-    let narrow = width < NAV_MIN_COLS;
+    let accept = first("accept");
+    let accept_file = first("accept_file");
+    let scope = app.accept_scope();
+    let context = match &scope {
+        Some(AcceptScope::Hunk { .. }) => accept.as_ref().map(|k| format!("{k} accept hunk")),
+        Some(AcceptScope::File { .. }) => match (&accept, &accept_file) {
+            (Some(a), Some(f)) => Some(format!("{a}/{f} accept file")),
+            (Some(a), None) => Some(format!("{a} accept file")),
+            (None, Some(f)) => Some(format!("{f} accept file")),
+            (None, None) => None,
+        },
+        Some(AcceptScope::Group { .. }) => accept.as_ref().map(|k| format!("{k} accept group")),
+        Some(AcceptScope::Root(root)) => accept
+            .as_ref()
+            .map(|k| format!("{k} accept all in {}", app.root_name(root))),
+        Some(AcceptScope::All) | None => None,
+    };
+    let file = match &scope {
+        Some(AcceptScope::Hunk { .. }) => accept_file.map(|k| format!("{k} accept file")),
+        _ => None,
+    };
+    // (hint, tier): when the line must shrink, tier 2 goes first (`focus`, `refresh`;
+    // always below `NAV_MIN_COLS`), then tier 1 (the file and global accept hints).
     let items = [
-        (pair("nav_up", "nav_down"), "select"),
-        (first("open"), "open"),
-        (pair("hunk_next", "hunk_prev"), "hunk"),
-        ((!narrow).then(|| first("focus_toggle")).flatten(), "focus"),
-        ((!narrow).then(|| first("refresh")).flatten(), "refresh"),
-        (first("help"), "help"),
-        (first("quit"), "quit"),
+        (pair("nav_up", "nav_down").map(|k| format!("{k} select")), 0),
+        (first("open").map(|k| format!("{k} open")), 0),
+        (
+            pair("hunk_next", "hunk_prev").map(|k| format!("{k} hunk")),
+            0,
+        ),
+        (context, 0),
+        (file, 1),
+        (first("accept_all").map(|k| format!("{k} accept all")), 1),
+        (first("focus_toggle").map(|k| format!("{k} focus")), 2),
+        (first("refresh").map(|k| format!("{k} refresh")), 2),
+        (first("help").map(|k| format!("{k} help")), 0),
+        (first("quit").map(|k| format!("{k} quit")), 0),
     ];
-    items
-        .into_iter()
-        .filter_map(|(key, what)| key.map(|k| format!("{k} {what}")))
-        .collect::<Vec<_>>()
-        .join("  ")
+    let join = |max_tier: u8| -> String {
+        items
+            .iter()
+            .filter(|(_, tier)| *tier <= max_tier)
+            .filter_map(|(hint, _)| hint.clone())
+            .collect::<Vec<_>>()
+            .join("  ")
+    };
+    let fits = |s: &str| s.width() <= width as usize;
+    let full = join(2);
+    if width >= NAV_MIN_COLS && fits(&full) {
+        return full;
+    }
+    let mid = join(1);
+    if fits(&mid) { mid } else { join(0) }
+}
+
+/// `key_label` with control keys as `^X`, the hint line's compact spelling.
+fn hint_label(spec: &str) -> String {
+    match spec.strip_prefix("ctrl-") {
+        Some(rest) => format!("^{}", rest.to_uppercase()),
+        None => key_label(spec),
+    }
 }
 
 // ---- nav ---------------------------------------------------------------------------------
@@ -282,7 +367,7 @@ fn render_nav(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
             line: Line::from(format!(
                 "  {} · {}",
                 view.meta.branch_label(),
-                plural(view.rows().len(), "file")
+                count_plus(view.rows().len(), view.pile.omitted > 0, "file")
             )),
             target: None,
             selected: false,
@@ -427,7 +512,7 @@ fn render_main(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
                     Span::raw(format!(
                         "  {} · {}",
                         view.meta.branch_label(),
-                        plural(view.rows().len(), "file")
+                        count_plus(view.rows().len(), view.pile.omitted > 0, "file")
                     )),
                 ];
                 for label in [view.meta.badge_label(), view.meta.in_progress_label()]
@@ -460,7 +545,15 @@ fn render_main(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
                 .get(root)
                 .and_then(|v| v.row(path).map(|r| (v, r)))
             {
-                lines.push(row_header(row));
+                let mut header = row_header(row);
+                let control = format!("[{} accept file]", control_key(app, "accept_file"));
+                if let Some(x) = right_align(&mut header, &control, area.width, dim()) {
+                    hits.targets.push((
+                        Rect::new(area.x + x, area.y, control.width() as u16, 1),
+                        Target::FileAccept,
+                    ));
+                }
+                lines.push(header);
                 // The row's own `<path>: …` notice is the body of an unreadable row, so the
                 // dimmed list above it carries only the root's other notices.
                 let own = format!("{}: ", row.path_lossy());
@@ -592,18 +685,53 @@ fn render_row_body(
         let hunk = &row.hunks[h];
         let height = super::app::hunk_height(hunk);
         while within < height && y < area.height {
-            let line = hunk_line(hunk, within, h == current);
+            let mut line = hunk_line(hunk, within, h == current);
             let row_rect = Rect::new(area.x, area.y + y, area.width, 1);
-            buf.set_line(area.x, area.y + y, &line, area.width);
             if within == 0 {
                 hits.targets.push((row_rect, Target::DiffHunk(h)));
+                let control = format!("[{} accept]", control_key(app, "accept"));
+                let style = if h == current {
+                    Style::new().add_modifier(Modifier::REVERSED)
+                } else {
+                    dim()
+                };
+                if let Some(x) = right_align(&mut line, &control, area.width, style) {
+                    hits.targets.push((
+                        Rect::new(area.x + x, area.y + y, control.width() as u16, 1),
+                        Target::HunkAccept(h),
+                    ));
+                }
             }
+            buf.set_line(area.x, area.y + y, &line, area.width);
             within += 1;
             y += 1;
         }
         h += 1;
         within = 0;
     }
+}
+
+/// The first key bound to `action`, as a control label (`a`, `A`); `?` when unbound.
+fn control_key(app: &App, action: &str) -> String {
+    app.keys_for(action)
+        .first()
+        .map(|s| key_label(s))
+        .unwrap_or_else(|| "?".to_owned())
+}
+
+/// Append `control` right-aligned on `line` within `width` columns, at least two columns
+/// after the text; returns its x offset, or `None` when it would not fit (then the line
+/// is left as it was).
+fn right_align(line: &mut Line<'static>, control: &str, width: u16, style: Style) -> Option<u16> {
+    let used = line.width();
+    let need = used + 2 + control.width();
+    if need > width as usize {
+        return None;
+    }
+    let x = width as usize - control.width();
+    line.spans.push(Span::raw(" ".repeat(x - used)));
+    line.spans.push(Span::styled(control.to_owned(), style));
+    Some(x as u16)
 }
 
 /// Line `i` of a hunk: 0 is the header (`@@ -a,b +c,d @@`, or `mode a → b` for a mode
@@ -681,18 +809,26 @@ fn key_label(spec: &str) -> String {
     }
 }
 
+fn keys_label(specs: &[impl AsRef<str>]) -> String {
+    specs
+        .iter()
+        .map(|s| key_label(s.as_ref()))
+        .collect::<Vec<_>>()
+        .join(" / ")
+}
+
+/// The keymap's rows, then the modal's fixed keys.
 fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
     let rows: Vec<String> = app
         .keymap
         .iter()
-        .map(|(name, specs)| {
-            let keys = specs
+        .map(|(name, specs)| (name.as_str(), keys_label(specs)))
+        .chain(
+            MODAL_KEYS
                 .iter()
-                .map(|s| key_label(s))
-                .collect::<Vec<_>>()
-                .join(" / ");
-            format!("{keys:<14} {}", Action::describe(name))
-        })
+                .map(|(name, specs)| (*name, keys_label(specs))),
+        )
+        .map(|(name, keys)| format!("{keys:<14} {}", Action::describe(name)))
         .collect();
     let width = (rows.iter().map(|r| r.width()).max().unwrap_or(0) + 4).min(area.width as usize);
     let height = (rows.len() + 4).min(area.height as usize);
@@ -724,6 +860,62 @@ fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
             "any key closes",
             inner.width.saturating_sub(1) as usize,
             dim(),
+        );
+    }
+}
+
+/// The confirm modal (§6.7), centered like the help overlay. Its numbers come from
+/// `App::confirm_counts`, i.e. the held piles as they are at this frame: `Accept all <N>
+/// files in <root>?` (one root) or `across <R> repos?`, then `<g> grouped upstream · <c>
+/// collapsed` only when either is non-zero, then the modal's keys.
+fn render_confirm(app: &App, buf: &mut Buffer, area: Rect) {
+    let Some(counts) = app.confirm_counts() else {
+        return;
+    };
+    let target = match counts.roots.as_slice() {
+        [one] => format!("in {one}"),
+        many => format!("across {}", plural(many.len(), "repo")),
+    };
+    let mut rows = vec![format!(
+        "Accept all {} {target}?",
+        plural(counts.files, "file")
+    )];
+    if counts.grouped > 0 || counts.collapsed > 0 {
+        rows.push(format!(
+            "{} grouped upstream · {} collapsed",
+            counts.grouped, counts.collapsed
+        ));
+    }
+    rows.push(String::new());
+    rows.push(
+        MODAL_KEYS
+            .iter()
+            .map(|(name, specs)| format!("{} {}", keys_label(specs), Action::describe(name)))
+            .collect::<Vec<_>>()
+            .join("    "),
+    );
+    let width = (rows.iter().map(|r| r.width()).max().unwrap_or(0) + 4).min(area.width as usize);
+    let height = (rows.len() + 2).min(area.height as usize);
+    let rect = Rect::new(
+        area.x + (area.width - width as u16) / 2,
+        area.y + (area.height - height as u16) / 2,
+        width as u16,
+        height as u16,
+    );
+    Clear.render(rect, buf);
+    let block = Block::bordered()
+        .title(" accept ")
+        .border_style(focused_border());
+    let inner = block.inner(rect);
+    block.render(rect, buf);
+    for (i, row) in rows.iter().take(inner.height as usize).enumerate() {
+        let style = if i == 0 { bold() } else { Style::new() };
+        buf.set_stringn(
+            inner.x + 1,
+            inner.y + i as u16,
+            row,
+            inner.width.saturating_sub(1) as usize,
+            style,
         );
     }
 }
@@ -813,7 +1005,7 @@ fn modifier_names(m: Modifier) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::app::testfix::*;
+    use super::super::app::{Changed, testfix::*};
     use super::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -859,11 +1051,11 @@ mod tests {
         let mut app = App::new();
         assert_eq!(
             hints(&app, 100),
-            "↑↓ select  ⏎ open  n/p hunk  Tab focus  r refresh  ? help  q quit"
+            "↑↓ select  ⏎ open  n/p hunk  ^A accept all  Tab focus  r refresh  ? help  q quit"
         );
         assert_eq!(
             hints(&app, 60),
-            "↑↓ select  ⏎ open  n/p hunk  ? help  q quit",
+            "↑↓ select  ⏎ open  n/p hunk  ^A accept all  ? help  q quit",
             "narrow drops focus and refresh"
         );
         for (name, specs) in &mut app.keymap {
@@ -875,9 +1067,150 @@ mod tests {
         assert!(frame.contains("? help  x quit"), "{frame}");
         assert!(!frame.contains("q quit"), "{frame}");
         app.help = true;
-        let (frame, _) = frame_of(&app, 80, 24);
+        let (frame, _) = frame_of(&app, 80, 30);
         assert!(frame.contains("x              quit"), "{frame}");
         assert!(!frame.contains("q / Ctrl-C"), "{frame}");
+        assert!(
+            frame.contains("A              accept the whole file"),
+            "{frame}"
+        );
+        assert!(frame.contains("y / ⏎          confirm"), "{frame}");
+        assert!(frame.contains("n / Esc        cancel"), "{frame}");
+    }
+
+    #[test]
+    fn render_hints_follow_the_selection() {
+        let mut app = three_roots();
+        app.select(Some(row("alpha", "f1")));
+        assert_eq!(
+            hints(&app, 100),
+            "↑↓ select  ⏎ open  n/p hunk  a/A accept file  ^A accept all  Tab focus  r refresh  ? help  q quit"
+        );
+        assert_eq!(
+            hints(&app, 90),
+            "↑↓ select  ⏎ open  n/p hunk  a/A accept file  ^A accept all  ? help  q quit",
+            "focus/refresh go when the line would not fit"
+        );
+        assert_eq!(
+            hints(&app, 60),
+            "↑↓ select  ⏎ open  n/p hunk  a/A accept file  ? help  q quit",
+            "then the global accept hint"
+        );
+        app.handle(Action::Open);
+        assert!(
+            hints(&app, 100).contains("n/p hunk  a accept hunk  A accept file  ^A accept all"),
+            "{}",
+            hints(&app, 100)
+        );
+        app.select(Some(Selection::Root(root("alpha"))));
+        assert!(
+            hints(&app, 100).contains("n/p hunk  a accept all in alpha  ^A accept all"),
+            "{}",
+            hints(&app, 100)
+        );
+        app.select(Some(Selection::Group(
+            root("beta"),
+            lastcall_engine::scan::Annotation::Upstream,
+        )));
+        assert!(
+            hints(&app, 100).contains("n/p hunk  a accept group  ^A accept all"),
+            "{}",
+            hints(&app, 100)
+        );
+    }
+
+    #[test]
+    fn render_accept_controls_are_targets() {
+        let mut app = three_roots();
+        app.apply(pile_event("alpha", alpha_two_hunks()));
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Open);
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut hits = HitMap::default();
+        terminal
+            .draw(|f| {
+                hits = render(&app, f);
+            })
+            .unwrap();
+        let frame = terminal.backend().to_string();
+        assert!(frame.contains("  [Accept All]"), "{frame}");
+        assert!(frame.contains("[A accept file]"), "{frame}");
+        assert_eq!(frame.matches("[a accept]").count(), 2, "{frame}");
+        let rect_of = |t: &Target| {
+            hits.targets
+                .iter()
+                .find(|(_, x)| x == t)
+                .map(|(r, _)| *r)
+                .unwrap_or_else(|| panic!("{t:?} on screen"))
+        };
+        let all = rect_of(&Target::HeaderAcceptAll);
+        assert_eq!((all.y, all.width), (0, 12));
+        assert_eq!(hits.at(all.x, 0), Some(&Target::HeaderAcceptAll));
+        let file = rect_of(&Target::FileAccept);
+        assert_eq!(hits.at(file.right() - 1, file.y), Some(&Target::FileAccept));
+        let h1 = rect_of(&Target::HunkAccept(1));
+        assert_eq!(hits.at(h1.x, h1.y), Some(&Target::HunkAccept(1)));
+        assert_eq!(hits.at(h1.x - 3, h1.y), Some(&Target::DiffHunk(1)));
+        assert_eq!(hits.at(file.x - 3, file.y), Some(&Target::DiffBody));
+        // The control label follows the keymap.
+        for (name, specs) in &mut app.keymap {
+            if name == "accept" {
+                *specs = vec!["z".to_owned()];
+            }
+        }
+        let (frame, _) = frame_of(&app, 100, 30);
+        assert!(frame.contains("[z accept]"), "{frame}");
+    }
+
+    #[test]
+    fn render_confirm_modal_shows_live_counts() {
+        let mut app = three_roots();
+        app.apply(pile_event("alpha", rows_n(11, 2, 1)));
+        app.select(Some(Selection::Root(root("alpha"))));
+        assert_eq!(app.handle(Action::Accept), (Changed::Yes, None));
+        let (frame, styles) = frame_of(&app, 100, 30);
+        assert!(frame.contains("Accept all 11 files in alpha?"), "{frame}");
+        assert!(
+            frame.contains("2 grouped upstream · 1 collapsed"),
+            "{frame}"
+        );
+        assert!(frame.contains("y / ⏎ confirm    n / Esc cancel"), "{frame}");
+        assert!(frame.contains(" accept "), "{frame}");
+        assert!(styles.contains("BOLD"), "{styles}");
+        // A pile applied underneath changes the number shown.
+        app.apply(pile_event_seq("alpha", 1, rows_n(12, 0, 0)));
+        let (frame, _) = frame_of(&app, 100, 30);
+        assert!(frame.contains("Accept all 12 files in alpha?"), "{frame}");
+        assert!(!frame.contains("grouped upstream"), "{frame}");
+        // Global scope names the repos.
+        app.handle(Action::Cancel);
+        assert_eq!(app.handle(Action::AcceptAll), (Changed::Yes, None));
+        let (frame, _) = frame_of(&app, 100, 30);
+        assert!(
+            frame.contains("Accept all 15 files across 3 repos?"),
+            "{frame}"
+        );
+    }
+
+    #[test]
+    fn render_truncated_counts_carry_a_plus() {
+        let mut app = three_roots();
+        let mut pile = pile("alpha");
+        pile.omitted = 7;
+        pile.notices
+            .push("2 files shown · 7 more changed paths not scanned".to_owned());
+        app.apply(pile_event("alpha", pile));
+        let (frame, _) = frame_of(&app, 100, 30);
+        assert!(frame.contains("lastcall  3 repos · 5+ files"), "{frame}");
+        assert!(frame.contains("main · 2+ files"), "{frame}");
+        assert!(
+            frame.contains("main · 2 files"),
+            "beta stays plain: {frame}"
+        );
+        app.select(Some(Selection::Root(root("alpha"))));
+        let (frame, _) = frame_of(&app, 100, 30);
+        assert!(frame.contains("alpha  main · 2+ files"), "{frame}");
+        assert!(frame.contains("7 more changed paths"), "{frame}");
     }
 
     #[test]
@@ -918,6 +1251,10 @@ mod tests {
         assert!(frame.contains("watching nothing"), "{frame}");
         assert!(frame.contains("↑↓ select"), "{frame}");
         assert!(styles.contains("0 0..37 Reset Reset BOLD"), "{styles}");
+        assert!(
+            styles.contains("0 39..51 Reset Reset DIM"),
+            "Accept All is dim with nothing listed: {styles}"
+        );
     }
 
     #[test]

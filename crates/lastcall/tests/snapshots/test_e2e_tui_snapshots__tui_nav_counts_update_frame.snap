@@ -2,10 +2,10 @@
 source: crates/lastcall/tests/test_e2e_tui_snapshots.rs
 expression: frame
 ---
-"lastcall  3 repos · 5 files · 5 hunks                                                     watching W"
+"lastcall  3 repos · 5 files · 5 hunks  [Accept All]                                       watching W"
 "┌──────────────────────────┬───────────────────────────────────────────────────────────────────────┐"
-"│alpha                     │f2  M  +2 −0                                                           │"
-"│  main · 2 files          │@@ -1 +1,3 @@                                                          │"
+"│alpha                     │f2  M  +2 −0                                            [A accept file]│"
+"│  main · 2 files          │@@ -1 +1,3 @@                                                [a accept]│"
 "│  M f1  +1 −1             │ b                                                                     │"
 "│  M f2  +2 −0             │+agent edit                                                            │"
 "│──────────────────────────│+second edit                                                           │"
@@ -31,4 +31,4 @@ expression: frame
 "│                          │                                                                       │"
 "│                          │                                                                       │"
 "└──────────────────────────┴───────────────────────────────────────────────────────────────────────┘"
-"↑↓ select  ⏎ open  n/p hunk  Tab focus  r refresh  ? help  q quit                                   "
+"↑↓ select  ⏎ open  n/p hunk  a/A accept file  ^A accept all  Tab focus  r refresh  ? help  q quit   "
