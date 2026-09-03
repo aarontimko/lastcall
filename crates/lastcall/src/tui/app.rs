@@ -762,7 +762,8 @@ impl App {
         let Some(Accepting { scope, files }) = inflight else {
             return changed;
         };
-        self.advance_after(&scope, before);
+        let taken = refusals.is_empty() && errors.is_empty();
+        self.advance_after(&scope, before, taken);
         let accepted: usize = files
             .iter()
             .filter(|(r, _)| ok_roots.contains(r))
@@ -811,9 +812,10 @@ impl App {
     }
 
     /// §6.7 after the piles came back: the selection the accept was asked from is gone →
-    /// [`App::advance`] from it; a hunk accept that left hunks in the row keeps the cursor
-    /// index (clamped) and scrolls to it.
-    fn advance_after(&mut self, scope: &AcceptScope, before: Option<Selection>) {
+    /// [`App::advance`] from it; a hunk accept that was `taken` (no refusal, no error) and
+    /// left hunks in the row keeps the cursor index (clamped) and scrolls to it. A refused
+    /// one moves nothing — the scroll stays where the user had it, not at the hunk header.
+    fn advance_after(&mut self, scope: &AcceptScope, before: Option<Selection>, taken: bool) {
         let Some(before) = before else {
             return;
         };
@@ -826,7 +828,8 @@ impl App {
             self.advance(&root, after.as_deref());
             return;
         }
-        if let AcceptScope::Hunk { root, path, .. } = scope
+        if taken
+            && let AcceptScope::Hunk { root, path, .. } = scope
             && before == Selection::Row(root.clone(), path.clone())
             && self.selection == Some(before)
         {
@@ -1857,6 +1860,48 @@ mod tests {
             "last hunk → next row"
         );
         assert_eq!(app.focus, Focus::Diff, "focus stays");
+    }
+
+    /// A refused hunk accept leaves the diff cursor exactly where it was: the scroll must
+    /// not snap back to the hunk header (`follow_hunk` is for a hunk that was taken).
+    #[test]
+    fn app_refused_hunk_accept_leaves_the_scroll_alone() {
+        use lastcall_engine::ops::{Outcome, Refused};
+        let mut app = three_roots();
+        app.apply(pile_event_seq("alpha", 1, alpha_hunks(3)));
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Open);
+        app.handle(Action::HunkNext);
+        assert_eq!(app.diff.hunk, 1);
+        assert_eq!(app.handle(Action::ScrollDown(2)), (Changed::Yes, None));
+        let scrolled = app.diff;
+        assert_eq!(
+            scrolled.scroll,
+            hunk_offsets(&alpha_hunks(3).rows[0].hunks)[1] + 2,
+            "two lines past the hunk header"
+        );
+        assert!(matches!(
+            app.handle(Action::Accept).1,
+            Some(Effect::Accept(_))
+        ));
+        // The engine refuses (the baseline moved); its rescan holds the same three hunks.
+        app.accepted(vec![(
+            root("alpha"),
+            Ok(Accepted {
+                outcome: Outcome {
+                    refused: vec![Refused::BaselineMoved {
+                        path: b"f1".to_vec(),
+                    }],
+                    ..Outcome::default()
+                },
+                seq: 2,
+                pile: alpha_hunks(3),
+            }),
+        )]);
+        assert!(status(&app).starts_with("f1:"), "{}", status(&app));
+        assert_eq!(app.selection, Some(row("alpha", "f1")));
+        assert_eq!(app.accepting, None);
+        assert_eq!(app.diff, scrolled, "a refused hunk accept moves nothing");
     }
 
     #[test]

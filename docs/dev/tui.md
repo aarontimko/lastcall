@@ -129,7 +129,9 @@ from what the user is looking at:
   `advance(root, path)` picks the next row by path after the accepted one in the root's
   new pile, else the first remaining row of that root, else the first *row* of the next
   listed root, else nothing; a root whose pile emptied is unlisted (the existing rule).
-  Focus stays where it was. A refusal leaves the selection where it was.
+  Focus stays where it was. A refusal (or an error) leaves the selection *and the diff
+  cursor* where they were — the scroll does not snap back to the hunk header
+  (`app_refused_hunk_accept_leaves_the_scroll_alone`).
 - **The confirm modal.** An accept covering more than `CONFIRM_ABOVE` = 10 files asks
   first (10 accepts, 11 asks). `App.confirm` stores only the scope; the numbers shown are
   `confirm_counts()` from the held piles at *every* render, so a pile applied under the
