@@ -18,7 +18,8 @@ child and never falls back to a `herdr` on `PATH`.
 `just test` runs the three in order. **`just test-unit` is the canonical suite**; its count is
 the ratchet floor from Phase 2 on (Phase 1 close: 85 engine + 16 testkit + 0 binary = 101, the
 Phase 2 floor; Phase 2 close: 166 engine + 16 testkit + 0 binary = 182, the Phase 3 floor; Phase 3 close: 168
-engine + 19 testkit + 64 binary lib + 4 binary main = 255, the Phase 4 floor).
+engine + 19 testkit + 64 binary lib + 4 binary main = 255, the Phase 4 floor; Phase 4 engine
+work (4a): 179 engine + 19 testkit + 64 binary lib + 4 binary main = 266).
 The suite never shrinks across commits. One recorded exception: at the Phase 2 code review
 the three filesystem-live watcher tests (up to 30 s waits, real FSEvents) left the unit tier
 for `crates/lastcall-engine/tests/test_integration_watcher.rs` because they contradicted the
@@ -38,6 +39,13 @@ re-executes the test binary as a child role and SIGKILLs it at each fault point
 (`FaultPoint::AfterObjectWrite`, `AfterLedgerTmpWrite`); D4 (case-only rename) and D6 (sparse
 checkout) self-skip with a printed reason when the filesystem or git cannot produce the
 precondition. `just test-integration` runs them too.
+
+`crates/lastcall-engine/tests/test_integration_accept_loop.rs` (Phase 4 kickoff deliverable
+9(a)) drives the whole reviewer loop through `Engine::accept` — the TUI's path — against a
+fixture "agent" that edits three files and commits behind the reviewer: hunk → file →
+accept-all → drop the engine, agent commits the rest, reopen → one more edit shows exactly
+that delta. Every step asserts the override map, then the folded seen tree (entries by oid)
+and `seen_at.head_commit`, which the agent's commits never move.
 
 ## The `status --json` golden
 
@@ -100,6 +108,13 @@ loaded host, report the measured numbers; do not loosen the budget.
 - Transport tests use the socket mock with real time and timeouts ≤ 50 ms.
 - No sleeps longer than 50 ms anywhere in the unit tier. Anything that waits on a real
   filesystem watch or a polling backstop is an integration test.
+- Property tests over real git (`ops::tests::proptests`, Phase 4 kickoff deliverable 8:
+  accept-all-then-edits and hunk/file accept interleavings) run through
+  `proptest::test_runner::TestRunner` so one draft-root fixture per test is shared across
+  cases, with `cases: 32` and `failure_persistence: None` (no `proptest-regressions/`
+  files to commit). Each case reuses the fixture's store and rewrites its file set; at
+  ~13 ms per git spawn on the development machine they take ~9 s and ~14 s, the two
+  slowest unit tests. The pure `hunks` proptest stays at 1000 cases.
 - A test that guards against a hang (`engine_scan_returns_under_a_global_fsmonitor_config`)
   runs the engine on a thread and bounds it with `recv_timeout` (5 s) — the bound is a
   failure, never a wait the passing path takes.
