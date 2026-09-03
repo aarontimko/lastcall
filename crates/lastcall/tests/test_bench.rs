@@ -270,7 +270,7 @@ fn bench_s1_clones_100_rows_4000() {
     pty.wait_for(LONG, |s| s.contents().contains("1 repo · 40 files"))
         .unwrap_or_else(|e| panic!("first pile: {e}"));
     bench(S, "first_pile_ms", t.elapsed().as_millis());
-    pty.wait_for_text("100 repos · 4000 files", LONG)
+    pty.wait_for_text("100 repos · 4,000 files", LONG)
         .unwrap_or_else(|e| panic!("header: {e}"));
     bench(S, "first_frame_ms", t.elapsed().as_millis());
     // Two more `--poll 1` rescans of all 100 roots before the RSS peak is read.
@@ -374,7 +374,7 @@ fn bench_s2_diff_100k_lines() {
 }
 
 /// S3: the TUI up on a clean root, then 1,000 new files as fast as the fixture writes
-/// them; `settle_ms` from the last write returning to the header reading `1000 files`.
+/// them; `settle_ms` from the last write returning to the header reading `1,000 files`.
 /// Twice: `--poll 1` (the 1 s rescan backstop) and default timings (`events`: the
 /// filesystem watcher, whose line is a skip when nothing fires within 25 s).
 #[test]
@@ -396,7 +396,7 @@ fn bench_s3_burst_1000_under_watch() {
             .unwrap_or_else(|e| panic!("watching: {e}"));
         assert!(pty.screen_text().contains("nothing pending across 1 root"));
         let last_write = drop_files(repo.path(), S3_FILES, 100);
-        match pty.wait_for(bound, |s| s.contents().contains("1 repo · 1000 files")) {
+        match pty.wait_for(bound, |s| s.contents().contains("1 repo · 1,000 files")) {
             Ok(_) => {
                 bench(scenario, "files", S3_FILES);
                 bench(scenario, "settle_ms", last_write.elapsed().as_millis());
@@ -447,7 +447,7 @@ fn bench_s4_drop_50000_cutoff() {
         thousands(omitted),
         thousands(cap)
     );
-    pty.wait_for_text(&format!("{cap}+ files"), LONG)
+    pty.wait_for_text(&format!("{}+ files", thousands(cap)), LONG)
         .unwrap_or_else(|e| panic!("capped count: {e}"));
     bench(S, "capped_count_ms", last_write.elapsed().as_millis());
     pty.send(b"j").expect("select the root");

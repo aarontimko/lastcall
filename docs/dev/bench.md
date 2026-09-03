@@ -57,7 +57,7 @@ the 100 roots whose ledgers already exist (discovery, then per root: store open,
 inspection, two `config --get`s, ledger load). `scan_all_ms` is one `Engine::scan_all`
 over the 100 roots. The screen metrics run from spawning `lastcall tui --poll 1` to the
 first root's pile (`1 repo · 40 files`) and to the header showing every root
-(`100 repos · 4000 files`); the RSS peak is read after two further one-second rescans.
+(`100 repos · 4,000 files`); the RSS peak is read after two further one-second rescans.
 
 | metric | value |
 |---|---|
@@ -107,7 +107,7 @@ target candidate, noted here, not acted on.
 
 One first-sighted repo with the TUI showing `nothing pending across 1 root` and the status
 line at `watching …`; then 1,000 files (`d00`–`d09`, 100 per dir) written as fast as the
-harness can. `settle_ms` runs from the last write to `1 repo · 1000 files` in the header.
+harness can. `settle_ms` runs from the last write to `1 repo · 1,000 files` in the header.
 `S3` is `tui --poll 1`; `S3_events` is `tui` with the default timings (debounce 750 ms, the
 30 s rescan backstop), so its number is the watcher's own.
 
@@ -121,7 +121,7 @@ harness can. `settle_ms` runs from the last write to `1 repo · 1000 files` in t
 
 One first-sighted repo under `tui --poll 1`, then 50,000 files (`d00`–`d49`, 1,000 per
 dir) written as fast as the harness can (4.7 s, outside the timed region).
-`capped_count_ms` runs from the last write to `10000+ files` in the header;
+`capped_count_ms` runs from the last write to `10,000+ files` in the header;
 `settle_ms` to the row-cap notice with its final numbers in the root's main view
 (`j` selects the root once it is listed):
 

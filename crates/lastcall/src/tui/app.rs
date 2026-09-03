@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use lastcall_engine::count::with_thousands;
 use lastcall_engine::engine::{AcceptRequest, Accepted, RootState};
 use lastcall_engine::git::Oid;
 use lastcall_engine::headstate::InProgress;
@@ -1244,11 +1245,13 @@ pub fn short(oid: &Oid) -> String {
 }
 
 /// `1 file`, `2 files`.
+/// `1 file`, `2 files`, `1,234 files`: every count on screen goes through the engine's
+/// [`with_thousands`], the same formatter the row-cap notice uses.
 pub fn plural(n: usize, noun: &str) -> String {
     if n == 1 {
         format!("1 {noun}")
     } else {
-        format!("{n} {noun}s")
+        format!("{} {noun}s", with_thousands(n))
     }
 }
 
@@ -1274,7 +1277,7 @@ pub fn refusal_text(refusals: &[String]) -> String {
         [] => String::new(),
         [one] => one.clone(),
         [a, b] => format!("{a} · {b}"),
-        [first, rest @ ..] => format!("{first} (+{} more)", rest.len()),
+        [first, rest @ ..] => format!("{first} (+{} more)", with_thousands(rest.len())),
     }
 }
 

@@ -5,6 +5,7 @@
 //! environment read goes through [`env::Env`], which tests construct explicitly.
 
 pub mod config;
+pub mod count;
 pub mod engine;
 pub mod env;
 pub mod git;

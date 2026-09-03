@@ -10,6 +10,7 @@
 
 use std::collections::BTreeSet;
 
+use lastcall_engine::count::with_thousands;
 use lastcall_engine::hunks::{Hunk, Tag};
 use lastcall_engine::scan::{Change, Collapsed, Rename, Row};
 use ratatui::Frame;
@@ -220,10 +221,11 @@ fn render_header(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
     }
 }
 
-/// `plural`, with `+` after the number when the count is a truncated one (`4+ files`).
+/// `plural`, with `+` after the number when the count is a truncated one (`4+ files`,
+/// `10,000+ files`).
 fn count_plus(n: usize, plus: bool, noun: &str) -> String {
     if plus {
-        format!("{n}+ {noun}s")
+        format!("{}+ {noun}s", with_thousands(n))
     } else {
         plural(n, noun)
     }
@@ -473,8 +475,8 @@ fn nav_row_line(row: &Row, full_paths: bool, width: usize) -> Line<'static> {
         markers.push_str(" ⚑");
     }
     let conflict = if row.conflicted { "  [conflict]" } else { "" };
-    let counts_added = format!("+{}", row.added);
-    let counts_deleted = format!("−{}", row.deleted);
+    let counts_added = format!("+{}", with_thousands(row.added));
+    let counts_deleted = format!("−{}", with_thousands(row.deleted));
     let annotation = row
         .annotation
         .map(|a| format!("  [{}]", annotation_name(a)))
@@ -623,9 +625,9 @@ fn row_header(row: &Row) -> Line<'static> {
     let mut spans = vec![
         Span::styled(row.path_lossy(), bold()),
         Span::raw(format!("  {}  ", letter(row.change))),
-        Span::styled(format!("+{}", row.added), green()),
+        Span::styled(format!("+{}", with_thousands(row.added)), green()),
         Span::raw(" "),
-        Span::styled(format!("−{}", row.deleted), red()),
+        Span::styled(format!("−{}", with_thousands(row.deleted)), red()),
     ];
     if row.conflicted {
         spans.push(Span::raw("  [conflict]"));
@@ -689,7 +691,8 @@ fn render_row_body(
             };
             let text = format!(
                 "collapsed ({kind}) · +{} −{} · expands in a later phase",
-                row.added, row.deleted
+                with_thousands(row.added),
+                with_thousands(row.deleted)
             );
             buf.set_line(area.x, area.y, &single(text, dim()), area.width);
             return;
@@ -1070,6 +1073,38 @@ mod tests {
         assert_eq!(plural(0, "file"), "0 files");
         assert_eq!(plural(1, "file"), "1 file");
         assert_eq!(plural(2, "root"), "2 roots");
+        assert_eq!(plural(1234, "hunk"), "1,234 hunks");
+        assert_eq!(count_plus(10_000, true, "file"), "10,000+ files");
+        assert_eq!(count_plus(4_000, false, "file"), "4,000 files");
+    }
+
+    /// The close-out ruling: every count on screen carries thousands separators — the
+    /// header, the nav branch line (with and without the row-cap `+`), the main-view
+    /// header, and a row's `+a −d`.
+    #[test]
+    fn render_counts_at_a_thousand_carry_separators() {
+        let mut app = three_roots();
+        let mut pile = rows_n(1200, 0, 0);
+        pile.rows[0].added = 100_000;
+        pile.rows[0].deleted = 1_000;
+        app.apply(pile_event("alpha", pile.clone()));
+        let (frame, _) = frame_of(&app, 100, 30);
+        assert!(
+            frame.contains("lastcall  3 repos · 1,203 files · "),
+            "{frame}"
+        );
+        assert!(frame.contains("main · 1,200 files"), "{frame}");
+        assert!(frame.contains("+100,000 −1,000"), "{frame}");
+
+        pile.omitted = 50;
+        app.apply(pile_event_seq("alpha", 1, pile));
+        app.select(Some(Selection::Root(root("alpha"))));
+        let (frame, _) = frame_of(&app, 100, 30);
+        assert!(
+            frame.contains("lastcall  3 repos · 1,203+ files · "),
+            "{frame}"
+        );
+        assert!(frame.contains("alpha  main · 1,200+ files"), "{frame}");
     }
 
     #[test]
