@@ -23,7 +23,8 @@ just probe-tui              # release binary: the interactive TUI over the same 
 just probe-tui-screen       # the PTY harness's transcript of the live-update demo (3 s)
 just bench                  # the performance baseline on the release build (docs/dev/bench.md; ~4 min; not a gate)
 just snapshots-update       # rewrite the TUI snapshots, then prove they pass; read every diff
-just hooks-install          # pre-commit = just lint && just test-unit
+just test-prepush           # what the pre-push hook runs: integration tier + 64-case proptests
+just hooks-install          # pre-commit = just lint && just test-unit; pre-push = just test-prepush
 ```
 
 Probes against the built binary: `just probe-config`, `just probe-hello`, `just probe-status`,

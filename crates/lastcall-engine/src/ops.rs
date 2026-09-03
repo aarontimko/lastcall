@@ -1173,9 +1173,12 @@ mod tests {
             }
         }
 
+        /// 8 cases in the unit tier, `PROPTEST_CASES` (64 from the pre-push hook and CI)
+        /// when set — see `crate::env::proptest_cases`. The pure `hunks` proptest keeps
+        /// its own 1000.
         fn config() -> ProptestConfig {
             ProptestConfig {
-                cases: 32,
+                cases: crate::env::proptest_cases(),
                 failure_persistence: None,
                 ..ProptestConfig::default()
             }

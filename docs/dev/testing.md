@@ -15,8 +15,9 @@ child and never falls back to a `herdr` on `PATH`.
 | integration | `just test-integration` = `cargo test --workspace --test 'test_integration_*'` | real git; the pinned herdr when `LASTCALL_TEST_HERDR_BIN` is set | CI via `just test-integration-herdr`; Linux blocking, macOS best-effort |
 | e2e | `just test-e2e` = `cargo test --workspace --test 'test_e2e_*'` | the TUI: twenty-three `TestBackend` snapshot scenes and seven PTY scenes against the built binary (`docs/dev/tui.md`) | everywhere; the PTY file skips with a visible reason only where no pseudo-terminal can be opened |
 | bench | `just bench` = release build, then `cargo test --release -p lastcall --test test_bench -- --ignored --nocapture --test-threads=1` | the four `#[ignore]`d baseline scenarios (`docs/dev/bench.md`); **not a gate** in Phase 4 — targets are set at the Phase 9 kickoff | by hand, on the machine named in `bench.md` |
+| pre-push | `just test-prepush` = `just test-integration`, then `PROPTEST_CASES=64 cargo test -p lastcall-engine --lib proptests` | the integration tier plus the two store-backed proptests at 64 cases (the unit tier runs them at 8) | the pre-push hook; by hand before a push from a machine without the hook |
 
-`just test` runs the three in order. **`just test-unit` is the canonical suite**; its count is
+`just test` runs the three tiers in order. **`just test-unit` is the canonical suite**; its count is
 the ratchet floor from Phase 2 on (Phase 1 close: 85 engine + 16 testkit + 0 binary = 101, the
 Phase 2 floor; Phase 2 close: 166 engine + 16 testkit + 0 binary = 182, the Phase 3 floor; Phase 3 close: 168
 engine + 19 testkit + 64 binary lib + 4 binary main = 255, the Phase 4 floor; Phase 4 engine
@@ -31,6 +32,17 @@ the three filesystem-live watcher tests (up to 30 s waits, real FSEvents) left t
 for `crates/lastcall-engine/tests/test_integration_watcher.rs` because they contradicted the
 determinism rules below (162 → 159 engine), and the same review added six engine unit tests
 (159 → 165). The pure routing/allowlist watcher tests stay in `watcher.rs`.
+
+## Hooks (`just hooks-install`)
+
+`core.hooksPath` is pointed at the committed `.githooks/`. **pre-commit** runs `just lint`
+and `just test-unit` — exactly the gate's lint and unit commands, so every commit is green
+under both and the unit tier must stay fast (a few seconds in the engine crate). **pre-push**
+runs `just test-prepush`: the integration tier and the store-backed proptests at 64 cases,
+the checks that are too slow for every commit but must be green before anything leaves the
+machine. Both print what they are running and fail the commit or push on the first red step.
+CI runs the same targets (`just lint`, `just test-unit` with `PROPTEST_CASES=64`,
+`just test-integration-herdr`, `just test-e2e`).
 
 ## Scenario suites (`just test-scenarios`)
 
@@ -123,10 +135,16 @@ loaded host, report the measured numbers; do not loosen the budget.
 - Property tests over real git (`ops::tests::proptests`, Phase 4 kickoff deliverable 8:
   accept-all-then-edits and hunk/file accept interleavings) run through
   `proptest::test_runner::TestRunner` so one draft-root fixture per test is shared across
-  cases, with `cases: 32` and `failure_persistence: None` (no `proptest-regressions/`
-  files to commit). Each case reuses the fixture's store and rewrites its file set; at
-  ~13 ms per git spawn on the development machine they take ~9 s and ~14 s, the two
-  slowest unit tests. The pure `hunks` proptest stays at 1000 cases.
+  cases, with `failure_persistence: None` (no `proptest-regressions/` files to commit).
+  The case count is `crate::env::proptest_cases()`: **8 by default** (the unit tier, so
+  the pre-commit hook stays fast) and `PROPTEST_CASES` when set — the pre-push hook and
+  CI export 64. It is read explicitly (and in `env.rs`, the engine's one `std::env`
+  reader) because an explicit `cases:` field in a `ProptestConfig` silently overrides the
+  variable proptest would otherwise honour. Each case reuses the fixture's store and
+  rewrites its file set; at ~13 ms per git spawn on the development machine the two tests
+  take ~2.5 s and ~3.5 s at 8 cases (they were ~9 s and ~14 s at the original 32, the two
+  slowest unit tests by far; the pair is ~28 s at 64). The pure `hunks` proptest stays at
+  1000 cases.
 - A test that guards against a hang (`engine_scan_returns_under_a_global_fsmonitor_config`)
   runs the engine on a thread and bounds it with `recv_timeout` (5 s) — the bound is a
   failure, never a wait the passing path takes.

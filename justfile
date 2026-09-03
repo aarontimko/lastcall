@@ -53,6 +53,19 @@ test-integration:
 test-e2e:
     cargo test --workspace --test 'test_e2e_*'
 
+# What the pre-push hook runs (`just hooks-install`): the integration tier, then the
+# store-backed proptests in ops::tests::proptests at 64 cases — the unit tier runs them
+# at 8 so every commit stays fast. Run it by hand before a push from a machine without
+# the hook. Each step says what it is doing; the first failure stops the push.
+test-prepush:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "--- test-prepush 1/2: just test-integration ---"
+    just test-integration
+    echo "--- test-prepush 2/2: PROPTEST_CASES=64 cargo test -p lastcall-engine --lib proptests ---"
+    PROPTEST_CASES=64 cargo test -p lastcall-engine --lib proptests
+    echo "--- test-prepush: green ---"
+
 # All three tiers, in order.
 # The scenario suites (docs/spec/01-scenarios.md, one test per ID) against real git.
 test-scenarios:
@@ -151,11 +164,12 @@ fixtures-sync:
 # Repo hygiene
 # ---------------------------------------------------------------------------------------
 
-# Enable the committed pre-commit hook (runs `just lint && just test-unit`).
+# Enable the committed hooks: pre-commit runs `just lint && just test-unit`, pre-push
+# runs `just test-prepush` (integration tier + 64-case proptests).
 hooks-install:
-    chmod +x .githooks/pre-commit
+    chmod +x .githooks/pre-commit .githooks/pre-push
     git config core.hooksPath .githooks
-    @echo "hooks installed: core.hooksPath=.githooks"
+    @echo "hooks installed: core.hooksPath=.githooks (pre-commit, pre-push)"
 
 # ---------------------------------------------------------------------------------------
 # Probes and demos (built-artifact passes exercise the release binary)

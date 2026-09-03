@@ -105,6 +105,20 @@ impl Env {
     }
 }
 
+/// How many cases the store-backed proptests in `ops::tests::proptests` run: 8 by default
+/// (the unit tier, every commit), `PROPTEST_CASES` when set (the pre-push hook and CI
+/// export 64). Read here, not in `ops.rs`, because this file is the engine's only
+/// `std::env` reader — and read explicitly, because an explicit `cases:` field in a
+/// `ProptestConfig` overrides the variable proptest would otherwise honour. Test-only:
+/// nothing the engine ships reads it.
+#[cfg(test)]
+pub(crate) fn proptest_cases() -> u32 {
+    std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
