@@ -20,7 +20,9 @@ the ratchet floor from Phase 2 on (Phase 1 close: 85 engine + 16 testkit + 0 bin
 Phase 2 floor; Phase 2 close: 166 engine + 16 testkit + 0 binary = 182, the Phase 3 floor; Phase 3 close: 168
 engine + 19 testkit + 64 binary lib + 4 binary main = 255, the Phase 4 floor; Phase 4 engine
 work (4a): 179 engine + 19 testkit + 64 binary lib + 4 binary main = 266; Phase 4 TUI work
-(4b): 180 engine + 19 testkit + 95 binary lib + 4 binary main = 298).
+(4b): 180 engine + 19 testkit + 95 binary lib + 4 binary main = 298; the rename-pairing fix:
+183 engine = 301; the Phase 4 review fold: 183 engine + 19 testkit + 100 binary lib + 4
+binary main = 306).
 The suite never shrinks across commits. One recorded exception: at the Phase 2 code review
 the three filesystem-live watcher tests (up to 30 s waits, real FSEvents) left the unit tier
 for `crates/lastcall-engine/tests/test_integration_watcher.rs` because they contradicted the
