@@ -191,24 +191,14 @@ impl PtyCommand {
                 }
             })?;
 
-        let rss = Arc::new(RssSampler {
-            peak_kb: AtomicU64::new(0),
-            stop: AtomicBool::new(false),
-        });
+        let rss = Arc::new(RssSampler::new());
         if let (true, Some(pid)) = (self.sample_rss, pid) {
             let sampler = rss.clone();
+            let feed = shared.clone();
             std::thread::Builder::new()
                 .name("lastcall-pty-rss".to_owned())
                 .spawn(move || {
-                    while !sampler.stop.load(Ordering::Relaxed) {
-                        match rss_kb_of(pid) {
-                            Some(kb) => {
-                                sampler.peak_kb.fetch_max(kb, Ordering::Relaxed);
-                            }
-                            None => return, // the child is gone
-                        }
-                        std::thread::sleep(POLL);
-                    }
+                    sample_loop(&sampler, || rss_kb_of(pid), || lock(&feed).eof);
                 })?;
         }
 
@@ -224,10 +214,68 @@ impl PtyCommand {
     }
 }
 
-/// The peak resident set size seen by the sampler thread (`0` until the first sample).
+/// The peak resident set size seen by the sampler thread (`0` until the first sample),
+/// and how the sampling went.
 struct RssSampler {
     peak_kb: AtomicU64,
+    /// Set by the harness once the child's exit was observed (`try_wait`) or on drop:
+    /// the loop's clean end.
     stop: AtomicBool,
+    /// Ticks at which `ps` gave no number while nothing said the child had exited.
+    failed_ticks: AtomicU64,
+    /// The loop gave up ([`RSS_GIVE_UP`] failed ticks in a row) before the child exited:
+    /// the peak is partial.
+    stopped_early: AtomicBool,
+}
+
+impl RssSampler {
+    fn new() -> Self {
+        Self {
+            peak_kb: AtomicU64::new(0),
+            stop: AtomicBool::new(false),
+            failed_ticks: AtomicU64::new(0),
+            stopped_early: AtomicBool::new(false),
+        }
+    }
+}
+
+/// How many failed ticks in a row make [`sample_loop`] give up: about a second of
+/// `ps` giving nothing for a child nobody has seen exit (`ps` missing altogether, say).
+const RSS_GIVE_UP: u32 = 100;
+
+/// The sampler thread's loop over any `sample` (the real one is `rss_kb_of(pid)`) until
+/// `stop` is set or `exited()` holds (the reader's EOF: the child closed the slave).
+/// A tick that yields no number is counted and skipped, never a reason to stop on its own:
+/// `ps` can fail transiently (fork pressure under a 50,000-file drop), and a child that
+/// has exited but is not yet reaped is a zombie `ps` reports as `0`, not an error.
+/// Only [`RSS_GIVE_UP`] failures in a row end the loop early, recorded as `stopped_early`
+/// so a bench can say its peak is partial rather than print a silently frozen number.
+fn sample_loop(
+    sampler: &RssSampler,
+    mut sample: impl FnMut() -> Option<u64>,
+    exited: impl Fn() -> bool,
+) {
+    let mut failures_in_a_row = 0u32;
+    while !sampler.stop.load(Ordering::Relaxed) && !exited() {
+        match sample() {
+            Some(kb) => {
+                sampler.peak_kb.fetch_max(kb, Ordering::Relaxed);
+                failures_in_a_row = 0;
+            }
+            None => {
+                if sampler.stop.load(Ordering::Relaxed) || exited() {
+                    return; // reaped between the check and the sample: not a failure
+                }
+                sampler.failed_ticks.fetch_add(1, Ordering::Relaxed);
+                failures_in_a_row += 1;
+                if failures_in_a_row >= RSS_GIVE_UP {
+                    sampler.stopped_early.store(true, Ordering::Relaxed);
+                    return;
+                }
+            }
+        }
+        std::thread::sleep(POLL);
+    }
 }
 
 /// `ps -o rss= -p <pid>`: the process's resident set in KiB; `None` once the process is
@@ -286,6 +334,24 @@ impl PtyTui {
         }
     }
 
+    /// True when the sampler gave up before the child's exit was seen ([`RSS_GIVE_UP`]
+    /// failed `ps` ticks in a row): [`peak_rss_kb`](Self::peak_rss_kb) covers only part
+    /// of the child's life, and a bench must say so.
+    pub fn rss_sampler_stopped_early(&self) -> bool {
+        self.rss.stopped_early.load(Ordering::Relaxed)
+    }
+
+    /// How many ticks `ps` gave no number for the child while it was still running (each
+    /// skipped, none fatal on its own).
+    pub fn rss_failed_ticks(&self) -> u64 {
+        self.rss.failed_ticks.load(Ordering::Relaxed)
+    }
+
+    /// The child's exit was observed: the sampler's clean end.
+    fn exit_seen(&self) {
+        self.rss.stop.store(true, Ordering::Relaxed);
+    }
+
     /// Look at the parsed screen.
     pub fn screen<R>(&self, f: impl FnOnce(&vt100::Screen) -> R) -> R {
         f(lock(&self.shared).parser.screen())
@@ -337,6 +403,7 @@ impl PtyTui {
                 return Ok(start.elapsed());
             }
             if let Ok(Some(status)) = self.child.try_wait() {
+                self.exit_seen();
                 // One last look: the final bytes may land after the exit is observed.
                 std::thread::sleep(POLL);
                 if self.screen(&mut pred) {
@@ -406,6 +473,7 @@ impl PtyTui {
         let start = Instant::now();
         loop {
             if let Some(status) = self.child.try_wait()? {
+                self.exit_seen();
                 return Ok(status);
             }
             if start.elapsed() >= timeout {
@@ -515,6 +583,91 @@ mod tests {
         assert_eq!(parse_rss(""), None, "no such process: empty output");
         assert_eq!(parse_rss("  RSS\n 12\n"), None, "a header is not a sample");
         assert_eq!(rss_kb_of(0), None, "pid 0 is never one of ours");
+    }
+
+    /// A failed `ps` tick is skipped, not the end of sampling: the peak keeps moving
+    /// after it, the failure is counted, and only a run of [`RSS_GIVE_UP`] failures
+    /// stops the loop early (and says so).
+    #[test]
+    fn pty_tui_rss_sampler_skips_a_failed_tick_and_keeps_going() {
+        assert_eq!(rss_kb_of(u32::MAX), None, "a bogus pid is a failed tick");
+
+        let sampler = RssSampler::new();
+        let ticks = [None, Some(100), None, None, Some(300), Some(200)];
+        let mut i = 0;
+        sample_loop(
+            &sampler,
+            || {
+                let tick = ticks[i];
+                i += 1;
+                if i == ticks.len() {
+                    sampler.stop.store(true, Ordering::Relaxed); // the harness saw the exit
+                }
+                tick
+            },
+            || false,
+        );
+        assert_eq!(i, ticks.len(), "every tick was taken");
+        assert_eq!(
+            sampler.peak_kb.load(Ordering::Relaxed),
+            300,
+            "the peak moved past the failed ticks"
+        );
+        assert_eq!(sampler.failed_ticks.load(Ordering::Relaxed), 3);
+        assert!(!sampler.stopped_early.load(Ordering::Relaxed));
+
+        let exited = RssSampler::new();
+        sample_loop(&exited, || None, || true);
+        assert_eq!(
+            exited.failed_ticks.load(Ordering::Relaxed),
+            0,
+            "the child is gone (EOF): nothing to sample, nothing failed"
+        );
+        assert!(!exited.stopped_early.load(Ordering::Relaxed));
+
+        let gave_up = RssSampler::new();
+        let mut asked = 0u32;
+        sample_loop(
+            &gave_up,
+            || {
+                asked += 1;
+                None
+            },
+            || false,
+        );
+        assert_eq!(
+            asked, RSS_GIVE_UP,
+            "gives up after RSS_GIVE_UP failures in a row"
+        );
+        assert!(gave_up.stopped_early.load(Ordering::Relaxed));
+        assert_eq!(gave_up.peak_kb.load(Ordering::Relaxed), 0);
+    }
+
+    /// The real sampler over a live child that exits on its own: the peak is a live
+    /// process's, the exit observed by `wait_exit` ends the loop cleanly (the zombie
+    /// between exit and reap is a `0` sample, not a failure), nothing stopped early.
+    #[test]
+    fn pty_tui_rss_sampler_runs_to_the_childs_exit() {
+        let spawned = PtyCommand::new(SH)
+            .arg("-c")
+            .arg("echo ready; sleep 0.3")
+            .size(40, 5)
+            .sample_rss()
+            .spawn();
+        let mut pty = match spawned {
+            Ok(p) => p,
+            Err(e) if skip_if_no_pty(&e) => return,
+            Err(e) => panic!("spawn: {e}"),
+        };
+        pty.wait_for_text("ready", Duration::from_secs(5))
+            .expect("the shell is up");
+        let status = pty.wait_exit(Duration::from_secs(5)).expect("exits");
+        assert_eq!(status.exit_code(), 0);
+        assert!(pty.rss.stop.load(Ordering::Relaxed), "the exit was seen");
+        let peak = pty.peak_rss_kb().expect("sampled while it lived");
+        assert!(peak > 0, "{peak} KiB");
+        assert!(!pty.rss_sampler_stopped_early());
+        assert_eq!(pty.rss_failed_ticks(), 0, "no tick failed on a live child");
     }
 
     #[test]

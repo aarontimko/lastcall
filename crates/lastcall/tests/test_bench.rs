@@ -167,7 +167,15 @@ fn quit(pty: &mut PtyTui) {
     assert_eq!(status.exit_code(), 0, "{status:?}");
 }
 
+/// `peak_rss_kb`, with a visible note when the harness's sampler gave up before the
+/// child exited (the number is then a partial peak, not a frozen one presented as whole).
 fn rss(scenario: &str, pty: &PtyTui) {
+    if pty.rss_sampler_stopped_early() {
+        note(&format!(
+            "--- {scenario} peak_rss_kb is PARTIAL: the rss sampler stopped before the child exited ({} failed ps ticks)",
+            pty.rss_failed_ticks()
+        ));
+    }
     bench(
         scenario,
         "peak_rss_kb",
