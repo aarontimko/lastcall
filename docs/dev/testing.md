@@ -24,7 +24,8 @@ work (4a): 179 engine + 19 testkit + 64 binary lib + 4 binary main = 266; Phase 
 (4b): 180 engine + 19 testkit + 95 binary lib + 4 binary main = 298; the rename-pairing fix:
 183 engine = 301; the Phase 4 review fold: 183 engine + 19 testkit + 100 binary lib + 4
 binary main = 306; Phase 4 e2e + bench work (4c): 184 engine + 21 testkit + 100 binary lib
-+ 4 binary main = 309, the Phase 5 floor).
++ 4 binary main = 309; the Phase 4 close-out review fold (the rss sampler tests): 184
+engine + 23 testkit + 100 binary lib + 4 binary main = 311, the Phase 5 floor).
 The suite never shrinks across commits. One recorded exception: at the Phase 2 code review
 the three filesystem-live watcher tests (up to 30 s waits, real FSEvents) left the unit tier
 for `crates/lastcall-engine/tests/test_integration_watcher.rs` because they contradicted the
