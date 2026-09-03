@@ -284,6 +284,8 @@ probe-tui:
     echo "export LASTCALL_CONFIG=$LASTCALL_CONFIG"
     echo "export LASTCALL_STATE_DIR=$LASTCALL_STATE_DIR"
     echo "--- (cd $dir/parent) lastcall tui --poll 1   [q quits; edit under $dir/parent from another shell] ---"
+    echo "--- accept keys work: a = hunk (or file/group/repo), A = file, ctrl-a = everything (y confirms above 10 files);"
+    echo "--- a relaunch with the same two exports shows what is still pending ---"
     (cd "$dir/parent" && "$OLDPWD/target/release/lastcall" tui --poll 1)
     echo "--- fixture left at $dir (rm -rf $dir when done) ---"
 
@@ -298,3 +300,15 @@ probe-tui-screen:
     cargo build --release -p lastcall
     LASTCALL_PROBE_BIN="$PWD/target/release/lastcall" \
         cargo test -p lastcall --test test_e2e_tui_pty probe_tui_screen -- --ignored --nocapture
+
+# The performance baseline (docs/dev/bench.md; not a gate): the four scenarios of
+# crates/lastcall/tests/test_bench.rs — 100 clones / 4,000 rows, one 100,000-line diff, a
+# 1,000-file burst under watch, a 50,000-file drop against the row cap — on the RELEASE
+# build only, one `BENCH <scenario> <metric>=<value>` stderr line per metric. Fixtures are
+# built outside the timed regions under temp dirs the test removes; about four minutes.
+bench:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --release -p lastcall
+    cargo test --release -p lastcall --test test_bench -- --ignored --nocapture --test-threads=1
+    echo "--- bench done: paste the BENCH lines above into docs/dev/bench.md with the machine block, date and commit ---" >&2
