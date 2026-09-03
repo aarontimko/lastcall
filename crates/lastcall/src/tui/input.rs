@@ -101,7 +101,8 @@ pub const MODAL_KEYS: &[(&str, &[&str])] =
     &[("confirm", &["y", "enter"]), ("cancel", &["n", "esc"])];
 
 /// The modal action for a key while the confirm is open: `Confirm`, `Cancel`, or nothing
-/// (every other key is swallowed, like the help overlay swallows keys).
+/// (the loop then lets only the keymap's `quit` keys through and swallows every other
+/// key, like the help overlay does).
 pub fn modal_action(key: Key) -> Option<Action> {
     for (name, specs) in MODAL_KEYS {
         if specs.iter().any(|s| Key::parse(s).ok() == Some(key)) {

@@ -316,8 +316,9 @@ pub struct App {
     pub seq: BTreeMap<PathBuf, u64>,
     /// The accept the loop is running, if any; a second one is refused meanwhile.
     pub accepting: Option<Accepting>,
-    /// The confirm modal, if open: every action but `Tick`/`Resize`/`Confirm`/`Cancel` is
-    /// ignored while it is.
+    /// The confirm modal, if open: every action but `Tick`/`Resize`/`Confirm`/`Cancel`/
+    /// `Quit` is ignored while it is (`Quit` passes as it does through the help overlay:
+    /// `q` and ctrl-c quit by default, everywhere).
     pub confirm: Option<Confirm>,
     /// The effective key bindings, `(action name, key specs)` in `DEFAULT_KEYMAP` order.
     /// Seeded from the defaults; worker 3b replaces it after `Keymap::from_config` so the
@@ -999,7 +1000,8 @@ impl App {
     /// Fold one user action in.
     pub fn handle(&mut self, action: Action) -> (Changed, Option<Effect>) {
         use Action::*;
-        if self.confirm.is_some() && !matches!(action, Tick | Resize(..) | Confirm | Cancel) {
+        if self.confirm.is_some() && !matches!(action, Tick | Resize(..) | Confirm | Cancel | Quit)
+        {
             return (Changed::No, None);
         }
         if self.help
@@ -1788,7 +1790,7 @@ mod tests {
             Action::AcceptAll,
             Action::Refresh,
             Action::Help,
-            Action::Quit,
+            Action::Back,
         ] {
             assert_eq!(
                 app.handle(action),
@@ -1801,6 +1803,13 @@ mod tests {
             (Changed::No, None),
             "clicks are ignored too"
         );
+        // Quit passes through, as it does through the help overlay; the modal stays.
+        assert_eq!(
+            app.handle(Action::Quit),
+            (Changed::No, Some(Effect::Quit)),
+            "q / ctrl-c quit from inside the modal"
+        );
+        assert!(app.confirm.is_some());
         assert_eq!(app.handle(Action::Resize(120, 40)).0, Changed::Yes);
         app.handle(Action::Resize(80, 24));
         assert_eq!(app.handle(Action::Tick).0, Changed::No);

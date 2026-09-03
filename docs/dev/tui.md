@@ -57,7 +57,9 @@ gate greps at the end of this page are how that is enforced).
   click resolved through the hit map and assert the same `App` (and, for the accepts, the
   same `Effect`). The confirm modal's keys (`input::MODAL_KEYS`: `y`/`enter` confirm,
   `n`/`esc` cancel) are not in the keymap: `Ui::event` resolves them through `modal_action`
-  before the keymap while the modal is open, and swallows every other key.
+  before the keymap while the modal is open, lets only the keymap's `quit` keys through
+  after that (`q` and ctrl-c quit everywhere, as through the help overlay), and swallows
+  every other key.
 - **`run.rs` — the loop.** One tokio `select!` over the watcher's events, the terminal
   reader thread's events, the loop's own finished engine work (`Local`), a 1 s tick, Ctrl-C
   (a key event under raw mode; the signal branch is for `kill -INT`) and SIGTERM. Every
@@ -133,8 +135,9 @@ from what the user is looking at:
   `confirm_counts()` from the held piles at *every* render, so a pile applied under the
   open modal changes them and `Confirm` folds exactly what is shown (if the scope empties
   underneath, the modal closes with `nothing to accept`). While the modal is open every
-  action but `Tick`, `Resize`, `Confirm`, `Cancel` is ignored, and every key but its own is
-  swallowed before the keymap — so `Esc` cancels without also going back.
+  action but `Tick`, `Resize`, `Confirm`, `Cancel`, `Quit` is ignored, and every key but
+  its own and the `quit` keys is swallowed before the keymap — so `Esc` cancels without
+  also going back, and `q` / ctrl-c still quit (the modal is never a trap).
 - **The seq rule (the §11 hardening).** `App.seq` remembers the last scan seq applied per
   root; a `Pile` event with a lower seq — a watcher scan that was already running when the
   accept took the lock — is `Changed::No` and touches nothing, through either channel
@@ -169,8 +172,9 @@ Defaults (`input::DEFAULT_KEYMAP`, in help-overlay order):
 | `quit` | `q` `ctrl-c` | exit 0 | |
 | `scroll_up` / `scroll_down` | *(unbound)* | bindable one-line diff scrolls | |
 
-The confirm modal answers only `y` / `enter` (confirm) and `n` / `esc` (cancel); these are
-fixed (`input::MODAL_KEYS`), not `[keys]` names, and the help overlay lists them last.
+The confirm modal answers `y` / `enter` (confirm) and `n` / `esc` (cancel) — fixed
+(`input::MODAL_KEYS`), not `[keys]` names, listed last in the help overlay — plus the
+`quit` keys, which quit from inside it; nothing else.
 
 Mouse: a left press on a nav entry selects it; on a hunk header it selects that hunk; on a
 hunk header's `[a accept]` it accepts that hunk, on the main view's `[A accept file]` the

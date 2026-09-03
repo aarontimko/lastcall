@@ -92,14 +92,19 @@ impl Ui {
     /// selection when the pointer is over the nav and scrolls the diff otherwise; a resize
     /// invalidates the hit map before the app sees it.
     pub fn event(&mut self, event: &Event) -> (Changed, Option<Effect>) {
-        // The confirm modal answers only to its own keys (`y`/`Enter`, `n`/`Esc`), consulted
-        // before the keymap and swallowing every other key, as the help overlay does.
+        // The confirm modal answers to its own keys (`y`/`Enter`, `n`/`Esc`), consulted
+        // before the keymap, and to the keymap's `quit` keys (`q` and ctrl-c quit by
+        // default, everywhere — the help overlay lets `Quit` through the same way); every
+        // other key is swallowed. `Esc` is the modal's cancel first, so it never quits.
         if self.app.confirm.is_some()
             && let Event::Key(k) = event
         {
             return match Key::of(k).and_then(modal_action) {
                 Some(action) => self.app.handle(action),
-                None => (Changed::No, None),
+                None => match to_action(event, &self.keymap) {
+                    Some(Action::Quit) => self.app.handle(Action::Quit),
+                    _ => (Changed::No, None),
+                },
             };
         }
         let Some(action) = to_action(event, &self.keymap) else {
@@ -781,6 +786,56 @@ mod tests {
             ui.event(&key(KeyCode::Char('r'))),
             (Changed::Yes, Some(Effect::Refresh))
         );
+    }
+
+    /// Inside the confirm modal `q` and ctrl-c still quit (the Phase 3 ruling: they quit
+    /// by default, everywhere), `Esc` only cancels, and every other key is swallowed.
+    #[test]
+    fn run_quit_keys_quit_from_inside_the_modal_and_esc_only_cancels() {
+        let mut ui = ui();
+        ui.app.apply(pile_event("alpha", rows_n(11, 0, 0)));
+        ui.event(&key(KeyCode::Char('a')));
+        assert_eq!(ui.app.selection, None, "`a` with nothing selected: nothing");
+        assert_eq!(
+            ui.event(&Event::Key(KeyEvent::new(
+                KeyCode::Char('a'),
+                KeyModifiers::CONTROL
+            ))),
+            (Changed::Yes, None)
+        );
+        assert!(ui.app.confirm.is_some(), "11 files ask first");
+        let open = ui.app.clone();
+        for ev in [
+            key(KeyCode::Char('j')),
+            key(KeyCode::Char('a')),
+            key(KeyCode::Char('?')),
+            key(KeyCode::Char('r')),
+            key(KeyCode::Char('h')),
+        ] {
+            assert_eq!(ui.event(&ev), (Changed::No, None), "{ev:?} swallowed");
+            assert_eq!(ui.app, open);
+        }
+        assert_eq!(
+            ui.event(&key(KeyCode::Char('q'))),
+            (Changed::No, Some(Effect::Quit)),
+            "q quits from inside the modal"
+        );
+        assert_eq!(
+            ui.event(&Event::Key(KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL
+            ))),
+            (Changed::No, Some(Effect::Quit)),
+            "ctrl-c quits from inside the modal"
+        );
+        assert_eq!(ui.app, open, "asking to quit changes nothing");
+        assert_eq!(
+            ui.event(&key(KeyCode::Esc)),
+            (Changed::Yes, None),
+            "Esc cancels, never quits"
+        );
+        assert!(ui.app.confirm.is_none());
+        assert!(ui.app.accepting.is_none());
     }
 
     #[test]
