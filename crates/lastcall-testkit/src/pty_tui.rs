@@ -62,11 +62,12 @@ impl PtyCommand {
         }
     }
 
-    /// Sample the child's resident set size at every [`POLL`] tick for the life of the
-    /// child (the Phase 4 bench's `peak_rss_kb`): a sampler thread runs
-    /// `ps -o rss= -p <pid>` — KiB on macOS and Linux alike — and keeps the maximum, read
-    /// with [`PtyTui::peak_rss_kb`]. Off by default: a `ps` per tick is a subprocess per
-    /// 10 ms, which the timing scenes must not pay. Not `getrusage`: the testkit's `nix`
+    /// Sample the child's resident set size for the life of the child (the Phase 4
+    /// bench's `peak_rss_kb`): a sampler thread runs `ps -o rss= -p <pid>` — KiB on macOS
+    /// and Linux alike — sleeps [`POLL`], and repeats, keeping the maximum, read with
+    /// [`PtyTui::peak_rss_kb`]. The period is therefore ≈10 ms plus one `ps` (a few ms),
+    /// not a strict tick. Off by default: that is a subprocess every ≈12 ms, which the
+    /// timing scenes must not pay. Not `getrusage`: the testkit's `nix`
     /// has no `resource` feature, `ru_maxrss` differs in unit between the two OSes, and
     /// `RUSAGE_CHILDREN` reports the largest of every waited-for descendant, git included.
     pub fn sample_rss(mut self) -> Self {

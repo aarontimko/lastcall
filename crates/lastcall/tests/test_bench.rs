@@ -17,8 +17,9 @@
 //! come from an `Engine` over the same state dir the binary then runs on. Screen metrics
 //! come from the built binary (`env!("CARGO_BIN_EXE_lastcall")`, the release one under
 //! `just bench`) in the PTY harness with `PtyCommand::sample_rss`: `peak_rss_kb` is the
-//! child's resident set as `ps -o rss= -p <pid>` reports it, sampled at every `POLL` tick
-//! (10 ms) over the scene, which is also the granularity of every screen `*_ms` value.
+//! child's resident set as `ps -o rss= -p <pid>` reports it, sampled over the scene with a
+//! `POLL` (10 ms) sleep between samples — a period of ≈10 ms plus one `ps` — while the
+//! screen is read every `POLL`, the granularity of every screen `*_ms` value.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};

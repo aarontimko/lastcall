@@ -22,8 +22,12 @@ lines, copied. A debug build prints a SKIP line and measures nothing.
 - Screen metrics come from the built binary in the testkit's PTY harness (100×30). Every
   screen `*_ms` value has the harness's `POLL` granularity: the screen is read every 10 ms,
   so a value is "the first 10 ms tick at which the text was on screen".
-- `peak_rss_kb` is the binary's resident set as `ps -o rss= -p <pid>` reports it, sampled at
-  every `POLL` tick from spawn to exit, maximum kept. No `getrusage`; no new dependency.
+- `peak_rss_kb` is the binary's resident set as `ps -o rss= -p <pid>` reports it, sampled
+  by a harness thread from spawn to exit, maximum kept. The sampler sleeps `POLL` between
+  samples, so its period is ≈10 ms plus one `ps` (about 2.5 ms on this machine), not a
+  strict 10 ms tick. A `ps` that gives no number is skipped, not fatal; a sampler that gave
+  up before the child exited prints a `PARTIAL` note next to the number. No `getrusage`; no
+  new dependency.
 - The TUI runs with `--poll 1` in S1, S2 and S4 (and in S3's first half), so head polling
   and the full rescan both tick every second; the `S3_events` half runs with the defaults
   (debounce 750 ms, head poll 10 s, rescan 30 s) so that the number is the watcher's, not
@@ -140,12 +144,21 @@ The in-process `scan_ms` is one `Engine::scan` of the same root after the TUI ha
 `rows_shown == DEFAULT_ROW_CAP` and `omitted == 50,000 − cap` are asserted by the
 harness, not just printed.
 
-## Variance (run B)
+## Variance (run B, and a third run)
 
-Run B, same machine, started right after run A: every `*_ms` value within 1 % of run A
-except S3 `settle_ms` (1595 vs 1553, +2.7 %) and the ≤ 15 ms screen metrics (S2 `open_ms`
-15 vs 12, i.e. inside the 10 ms `POLL` granularity); `peak_rss_kb` within 6 % (S2 52848 vs
-56224, S4 83360 vs 88448); every spawn, row and file count identical.
+Run B, same machine, started right after run A. The bounds, from A/B and the third run
+below: metrics of 100 ms and more agree to ≈2 % (S1 `open_ms` / `scan_all_ms` /
+`first_frame_ms`, S2 `scan_ms`, S3 `settle_ms`, S4 `settle_ms` / `scan_ms`; the widest
+A/B spread is S3 `settle_ms`, 1595 vs 1553, +2.7 %); the sub-20 ms screen metrics (S2
+`open_ms`, `hunk_next_ms`, `page_down_ms`) are quantised to the 10 ms `POLL` tick, so 12 vs
+15 ms is one tick, not a change; `peak_rss_kb` moves by up to ±15 % (S2 52848 vs 56224
+between A and B, 12.8 % on the third run); every spawn, row and file count is identical.
+
+The baseline is a two-run A/B. A third, independent run (the verifier's; same machine,
+same commit) reproduced every count bit-identically and every headline number within
+those bounds: S1 `open_ms` 32368 / `scan_all_ms` 25177 / `first_frame_ms` 55584; S2
+`scan_ms` 268; S3 `settle_ms` 1575; S4 `scan_ms` 1662, `settle_ms` 5444, `rows_shown`
+10000, `omitted` 40000.
 
 Run B's raw lines:
 
