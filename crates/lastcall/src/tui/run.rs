@@ -533,6 +533,80 @@ mod tests {
         Ui::new(app, Keymap::defaults())
     }
 
+    fn frame_of(ui: &Ui) -> String {
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| {
+            render(&ui.app, f);
+        })
+        .unwrap();
+        term.backend().to_string()
+    }
+
+    /// The §11 hardening, at the loop's level: a watcher pile carrying a seq below the one
+    /// the accept applied — a scan that was already running when the accept took the lock
+    /// — reaches the app through either channel and leaves it, and the frame, untouched;
+    /// the next newer pile is applied as usual.
+    #[test]
+    fn run_stale_watcher_pile_after_accept_is_dropped() {
+        let mut ui = ui();
+        assert_eq!(
+            ui.local(Local::Pile(root("alpha"), 3, alpha_two_hunks())),
+            (Changed::Yes, None)
+        );
+        ui.app.select(Some(row("alpha", "f1")));
+        // Nav focus: `a` is accept-file.
+        let (_, effect) = ui.event(&key(KeyCode::Char('a')));
+        assert!(matches!(effect, Some(Effect::Accept(_))), "{effect:?}");
+        assert!(ui.app.accepting.is_some());
+        // The accept's own rescan comes back at seq 5 with `f1` gone.
+        let after_accept = without(pile("alpha"), &["f1"]);
+        assert_eq!(
+            ui.local(Local::Accepted(vec![accepted_ok(
+                "alpha",
+                5,
+                after_accept.clone()
+            )])),
+            (Changed::Yes, None)
+        );
+        assert!(ui.app.accepting.is_none());
+        assert_eq!(ui.app.selection, Some(row("alpha", "f2")), "advanced");
+        let before = ui.app.clone();
+        let frame = frame_of(&ui);
+        assert!(frame.contains("accepted f1"), "{frame}");
+
+        // The pre-accept scan lands late, through the refresh channel …
+        assert_eq!(
+            ui.local(Local::Pile(root("alpha"), 4, alpha_two_hunks())),
+            (Changed::No, None)
+        );
+        assert_eq!(ui.app, before);
+        assert_eq!(frame_of(&ui), frame);
+        // … and through the watcher's.
+        assert_eq!(
+            ui.engine(EngineEvent::Pile {
+                root: root("alpha"),
+                seq: 4,
+                pile: alpha_two_hunks(),
+            }),
+            (Changed::No, None)
+        );
+        assert_eq!(ui.app, before);
+        assert_eq!(frame_of(&ui), frame);
+        assert_eq!(ui.app.seq[&root("alpha")], 5);
+
+        // A newer scan is applied as ever.
+        assert_eq!(
+            ui.engine(EngineEvent::Pile {
+                root: root("alpha"),
+                seq: 6,
+                pile: alpha_two_hunks(),
+            }),
+            (Changed::Yes, None)
+        );
+        assert_eq!(ui.app.roots[&root("alpha")].rows().len(), 2);
+        assert_eq!(ui.app.seq[&root("alpha")], 6);
+    }
+
     #[test]
     fn run_fatal_local_quits_and_a_dead_engine_task_becomes_fatal() {
         let mut ui = ui();

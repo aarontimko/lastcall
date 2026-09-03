@@ -521,8 +521,9 @@ pub fn pointer(event: &Event) -> Option<(u16, u16)> {
 mod tests {
     use super::*;
     use crate::tui::app::testfix::*;
-    use crate::tui::app::{App, Selection, Target};
+    use crate::tui::app::{App, Changed, Effect, Selection, Target};
     use crate::tui::render::{HitMap, render};
+    use lastcall_engine::engine::AcceptRequest;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -565,14 +566,19 @@ mod tests {
     }
 
     /// Feed a key through the same path the loop uses: `to_action` then `App::handle`.
-    fn press_key(app: &mut App, keymap: &Keymap, event: Event) {
+    fn press_key(app: &mut App, keymap: &Keymap, event: Event) -> (Changed, Option<Effect>) {
         let action = to_action(&event, keymap).expect("bound");
-        app.handle(action);
+        app.handle(action)
     }
 
     /// Click the rendered `target` through the loop's path: a left-button `Down` becomes
     /// `Press(x, y)`, resolved against the hit map, then `App::hit`.
-    fn click(app: &mut App, keymap: &Keymap, hits: &HitMap, target: &Target) {
+    fn click(
+        app: &mut App,
+        keymap: &Keymap,
+        hits: &HitMap,
+        target: &Target,
+    ) -> (Changed, Option<Effect>) {
         let (rect, _) = hits
             .targets
             .iter()
@@ -591,7 +597,7 @@ mod tests {
             .expect("the press lands on the target")
             .clone();
         assert_eq!(&hit, target);
-        app.hit(hit);
+        app.hit(hit)
     }
 
     // ---- keymap ----------------------------------------------------------------------
@@ -1224,5 +1230,109 @@ mod tests {
         assert_eq!(to_action(&key('x'), &km), Some(Action::Accept));
         assert_eq!(to_action(&key('a'), &km), None);
         assert_eq!(to_action(&key('X'), &km), Some(Action::AcceptAll));
+    }
+
+    // ---- accept parity (kickoff deliverable 7) ----------------------------------------
+
+    /// `n`, `n`, `a` vs a click on hunk 2's `[a accept]`: equal apps, equal effects, and
+    /// the effect is one `AcceptRequest::Hunk` for index 2 of 3.
+    #[test]
+    fn input_parity_accept_hunk() {
+        let km = Keymap::defaults();
+        let mut base = three_roots();
+        base.handle(Action::Resize(100, 30));
+        base.apply(pile_event("alpha", alpha_hunks(3)));
+        base.select(Some(row("alpha", "f1")));
+        base.handle(Action::Open);
+        let (_, hits) = frame(&base);
+        let mut by_key = base.clone();
+        let mut by_mouse = base;
+
+        press_key(&mut by_key, &km, key('n'));
+        press_key(&mut by_key, &km, key('n'));
+        assert_eq!(by_key.diff.hunk, 2);
+        let by_key_effect = press_key(&mut by_key, &km, key('a'));
+        let by_mouse_effect = click(&mut by_mouse, &km, &hits, &Target::HunkAccept(2));
+
+        assert_eq!(by_key, by_mouse);
+        assert_eq!(by_key_effect, by_mouse_effect);
+        assert_eq!(frame(&by_key).0, frame(&by_mouse).0);
+        let Some(Effect::Accept(reqs)) = by_key_effect.1 else {
+            panic!("an accept effect: {by_key_effect:?}");
+        };
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].0, root("alpha"));
+        match &reqs[0].1 {
+            AcceptRequest::Hunk { index, hunks, .. } => {
+                assert_eq!((*index, hunks.len()), (2, 3));
+            }
+            other => panic!("a hunk request: {other:?}"),
+        }
+        assert!(by_key.accepting.is_some());
+    }
+
+    /// `A` vs a click on the main-view header's `[A accept file]`, from the nav pane.
+    #[test]
+    fn input_parity_accept_file() {
+        let km = Keymap::defaults();
+        let mut base = three_roots();
+        base.handle(Action::Resize(100, 30));
+        base.select(Some(row("alpha", "f1")));
+        let (_, hits) = frame(&base);
+        let mut by_key = base.clone();
+        let mut by_mouse = base;
+
+        let by_key_effect = press_key(
+            &mut by_key,
+            &km,
+            key_code(KeyCode::Char('A'), KeyModifiers::SHIFT),
+        );
+        let by_mouse_effect = click(&mut by_mouse, &km, &hits, &Target::FileAccept);
+
+        assert_eq!(by_key, by_mouse);
+        assert_eq!(by_key_effect, by_mouse_effect);
+        assert_eq!(frame(&by_key).0, frame(&by_mouse).0);
+        let Some(Effect::Accept(reqs)) = by_key_effect.1 else {
+            panic!("an accept effect: {by_key_effect:?}");
+        };
+        assert_eq!(reqs.len(), 1);
+        assert!(
+            matches!(reqs[0].1, AcceptRequest::File(_)),
+            "{:?}",
+            reqs[0].1
+        );
+    }
+
+    /// `ctrl-a` vs a click on the header's `[Accept All]`: one `AcceptRequest::All` per
+    /// listed root, each carrying that root's held pile; five files, so no modal.
+    #[test]
+    fn input_parity_accept_all() {
+        let km = Keymap::defaults();
+        let mut base = three_roots();
+        base.handle(Action::Resize(100, 30));
+        let (_, hits) = frame(&base);
+        let mut by_key = base.clone();
+        let mut by_mouse = base.clone();
+
+        let by_key_effect = press_key(
+            &mut by_key,
+            &km,
+            key_code(KeyCode::Char('a'), KeyModifiers::CONTROL),
+        );
+        let by_mouse_effect = click(&mut by_mouse, &km, &hits, &Target::HeaderAcceptAll);
+
+        assert_eq!(by_key, by_mouse);
+        assert_eq!(by_key_effect, by_mouse_effect);
+        assert_eq!(frame(&by_key).0, frame(&by_mouse).0);
+        assert!(by_key.confirm.is_none(), "five files ask nothing");
+        let Some(Effect::Accept(reqs)) = by_key_effect.1 else {
+            panic!("an accept effect: {by_key_effect:?}");
+        };
+        let expected: Vec<(std::path::PathBuf, AcceptRequest)> = base
+            .listed_roots()
+            .map(|v| (v.meta.path.clone(), AcceptRequest::All(v.pile.clone())))
+            .collect();
+        assert_eq!(reqs.len(), 3);
+        assert_eq!(reqs, expected, "exactly the held piles, in nav order");
     }
 }
