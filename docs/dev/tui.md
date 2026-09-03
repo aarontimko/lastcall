@@ -37,7 +37,9 @@ gate greps at the end of this page are how that is enforced).
 - **`render.rs` — `render(&App, frame) -> HitMap`.** Reads nothing but the app and the
   frame's own area: no clock, no engine, no files. Layout: a one-line header (`lastcall  N
   repos · N files · N hunks  [Accept All]` plus the watch notice on the right; the file
-  count reads `N+` when any root's pile stopped at the engine's row cap), the body — a nav pane
+  count reads `N+` when any root's pile stopped at the engine's row cap; when the control
+  and the notice do not both fit — 60 columns — the control is dropped and the notice
+  kept, since `^A` duplicates the control and nothing else says what is watched), the body — a nav pane
   (outer width `App.nav_width`, 16..=60, default 28; hidden below `NAV_MIN_COLS` = 70
   columns, when the diff takes the whole body and has focus) sharing its right border with a
   bordered main pane — and a one-line status bar (the latest engine notice with its age for

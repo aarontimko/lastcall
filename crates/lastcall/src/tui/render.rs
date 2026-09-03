@@ -154,7 +154,9 @@ pub fn render(app: &App, frame: &mut Frame<'_>) -> HitMap {
 
 /// `lastcall  <repos> · <files> · <hunks>  [Accept All]` … `watching <parents>`. The file
 /// count carries `+` when any listed root's pile stopped at the row cap; the control is
-/// dim when nothing is listed and is the `HeaderAcceptAll` target either way.
+/// dim when nothing is listed and is the `HeaderAcceptAll` target either way. When the
+/// control and the notice do not both fit (60 columns), the control goes and the notice
+/// stays: `^A` duplicates the control, nothing else says what is being watched.
 fn render_header(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
     let listed: Vec<&RootView> = app.listed_roots().collect();
     let files: usize = listed.iter().map(|v| v.rows().len()).sum();
@@ -184,25 +186,33 @@ fn render_header(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
             parents.into_iter().collect::<Vec<_>>().join(", ")
         )
     };
-    let used = left.width() + 2 + control.width();
-    let pad = (area.width as usize).saturating_sub(used + right.width());
-    let mut spans = vec![
-        Span::styled(left, bold()),
-        Span::raw("  "),
-        Span::styled(
+    let width = area.width as usize;
+    let with_control = left.width() + 2 + control.width();
+    // Priority when the line is short: the counts, then the notice, then the control.
+    let both_fit = with_control + 2 + right.width() <= width;
+    let notice_fits_alone = left.width() + 2 + right.width() <= width;
+    let show_control = both_fit || !notice_fits_alone;
+    let show_notice = both_fit || notice_fits_alone;
+    let mut used = left.width();
+    let mut spans = vec![Span::styled(left, bold())];
+    if show_control {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
             control,
             if listed.is_empty() {
                 dim()
             } else {
                 Style::new()
             },
-        ),
-    ];
-    if pad >= 2 {
+        ));
+        used = with_control;
+    }
+    if show_notice {
+        let pad = width.saturating_sub(used + right.width());
         spans.push(Span::raw(format!("{}{right}", " ".repeat(pad))));
     }
     buf.set_line(area.x, area.y, &Line::from(spans), area.width);
-    if used <= area.width as usize {
+    if show_control && with_control <= width {
         hits.targets.push((
             Rect::new(control_x, area.y, control.width() as u16, 1),
             Target::HeaderAcceptAll,
@@ -1272,6 +1282,38 @@ mod tests {
         assert!(!frame.contains("┬"), "{frame}");
         let (frame, _) = frame_of(&app, 70, 12);
         assert!(frame.contains("┬"), "{frame}");
+    }
+
+    /// At 60 columns the header cannot hold both `[Accept All]` and `watching W`: the
+    /// notice wins (nothing else says what is watched; `^A` duplicates the control), and
+    /// the control's target goes with it. At 100 both are there.
+    #[test]
+    fn render_narrow_header_keeps_the_notice_and_drops_the_control() {
+        let app = three_roots();
+        let header_and_hits = |w: u16| {
+            let mut terminal = Terminal::new(TestBackend::new(w, 20)).unwrap();
+            let mut hits = HitMap::default();
+            terminal
+                .draw(|f| {
+                    hits = render(&app, f);
+                })
+                .unwrap();
+            let frame = terminal.backend().to_string();
+            let header = frame.lines().next().unwrap().trim_matches('"').to_owned();
+            let control = hits
+                .targets
+                .iter()
+                .any(|(_, t)| *t == Target::HeaderAcceptAll);
+            (header, control)
+        };
+        let (header, control) = header_and_hits(60);
+        assert!(!header.contains("[Accept All]"), "{header}");
+        assert!(header.trim_end().ends_with("watching W"), "{header}");
+        assert!(!control, "no control, no target");
+        let (header, control) = header_and_hits(100);
+        assert!(header.contains("  [Accept All]"), "{header}");
+        assert!(header.trim_end().ends_with("watching W"), "{header}");
+        assert!(control);
     }
 
     #[test]
