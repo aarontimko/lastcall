@@ -51,6 +51,13 @@ fn note(line: &str) {
     let _ = err.flush();
 }
 
+/// A blank line first: under `--nocapture` libtest prints its `test <name> ... ` prefix
+/// without a newline, so a scenario's first line would be glued to it and
+/// `grep '^BENCH '` would drop it (S2's `file_bytes`, S3's `files`, the SKIP lines).
+fn fresh_line() {
+    note("");
+}
+
 fn bench(scenario: &str, metric: &str, value: impl std::fmt::Display) {
     note(&format!("BENCH {scenario} {metric}={value}"));
 }
@@ -203,6 +210,7 @@ fn drop_files(root: &Path, n: usize, per_dir: usize) -> Instant {
 #[test]
 #[ignore]
 fn bench_s1_clones_100_rows_4000() {
+    fresh_line();
     if !release_build() {
         return;
     }
@@ -277,6 +285,7 @@ fn bench_s1_clones_100_rows_4000() {
 #[test]
 #[ignore]
 fn bench_s2_diff_100k_lines() {
+    fresh_line();
     if !release_build() {
         return;
     }
@@ -371,6 +380,7 @@ fn bench_s2_diff_100k_lines() {
 #[test]
 #[ignore]
 fn bench_s3_burst_1000_under_watch() {
+    fresh_line();
     if !release_build() {
         return;
     }
@@ -411,6 +421,7 @@ fn bench_s3_burst_1000_under_watch() {
 #[test]
 #[ignore]
 fn bench_s4_drop_50000_cutoff() {
+    fresh_line();
     if !release_build() {
         return;
     }
