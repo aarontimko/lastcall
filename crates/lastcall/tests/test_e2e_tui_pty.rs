@@ -11,6 +11,11 @@
 //! not perturbed by a sibling scene's fixture build. Timings and skips are written with
 //! `stderr().write_all`, which libtest does not swallow.
 //!
+//! Phase 4 (kickoff deliverable 9(b)) adds the scripted agent loop through the same
+//! binary — `pty_accept_loop_and_restart` (accept hunk, file, everything; `ledger.json`
+//! read back; `q`; the agent commits; a **second process** on the same state dir shows
+//! nothing pending) — and the CAS refusal on screen, `pty_accept_refused_when_file_moves`.
+//!
 //! `probe_tui_screen` (ignored) is `just probe-tui-screen`: the same flow against the
 //! release binary, printing the final screen and the exit code.
 
@@ -21,6 +26,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use lastcall_testkit::fixture_parent;
+use lastcall_testkit::fixture_repo::FixtureRepo;
 use lastcall_testkit::pty_tui::{PtyCommand, PtyTui, col_of, vt100};
 use lastcall_testkit::tmp::TempDir;
 
@@ -195,6 +201,55 @@ impl Fixture {
         f.write_all(line.as_bytes()).expect("append");
         f.flush().expect("flush");
     }
+
+    /// The fixture "agent"'s handle on one of the repos (`alpha`, `beta`): writes and
+    /// commits with the fixture's fixed identity, never through the engine.
+    fn repo(&self, name: &str) -> FixtureRepo {
+        FixtureRepo::open_in(TempDir::adopt(&self.parent), name)
+    }
+
+    /// `ledger.json` of the root at `<parent>/<name>`, found under
+    /// `<state>/roots/<parent-id>/repos/<root-id>/` by its `root` field (the canonical
+    /// path) — read from disk, exactly what the next process will load.
+    fn ledger(&self, name: &str) -> serde_json::Value {
+        let root = std::fs::canonicalize(self.parent.join(name)).expect("root exists");
+        let root = root.to_string_lossy().into_owned();
+        let roots = self.state.join("roots");
+        let mut found = Vec::new();
+        for parent in std::fs::read_dir(&roots)
+            .expect("state/roots exists")
+            .flatten()
+        {
+            let repos = parent.path().join("repos");
+            let Ok(entries) = std::fs::read_dir(&repos) else {
+                continue;
+            };
+            for repo in entries.flatten() {
+                let path = repo.path().join("ledger.json");
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let value: serde_json::Value = serde_json::from_str(&text)
+                    .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+                if value["root"].as_str() == Some(root.as_str()) {
+                    found.push(value);
+                }
+            }
+        }
+        assert_eq!(found.len(), 1, "exactly one ledger for {root}: {found:?}");
+        found.pop().unwrap()
+    }
+}
+
+/// The status bar reads `<text> · <age>` for exactly `text` (an `accepted f1` status must
+/// not pass for `accepted f1 · hunk 1 of 2`).
+fn status_is(s: &vt100::Screen, text: &str) -> bool {
+    let (_, cols) = s.size();
+    s.rows(0, cols).last().is_some_and(|r| {
+        r.trim_end()
+            .strip_prefix(&format!("{text} · "))
+            .is_some_and(|age| !age.is_empty() && !age.contains(' '))
+    })
 }
 
 fn bin() -> PathBuf {
@@ -573,4 +628,234 @@ fn probe_tui_screen() {
     pty.send(b"q").expect("q");
     let status = pty.wait_exit(QUIT_BUDGET).expect("exits");
     note(&format!("--- exit={}", status.exit_code()));
+}
+
+/// `f1` with line 1 and line 10 changed against the seen `a1..a10`: two separated hunks.
+const F1_TWO_HUNKS: &str = "A1\na2\na3\na4\na5\na6\na7\na8\na9\nA10\n";
+const F2_EDIT: &str = "b\nagent edit\nmore\n";
+const F2_EDIT_AGAIN: &str = "b\nagent edit\nmore\nagain\n";
+const F3_EDIT: &str = "c changed\n";
+/// Added files so that after the hunk and file accepts `ctrl-a` still covers eleven files
+/// (> `CONFIRM_ABOVE`), which drives the confirm modal through the real terminal.
+const ADDED: [&str; 6] = ["g01", "g02", "g03", "g04", "g05", "g06"];
+
+/// Kickoff deliverable 9(b): the whole reviewer loop through the real binary. The fixture
+/// "agent" writes and commits in `alpha` before the reviewer looks; `a` (hunk), `A`
+/// (file) and `ctrl-a` + `y` (everything, across three roots, above the confirm threshold)
+/// shrink the nav to `nothing pending`; the ledgers on disk carry the fold; `q` exits 0;
+/// the agent commits the rest; a **second process** on the same state dir shows the empty
+/// state once its scans are done, and one more edit shows exactly that delta.
+#[test]
+fn pty_accept_loop_and_restart() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let alpha = fx.repo("alpha");
+
+    // The agent: f1 (two hunks), f2, f3 committed, six added files.
+    alpha.write("f1", F1_TWO_HUNKS);
+    alpha.write("f2", F2_EDIT);
+    alpha.write("f3", F3_EDIT);
+    alpha.git(&["add", "f3"]).expect("git add f3");
+    alpha
+        .git(&["commit", "-q", "-m", "agent: f3"])
+        .expect("git commit f3");
+    let f3_commit = alpha.head().expect("HEAD");
+    for name in ADDED {
+        alpha.write(name, format!("{name}\n"));
+    }
+    let before = fx.ledger("alpha");
+    assert_eq!(before["overrides"], serde_json::json!({}), "{before}");
+
+    let Some(mut pty) = fx.spawn_tui(&bin()) else {
+        return;
+    };
+    let first = wait_first_piles(&mut pty);
+    pty.wait_for(LONG, |s| {
+        let t = s.contents();
+        t.contains("M f3") && t.contains("A g06") && t.contains("3 repos · 12 files")
+    })
+    .unwrap_or_else(|e| panic!("all twelve rows: {e}"));
+    note(&format!(
+        "PTY accept loop: 12 files on screen after {first:.3?}"
+    ));
+
+    // (1) open f1: two hunks; `a` accepts the first, the row shrinks to the second.
+    pty.send(b"jj\r").expect("keys");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        let t = s.contents();
+        t.contains("f1  M  +2 −2") && t.matches("@@ -").count() == 2
+    })
+    .unwrap_or_else(|e| panic!("f1 open with two hunks: {e}"));
+    let t = Instant::now();
+    pty.send(b"a").expect("a");
+    pty.wait_for(OVERLOADED, |s| {
+        status_is(s, "accepted f1 · hunk 1 of 2") && s.contents().contains("M f1  +1 −1")
+    })
+    .unwrap_or_else(|e| panic!("accept hunk: {e}"));
+    note(&format!(
+        "PTY accept hunk: status + row after {:.3?}",
+        t.elapsed()
+    ));
+
+    // (2) `A` accepts the file: f1 leaves the nav, the selection lands on f2.
+    let t = Instant::now();
+    pty.send(b"A").expect("A");
+    pty.wait_for(OVERLOADED, |s| {
+        let text = s.contents();
+        status_is(s, "accepted f1") && !text.contains("M f1") && text.contains("f2  M  +2 −0")
+    })
+    .unwrap_or_else(|e| panic!("accept file: {e}"));
+    note(&format!(
+        "PTY accept file: f1 gone after {:.3?}",
+        t.elapsed()
+    ));
+
+    // (3) `ctrl-a`: eleven files across three roots is above the confirm threshold; the
+    // modal counts u1 as the one grouped upstream row; `y` folds all three ledgers.
+    pty.send(b"\x01").expect("ctrl-a");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        let text = s.contents();
+        text.contains("Accept all 11 files across 3 repos?")
+            && text.contains("1 grouped upstream · 0 collapsed")
+    })
+    .unwrap_or_else(|e| panic!("confirm modal: {e}"));
+    let t = Instant::now();
+    pty.send(b"y").expect("y");
+    pty.wait_for(OVERLOADED, |s| {
+        status_is(s, "accepted 11 files in 3 repos")
+            && s.contents().contains("nothing pending across 3 roots")
+    })
+    .unwrap_or_else(|e| panic!("accept all: {e}"));
+    note(&format!(
+        "PTY accept all: nothing pending after {:.3?}",
+        t.elapsed()
+    ));
+    pty.wait_for_text("0 repos · 0 files · 0 hunks", Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("empty header: {e}"));
+
+    // The fold persisted: what the next process will load.
+    let after = fx.ledger("alpha");
+    assert_eq!(after["overrides"], serde_json::json!({}), "{after}");
+    assert_ne!(
+        after["seen_tree"], before["seen_tree"],
+        "alpha's seen tree moved"
+    );
+    assert_eq!(
+        after["seen_at"]["head_commit"].as_str(),
+        Some(f3_commit.as_str()),
+        "seen_at is the agent's commit the fold happened on: {after}"
+    );
+    for name in ["beta", "notes"] {
+        let ledger = fx.ledger(name);
+        assert_eq!(ledger["overrides"], serde_json::json!({}), "{ledger}");
+        assert!(ledger["seen_tree"].is_string(), "{name} folded: {ledger}");
+    }
+
+    // (4) `q`, then the agent commits the rest behind the reviewer's back.
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+    drop(pty);
+    alpha
+        .git(&["commit", "-q", "-a", "-m", "agent: the rest"])
+        .expect("git commit -a");
+    assert_ne!(alpha.head().expect("HEAD"), f3_commit);
+
+    // (5) a second process on the same state dir: the empty state, after scanning (the
+    // `watching <parent> (3 roots)` status replaces `scanning 3 roots…` once the
+    // post-install rescans are done; the temp path is long, so only its head fits).
+    let Some(mut pty) = fx.spawn_tui(&bin()) else {
+        return;
+    };
+    let t = Instant::now();
+    pty.wait_for(LONG, |s| {
+        let (_, cols) = s.size();
+        s.rows(0, cols)
+            .last()
+            .is_some_and(|r| r.starts_with("watching "))
+    })
+    .unwrap_or_else(|e| panic!("relaunch scanned: {e}"));
+    assert!(
+        find_words(&pty.raw(), &["scanning", "3", "roots…"]).is_some(),
+        "the relaunch scanned first"
+    );
+    note(&format!("PTY relaunch: scanned after {:.3?}", t.elapsed()));
+    let text = pty.screen_text();
+    assert!(text.contains("nothing pending across 3 roots"), "{text}");
+    assert!(text.contains("0 repos · 0 files · 0 hunks"), "{text}");
+    let raw = pty.raw();
+    for row in ["M f1", "M f2", "M f3", "A g01", "A u1", "M n2.md"] {
+        assert!(find(&raw, row.as_bytes()).is_none(), "{row} never drawn");
+    }
+    assert_eq!(
+        fx.ledger("alpha"),
+        after,
+        "the agent's commit did not touch the ledger"
+    );
+
+    // (6) one more edit shows exactly that delta.
+    alpha.write("f2", F2_EDIT_AGAIN);
+    let took = pty
+        .wait_for_text("M f2  +1 −0", OVERLOADED)
+        .unwrap_or_else(|e| panic!("the re-edit: {e}"));
+    pty.wait_for_text("1 repo · 1 file · 1 hunk", Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("header after the re-edit: {e}"));
+    note(&format!("PTY relaunch edit-to-screen {took:.3?}"));
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}
+
+/// Kickoff deliverable 9(b): the CAS refusal through the real terminal. The diff is open,
+/// the agent rewrites the file, `A` is pressed before the watcher's debounce has rescanned:
+/// the status says so and the row stays; once the screen shows the new counts, `A` accepts.
+#[test]
+fn pty_accept_refused_when_file_moves() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let Some(mut pty) = fx.spawn_tui(&bin()) else {
+        return;
+    };
+    wait_first_piles(&mut pty);
+    pty.send(b"jj\r").expect("keys");
+    pty.wait_for_text("f1  M  +1 −1", Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("f1 open: {e}"));
+
+    fx.append("alpha/f1", "moved after render\n");
+    let t = Instant::now();
+    pty.send(b"A").expect("A");
+    pty.wait_for(OVERLOADED, |s| {
+        status_is(s, "f1: changed since rendered; not accepted")
+    })
+    .unwrap_or_else(|e| panic!("refusal status: {e}"));
+    note(&format!(
+        "PTY accept refused: status after {:.3?}",
+        t.elapsed()
+    ));
+    assert!(pty.screen_text().contains("M f1"), "the row remains");
+    assert_eq!(fx.ledger("alpha")["overrides"], serde_json::json!({}));
+
+    pty.wait_for_text("M f1  +2 −1", OVERLOADED)
+        .unwrap_or_else(|e| panic!("the rescan shows the new counts: {e}"));
+    let t = Instant::now();
+    pty.send(b"A").expect("A");
+    pty.wait_for(OVERLOADED, |s| {
+        status_is(s, "accepted f1") && !s.contents().contains("M f1")
+    })
+    .unwrap_or_else(|e| panic!("accept after the rescan: {e}"));
+    note(&format!(
+        "PTY accept after refusal: f1 gone after {:.3?}",
+        t.elapsed()
+    ));
+    assert!(fx.ledger("alpha")["overrides"]["f1"].is_object());
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
 }
