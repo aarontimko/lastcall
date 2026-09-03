@@ -13,13 +13,14 @@ child and never falls back to a `herdr` on `PATH`.
 |---|---|---|---|
 | unit | `just test-unit` = `cargo test --workspace --lib --bins` | in-module `#[cfg(test)]` only | everywhere, incl. macOS CI |
 | integration | `just test-integration` = `cargo test --workspace --test 'test_integration_*'` | real git; the pinned herdr when `LASTCALL_TEST_HERDR_BIN` is set | CI via `just test-integration-herdr`; Linux blocking, macOS best-effort |
-| e2e | `just test-e2e` = `cargo test --workspace --test 'test_e2e_*'` | the TUI: sixteen `TestBackend` snapshot scenes and the PTY scenes against the built binary (`docs/dev/tui.md`) | everywhere; the PTY file skips with a visible reason only where no pseudo-terminal can be opened |
+| e2e | `just test-e2e` = `cargo test --workspace --test 'test_e2e_*'` | the TUI: twenty-three `TestBackend` snapshot scenes and the PTY scenes against the built binary (`docs/dev/tui.md`) | everywhere; the PTY file skips with a visible reason only where no pseudo-terminal can be opened |
 
 `just test` runs the three in order. **`just test-unit` is the canonical suite**; its count is
 the ratchet floor from Phase 2 on (Phase 1 close: 85 engine + 16 testkit + 0 binary = 101, the
 Phase 2 floor; Phase 2 close: 166 engine + 16 testkit + 0 binary = 182, the Phase 3 floor; Phase 3 close: 168
 engine + 19 testkit + 64 binary lib + 4 binary main = 255, the Phase 4 floor; Phase 4 engine
-work (4a): 179 engine + 19 testkit + 64 binary lib + 4 binary main = 266).
+work (4a): 179 engine + 19 testkit + 64 binary lib + 4 binary main = 266; Phase 4 TUI work
+(4b): 180 engine + 19 testkit + 95 binary lib + 4 binary main = 298).
 The suite never shrinks across commits. One recorded exception: at the Phase 2 code review
 the three filesystem-live watcher tests (up to 30 s waits, real FSEvents) left the unit tier
 for `crates/lastcall-engine/tests/test_integration_watcher.rs` because they contradicted the
@@ -64,7 +65,10 @@ and commit the file.
 
 Both files live in `crates/lastcall/tests/`; `docs/dev/tui.md` has the how-to.
 
-`test_e2e_tui_snapshots.rs` renders sixteen scenes through `ratatui::backend::TestBackend`
+`test_e2e_tui_snapshots.rs` renders twenty-three scenes (the sixteen Phase 3 ones and the
+seven Phase 4 accept scenes, which drive the real `Engine::accept` from the reducer's own
+`Effect::Accept` and feed `App::accepted`; `tui_accept_all_confirm` pins a second `_live`
+frame) through `ratatui::backend::TestBackend`
 from an `App` fed by a real engine over the shared `fixture_parent` (each scene builds its
 own fixture and state dir under a temp dir) and pins each as two `insta` snapshots under
 `crates/lastcall/tests/snapshots/`: `<scene>_frame` (the symbols, exactly as a 100×30 — or

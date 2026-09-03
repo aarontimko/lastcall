@@ -23,9 +23,10 @@ gate greps at the end of this page are how that is enforced).
 
 - **`app.rs` — `App` is a pure value.** `apply` folds engine events (`Pile`, `Head`,
   `Notice`, `RootsChanged`, …) into it, `handle` folds user `Action`s, `sync_roots` folds
-  the engine's root list. Every reducer returns `(Changed, Option<Effect>)`: `Changed::Yes`
-  is the only thing that triggers a redraw, and an `Effect` (`Refresh`, `SyncRoots`, `Quit`)
-  is the only way the app asks the loop for work — the reducer itself does no I/O. The same
+  the engine's root list, `accepted` folds the results of an accept. Every reducer returns
+  `(Changed, Option<Effect>)`: `Changed::Yes` is the only thing that triggers a redraw, and
+  an `Effect` (`Refresh`, `SyncRoots`, `Quit`, `Accept(requests)`) is the only way the app
+  asks the loop for work — the reducer itself does no I/O. The same
   event sequence always yields the same `App` (`app_unchanged_pile_is_no_change` feeds one
   pile twice and asserts nothing changed). Selection is by root path and row path *bytes*,
   never by index, so a rescan that reorders or removes rows can only move it through
@@ -35,26 +36,36 @@ gate greps at the end of this page are how that is enforced).
   from it, never from `Instant::now()`, which is why two renders of one `App` are identical.
 - **`render.rs` — `render(&App, frame) -> HitMap`.** Reads nothing but the app and the
   frame's own area: no clock, no engine, no files. Layout: a one-line header (`lastcall  N
-  repos · N files · N hunks` plus the watch notice on the right), the body — a nav pane
+  repos · N files · N hunks  [Accept All]` plus the watch notice on the right; the file
+  count reads `N+` when any root's pile stopped at the engine's row cap), the body — a nav pane
   (outer width `App.nav_width`, 16..=60, default 28; hidden below `NAV_MIN_COLS` = 70
   columns, when the diff takes the whole body and has focus) sharing its right border with a
   bordered main pane — and a one-line status bar (the latest engine notice with its age for
   `app::STATUS_TTL` = 30 s, then the key hints). Below `MIN_SIZE` (40×10) the whole frame
   is `render::TOO_SMALL` (`too small: 40×10 min`) and the hit map is empty. Only the visible
   window of nav entries and diff lines is built, so a 50 000-line diff costs the same as a
-  50-line one. The help overlay (`?`) is drawn last over everything.
+  50-line one. The help overlay (`?`) and the accept confirm modal are drawn last over
+  everything.
 - **`input.rs` — `Action` and the keymap.** Every key, mouse gesture and the 1 s tick becomes
   one `Action` before it touches `App` (`to_action(&Event, &Keymap)`), so the reducer never
-  sees a crossterm type and the keyboard and mouse paths are provably equivalent — the four
+  sees a crossterm type and the keyboard and mouse paths are provably equivalent — the seven
   parity tests `input_parity_select_repo`, `input_parity_select_file`,
-  `input_parity_hunk_next`, `input_parity_hunk_prev` drive the same scene by key and by a
-  click resolved through the hit map and assert the same `App`.
+  `input_parity_hunk_next`, `input_parity_hunk_prev`, `input_parity_accept_hunk`,
+  `input_parity_accept_file`, `input_parity_accept_all` drive the same scene by key and by a
+  click resolved through the hit map and assert the same `App` (and, for the accepts, the
+  same `Effect`). The confirm modal's keys (`input::MODAL_KEYS`: `y`/`enter` confirm,
+  `n`/`esc` cancel) are not in the keymap: `Ui::event` resolves them through `modal_action`
+  before the keymap while the modal is open, and swallows every other key.
 - **`run.rs` — the loop.** One tokio `select!` over the watcher's events, the terminal
   reader thread's events, the loop's own finished engine work (`Local`), a 1 s tick, Ctrl-C
   (a key event under raw mode; the signal branch is for `kill -INT`) and SIGTERM. Every
   engine call goes through `watcher::blocking` on a spawned task; the UI task never holds the
-  engine mutex (`rg -n 'lock\(' crates/lastcall/src/tui` finds nothing). The `Ui` wrapper
-  (`event` / `engine` / `local` / `rendered`) is the unit-testable half of the loop.
+  engine mutex (`rg -n 'lock\(' crates/lastcall/src/tui` finds nothing). `Effect::Accept`
+  runs as **one** `blocking` closure over every root it covers (`spawn_accept`): each root's
+  `Engine::accept` — the op and its rescan — happens under the same hold of the engine
+  mutex, so no watcher scan interleaves, and the results come back as one `Local::Accepted`.
+  The `Ui` wrapper (`event` / `engine` / `local` / `rendered`) is the unit-testable half of
+  the loop.
 - **`term.rs` — the terminal lifecycle.** `enter()` installs the panic hook *before* raw
   mode, then raw mode + alternate screen + mouse capture (bracketed paste stays off).
   `restore()` is idempotent, uses only global crossterm commands on stdout, and is shared by
@@ -83,6 +94,57 @@ timeout under a stop flag and exits on its own. `run_shutdown_restores_before_jo
 pins the order; the PTY scenes measure and print it (a few hundred milliseconds after `q`
 or Ctrl-C on the fixture).
 
+## The accept loop
+
+Every accept on screen is the Phase 2 engine's compare-and-swap (`00-spec.md` §6.3) driven
+from what the user is looking at:
+
+- **Scope** (`App::accept_scope`, `AcceptScope`): `a` on a file row with the diff focused
+  is the hunk under the cursor; on a file row otherwise, the whole file; on a group entry,
+  the group; on a root entry, every row of that root (the per-repo fold). `A` is the whole
+  file from either pane; `ctrl-a` and the header's `[Accept All]` are every listed root.
+- **Requests are built from the held rows, never from the engine.** `accept_requests`
+  makes one `(root, AcceptRequest)` per root covered, with `Rendered::of` on the `App`'s own
+  `Row` (`rg -n 'Rendered::of' crates/lastcall/src` finds only `app.rs`) and, for a fold,
+  `AcceptRequest::All(view.pile.clone())` — exactly the pile that was rendered, so the
+  engine blesses what was shown and refuses (`Refused::Moved`) anything that changed since.
+- **One at a time.** `App.accepting` holds the scope in flight; a second accept while one
+  runs is ignored with the status `accept in progress`, and the modal never opens while one
+  is running (`Confirm` re-checks, so a confirm is never silently dropped or doubled).
+- **Completion** (`App::accepted(Vec<(root, Result<Accepted, String>)>)`): each root's
+  pile goes through the same `apply_pile` path as a watcher pile (seq included); then the
+  advance rule; then one status line — `accepted f1 · hunk 2 of 3` (the index and count
+  are the row's at the moment the accept was asked; each rescan shrinks the count),
+  `accepted f1`, `accepted f3 (deleted)`, `accepted upstream · 4 files`, `accepted 12 files
+  in alpha`, `accepted 30 files in 3 repos`; on refusals the `Refused` texts joined by
+  ` · ` (the first only plus ` (+N more)` beyond two); an `Err` for one root is reported as
+  `alpha: <error>` and does not undo the others.
+- **Advance (§6.7).** After a hunk accept with hunks left, the cursor keeps its index
+  (clamped — the next hunk slides into it) and the scroll follows. When the accepted
+  selection is gone from the nav — the row's last hunk, a whole file, a group, a fold —
+  `advance(root, path)` picks the next row by path after the accepted one in the root's
+  new pile, else the first remaining row of that root, else the first *row* of the next
+  listed root, else nothing; a root whose pile emptied is unlisted (the existing rule).
+  Focus stays where it was. A refusal leaves the selection where it was.
+- **The confirm modal.** An accept covering more than `CONFIRM_ABOVE` = 10 files asks
+  first (10 accepts, 11 asks). `App.confirm` stores only the scope; the numbers shown are
+  `confirm_counts()` from the held piles at *every* render, so a pile applied under the
+  open modal changes them and `Confirm` folds exactly what is shown (if the scope empties
+  underneath, the modal closes with `nothing to accept`). While the modal is open every
+  action but `Tick`, `Resize`, `Confirm`, `Cancel` is ignored, and every key but its own is
+  swallowed before the keymap — so `Esc` cancels without also going back.
+- **The seq rule (the §11 hardening).** `App.seq` remembers the last scan seq applied per
+  root; a `Pile` event with a lower seq — a watcher scan that was already running when the
+  accept took the lock — is `Changed::No` and touches nothing, through either channel
+  (`app_older_seq_pile_is_dropped_untouched`,
+  `run_stale_watcher_pile_after_accept_is_dropped`). The entry is removed when the root is
+  removed, so a re-added root receives piles again.
+- **Hints follow the selection** so the per-repo fold and the global one are told apart:
+  `a accept hunk  A accept file` on a file row with the diff focused, `a/A accept file`
+  otherwise, `a accept group`, `a accept all in <root>`, and `^A accept all` always. When
+  the line would not fit it drops `Tab focus  r refresh` first (always below 70 columns),
+  then the file and global accept hints.
+
 ## Keys
 
 Defaults (`input::DEFAULT_KEYMAP`, in help-overlay order):
@@ -97,14 +159,22 @@ Defaults (`input::DEFAULT_KEYMAP`, in help-overlay order):
 | `hunk_next` / `hunk_prev` | `n` `]` / `p` `[` | next / previous hunk (the current hunk's header is drawn inverted) | |
 | `toggle_full_paths` | `f` | root-relative paths instead of basenames | |
 | `toggle_remote` | `o` | show each repo's `org/repo` slug | |
+| `accept` | `a` | accept the selected entry: a file, a group, or every row of a root (asks above 10 files) | accept the hunk under the cursor |
+| `accept_file` | `shift-a` | accept the selected file whole | |
+| `accept_all` | `ctrl-a` | accept everything listed, every root (asks above 10 files) | |
 | `refresh` | `r` | rescan every root now (ignored while one is running) | |
 | `help` | `?` | the help overlay (any key closes it) | |
 | `quit` | `q` `ctrl-c` | exit 0 | |
 | `scroll_up` / `scroll_down` | *(unbound)* | bindable one-line diff scrolls | |
 
-Mouse: a left press on a nav entry selects it; on a hunk header it selects that hunk; on the
-diff body it focuses the diff; dragging the divider resizes the nav (clamped to 16..=60);
-the wheel scrolls the pane under the pointer, three lines a notch.
+The confirm modal answers only `y` / `enter` (confirm) and `n` / `esc` (cancel); these are
+fixed (`input::MODAL_KEYS`), not `[keys]` names, and the help overlay lists them last.
+
+Mouse: a left press on a nav entry selects it; on a hunk header it selects that hunk; on a
+hunk header's `[a accept]` it accepts that hunk, on the main view's `[A accept file]` the
+file, on the header's `[Accept All]` everything listed; on the diff body it focuses the
+diff; dragging the divider resizes the nav (clamped to 16..=60); the wheel scrolls the pane
+under the pointer, three lines a notch.
 
 ### The `[keys]` table (`config.toml`)
 
@@ -140,8 +210,10 @@ The loop keeps the `HitMap` of the *last drawn* frame — not `App` — and drop
 `Resize`, so a press between a resize and the next render hits nothing rather than something
 stale (`run_press_resolves_through_the_hit_map_and_resize_invalidates_it`). A press becomes
 `Action::Press(col, row)`; the loop resolves it to a `Target` (`NavRoot`, `NavRow`,
-`NavGroup`, `DiffHunk(i)`, `DiffBody`, `Divider`) and calls `App::hit`, which is the same
-reducer path the equivalent key takes (`app_hunk_click_equals_hunk_key`).
+`NavGroup`, `DiffHunk(i)`, `DiffBody`, `Divider`, `HeaderAcceptAll`, `FileAccept`,
+`HunkAccept(i)`) and calls `App::hit`, which is the same reducer path the equivalent key
+takes (`app_hunk_click_equals_hunk_key`, `app_accept_hunk_by_keys_equals_hunk_accept_click`).
+While the confirm modal is open `hit` ignores every target.
 
 ## Adding a widget, with a snapshot
 
@@ -222,6 +294,8 @@ use the raw log only for escape sequences and ordering.
 rg -n 'Command::new\("git"\)' crates                       # engine git.rs, plus the testkit's fixture builder; nothing under tui/
 rg -n 'std::env::var|home_dir\(' crates/lastcall/src        # only the LASTCALL_LOG* reads in tui/term.rs
 rg -n 'lock\(' crates/lastcall/src/tui                      # nothing
+rg -n 'Rendered::of' crates/lastcall/src                    # only tui/app.rs (requests come from the held rows)
+rg -n 'last_pile|scan_all\(|\.scan\(' crates/lastcall/src/tui/app.rs   # nothing (the reducer never scans)
 rg -n 'println!|eprintln!|print!' crates/lastcall/src/tui   # nothing (the messages are in commands/)
 rg -n 'thread::sleep|tokio::time::sleep' crates/lastcall/src/tui   # nothing
 cargo tree -e normal -p lastcall -p lastcall-engine | grep -c testkit   # 0
