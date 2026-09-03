@@ -522,15 +522,22 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
         render_content(store, inputs, blobs.as_ref(), row, &mut notices)?;
     }
 
-    // 5. D5 rename pairing: only when the pile has both deletions and additions.
-    let has_del = rows.iter().any(|r| r.change == Change::Deleted);
+    // 5. D5 rename pairing: only when the pile has both deletions and additions. The
+    // candidates are the pile's own rows — a deletion's baseline may be an override blob
+    // (or the path may not be a row at all: an accepted deletion), so the seen tree is
+    // not the right "before" side.
+    let deleted: Vec<(Vec<u8>, Entry)> = rows
+        .iter()
+        .filter(|r| r.change == Change::Deleted)
+        .filter_map(|r| r.baseline.clone().map(|b| (r.path.clone(), b)))
+        .collect();
     let added: Vec<Vec<u8>> = rows
         .iter()
         .filter(|r| r.change == Change::Added && r.current.is_some())
         .map(|r| r.path.clone())
         .collect();
-    if has_del && !added.is_empty() {
-        match detect_renames(store, inputs.index, inputs.index_tmp, &added) {
+    if !deleted.is_empty() && !added.is_empty() {
+        match detect_renames(store, inputs.index_tmp, &deleted, &added) {
             Ok(pairs) => {
                 for (from, to, similarity) in pairs {
                     if let Some(r) = rows
@@ -673,20 +680,41 @@ fn render_content(
 /// `(from, to, similarity)` as reported by `diff -M`.
 type RenamePair = (Vec<u8>, Vec<u8>, u8);
 
-/// D5: a temp index that is a **copy of the refreshed private index**, `add -N` the added
-/// paths, then `diff -M -z --name-status`. Returns `(from, to, similarity)`.
+/// D5: a temp index holding exactly the pile's **deleted rows at their baselines**
+/// (`read-tree --empty` + `update-index --index-info`), `add -N` the added paths, then
+/// `diff -M -z --name-status`. Returns `(from, to, similarity)`.
+///
+/// The index is built from the rows, not copied from the private index: the private index
+/// is the seen tree, and the pile is `diff(tree ⊕ overrides, worktree)`. A copy would let
+/// `diff -M` pair an addition with a path the user already accepted as deleted (override
+/// `null`, no row), or score a deleted row against the tree's blob instead of its accepted
+/// one — and since compaction folds overrides into the tree, the pairing would then change
+/// across a fold that changes no baseline.
 fn detect_renames(
     store: &Store,
-    index: &PrivateIndex,
     index_tmp: &Path,
+    deleted: &[(Vec<u8>, Entry)],
     added: &[Vec<u8>],
 ) -> Result<Vec<RenamePair>, ScanError> {
     let _ = std::fs::remove_file(index_tmp);
-    std::fs::copy(index.path(), index_tmp).map_err(|e| StoreError::Io {
-        path: index_tmp.to_path_buf(),
-        source: e,
-    })?;
     let result = (|| -> Result<Vec<RenamePair>, ScanError> {
+        store
+            .git()
+            .run_with_index(index_tmp, &["read-tree", "--empty"])?;
+        let mut stdin = Vec::new();
+        for (path, e) in deleted {
+            stdin.extend_from_slice(e.mode.as_str().as_bytes());
+            stdin.push(b' ');
+            stdin.extend_from_slice(e.oid.as_str().as_bytes());
+            stdin.push(b'\t');
+            stdin.extend_from_slice(path);
+            stdin.push(0);
+        }
+        store.git().run_stdin(
+            Some(index_tmp),
+            &["update-index", "-z", "--index-info"],
+            &stdin,
+        )?;
         let mut args: Vec<OsString> = vec!["add".into(), "-N".into(), "--".into()];
         args.extend(added.iter().map(|p| OsString::from_vec(p.clone())));
         store.git().run_with_index(index_tmp, &args)?;

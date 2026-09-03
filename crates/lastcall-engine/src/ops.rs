@@ -667,7 +667,7 @@ impl Ops<'_> {
 mod tests {
     use super::*;
     use crate::scan::fixture_tests::Harness;
-    use crate::scan::{Change, pile_lines};
+    use crate::scan::{Change, Rename, pile_lines};
     use lastcall_testkit::fixture_repo::FixtureRepo;
     use lastcall_testkit::tmp::TempDir;
 
@@ -796,6 +796,61 @@ mod tests {
         assert_eq!(h.ledger.overrides.get("f2").unwrap().blob, Some(None));
         assert_eq!(pile_lines(&h.scan().pile), vec!["f3"]);
         assert_eq!(h.scan().pile.row(b"f3").unwrap().change, Change::Modified);
+    }
+
+    /// D5 pairs the pile's rows against their *baselines* (tree ⊕ overrides), never the
+    /// seen tree alone: an accepted deletion is not a rename source, a deleted row whose
+    /// baseline is an override blob scores against that blob, and a fold (which moves
+    /// exactly those overrides into the tree) leaves the pairing untouched.
+    #[test]
+    fn ops_rename_pairing_reads_baselines_so_compact_keeps_the_pile() {
+        let repo = FixtureRepo::new("ops-ren-base").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        let body: String = (0..40).map(|i| format!("line {i}\n")).collect();
+        let other: String = (0..40).map(|i| format!("other {i}\n")).collect();
+        repo.write("old.rs", &body);
+        repo.write("gone.rs", &body);
+        h.mark_seen();
+        assert!(h.scan().pile.is_empty());
+        // `old.rs` is accepted at a full rewrite: its baseline is now an override blob
+        // while the seen tree still holds `body`.
+        repo.write("old.rs", &other);
+        let r = rendered(&h, b"old.rs");
+        assert!(h.ops().accept_file(&r, &NoFault).unwrap().ok());
+        // `gone.rs` is accepted as deleted: override `null`, no row.
+        repo.remove("gone.rs");
+        let r = rendered(&h, b"gone.rs");
+        assert!(h.ops().accept_deletion(&r, &NoFault).unwrap().ok());
+        assert!(h.scan().pile.is_empty());
+        // The accepted content moves, and the accepted-deleted content reappears elsewhere.
+        repo.remove("old.rs");
+        repo.write("new.rs", &other);
+        repo.write("back.rs", &body);
+        let pile = h.scan().pile;
+        assert_eq!(pile_lines(&pile), vec!["back.rs", "new.rs", "old.rs"]);
+        assert!(
+            matches!(
+                pile.row(b"old.rs").unwrap().rename,
+                Some(Rename::To { ref to, similarity }) if to == b"new.rs" && similarity == 100
+            ),
+            "old.rs pairs at its accepted content, not the tree's: {:?}",
+            pile.row(b"old.rs").unwrap().rename
+        );
+        assert!(matches!(
+            pile.row(b"new.rs").unwrap().rename,
+            Some(Rename::From { ref from, .. }) if from == b"old.rs"
+        ));
+        assert_eq!(
+            pile.row(b"back.rs").unwrap().rename,
+            None,
+            "an accepted deletion is not a rename source"
+        );
+        // Folding the two overrides into the tree changes no baseline, so no pairing.
+        h.ops().compact(&NoFault).unwrap();
+        assert!(h.ledger.overrides.is_empty(), "folded");
+        assert_eq!(h.scan().pile, pile, "compact changed the pile");
+        assert!(!h.paths.index_tmp.exists(), "temp index unlinked");
     }
 
     #[test]
@@ -1233,6 +1288,63 @@ mod tests {
             if let Err(e) = result {
                 panic!("{e}");
             }
+        }
+
+        /// Replay one `(files, first, second, pick)` case of the proptest above by hand:
+        /// the pile before and after `compact`.
+        fn replay_compact_case(
+            name: &str,
+            files: &[(&str, &[u8])],
+            first: &[(&str, Option<&[u8]>)],
+            second: &[(&str, Option<&[u8]>)],
+            pick: usize,
+        ) -> (Pile, Pile) {
+            let mut d = Draft::new(name);
+            let files: BTreeMap<String, Vec<u8>> = files
+                .iter()
+                .map(|(n, c)| ((*n).to_owned(), c.to_vec()))
+                .collect();
+            d.reset(&files);
+            for (n, c) in first {
+                d.set(n, *c);
+            }
+            let snapshot = d.scan();
+            assert!(d.ops().accept_all(&snapshot, &NoFault).unwrap().ok());
+            for (n, c) in second {
+                d.set(n, *c);
+            }
+            let pile = d.scan();
+            if !pile.rows.is_empty() {
+                let r = Rendered::of(&pile.rows[pick % pile.rows.len()]);
+                assert!(d.ops().accept_file(&r, &NoFault).unwrap().ok());
+            }
+            let before = d.scan();
+            d.ops().compact(&NoFault).unwrap();
+            (before, d.scan())
+        }
+
+        #[test]
+        fn ops_compact_keeps_the_pile_when_an_accepted_deletion_resembles_an_addition_a() {
+            let (before, after) = replay_compact_case(
+                "lc-compact-a",
+                &[("f3", b""), ("f4", b"l2\nl0\nl3\n")],
+                &[],
+                &[("f4", None), ("f3", None), ("f0", Some(b"l2\nl0\n"))],
+                2,
+            );
+            assert_eq!(after, before, "compact changed the pile");
+        }
+
+        #[test]
+        fn ops_compact_keeps_the_pile_when_an_accepted_deletion_resembles_an_addition_b() {
+            let (before, after) = replay_compact_case(
+                "lc-compact-b",
+                &[],
+                &[("f4", Some(b"l1\nl3\nl1\n")), ("f1", Some(b""))],
+                &[("f0", Some(b"l1\nl1\n")), ("f4", None), ("f1", None)],
+                2,
+            );
+            assert_eq!(after, before, "compact changed the pile");
         }
 
         /// A baseline of unique lines and a current side with a few separated edits
