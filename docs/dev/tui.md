@@ -286,11 +286,43 @@ they survive libtest's capture. Ratatui draws only the cells that changed, so a 
 frame's words are not contiguous in the raw transcript — assert on the `vt100` screen, and
 use the raw log only for escape sequences and ordering.
 
+The two Phase 4 scenes drive the accept loop through the same binary:
+
+- `pty_accept_loop_and_restart` — a fixture "agent" (`FixtureRepo::open_in` on the
+  scene's `alpha`) writes `f1` with two hunks, `f2`, `f3` (committed) and six added files
+  before the reviewer looks; the screen shows `3 repos · 12 files`; `a` on `f1`'s first
+  hunk → `accepted f1 · hunk 1 of 2` and the row reads `+1 −1`; `A` → `accepted f1`, the
+  selection lands on `f2`; `ctrl-a` → `Accept all 11 files across 3 repos?` with `1
+  grouped upstream · 0 collapsed`, `y` → `nothing pending across 3 roots` and `accepted 11
+  files in 3 repos`. Then the scene reads the three `ledger.json` files from the state dir
+  (empty `overrides`, a moved `seen_tree`, alpha's `seen_at.head_commit` = the agent's
+  commit); `q` exits 0 with the terminal restored; the agent runs `git commit -a`; a
+  **second process** on the same state dir shows `scanning 3 roots…` then `watching …`
+  with `nothing pending across 3 roots` and no file row ever drawn (the agent's commit
+  moved HEAD, not a baseline); one more edit shows `M f2  +1 −0` and `1 repo · 1 file · 1
+  hunk`.
+- `pty_accept_refused_when_file_moves` — `f1`'s diff open, the agent appends a line, `A`
+  goes out before the 750 ms debounce has rescanned: the status reads `f1: changed since
+  rendered; not accepted`, the row stays, the ledger has no override; once the rescan
+  shows `M f1  +2 −1`, `A` accepts.
+
+Both print `PTY accept …` timing lines. The status bar is asserted as `<text> · <age>`
+exactly, so `accepted f1` cannot pass for `accepted f1 · hunk 1 of 2`.
+
 ## Probes and logging
 
 - `just probe-tui` — release build, a fixture parent in `/tmp/lc-probe-<pid>/`, then the
   interactive TUI over it with `--poll 1`; prints the `LASTCALL_CONFIG` / `LASTCALL_STATE_DIR`
-  lines first so you can re-run by hand and edit a fixture file from another terminal.
+  lines first so you can re-run by hand and edit a fixture file from another terminal. The
+  accept keys work in it (its banner says so): review the fixture to zero with `a` / `A` /
+  `ctrl-a`, `q`, re-run the printed command with the same two exports — the relaunch shows
+  `nothing pending across 3 roots`.
+- The sponsor's demo on a real working directory, without touching the real state dir:
+  `LASTCALL_STATE_DIR=$(mktemp -d) lastcall` in a parent where an agent has been working;
+  first sight makes everything already there "seen", so edit or let the agent edit, review
+  to zero, `q`, relaunch with the same `LASTCALL_STATE_DIR` → zero. The kickoff's
+  `pty_accept_loop_and_restart` is this recipe under the harness.
+- `just bench` — the performance baseline on the release build (`docs/dev/bench.md`).
 - `just probe-tui-screen` — the transcript form: the PTY harness drives the release binary
   over the same fixture, appends a line to `alpha/f1`, waits for the row's counts to change,
   opens the diff and prints the screen as text plus the exit code after `q`. About three

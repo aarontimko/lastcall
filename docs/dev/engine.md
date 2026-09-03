@@ -84,7 +84,12 @@ at every open beside the copied `core.autocrlf`/`eol`/`filemode`/`ignorecase`: a
 `core.fsmonitor = true` otherwise makes `update-index --refresh` under our `GIT_DIR` wait on a
 daemon that never answers (and starts `fsmonitor--daemon`s as a side effect), and the other
 two would put index extensions into the private index that the seed/refresh path does not
-manage.
+manage. A child's stdin (`hash-object --stdin-paths`, `cat-file --batch`,
+`update-index --index-info`) is written from its own scoped thread while the runner drains
+stdout and stderr: a batch command answers each line as it reads it, so feeding the whole
+input before reading any output deadlocks once both 64 KiB pipes are full — a few thousand
+paths, which is how the Phase 4 bench's 50,000-file drop first hung the scan
+(`git_run_command_feeds_stdin_while_draining_stdout` round-trips 300 KiB through `cat`).
 
 | runner | cwd | env | may write? | used for |
 |---|---|---|---|---|

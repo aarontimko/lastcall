@@ -13,7 +13,8 @@ child and never falls back to a `herdr` on `PATH`.
 |---|---|---|---|
 | unit | `just test-unit` = `cargo test --workspace --lib --bins` | in-module `#[cfg(test)]` only | everywhere, incl. macOS CI |
 | integration | `just test-integration` = `cargo test --workspace --test 'test_integration_*'` | real git; the pinned herdr when `LASTCALL_TEST_HERDR_BIN` is set | CI via `just test-integration-herdr`; Linux blocking, macOS best-effort |
-| e2e | `just test-e2e` = `cargo test --workspace --test 'test_e2e_*'` | the TUI: twenty-three `TestBackend` snapshot scenes and the PTY scenes against the built binary (`docs/dev/tui.md`) | everywhere; the PTY file skips with a visible reason only where no pseudo-terminal can be opened |
+| e2e | `just test-e2e` = `cargo test --workspace --test 'test_e2e_*'` | the TUI: twenty-three `TestBackend` snapshot scenes and seven PTY scenes against the built binary (`docs/dev/tui.md`) | everywhere; the PTY file skips with a visible reason only where no pseudo-terminal can be opened |
+| bench | `just bench` = release build, then `cargo test --release -p lastcall --test test_bench -- --ignored --nocapture --test-threads=1` | the four `#[ignore]`d baseline scenarios (`docs/dev/bench.md`); **not a gate** in Phase 4 — targets are set at the Phase 9 kickoff | by hand, on the machine named in `bench.md` |
 
 `just test` runs the three in order. **`just test-unit` is the canonical suite**; its count is
 the ratchet floor from Phase 2 on (Phase 1 close: 85 engine + 16 testkit + 0 binary = 101, the
@@ -22,7 +23,8 @@ engine + 19 testkit + 64 binary lib + 4 binary main = 255, the Phase 4 floor; Ph
 work (4a): 179 engine + 19 testkit + 64 binary lib + 4 binary main = 266; Phase 4 TUI work
 (4b): 180 engine + 19 testkit + 95 binary lib + 4 binary main = 298; the rename-pairing fix:
 183 engine = 301; the Phase 4 review fold: 183 engine + 19 testkit + 100 binary lib + 4
-binary main = 306).
+binary main = 306; Phase 4 e2e + bench work (4c): 184 engine + 21 testkit + 100 binary lib
++ 4 binary main = 309, the Phase 5 floor).
 The suite never shrinks across commits. One recorded exception: at the Phase 2 code review
 the three filesystem-live watcher tests (up to 30 s waits, real FSEvents) left the unit tier
 for `crates/lastcall-engine/tests/test_integration_watcher.rs` because they contradicted the
@@ -90,8 +92,11 @@ green.
 live update after an edit (the clock starts after the write returns; the minimum of two
 tries must be ≤ 1.75 s and both are printed), hunk keys, a mouse click, a resize, and the
 restored terminal after `q` / Ctrl-C (the raw transcript must carry the mouse-off and
-alternate-screen-off sequences and no log line). The scenes are serialized (one mutex); the
-whole file is about 20 s. Timing lines go to `stderr().write_all` so they survive libtest's
+alternate-screen-off sequences and no log line). The Phase 4 scenes
+(`pty_accept_loop_and_restart`, `pty_accept_refused_when_file_moves`) drive `a` / `A` /
+`ctrl-a` + `y` against a fixture agent's edits, read the `ledger.json` files back after the
+fold, and relaunch a **second process** on the same state dir to show the empty state. The
+scenes are serialized (one mutex); the whole file is about 30 s. Timing lines go to `stderr().write_all` so they survive libtest's
 capture — run it with `-- --nocapture` to see them. If the live-update assertion fails on a
 loaded host, report the measured numbers; do not loosen the budget.
 
@@ -135,6 +140,17 @@ then accept-all and a no-change scan that must hash nothing. Run it by hand with
 the scan pipeline; at the Phase 2 close a scan of everything-unseen was 16 git processes and
 under 0.5 s (it was 2,018 processes and 25 s before blobs were fetched in one
 `cat-file --batch`).
+
+## Not a gate: `test_bench` (`just bench`)
+
+`crates/lastcall/tests/test_bench.rs` is the Phase 4 performance baseline: four
+`#[ignore]`d scenarios at the sizes ruled in `docs/spec/93-phase4-kickoff.md`, run against
+the release build only (a debug build prints a SKIP line) and recorded in
+`docs/dev/bench.md`. Each prints `BENCH <scenario> <metric>=<value>` lines; fixture
+construction is outside every timed region; RSS is `ps -o rss=` sampled by the PTY harness
+(`PtyCommand::sample_rss`, `PtyTui::peak_rss_kb`). No target is asserted in this phase
+(S4's `rows_shown == cap` and `omitted == 50,000 − cap` are correctness assertions, not
+budgets); the Phase 9 kickoff sets the targets against these numbers.
 
 ## How skips are reported
 
