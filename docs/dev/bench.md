@@ -298,6 +298,29 @@ BENCH S1h first_frame_ms=18512
 BENCH S1h peak_rss_kb=23344
 ```
 
+### Re-measured at the end of the phase
+
+The table above was taken right after deliverable 1. Deliverables 2 and 3 landed after it
+(a `read_dir` of the repo dir added to every `Store::open` for the stale-temp-index sweep,
+among other things), so the two scenarios were run again at the branch tip on the same
+machine:
+
+```text
+BENCH S1 open_ms=4291        BENCH S1h open_ms=2202
+BENCH S1 open_spawns=1102    BENCH S1h open_spawns=552
+BENCH S1 roots=100           BENCH S1h roots=50
+BENCH S1 rows=4000           BENCH S1h rows=4000
+BENCH S1 scan_all_ms=4464    BENCH S1h scan_all_ms=3113
+BENCH S1 scan_all_spawns=1700 BENCH S1h scan_all_spawns=850
+BENCH S1 first_pile_ms=4900  BENCH S1h first_pile_ms=2588
+BENCH S1 first_frame_ms=8803 BENCH S1h first_frame_ms=4845
+BENCH S1 peak_rss_kb=29808   BENCH S1h peak_rss_kb=28032
+```
+
+Every figure is inside run-to-run noise of the table (`first_frame_ms` 8762 → 8803 and
+4782 → 4845, under 1 %), spawn counts identical, and both ceilings still met. The sweep's
+one extra `read_dir` per root at open does not show.
+
 ### What changed, in one paragraph
 
 The batched reads alone (the width-1 column against run A) take S1's open from 33.1 s to
