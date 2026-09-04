@@ -288,26 +288,50 @@ fn count_plus(n: usize, plus: bool, noun: &str) -> String {
 }
 
 /// The status line: a transient status with its age, else the hint line — with the
-/// mandatory scope notice (deliverable 8) right-aligned beside the hints, and alone when
-/// the two do not both fit.
+/// mandatory scope notice (deliverable 8) right-aligned beside whichever of the two is
+/// showing, and alone when neither pairing fits.
+///
+/// The notice is mandatory *while a scope is active* (ruling 1, and the "Scope hiding
+/// pending work silently" trap), so a transient status — set at startup, after every
+/// accept, on a HEAD change, on a focus verdict — yields the room rather than hiding it:
+/// the status text is truncated first and the notice keeps its right-hand column.
 fn render_status(app: &App, buf: &mut Buffer, area: Rect) {
     let width = area.width as usize;
+    let notice = app.scope_notice();
+    // The notice needs its own column plus a gap; below that it takes the line alone.
+    let notice_room = notice.as_ref().filter(|n| n.width() + 4 <= width);
     let line = match (&app.status, app.status_age()) {
-        (Some(s), Some(age)) => Line::from(vec![
-            Span::raw(s.text.clone()),
-            Span::styled(format!(" · {age}"), dim()),
-        ]),
-        _ => match app.scope_notice() {
-            None => Line::from(Span::styled(hints(app, area.width), dim())),
-            Some(notice) if notice.width() + 4 > width => Line::from(Span::styled(notice, dim())),
-            Some(notice) => {
+        (Some(s), Some(age)) => {
+            let age = format!(" · {age}");
+            match (notice_room, &notice) {
+                (Some(notice), _) => {
+                    let room = (width - notice.width() - 2).saturating_sub(age.width());
+                    let text = ellipsize(&s.text, room);
+                    let pad = width.saturating_sub(text.width() + age.width() + notice.width());
+                    Line::from(vec![
+                        Span::raw(text),
+                        Span::styled(age, dim()),
+                        Span::raw(" ".repeat(pad)),
+                        Span::styled(notice.clone(), dim()),
+                    ])
+                }
+                (None, Some(notice)) => Line::from(Span::styled(notice.clone(), dim())),
+                (None, None) => {
+                    Line::from(vec![Span::raw(s.text.clone()), Span::styled(age, dim())])
+                }
+            }
+        }
+        _ => match (notice_room, &notice) {
+            (None, None) => Line::from(Span::styled(hints(app, area.width), dim())),
+            (None, Some(notice)) => Line::from(Span::styled(notice.clone(), dim())),
+            (Some(notice), _) => {
                 let room = width - notice.width() - 2;
                 let hints = hints(app, room as u16);
                 let pad = width.saturating_sub(hints.width() + notice.width());
                 Line::from(vec![
                     Span::styled(hints, dim()),
                     Span::raw(" ".repeat(pad)),
-                    Span::styled(notice, dim()),
+                    Span::styled(notice.clone(), dim()),
                 ])
             }
         },
@@ -1627,6 +1651,47 @@ mod tests {
         // Nothing under the width of the counts alone survives but the counts.
         let (narrow, _) = frame_of(&app, 40, 12);
         assert!(narrow.contains("lastcall  0 repos"), "{narrow}");
+    }
+
+    /// Deliverable 8 / ruling 1: the scope notice is mandatory *while the scope is
+    /// active*, not merely while the status line happens to be free. A transient status —
+    /// one is set at startup, after every accept, on a HEAD change and on a focus verdict,
+    /// and lives 30 s — shares the row with it: status left, notice right, the status text
+    /// truncated first. Below the notice's own width the notice takes the row alone.
+    #[test]
+    fn render_scope_notice_survives_a_transient_status() {
+        use crate::tui::herdr::{HerdrUpdate, Scope};
+        let mut app = three_roots();
+        app.herdr.scoped = true;
+        app.handle(Action::Herdr(HerdrUpdate::Scope(Some(Scope {
+            label: "alpha".to_owned(),
+            roots: [root("alpha")].into_iter().collect(),
+        }))));
+        let notice = app.scope_notice().expect("a scope is active");
+        assert_eq!(notice, "scope: alpha · 2 repos hidden (w shows all)");
+
+        // With no status the notice sits beside the hints (the pre-existing layout).
+        let (frame, _) = frame_of(&app, 100, 12);
+        assert!(frame.contains("repos hidden"), "{frame}");
+
+        // With one set it is still there — this is what the old code dropped.
+        app.set_status("accepted f1 in alpha");
+        let last = |frame: &str| frame.lines().last().unwrap().trim_matches('"').to_owned();
+        let (frame, _) = frame_of(&app, 100, 12);
+        let row = last(&frame);
+        assert!(row.contains("repos hidden"), "{row}");
+        assert!(row.starts_with("accepted f1 in alpha · 0s"), "{row}");
+        assert!(row.trim_end().ends_with(&notice), "{row}");
+
+        // A long status yields the room rather than pushing the notice off the row.
+        app.set_status("x".repeat(200));
+        let row = last(&frame_of(&app, 100, 12).0);
+        assert!(row.trim_end().ends_with(&notice), "{row}");
+        assert!(row.contains('…'), "the status is what truncates: {row}");
+
+        // Too narrow for both: the notice keeps the row, the status yields entirely.
+        let row = last(&frame_of(&app, 46, 12).0);
+        assert_eq!(row.trim_end(), notice);
     }
 
     #[test]

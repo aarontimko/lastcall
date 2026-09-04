@@ -934,3 +934,27 @@ fn tui_herdr_scope_notice() {
     );
     snapshot("tui_herdr_scope_notice", &app, W, H);
 }
+
+/// Review (b) F2: the notice is mandatory while the scope is active, and a transient
+/// status owns the status row most of the time (one is set at startup, after every accept,
+/// on a HEAD change and on a focus verdict, for 30 s each). The two share the row — status
+/// left with its age, notice right — instead of the notice disappearing under the status.
+#[test]
+fn tui_herdr_scope_notice_with_status() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    let alpha = root_named(&engine, "alpha");
+    herdr_connected(&mut app);
+    app.handle(Action::Herdr(HerdrUpdate::Scope(Some(Scope {
+        label: "alpha".to_owned(),
+        roots: [alpha].into_iter().collect(),
+    }))));
+    app.herdr.scoped = true;
+    app.set_status("accepted f1 in alpha");
+    let (frame, _) = draw(&app, W, H);
+    let row = frame.lines().last().expect("a status row");
+    assert!(row.contains("repos hidden"), "{row}");
+    assert!(row.contains("accepted f1 in alpha"), "{row}");
+    snapshot("tui_herdr_scope_notice_with_status", &app, W, H);
+}
