@@ -124,6 +124,47 @@ impl HerdrIsolation {
             socket_path,
         })
     }
+
+    /// Every environment variable a herdr process (server or CLI) must be given so it can
+    /// only ever see this isolation.
+    ///
+    /// One list, used by [`SpawnedHerdr::spawn`], [`SpawnedHerdr::respawn`] and
+    /// [`SpawnedHerdr::stop_server`], so a restart cannot drift onto the sponsor's real
+    /// socket or config (kickoff "Operational rules": sacred and untouchable).
+    pub fn env_pairs(&self) -> Vec<(&'static str, &Path)> {
+        vec![
+            ("XDG_CONFIG_HOME", self.config_home.as_path()),
+            ("XDG_RUNTIME_DIR", self.runtime_dir.as_path()),
+            ("HOME", self.home.as_path()),
+            ("XDG_STATE_HOME", self.state_home.as_path()),
+            ("XDG_DATA_HOME", self.data_home.as_path()),
+            ("XDG_CACHE_HOME", self.cache_home.as_path()),
+            ("HERDR_SOCKET_PATH", self.socket_path.as_path()),
+        ]
+    }
+
+    /// Refuse to start or stop anything that is not inside a private `/tmp/lc-…` base.
+    ///
+    /// Called before **every** spawn, respawn and `herdr server stop`: `herdr server stop`
+    /// reads `HERDR_SOCKET_PATH` (`src/session.rs:173-181` at v0.8.2), so a leaked or
+    /// hand-built isolation would stop the sponsor's live session instead of ours.
+    pub fn assert_isolated(&self) -> std::io::Result<()> {
+        let base = self.base.to_string_lossy().to_string();
+        if !base.starts_with("/tmp/lc-") {
+            return Err(std::io::Error::other(format!(
+                "isolation base {base} is not a private /tmp/lc-… dir; refusing to touch it"
+            )));
+        }
+        for (name, path) in self.env_pairs() {
+            if !path.starts_with(&self.base) {
+                return Err(std::io::Error::other(format!(
+                    "{name}={} escapes the isolation base {base}; refusing",
+                    path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A running `herdr server` inside a PTY. Killed on drop.
@@ -151,48 +192,91 @@ impl SpawnedHerdr {
         let bin = std::fs::canonicalize(bin)?;
         let isolation = HerdrIsolation::create()?;
         register_runtime_dir(&isolation.base);
-
-        let pair = native_pty_system()
-            .openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(std::io::Error::other)?;
-
-        let mut cmd = CommandBuilder::new(&bin);
-        cmd.arg("server");
-        // Clear every inherited HERDR_* first: our own shell may be inside herdr.
-        for (key, _) in std::env::vars_os() {
-            if key.to_string_lossy().starts_with("HERDR_") {
-                cmd.env_remove(key);
-            }
-        }
-        cmd.env("XDG_CONFIG_HOME", &isolation.config_home);
-        cmd.env("XDG_RUNTIME_DIR", &isolation.runtime_dir);
-        cmd.env("HOME", &isolation.home);
-        cmd.env("XDG_STATE_HOME", &isolation.state_home);
-        cmd.env("XDG_DATA_HOME", &isolation.data_home);
-        cmd.env("XDG_CACHE_HOME", &isolation.cache_home);
-        cmd.env("HERDR_SOCKET_PATH", &isolation.socket_path);
-        cmd.env("SHELL", "/bin/sh");
-        cmd.cwd(&isolation.base);
-
-        let child = pair
-            .slave
-            .spawn_command(cmd)
-            .map_err(std::io::Error::other)?;
-        let pid = child.process_id();
-        register_spawned_pid(pid, &bin);
-
+        let (master, child, pid) = spawn_server_child(&bin, &isolation)?;
         Ok(Self {
-            _master: pair.master,
+            _master: master,
             child,
             pid,
             bin,
             isolation,
         })
+    }
+
+    /// Stop this server the way a user would — `herdr server stop` **over its own isolated
+    /// socket** — so the socket file is gone deterministically when the call returns
+    /// (`stop_socket_with_timeout` waits for it, `src/session.rs:260-296` at v0.8.2).
+    ///
+    /// A `SIGKILL` would leave the stale socket file behind and the client would see a
+    /// connect refusal instead of a clean disconnect, which is not the scenario G6 means.
+    /// The isolation is re-verified first: this command's whole target is
+    /// `HERDR_SOCKET_PATH`.
+    pub fn stop_server(&mut self, timeout: Duration) -> std::io::Result<()> {
+        self.isolation.assert_isolated()?;
+        let mut cmd = std::process::Command::new(&self.bin);
+        cmd.args(["server", "stop"]);
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("HERDR_") {
+                cmd.env_remove(key);
+            }
+        }
+        for (key, value) in self.isolation.env_pairs() {
+            cmd.env(key, value);
+        }
+        cmd.env("SHELL", "/bin/sh");
+        cmd.current_dir(&self.isolation.base);
+        let output = cmd.output()?;
+        if !output.status.success() {
+            return Err(std::io::Error::other(format!(
+                "`herdr server stop` exited {:?}: {}{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout).trim(),
+                String::from_utf8_lossy(&output.stderr).trim(),
+            )));
+        }
+        // The server process itself must go away too, or `respawn` would race it for the
+        // socket path.
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            match self.child.try_wait() {
+                Ok(Some(_)) | Err(_) => {
+                    unregister_spawned_pid(self.pid);
+                    self.pid = None;
+                    return Ok(());
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "herdr did not exit within {timeout:?} after `server stop`; ps says: {}",
+                self.pid.map_or("(no pid)".to_string(), ps_snapshot)
+            ),
+        ))
+    }
+
+    /// Start a fresh server on the **same** socket path and config dir (scenario G6): the
+    /// client's discovery is pinned to that path, so a restart anywhere else would not be a
+    /// reconnect.
+    ///
+    /// `isolation` must be this spawner's own — it is taken as an argument so the call site
+    /// reads as the kickoff names it, and is checked rather than trusted.
+    pub fn respawn(&mut self, isolation: &HerdrIsolation) -> std::io::Result<()> {
+        if isolation.socket_path != self.isolation.socket_path {
+            return Err(std::io::Error::other(format!(
+                "respawn: {} is not this server's socket ({})",
+                isolation.socket_path.display(),
+                self.isolation.socket_path.display()
+            )));
+        }
+        if self.pid.is_some() {
+            self.stop_server(Duration::from_secs(5))?;
+        }
+        let (master, child, pid) = spawn_server_child(&self.bin, &self.isolation)?;
+        self._master = master;
+        self.child = child;
+        self.pid = pid;
+        Ok(())
     }
 
     pub fn socket_path(&self) -> &Path {
@@ -240,6 +324,70 @@ impl SpawnedHerdr {
         self.pid
             .is_some_and(|pid| process_matches_binary(pid, &self.bin))
     }
+}
+
+/// Launch one `<bin> server` inside a PTY under `isolation`. Shared by
+/// [`SpawnedHerdr::spawn`] and [`SpawnedHerdr::respawn`] so a restart cannot use a different
+/// environment than the first start.
+type SpawnedChild = (
+    Box<dyn MasterPty + Send>,
+    Box<dyn Child + Send + Sync>,
+    Option<u32>,
+);
+
+fn spawn_server_child(bin: &Path, isolation: &HerdrIsolation) -> std::io::Result<SpawnedChild> {
+    isolation.assert_isolated()?;
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(std::io::Error::other)?;
+
+    let mut cmd = CommandBuilder::new(bin);
+    cmd.arg("server");
+    // Clear every inherited HERDR_* first: our own shell may be inside herdr.
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("HERDR_") {
+            cmd.env_remove(key);
+        }
+    }
+    for (key, value) in isolation.env_pairs() {
+        cmd.env(key, value);
+    }
+    cmd.env("SHELL", "/bin/sh");
+    cmd.cwd(&isolation.base);
+
+    let child = pair
+        .slave
+        .spawn_command(cmd)
+        .map_err(std::io::Error::other)?;
+    let pid = child.process_id();
+    register_spawned_pid(pid, bin);
+
+    // Drain the master, or the server cannot exit.
+    //
+    // `portable_pty` gives the child its own session (`setsid`) with this pty as its
+    // *controlling* terminal (`unix.rs:255-274`). When such a process exits, the kernel
+    // revokes the controlling terminal, and that blocks until the tty's output queue drains.
+    // Nobody was reading this master, so a full queue left `herdr server stop` with a process
+    // wedged in macOS `ps` state `E` ("trying to exit") forever — the G6 restart timed out.
+    // We do not want the output, only the drain; reading to EOF also ends the thread by
+    // itself when the master is dropped on respawn.
+    if let Ok(mut reader) = pair.master.try_clone_reader() {
+        std::thread::spawn(move || {
+            let mut sink = [0u8; 8192];
+            while let Ok(n) = std::io::Read::read(&mut reader, &mut sink) {
+                if n == 0 {
+                    break;
+                }
+            }
+        });
+    }
+
+    Ok((pair.master, child, pid))
 }
 
 impl Drop for SpawnedHerdr {
@@ -347,6 +495,21 @@ pub fn process_matches_binary(pid: u32, bin: &Path) -> bool {
     (same_path || same_name) && parent_pid(pid) == Some(std::process::id())
 }
 
+/// `ps -o pid=,ppid=,stat=,comm= -p <pid>`, for diagnostics in failure messages: a harness
+/// that only says "it did not exit" cannot tell a live server from a zombie.
+pub fn ps_snapshot(pid: u32) -> String {
+    match std::process::Command::new("ps")
+        .args(["-o", "pid=,ppid=,stat=,comm=", "-p", &pid.to_string()])
+        .output()
+    {
+        Ok(out) if out.status.success() && !out.stdout.is_empty() => {
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+        Ok(_) => format!("(pid {pid} not in ps)"),
+        Err(e) => format!("(ps failed: {e})"),
+    }
+}
+
 /// `ps -o ppid= -p <pid>`; `None` when the process is gone or `ps` fails.
 pub fn parent_pid(pid: u32) -> Option<u32> {
     let output = std::process::Command::new("ps")
@@ -423,6 +586,50 @@ mod tests {
         ));
         // A PID that certainly does not exist.
         assert!(!process_matches_binary(u32::MAX - 1, Path::new("/bin/sh")));
+    }
+
+    #[test]
+    fn herdr_spawn_isolation_env_covers_every_path_herdr_reads() {
+        let iso = HerdrIsolation::create().unwrap();
+        let pairs = iso.env_pairs();
+        let names: Vec<&str> = pairs.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            names,
+            vec![
+                "XDG_CONFIG_HOME",
+                "XDG_RUNTIME_DIR",
+                "HOME",
+                "XDG_STATE_HOME",
+                "XDG_DATA_HOME",
+                "XDG_CACHE_HOME",
+                "HERDR_SOCKET_PATH",
+            ]
+        );
+        // Every one of them stays inside the private base: this is what `assert_isolated`
+        // checks before a spawn, a respawn or a `herdr server stop`.
+        for (_, path) in &pairs {
+            assert!(path.starts_with(&iso.base), "{}", path.display());
+        }
+        iso.assert_isolated().expect("a fresh isolation is private");
+        std::fs::remove_dir_all(&iso.base).unwrap();
+    }
+
+    #[test]
+    fn herdr_spawn_assert_isolated_refuses_a_real_looking_socket() {
+        // The failure this guards: a hand-built isolation whose socket is the sponsor's own.
+        let mut iso = HerdrIsolation::create().unwrap();
+        let base = iso.base.clone();
+        iso.socket_path = PathBuf::from("/Users/someone/.local/state/herdr/herdr.sock");
+        let err = iso.assert_isolated().expect_err("escaping socket refused");
+        assert!(err.to_string().contains("HERDR_SOCKET_PATH"), "{err}");
+        // And a base that is not a private /tmp/lc-… dir at all.
+        let outside = HerdrIsolation {
+            base: PathBuf::from("/tmp/not-ours"),
+            ..iso
+        };
+        let err = outside.assert_isolated().expect_err("foreign base refused");
+        assert!(err.to_string().contains("refusing to touch it"), "{err}");
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
