@@ -14,11 +14,12 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use lastcall_engine::count::with_thousands;
-use lastcall_engine::engine::{AcceptRequest, Accepted, RootState};
+use lastcall_engine::engine::{AcceptRequest, Accepted, EngineError, RootState};
 use lastcall_engine::git::Oid;
 use lastcall_engine::headstate::InProgress;
 use lastcall_engine::hunks::Hunk;
-use lastcall_engine::ops::Rendered;
+use lastcall_engine::ledger::LedgerError;
+use lastcall_engine::ops::{OpsError, Rendered};
 use lastcall_engine::roots::Badge;
 use lastcall_engine::scan::{Annotation, Change, Group, Pile, Row};
 use lastcall_engine::store::RootKind;
@@ -289,6 +290,33 @@ pub const NOTHING_TO_ACCEPT: &str = "nothing to accept";
 
 /// How long a status notice stays on the status line before the key hints return.
 pub const STATUS_TTL: Duration = Duration::from_secs(30);
+
+/// One root's accept result, as the loop hands it to the reducer.
+pub type AcceptResult = Result<Accepted, AcceptFailed>;
+
+/// Why one root's accept failed.
+///
+/// `LedgerBusy` is separate because it is a *whole-root* condition — another lastcall
+/// process is mid-write on this root's ledger — where every `Refused` carries a row path and
+/// renders against that row. It stays an `Err` off the accepted path so nothing is marked
+/// seen, and the row it was asked for is still pending when the status line appears
+/// (Phase 5 deliverable 2c).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcceptFailed {
+    LedgerBusy,
+    Other(String),
+}
+
+impl AcceptFailed {
+    /// Classify what `Engine::accept` returned. Matched on the typed error, never on the
+    /// message text.
+    pub fn of(e: &EngineError) -> Self {
+        match e {
+            EngineError::Ops(OpsError::Ledger(LedgerError::LockBusy { .. })) => Self::LedgerBusy,
+            other => Self::Other(other.to_string()),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct App {
@@ -742,7 +770,7 @@ impl App {
     /// path as a watcher pile (seq included), then the §6.7 advance rule runs for the
     /// selection the accept was asked from, `accepting` clears and one status line says
     /// what happened. An `Err` for one root is named in the status and undoes nothing.
-    pub fn accepted(&mut self, results: Vec<(PathBuf, Result<Accepted, String>)>) -> Changed {
+    pub fn accepted(&mut self, results: Vec<(PathBuf, AcceptResult)>) -> Changed {
         let inflight = self.accepting.take();
         let before = self.selection.clone();
         let mut changed = if inflight.is_some() {
@@ -760,7 +788,16 @@ impl App {
                     ok_roots.push(root.clone());
                     changed = changed.or(self.apply_pile(root, acc.seq, acc.pile));
                 }
-                Err(e) => errors.push(format!("{}: {e}", self.root_name(&root))),
+                // A busy ledger is a whole-root condition, not a per-row refusal: another
+                // lastcall process holds this root's lock. Say so plainly and leave the row
+                // pending — the same keystroke works a moment later (Phase 5 deliverable 2c).
+                Err(AcceptFailed::LedgerBusy) => errors.push(format!(
+                    "ledger busy in {} — try again",
+                    self.root_name(&root)
+                )),
+                Err(AcceptFailed::Other(e)) => {
+                    errors.push(format!("{}: {e}", self.root_name(&root)))
+                }
             }
         }
         let Some(Accepting { scope, files }) = inflight else {
@@ -1357,7 +1394,7 @@ pub(crate) mod testfix {
     }
 
     /// An engine answer for `root`: a clean outcome, `seq`, and `pile` as the rescan.
-    pub fn accepted_ok(name: &str, seq: u64, pile: Pile) -> (PathBuf, Result<Accepted, String>) {
+    pub fn accepted_ok(name: &str, seq: u64, pile: Pile) -> (PathBuf, AcceptResult) {
         (
             root(name),
             Ok(Accepted {
@@ -2090,13 +2127,56 @@ mod tests {
         assert_eq!(status(&app), "accepted f1 (deleted)");
     }
 
+    /// A second lastcall process held the root's ledger lock (Phase 5 deliverable 2c). The
+    /// status line says so in the root's own words, the row is *not* marked seen, and it is
+    /// still there to try again — this is deliberately not a `Refused`, which would render
+    /// against the row and read like the file changed underneath.
+    #[test]
+    fn app_accept_refused_by_a_busy_ledger_says_try_again_and_leaves_the_row_pending() {
+        let mut app = three_roots();
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Accept);
+        let changed = app.accepted(vec![(root("alpha"), Err(AcceptFailed::LedgerBusy))]);
+        assert_eq!(changed, Changed::Yes);
+        assert_eq!(status(&app), "ledger busy in alpha — try again");
+        assert!(
+            app.roots[&root("alpha")].listed(),
+            "alpha's pile is untouched, so the row is still pending"
+        );
+        assert_eq!(
+            app.selection,
+            Some(row("alpha", "f1")),
+            "the cursor did not move on"
+        );
+        assert_eq!(
+            app.accepting, None,
+            "the request is over; the key works again"
+        );
+    }
+
+    /// The classification is on the typed error, not on the message text.
+    #[test]
+    fn app_accept_failed_classifies_lock_busy_and_nothing_else() {
+        use lastcall_engine::paths::RepoPaths;
+        let busy = EngineError::Ops(OpsError::Ledger(LedgerError::LockBusy {
+            path: RepoPaths::under("/state/repo".into()).lock,
+            retries: 40,
+        }));
+        assert_eq!(AcceptFailed::of(&busy), AcceptFailed::LedgerBusy);
+        let other = EngineError::NoSuchRoot("/gone".into());
+        assert_eq!(
+            AcceptFailed::of(&other),
+            AcceptFailed::Other("no such root: /gone".into())
+        );
+    }
+
     #[test]
     fn app_multi_root_accepted_with_one_err_applies_others_and_names_failed_root() {
         let mut app = three_roots();
         app.select(Some(row("beta", "u1")));
         app.handle(Action::AcceptAll);
         let changed = app.accepted(vec![
-            (root("alpha"), Err("boom".into())),
+            (root("alpha"), Err(AcceptFailed::Other("boom".into()))),
             accepted_ok("beta", 2, Pile::default()),
             accepted_ok("notes", 2, Pile::default()),
         ]);

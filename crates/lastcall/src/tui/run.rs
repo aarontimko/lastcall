@@ -28,14 +28,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crossterm::event::Event;
-use lastcall_engine::engine::{AcceptRequest, Accepted, Engine};
+use lastcall_engine::engine::{AcceptRequest, Engine};
 use lastcall_engine::scan::Pile;
 use lastcall_engine::watcher::{EngineEvent, EngineTimings, Watcher, blocking};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 
-use super::app::{App, Changed, Effect, RootMeta};
+use super::app::{AcceptFailed, AcceptResult, App, Changed, Effect, RootMeta};
 use super::input::{Action, Key, Keymap, modal_action, pointer, to_action};
 use super::render::{HitMap, Pane, render};
 use super::term;
@@ -54,7 +54,7 @@ pub enum Local {
     /// the reducer can drop an older watcher pile that lands after it.
     Pile(PathBuf, u64, Pile),
     /// An `Effect::Accept` finished: one result per root it covered.
-    Accepted(Vec<(PathBuf, Result<Accepted, String>)>),
+    Accepted(Vec<(PathBuf, AcceptResult)>),
     /// The engine's roots after a `SyncRoots`.
     Roots(Vec<RootMeta>),
     /// The `Refresh` finished (all its piles were sent first).
@@ -297,7 +297,7 @@ fn spawn_accept(
             blocking(&engine, move |e| {
                 reqs.into_iter()
                     .map(|(root, req)| {
-                        let result = e.accept(&root, req).map_err(|e| e.to_string());
+                        let result = e.accept(&root, req).map_err(|e| AcceptFailed::of(&e));
                         (root, result)
                     })
                     .collect::<Vec<_>>()

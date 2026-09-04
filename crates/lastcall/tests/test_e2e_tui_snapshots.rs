@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use lastcall::tui::app::{App, Effect, RootMeta, Selection};
+use lastcall::tui::app::{AcceptFailed, App, Effect, RootMeta, Selection};
 use lastcall::tui::input::Action;
 use lastcall::tui::render::{render, styles};
 use lastcall_engine::engine::{Engine, EngineOptions};
@@ -468,7 +468,7 @@ fn run_accept(app: &mut App, engine: &mut Engine, effect: Option<Effect>) {
     let results = reqs
         .into_iter()
         .map(|(root, req)| {
-            let result = engine.accept(&root, req).map_err(|e| e.to_string());
+            let result = engine.accept(&root, req).map_err(|e| AcceptFailed::of(&e));
             (root, result)
         })
         .collect();
