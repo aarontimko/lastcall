@@ -662,11 +662,11 @@ pub fn run(
                     }
                     Some(Effect::Toast(request)) => {
                         if let Some(tx) = &link.toast {
-                            for name in request.ready {
-                                let _ = tx.send(ToastMsg::Ready(name));
+                            for (root, name) in request.ready {
+                                let _ = tx.send(ToastMsg::Ready { root, name });
                             }
-                            for name in request.dropped {
-                                let _ = tx.send(ToastMsg::Drop(name));
+                            for root in request.dropped {
+                                let _ = tx.send(ToastMsg::Drop(root));
                             }
                         }
                     }

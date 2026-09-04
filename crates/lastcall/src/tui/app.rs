@@ -1272,13 +1272,13 @@ impl App {
         if !self.herdr.ack(&root) {
             return (Changed::No, None);
         }
-        let name = self.root_name(&root);
         self.reconcile_selection();
+        // Keyed by path, so acking `/A/proj` leaves `/B/proj` in the window (review (b) F5).
         (
             Changed::Yes,
             Some(Effect::Toast(ToastRequest {
                 ready: Vec::new(),
-                dropped: vec![name],
+                dropped: vec![root],
             })),
         )
     }
@@ -1313,8 +1313,12 @@ impl App {
                 let delta = self.herdr.apply_roots(derived);
                 self.reconcile_selection();
                 let request = ToastRequest {
-                    ready: delta.opened.iter().map(|r| self.root_name(r)).collect(),
-                    dropped: delta.closed.iter().map(|r| self.root_name(r)).collect(),
+                    ready: delta
+                        .opened
+                        .iter()
+                        .map(|r| (r.clone(), self.root_name(r)))
+                        .collect(),
+                    dropped: delta.closed.clone(),
                 };
                 let effect =
                     (self.herdr.toast && !request.is_empty()).then_some(Effect::Toast(request));
@@ -3002,7 +3006,7 @@ mod tests {
             effect,
             Some(Effect::Toast(ToastRequest {
                 ready: Vec::new(),
-                dropped: vec!["alpha".to_owned()],
+                dropped: vec![root("alpha")],
             }))
         );
         assert_eq!(
@@ -3039,7 +3043,7 @@ mod tests {
         assert_eq!(
             effect,
             Some(Effect::Toast(ToastRequest {
-                ready: vec!["alpha".to_owned()],
+                ready: vec![(root("alpha"), "alpha".to_owned())],
                 dropped: Vec::new(),
             }))
         );
@@ -3058,7 +3062,7 @@ mod tests {
             effect,
             Some(Effect::Toast(ToastRequest {
                 ready: Vec::new(),
-                dropped: vec!["alpha".to_owned()],
+                dropped: vec![root("alpha")],
             }))
         );
 

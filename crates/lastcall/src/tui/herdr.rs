@@ -102,13 +102,18 @@ pub struct Scope {
     pub roots: BTreeSet<PathBuf>,
 }
 
-/// What the reducer tells the toast task after a re-derivation or an ack: the display
-/// names of the roots whose ready episode just opened, and of those whose episode ended
-/// (acked, or the agent moved off `done`) before the coalescing window fired.
+/// What the reducer tells the toast task after a re-derivation or an ack: the roots whose
+/// ready episode just opened, and those whose episode ended (acked, or the agent moved off
+/// `done`) before the coalescing window fired.
+///
+/// Both halves are keyed by **path**, never by the display name: two checkouts can share a
+/// basename, and a window keyed by name would collapse them into one entry and let an ack
+/// of either withdraw both (review (b) F5). The name rides along with an opened episode
+/// only so the task can label it — the identity is the path.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ToastRequest {
-    pub ready: Vec<String>,
-    pub dropped: Vec<String>,
+    pub ready: Vec<(PathBuf, String)>,
+    pub dropped: Vec<PathBuf>,
 }
 
 impl ToastRequest {
@@ -563,13 +568,30 @@ pub const TOAST_TITLE_MAX: usize = 80;
 /// Body cap (§5.9).
 pub const TOAST_BODY_MAX: usize = 240;
 
-/// What the reducer tells the toast task.
+/// What the reducer tells the toast task, one root at a time. Keyed by path (review (b)
+/// F5); `name` is what the window should call this root when it fires.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToastMsg {
-    /// This root's name went ready; start or extend the window.
-    Ready(String),
+    /// This root went ready; start or extend the window.
+    Ready { root: PathBuf, name: String },
     /// This root was acked (or its episode ended) before the window fired: drop it.
-    Drop(String),
+    Drop(PathBuf),
+}
+
+/// The names one window shows, formatted at fire time from the pending roots (review (b)
+/// F5). A name two pending roots share is qualified by its parent directory, so `/A/proj`
+/// and `/B/proj` read as `A/proj, B/proj` rather than twice the same word.
+pub fn toast_names(pending: &[(PathBuf, String)]) -> Vec<String> {
+    let shared = |name: &str| pending.iter().filter(|(_, n)| n == name).count() > 1;
+    pending
+        .iter()
+        .map(
+            |(root, name)| match root.parent().and_then(Path::file_name) {
+                Some(parent) if shared(name) => format!("{}/{name}", parent.to_string_lossy()),
+                _ => name.clone(),
+            },
+        )
+        .collect()
 }
 
 /// Title and body for a window, sanitised and capped (§5.9).
@@ -644,62 +666,103 @@ fn retryable(reason: &str) -> bool {
     matches!(reason, "busy" | "rate_limited")
 }
 
+/// One window's `notification.show`, with the verdict folded in: `Some(held)` when the
+/// refusal earns the single retry (ruling 5), `None` when there is nothing more to do.
+async fn show_window<T: Transport>(
+    transport: &T,
+    pending: &[(PathBuf, String)],
+    updates: &mpsc::UnboundedSender<HerdrUpdate>,
+) -> Option<Vec<(PathBuf, String)>> {
+    match show_once(transport, &toast_names(pending)).await {
+        Ok(shown) if shown.shown => {
+            let _ = updates.send(HerdrUpdate::Toast(Ok(shown)));
+            None
+        }
+        Ok(shown) if retryable(&shown.reason) => {
+            tracing::debug!(reason = %shown.reason, "toast refused; one retry");
+            Some(pending.to_vec())
+        }
+        Ok(shown) => {
+            tracing::debug!(reason = %shown.reason, "toast refused");
+            None
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "toast failed");
+            None
+        }
+    }
+}
+
+/// A deadline that may not exist: `None` never resolves, so the arm stays parked.
+async fn due_at(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
 /// The toast task: coalesce every `Ready` inside a [`TOAST_DELAY`] window, drop what was
 /// acked meanwhile, then send **one** `notification.show`; retry once after
 /// [`TOAST_RETRY`] on `busy`/`rate_limited`, drop on anything else. Ends when `rx` closes.
+///
+/// The retry is **timer state**, not a `sleep` inside the arm (review (b) F6): while it
+/// waits, an ack still withdraws its root, and a root that goes ready still starts its own
+/// 7 s window from the moment it arrived rather than from the end of the wait.
 pub async fn toast_loop<T: Transport>(
     transport: T,
     mut rx: mpsc::UnboundedReceiver<ToastMsg>,
     updates: mpsc::UnboundedSender<HerdrUpdate>,
 ) {
-    let mut pending: Vec<String> = Vec::new();
+    // Arrival order, one entry per path.
+    let mut pending: Vec<(PathBuf, String)> = Vec::new();
     let mut deadline: Option<tokio::time::Instant> = None;
+    // The single retry a refusal earned, with the names it holds.
+    let mut retry: Option<(tokio::time::Instant, Vec<(PathBuf, String)>)> = None;
     loop {
-        // Copied out so the timer future borrows nothing the other arm assigns to.
+        // Copied out so the timer futures borrow nothing the other arms assign to.
         let due = deadline;
-        let sleep = async {
-            match due {
-                Some(at) => tokio::time::sleep_until(at).await,
-                None => std::future::pending().await,
-            }
-        };
+        let retry_due = retry.as_ref().map(|(at, _)| *at);
         tokio::select! {
             msg = rx.recv() => match msg {
                 None => return,
-                Some(ToastMsg::Ready(name)) => {
-                    if !pending.contains(&name) {
-                        pending.push(name);
+                Some(ToastMsg::Ready { root, name }) => {
+                    match pending.iter_mut().find(|(p, _)| *p == root) {
+                        Some(slot) => slot.1 = name,
+                        None => pending.push((root, name)),
                     }
                     deadline = Some(tokio::time::Instant::now() + TOAST_DELAY);
                 }
-                Some(ToastMsg::Drop(name)) => {
-                    pending.retain(|n| *n != name);
+                Some(ToastMsg::Drop(root)) => {
+                    pending.retain(|(p, _)| *p != root);
                     if pending.is_empty() {
                         deadline = None;
                     }
+                    // An ack that lands mid-retry withdraws that root from the retry too.
+                    if let Some((_, held)) = &mut retry {
+                        held.retain(|(p, _)| *p != root);
+                        if held.is_empty() {
+                            retry = None;
+                        }
+                    }
                 }
             },
-            _ = sleep => {
+            _ = due_at(due) => {
                 deadline = None;
                 let names = std::mem::take(&mut pending);
                 if names.is_empty() {
                     continue;
                 }
-                let first = show_once(&transport, &names).await;
-                let outcome = match &first {
-                    Ok(shown) if !shown.shown && retryable(&shown.reason) => {
-                        tokio::time::sleep(TOAST_RETRY).await;
-                        show_once(&transport, &names).await
-                    }
-                    _ => first,
-                };
-                match outcome {
-                    Ok(shown) if shown.shown => {
-                        let _ = updates.send(HerdrUpdate::Toast(Ok(shown)));
-                    }
-                    Ok(shown) => tracing::debug!(reason = %shown.reason, "toast refused"),
-                    Err(e) => tracing::debug!(error = %e, "toast failed"),
+                if let Some(held) = show_window(&transport, &names, &updates).await {
+                    retry = Some((tokio::time::Instant::now() + TOAST_RETRY, held));
                 }
+            }
+            _ = due_at(retry_due) => {
+                let Some((_, names)) = retry.take() else {
+                    continue;
+                };
+                // Ruling 5: this is the second request and there is never a third, so the
+                // verdict of the retry is read for its log line and nothing else.
+                let _ = show_window(&transport, &names, &updates).await;
             }
         }
     }
@@ -1218,6 +1281,20 @@ mod tests {
             .collect()
     }
 
+    /// A `Ready` for a root path, named the way the reducer names it (the basename).
+    fn ready_at(path: &str) -> ToastMsg {
+        let root = PathBuf::from(path);
+        let name = root
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        ToastMsg::Ready { root, name }
+    }
+
+    fn drop_at(path: &str) -> ToastMsg {
+        ToastMsg::Drop(PathBuf::from(path))
+    }
+
     fn last_params(control: &MockControl) -> Value {
         control
             .requests()
@@ -1232,10 +1309,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn herdr_toast_coalesces_a_window_into_one_notification() {
         let (control, tx, mut updates, task) = toaster(vec![shown()]);
-        tx.send(ToastMsg::Ready("alpha".to_owned())).unwrap();
+        tx.send(ready_at("/W/alpha")).unwrap();
         tokio::time::sleep(TOAST_DELAY / 2).await;
-        tx.send(ToastMsg::Ready("beta".to_owned())).unwrap();
-        tx.send(ToastMsg::Ready("beta".to_owned())).unwrap();
+        tx.send(ready_at("/W/beta")).unwrap();
+        tx.send(ready_at("/W/beta")).unwrap();
         tokio::time::sleep(TOAST_DELAY * 2).await;
 
         assert_eq!(shows(&control).len(), 1, "one window, one request");
@@ -1259,10 +1336,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn herdr_toast_drops_an_acked_name_and_sends_nothing_when_empty() {
         let (control, tx, _updates, task) = toaster(vec![shown()]);
-        tx.send(ToastMsg::Ready("alpha".to_owned())).unwrap();
-        tx.send(ToastMsg::Ready("beta".to_owned())).unwrap();
+        tx.send(ready_at("/W/alpha")).unwrap();
+        tx.send(ready_at("/W/beta")).unwrap();
         tokio::time::sleep(TOAST_DELAY / 2).await;
-        tx.send(ToastMsg::Drop("alpha".to_owned())).unwrap();
+        tx.send(drop_at("/W/alpha")).unwrap();
         tokio::time::sleep(TOAST_DELAY * 2).await;
         assert_eq!(shows(&control).len(), 1);
         assert_eq!(
@@ -1271,9 +1348,9 @@ mod tests {
         );
 
         control.clear_requests();
-        tx.send(ToastMsg::Ready("gamma".to_owned())).unwrap();
+        tx.send(ready_at("/W/gamma")).unwrap();
         tokio::time::sleep(TOAST_DELAY / 2).await;
-        tx.send(ToastMsg::Drop("gamma".to_owned())).unwrap();
+        tx.send(drop_at("/W/gamma")).unwrap();
         tokio::time::sleep(TOAST_DELAY * 3).await;
         assert!(shows(&control).is_empty(), "an emptied window is not sent");
         drop(tx);
@@ -1285,7 +1362,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn herdr_toast_retries_once_on_busy_and_never_a_third_time() {
         let (control, tx, mut updates, task) = toaster(vec![refused("busy"), refused("busy")]);
-        tx.send(ToastMsg::Ready("alpha".to_owned())).unwrap();
+        tx.send(ready_at("/W/alpha")).unwrap();
         tokio::time::sleep(TOAST_DELAY + TOAST_RETRY * 4).await;
         let at = shows(&control);
         assert_eq!(at.len(), 2, "one retry, never a third: {at:?}");
@@ -1302,10 +1379,85 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn herdr_toast_drops_a_non_retryable_refusal() {
         let (control, tx, mut updates, task) = toaster(vec![refused("do_not_disturb"), shown()]);
-        tx.send(ToastMsg::Ready("alpha".to_owned())).unwrap();
+        tx.send(ready_at("/W/alpha")).unwrap();
         tokio::time::sleep(TOAST_DELAY + TOAST_RETRY * 4).await;
         assert_eq!(shows(&control).len(), 1, "no retry");
         assert!(updates.try_recv().is_err());
+        drop(tx);
+        task.await.unwrap();
+    }
+
+    /// Review (b) F5: the window is keyed by path, not by the display name, so two
+    /// checkouts that share a basename are two entries — and an ack of one leaves the
+    /// other's toast standing.
+    #[tokio::test(start_paused = true)]
+    async fn herdr_toast_keys_the_window_by_path_not_by_display_name() {
+        let (control, tx, _updates, task) = toaster(vec![shown(), shown()]);
+        tx.send(ready_at("/A/proj")).unwrap();
+        tx.send(ready_at("/B/proj")).unwrap();
+        tokio::time::sleep(TOAST_DELAY * 2).await;
+        assert_eq!(shows(&control).len(), 1, "one window");
+        let params = last_params(&control);
+        assert_eq!(params["title"], "lastcall: 2 repos ready for review");
+        assert_eq!(
+            params["body"], "A/proj, B/proj",
+            "two entries, each qualified by its parent"
+        );
+
+        control.clear_requests();
+        tx.send(ready_at("/A/proj")).unwrap();
+        tx.send(ready_at("/B/proj")).unwrap();
+        tokio::time::sleep(TOAST_DELAY / 2).await;
+        tx.send(drop_at("/A/proj")).unwrap();
+        tokio::time::sleep(TOAST_DELAY * 2).await;
+        assert_eq!(shows(&control).len(), 1);
+        assert_eq!(
+            last_params(&control)["title"],
+            "lastcall: proj ready for review",
+            "acking /A/proj withdraws only /A/proj"
+        );
+        drop(tx);
+        task.await.unwrap();
+    }
+
+    /// Review (b) F6 (a): the retry is timer state, so an ack that lands during the 5 s
+    /// wait withdraws its root and the retry never goes out.
+    #[tokio::test(start_paused = true)]
+    async fn herdr_toast_an_ack_during_the_retry_wait_cancels_it() {
+        let (control, tx, _updates, task) = toaster(vec![refused("busy"), shown()]);
+        tx.send(ready_at("/W/alpha")).unwrap();
+        tokio::time::sleep(TOAST_DELAY + Duration::from_secs(1)).await;
+        assert_eq!(shows(&control).len(), 1, "the window fired at 7 s");
+        tx.send(drop_at("/W/alpha")).unwrap();
+        tokio::time::sleep(TOAST_RETRY * 4).await;
+        assert_eq!(shows(&control).len(), 1, "an acked root is not retried");
+        drop(tx);
+        task.await.unwrap();
+    }
+
+    /// Review (b) F6 (b): a root that goes ready at 9 s, while the retry for another root
+    /// is still waiting, gets its own window at 16 s — not at 19 s, behind the wait.
+    #[tokio::test(start_paused = true)]
+    async fn herdr_toast_a_ready_during_the_retry_wait_starts_its_window_on_time() {
+        let (control, tx, _updates, task) =
+            toaster(vec![refused("busy"), refused("busy"), shown()]);
+        tx.send(ready_at("/W/alpha")).unwrap();
+        tokio::time::sleep(Duration::from_secs(9)).await;
+        tx.send(ready_at("/W/beta")).unwrap();
+        tokio::time::sleep(Duration::from_secs(30)).await;
+
+        let at = shows(&control);
+        assert_eq!(at.len(), 3, "alpha, alpha's retry, beta: {at:?}");
+        assert_eq!(at[1] - at[0], TOAST_RETRY, "alpha's retry, 5 s after 7 s");
+        assert_eq!(
+            at[2] - at[0],
+            Duration::from_secs(9),
+            "beta arrived at 9 s and fires at 16 s: {at:?}"
+        );
+        assert_eq!(
+            last_params(&control)["title"],
+            "lastcall: beta ready for review"
+        );
         drop(tx);
         task.await.unwrap();
     }
