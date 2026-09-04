@@ -31,8 +31,8 @@ separator and the selected-header band: 102 binary lib = 313; the nav-pane hunk 
 focus arrows and the shift-drag note: 106 binary lib = 317; the deletion-row hunk accept
 (sponsor-found, `a4e353c`): 185 engine = 318, the Phase 5 floor; Phase 5 engine and TUI work
 (5a/5b): 205 engine + 24 testkit + 146 binary lib + 5 binary main = 380; Phase 5 real-server
-and schema work (5c, the `herdr_schema` projection's own tests): 33 testkit = **389**, the
-Phase 6 floor).
+and schema work (5c, the `herdr_schema` projection's own tests and the isolation-collision
+test): 34 testkit = **390**, the Phase 6 floor).
 The suite never shrinks across commits. One recorded exception: at the Phase 2 code review
 the three filesystem-live watcher tests (up to 30 s waits, real FSEvents) left the unit tier
 for `crates/lastcall-engine/tests/test_integration_watcher.rs` because they contradicted the
@@ -280,10 +280,16 @@ sanctioned network fetch besides cargo and rustup) and exports the variable.
 
 ## Isolation for the real herdr (`lastcall_testkit::herdr_spawn`)
 
-Per spawn: `/tmp/lc-<pid>-<nanos>/` (never `$TMPDIR` — macOS caps Unix socket paths at 104
-bytes; the path is asserted under 100), private `XDG_CONFIG_HOME`, `XDG_RUNTIME_DIR`, `HOME`,
-explicit `HERDR_SOCKET_PATH`, `SHELL=/bin/sh`, `onboarding = false` written before spawning,
-every inherited `HERDR_*` removed. Socket readiness is polled (`exists && connect`) every 25 ms
+Per spawn: `/tmp/lc-<pid>-<nanos>-<n>/` (never `$TMPDIR` — macOS caps Unix socket paths at 104
+bytes; the path is asserted under 100). The trailing counter is load-bearing: macOS's
+`SystemTime::now()` is microsecond-grained, so two tests in one binary that spawn together
+used to land on the same base and the second herdr exited with `error: herdr server is
+already running`. The base is created with `create_dir`, so any future collision is a plain
+error rather than a shared socket, and the drain thread keeps the last 8 KiB the server wrote
+so a start that fails quotes herdr's own words. Inside that base: private
+`XDG_CONFIG_HOME`, `XDG_RUNTIME_DIR`, `HOME`, `XDG_STATE_HOME`, `XDG_DATA_HOME`,
+`XDG_CACHE_HOME`, an explicit `HERDR_SOCKET_PATH`, `SHELL=/bin/sh`, `onboarding = false`
+written before spawning, and every inherited `HERDR_*` removed. Socket readiness is polled (`exists && connect`) every 25 ms
 up to 5 s. Kill-on-drop and kill-on-panic through a PID registry with a matcher
 (`ps -o comm= -p`) that refuses to kill anything it did not spawn. Safe wrappers only
 (`unsafe_code = "forbid"`, no `libc`).
@@ -293,7 +299,8 @@ never a signal, never the user's herdr) and waits for the pid to leave `ps`; `re
 a new one on the same socket path with the same `HerdrIsolation`, which is what G6 needs. One
 subtlety is load-bearing there: `portable_pty` gives the child its own session with the pty as
 its **controlling** terminal, and the kernel's revoke at exit blocks until the tty output
-queue drains — so `spawn_server_child` runs a thread that reads the master and throws it away.
+queue drains — so `spawn_server_child` runs a thread that reads the master (keeping only the
+tail).
 Without it a stopped herdr wedges in macOS `ps` state `E` and `stop_server` times out after
 10 s; with it the stop takes about 200 ms. The timeout error prints a `ps` line for the pid,
 so a future wedge says what state it wedged in.

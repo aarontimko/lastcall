@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, Once, OnceLock};
+use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -60,13 +60,23 @@ pub fn write_skip_notice() {
     let _ = err.flush();
 }
 
-/// `/tmp/lc-<pid>-<nanos>` (herdr uses `/tmp/hapi-<pid>-<nanos>` for the same reason).
+/// `/tmp/lc-<pid>-<nanos>-<n>` (herdr uses `/tmp/hapi-<pid>-<nanos>` for the same reason).
+///
+/// The counter is not decoration. macOS reports `SystemTime::now()` at **microsecond**
+/// granularity (every value here ends in `000`), so two tests in one binary that spawn a
+/// server at the same moment used to get the *same* base — and therefore the same
+/// `HERDR_SOCKET_PATH`, at which point the second server found the first's socket and exited
+/// with `error: herdr server is already running`. The process-wide counter makes two
+/// isolations in one process distinct whatever the clock does, and the pid keeps two
+/// processes apart.
 pub fn unique_test_dir() -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    PathBuf::from(format!("/tmp/lc-{}-{nanos}", std::process::id()))
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    PathBuf::from(format!("/tmp/lc-{}-{nanos}-{n}", std::process::id()))
 }
 
 /// The per-spawn directories and the explicit socket path.
@@ -103,6 +113,11 @@ impl HerdrIsolation {
                 socket_path.display()
             )));
         }
+        // `create_dir`, not `create_dir_all`: an already-existing base means two isolations
+        // collided, and a shared socket path is exactly the failure this must not reach.
+        std::fs::create_dir(&base).map_err(|e| {
+            std::io::Error::new(e.kind(), format!("isolation base {}: {e}", base.display()))
+        })?;
         std::fs::create_dir_all(config_home.join("herdr"))?;
         std::fs::create_dir_all(&runtime_dir)?;
         std::fs::create_dir_all(&home)?;
@@ -172,6 +187,8 @@ pub struct SpawnedHerdr {
     _master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
     pid: Option<u32>,
+    /// What this server last wrote to its pty (the drain thread keeps it).
+    tail: PtyTail,
     bin: PathBuf,
     isolation: HerdrIsolation,
 }
@@ -192,11 +209,12 @@ impl SpawnedHerdr {
         let bin = std::fs::canonicalize(bin)?;
         let isolation = HerdrIsolation::create()?;
         register_runtime_dir(&isolation.base);
-        let (master, child, pid) = spawn_server_child(&bin, &isolation)?;
+        let (master, child, pid, tail) = spawn_server_child(&bin, &isolation)?;
         Ok(Self {
             _master: master,
             child,
             pid,
+            tail,
             bin,
             isolation,
         })
@@ -272,10 +290,11 @@ impl SpawnedHerdr {
         if self.pid.is_some() {
             self.stop_server(Duration::from_secs(5))?;
         }
-        let (master, child, pid) = spawn_server_child(&self.bin, &self.isolation)?;
+        let (master, child, pid, tail) = spawn_server_child(&self.bin, &self.isolation)?;
         self._master = master;
         self.child = child;
         self.pid = pid;
+        self.tail = tail;
         Ok(())
     }
 
@@ -301,7 +320,8 @@ impl SpawnedHerdr {
         while Instant::now() < deadline {
             if let Ok(Some(status)) = self.child.try_wait() {
                 return Err(std::io::Error::other(format!(
-                    "herdr exited before its socket appeared: {status:?}"
+                    "herdr exited before its socket appeared: {status:?}; it said: {}",
+                    tail_text(&self.tail)
                 )));
             }
             let path = &self.isolation.socket_path;
@@ -313,8 +333,9 @@ impl SpawnedHerdr {
         Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             format!(
-                "socket did not appear at {} within {timeout:?}",
-                self.isolation.socket_path.display()
+                "socket did not appear at {} within {timeout:?}; the server said: {}",
+                self.isolation.socket_path.display(),
+                tail_text(&self.tail)
             ),
         ))
     }
@@ -333,7 +354,32 @@ type SpawnedChild = (
     Box<dyn MasterPty + Send>,
     Box<dyn Child + Send + Sync>,
     Option<u32>,
+    PtyTail,
 );
+
+/// The last [`PTY_TAIL_MAX`] bytes the server wrote to its pty, kept by the drain thread so
+/// that a server which dies at startup can say why.
+type PtyTail = Arc<Mutex<Vec<u8>>>;
+
+/// How much of the server's own output to keep. Its startup banner and any panic fit easily.
+const PTY_TAIL_MAX: usize = 8192;
+
+/// The kept tail as one line, for an error message. Empty when the server said nothing.
+fn tail_text(tail: &PtyTail) -> String {
+    let bytes = tail.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let text = String::from_utf8_lossy(&bytes);
+    let joined = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    if joined.is_empty() {
+        "(the server wrote nothing)".to_owned()
+    } else {
+        joined
+    }
+}
 
 fn spawn_server_child(bin: &Path, isolation: &HerdrIsolation) -> std::io::Result<SpawnedChild> {
     isolation.assert_isolated()?;
@@ -374,20 +420,29 @@ fn spawn_server_child(bin: &Path, isolation: &HerdrIsolation) -> std::io::Result
     // revokes the controlling terminal, and that blocks until the tty's output queue drains.
     // Nobody was reading this master, so a full queue left `herdr server stop` with a process
     // wedged in macOS `ps` state `E` ("trying to exit") forever — the G6 restart timed out.
-    // We do not want the output, only the drain; reading to EOF also ends the thread by
-    // itself when the master is dropped on respawn.
+    // Reading to EOF also ends the thread by itself when the master is dropped on respawn.
+    // The last few KiB are kept so that a server which exits at startup can be quoted back
+    // in the error instead of dying silently.
+    let tail: PtyTail = Arc::new(Mutex::new(Vec::new()));
     if let Ok(mut reader) = pair.master.try_clone_reader() {
+        let tail = Arc::clone(&tail);
         std::thread::spawn(move || {
             let mut sink = [0u8; 8192];
             while let Ok(n) = std::io::Read::read(&mut reader, &mut sink) {
                 if n == 0 {
                     break;
                 }
+                let mut kept = tail.lock().unwrap_or_else(|e| e.into_inner());
+                kept.extend_from_slice(&sink[..n]);
+                if kept.len() > PTY_TAIL_MAX {
+                    let cut = kept.len() - PTY_TAIL_MAX;
+                    kept.drain(..cut);
+                }
             }
         });
     }
 
-    Ok((pair.master, child, pid))
+    Ok((pair.master, child, pid, tail))
 }
 
 impl Drop for SpawnedHerdr {
@@ -563,6 +618,23 @@ pub fn kill_all_registered() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two servers in one test binary must never share a socket path. macOS's clock is
+    /// microsecond-grained, so the timestamp alone is not unique across threads that start
+    /// together — and a shared path makes the second herdr exit with "already running".
+    #[test]
+    fn herdr_spawn_isolation_bases_are_unique_across_threads() {
+        let dirs: Vec<PathBuf> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..16).map(|_| scope.spawn(unique_test_dir)).collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let unique: std::collections::BTreeSet<&PathBuf> = dirs.iter().collect();
+        assert_eq!(
+            unique.len(),
+            dirs.len(),
+            "colliding isolation bases: {dirs:?}"
+        );
+    }
 
     #[test]
     fn herdr_spawn_isolation_dirs_are_short_and_carry_onboarding_off() {
