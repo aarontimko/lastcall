@@ -6,7 +6,7 @@ compared against. It is not a gate: nothing here fails a build.
 
 ## How the numbers are taken
 
-`just bench` builds the release binary and runs the four `#[ignore]`d scenarios of
+`just bench` builds the release binary and runs the five `#[ignore]`d scenarios of
 `crates/lastcall/tests/test_bench.rs` (`cargo test --release -p lastcall --test test_bench
 -- --ignored --nocapture --test-threads=1`). Each scenario prints one
 `BENCH <scenario> <metric>=<value>` line per metric to stderr; the table below is those
@@ -195,6 +195,126 @@ BENCH S4 scan_spawns=18
 BENCH S4 rows_shown=10000
 BENCH S4 omitted=40000
 ```
+
+## Phase 5 (run C): the batched reads and the bounded pool
+
+`docs/spec/94-phase5-kickoff.md` deliverable 1. Three things changed between run A and
+this one: one `config --list -z` and one batched `rev-parse` per root instead of seven
+`--get`s and six separate `rev-parse`s (1c), roots opened and scanned on a bounded thread
+pool of `min(available_parallelism(), 8)` (1a/1b), and the watcher's initial pass going
+through `Engine::scan_all` instead of scanning one root at a time behind the engine mutex.
+
+Two columns are measured, on the same machine, from the same commit, over freshly built
+fixtures: **pool off** is the whole run with `LASTCALL_PARALLELISM=1`, which pins both the
+engine's pool and the binary's to one thread and so isolates the pool from the batched
+reads; **after** is the default width (8 on this machine). Run A's numbers are the Phase 4
+baseline at commit `3579bf1`, kept for the columns that are comparable.
+
+Machine block: unchanged from above except the date (2026-09-04) and the commit (this
+branch, `eaad038` plus the watcher change). Command:
+
+```text
+cargo build --release -p lastcall
+cargo test --release -p lastcall --test test_bench -- --ignored --nocapture --test-threads=1 bench_s1
+```
+
+### S1 — 100 clones, 40 edited files each (4,000 rows)
+
+| metric | run A (Phase 4) | pool off (width 1) | after (width 8) |
+|---|---|---|---|
+| `open_ms` | 33050 | 12954 | 4228 |
+| `open_spawns` | 2902 | 1102 | 1102 |
+| `roots` | 100 | 100 | 100 |
+| `rows` | 4000 | 4000 | 4000 |
+| `scan_all_ms` | 25553 | 23801 | 4493 |
+| `scan_all_spawns` | 1900 | 1700 | 1700 |
+| `first_pile_ms` | 33623 | 13851 | 4803 |
+| `first_frame_ms` | 56568 | 35947 | 8762 |
+| `peak_rss_kb` | 31936 | 28288 | 28736 |
+
+### S1h — 50 clones, 80 edited files each (4,000 rows)
+
+New in Phase 5: the same 4,000 rows as S1 but half the roots and twice the files each, so
+that the per-root cost and the per-row cost can be told apart. No run-A column exists; the
+scenario did not.
+
+| metric | pool off (width 1) | after (width 8) |
+|---|---|---|
+| `open_ms` | 6484 | 2179 |
+| `open_spawns` | 552 | 552 |
+| `roots` | 50 | 50 |
+| `rows` | 4000 | 4000 |
+| `scan_all_ms` | 13348 | 3437 |
+| `scan_all_spawns` | 850 | 850 |
+| `first_pile_ms` | 6977 | 2641 |
+| `first_frame_ms` | 18512 | 4782 |
+| `peak_rss_kb` | 23344 | 27968 |
+
+### The raw `BENCH` lines
+
+Width 8 (`cargo test --release … bench_s1`):
+
+```text
+BENCH S1 open_ms=4228
+BENCH S1 open_spawns=1102
+BENCH S1 roots=100
+BENCH S1 rows=4000
+BENCH S1 scan_all_ms=4493
+BENCH S1 scan_all_spawns=1700
+BENCH S1 first_pile_ms=4803
+BENCH S1 first_frame_ms=8762
+BENCH S1 peak_rss_kb=28736
+BENCH S1h open_ms=2179
+BENCH S1h open_spawns=552
+BENCH S1h roots=50
+BENCH S1h rows=4000
+BENCH S1h scan_all_ms=3437
+BENCH S1h scan_all_spawns=850
+BENCH S1h first_pile_ms=2641
+BENCH S1h first_frame_ms=4782
+BENCH S1h peak_rss_kb=27968
+```
+
+Width 1 (`LASTCALL_PARALLELISM=1 cargo test --release … bench_s1`):
+
+```text
+BENCH S1 open_ms=12954
+BENCH S1 open_spawns=1102
+BENCH S1 roots=100
+BENCH S1 rows=4000
+BENCH S1 scan_all_ms=23801
+BENCH S1 scan_all_spawns=1700
+BENCH S1 first_pile_ms=13851
+BENCH S1 first_frame_ms=35947
+BENCH S1 peak_rss_kb=28288
+BENCH S1h open_ms=6484
+BENCH S1h open_spawns=552
+BENCH S1h roots=50
+BENCH S1h rows=4000
+BENCH S1h scan_all_ms=13348
+BENCH S1h scan_all_spawns=850
+BENCH S1h first_pile_ms=6977
+BENCH S1h first_frame_ms=18512
+BENCH S1h peak_rss_kb=23344
+```
+
+### What changed, in one paragraph
+
+The batched reads alone (the width-1 column against run A) take S1's open from 33.1 s to
+13.0 s: **29 git processes per root at open became 11** — nine in `open_root` plus two in
+discovery — and the head inspection inside a scan going from six spawns to four took the
+**per-scan count from 19 per root to 17**. Time per spawn is unchanged, so the open is
+still git-process bound; there are simply fewer processes. The pool is the rest: at width
+8, open falls 12.95 s → 4.23 s and `scan_all` 23.80 s → 4.49 s, both close to the ×5–6 an
+8-wide pool of I/O-bound children reaches on ten cores. The user-visible number,
+`first_frame_ms`, is **56568 → 8762** on S1 (6.5×, against the kickoff's ≥ 4× and its
+14,142 ms ceiling) and **4782 on S1h** (ceiling 6,000). Two thirds of the S1 gain came from
+the pool and one third from the batching, and the last piece was the watcher: its initial
+pass used to scan one root at a time behind the engine mutex, which the pool cannot help,
+so the gap between the first pile and the full frame stayed at ~22 s until that pass became
+one `scan_all` (S1's first pile is still streamed on its own, so `first_pile_ms` is
+unaffected). `peak_rss_kb` moves by less than the sampler's noise: eight concurrent roots
+cost about 0.4 MB over one on S1, and nothing near a per-root allocation.
 
 ## What the first run found
 

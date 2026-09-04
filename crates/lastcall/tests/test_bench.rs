@@ -1,5 +1,5 @@
 //! The Phase 4 performance baseline (kickoff deliverable 10; `docs/dev/bench.md`). Not a
-//! gate: four `#[ignore]`d scenarios at the ruled sizes, run only against the release
+//! gate: five `#[ignore]`d scenarios at the ruled sizes, run only against the release
 //! build by
 //!
 //! ```text
@@ -26,9 +26,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use lastcall_engine::config::Config;
-use lastcall_engine::engine::{DEFAULT_ROW_CAP, Engine};
+use lastcall_engine::engine::{DEFAULT_ROW_CAP, Engine, EngineOptions, default_parallelism};
 use lastcall_engine::git::spawn_count;
-use lastcall_testkit::engine::open_engine;
+use lastcall_testkit::engine::open_engine_with;
 use lastcall_testkit::fixture_repo::{FixtureRepo, engine_env_for};
 use lastcall_testkit::pty_tui::{PtyCommand, PtyTui, vt100};
 use lastcall_testkit::tmp::TempDir;
@@ -43,6 +43,16 @@ const S2_COLLAPSE_SIZE_BYTES: u64 = 16_777_216;
 const S2_LINES: usize = 100_000;
 const S3_FILES: usize = 1_000;
 const S4_FILES: usize = 50_000;
+
+/// `LASTCALL_PARALLELISM` as the built binary reads it, for the in-process metrics.
+fn parallelism_env() -> Option<usize> {
+    std::env::var_os("LASTCALL_PARALLELISM")?
+        .to_str()?
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|n| *n >= 1)
+}
 
 fn note(line: &str) {
     let mut err = std::io::stderr();
@@ -120,7 +130,21 @@ impl Bench {
 
     fn engine(&self) -> Engine {
         let env = engine_env_for(&self.parent, &self.home, &self.state);
-        open_engine(&self.parent, &env, &self.state, self.config.clone())
+        // `LASTCALL_PARALLELISM` reaches the built binary on its own (the PTY inherits the
+        // bench's environment); honoring it here too is what makes a whole `just bench` run
+        // at width 1 the *before* column for Phase 5 — same machine, same commit, same
+        // fixtures, the pool the only difference.
+        let options = EngineOptions {
+            parallelism: parallelism_env().unwrap_or_else(default_parallelism),
+            ..EngineOptions::default()
+        };
+        open_engine_with(
+            &self.parent,
+            &env,
+            &self.state,
+            self.config.clone(),
+            options,
+        )
     }
 
     /// First sight of every root, in process, before the scenario's mutation.
@@ -274,6 +298,82 @@ fn bench_s1_clones_100_rows_4000() {
         .unwrap_or_else(|e| panic!("header: {e}"));
     bench(S, "first_frame_ms", t.elapsed().as_millis());
     // Two more `--poll 1` rescans of all 100 roots before the RSS peak is read.
+    std::thread::sleep(Duration::from_secs(2));
+    quit(&mut pty);
+    rss(S, &pty);
+}
+
+/// S1h: the same 4,000 pending rows as S1, but as **50 clones of 80 files** instead of 100
+/// of 40 — half the roots, twice the work each. S1 measures the per-root overhead (a root
+/// is a fixed number of git spawns however small it is); S1h holds the row count fixed and
+/// halves the number of roots, so the two together separate per-root cost from per-row
+/// cost, and a pool that only helps when there are many tiny roots shows up as S1
+/// improving while S1h does not (Phase 5 deliverable 1d).
+#[test]
+#[ignore]
+fn bench_s1h_clones_50_files_80_rows_4000() {
+    fresh_line();
+    if !release_build() {
+        return;
+    }
+    const S: &str = "S1h";
+    let b = Bench::new("s1h", None);
+    let files: Vec<(String, String)> = (0..80)
+        .map(|j| (format!("src/m{j:02}.rs"), format!("fn m{j}() {{}}\n")))
+        .collect();
+    let refs: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(a, c)| (a.as_str(), c.as_str()))
+        .collect();
+    let built = Instant::now();
+    let repos: Vec<FixtureRepo> = (0..50)
+        .map(|i| {
+            let mut repo = b.repo(&format!("r{i:03}"));
+            repo.commit_files(&refs, "eighty files").expect("commit");
+            repo
+        })
+        .collect();
+    b.first_sight(50);
+    for repo in &repos {
+        for (path, _) in &files {
+            repo.write(path, format!("{path} edited\n"));
+        }
+    }
+    note(&format!(
+        "--- S1h fixture: 50 clones × 80 edits built in {:.1?} (not timed)",
+        built.elapsed()
+    ));
+
+    let before = spawn_count();
+    let t = Instant::now();
+    let mut engine = b.engine();
+    bench(S, "open_ms", t.elapsed().as_millis());
+    bench(S, "open_spawns", spawn_count() - before);
+    let before = spawn_count();
+    let t = Instant::now();
+    let results = engine.scan_all();
+    let wall = t.elapsed();
+    let spawns = spawn_count() - before;
+    drop(engine);
+    let rows: usize = results
+        .iter()
+        .map(|(_, _, r)| r.as_ref().map_or(0, |p| p.rows.len()))
+        .sum();
+    assert_eq!(results.len(), 50);
+    assert_eq!(rows, 4_000, "every edit is a row");
+    bench(S, "roots", results.len());
+    bench(S, "rows", rows);
+    bench(S, "scan_all_ms", wall.as_millis());
+    bench(S, "scan_all_spawns", spawns);
+
+    let t = Instant::now();
+    let mut pty = b.tui(&["tui", "--poll", "1"]);
+    pty.wait_for(LONG, |s| s.contents().contains("1 repo · 80 files"))
+        .unwrap_or_else(|e| panic!("first pile: {e}"));
+    bench(S, "first_pile_ms", t.elapsed().as_millis());
+    pty.wait_for_text("50 repos · 4,000 files", LONG)
+        .unwrap_or_else(|e| panic!("header: {e}"));
+    bench(S, "first_frame_ms", t.elapsed().as_millis());
     std::thread::sleep(Duration::from_secs(2));
     quit(&mut pty);
     rss(S, &pty);
