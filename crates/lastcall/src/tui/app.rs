@@ -713,8 +713,10 @@ impl App {
                 }
             }
             AcceptScope::All => {
+                // "Every listed root" is the nav's own rule (deliverable 8): a root the
+                // active scope hides is not on screen, so accept-all never touches it.
                 for (root, view) in &self.roots {
-                    if view.listed() {
+                    if view.listed() && self.is_listed(view) {
                         out.push((root.clone(), AcceptRequest::All(view.pile.clone())));
                     }
                 }
@@ -751,8 +753,12 @@ impl App {
                 }
             }
             AcceptScope::All => {
+                // The same rule as `accept_requests`, so the confirm modal's numbers and
+                // names describe exactly the roots the accept will cover.
                 for (root, view) in &self.roots {
-                    tally(root, &view.rows().iter().collect::<Vec<_>>());
+                    if self.is_listed(view) {
+                        tally(root, &view.rows().iter().collect::<Vec<_>>());
+                    }
                 }
             }
         }
@@ -3127,6 +3133,58 @@ mod tests {
             (Changed::No, None),
             "re-deriving the same scope while it is off is not a redraw"
         );
+    }
+
+    /// Deliverable 8: "accept-all under scope covers listed roots only". `^A` folds every
+    /// **listed** root, and the scope is what decides listing — a hidden root's rows are
+    /// neither accepted nor named in the confirm modal.
+    #[test]
+    fn app_herdr_accept_all_under_scope_covers_listed_roots_only() {
+        let mut app = three_roots();
+        app.herdr.scoped = true;
+        app.handle(Action::Herdr(HerdrUpdate::Scope(Some(Scope {
+            label: "alpha".to_owned(),
+            roots: [root("alpha")].into_iter().collect(),
+        }))));
+        assert_eq!(app.listed_roots().count(), 1, "beta and notes are hidden");
+
+        // The requests the reducer would hand the engine name alpha and nothing else.
+        assert_eq!(
+            app.accept_requests(&AcceptScope::All)
+                .into_iter()
+                .map(|(r, _)| r)
+                .collect::<Vec<_>>(),
+            vec![root("alpha")],
+            "a hidden root is not accepted behind the user's back"
+        );
+        // And so do the confirm modal's numbers: alpha's two rows, alpha's name.
+        let counts = app.counts_of(&AcceptScope::All);
+        assert_eq!(counts.roots, vec!["alpha".to_owned()]);
+        assert_eq!(
+            counts.files, 2,
+            "beta's two and notes' one are out of scope"
+        );
+
+        // Above the threshold the modal shows that same tally, and `y` accepts that set.
+        app.apply(pile_event_seq("alpha", 1, rows_n(11, 0, 0)));
+        assert_eq!(app.handle(Action::AcceptAll).1, None, "eleven files ask");
+        let counts = app.confirm_counts().expect("the modal is open");
+        assert_eq!(counts.roots, vec!["alpha".to_owned()]);
+        assert_eq!(counts.files, 11);
+        let (_, effect) = app.handle(Action::Confirm);
+        let Some(Effect::Accept(reqs)) = effect else {
+            panic!("y starts the accept: {effect:?}")
+        };
+        assert_eq!(
+            reqs.into_iter().map(|(r, _)| r).collect::<Vec<_>>(),
+            vec![root("alpha")]
+        );
+
+        // `w` shows all three again, and then accept-all covers all three.
+        app.accepting = None;
+        app.handle(Action::ScopeToggle);
+        assert_eq!(app.counts_of(&AcceptScope::All).roots.len(), 3);
+        assert_eq!(app.accept_requests(&AcceptScope::All).len(), 3);
     }
 
     /// The confirm modal and the help overlay are the user's own state: herdr news folds
