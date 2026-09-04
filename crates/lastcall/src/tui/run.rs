@@ -29,6 +29,10 @@ use std::time::Duration;
 
 use crossterm::event::Event;
 use lastcall_engine::engine::{AcceptRequest, Engine};
+use lastcall_engine::env::Env;
+use lastcall_engine::herdr::HerdrEvent;
+use lastcall_engine::herdr::client::ClientHandle;
+use lastcall_engine::herdr::transport::SocketTransport;
 use lastcall_engine::scan::Pile;
 use lastcall_engine::watcher::{EngineEvent, EngineTimings, Watcher, blocking};
 use ratatui::Terminal;
@@ -36,6 +40,7 @@ use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 
 use super::app::{AcceptFailed, AcceptResult, App, Changed, Effect, RootMeta};
+use super::herdr::{self, HerdrLink, HerdrPlan, HerdrUpdate, Link, ToastMsg};
 use super::input::{Action, Key, Keymap, modal_action, pointer, to_action};
 use super::render::{HitMap, Pane, render};
 use super::term;
@@ -46,6 +51,10 @@ pub const SHUTDOWN_BUDGET: Duration = Duration::from_millis(500);
 pub const INPUT_POLL: Duration = Duration::from_millis(50);
 /// Status-line ages advance this often.
 pub const TICK: Duration = Duration::from_secs(1);
+/// How long a burst of `worktree.*` events is coalesced before one discovery rescan
+/// (deliverable 7): long enough that `git worktree add`'s own file churn settles, short
+/// enough that the new repo appears while the user is still looking at the screen.
+pub const WORKTREE_DEBOUNCE: Duration = Duration::from_millis(500);
 
 /// Results of the engine work the loop spawned on the app's behalf.
 #[derive(Debug, Clone, PartialEq)]
@@ -64,6 +73,8 @@ pub enum Local {
     /// An engine task died (panicked): the panic hook has already restored the terminal,
     /// so the loop must end. `run` reports the text on stderr and fails.
     Fatal(String),
+    /// A herdr request the loop made off the UI task came back (`agent.focus`, a toast).
+    Herdr(HerdrUpdate),
 }
 
 /// The terminal-free core of the loop: the app, the keymap, and the hit map of the last
@@ -161,6 +172,7 @@ impl Ui {
                 self.app.set_status(text);
                 (Changed::No, Some(Effect::Quit))
             }
+            Local::Herdr(update) => self.app.handle(Action::Herdr(update)),
         }
     }
 
@@ -174,16 +186,21 @@ impl Ui {
 pub trait Shutdown {
     /// Leave the alternate screen, drop mouse capture and raw mode.
     fn restore(&mut self);
+    /// Stop the herdr client and wait for it, bounded (deliverable 4: a dead socket must
+    /// not hold the quit path open).
+    fn shutdown_herdr(&mut self);
     /// Stop the watcher and wait for it, bounded.
     fn join_watcher(&mut self);
     /// Shut the runtime down, bounded.
     fn shutdown_runtime(&mut self);
 }
 
-/// Restore the terminal **first** (the screen is sane even if shutdown hangs), then join
-/// the watcher, then shut the runtime down.
+/// Restore the terminal **first** (the screen is sane even if shutdown hangs), then stop
+/// the herdr client, then join the watcher, then shut the runtime down. Every step after
+/// the first is bounded by [`SHUTDOWN_BUDGET`], so `q` always returns the shell.
 pub fn shut_down(s: &mut impl Shutdown) {
     s.restore();
+    s.shutdown_herdr();
     s.join_watcher();
     s.shutdown_runtime();
 }
@@ -195,6 +212,7 @@ struct RealShutdown {
     guard: Option<term::TerminalGuard>,
     runtime: Option<tokio::runtime::Runtime>,
     watcher: Option<Watcher>,
+    herdr: Option<ClientHandle>,
 }
 
 impl Shutdown for RealShutdown {
@@ -204,6 +222,14 @@ impl Shutdown for RealShutdown {
         }
         drop(self.guard.take());
         term::restore();
+    }
+
+    fn shutdown_herdr(&mut self) {
+        if let (Some(h), Some(rt)) = (self.herdr.take(), self.runtime.as_ref()) {
+            // `ClientHandle::drop` aborts the task anyway; this only gives the connections
+            // a bounded chance to close politely first.
+            block_bounded(rt, SHUTDOWN_BUDGET, h.shutdown());
+        }
     }
 
     fn join_watcher(&mut self) {
@@ -338,6 +364,93 @@ async fn joined<T>(
     }
 }
 
+/// The loop's half of the herdr link: what it needs to derive, to request, and to stop.
+/// The reducer sees none of this (§6.6).
+#[derive(Default)]
+struct Herdr {
+    handle: Option<ClientHandle>,
+    transport: Option<SocketTransport>,
+    events: Option<mpsc::Receiver<HerdrEvent>>,
+    toast: Option<mpsc::UnboundedSender<ToastMsg>>,
+    workspace_id: Option<String>,
+}
+
+impl Herdr {
+    /// Take the link apart into the loop's fields and start the toast task.
+    fn adopt(link: HerdrLink, updates: mpsc::UnboundedSender<Local>) -> Herdr {
+        let toast = link.plan.toast.then(|| {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let transport = link.transport.clone();
+            tokio::spawn(async move {
+                let (utx, mut urx) = mpsc::unbounded_channel();
+                let send = tokio::spawn(async move {
+                    while let Some(update) = urx.recv().await {
+                        if updates.send(Local::Herdr(update)).is_err() {
+                            break;
+                        }
+                    }
+                });
+                herdr::toast_loop(transport, rx, utx).await;
+                send.abort();
+            });
+            tx
+        });
+        Herdr {
+            handle: Some(link.handle),
+            transport: Some(link.transport),
+            events: Some(link.events),
+            toast,
+            workspace_id: link.plan.workspace_id,
+        }
+    }
+}
+
+/// The fourth `select!` arm's future: the client's event stream, or forever when there is
+/// no link (`mode = "off"`, or a standalone start).
+async fn herdr_recv(events: &mut Option<mpsc::Receiver<HerdrEvent>>) -> Option<HerdrEvent> {
+    match events {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Re-derive the association and the scope from a fresh snapshot and fold both in
+/// (deliverable 4's trigger set, plus `Local::Roots`).
+fn herdr_rederive(ui: &mut Ui, link: &Herdr) -> (Changed, Option<Effect>) {
+    let Some(cache) = link.handle.as_ref().and_then(ClientHandle::snapshot) else {
+        return (Changed::No, None);
+    };
+    let metas: Vec<RootMeta> = ui.app.roots.values().map(|v| v.meta.clone()).collect();
+    let scope = link
+        .workspace_id
+        .as_deref()
+        .and_then(|id| herdr::derive_scope(&cache, &metas, id));
+    let roots = herdr::derive(&cache, &metas);
+    let (c1, _) = ui.app.handle(Action::Herdr(HerdrUpdate::Scope(scope)));
+    let (c2, effect) = ui.app.handle(Action::Herdr(HerdrUpdate::Roots(roots)));
+    (c1.or(c2), effect)
+}
+
+/// `Effect::Focus`: `agent.focus` off the UI task; the verdict comes back as
+/// `Local::Herdr(Focused)`.
+fn spawn_focus(
+    transport: Option<SocketTransport>,
+    tx: mpsc::UnboundedSender<Local>,
+    pane: String,
+    label: String,
+) {
+    let Some(transport) = transport else {
+        return;
+    };
+    tokio::spawn(async move {
+        let update = match herdr::focus(&transport, &pane).await {
+            Ok(()) => HerdrUpdate::Focused(Ok(label)),
+            Err(e) => HerdrUpdate::Focused(Err(e)),
+        };
+        let _ = tx.send(Local::Herdr(update));
+    });
+}
+
 fn draw(terminal: &mut Screen, ui: &mut Ui) -> io::Result<()> {
     let mut hits = HitMap::default();
     terminal.draw(|frame| hits = render(&ui.app, frame))?;
@@ -402,6 +515,8 @@ pub fn run(
     engine: Engine,
     timings: EngineTimings,
     keymap: Keymap,
+    env: Env,
+    plan: HerdrPlan,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -417,6 +532,7 @@ pub fn run(
     let stop = spawn_input(input_tx)?;
     let (local_tx, mut local_rx) = mpsc::unbounded_channel::<Local>();
 
+    let mut link = Herdr::default();
     let (outcome, watcher) = runtime.block_on(async {
         let mut watcher = engine.run(timings);
         let outcome: io::Result<ExitCode> = async {
@@ -432,11 +548,28 @@ pub fn run(
             }
             draw(&mut terminal, &mut ui)?;
 
+            // The link is opened after the first frame: discovery and the protocol guard
+            // are bounded, but the empty state is on screen before either runs.
+            ui.app.herdr.scoped = plan.scoped;
+            ui.app.herdr.toast = plan.toast;
+            match herdr::connect(&env, plan).await {
+                Ok(open) => link = Herdr::adopt(open, local_tx.clone()),
+                Err(badge) => ui.app.herdr.link = badge,
+            }
+            if ui.app.herdr.link != Link::Off {
+                draw(&mut terminal, &mut ui)?;
+            }
+
             let mut tick = tokio::time::interval(TICK);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             tick.tick().await; // the immediate first tick
             let mut fatal: Option<String> = None;
+            // Set by a `worktree.*` event, fired once the burst has been quiet this long.
+            let mut worktree_due: Option<tokio::time::Instant> = None;
             loop {
+                // Copied out so the timer future borrows nothing a handler assigns to.
+                let due = worktree_due;
+                let mut rescan = false;
                 let (changed, effect) = tokio::select! {
                     _ = signals.recv() => break,
                     event = watcher.events.recv() => match event {
@@ -457,17 +590,85 @@ pub fn run(
                             fatal = Some(text);
                             break;
                         }
+                        Some(Local::Roots(metas)) => {
+                            // The root set moved under a live cache: re-associate.
+                            let (c, _) = ui.local(Local::Roots(metas));
+                            let (c2, e) = herdr_rederive(&mut ui, &link);
+                            (c.or(c2), e)
+                        }
                         Some(local) => ui.local(local),
                         None => (Changed::No, None),
                     },
+                    event = herdr_recv(&mut link.events) => match event {
+                        Some(event) => {
+                            if matches!(event, HerdrEvent::WorktreeChanged { .. }) {
+                                worktree_due =
+                                    Some(tokio::time::Instant::now() + WORKTREE_DEBOUNCE);
+                            }
+                            let mut changed = Changed::No;
+                            let mut effect = None;
+                            if let Some(update) = herdr::update_of(&event) {
+                                let (c, e) = ui.app.handle(Action::Herdr(update));
+                                changed = changed.or(c);
+                                effect = effect.or(e);
+                            }
+                            if herdr::rederives(&event) {
+                                let (c, e) = herdr_rederive(&mut ui, &link);
+                                changed = changed.or(c);
+                                effect = effect.or(e);
+                            }
+                            (changed, effect)
+                        }
+                        // The client task ended (it never does with `reconnect: true`).
+                        None => {
+                            link.events = None;
+                            (Changed::No, None)
+                        }
+                    },
+                    _ = async {
+                        match due {
+                            Some(at) => tokio::time::sleep_until(at).await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        rescan = true;
+                        (Changed::No, None)
+                    }
                     _ = tick.tick() => ui.app.handle(Action::Tick),
                 };
+                if rescan {
+                    // Deliverable 7: the event is only a trigger — `roots::discover` decides
+                    // what is a root, and `RootsChanged` + the new pile take the usual path.
+                    worktree_due = None;
+                    watcher.request_rescan();
+                }
                 match effect {
                     Some(Effect::Quit) => break,
                     Some(Effect::Refresh) => spawn_refresh(&watcher.engine, local_tx.clone()),
                     Some(Effect::SyncRoots) => spawn_sync_roots(&watcher.engine, local_tx.clone()),
                     Some(Effect::Accept(reqs)) => {
                         spawn_accept(&watcher.engine, local_tx.clone(), reqs)
+                    }
+                    Some(Effect::Focus(pane)) => {
+                        let label = ui
+                            .app
+                            .herdr
+                            .roots
+                            .values()
+                            .find(|f| f.pane.as_deref() == Some(pane.as_str()))
+                            .map(|f| f.agent_label())
+                            .unwrap_or_else(|| pane.clone());
+                        spawn_focus(link.transport.clone(), local_tx.clone(), pane, label);
+                    }
+                    Some(Effect::Toast(request)) => {
+                        if let Some(tx) = &link.toast {
+                            for name in request.ready {
+                                let _ = tx.send(ToastMsg::Ready(name));
+                            }
+                            for name in request.dropped {
+                                let _ = tx.send(ToastMsg::Drop(name));
+                            }
+                        }
                     }
                     None => {}
                 }
@@ -490,6 +691,7 @@ pub fn run(
         guard: Some(guard),
         runtime: Some(runtime),
         watcher: Some(watcher),
+        herdr: link.handle.take(),
     };
     shut_down(&mut real);
     Ok(outcome?)
@@ -945,6 +1147,9 @@ mod tests {
             fn restore(&mut self) {
                 self.0.push("restore");
             }
+            fn shutdown_herdr(&mut self) {
+                self.0.push("herdr");
+            }
             fn join_watcher(&mut self) {
                 self.0.push("join");
             }
@@ -954,7 +1159,7 @@ mod tests {
         }
         let mut r = Recorder::default();
         shut_down(&mut r);
-        assert_eq!(r.0, ["restore", "join", "shutdown"]);
+        assert_eq!(r.0, ["restore", "herdr", "join", "shutdown"]);
     }
 
     #[test]
@@ -966,6 +1171,7 @@ mod tests {
             guard: None,
             runtime: None,
             watcher: None,
+            herdr: None,
         };
         shut_down(&mut real);
         assert!(!term::is_active());

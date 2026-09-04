@@ -8,6 +8,7 @@
 use std::io::{self, IsTerminal};
 use std::process::ExitCode;
 
+use lastcall::tui::herdr::HerdrPlan;
 use lastcall::tui::input::Keymap;
 use lastcall::tui::{run, term};
 use lastcall_engine::config;
@@ -39,7 +40,10 @@ pub fn run(poll: Option<u64>) -> Result<ExitCode, Box<dyn std::error::Error>> {
             return Ok(ExitCode::from(1));
         }
     };
+    // What `[herdr]` asks for, resolved before the terminal is taken; the link itself is
+    // opened inside the loop's runtime, after the first frame (kickoff deliverable 4).
+    let plan = HerdrPlan::of(&loaded.config.herdr, &env);
     // File-only tracing (`LASTCALL_LOG_FILE`), or nothing: the screen is about to be ours.
     let _ = term::init_tracing();
-    run::run(engine, super::poll_timings(poll), keymap)
+    run::run(engine, super::poll_timings(poll), keymap, env, plan)
 }

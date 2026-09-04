@@ -25,6 +25,7 @@ use lastcall_engine::scan::{Annotation, Change, Group, Pile, Row};
 use lastcall_engine::store::RootKind;
 use lastcall_engine::watcher::EngineEvent;
 
+use super::herdr::{HerdrUpdate, HerdrView, Link, ToastRequest};
 use super::input::{Action, Keymap};
 
 pub const NAV_WIDTH_DEFAULT: u16 = 28;
@@ -176,6 +177,10 @@ pub enum Target {
     FileAccept,
     /// The `[a accept]` hint on hunk `i`'s header line.
     HunkAccept(usize),
+    /// A root row's herdr dot: a click there acks the flag (deliverable 5).
+    RootDot(PathBuf),
+    /// The header's herdr badge: a click shows the full standalone reason.
+    HeaderHerdr,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,7 +211,7 @@ pub enum Changed {
 }
 
 impl Changed {
-    fn or(self, other: Changed) -> Changed {
+    pub fn or(self, other: Changed) -> Changed {
         if self == Changed::Yes || other == Changed::Yes {
             Changed::Yes
         } else {
@@ -227,6 +232,11 @@ pub enum Effect {
     /// the results to [`App::accepted`]. Every request is built from the held `RootView`
     /// (§6.3): `Rendered::of` on a held row, `All` on the held pile.
     Accept(Vec<(PathBuf, AcceptRequest)>),
+    /// `agent.focus` on this pane id (herdr's own public id, never a name); the result
+    /// comes back as `HerdrUpdate::Focused`.
+    Focus(String),
+    /// Tell the toast task which ready episodes opened and which ended (deliverable 6).
+    Toast(ToastRequest),
 }
 
 /// What one accept covers (§6.7): the key to the status text, the confirm modal's live
@@ -349,6 +359,9 @@ pub struct App {
     /// `Quit` is ignored while it is (`Quit` passes as it does through the help overlay:
     /// `q` and ctrl-c quit by default, everywhere).
     pub confirm: Option<Confirm>,
+    /// Everything herdr says, and the local ack episodes (Phase 5). Socket-free: the
+    /// reducer never sees the client's own types.
+    pub herdr: HerdrView,
     /// The effective key bindings, `(action name, key specs)` in `DEFAULT_KEYMAP` order.
     /// Seeded from the defaults; worker 3b replaces it after `Keymap::from_config` so the
     /// hint line and the help overlay show the user's own bindings.
@@ -381,6 +394,7 @@ impl App {
             seq: BTreeMap::new(),
             accepting: None,
             confirm: None,
+            herdr: HerdrView::default(),
             // The canonical spellings (`shift-a` shows as `A`), as `Keymap::table` gives.
             keymap: Keymap::defaults().table(),
         }
@@ -396,11 +410,47 @@ impl App {
 
     // ---- derived views -------------------------------------------------------------------
 
+    /// Whether `view` is listed in the nav (§6.7 plus deliverable 5): it has pending rows
+    /// **or** an attention flag (a ready episode, acked or not, or a blocked agent) — and
+    /// it survives the active workspace scope (deliverable 8). `working`/`idle`/`unknown`
+    /// never list a root by themselves; they annotate one already listed.
+    pub fn is_listed(&self, view: &RootView) -> bool {
+        self.herdr.in_scope(&view.meta.path)
+            && (view.listed()
+                || self
+                    .herdr
+                    .flag(&view.meta.path)
+                    .is_some_and(|f| f.attention()))
+    }
+
+    /// Roots the active scope hides that would otherwise be listed: the `N` of the
+    /// `scope: … · N repos hidden (w shows all)` notice.
+    pub fn scoped_out(&self) -> usize {
+        if self.herdr.active_scope().is_none() {
+            return 0;
+        }
+        self.roots
+            .values()
+            .filter(|v| !self.herdr.in_scope(&v.meta.path))
+            .filter(|v| v.listed() || self.herdr.flag(&v.meta.path).is_some_and(|f| f.attention()))
+            .count()
+    }
+
+    /// The mandatory scope notice (deliverable 8), or `None` when no scope is in force.
+    pub fn scope_notice(&self) -> Option<String> {
+        let scope = self.herdr.active_scope()?;
+        Some(format!(
+            "scope: {} · {} hidden (w shows all)",
+            scope.label,
+            plural(self.scoped_out(), "repo")
+        ))
+    }
+
     /// Nav order: for each listed root by path, `[Root, rows…, groups…]`.
     pub fn nav_entries(&self) -> Vec<Selection> {
         let mut out = Vec::new();
         for (path, view) in &self.roots {
-            if !view.listed() {
+            if !self.is_listed(view) {
                 continue;
             }
             out.push(Selection::Root(path.clone()));
@@ -415,7 +465,7 @@ impl App {
     }
 
     pub fn listed_roots(&self) -> impl Iterator<Item = &RootView> {
-        self.roots.values().filter(|v| v.listed())
+        self.roots.values().filter(|v| self.is_listed(v))
     }
 
     /// The selected row, if the selection is a row that still exists.
@@ -1048,9 +1098,18 @@ impl App {
     /// Fold one user action in.
     pub fn handle(&mut self, action: Action) -> (Changed, Option<Effect>) {
         use Action::*;
-        if self.confirm.is_some() && !matches!(action, Tick | Resize(..) | Confirm | Cancel | Quit)
+        // `Herdr` passes both gates: news from the herdr task is not a keystroke, and it
+        // must never close the confirm modal or the help overlay (deliverable 5).
+        if self.confirm.is_some()
+            && !matches!(
+                action,
+                Tick | Resize(..) | Confirm | Cancel | Quit | Herdr(_)
+            )
         {
             return (Changed::No, None);
+        }
+        if let Herdr(update) = action {
+            return self.herdr_update(update);
         }
         if self.help
             && !matches!(
@@ -1083,7 +1142,13 @@ impl App {
                         .nav_entries()
                         .into_iter()
                         .find(|e| matches!(e, Selection::Row(r, _) if *r == root));
-                    self.select(first)
+                    match first {
+                        Some(row) => self.select(Some(row)),
+                        // A flag-only root has no row to open; the diff pane says
+                        // `nothing pending · agent done`, so focus it rather than
+                        // dropping the selection.
+                        None => self.set_focus(Focus::Diff),
+                    }
                 }
                 None => self.move_selection(1),
             },
@@ -1142,6 +1207,17 @@ impl App {
                     Changed::No
                 }
             }
+            Ack => return self.ack_selected(),
+            Jump => return self.jump_selected(),
+            ScopeToggle => {
+                if self.herdr.scope.is_none() {
+                    return (Changed::No, None);
+                }
+                self.herdr.scoped = !self.herdr.scoped;
+                self.reconcile_selection();
+                Changed::Yes
+            }
+            Herdr(_) => unreachable!("handled above, before the help gate"),
             Quit => return (Changed::No, Some(Effect::Quit)),
             Press(_, _) => Changed::No,
             Drag(x, _) => {
@@ -1173,6 +1249,96 @@ impl App {
         (changed, None)
     }
 
+    // ---- herdr ---------------------------------------------------------------------------
+
+    /// The root an ack or a jump applies to: the selected entry's root, whichever pane has
+    /// focus and whether a root, a row or a group is selected.
+    pub fn flagged_root(&self) -> Option<PathBuf> {
+        Some(self.selection.as_ref()?.root().to_path_buf())
+    }
+
+    /// `d`: ack the selected root's flag. Local to this process (ruling 10) and idempotent;
+    /// the dot dims and herdr is not told. The name also leaves any pending toast window.
+    fn ack_selected(&mut self) -> (Changed, Option<Effect>) {
+        let Some(root) = self.flagged_root() else {
+            return (Changed::No, None);
+        };
+        if !self.herdr.ack(&root) {
+            return (Changed::No, None);
+        }
+        let name = self.root_name(&root);
+        self.reconcile_selection();
+        (
+            Changed::Yes,
+            Some(Effect::Toast(ToastRequest {
+                ready: Vec::new(),
+                dropped: vec![name],
+            })),
+        )
+    }
+
+    /// `g`: focus the selected root's agent in herdr. Nothing to do without a pane id.
+    fn jump_selected(&mut self) -> (Changed, Option<Effect>) {
+        let Some(root) = self.flagged_root() else {
+            return (Changed::No, None);
+        };
+        match self.herdr.flag(&root).and_then(|f| f.pane.clone()) {
+            Some(pane) => (Changed::No, Some(Effect::Focus(pane))),
+            None => (Changed::No, None),
+        }
+    }
+
+    /// Fold one piece of herdr news in (deliverables 4, 5, 6, 8).
+    pub fn herdr_update(&mut self, update: HerdrUpdate) -> (Changed, Option<Effect>) {
+        match update {
+            HerdrUpdate::Connected { version, .. } => {
+                self.herdr.link = Link::Connected { version };
+                (Changed::Yes, None)
+            }
+            HerdrUpdate::Reconnecting => {
+                self.herdr.link = Link::Reconnecting;
+                (Changed::Yes, None)
+            }
+            HerdrUpdate::Standalone { reason } => {
+                self.herdr.link = Link::Standalone { reason };
+                (Changed::Yes, None)
+            }
+            HerdrUpdate::Roots(derived) => {
+                let delta = self.herdr.apply_roots(derived);
+                self.reconcile_selection();
+                let request = ToastRequest {
+                    ready: delta.opened.iter().map(|r| self.root_name(r)).collect(),
+                    dropped: delta.closed.iter().map(|r| self.root_name(r)).collect(),
+                };
+                let effect =
+                    (self.herdr.toast && !request.is_empty()).then_some(Effect::Toast(request));
+                (Changed::Yes, effect)
+            }
+            HerdrUpdate::Scope(scope) => {
+                if self.herdr.scope == scope {
+                    return (Changed::No, None);
+                }
+                self.herdr.scope = scope;
+                self.reconcile_selection();
+                (Changed::Yes, None)
+            }
+            HerdrUpdate::Toast(Ok(shown)) if shown.shown => {
+                self.set_status("toast shown");
+                (Changed::Yes, None)
+            }
+            // A refusal or a transport error is a debug log in the task, not a banner.
+            HerdrUpdate::Toast(_) => (Changed::No, None),
+            HerdrUpdate::Focused(Ok(agent)) => {
+                self.set_status(format!("focused {agent} in herdr"));
+                (Changed::Yes, None)
+            }
+            HerdrUpdate::Focused(Err(reason)) => {
+                self.set_status(format!("jump failed: {reason}"));
+                (Changed::Yes, None)
+            }
+        }
+    }
+
     /// Fold a resolved mouse target in (the loop maps `Press(x, y)` through the `HitMap`).
     pub fn hit(&mut self, target: Target) -> (Changed, Option<Effect>) {
         if self.confirm.is_some() {
@@ -1184,6 +1350,26 @@ impl App {
         }
         let changed = match target {
             Target::HeaderAcceptAll => return self.handle(Action::AcceptAll),
+            Target::RootDot(root) => {
+                // The click selects the root exactly as a click on its name does, then
+                // acks — key and mouse land on one `App` (the parity test).
+                self.select(Some(Selection::Root(root)));
+                self.set_focus(Focus::Nav);
+                return self.handle(Action::Ack);
+            }
+            Target::HeaderHerdr => match &self.herdr.link {
+                Link::Standalone { reason } if !reason.is_empty() => {
+                    let reason = reason.clone();
+                    self.set_status(format!("standalone: {reason}"));
+                    Changed::Yes
+                }
+                Link::Connected { version } => {
+                    let version = version.clone();
+                    self.set_status(format!("herdr {version}"));
+                    Changed::Yes
+                }
+                _ => Changed::No,
+            },
             Target::FileAccept => return self.handle(Action::AcceptFile),
             Target::HunkAccept(i) => {
                 // The cursor first lands on hunk `i` exactly as a click on its header
@@ -1937,7 +2123,7 @@ mod tests {
             Action::Back,
         ] {
             assert_eq!(
-                app.handle(action),
+                app.handle(action.clone()),
                 (Changed::No, None),
                 "{action:?} ignored"
             );
