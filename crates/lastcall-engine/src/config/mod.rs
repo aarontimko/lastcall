@@ -573,6 +573,29 @@ nav_down = ["down", "j", "ctrl-n"]
         assert!(err.to_string().contains("socket"), "{err}");
     }
 
+    /// Phase 5 rulings 1 and 5: the two new keys are optional, and their defaults are the
+    /// ones the rulings name — a `[herdr]` table that mentions neither still toasts and
+    /// still starts scoped to the workspace.
+    #[test]
+    fn config_herdr_toast_and_scope_default_on_and_parse() {
+        let dir = TempDir::new("lc-config");
+        let (env, _) = env_with_config(&dir, "[herdr]\nmode = \"on\"\n");
+        let herdr = load(&env).unwrap().config.herdr;
+        assert!(herdr.toast, "toast defaults on (ruling 5)");
+        assert_eq!(herdr.scope, HerdrScope::Workspace, "ruling 1");
+
+        let (env, _) = env_with_config(&dir, "[herdr]\ntoast = false\nscope = \"all\"\n");
+        let herdr = load(&env).unwrap().config.herdr;
+        assert!(!herdr.toast);
+        assert_eq!(herdr.scope, HerdrScope::All);
+
+        let (env, _) = env_with_config(&dir, "[herdr]\nscope = \"workspaces\"\n");
+        assert!(
+            matches!(load(&env).unwrap_err(), ConfigError::Parse { .. }),
+            "a near-miss spelling is an error, not a silent default"
+        );
+    }
+
     #[test]
     fn config_rejects_invalid_enum_value() {
         let dir = TempDir::new("lc-config");
