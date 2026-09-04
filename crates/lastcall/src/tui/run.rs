@@ -405,6 +405,27 @@ impl Herdr {
     }
 }
 
+/// The connect arm's future: the outcome of [`herdr::connect`] **once**, then forever, so
+/// an adopted link never re-enters the arm. Cancel-safe — a sibling arm winning leaves the
+/// task running and the next poll picks it up where it was. `None` is a task that panicked
+/// or was aborted: the badge stays as it is.
+async fn connect_ready(
+    task: &mut Option<tokio::task::JoinHandle<Result<HerdrLink, Link>>>,
+) -> Option<Result<HerdrLink, Link>> {
+    let Some(handle) = task.as_mut() else {
+        return std::future::pending().await;
+    };
+    let joined = (&mut *handle).await;
+    *task = None;
+    match joined {
+        Ok(outcome) => Some(outcome),
+        Err(e) => {
+            tracing::warn!(error = %e, "the herdr connect task ended without an answer");
+            None
+        }
+    }
+}
+
 /// The fourth `select!` arm's future: the client's event stream, or forever when there is
 /// no link (`mode = "off"`, or a standalone start).
 async fn herdr_recv(events: &mut Option<mpsc::Receiver<HerdrEvent>>) -> Option<HerdrEvent> {
@@ -548,17 +569,16 @@ pub fn run(
             }
             draw(&mut terminal, &mut ui)?;
 
-            // The link is opened after the first frame: discovery and the protocol guard
-            // are bounded, but the empty state is on screen before either runs.
+            // The link is opened after the first frame, and on its **own task** (review (b)
+            // F3): discovery and the protocol guard are bounded, but a socket that accepts
+            // and never answers holds them for seconds, and keys, resizes, SIGINT and the
+            // watcher have to keep being served throughout. The result arrives through the
+            // loop's own arm, like everything else.
             ui.app.herdr.scoped = plan.scoped;
             ui.app.herdr.toast = plan.toast;
-            match herdr::connect(&env, plan).await {
-                Ok(open) => link = Herdr::adopt(open, local_tx.clone()),
-                Err(badge) => ui.app.herdr.link = badge,
-            }
-            if ui.app.herdr.link != Link::Off {
-                draw(&mut terminal, &mut ui)?;
-            }
+            let mut connecting = Some(tokio::spawn(async move {
+                herdr::connect(&env, plan).await
+            }));
 
             let mut tick = tokio::time::interval(TICK);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -625,6 +645,19 @@ pub fn run(
                             (Changed::No, None)
                         }
                     },
+                    opened = connect_ready(&mut connecting) => match opened {
+                        // The badge itself comes later, with the client's `Connected`.
+                        Some(Ok(open)) => {
+                            link = Herdr::adopt(open, local_tx.clone());
+                            (Changed::No, None)
+                        }
+                        Some(Err(badge)) => {
+                            let changed = if badge == Link::Off { Changed::No } else { Changed::Yes };
+                            ui.app.herdr.link = badge;
+                            (changed, None)
+                        }
+                        None => (Changed::No, None),
+                    },
                     _ = async {
                         match due {
                             Some(at) => tokio::time::sleep_until(at).await,
@@ -675,6 +708,10 @@ pub fn run(
                 if changed == Changed::Yes {
                     draw(&mut terminal, &mut ui)?;
                 }
+            }
+            // A connect still in flight has nothing left to deliver.
+            if let Some(task) = connecting.take() {
+                task.abort();
             }
             match fatal {
                 Some(text) => Err(io::Error::other(text)),

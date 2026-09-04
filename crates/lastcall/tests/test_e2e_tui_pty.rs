@@ -1092,3 +1092,52 @@ fn pty_herdr_flag_ack_jump() {
     assert_clean_exit(&pty, since);
     rt.block_on(mock.shutdown());
 }
+
+/// Review (b) F3: the link opens on its own task, so a socket that accepts and never
+/// answers cannot hold the loop. `HERDR_SOCKET_PATH` is authoritative and unprobed, so the
+/// whole 5 s request timeout of the protocol guard is spent against a stalled mock — and a
+/// `q` pressed in that window still exits inside the quit budget.
+#[test]
+fn pty_herdr_a_stalled_socket_does_not_hold_the_keys() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime for the mock");
+    let sock = fx.state.join("herdr.sock");
+    let mock = rt.block_on(async {
+        MockHerdr::builder()
+            .stall()
+            .serve(&sock)
+            .await
+            .expect("bind the mock socket")
+    });
+
+    let Ok(mut pty) = fx
+        .command(&bin())
+        .args(["tui", "--poll", "1"])
+        .env("HERDR_SOCKET_PATH", &sock)
+        .spawn()
+    else {
+        note("SKIP: this host cannot open a pty");
+        return;
+    };
+    // The frame drawn *before* the link is opened; the guard is hanging from here on.
+    pty.wait_for_text("scanning", LONG)
+        .unwrap_or_else(|e| panic!("the first frame: {e}"));
+
+    let since = pty.raw().len();
+    let t = Instant::now();
+    pty.send(b"q").expect("q");
+    let status = pty
+        .wait_exit(QUIT_BUDGET)
+        .expect("q during the connect still exits inside the quit budget");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    note(&format!(
+        "PTY herdr: quit mid-connect in {:.3?} (the guard's timeout is 5 s)",
+        t.elapsed()
+    ));
+    assert_clean_exit(&pty, since);
+    rt.block_on(mock.shutdown());
+}
