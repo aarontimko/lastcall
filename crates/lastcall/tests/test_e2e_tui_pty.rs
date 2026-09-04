@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 
 use lastcall_testkit::fixture_parent;
 use lastcall_testkit::fixture_repo::FixtureRepo;
+use lastcall_testkit::mock_herdr::MockHerdr;
 use lastcall_testkit::pty_tui::{PtyCommand, PtyTui, col_of, vt100};
 use lastcall_testkit::tmp::TempDir;
 
@@ -917,4 +918,177 @@ fn pty_accept_refused_when_file_moves() {
     let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
     assert_eq!(status.exit_code(), 0, "{status:?}");
     assert_clean_exit(&pty, since);
+}
+
+// --- Phase 5: herdr through the real terminal ------------------------------------------
+
+/// The recorded two-pane snapshot with every pane and agent moved into `root`, so §6.6
+/// association has somewhere real to land: `w1:p1` is the agent (`demo`), `w1:p2` the bare
+/// shell beside it.
+fn herdr_snapshot(root: &Path) -> serde_json::Value {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../lastcall-testkit/fixtures/herdr/snapshot_two_panes.json"
+    );
+    let text = std::fs::read_to_string(path).expect("the recorded snapshot fixture");
+    let mut v: serde_json::Value = serde_json::from_str(&text).expect("valid json");
+    let cwd = serde_json::json!(root.to_string_lossy());
+    for key in ["panes", "agents"] {
+        for entry in v["snapshot"][key].as_array_mut().expect("an array") {
+            entry["cwd"] = cwd.clone();
+            entry["foreground_cwd"] = cwd.clone();
+        }
+    }
+    v
+}
+
+/// One `pane.agent_status_changed` line for the mock to push down the live status stream.
+fn status_line(pane_id: &str, status: &str) -> String {
+    serde_json::json!({
+        "event": "pane.agent_status_changed",
+        "data": {"agent": "demo", "agent_status": status, "pane_id": pane_id,
+                 "workspace_id": "w1"}
+    })
+    .to_string()
+}
+
+/// Gate 5's PTY scene. The built binary talks to the socket mock over `HERDR_SOCKET_PATH`:
+/// the header names the version, alpha carries the working dot, the agent finishes where
+/// nobody is looking (`done`) and the row grows a bright flag, `d` dims it (bold → not, the
+/// one attribute vt100 keeps for us), `g` sends `agent.focus` with the **public pane id**
+/// and the status says so, and `q` still exits clean with a live link.
+#[test]
+fn pty_herdr_flag_ack_jump() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let alpha = std::fs::canonicalize(fx.parent.join("alpha")).expect("alpha exists");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime for the mock");
+    let sock = fx.state.join("herdr.sock");
+    let mock = rt.block_on(async {
+        MockHerdr::builder()
+            .snapshot(herdr_snapshot(&alpha))
+            .canned("agent.focus", serde_json::json!({"type": "ok"}))
+            .canned(
+                "notification.show",
+                serde_json::json!({"type": "notification_shown", "shown": true, "reason": ""}),
+            )
+            .serve(&sock)
+            .await
+            .expect("bind the mock socket")
+    });
+    let control = mock.control();
+
+    let Ok(mut pty) = fx
+        .command(&bin())
+        .args(["tui", "--poll", "1"])
+        .env("HERDR_SOCKET_PATH", &sock)
+        .spawn()
+    else {
+        note("SKIP: this host cannot open a pty");
+        return;
+    };
+    wait_first_piles(&mut pty);
+    let took = pty
+        .wait_for_text("herdr 0.8.2", Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("the header names the link: {e}"));
+    note(&format!("PTY herdr: badge after {took:.3?}"));
+
+    // The snapshot says `working`: a dot, and alpha is listed because it has rows anyway.
+    let took = pty
+        .wait_for(Duration::from_secs(5), |s| s.contents().contains("● alpha"))
+        .unwrap_or_else(|e| panic!("the working dot: {e}"));
+    note(&format!("PTY herdr: working dot after {took:.3?}"));
+
+    // The agent finishes in a pane nobody is watching. Push it only once the client's
+    // per-pane subscription is up, or the line would go nowhere.
+    let subscribed = Instant::now();
+    while control.status_streams_open("w1:p1") == 0 {
+        assert!(
+            subscribed.elapsed() < Duration::from_secs(10),
+            "the client never subscribed to w1:p1: {:?}",
+            control.methods()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let flipped = Instant::now();
+    control.push_status("w1:p1", status_line("w1:p1", "done"));
+    let took = pty
+        .wait_for(Duration::from_secs(10), |s| {
+            s.contents().contains("⚑ alpha")
+        })
+        .unwrap_or_else(|e| panic!("the flag: {e}"));
+    note(&format!(
+        "PTY herdr: done to flag in {took:.3?} (pushed {:.3?} ago)",
+        flipped.elapsed()
+    ));
+
+    // Select alpha by clicking its **name** (a click on the dot would ack, which is the
+    // parity path the unit tier owns) and read the flag cell's weight.
+    let row = pty
+        .find_row(|r| r.contains("⚑ alpha"))
+        .expect("the flagged row");
+    let text = pty.rows()[row as usize].clone();
+    let name_col = col_of(&text, "alpha").expect("the name's column");
+    let flag_col = col_of(&text, "⚑").expect("the flag's column");
+    pty.click(name_col, row).expect("click the name");
+    // The selected row is drawn inverted (the hint line is not visible here: the startup
+    // `watching <dir>` status still owns the bottom row).
+    pty.wait_for(Duration::from_secs(5), |s| {
+        s.cell(row, name_col).is_some_and(vt100::Cell::inverse)
+    })
+    .unwrap_or_else(|e| panic!("the click selects alpha: {e}"));
+    assert!(
+        pty.screen(|s| s.cell(row, flag_col).is_some_and(vt100::Cell::bold)),
+        "an unacked flag is bright"
+    );
+
+    let t = Instant::now();
+    pty.send(b"d").expect("d");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        s.cell(row, flag_col).is_some_and(|c| !c.bold())
+    })
+    .unwrap_or_else(|e| panic!("the ack dims the flag: {e}"));
+    note(&format!(
+        "PTY herdr: d dims the flag after {:.3?}",
+        t.elapsed()
+    ));
+    assert!(
+        pty.screen_text().contains("⚑ alpha"),
+        "still flagged, only dimmer — herdr still says done"
+    );
+
+    // `g` sends `agent.focus {"target": "w1:p1"}` on a one-shot connection.
+    let t = Instant::now();
+    pty.send(b"g").expect("g");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        status_is(s, "focused demo in herdr")
+    })
+    .unwrap_or_else(|e| panic!("the jump verdict: {e}"));
+    note(&format!("PTY herdr: g answered after {:.3?}", t.elapsed()));
+    let focus: Vec<serde_json::Value> = control
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "agent.focus")
+        .map(|r| r.params)
+        .collect();
+    assert_eq!(
+        focus,
+        vec![serde_json::json!({"target": "w1:p1"})],
+        "the public pane id, once, and never a display name"
+    );
+
+    let since = pty.raw().len();
+    let t = Instant::now();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    note(&format!(
+        "PTY herdr: quit with a live link in {:.3?}",
+        t.elapsed()
+    ));
+    assert_clean_exit(&pty, since);
+    rt.block_on(mock.shutdown());
 }
