@@ -26,9 +26,10 @@ work (4a): 179 engine + 19 testkit + 64 binary lib + 4 binary main = 266; Phase 
 183 engine = 301; the Phase 4 review fold: 183 engine + 19 testkit + 100 binary lib + 4
 binary main = 306; Phase 4 e2e + bench work (4c): 184 engine + 21 testkit + 100 binary lib
 + 4 binary main = 309; the Phase 4 close-out review fold (the rss sampler tests): 184
-engine + 23 testkit + 101 binary lib + 4 binary main = 312, the Phase 5 floor; the hunk
+engine + 23 testkit + 101 binary lib + 4 binary main = 312; the hunk
 separator and the selected-header band: 102 binary lib = 313; the nav-pane hunk accept, the
-focus arrows and the shift-drag note: 106 binary lib = 317).
+focus arrows and the shift-drag note: 106 binary lib = 317; the deletion-row hunk accept
+(sponsor-found, `a4e353c`): 185 engine = 318, the Phase 5 floor).
 The suite never shrinks across commits. One recorded exception: at the Phase 2 code review
 the three filesystem-live watcher tests (up to 30 s waits, real FSEvents) left the unit tier
 for `crates/lastcall-engine/tests/test_integration_watcher.rs` because they contradicted the
