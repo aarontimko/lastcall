@@ -413,8 +413,28 @@ impl Ops<'_> {
         }
     }
 
-    /// Accept one hunk (A3): live CAS as `accept_file` **plus** the baseline CAS; the
-    /// baseline with only that hunk applied becomes the override blob.
+    /// Accept one hunk (A3): the **baseline** CAS only; the baseline with that one hunk
+    /// applied becomes the override blob.
+    ///
+    /// There is deliberately no live CAS here (Amendment A3, ruling of 2026-09-03). What
+    /// the user accepted is a hunk against a baseline they were shown, and that baseline is
+    /// still what it was — so the accept is meaningful whatever the working tree has done
+    /// since. Refusing it because the file moved under them punished exactly the case the
+    /// feature is for: an agent still writing to the file while the human reviews it. A
+    /// stale accept cannot smuggle anything in, because the override is
+    /// `apply_hunks(baseline, rendered_hunks, [k])` — baseline plus the one hunk they saw,
+    /// never a byte of the live file.
+    ///
+    /// The consequence is that nothing in here may read the live file: the mode comes from
+    /// `rendered.mode`, which is the mode the row was rendered with. A re-stat would be a
+    /// live read by another name, and would reintroduce the race in the one place A3 says
+    /// there must not be one.
+    ///
+    /// The baseline CAS stays (`BaselineMoved`): if the *baseline* moved, the hunks were
+    /// computed against something that is no longer the comparison point, so applying one
+    /// would write a blob the user never saw. `NoSuchHunk` and the deletion route stay.
+    /// File, root and accept-all keep their live CAS (A5/A6) — those accept the live
+    /// content, so the live content is what they must check.
     pub fn accept_hunk(
         &mut self,
         rendered: &Rendered,
@@ -444,10 +464,6 @@ impl Ops<'_> {
         if rendered.oid.is_none() {
             return self.accept_file(rendered, fault);
         }
-        let live = match self.cas_live(rendered) {
-            Ok(l) => l,
-            Err(r) => return refuse(r),
-        };
         let baseline = {
             let mut resolver = BaselineResolver::new(
                 self.ledger,
@@ -468,8 +484,9 @@ impl Ops<'_> {
             });
         }
         let (blob, mode) = if hunk.is_mode_change() {
-            // D1: the synthetic mode hunk moves only the mode.
-            (base_oid, Some(live.mode))
+            // D1: the synthetic mode hunk moves only the mode - to the mode the row was
+            // rendered with, which is the one the user saw on the hunk's `+` side.
+            (base_oid, rendered.mode)
         } else {
             let base_bytes = match &base_oid {
                 Some(o) => self.store.cat_blob(o)?,
@@ -479,11 +496,12 @@ impl Ops<'_> {
             let oid = self.store.hash_bytes(&spliced)?;
             fault.at(FaultPoint::AfterObjectWrite);
             // A content hunk leaves the mode where the baseline had it; without a mode
-            // hunk the modes agree and the live mode is that mode.
+            // hunk the modes agreed when the row was rendered, so the rendered mode is
+            // that mode.
             let mode = if hunks.iter().any(Hunk::is_mode_change) {
-                base_mode.or(Some(live.mode))
+                base_mode.or(rendered.mode)
             } else {
-                Some(live.mode)
+                rendered.mode
             };
             (Some(oid), mode)
         };
@@ -1425,6 +1443,173 @@ mod tests {
                     }
                     (base.concat().into_bytes(), cur.concat().into_bytes())
                 })
+        }
+
+        /// A base and a current side with **exactly two** well-separated replacements, so
+        /// the diff is always two hunks and a hunk accept is never the same thing as a file
+        /// accept. Yields `(base, cur, marker_a, marker_b)` where the markers are the two
+        /// changed lines on the current side, each unique in the file.
+        fn two_hunk_file() -> impl Strategy<Value = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> {
+            (20..40usize, 0..6usize, 0..6usize).prop_map(|(n, da, db)| {
+                // Two spots at least ten lines apart, so three lines of context on each
+                // side can never let the two changes fall into one hunk.
+                let a = 2 + da;
+                let b = n - 3 - db;
+                let base: Vec<String> = (0..n).map(|i| format!("t{i}\n")).collect();
+                let mut cur = base.clone();
+                let (ma, mb) = (format!("A{a}\n"), format!("B{b}\n"));
+                cur[a] = ma.clone();
+                cur[b] = mb.clone();
+                (
+                    base.concat().into_bytes(),
+                    cur.concat().into_bytes(),
+                    ma.into_bytes(),
+                    mb.into_bytes(),
+                )
+            })
+        }
+
+        /// Amendment A3: a hunk accept has no live CAS. The user is shown a baseline and a
+        /// hunk against it; that is still true however the working tree moved since, so the
+        /// accept lands. Before A3 an agent writing to the file during the review turned
+        /// every hunk accept into a `Refused::Moved`.
+        ///
+        /// What lands is `apply_hunks(baseline, rendered_hunks, [k])` — the baseline plus
+        /// exactly the hunk the user saw, never a byte the edit brought in. The check is
+        /// therefore the *re-diff* against that new override, not a whole-file equality:
+        /// the next render must be exactly what the new override and the new disk differ by.
+        #[test]
+        fn ops_hunk_accept_lands_despite_an_unseen_edit_and_writes_only_the_rendered_hunk() {
+            let d = RefCell::new(Draft::new("lc-prop-a3-unseen"));
+            let mut runner = TestRunner::new(config());
+            let result = runner.run(
+                &(two_hunk_file(), any::<bool>(), 0..6usize),
+                |((base, cur, ma, mb), pick_b, tail)| {
+                    let mut d = d.borrow_mut();
+                    d.reset(&BTreeMap::from([("f".to_owned(), base.clone())]));
+                    d.write("f", &cur);
+                    let row = d.scan().row(b"f").cloned().expect("f is pending");
+                    let rendered = Rendered::of(&row);
+                    prop_assert_eq!(row.hunks.len(), 2, "the fixture must have two hunks");
+                    let k = usize::from(pick_b);
+
+                    // The unseen edit: an agent appends to the file after the render. It
+                    // touches neither hunk's lines, so nothing about the accept is stale
+                    // except the live content the old CAS used to insist on.
+                    let mut live = cur.clone();
+                    live.extend_from_slice(format!("late{tail}\n").as_bytes());
+                    d.write("f", &live);
+
+                    let out = d
+                        .ops()
+                        .accept_hunk(&rendered, &row.hunks, k, &NoFault)
+                        .unwrap();
+                    prop_assert!(
+                        out.ok(),
+                        "A3: the live file moved, the accept still lands: {:?}",
+                        out
+                    );
+
+                    // The override is the baseline plus that one hunk, and the next render
+                    // is exactly the re-diff of it against what is on disk now.
+                    let expected = hunks::apply_hunks(&base, &row.hunks, &[k]);
+                    let after = d.scan().row(b"f").cloned().expect("the rest is pending");
+                    prop_assert_eq!(
+                        &after.hunks,
+                        &hunks::diff(&expected, &live),
+                        "not the re-diff against the new override"
+                    );
+                    // Concretely: the accepted marker is gone, the other one and the unseen
+                    // edit are still pending.
+                    let lines = sorted_changes(&after.hunks);
+                    let has = |m: &[u8]| lines.iter().any(|(t, l)| *t == Tag::Insert && l == m);
+                    let (accepted, other) = if k == 0 { (&ma, &mb) } else { (&mb, &ma) };
+                    prop_assert!(!has(accepted), "the accepted hunk is still shown");
+                    prop_assert!(has(other), "the other hunk stopped being pending");
+                    prop_assert!(
+                        has(format!("late{tail}\n").as_bytes()),
+                        "the unseen edit is not pending"
+                    );
+                    Ok(())
+                },
+            );
+            result.unwrap();
+        }
+
+        /// The other half of A3: an accepted hunk's lines being rewritten *in place* must
+        /// show as `X → Y`, not as the original `base → Y`. The accept moved the baseline
+        /// to include X, so the next diff starts from X — which is the whole point of
+        /// storing `apply_hunks(baseline, .., [k])` rather than the live blob.
+        #[test]
+        fn ops_rewriting_an_accepted_hunk_in_place_renders_the_accepted_lines_as_the_old_side() {
+            let d = RefCell::new(Draft::new("lc-prop-a3-rewrite"));
+            let mut runner = TestRunner::new(config());
+            let result = runner.run(
+                &(two_hunk_file(), any::<bool>(), 0..6usize),
+                |((base, cur, ma, mb), pick_b, y)| {
+                    let mut d = d.borrow_mut();
+                    d.reset(&BTreeMap::from([("f".to_owned(), base.clone())]));
+                    d.write("f", &cur);
+                    let row = d.scan().row(b"f").cloned().expect("f is pending");
+                    prop_assert_eq!(row.hunks.len(), 2, "the fixture must have two hunks");
+                    let k = usize::from(pick_b);
+                    let (x, other) = if k == 0 { (&ma, &mb) } else { (&mb, &ma) };
+                    let out = d
+                        .ops()
+                        .accept_hunk(&Rendered::of(&row), &row.hunks, k, &NoFault)
+                        .unwrap();
+                    prop_assert!(out.ok(), "{:?}", out);
+
+                    // Rewrite X's line to Y, in place, leaving everything else alone.
+                    let yline = format!("Y{y}\n").into_bytes();
+                    let live = String::from_utf8(cur.clone())
+                        .unwrap()
+                        .replace(
+                            std::str::from_utf8(x).unwrap(),
+                            std::str::from_utf8(&yline).unwrap(),
+                        )
+                        .into_bytes();
+                    d.write("f", &live);
+
+                    let after = d.scan().row(b"f").cloned().expect("still pending");
+                    // The X region shows exactly X → Y: one hunk, and its old side is the
+                    // line the user accepted, not the line the base had there.
+                    let xy: Vec<&Hunk> = after
+                        .hunks
+                        .iter()
+                        .filter(|h| h.change_lines().iter().any(|(_, l)| *l == yline))
+                        .collect();
+                    prop_assert_eq!(
+                        xy.len(),
+                        1,
+                        "one hunk covers the rewrite: {:?}",
+                        after.hunks
+                    );
+                    let changes = xy[0].change_lines();
+                    prop_assert!(
+                        changes.contains(&(Tag::Delete, x.clone())),
+                        "the old side must be the accepted line {:?}, not the base's: {:?}",
+                        String::from_utf8_lossy(x),
+                        changes
+                    );
+                    prop_assert!(
+                        !changes
+                            .iter()
+                            .any(|(t, l)| *t == Tag::Delete && l.starts_with(b"t") && *l != *x),
+                        "the base's line at that spot is not the old side: {:?}",
+                        changes
+                    );
+                    prop_assert!(changes.contains(&(Tag::Insert, yline.clone())));
+                    // And the hunk that was never accepted is still pending, untouched.
+                    let lines = sorted_changes(&after.hunks);
+                    prop_assert!(
+                        lines.contains(&(Tag::Insert, other.clone())),
+                        "the unaccepted hunk stopped being pending"
+                    );
+                    Ok(())
+                },
+            );
+            result.unwrap();
         }
 
         /// One op: `(file b?, accept the whole file?, hunk pick)`.
