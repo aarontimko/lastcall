@@ -429,6 +429,12 @@ impl Ops<'_> {
                 index: hunk_index,
             });
         };
+        // A deletion renders as one hunk (`@@ -n +0,0 @@`) with its own accept control;
+        // its live CAS is "still absent" (A7), not "unchanged content", so it takes the
+        // deletion path — the sponsor hit the refusal live (2026-09-02).
+        if rendered.oid.is_none() {
+            return self.accept_file(rendered, fault);
+        }
         let live = match self.cas_live(rendered) {
             Ok(l) => l,
             Err(r) => return refuse(r),
@@ -796,6 +802,42 @@ mod tests {
         assert_eq!(h.ledger.overrides.get("f2").unwrap().blob, Some(None));
         assert_eq!(pile_lines(&h.scan().pile), vec!["f3"]);
         assert_eq!(h.scan().pile.row(b"f3").unwrap().change, Change::Modified);
+    }
+
+    /// A deleted row is one hunk with an accept control: `a` on it must accept the
+    /// deletion (A7 semantics), not refuse it as "changed since rendered" because the
+    /// live file is absent. Found by the sponsor in the Gate 4 run.
+    #[test]
+    fn ops_accept_hunk_on_a_deletion_row_accepts_the_deletion() {
+        let repo = FixtureRepo::new("ops-del-hunk").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        repo.remove("f2");
+        let pile = h.scan().pile;
+        let row = pile.row(b"f2").unwrap();
+        assert_eq!(row.change, Change::Deleted);
+        assert_eq!(row.hunks.len(), 1, "a deletion renders as exactly one hunk");
+        let rendered = Rendered::of(row);
+        assert!(rendered.oid.is_none());
+        let out = h
+            .ops()
+            .accept_hunk(&rendered, &row.hunks, 1, &NoFault)
+            .unwrap();
+        assert!(matches!(
+            out.refused[0],
+            Refused::NoSuchHunk { index: 1, .. }
+        ));
+        let out = h
+            .ops()
+            .accept_hunk(&rendered, &row.hunks, 0, &NoFault)
+            .unwrap();
+        assert!(out.refused.is_empty(), "{:?}", out.refused);
+        assert!(out.written);
+        assert_eq!(h.ledger.overrides.get("f2").unwrap().blob, Some(None));
+        assert!(
+            h.scan().pile.row(b"f2").is_none(),
+            "the deletion is no longer pending"
+        );
     }
 
     /// D5 pairs the pile's rows against their *baselines* (tree ⊕ overrides), never the
