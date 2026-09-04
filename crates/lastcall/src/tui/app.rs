@@ -556,14 +556,17 @@ impl App {
 
     // ---- accepting -----------------------------------------------------------------------
 
-    /// What `Accept` covers from here: the hunk under the diff cursor when the diff has
-    /// focus and the row has hunks, else the selected entry (a row whole, a group, every
-    /// row of a root). `None` with nothing selected or a vanished row.
+    /// What `Accept` covers from here: on a file row **with hunks**, the one hunk under the
+    /// diff cursor — whichever pane has focus, so `a` from the nav takes a hunk, not the
+    /// file (`A` / `accept_file` is the only key that takes a whole file). A file row with
+    /// no hunks (binary, collapsed, deleted, unreadable) has no hunk to point at, so `a`
+    /// there keeps taking the row whole. A group entry is the group, a root entry every row
+    /// of that root. `None` with nothing selected or a vanished row.
     pub fn accept_scope(&self) -> Option<AcceptScope> {
         match self.selection.clone()? {
             Selection::Row(root, path) => {
                 let row = self.roots.get(&root)?.row(&path)?;
-                if self.effective_focus() == Focus::Diff && !row.hunks.is_empty() {
+                if !row.hunks.is_empty() {
                     Some(AcceptScope::Hunk {
                         root,
                         path,
@@ -1509,11 +1512,96 @@ mod tests {
             requests(key_effect.1.clone()),
             vec![(root("alpha"), AcceptRequest::File(Rendered::of(held)))]
         );
-        // With the nav focused, `a` on a row is the file too.
+        // `A` is the whole file from the nav pane too (the ruling: it is the only key that
+        // takes a whole file).
         let mut nav = three_roots();
         nav.select(Some(row("alpha", "f1")));
         assert_eq!(nav.focus, Focus::Nav);
-        assert_eq!(nav.handle(Action::Accept).1, key_effect.1);
+        assert_eq!(nav.handle(Action::AcceptFile).1, key_effect.1);
+    }
+
+    /// The ruling: on a file row `a` takes ONE hunk — the one under the diff cursor —
+    /// whichever pane has focus, and the request is the diff-focused one exactly.
+    #[test]
+    fn app_accept_from_the_nav_pane_takes_one_hunk_not_the_file() {
+        let mut base = three_roots();
+        base.apply(pile_event("alpha", alpha_hunks(3)));
+        base.select(Some(row("alpha", "f1")));
+
+        let mut nav = base.clone();
+        assert_eq!(nav.focus, Focus::Nav);
+        nav.handle(Action::HunkNext);
+        assert_eq!(nav.diff.hunk, 1, "n moves the diff cursor from either pane");
+        let nav_scope = nav.accept_scope();
+        let nav_effect = nav.handle(Action::Accept);
+
+        let mut diff = base.clone();
+        diff.handle(Action::Open);
+        assert_eq!(diff.effective_focus(), Focus::Diff);
+        diff.handle(Action::HunkNext);
+        let diff_effect = diff.handle(Action::Accept);
+
+        let held = base.roots[&root("alpha")].row(b"f1").unwrap();
+        assert_eq!(
+            nav_scope,
+            Some(AcceptScope::Hunk {
+                root: root("alpha"),
+                path: b"f1".to_vec(),
+                index: 1,
+                hunks: 3,
+            }),
+            "not AcceptScope::File"
+        );
+        assert_eq!(
+            requests(nav_effect.1.clone()),
+            vec![(
+                root("alpha"),
+                AcceptRequest::Hunk {
+                    rendered: Rendered::of(held),
+                    hunks: held.hunks.clone(),
+                    index: 1,
+                }
+            )]
+        );
+        assert_eq!(
+            nav_effect.1, diff_effect.1,
+            "the same request from either pane"
+        );
+        assert_eq!(nav.accepting, diff.accepting);
+
+        // `A` from the nav pane is still the whole file.
+        let mut whole = base.clone();
+        assert_eq!(
+            requests(whole.handle(Action::AcceptFile).1),
+            vec![(root("alpha"), AcceptRequest::File(Rendered::of(held)))]
+        );
+
+        // A root entry's `a` is untouched: the per-repo fold, not a hunk.
+        let mut fold = base;
+        fold.select(Some(Selection::Root(root("alpha"))));
+        assert_eq!(fold.accept_scope(), Some(AcceptScope::Root(root("alpha"))));
+    }
+
+    /// The carve-out: a file row with no hunks to point at (binary, collapsed, deleted,
+    /// unreadable) keeps `a` = the whole row, in either pane.
+    #[test]
+    fn app_accept_on_a_hunkless_row_is_still_the_whole_row() {
+        let mut hunkless = pile("alpha");
+        hunkless.rows[0].hunks.clear();
+        let mut app = three_roots();
+        app.apply(pile_event("alpha", hunkless));
+        app.select(Some(row("alpha", "f1")));
+        let held = app.roots[&root("alpha")].row(b"f1").unwrap().clone();
+        assert!(held.hunks.is_empty());
+        let expect = Some(AcceptScope::File {
+            root: root("alpha"),
+            path: b"f1".to_vec(),
+            deleted: held.change == Change::Deleted,
+        });
+        assert_eq!(app.accept_scope(), expect, "nav pane");
+        app.handle(Action::Open);
+        assert_eq!(app.effective_focus(), Focus::Diff);
+        assert_eq!(app.accept_scope(), expect, "diff pane");
     }
 
     #[test]

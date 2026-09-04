@@ -29,6 +29,10 @@ use super::input::{Action, MODAL_KEYS};
 
 pub const TOO_SMALL: &str = "too small: 40×10 min";
 pub const NO_SELECTION: &str = "select a file (↑↓ or click) · ? for help";
+/// The help overlay's mouse note (ruling 3): `term::enter` turns mouse capture on, so the
+/// terminal's own text selection needs the shift override. The stopgap until the Phase 8
+/// select-to-copy item lands.
+pub const SELECT_NOTE: &str = "shift+drag selects text (mouse capture is on)";
 
 /// Which pane a screen position belongs to (the wheel scrolls the pane under the pointer).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,9 +248,10 @@ fn render_status(app: &App, buf: &mut Buffer, area: Rect) {
 
 /// The hint line from the app's own keymap: `↑↓ select  ⏎ open  n/p hunk  <accept>  ^A
 /// accept all  Tab focus  r refresh  ? help  q quit`, where `<accept>` follows the
-/// selection — `a accept hunk  A accept file` on a file row with diff focus, `a/A accept
-/// file` on a file row otherwise, `a accept group` on a group entry, `a accept all in
-/// <root>` on a root entry (how the per-repo fold is told from the header's global one).
+/// selection — `a accept hunk  A accept file` on a file row with hunks in **either** pane,
+/// `a/A accept file` on a hunkless file row (binary, collapsed, deleted, unreadable),
+/// `a accept group` on a group entry, `a accept all in <root>` on a root entry (how the
+/// per-repo fold is told from the header's global one).
 /// Below `NAV_MIN_COLS`, or when the line would not fit, the `focus` and `refresh` hints
 /// are dropped. While the confirm modal is open the line is `y confirm  n cancel  q quit`:
 /// exactly the keys that work there (the modal's own, fixed, and the keymap's `quit`).
@@ -852,6 +857,8 @@ fn key_label(spec: &str) -> String {
     match spec {
         "up" => "↑".into(),
         "down" => "↓".into(),
+        "left" => "←".into(),
+        "right" => "→".into(),
         "enter" => "⏎".into(),
         "esc" => "Esc".into(),
         "tab" => "Tab".into(),
@@ -871,9 +878,9 @@ fn keys_label(specs: &[impl AsRef<str>]) -> String {
         .join(" / ")
 }
 
-/// The keymap's rows, then the modal's fixed keys.
+/// The keymap's rows, then the modal's fixed keys, then the mouse note.
 fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
-    let rows: Vec<String> = app
+    let mut rows: Vec<String> = app
         .keymap
         .iter()
         .map(|(name, specs)| (name.as_str(), keys_label(specs)))
@@ -884,6 +891,8 @@ fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
         )
         .map(|(name, keys)| format!("{keys:<14} {}", Action::describe(name)))
         .collect();
+    rows.push(String::new());
+    rows.push(SELECT_NOTE.to_owned());
     let width = (rows.iter().map(|r| r.width()).max().unwrap_or(0) + 4).min(area.width as usize);
     let height = (rows.len() + 4).min(area.height as usize);
     let rect = Rect::new(
@@ -1162,6 +1171,11 @@ mod tests {
         );
         assert!(frame.contains("y / ⏎          confirm"), "{frame}");
         assert!(frame.contains("n / Esc        cancel"), "{frame}");
+        // Ruling 2: the arrows are the third spec of `open` / `back`, drawn like ↑↓.
+        assert!(frame.contains("⏎ / l / →      open the diff"), "{frame}");
+        assert!(frame.contains("Esc / h / ←    back"), "{frame}");
+        // Ruling 3: the mouse note, until Phase 8's select-to-copy.
+        assert!(frame.contains(SELECT_NOTE), "{frame}");
     }
 
     /// Under the modal the hint line names only the keys that work there: the modal's
@@ -1202,26 +1216,25 @@ mod tests {
     fn render_hints_follow_the_selection() {
         let mut app = three_roots();
         app.select(Some(row("alpha", "f1")));
+        // The ruling: `a accept hunk` on a file row in BOTH panes — this one is the nav.
+        assert_eq!(app.effective_focus(), super::super::app::Focus::Nav);
+        let nav_line = hints(&app, 120);
         assert_eq!(
-            hints(&app, 100),
-            "↑↓ select  ⏎ open  n/p hunk  a/A accept file  ^A accept all  Tab focus  r refresh  ? help  q quit"
+            nav_line,
+            "↑↓ select  ⏎ open  n/p hunk  a accept hunk  A accept file  ^A accept all  Tab focus  r refresh  ? help  q quit"
         );
         assert_eq!(
-            hints(&app, 90),
-            "↑↓ select  ⏎ open  n/p hunk  a/A accept file  ^A accept all  ? help  q quit",
+            hints(&app, 100),
+            "↑↓ select  ⏎ open  n/p hunk  a accept hunk  A accept file  ^A accept all  ? help  q quit",
             "focus/refresh go when the line would not fit"
         );
         assert_eq!(
             hints(&app, 60),
-            "↑↓ select  ⏎ open  n/p hunk  a/A accept file  ? help  q quit",
-            "then the global accept hint"
+            "↑↓ select  ⏎ open  n/p hunk  a accept hunk  ? help  q quit",
+            "then the file and global accept hints"
         );
         app.handle(Action::Open);
-        assert!(
-            hints(&app, 100).contains("n/p hunk  a accept hunk  A accept file  ^A accept all"),
-            "{}",
-            hints(&app, 100)
-        );
+        assert_eq!(hints(&app, 120), nav_line, "the diff pane says the same");
         app.select(Some(Selection::Root(root("alpha"))));
         assert!(
             hints(&app, 100).contains("n/p hunk  a accept all in alpha  ^A accept all"),

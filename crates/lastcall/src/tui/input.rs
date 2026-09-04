@@ -34,9 +34,11 @@ pub enum Action {
     NavPageUp,
     /// Nav focus: a page of entries down. Diff focus: a page of lines down.
     NavPageDown,
-    /// Focus the diff for the selected row/group; on a root entry, select its first row.
+    /// Focus the diff for the selected row/group (the cursor stays on that file's current
+    /// hunk); on a root entry, select its first row. Bound to `enter`, `l` and `right`.
     Open,
-    /// Close the help overlay if open, else return focus to the nav. Never quits.
+    /// Close the help overlay if open, else return focus to the nav with the same row
+    /// selected. Never quits. Bound to `esc`, `h` and `left`.
     Back,
     FocusToggle,
     HunkNext,
@@ -60,8 +62,9 @@ pub enum Action {
     Resize(u16, u16),
     /// One second passed (the loop's 1 s timer): status-line ages advance.
     Tick,
-    /// Accept what the cursor is on (§6.7): the hunk under the diff cursor, else the
-    /// selected entry — a row whole, a group, every row of a root.
+    /// Accept what the cursor is on (§6.7): on a file row with hunks, the one hunk under
+    /// the diff cursor whichever pane has focus; else the selected entry — a hunkless row
+    /// whole, a group, every row of a root.
     Accept,
     /// Accept the selected row whole, whichever pane has focus.
     AcceptFile,
@@ -79,8 +82,8 @@ pub const DEFAULT_KEYMAP: &[(&str, &[&str])] = &[
     ("nav_down", &["down", "j"]),
     ("nav_page_up", &["pageup", "b"]),
     ("nav_page_down", &["pagedown", "space"]),
-    ("open", &["enter", "l"]),
-    ("back", &["esc", "h"]),
+    ("open", &["enter", "l", "right"]),
+    ("back", &["esc", "h", "left"]),
     ("focus_toggle", &["tab"]),
     ("hunk_next", &["n", "]"]),
     ("hunk_prev", &["p", "["]),
@@ -522,7 +525,7 @@ pub fn pointer(event: &Event) -> Option<(u16, u16)> {
 mod tests {
     use super::*;
     use crate::tui::app::testfix::*;
-    use crate::tui::app::{App, Changed, Effect, Selection, Target};
+    use crate::tui::app::{App, Changed, Effect, Focus, Selection, Target};
     use crate::tui::render::{HitMap, render};
     use lastcall_engine::engine::AcceptRequest;
     use ratatui::Terminal;
@@ -1068,6 +1071,67 @@ mod tests {
 
         assert_eq!(by_key, by_mouse);
         assert_eq!(frame(&by_key).0, frame(&by_mouse).0);
+    }
+
+    /// Ruling 2: `right` is `open` and `left` is `back`, exactly as `l` and `h` are —
+    /// same `App`, same frame, so the arrows are a third spelling and not a second path.
+    #[test]
+    fn input_parity_arrows_match_h_and_l() {
+        let km = Keymap::defaults();
+        let mut base = three_roots();
+        base.handle(Action::Resize(100, 30));
+        base.apply(pile_event("alpha", alpha_two_hunks()));
+        base.select(Some(row("alpha", "f1")));
+        base.handle(Action::HunkNext);
+
+        // Right / `l` open the diff with the cursor left on hunk 2.
+        let mut by_letter = base.clone();
+        let mut by_arrow = base;
+        press_key(&mut by_letter, &km, key('l'));
+        press_key(
+            &mut by_arrow,
+            &km,
+            key_code(KeyCode::Right, KeyModifiers::NONE),
+        );
+        assert_eq!(by_letter.effective_focus(), Focus::Diff);
+        assert_eq!(by_letter.diff.hunk, 1, "the row's current hunk is kept");
+        assert_eq!(by_letter, by_arrow);
+        assert_eq!(frame(&by_letter).0, frame(&by_arrow).0);
+
+        // Left / `h` come back to the nav with the same row selected.
+        let selected = by_letter.selection.clone();
+        press_key(&mut by_letter, &km, key('h'));
+        press_key(
+            &mut by_arrow,
+            &km,
+            key_code(KeyCode::Left, KeyModifiers::NONE),
+        );
+        assert_eq!(by_letter.effective_focus(), Focus::Nav);
+        assert_eq!(by_letter.selection, selected);
+        assert_eq!(by_letter, by_arrow);
+        assert_eq!(frame(&by_letter).0, frame(&by_arrow).0);
+    }
+
+    /// `[keys] back = ["left"]` replaces the whole default list like any other override:
+    /// `left` still means `back`, `esc` and `h` are unbound, and `open` is untouched.
+    #[test]
+    fn keymap_back_can_be_rebound_to_left() {
+        let km = Keymap::from_config(&keys(&[("back", &["left"])])).expect("left is a key spec");
+        let table = km.table();
+        let row = |n: &str| table.iter().find(|(name, _)| name == n).unwrap().1.clone();
+        assert_eq!(row("back"), vec!["left"]);
+        assert_eq!(row("open"), vec!["enter", "l", "right"], "untouched");
+        let bound = |ev: Event| to_action(&ev, &km);
+        assert_eq!(
+            bound(key_code(KeyCode::Left, KeyModifiers::NONE)),
+            Some(Action::Back)
+        );
+        assert_eq!(bound(key_code(KeyCode::Esc, KeyModifiers::NONE)), None);
+        assert_eq!(bound(key('h')), None);
+        assert_eq!(
+            bound(key_code(KeyCode::Right, KeyModifiers::NONE)),
+            Some(Action::Open)
+        );
     }
 
     #[test]

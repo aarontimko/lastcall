@@ -60,7 +60,8 @@ gate greps at the end of this page are how that is enforced).
   `input_parity_hunk_next`, `input_parity_hunk_prev`, `input_parity_accept_hunk`,
   `input_parity_accept_file`, `input_parity_accept_all` drive the same scene by key and by a
   click resolved through the hit map and assert the same `App` (and, for the accepts, the
-  same `Effect`). The confirm modal's keys (`input::MODAL_KEYS`: `y`/`enter` confirm,
+  same `Effect`). `input_parity_arrows_match_h_and_l` is the same shape for two spellings of
+  one key: `right`/`l` and `left`/`h`. The confirm modal's keys (`input::MODAL_KEYS`: `y`/`enter` confirm,
   `n`/`esc` cancel) are not in the keymap: `Ui::event` resolves them through `modal_action`
   before the keymap while the modal is open, lets only the keymap's `quit` keys through
   after that (`q` and ctrl-c quit everywhere, as through the help overlay), and swallows
@@ -108,10 +109,13 @@ or Ctrl-C on the fixture).
 Every accept on screen is the Phase 2 engine's compare-and-swap (`00-spec.md` §6.3) driven
 from what the user is looking at:
 
-- **Scope** (`App::accept_scope`, `AcceptScope`): `a` on a file row with the diff focused
-  is the hunk under the cursor; on a file row otherwise, the whole file; on a group entry,
-  the group; on a root entry, every row of that root (the per-repo fold). `A` is the whole
-  file from either pane; `ctrl-a` and the header's `[Accept All]` are every listed root.
+- **Scope** (`App::accept_scope`, `AcceptScope`): `a` on a file row is the **one hunk**
+  under the diff cursor — whichever pane has focus, so `a` from the nav never takes a whole
+  file (`app_accept_from_the_nav_pane_takes_one_hunk_not_the_file`). The one carve-out is a
+  file row with no hunks to point at (binary, collapsed, deleted, unreadable): there `a`
+  still takes the row whole. On a group entry `a` is the group; on a root entry, every row
+  of that root (the per-repo fold). `A` is the only key that takes a whole file, from either
+  pane; `ctrl-a` and the header's `[Accept All]` are every listed root.
 - **Requests are built from the held rows, never from the engine.** `accept_requests`
   makes one `(root, AcceptRequest)` per root covered, with `Rendered::of` on the `App`'s own
   `Row` (`rg -n 'Rendered::of' crates/lastcall/src` finds only `app.rs`) and, for a fold,
@@ -154,8 +158,8 @@ from what the user is looking at:
   `run_stale_watcher_pile_after_accept_is_dropped`). The entry is removed when the root is
   removed, so a re-added root receives piles again.
 - **Hints follow the selection** so the per-repo fold and the global one are told apart:
-  `a accept hunk  A accept file` on a file row with the diff focused, `a/A accept file`
-  otherwise, `a accept group`, `a accept all in <root>`, and `^A accept all` always. When
+  `a accept hunk  A accept file` on a file row **in both panes**, `a/A accept file` on a
+  hunkless file row, `a accept group`, `a accept all in <root>`, and `^A accept all`. When
   the line would not fit it drops `Tab focus  r refresh` first (always below 70 columns),
   then the file and global accept hints. While the confirm modal is open the line is
   `y confirm  n cancel  q quit` — exactly the keys that work there, the `quit` label being
@@ -169,19 +173,28 @@ Defaults (`input::DEFAULT_KEYMAP`, in help-overlay order):
 |---|---|---|---|
 | `nav_up` / `nav_down` | `up` `k` / `down` `j` | previous / next entry | scroll one line |
 | `nav_page_up` / `nav_page_down` | `pageup` `b` / `pagedown` `space` | a page of entries | a page of lines |
-| `open` | `enter` `l` | open the selected row's diff (on a root: its first row) | — |
-| `back` | `esc` `h` | — | back to the file list; closes help first; never quits |
+| `open` | `enter` `l` `right` | open the selected row's diff, cursor on that file's current hunk (on a root: its first row) | — |
+| `back` | `esc` `h` `left` | — | back to the file list with the same row selected; closes help first; never quits |
 | `focus_toggle` | `tab` | toggle focus between the panes | |
 | `hunk_next` / `hunk_prev` | `n` `]` / `p` `[` | next / previous hunk (the current hunk's header is a full-width inverted band) | |
 | `toggle_full_paths` | `f` | root-relative paths instead of basenames | |
 | `toggle_remote` | `o` | show each repo's `org/repo` slug | |
-| `accept` | `a` | accept the selected entry: a file, a group, or every row of a root (asks above 10 files) | accept the hunk under the cursor |
-| `accept_file` | `shift-a` | accept the selected file whole | |
+| `accept` | `a` | on a file row: the one hunk under the diff cursor (a hunkless row — binary, collapsed, deleted, unreadable — whole); on a group: the group; on a root: every row of it (asks above 10 files) | the same hunk |
+| `accept_file` | `shift-a` | accept the selected file whole — the only key that does | |
 | `accept_all` | `ctrl-a` | accept everything listed, every root (asks above 10 files) | |
 | `refresh` | `r` | rescan every root now (ignored while one is running) | |
 | `help` | `?` | the help overlay (any key closes it) | |
 | `quit` | `q` `ctrl-c` | exit 0 | |
 | `scroll_up` / `scroll_down` | *(unbound)* | bindable one-line diff scrolls | |
+
+**Focus moves horizontally.** The two panes sit side by side, so the arrows move between
+them: `right` (= `enter` / `l`, action `open`) on a selected file row focuses the diff with
+the cursor on that file's current hunk; `left` (= `esc` / `h`, action `back`) returns focus
+to the nav with the same row still selected. They are ordinary third specs of `open` and
+`back`, not a separate path — `input_parity_arrows_match_h_and_l` drives one scene both ways
+and asserts the same `App` and the same frame — and `[keys]` overrides them like any other
+binding (`keymap_back_can_be_rebound_to_left`). `tab` (`focus_toggle`) still flips focus
+without touching the selection, and a hidden nav (below 70 columns) can never hold focus.
 
 The confirm modal answers `y` / `enter` (confirm) and `n` / `esc` (cancel) — fixed
 (`input::MODAL_KEYS`), not `[keys]` names, listed last in the help overlay — plus the
@@ -192,6 +205,12 @@ hunk header's `[a accept]` it accepts that hunk, on the main view's `[A accept f
 file, on the header's `[Accept All]` everything listed; on the diff body it focuses the
 diff; dragging the divider resizes the nav (clamped to 16..=60); the wheel scrolls the pane
 under the pointer, three lines a notch.
+
+**Selecting text.** `term::enter` turns mouse capture on, so a plain drag is ours, not the
+terminal's. Hold **shift** while dragging to select and copy with the terminal's own
+selection (every terminal we target honours the shift override). The help overlay says so
+in its last line (`render::SELECT_NOTE`); it is the stopgap until the Phase 8 select-to-copy
+item lands.
 
 ### The `[keys]` table (`config.toml`)
 
