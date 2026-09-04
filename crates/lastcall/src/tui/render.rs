@@ -36,6 +36,14 @@ pub fn nothing_pending(status: &str) -> String {
     format!("nothing pending · agent {status}")
 }
 
+/// The same line for a nav column too narrow for it: the `nothing pending · ` half is
+/// already implied by the branch line's `0 files` above it, while the status word is the
+/// only thing on screen that says *why* the root is listed — so that half is what
+/// survives a truncation rather than what gets cut (review (b) F9).
+pub fn nothing_pending_short(status: &str) -> String {
+    format!("agent {status}")
+}
+
 /// The help overlay's mouse note (ruling 3): `term::enter` turns mouse capture on, so the
 /// terminal's own text selection needs the shift override. The stopgap until the Phase 8
 /// select-to-copy item lands.
@@ -398,14 +406,18 @@ pub fn hints(app: &App, width: u16) -> String {
     // always below `NAV_MIN_COLS`), then tier 1 (the file and global accept hints).
     // The herdr hints are conditional: `d`/`g` only while the selected root carries a
     // flag, `w` only while a scope is active (deliverable 5's hint ladder).
-    let flagged = app
-        .flagged_root()
-        .and_then(|r| app.herdr.flag(&r).map(|f| f.attention()))
-        .unwrap_or(false);
-    let ack = flagged
+    // `d` acks a **ready episode** and nothing else, so a blocked root — which is listed,
+    // and does carry a dot — must not be offered `d ack`, where the key would do nothing
+    // (review (b) F7). `g` is offered for either, because both have a pane to jump to.
+    let flag = app.flagged_root().and_then(|r| app.herdr.flag(&r).cloned());
+    let ack = flag
+        .as_ref()
+        .is_some_and(|f| f.ready.is_some())
         .then(|| first("ack").map(|k| format!("{k} ack")))
         .flatten();
-    let jump = flagged
+    let jump = flag
+        .as_ref()
+        .is_some_and(|f| f.attention())
         .then(|| first("jump").map(|k| format!("{k} jump")))
         .flatten();
     let scope = app
@@ -542,11 +554,14 @@ fn render_nav(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
                 .flag(path)
                 .map(|f| f.status.as_str())
                 .unwrap_or("done");
+            let full = format!("  {}", nothing_pending(status));
+            let text = if full.width() <= width {
+                full
+            } else {
+                format!("  {}", nothing_pending_short(status))
+            };
             lines.push(NavLine {
-                line: Line::from(Span::styled(
-                    format!("  {}", nothing_pending(status)),
-                    dim(),
-                )),
+                line: Line::from(Span::styled(text, dim())),
                 target: Some(Target::NavRoot(path.clone())),
                 selected: false,
             });
@@ -1692,6 +1707,107 @@ mod tests {
         // Too narrow for both: the notice keeps the row, the status yields entirely.
         let row = last(&frame_of(&app, 46, 12).0);
         assert_eq!(row.trim_end(), notice);
+    }
+
+    /// Review (b) F7: `d` acks a ready episode; on a blocked root it does nothing, so the
+    /// hint ladder must not offer it. `g jump` is offered for either — both have a pane.
+    #[test]
+    fn render_ack_hint_only_where_d_would_do_something() {
+        use crate::tui::herdr::{Attention, HerdrUpdate, RootAgents};
+        let flagged = |status: Attention| {
+            let mut app = three_roots();
+            app.handle(Action::Herdr(HerdrUpdate::Connected {
+                version: "0.8.2".to_owned(),
+                protocol: 21,
+            }));
+            app.handle(Action::Herdr(HerdrUpdate::Roots(
+                [(
+                    root("alpha"),
+                    RootAgents {
+                        status,
+                        agents: 1,
+                        pane: Some("w1:p1".to_owned()),
+                        agent: Some("claude".to_owned()),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            )));
+            app.select(Some(Selection::Root(root("alpha"))));
+            app
+        };
+
+        let blocked = flagged(Attention::Blocked);
+        assert!(blocked.herdr.flag(&root("alpha")).unwrap().attention());
+        assert_eq!(
+            blocked.clone().handle(Action::Ack),
+            (Changed::No, None),
+            "`d` on a blocked root does nothing"
+        );
+        let line = hints(&blocked, 200);
+        assert!(!line.contains("d ack"), "{line}");
+        assert!(line.contains("g jump"), "{line}");
+
+        // A ready episode is what `d` is for — offered before and after the ack, because
+        // the flag stays on screen and the key stays the way to explain it.
+        let mut done = flagged(Attention::Done);
+        assert!(hints(&done, 200).contains("d ack"), "{}", hints(&done, 200));
+        assert_eq!(done.handle(Action::Ack).0, Changed::Yes);
+        let line = hints(&done, 200);
+        assert!(line.contains("d ack"), "{line}");
+        assert!(line.contains("g jump"), "{line}");
+    }
+
+    /// Review (b) F9: at the nav's real width the flag-only line truncated to
+    /// `nothing pending · agent`, losing herdr's status word — the only thing on screen
+    /// saying why the root is listed. Narrow rows drop the leading half instead.
+    #[test]
+    fn render_flag_only_row_keeps_the_status_word_when_it_cannot_fit() {
+        use crate::tui::herdr::{Attention, HerdrUpdate, RootAgents};
+        let mut app = three_roots();
+        app.apply(pile_event_seq(
+            "alpha",
+            1,
+            without(pile("alpha"), &["f1", "f2"]),
+        ));
+        app.handle(Action::Herdr(HerdrUpdate::Connected {
+            version: "0.8.2".to_owned(),
+            protocol: 21,
+        }));
+        app.handle(Action::Herdr(HerdrUpdate::Roots(
+            [(
+                root("alpha"),
+                RootAgents {
+                    status: Attention::Done,
+                    agents: 1,
+                    pane: Some("w1:p1".to_owned()),
+                    agent: Some("claude".to_owned()),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        )));
+        app.select(Some(Selection::Root(root("alpha"))));
+        // The nav column at 100×30 is 26 wide: `  nothing pending · agent done` is 30.
+        let (frame, _) = frame_of(&app, 100, 30);
+        assert!(
+            frame.lines().any(|l| l.starts_with("\"│  agent done")),
+            "the nav keeps herdr's word: {frame}"
+        );
+        assert!(
+            !frame.contains("│  nothing pending · agent"),
+            "never the half that says nothing: {frame}"
+        );
+        // The diff pane is wide enough for the full sentence, and still shows it.
+        assert!(frame.contains(&nothing_pending("done")), "{frame}");
+
+        // A nav column dragged wide enough keeps the full line.
+        app.nav_width = 40;
+        let (wide, _) = frame_of(&app, 100, 30);
+        assert!(
+            wide.contains(&format!("│  {}", nothing_pending("done"))),
+            "{wide}"
+        );
     }
 
     #[test]
