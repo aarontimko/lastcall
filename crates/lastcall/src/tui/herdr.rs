@@ -705,6 +705,15 @@ pub fn rederives(event: &HerdrEvent) -> bool {
     )
 }
 
+/// Whether `event` means the *set of repos* may have moved and a discovery rescan is due
+/// (deliverable 7). Only the worktree events qualify: herdr's own `worktree.*` are the one
+/// notice we get that a checkout appeared or went away. The event is a trigger and nothing
+/// more — `roots::discover` decides what is really there, so a `Removed` path still on disk
+/// stays a root.
+pub fn triggers_rescan(event: &HerdrEvent) -> bool {
+    matches!(event, HerdrEvent::WorktreeChanged { .. })
+}
+
 /// Cache builders shared by this module's tests and `app.rs`'s.
 #[cfg(test)]
 pub(crate) mod testfix {
@@ -1260,5 +1269,43 @@ mod tests {
                 reason: "protocol 99".to_owned()
             })
         );
+    }
+
+    /// Deliverable 7: only a worktree event asks the engine to look for new repos. A status
+    /// flip moves a dot, and rescanning every parent dir for one would be absurd.
+    #[test]
+    fn herdr_only_a_worktree_event_asks_for_a_discovery_rescan() {
+        use lastcall_engine::herdr::client::{ResyncTarget, WorktreeChange};
+
+        let worktree = |change| HerdrEvent::WorktreeChanged {
+            change,
+            workspace_id: "w1".to_owned(),
+            path: "/tmp/w/alpha-wt".to_owned(),
+            branch: Some("wt".to_owned()),
+        };
+        for change in [
+            WorktreeChange::Created,
+            WorktreeChange::Opened,
+            WorktreeChange::Removed,
+        ] {
+            let event = worktree(change);
+            assert!(triggers_rescan(&event), "{event:?}");
+            assert!(!rederives(&event), "the roots moved, not the association");
+        }
+        for quiet in [
+            HerdrEvent::Resync(ResyncTarget::Snapshot),
+            HerdrEvent::AgentStatusChanged {
+                pane_id: "w1:p1".to_owned(),
+                workspace_id: "w1".to_owned(),
+                from: Some(AgentStatus::Working),
+                to: AgentStatus::Done,
+                agent: None,
+            },
+            HerdrEvent::Disconnected {
+                reason: "eof".to_owned(),
+            },
+        ] {
+            assert!(!triggers_rescan(&quiet), "{quiet:?}");
+        }
     }
 }

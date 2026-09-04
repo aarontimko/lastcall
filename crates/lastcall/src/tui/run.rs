@@ -601,7 +601,7 @@ pub fn run(
                     },
                     event = herdr_recv(&mut link.events) => match event {
                         Some(event) => {
-                            if matches!(event, HerdrEvent::WorktreeChanged { .. }) {
+                            if herdr::triggers_rescan(&event) {
                                 worktree_due =
                                     Some(tokio::time::Instant::now() + WORKTREE_DEBOUNCE);
                             }
