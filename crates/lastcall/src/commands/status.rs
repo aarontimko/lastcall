@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use lastcall_engine::config;
-use lastcall_engine::engine::{Engine, EngineOptions};
+use lastcall_engine::engine::Engine;
 use lastcall_engine::env::Env;
 use lastcall_engine::status::StatusReport;
 
@@ -16,7 +16,8 @@ pub fn run(json: bool, roots: Vec<PathBuf>) -> Result<ExitCode, Box<dyn std::err
     let env = Env::from_process();
     let loaded = config::load(&env)?;
     let resolved = loaded.resolve(env.cwd());
-    let mut engine = match Engine::open(&loaded, &resolved, &env, EngineOptions::default()) {
+    let mut engine = match Engine::open(&loaded, &resolved, &env, crate::commands::engine_options())
+    {
         Ok(e) => e,
         Err(e) => {
             eprintln!("lastcall: {e}");

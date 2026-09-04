@@ -11,7 +11,7 @@ use std::process::ExitCode;
 use lastcall::tui::input::Keymap;
 use lastcall::tui::{run, term};
 use lastcall_engine::config;
-use lastcall_engine::engine::{Engine, EngineOptions};
+use lastcall_engine::engine::Engine;
 use lastcall_engine::env::Env;
 
 /// The message for a piped stdout; printed to stderr, exit 2.
@@ -32,7 +32,7 @@ pub fn run(poll: Option<u64>) -> Result<ExitCode, Box<dyn std::error::Error>> {
         }
     };
     let resolved = loaded.resolve(env.cwd());
-    let engine = match Engine::open(&loaded, &resolved, &env, EngineOptions::default()) {
+    let engine = match Engine::open(&loaded, &resolved, &env, crate::commands::engine_options()) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("lastcall: {e}");
