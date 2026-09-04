@@ -50,8 +50,7 @@ changed underneath, the status says `changed since rendered; not accepted` and t
 stays. The pile shrinks to `nothing pending`, and a relaunch on the same state dir starts
 from there, whatever the agent committed in between (an agent's commit moves HEAD, never
 your baseline). Not yet: flagging with a note and restoring (Phase 7), draft dirs and
-single-row lockfile/binary accepts (Phase 6), herdr status in the UI (Phase 5), editing in
-place (Phase 8). `lastcall tui --poll 2` polls every 2 s if filesystem events are late or
+single-row lockfile/binary accepts (Phase 6), editing in place (Phase 8). `lastcall tui --poll 2` polls every 2 s if filesystem events are late or
 missing.
 Keys are rebindable in `config.toml`, one spec or a list per action (the full grammar and
 table: [`docs/dev/tui.md`](docs/dev/tui.md)):
@@ -61,6 +60,22 @@ table: [`docs/dev/tui.md`](docs/dev/tui.md)):
 quit = "ctrl-q"
 hunk_next = ["n", "ctrl-n"]
 ```
+
+Run inside a herdr pane and each repo row also carries its agents' status: `⚑` when an agent
+finished in a tab you were not watching (that repo is listed even with nothing pending), a
+red `●` blocked, a yellow `●` working. `d` acks the flag, `g` jumps to the agent, `w` toggles
+the workspace scope. The `[herdr]` table:
+
+```toml
+[herdr]
+mode = "auto"       # auto | on | off — "on" shows why a link failed in the header
+session = "work"    # optional named-session pin
+toast = true        # a desktop notification when a repo first goes ready (default true)
+scope = "workspace" # workspace | all — which repos the overlay covers
+```
+
+The toast also needs herdr's own `[ui.toast] delivery = "herdr"`, which is `"off"` by
+default; the details and the demo recipe are in [`docs/dev/tui.md`](docs/dev/tui.md).
 
 The headless commands:
 

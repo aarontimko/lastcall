@@ -101,7 +101,7 @@ pub struct EngineOptions {
     pub row_cap: usize,
     /// How many roots are opened, and scanned, at once. 1 runs everything inline on the
     /// calling thread — no thread is spawned at all — and the resulting state must be
-    /// identical at every value (`engine_parallel_open_and_scan_are_deterministic`).
+    /// identical at every value (`engine_parallel_open_and_scan_match_the_sequential_run_exactly`).
     pub parallelism: usize,
 }
 

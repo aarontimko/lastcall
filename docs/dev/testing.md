@@ -12,8 +12,8 @@ child and never falls back to a `herdr` on `PATH`.
 | tier | command | what runs | where |
 |---|---|---|---|
 | unit | `just test-unit` = `cargo test --workspace --lib --bins` | in-module `#[cfg(test)]` only | everywhere, incl. macOS CI |
-| integration | `just test-integration` = `cargo test --workspace --test 'test_integration_*'` | real git; the pinned herdr when `LASTCALL_TEST_HERDR_BIN` is set | CI via `just test-integration-herdr`; Linux blocking, macOS best-effort |
-| e2e | `just test-e2e` = `cargo test --workspace --test 'test_e2e_*'` | the TUI: twenty-three `TestBackend` snapshot scenes and seven PTY scenes against the built binary (`docs/dev/tui.md`) | everywhere; the PTY file skips with a visible reason only where no pseudo-terminal can be opened |
+| integration | `just test-integration` = `cargo test --workspace --test 'test_integration_*'` | real git; the four-test real-herdr subset when `LASTCALL_TEST_HERDR_BIN` is set (`just test-integration-herdr` sets it from the pinned release; `just test-integration-herdr-latest` from herdr's newest) | CI via `just test-integration-herdr`; Linux blocking, macOS best-effort; the latest-release run is the weekly `herdr-compat` workflow, never a blocker |
+| e2e | `just test-e2e` = `cargo test --workspace --test 'test_e2e_*'` | the TUI: twenty-nine `TestBackend` snapshot scenes and ten PTY scenes against the built binary (`docs/dev/tui.md`) | everywhere; the PTY file skips with a visible reason only where no pseudo-terminal can be opened |
 | bench | `just bench` = release build, then `cargo test --release -p lastcall --test test_bench -- --ignored --nocapture --test-threads=1` | the four `#[ignore]`d baseline scenarios (`docs/dev/bench.md`); **not a gate** in Phase 4 — targets are set at the Phase 9 kickoff | by hand, on the machine named in `bench.md` |
 | pre-push | `just test-prepush` = `just test-integration`, then `PROPTEST_CASES=64 cargo test -p lastcall-engine --lib proptests` | the integration tier plus the two store-backed proptests at 64 cases (the unit tier runs them at 8) | the pre-push hook; by hand before a push from a machine without the hook |
 
@@ -29,7 +29,10 @@ binary main = 306; Phase 4 e2e + bench work (4c): 184 engine + 21 testkit + 100 
 engine + 23 testkit + 101 binary lib + 4 binary main = 312; the hunk
 separator and the selected-header band: 102 binary lib = 313; the nav-pane hunk accept, the
 focus arrows and the shift-drag note: 106 binary lib = 317; the deletion-row hunk accept
-(sponsor-found, `a4e353c`): 185 engine = 318, the Phase 5 floor).
+(sponsor-found, `a4e353c`): 185 engine = 318, the Phase 5 floor; Phase 5 engine and TUI work
+(5a/5b): 205 engine + 24 testkit + 146 binary lib + 5 binary main = 380; Phase 5 real-server
+and schema work (5c, the `herdr_schema` projection's own tests): 33 testkit = **389**, the
+Phase 6 floor).
 The suite never shrinks across commits. One recorded exception: at the Phase 2 code review
 the three filesystem-live watcher tests (up to 30 s waits, real FSEvents) left the unit tier
 for `crates/lastcall-engine/tests/test_integration_watcher.rs` because they contradicted the
@@ -85,10 +88,14 @@ and commit the file.
 
 Both files live in `crates/lastcall/tests/`; `docs/dev/tui.md` has the how-to.
 
-`test_e2e_tui_snapshots.rs` renders twenty-three scenes (the sixteen Phase 3 ones and the
+`test_e2e_tui_snapshots.rs` renders twenty-nine scenes (the sixteen Phase 3 ones; the
 seven Phase 4 accept scenes, which drive the real `Engine::accept` from the reducer's own
-`Effect::Accept` and feed `App::accepted`; `tui_accept_all_confirm` pins a second `_live`
-frame) through `ratatui::backend::TestBackend`
+`Effect::Accept` and feed `App::accepted`, and where `tui_accept_all_confirm` pins a second
+`_live` frame; and the six Phase 5 herdr scenes — `tui_herdr_status_dots`,
+`tui_herdr_ready_ack_dims`, `tui_herdr_flag_only_root_listed`, `tui_herdr_header_states`,
+`tui_herdr_scope_notice`, `tui_herdr_scope_notice_with_status`, fed by a `HerdrView` built
+in-process, with no socket anywhere; `tui_herdr_header_states` pins one snapshot rather than
+two, being a list of badge lines and not a frame) through `ratatui::backend::TestBackend`
 from an `App` fed by a real engine over the shared `fixture_parent` (each scene builds its
 own fixture and state dir under a temp dir) and pins each as two `insta` snapshots under
 `crates/lastcall/tests/snapshots/`: `<scene>_frame` (the symbols, exactly as a 100×30 — or
@@ -112,7 +119,16 @@ alternate-screen-off sequences and no log line). The Phase 4 scenes
 (`pty_accept_loop_and_restart`, `pty_accept_refused_when_file_moves`) drive `a` / `A` /
 `ctrl-a` + `y` against a fixture agent's edits, read the `ledger.json` files back after the
 fold, and relaunch a **second process** on the same state dir to show the empty state. The
-scenes are serialized (one mutex); the whole file is about 30 s. Timing lines go to `stderr().write_all` so they survive libtest's
+three Phase 5 scenes point the built binary's `HERDR_SOCKET_PATH` at a
+`lastcall_testkit::mock_herdr` socket rather than a real herdr:
+`pty_herdr_flag_ack_jump` (the version in the header, the working dot, a `done` pushed as
+`pane.agent_status_changed` growing a bright flag, `d` dimming it — bold is the one attribute
+vt100 keeps — `g` sending `agent.focus` with the public pane id, and a clean `q` with the
+link live), `pty_herdr_a_stalled_socket_does_not_hold_the_keys` (a socket that accepts and
+never answers: `q` still exits inside the quit budget while the 5 s guard timeout runs), and
+`pty_herdr_worktree_created_reaches_the_nav_through_the_loop` (a checkout made after startup,
+with the discovery backstop parked at `--poll 300`, so only the loop's `worktree_due` arm can
+bring it in). The scenes are serialized (one mutex); the whole file is about 30 s. Timing lines go to `stderr().write_all` so they survive libtest's
 capture — run it with `-- --nocapture` to see them. If the live-update assertion fails on a
 loaded host, report the measured numbers; do not loosen the budget.
 
@@ -152,6 +168,83 @@ loaded host, report the measured numbers; do not loosen the budget.
   runs the engine on a thread and bounds it with `recv_timeout` (5 s) — the bound is a
   failure, never a wait the passing path takes.
 
+## The real-herdr subset (`test_integration_herdr_real.rs`)
+
+Four tests in `crates/lastcall-engine/tests/`, run against a **real** herdr the test spawns
+itself. `just test-integration-herdr` fetches the pinned release and exports
+`LASTCALL_TEST_HERDR_BIN`; without that variable every one of them prints the sanctioned
+`SKIP:` line and returns. That is the **only** skip they are allowed: any other reason a
+test cannot do its job — no socket, a protocol the guard refuses, a spawn that never came
+up — is a failure, because a subset that quietly turns into no subset is worse than no
+subset at all.
+
+| test | what it proves |
+|---|---|
+| `herdr_real_ping_bootstrap_events_and_done_derivation` | the ping, the guard, the bootstrap snapshot, live events, and §5.7's `done` derivation from a real server |
+| `herdr_real_done_flip_heals_within_fallback` (G3) | the silent `done → idle` flip on focus, which herdr announces with **no** event, is healed by the periodic fallback resync |
+| `herdr_real_disconnect_reconnect_converges` (G6) | the cache converges after the server is really stopped and started again |
+| `herdr_real_schema_consumed_surface_unchanged` | the API surface we consume is byte-identical to the pinned fixture |
+
+**G3 is the one that is easy to make vacuous**, and two things keep it honest. The client is
+wrapped in a `FilteringTransport<T: Transport>` that drops the events the flip might
+otherwise be announced through and re-serves the rest — `EventStream::new` takes a
+`Box<dyn AsyncRead>`, so the filtered lines go back through a `tokio::io::duplex` and the
+client cannot tell. And the test *settles* first: it waits for 800 ms of quiet on the push
+stream before focusing the tab, because herdr announces a new tab's pane asynchronously long
+after `tab.create` returned, and any lifecycle event schedules a 200 ms coalesced resync that
+would heal the flip for the wrong reason. After the focus it asserts that the heal took at
+least the configured `fallback` (3 s in this test, so a run takes about that), that no
+reconnect happened, and that herdr forwarded **nothing** in between: if it ever does, the
+filter list is incomplete or herdr found another way to announce the flip, and the assertion
+message says to report it rather than to widen the filter.
+
+G6 stops the server through `SpawnedHerdr::stop_server` (`herdr server stop` over the
+isolated socket, never a signal and never the user's herdr), waits for the process to go, and
+brings it back with `SpawnedHerdr::respawn(&HerdrIsolation)` on the same socket path. The
+cache is proven to have re-bootstrapped by `Cache.resyncs` going `1 -> 2`, not by a timer.
+
+## The consumed API surface, and the weekly compat check
+
+`herdr api schema --json` is 255 KB of JSON-Schema, 91 request and 58 result variants, almost
+none of it ours — diffing all of it would flag every unrelated herdr feature, and an alert
+nobody trusts is not a check. `lastcall_testkit::herdr_schema` projects it onto the surface
+this repo actually consumes: the ten methods we call with their params and result schemas,
+the fifteen §5.4 lifecycle events plus `pane.agent_status_changed`, the transitive type
+closure, and the `AgentStatus` and `NotificationShowSound` vocabularies the code branches on.
+About 50 KB, key-sorted (`serde_json`'s maps are `BTreeMap`s here — no `preserve_order`), one
+trailing newline, so a regeneration is byte-stable.
+
+- `$ref`s are re-keyed `<section>/<Name>` rather than merged: herdr defines `PaneInfo`,
+  `AgentStatus` and `TabInfo` separately per section, and merging them would hide the day one
+  of them changes alone. `AgentStatus` is the single case where cross-section sameness is
+  asserted, because our code assumes it.
+- The method → result mapping is not derivable (herdr's `ResponseResult` is one flat
+  `oneOf`), so `CONSUMED_METHODS` states it and the generator verifies each named result
+  const exists in the schema.
+- `just herdr-schema-fixture` regenerates
+  `crates/lastcall-testkit/fixtures/herdr/schema/consumed-surface.json` from the **pinned
+  release asset** — never master, never by hand. `herdr api schema --json` needs no server,
+  so neither the generator nor the test touches a socket.
+- `herdr_real_schema_consumed_surface_unchanged` compares and prints a path-by-path diff on
+  mismatch, and asserts the projection is not vacuous (a method count, a result const per
+  method, an event count equal to `wire::LIFECYCLE_SUBSCRIPTIONS.len()`, both pinned enums,
+  more than twenty defs) so an empty projection can never pass.
+
+`just herdr-fetch-latest` downloads herdr's **newest** release into `target/herdr/<tag>/` and
+`just test-integration-herdr-latest` runs the subset against it.
+`.github/workflows/herdr-compat.yml` does that on a schedule — Mondays 06:00 UTC, plus
+`workflow_dispatch`, plus `pull_request` on its own paths so it has a green run before a
+change to it merges. A failure there is **information, not a blocker**: `ci.yml` is untouched
+and keeps using the pinned tag. The job files exactly one issue, labelled `herdr-compat`,
+creating the label with `--force` if it does not exist yet and refusing to file while any
+open `herdr-compat` issue exists (with a same-title search as a second guard), because drift
+persists until someone adopts the release and a second issue would only be the same news
+again.
+
+To adopt a new herdr: bump `herdr_version` in the `justfile`, run `just herdr-schema-fixture`,
+read the fixture diff and update `consumed-surface.json.provenance.md`, then
+`just test-integration-herdr`.
+
 ## Not a gate: `test_perf_scan`
 
 `crates/lastcall-engine/tests/test_perf_scan.rs` is `#[ignore]`d evidence, not a tier: 2,000
@@ -176,7 +269,9 @@ budgets); the Phase 9 kickoff sets the targets against these numbers.
 
 ## How skips are reported
 
-The real-herdr test needs the pinned binary. Without `LASTCALL_TEST_HERDR_BIN` it writes
+The real-herdr tests need the pinned binary, and that unset variable is the **only** skip
+they may take — everything else is a failure (see the subset section above). Without
+`LASTCALL_TEST_HERDR_BIN` each writes
 `SKIP: LASTCALL_TEST_HERDR_BIN unset (run: just test-integration-herdr)` with
 `stderr().write_all` (libtest swallows `eprintln!` of passing tests) and returns; `just
 test-integration` prints the same skip at the shell level, so it is visible twice rather than
@@ -193,12 +288,25 @@ up to 5 s. Kill-on-drop and kill-on-panic through a PID registry with a matcher
 (`ps -o comm= -p`) that refuses to kill anything it did not spawn. Safe wrappers only
 (`unsafe_code = "forbid"`, no `libc`).
 
+`stop_server` asks the server to quit over **its own** isolated socket (`herdr server stop`,
+never a signal, never the user's herdr) and waits for the pid to leave `ps`; `respawn` starts
+a new one on the same socket path with the same `HerdrIsolation`, which is what G6 needs. One
+subtlety is load-bearing there: `portable_pty` gives the child its own session with the pty as
+its **controlling** terminal, and the kernel's revoke at exit blocks until the tty output
+queue drains — so `spawn_server_child` runs a thread that reads the master and throws it away.
+Without it a stopped herdr wedges in macOS `ps` state `E` and `stop_server` times out after
+10 s; with it the stop takes about 200 ms. The timeout error prints a `ps` line for the pid,
+so a future wedge says what state it wedged in.
+
 ## Fixtures
 
 `crates/lastcall-testkit/fixtures/herdr/`: each fixture has a `<name>.provenance.md` saying
 whether it was recorded from the pinned binary (preferred) or hand-written from the schema,
 and from which schema lines. `just herdr-record` re-records into `recorded/`;
-`just fixtures-sync` derives the named fixtures. Fixture git repositories come from
+`just fixtures-sync` derives the named fixtures. `fixtures/herdr/schema/consumed-surface.json`
+is the odd one out — generated by `just herdr-schema-fixture` from the pinned release's own
+`api schema --json`, never edited by hand; its provenance file records the tag, the exact
+command, the date and the generator's summary line. Fixture git repositories come from
 `lastcall_testkit::fixture_repo::FixtureRepo` (deterministic identity, dates, and config; a
 local bare `origin`; `coworker_push`), proven by `test_integration_fixture_repo.rs`.
 `lastcall_testkit::engine` opens an engine over one (`open_engine`, `assert_pile!`, the

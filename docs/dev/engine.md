@@ -93,6 +93,17 @@ input before reading any output deadlocks once both 64 KiB pipes are full — a 
 paths, which is how the Phase 4 bench's 50,000-file drop first hung the scan
 (`git_run_command_feeds_stdin_while_draining_stdout` round-trips 300 KiB through `cat`).
 
+Phase 5 cut the per-root spawn count on the read side. The store's config is read with one
+`config --list -z` (`ConfigList::parse`: NUL-separated records, the key ends at the first
+newline, so `=` and newlines inside a value survive, and a repeated key means last wins)
+instead of seven `--get`s. Head inspection batches what it can into one
+`rev-parse --path-format=absolute` (`rev_parse_batch(flags, expected_lines)` checks the line
+count it got back): `--git-dir --git-common-dir --is-shallow-repository` plus a `--git-path
+<name>` per interesting file, six spawns down to four. `symbolic-ref -q --short HEAD` and the
+two `-q --verify` calls stay separate because a non-zero exit *is* their answer, and a batch
+would lose which line failed. S1's `open_spawns` fell 2,902 → 1,102 (`docs/dev/bench.md`,
+run C).
+
 | runner | cwd | env | may write? | used for |
 |---|---|---|---|---|
 | `StoreGit` | the root | `GIT_DIR=<store>`, `GIT_WORK_TREE=<root>`, `GIT_INDEX_FILE=<index>` explicit on every call | yes, to **our** store and index only | `hash-object -w --stdin-paths`, `read-tree`, `write-tree`, `ls-tree`, `cat-file --batch-check`, `cat-file --batch` (one call per scan for every rendered blob), `diff-files`, `ls-files --others`, `update-index --refresh`, `config` (the neutralized keys) |
@@ -105,7 +116,7 @@ paths, which is how the Phase 4 bench's 50,000-file drop first hung the scan
 | `--version` | alone |
 | `rev-parse`, `rev-list`, `merge-base`, `diff-tree`, `cat-file`, `for-each-ref` | any arguments |
 | `symbolic-ref` | exactly one ref (the two-ref form writes) |
-| `config` | `--get` only |
+| `config` | `--get <key>`, or exactly `--list -z` (Phase 5: one spawn per root instead of seven `--get`s) |
 | `ls-files` | only with `-v`, `-u`, `--stage`/`-s` (skip-worktree bits and conflict stages are *read* from the user's index, D6/C4) |
 | `log` | only with a `--format` |
 | `worktree` | `list --porcelain` only |
@@ -123,9 +134,88 @@ Refused by construction: `status`, `diff`, `add`, `update-index`, `checkout`, `s
 5. `baseline` per path from the ledger (override blob → override null → seen tree → empty); a missing override blob or an unparsable override falls to the tree with a notice (E2).
 6. Row iff baseline ≠ current by oid or mode (D1); on `core.filemode=false` roots the executable bit is normalized away on both sides, so a mode-only row cannot appear there.
 7. Every baseline and current blob of every row fetched in **one** `cat-file --batch` (2,000 unseen files cost 16 git processes per scan, not 2,000); hunks from a byte diff of the two blobs (`hunks.rs`); binary (NUL in the first 8000 bytes) or ≥ `collapse_size_bytes` or matching `collapsed_globs` → collapsed (D7/D8). A blob the batch cannot produce renders that row without content and a notice.
-8. Conflict state from the user's `ls-files -u` (C4); the override's flag; rename pairing (D5) — presentation only, the ledger stores delete + add. The pairing reads the **pile's rows**: a temp index (`index.tmp`) holds exactly the `deleted` rows at their baselines (`read-tree --empty` + `update-index --index-info`), the `added` rows are `add -N`ed, then `diff -M -z --name-status`. It is not a copy of the private index — that is the seen tree, and a path the user accepted as deleted (override `null`, no row) or a deleted row whose baseline is an override blob would otherwise pair or score differently before and after a compaction that changes no baseline.
+8. Conflict state from the user's `ls-files -u` (C4); the override's flag; rename pairing (D5) — presentation only, the ledger stores delete + add. The pairing reads the **pile's rows**: a temp index (`index.<pid>.tmp`, this process's own) holds exactly the `deleted` rows at their baselines (`read-tree --empty` + `update-index --index-info`), the `added` rows are `add -N`ed, then `diff -M -z --name-status`. It is not a copy of the private index — that is the seen tree, and a path the user accepted as deleted (override `null`, no row) or a deleted row whose baseline is an override blob would otherwise pair or score differently before and after a compaction that changes no baseline.
 9. Annotation (`upstream.rs`): heads = HEAD (+ `MERGE_HEAD`); range `seen_head..head` or from the merge-base; commits reachable from a remote ref by someone else are upstream; a pending path whose content equals a head's blob is `upstream`, touched upstream but different is `mixed`, otherwise plain. No merge-base, detached with no upstream, shallow, or no remotes → nothing annotated (C7).
 10. Notices from every step ride along in `pile.notices`; nothing after step 6 removes a row.
+
+## Many roots at once, many lastcalls at once (Phase 5)
+
+**One pool, two uses.** `rescan` opens newly discovered roots, and `scan_all` scans them, on
+a scoped thread pool of `EngineOptions.parallelism` threads (`engine::parallel_map`, built on
+`std::thread::scope`). The default is `default_parallelism()` =
+`min(available_parallelism(), MAX_PARALLELISM)`, floor 1, and `MAX_PARALLELISM` is **8** —
+past that the disk is the limit, not the CPU. There is deliberately no config key for the
+width; `LASTCALL_PARALLELISM` is read in the **binary only**
+(`crates/lastcall/src/commands/mod.rs`, `parallelism_override`), and it exists so the
+`status --json` golden can be produced at width 1 and width 8 and compared byte for byte.
+Not a user knob, not read by the engine, not read by the TUI.
+
+What the pool must not change is the answer:
+
+- `parallel_map` returns results **in item order**, never completion order, and `width <= 1`
+  (or a single item) runs everything inline with no thread spawned at all — the sequential
+  path is then literally the same code, so "identical at 1 and at 8" is a claim about the
+  work rather than about two implementations kept in step.
+- Everything order-bearing stays serial and outside the pool: the parent's `meta.json` write
+  before it; after it, the apply step that inserts roots in path order, assigns `scan_seq`,
+  appends notices and ORs `nested_changed`. `EngineEvent::Pile { seq }` ordering
+  (§10, Phase 4, "engine-global") is unchanged, because `scan_seq` is still written in the
+  apply step and nowhere else. The nested-repo passes stay serial between passes.
+- A per-root failure stays per-root: an unopenable root becomes a notice and the rest open.
+- No engine lock is held across the pool, and each root's `RootState` is borrowed by exactly
+  one thread for the whole call, so the per-root worker needs no lock of its own.
+
+`engine_parallel_open_and_scan_match_the_sequential_run_exactly` and
+`engine_parallel_open_reports_an_unopenable_root_as_a_notice` are those claims under test;
+`docs/dev/bench.md` run C has what it bought.
+
+**N lastcalls over one state dir.** Amendment v1.2 allows several instances at once — one per
+herdr workspace pane is the ordinary case, not the exotic one — so every file a root owns is
+either per-process or deliberately shared:
+
+| file | per process or shared | why |
+|---|---|---|
+| `index.<pid>.tmp` | per process | two concurrent scans would `read-tree` into the same file; a fold owns it for the fold's length |
+| `index`, `index.tree` | shared | a cache of the seen tree, and git itself serialises writes to it through `index.lock` |
+| `ledger.json` | shared | `lock` serialises writes, and every write reloads the on-disk ledger under it and replays the in-memory change |
+
+The temp index is `paths::temp_index_name(pid)` = `index.<pid>.tmp`, a sibling of `store/` in
+the root's state dir. It is unlinked when the fold finishes, again when the `Engine` drops
+(the clean-quit path), and — for a file left by *another* process — by `sweep_temp_indexes` at
+the next `Store::open`, but only once it has gone an hour untouched (`STALE_TEMP_INDEX`).
+There is no liveness probe on purpose: a pid on this machine says nothing (it may have been
+reused; the file may have been written inside a container's pid namespace), and a probe would
+be a new dependency for a file that costs nothing to leave lying. `is_temp_index_name` matches
+`index.<digits>.tmp` and nothing else, so the sweep can never take `index`, `index.tree`, or a
+file some later version adds. On Windows only our own is removed. Every failure in the sweep
+is silence: a temp index we could not delete is litter, never a reason to fail an open.
+
+The persistent index stays **shared**, which was a decision and not an oversight. It is a
+cache; git already serialises it; `PrivateIndex` retries its own `index.lock` 3 × 50 ms
+and then scans unrefreshed with the notice `index.lock held by another process; scanned
+without refresh` (over-report at worst, which is the fail-open direction).
+`engine_two_engines_scan_one_root_concurrently_and_agree` interleaves eight scans across two
+engines over one root: all twelve rows identical, and the 3 × 50 ms budget absorbed it with no
+exhaustion, so it was left alone.
+
+**The ledger lock budget doubled** in Phase 5: 20 × 50 ms → **40 × 50 ms = 2 s**
+(`ledger::LOCK_RETRIES`, `ledger::LOCK_BACKOFF`). With one lastcall per pane, finding another
+process mid `read → merge → write tmp → rename` is routine rather than a collision, and one
+second was thin on a cold state dir. Above two seconds an accept stops feeling like a
+keystroke, so that is where waiting stops and `LedgerError::LockBusy { path, retries }` takes
+over. `Ops` carries the budget as `lock: (u32, Duration)` (`ops::DEFAULT_LOCK`) purely so a
+test can reach the busy path in 20 ms instead of sleeping the shipping two seconds.
+
+`LockBusy` is an **error, not a refusal**. A refusal means the file moved under us and the
+accept is void; this means only that someone else held the lock. Nothing was written, the row
+is still pending, and the TUI classifies it as `AcceptFailed::LedgerBusy` — a whole-root
+condition rather than a per-row one — and says:
+
+```text
+ledger busy in <root> — try again
+```
+
+Pressing the same key a moment later is the entire fix.
 
 ## The fail-open ladder
 
