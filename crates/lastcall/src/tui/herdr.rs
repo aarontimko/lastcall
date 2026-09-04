@@ -3,7 +3,10 @@
 //!
 //! Everything the reducer is allowed to see lives here: [`HerdrUpdate`] (what the loop
 //! folds in), [`HerdrView`] (what the reducer keeps), and the pure [`derive`] /
-//! [`derive_scope`] that turn a [`Cache`] into them. `app.rs` imports only this module —
+//! [`derive_scope_with`] that turn a [`Cache`] into them (the convenience wrapper
+//! [`derive_scope`] adds exactly one impure step, [`canonical_checkout`], because herdr
+//! reports the path the user typed and the engine's roots are resolved). `app.rs` imports
+//! only this module —
 //! it never names `lastcall_engine::herdr`, so no `Cache`, `PaneInfo` or `ClientHandle`
 //! can reach the reducer (§6.6: a dedicated task owns every socket).
 //!
@@ -372,6 +375,16 @@ pub fn derive(cache: &Cache, roots: &[RootMeta]) -> BTreeMap<PathBuf, RootAgents
     out
 }
 
+/// A workspace's `checkout_path` in the shape a `RootMeta.path` can be compared to:
+/// `.`/`..`/`//`/trailing-separator noise removed, then resolved through the filesystem —
+/// falling back to the cleaned raw value when the path is not there (a `worktree_removed`
+/// the cache still carries, or a checkout on another machine). The one impure step in this
+/// half of the module, which is why [`derive_scope_with`] takes it as an argument.
+pub fn canonical_checkout(raw: &str) -> PathBuf {
+    let cleaned: PathBuf = Path::new(raw).components().collect();
+    std::fs::canonicalize(&cleaned).unwrap_or(cleaned)
+}
+
 /// The longest root that is `path` or a prefix of it (nested repos: the innermost wins).
 fn deepest_root<'a>(roots: &'a [RootMeta], path: &Path) -> Option<&'a Path> {
     roots
@@ -386,6 +399,17 @@ fn deepest_root<'a>(roots: &'a [RootMeta], path: &Path) -> Option<&'a Path> {
 /// badge links it; failing that, to every root containing a pane of that workspace; failing
 /// that, to nothing at all (`None` — no scope, no notice).
 pub fn derive_scope(cache: &Cache, roots: &[RootMeta], workspace_id: &str) -> Option<Scope> {
+    derive_scope_with(cache, roots, workspace_id, canonical_checkout)
+}
+
+/// [`derive_scope`] with the checkout-path resolver injected, so the pure half can be
+/// tested without touching a disk. `derive_scope` passes [`canonical_checkout`].
+pub fn derive_scope_with(
+    cache: &Cache,
+    roots: &[RootMeta],
+    workspace_id: &str,
+    resolve: impl Fn(&str) -> PathBuf,
+) -> Option<Scope> {
     let ws = cache.workspaces.get(workspace_id)?;
     let label = if ws.label.is_empty() {
         ws.workspace_id.clone()
@@ -393,7 +417,11 @@ pub fn derive_scope(cache: &Cache, roots: &[RootMeta], workspace_id: &str) -> Op
         ws.label.clone()
     };
     if let Some(worktree) = &ws.worktree {
-        let checkout = Path::new(&worktree.checkout_path);
+        // Canonicalised (deliverable 8): herdr reports the path the user typed, while the
+        // engine's roots came through `roots::discover`, which resolved every symlink. On
+        // macOS that alone is the difference between `/tmp/W/alpha` and
+        // `/private/tmp/W/alpha`, and an unresolved compare silently yields no scope.
+        let checkout = resolve(&worktree.checkout_path);
         if let Some(anchor) = roots.iter().find(|m| m.path == checkout) {
             let mut scoped: BTreeSet<PathBuf> = BTreeSet::new();
             scoped.insert(anchor.path.clone());
@@ -937,6 +965,48 @@ mod tests {
                 .collect::<BTreeSet<_>>(),
             "the checkout plus what its badges link, and not beta"
         );
+    }
+
+    /// Deliverable 8 says the `checkout_path` compare is "(canonicalised)". herdr reports
+    /// the path the user typed; the engine's roots came through `roots::discover`, which
+    /// resolved every symlink — so the raw compare finds nothing and the workspace, whose
+    /// whole provenance is right there, silently gets no scope at all.
+    #[test]
+    fn herdr_scope_places_a_symlinked_checkout_path() {
+        let tmp = lastcall_testkit::tmp::TempDir::new("lc-scope-symlink");
+        let real = tmp.join("real");
+        std::fs::create_dir_all(real.join("alpha")).expect("the real checkout");
+        let link = tmp.join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink the parent");
+        // What the engine holds: fully resolved, as `roots::discover` leaves it.
+        let resolved = std::fs::canonicalize(real.join("alpha")).expect("canonicalize");
+        let roots = vec![meta(&resolved.to_string_lossy(), None)];
+        // What herdr reports: the path through the symlink, with a trailing separator and
+        // a `.` for good measure — all three of which the raw compare failed on.
+        let reported = format!("{}/./alpha/", link.display());
+
+        let mut cache = cache(vec![]);
+        cache
+            .workspaces
+            .insert("w1".to_owned(), workspace("w1", "alpha", Some(&reported)));
+        let scope = derive_scope(&cache, &roots, "w1").expect("the checkout is a known root");
+        assert_eq!(
+            scope.roots,
+            [resolved.clone()].into_iter().collect::<BTreeSet<_>>()
+        );
+
+        // The pure half is unchanged: with an identity resolver the reported path places
+        // nothing, and a checkout that is not on disk falls back to its cleaned value.
+        assert_eq!(
+            derive_scope_with(&cache, &roots, "w1", |raw| PathBuf::from(raw)),
+            None,
+            "no resolution, no anchor — the defect, pinned"
+        );
+        assert_eq!(
+            canonical_checkout("/gone/./alpha/"),
+            PathBuf::from("/gone/alpha")
+        );
+        assert_eq!(canonical_checkout(&reported), resolved);
     }
 
     /// No provenance we can place: fall back to where this workspace's panes actually are,
