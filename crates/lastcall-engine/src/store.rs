@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use crate::env::Env;
 use crate::git::{self, BatchCheck, ConfigList, GitError, Mode, Oid, RepoGit, StoreGit};
-use crate::paths::RepoPaths;
+use crate::paths::{self, RepoPaths};
 
 /// `git | draft`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -129,6 +129,49 @@ impl<'a> RepoFacts<'a> {
     }
 }
 
+/// How long another process's temp index must have gone untouched before the sweep takes it.
+const STALE_TEMP_INDEX: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Remove this process's own temp index and any *stale* one left by a process that died
+/// (Phase 5 deliverable 2a).
+///
+/// Ours goes unconditionally - a leftover from our own crashed fold, which `read-tree` would
+/// replace anyway. Another process's goes only when it has not been modified for an hour,
+/// because there is no liveness probe here: a pid on this machine says nothing (it may have
+/// been reused, and the file may belong to a container's pid namespace), and adding a probe
+/// would mean a new dependency for a file that costs nothing to leave lying. On Windows
+/// nothing but ours is ever removed. A failure at any step is silence: a temp index we could
+/// not delete is litter, never a reason to fail an open.
+fn sweep_temp_indexes(repo_dir: &Path, ours: &Path) {
+    let _ = std::fs::remove_file(ours);
+    if cfg!(windows) {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(repo_dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !paths::is_temp_index_name(name) {
+            continue;
+        }
+        let path = entry.path();
+        if path == ours {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .and_then(|m| now.duration_since(m).map_err(std::io::Error::other))
+            .is_ok_and(|age| age >= STALE_TEMP_INDEX);
+        if stale {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
 impl Store {
     /// Open (initializing when absent) the store for `root`. `repo` is `Some` for git
     /// roots. Returns the store and any notices (a failed key copy is a notice, never fatal).
@@ -144,8 +187,7 @@ impl Store {
         if !paths.store.join("HEAD").is_file() {
             StoreGit::init_bare(env, &paths.store)?;
         }
-        // A stale temp index from a crashed fold; read-tree would replace it anyway.
-        let _ = std::fs::remove_file(&paths.index_tmp);
+        sweep_temp_indexes(&paths.repo_dir, &paths.index_tmp);
 
         let excludes_file = repo
             .and_then(|r| r.config.get("core.excludesfile"))
@@ -612,15 +654,83 @@ pub(crate) mod tests {
     }
 
     fn open_git(repo: &FixtureRepo, state: &TempDir) -> (Store, RepoGit) {
+        open_git_at(repo, state, &RepoPaths::under(state.join("repo")))
+    }
+
+    fn open_git_at(repo: &FixtureRepo, state: &TempDir, paths: &RepoPaths) -> (Store, RepoGit) {
         let env = fixture_env(repo, state);
-        let paths = RepoPaths::under(state.join("repo"));
         let rg = RepoGit::new(&env, repo.path());
         let config = rg.config_list().unwrap();
         let facts = RepoFacts::read(&rg, &config).unwrap();
         let (store, notices) =
-            Store::open(&env, repo.path(), RootKind::Git, &paths, Some(&facts)).unwrap();
+            Store::open(&env, repo.path(), RootKind::Git, paths, Some(&facts)).unwrap();
         assert!(notices.is_empty(), "{notices:?}");
         (store, rg)
+    }
+
+    /// Set `path`'s mtime `secs` into the past, so a sweep sees an aged file without a sleep.
+    fn age(path: &Path, secs: u64) {
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(secs);
+        let f = std::fs::File::options().write(true).open(path).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(when))
+            .unwrap();
+    }
+
+    /// The sweep takes our own temp index and a *dead* process's aged one, and nothing else:
+    /// not a temp index another live lastcall touched a minute ago, and not the persistent
+    /// index or its tree stamp, which share the `index` stem (deliverable 2a).
+    #[test]
+    fn store_sweeps_only_our_temp_index_and_an_hour_old_orphan() {
+        let dir = TempDir::new("lc-sweep");
+        let repo_dir = dir.mkdir("repo");
+        let paths = RepoPaths::under(repo_dir.clone());
+        // A pid that is not ours; the sweep never probes liveness, only the mtime.
+        let dead = repo_dir.join(paths::temp_index_name(999_999));
+        let live = repo_dir.join(paths::temp_index_name(std::process::id() + 1));
+        for f in [
+            &paths.index_tmp,
+            &dead,
+            &live,
+            &paths.index,
+            &paths.index_tree,
+        ] {
+            std::fs::write(f, b"x").unwrap();
+        }
+        age(&dead, 60 * 60 + 5);
+        age(&live, 60);
+        // The persistent index is old too: age alone must not be enough to take a file.
+        age(&paths.index, 60 * 60 * 24);
+
+        sweep_temp_indexes(&repo_dir, &paths.index_tmp);
+
+        assert!(!paths.index_tmp.exists(), "ours goes unconditionally");
+        assert!(!dead.exists(), "an hour-old orphan goes");
+        assert!(live.exists(), "a temp index touched a minute ago stays");
+        assert!(paths.index.exists(), "the persistent index is never swept");
+        assert!(paths.index_tree.exists(), "nor its tree stamp");
+    }
+
+    /// And `Store::open` is where it runs.
+    #[test]
+    fn store_open_sweeps_a_stale_temp_index_left_by_a_dead_process() {
+        let repo = FixtureRepo::new("sweep").unwrap();
+        let state = TempDir::new("lc-sweep-open");
+        let repo_dir = state.mkdir("repo");
+        let paths = RepoPaths::under(repo_dir.clone());
+        let dead = repo_dir.join(paths::temp_index_name(999_998));
+        std::fs::write(&dead, b"x").unwrap();
+        age(&dead, 60 * 60 + 5);
+
+        let (store, _) = open_git_at(&repo, &state, &paths);
+
+        assert!(!dead.exists(), "the stale temp index is gone after open");
+        assert!(
+            store
+                .index_tmp
+                .ends_with(paths::temp_index_name(std::process::id())),
+            "the store scans through its own process's temp index: {}",
+            store.index_tmp.display()
+        );
     }
 
     /// The one batched read must answer **exactly** what the seven `config --get` calls it
