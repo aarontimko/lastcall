@@ -26,8 +26,13 @@ impl JsonLineReader {
 
     /// Write one line (a newline is appended).
     pub fn send_line(&mut self, json: &str) -> std::io::Result<()> {
-        self.stream.write_all(json.as_bytes())?;
-        self.stream.write_all(b"\n")?;
+        // One write: a peer that reads once and then closes must never be left with an
+        // unread trailing newline — on Linux that turns the client's next read into
+        // `ConnectionReset` instead of the EOF every caller is written against.
+        let mut line = Vec::with_capacity(json.len() + 1);
+        line.extend_from_slice(json.as_bytes());
+        line.push(b'\n');
+        self.stream.write_all(&line)?;
         self.stream.flush()
     }
 
@@ -133,9 +138,16 @@ mod tests {
         let listener = UnixListener::bind(&path).unwrap();
         let server = std::thread::spawn(move || {
             let (mut conn, _) = listener.accept().unwrap();
-            let mut first = [0u8; 64];
-            let n = conn.read(&mut first).unwrap();
-            assert!(String::from_utf8_lossy(&first[..n]).contains("\"ping\""));
+            // Read the whole request line before answering and closing: closing with
+            // unread bytes in the receive buffer is a reset on Linux, not an EOF.
+            let mut first = Vec::new();
+            let mut chunk = [0u8; 64];
+            while !first.contains(&b'\n') {
+                let n = conn.read(&mut chunk).unwrap();
+                assert!(n > 0, "client closed before sending its request line");
+                first.extend_from_slice(&chunk[..n]);
+            }
+            assert!(String::from_utf8_lossy(&first).contains("\"ping\""));
             conn.write_all(b"{\"id\":\"a\",\"result\":{\"type\":\"po")
                 .unwrap();
             conn.flush().unwrap();
