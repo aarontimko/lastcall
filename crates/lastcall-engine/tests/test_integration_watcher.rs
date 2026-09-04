@@ -186,3 +186,47 @@ async fn watcher_ignore_globs_do_not_hide_tracked_edits() {
     assert!(shown, "the rescan backstop shows the edit");
     w.join().await;
 }
+
+/// The seam Phase 5 deliverable 7 needs (worker 5b): a new root becomes visible when asked,
+/// not at the backstop. `Engine::rescan` opens roots but neither scans nor watches them, so
+/// this loop is the only thing that turns a new directory into a visible root - and the
+/// backstop here is a minute, far past the assertion window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watcher_request_rescan_finds_a_new_root_without_waiting_for_the_backstop() {
+    let repo = FixtureRepo::new("watch-req").unwrap();
+    let state = TempDir::new("lc-watch-state");
+    let env = repo.engine_env(state.path());
+    let engine = open_engine(repo.parent_dir(), &env, state.path(), Config::default());
+    let mut w = engine.run(EngineTimings {
+        debounce: Duration::from_millis(100),
+        head_poll: Duration::from_secs(60),
+        rescan: Duration::from_secs(60),
+    });
+    wait_live(&mut w).await;
+
+    // A second repo under the same parent dir, made after the engine opened.
+    let _second = FixtureRepo::new_in(TempDir::adopt(repo.parent_dir()), "later").unwrap();
+    w.request_rescan();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no RootsChanged naming the new root within 10 s"
+        );
+        if let Some(EngineEvent::RootsChanged(roots)) =
+            next_event(&mut w, Duration::from_secs(3)).await
+            && roots.added.iter().any(|r| r.ends_with("later"))
+        {
+            break;
+        }
+    }
+    assert!(
+        lock(&w.engine)
+            .root_paths()
+            .iter()
+            .any(|p| p.ends_with("later")),
+        "the engine holds the new root"
+    );
+    w.join().await;
+}
