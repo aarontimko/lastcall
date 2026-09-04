@@ -1228,20 +1228,29 @@ pub fn hunk_height(hunk: &Hunk) -> usize {
     }
 }
 
-/// First diff line of each hunk (its header).
+/// Diff lines hunk `i` occupies *with* its separator: exactly one blank line follows every
+/// hunk but the last, so consecutive hunks are told apart on screen. The last hunk has none
+/// (and neither does the first get one before it), so a one-hunk row is unchanged.
+pub fn hunk_block(hunks: &[Hunk], i: usize) -> usize {
+    hunk_height(&hunks[i]) + usize::from(i + 1 < hunks.len())
+}
+
+/// First diff line of each hunk (its header), counting the blank separator lines.
 pub fn hunk_offsets(hunks: &[Hunk]) -> Vec<usize> {
     let mut out = Vec::with_capacity(hunks.len());
     let mut at = 0;
-    for h in hunks {
+    for i in 0..hunks.len() {
         out.push(at);
-        at += hunk_height(h);
+        at += hunk_block(hunks, i);
     }
     out
 }
 
-/// Total diff lines of a row.
+/// Total diff lines of a row, counting the blank separator lines.
 pub fn diff_len(row: &Row) -> usize {
-    row.hunks.iter().map(hunk_height).sum()
+    (0..row.hunks.len())
+        .map(|i| hunk_block(&row.hunks, i))
+        .sum()
 }
 
 pub fn short(oid: &Oid) -> String {
@@ -2546,9 +2555,12 @@ mod tests {
         ];
         assert!(mode.is_mode_change());
         assert_eq!(hunk_height(&mode), 1);
+        // The mode line, then the blank separator, then the second hunk's header.
         assert_eq!(
             hunk_offsets(&[mode.clone(), row.hunks[0].clone()]),
-            vec![0, 1]
+            vec![0, 2]
         );
+        assert_eq!(hunk_block(&[mode.clone(), row.hunks[0].clone()], 0), 2);
+        assert_eq!(hunk_block(&[mode.clone()], 0), 1, "the last hunk has none");
     }
 }

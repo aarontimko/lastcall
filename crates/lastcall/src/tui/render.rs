@@ -713,7 +713,15 @@ fn render_row_body(
     while y < area.height && h < row.hunks.len() {
         let hunk = &row.hunks[h];
         let height = super::app::hunk_height(hunk);
-        while within < height && y < area.height {
+        let block = super::app::hunk_block(&row.hunks, h);
+        while within < block && y < area.height {
+            // `block` is the hunk's own lines plus, for every hunk but the last, the blank
+            // separator line: nothing to draw, it just spaces the sections apart.
+            if within >= height {
+                within += 1;
+                y += 1;
+                continue;
+            }
             let mut line = hunk_line(hunk, within, h == current);
             let row_rect = Rect::new(area.x, area.y + y, area.width, 1);
             if within == 0 {
@@ -730,6 +738,9 @@ fn render_row_body(
                         Target::HunkAccept(h),
                     ));
                 }
+                if h == current {
+                    band(&mut line, area.width, style);
+                }
             }
             buf.set_line(area.x, area.y + y, &line, area.width);
             within += 1;
@@ -737,6 +748,20 @@ fn render_row_body(
         }
         h += 1;
         within = 0;
+    }
+}
+
+/// Make `line` a full-width band: pad it out to `width` and put `style` under every span,
+/// so the selected hunk's header reads as one run across the diff pane — the `[a accept]`
+/// control visibly belonging to it — instead of two islands of inverse.
+fn band(line: &mut Line<'static>, width: u16, style: Style) {
+    let used = line.width();
+    if used < width as usize {
+        line.spans
+            .push(Span::raw(" ".repeat(width as usize - used)));
+    }
+    for span in &mut line.spans {
+        span.style = style.patch(span.style);
     }
 }
 
@@ -1255,6 +1280,69 @@ mod tests {
         }
         let (frame, _) = frame_of(&app, 100, 30);
         assert!(frame.contains("[z accept]"), "{frame}");
+    }
+
+    /// The sponsor's ruling: exactly one blank line between consecutive hunks (none before
+    /// the first, none after the last), and the selected hunk's `@@ … @@` header is a
+    /// full-width band across the diff pane rather than two islands of inverse.
+    #[test]
+    fn render_hunks_are_separated_and_the_current_header_is_a_band() {
+        let mut app = three_roots();
+        app.apply(pile_event("alpha", alpha_two_hunks()));
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Open);
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut hits = HitMap::default();
+        terminal
+            .draw(|f| {
+                hits = render(&app, f);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let main = hits.main.expect("the main pane");
+        let text = |y: u16| -> String {
+            (main.x..main.right())
+                .map(|x| buf[(x, y)].symbol())
+                .collect()
+        };
+        let headers: Vec<u16> = (main.y..main.bottom())
+            .filter(|y| text(*y).contains("@@ -"))
+            .collect();
+        assert_eq!(headers.len(), 2, "{}", terminal.backend());
+        let (first, second) = (headers[0], headers[1]);
+        assert!(
+            text(second - 1).trim().is_empty(),
+            "a blank line before the second hunk: {:?}",
+            text(second - 1)
+        );
+        assert!(
+            !text(second - 2).trim().is_empty(),
+            "exactly one blank line, not two: {:?}",
+            text(second - 2)
+        );
+        // None after the last hunk: two hunks cost their own lines plus one separator.
+        let selected = app.selected_row().expect("f1");
+        let own: usize = selected
+            .hunks
+            .iter()
+            .map(super::super::app::hunk_height)
+            .sum();
+        assert_eq!(diff_len(selected), own + 1);
+        // The current hunk's header is one style run across the whole pane; the other
+        // header is not inverted at all.
+        assert!(
+            styles(&buf).contains(&format!(
+                "{first} {}..{} Reset Reset REVERSED\n",
+                main.x,
+                main.right()
+            )),
+            "{}",
+            styles(&buf)
+        );
+        assert!(
+            !buf[(main.x, second)].modifier.contains(Modifier::REVERSED),
+            "only the selected header is a band"
+        );
     }
 
     #[test]

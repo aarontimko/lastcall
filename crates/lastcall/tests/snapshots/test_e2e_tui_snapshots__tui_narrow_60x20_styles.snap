@@ -11,8 +11,7 @@ expression: style
 2 44..59 Reset Reset DIM
 2 59..60 Cyan Reset -
 3 0..1 Cyan Reset -
-3 1..16 Reset Reset REVERSED
-3 49..59 Reset Reset REVERSED
+3 1..59 Reset Reset REVERSED
 3 59..60 Cyan Reset -
 4 0..1 Cyan Reset -
 4 1..4 Red Reset -

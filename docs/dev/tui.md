@@ -46,7 +46,12 @@ gate greps at the end of this page are how that is enforced).
   `app::STATUS_TTL` = 30 s, then the key hints). Below `MIN_SIZE` (40×10) the whole frame
   is `render::TOO_SMALL` (`too small: 40×10 min`) and the hit map is empty. Only the visible
   window of nav entries and diff lines is built, so a 50 000-line diff costs the same as a
-  50-line one. The help overlay (`?`) and the accept confirm modal are drawn last over
+  50-line one. In the diff, one blank line separates consecutive hunks — none before the
+  first, none after the last — and the selected hunk's `@@ … @@` header is a full-width
+  band across the pane (its `[a accept]` control inside the band, so it is plain which hunk
+  the control takes); `app::hunk_block` is that geometry, and every scroll, offset and
+  `diff_len` counts the separators (`render_hunks_are_separated_and_the_current_header_is_a_band`).
+  The help overlay (`?`) and the accept confirm modal are drawn last over
   everything.
 - **`input.rs` — `Action` and the keymap.** Every key, mouse gesture and the 1 s tick becomes
   one `Action` before it touches `App` (`to_action(&Event, &Keymap)`), so the reducer never
@@ -167,7 +172,7 @@ Defaults (`input::DEFAULT_KEYMAP`, in help-overlay order):
 | `open` | `enter` `l` | open the selected row's diff (on a root: its first row) | — |
 | `back` | `esc` `h` | — | back to the file list; closes help first; never quits |
 | `focus_toggle` | `tab` | toggle focus between the panes | |
-| `hunk_next` / `hunk_prev` | `n` `]` / `p` `[` | next / previous hunk (the current hunk's header is drawn inverted) | |
+| `hunk_next` / `hunk_prev` | `n` `]` / `p` `[` | next / previous hunk (the current hunk's header is a full-width inverted band) | |
 | `toggle_full_paths` | `f` | root-relative paths instead of basenames | |
 | `toggle_remote` | `o` | show each repo's `org/repo` slug | |
 | `accept` | `a` | accept the selected entry: a file, a group, or every row of a root (asks above 10 files) | accept the hunk under the cursor |
