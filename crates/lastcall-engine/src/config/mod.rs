@@ -139,7 +139,9 @@ pub enum DraftInitial {
 }
 
 /// The `[herdr]` table.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+///
+/// No `derive(Default)`: `toast` defaults to `true`, which a derive cannot express.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)] // required on config types; see `Config`
 pub struct HerdrConfig {
     /// `auto | on | off`, default `auto`.
@@ -147,6 +149,21 @@ pub struct HerdrConfig {
     /// Optional named-session pin (§6.6).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
+    /// Ask herdr to show a desktop notification when a repo first goes ready. Default `true`.
+    pub toast: bool,
+    /// Which repos the herdr overlay covers, `workspace | all`. Default `workspace`.
+    pub scope: HerdrScope,
+}
+
+impl Default for HerdrConfig {
+    fn default() -> Self {
+        Self {
+            mode: HerdrMode::default(),
+            session: None,
+            toast: true,
+            scope: HerdrScope::default(),
+        }
+    }
 }
 
 /// `herdr.mode`.
@@ -157,6 +174,17 @@ pub enum HerdrMode {
     Auto,
     On,
     Off,
+}
+
+/// `herdr.scope`: which repos the overlay covers when a workspace can be identified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum HerdrScope {
+    /// Only the repos of the herdr workspace this pane belongs to.
+    #[default]
+    Workspace,
+    /// Every watched repo, whatever workspace it belongs to.
+    All,
 }
 
 /// Where the effective config came from.

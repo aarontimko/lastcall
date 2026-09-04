@@ -40,6 +40,8 @@ pub mod method {
     pub const EVENTS_SUBSCRIBE: &str = "events.subscribe";
     /// Phase 5.
     pub const NOTIFICATION_SHOW: &str = "notification.show";
+    /// Phase 5: focus the pane an agent runs in.
+    pub const AGENT_FOCUS: &str = "agent.focus";
 }
 
 /// Errors from parsing wire lines.
@@ -446,6 +448,16 @@ pub struct NotificationShowResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneTarget {
     pub pane_id: String,
+}
+
+/// `agent.focus` params (schema `AgentTarget`).
+///
+/// `target` is herdr's own public pane id, never a display name: the server
+/// resolves it against the session, and a name would silently focus the wrong
+/// pane (or nothing) when two panes share one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTarget {
+    pub target: String,
 }
 
 /// `worktree.list` params (schema line 4373).
