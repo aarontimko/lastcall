@@ -34,9 +34,11 @@ pub enum Action {
     NavPageUp,
     /// Nav focus: a page of entries down. Diff focus: a page of lines down.
     NavPageDown,
-    /// Focus the diff for the selected row/group; on a root entry, select its first row.
+    /// Focus the diff for the selected row/group (the cursor stays on that file's current
+    /// hunk); on a root entry, select its first row. Bound to `enter`, `l` and `right`.
     Open,
-    /// Close the help overlay if open, else return focus to the nav. Never quits.
+    /// Close the help overlay if open, else return focus to the nav with the same row
+    /// selected. Never quits. Bound to `esc`, `h` and `left`.
     Back,
     FocusToggle,
     HunkNext,
@@ -60,6 +62,18 @@ pub enum Action {
     Resize(u16, u16),
     /// One second passed (the loop's 1 s timer): status-line ages advance.
     Tick,
+    /// Accept what the cursor is on (§6.7): on a file row with hunks, the one hunk under
+    /// the diff cursor whichever pane has focus; else the selected entry — a hunkless row
+    /// whole, a group, every row of a root.
+    Accept,
+    /// Accept the selected row whole, whichever pane has focus.
+    AcceptFile,
+    /// Accept every row of every listed root.
+    AcceptAll,
+    /// Answer the confirm modal (`y` / `Enter`); nothing outside it.
+    Confirm,
+    /// Dismiss the confirm modal (`n` / `Esc`); nothing outside it.
+    Cancel,
 }
 
 /// Action name (the `[keys]` config key) → default key specs, in help-overlay order.
@@ -68,17 +82,41 @@ pub const DEFAULT_KEYMAP: &[(&str, &[&str])] = &[
     ("nav_down", &["down", "j"]),
     ("nav_page_up", &["pageup", "b"]),
     ("nav_page_down", &["pagedown", "space"]),
-    ("open", &["enter", "l"]),
-    ("back", &["esc", "h"]),
+    ("open", &["enter", "l", "right"]),
+    ("back", &["esc", "h", "left"]),
     ("focus_toggle", &["tab"]),
     ("hunk_next", &["n", "]"]),
     ("hunk_prev", &["p", "["]),
     ("toggle_full_paths", &["f"]),
     ("toggle_remote", &["o"]),
+    ("accept", &["a"]),
+    ("accept_file", &["shift-a"]),
+    ("accept_all", &["ctrl-a"]),
     ("refresh", &["r"]),
     ("help", &["?"]),
     ("quit", &["q", "ctrl-c"]),
 ];
+
+/// The confirm modal's keys, consulted before the keymap while `App::confirm` is open and
+/// nowhere else. Not rebindable in v1 (kickoff deliverable 4), so they live outside
+/// [`DEFAULT_KEYMAP`]; the help overlay appends them after the bindable rows.
+pub const MODAL_KEYS: &[(&str, &[&str])] =
+    &[("confirm", &["y", "enter"]), ("cancel", &["n", "esc"])];
+
+/// The modal action for a key while the confirm is open: `Confirm`, `Cancel`, or nothing
+/// (the loop then lets only the keymap's `quit` keys through and swallows every other
+/// key, like the help overlay does).
+pub fn modal_action(key: Key) -> Option<Action> {
+    for (name, specs) in MODAL_KEYS {
+        if specs.iter().any(|s| Key::parse(s).ok() == Some(key)) {
+            return Some(match *name {
+                "confirm" => Action::Confirm,
+                _ => Action::Cancel,
+            });
+        }
+    }
+    None
+}
 
 impl Action {
     /// The key-bindable action for a `[keys]` name (`nav_up`, `quit`, …). `scroll_up` /
@@ -99,6 +137,9 @@ impl Action {
             "scroll_down" => Action::ScrollDown(1),
             "toggle_full_paths" => Action::ToggleFullPaths,
             "toggle_remote" => Action::ToggleRemote,
+            "accept" => Action::Accept,
+            "accept_file" => Action::AcceptFile,
+            "accept_all" => Action::AcceptAll,
             "refresh" => Action::Refresh,
             "help" => Action::Help,
             "quit" => Action::Quit,
@@ -120,11 +161,16 @@ impl Action {
             "hunk_prev" => "previous hunk",
             "toggle_full_paths" => "full paths",
             "toggle_remote" => "show org/repo",
+            "accept" => "accept the hunk or the selected entry",
+            "accept_file" => "accept the whole file",
+            "accept_all" => "accept everything listed",
             "refresh" => "rescan now",
             "help" => "this help",
             "quit" => "quit",
             "scroll_up" => "scroll the diff up",
             "scroll_down" => "scroll the diff down",
+            "confirm" => "confirm",
+            "cancel" => "cancel",
             _ => "",
         }
     }
@@ -374,6 +420,7 @@ impl Keymap {
             })
             .collect();
         for (name, specs) in keys {
+            // `confirm` / `cancel` are not in `from_name`, so `[keys]` refuses them too.
             if Action::from_name(name).is_none() {
                 return Err(KeymapError::UnknownAction {
                     action: name.clone(),
@@ -478,8 +525,9 @@ pub fn pointer(event: &Event) -> Option<(u16, u16)> {
 mod tests {
     use super::*;
     use crate::tui::app::testfix::*;
-    use crate::tui::app::{App, Selection, Target};
+    use crate::tui::app::{App, Changed, Effect, Focus, Selection, Target};
     use crate::tui::render::{HitMap, render};
+    use lastcall_engine::engine::AcceptRequest;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -522,14 +570,19 @@ mod tests {
     }
 
     /// Feed a key through the same path the loop uses: `to_action` then `App::handle`.
-    fn press_key(app: &mut App, keymap: &Keymap, event: Event) {
+    fn press_key(app: &mut App, keymap: &Keymap, event: Event) -> (Changed, Option<Effect>) {
         let action = to_action(&event, keymap).expect("bound");
-        app.handle(action);
+        app.handle(action)
     }
 
     /// Click the rendered `target` through the loop's path: a left-button `Down` becomes
     /// `Press(x, y)`, resolved against the hit map, then `App::hit`.
-    fn click(app: &mut App, keymap: &Keymap, hits: &HitMap, target: &Target) {
+    fn click(
+        app: &mut App,
+        keymap: &Keymap,
+        hits: &HitMap,
+        target: &Target,
+    ) -> (Changed, Option<Effect>) {
         let (rect, _) = hits
             .targets
             .iter()
@@ -548,7 +601,7 @@ mod tests {
             .expect("the press lands on the target")
             .clone();
         assert_eq!(&hit, target);
-        app.hit(hit);
+        app.hit(hit)
     }
 
     // ---- keymap ----------------------------------------------------------------------
@@ -878,13 +931,20 @@ mod tests {
     fn keymap_table_shows_the_canonical_spelling_of_an_override() {
         for (_, specs) in DEFAULT_KEYMAP {
             for spec in *specs {
-                assert_eq!(
-                    Key::parse(spec).unwrap().spec(),
-                    *spec,
-                    "default {spec} is canonical"
-                );
+                let key = Key::parse(spec).unwrap();
+                // `shift-a` is the one default spelled by its modifier (a bare `A` would
+                // case-fold onto `a`); its canonical form is `A`, and it round-trips.
+                let canonical = if *spec == "shift-a" { "A" } else { *spec };
+                assert_eq!(key.spec(), canonical, "default {spec} is canonical");
             }
         }
+        assert!(
+            App::new()
+                .keymap
+                .iter()
+                .any(|(n, s)| n == "accept_file" && s == &["A".to_owned()]),
+            "App seeds the canonical table: shift-a shows as A"
+        );
         let keys: BTreeMap<String, KeySpecs> = [
             ("quit".to_owned(), KeySpecs::One("Q".to_owned())),
             (
@@ -1013,6 +1073,67 @@ mod tests {
         assert_eq!(frame(&by_key).0, frame(&by_mouse).0);
     }
 
+    /// Ruling 2: `right` is `open` and `left` is `back`, exactly as `l` and `h` are —
+    /// same `App`, same frame, so the arrows are a third spelling and not a second path.
+    #[test]
+    fn input_parity_arrows_match_h_and_l() {
+        let km = Keymap::defaults();
+        let mut base = three_roots();
+        base.handle(Action::Resize(100, 30));
+        base.apply(pile_event("alpha", alpha_two_hunks()));
+        base.select(Some(row("alpha", "f1")));
+        base.handle(Action::HunkNext);
+
+        // Right / `l` open the diff with the cursor left on hunk 2.
+        let mut by_letter = base.clone();
+        let mut by_arrow = base;
+        press_key(&mut by_letter, &km, key('l'));
+        press_key(
+            &mut by_arrow,
+            &km,
+            key_code(KeyCode::Right, KeyModifiers::NONE),
+        );
+        assert_eq!(by_letter.effective_focus(), Focus::Diff);
+        assert_eq!(by_letter.diff.hunk, 1, "the row's current hunk is kept");
+        assert_eq!(by_letter, by_arrow);
+        assert_eq!(frame(&by_letter).0, frame(&by_arrow).0);
+
+        // Left / `h` come back to the nav with the same row selected.
+        let selected = by_letter.selection.clone();
+        press_key(&mut by_letter, &km, key('h'));
+        press_key(
+            &mut by_arrow,
+            &km,
+            key_code(KeyCode::Left, KeyModifiers::NONE),
+        );
+        assert_eq!(by_letter.effective_focus(), Focus::Nav);
+        assert_eq!(by_letter.selection, selected);
+        assert_eq!(by_letter, by_arrow);
+        assert_eq!(frame(&by_letter).0, frame(&by_arrow).0);
+    }
+
+    /// `[keys] back = ["left"]` replaces the whole default list like any other override:
+    /// `left` still means `back`, `esc` and `h` are unbound, and `open` is untouched.
+    #[test]
+    fn keymap_back_can_be_rebound_to_left() {
+        let km = Keymap::from_config(&keys(&[("back", &["left"])])).expect("left is a key spec");
+        let table = km.table();
+        let row = |n: &str| table.iter().find(|(name, _)| name == n).unwrap().1.clone();
+        assert_eq!(row("back"), vec!["left"]);
+        assert_eq!(row("open"), vec!["enter", "l", "right"], "untouched");
+        let bound = |ev: Event| to_action(&ev, &km);
+        assert_eq!(
+            bound(key_code(KeyCode::Left, KeyModifiers::NONE)),
+            Some(Action::Back)
+        );
+        assert_eq!(bound(key_code(KeyCode::Esc, KeyModifiers::NONE)), None);
+        assert_eq!(bound(key('h')), None);
+        assert_eq!(
+            bound(key_code(KeyCode::Right, KeyModifiers::NONE)),
+            Some(Action::Open)
+        );
+    }
+
     #[test]
     fn input_default_keymap_has_no_duplicate_binding() {
         let mut seen: Vec<&str> = Vec::new();
@@ -1068,15 +1189,29 @@ mod tests {
             (Action::Refresh, "key"),
             (Action::Help, "key"),
             (Action::Quit, "key"),
+            (Action::Accept, "key"),
+            (Action::AcceptFile, "key"),
+            (Action::AcceptAll, "key"),
+            (Action::Confirm, "modal"),
+            (Action::Cancel, "modal"),
             (Action::Press(1, 1), "mouse"),
             (Action::Drag(1, 1), "mouse"),
             (Action::Release, "mouse"),
             (Action::Resize(80, 24), "terminal"),
             (Action::Tick, "timer"),
         ];
+        let by_modal: Vec<Action> = MODAL_KEYS
+            .iter()
+            .flat_map(|(_, specs)| specs.iter())
+            .filter_map(|s| modal_action(Key::parse(s).unwrap()))
+            .collect();
         for (action, source) in table {
             match *source {
                 "key" => assert!(by_key.contains(action), "{action:?} has no default key"),
+                "modal" => {
+                    assert!(by_modal.contains(action), "{action:?} has no modal key");
+                    assert!(!by_key.contains(action), "{action:?} must not be key-bound");
+                }
                 _ => assert!(!by_key.contains(action), "{action:?} must not be key-bound"),
             }
         }
@@ -1102,8 +1237,167 @@ mod tests {
             | Action::Drag(_, _)
             | Action::Release
             | Action::Resize(_, _)
-            | Action::Tick => 21,
+            | Action::Tick
+            | Action::Accept
+            | Action::AcceptFile
+            | Action::AcceptAll
+            | Action::Confirm
+            | Action::Cancel => 26,
         };
-        assert_eq!(table.len(), 21);
+        assert_eq!(table.len(), 26);
+    }
+
+    #[test]
+    fn input_modal_keys_resolve_only_through_modal_action() {
+        let km = Keymap::defaults();
+        let y = Key::parse("y").unwrap();
+        let enter = Key::parse("enter").unwrap();
+        let n = Key::parse("n").unwrap();
+        let esc = Key::parse("esc").unwrap();
+        assert_eq!(modal_action(y), Some(Action::Confirm));
+        assert_eq!(modal_action(enter), Some(Action::Confirm));
+        assert_eq!(modal_action(n), Some(Action::Cancel));
+        assert_eq!(modal_action(esc), Some(Action::Cancel));
+        assert_eq!(modal_action(Key::parse("a").unwrap()), None);
+        // Outside the modal the same keys keep their keymap meaning (or none).
+        assert_eq!(to_action(&key('n'), &km), Some(Action::HunkNext));
+        assert_eq!(to_action(&key('y'), &km), None);
+        assert!(
+            km.bindings()
+                .iter()
+                .all(|(_, a)| !matches!(a, Action::Confirm | Action::Cancel)),
+            "confirm/cancel are never in the keymap"
+        );
+        // …and `[keys]` cannot bind them in v1.
+        for name in ["confirm", "cancel"] {
+            assert!(matches!(
+                Keymap::from_config(&keys(&[(name, &["x"])])),
+                Err(KeymapError::UnknownAction { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn input_accept_keys_by_default() {
+        let km = Keymap::defaults();
+        assert_eq!(to_action(&key('a'), &km), Some(Action::Accept));
+        assert_eq!(
+            to_action(&key_code(KeyCode::Char('A'), KeyModifiers::SHIFT), &km),
+            Some(Action::AcceptFile)
+        );
+        assert_eq!(
+            to_action(&key_code(KeyCode::Char('a'), KeyModifiers::CONTROL), &km),
+            Some(Action::AcceptAll)
+        );
+        // `[keys]` overrides cover the three accept actions.
+        let km = Keymap::from_config(&keys(&[("accept", &["x"]), ("accept_all", &["shift-x"])]))
+            .unwrap();
+        assert_eq!(to_action(&key('x'), &km), Some(Action::Accept));
+        assert_eq!(to_action(&key('a'), &km), None);
+        assert_eq!(to_action(&key('X'), &km), Some(Action::AcceptAll));
+    }
+
+    // ---- accept parity (kickoff deliverable 7) ----------------------------------------
+
+    /// `n`, `n`, `a` vs a click on hunk 2's `[a accept]`: equal apps, equal effects, and
+    /// the effect is one `AcceptRequest::Hunk` for index 2 of 3.
+    #[test]
+    fn input_parity_accept_hunk() {
+        let km = Keymap::defaults();
+        let mut base = three_roots();
+        base.handle(Action::Resize(100, 30));
+        base.apply(pile_event("alpha", alpha_hunks(3)));
+        base.select(Some(row("alpha", "f1")));
+        base.handle(Action::Open);
+        let (_, hits) = frame(&base);
+        let mut by_key = base.clone();
+        let mut by_mouse = base;
+
+        press_key(&mut by_key, &km, key('n'));
+        press_key(&mut by_key, &km, key('n'));
+        assert_eq!(by_key.diff.hunk, 2);
+        let by_key_effect = press_key(&mut by_key, &km, key('a'));
+        let by_mouse_effect = click(&mut by_mouse, &km, &hits, &Target::HunkAccept(2));
+
+        assert_eq!(by_key, by_mouse);
+        assert_eq!(by_key_effect, by_mouse_effect);
+        assert_eq!(frame(&by_key).0, frame(&by_mouse).0);
+        let Some(Effect::Accept(reqs)) = by_key_effect.1 else {
+            panic!("an accept effect: {by_key_effect:?}");
+        };
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].0, root("alpha"));
+        match &reqs[0].1 {
+            AcceptRequest::Hunk { index, hunks, .. } => {
+                assert_eq!((*index, hunks.len()), (2, 3));
+            }
+            other => panic!("a hunk request: {other:?}"),
+        }
+        assert!(by_key.accepting.is_some());
+    }
+
+    /// `A` vs a click on the main-view header's `[A accept file]`, from the nav pane.
+    #[test]
+    fn input_parity_accept_file() {
+        let km = Keymap::defaults();
+        let mut base = three_roots();
+        base.handle(Action::Resize(100, 30));
+        base.select(Some(row("alpha", "f1")));
+        let (_, hits) = frame(&base);
+        let mut by_key = base.clone();
+        let mut by_mouse = base;
+
+        let by_key_effect = press_key(
+            &mut by_key,
+            &km,
+            key_code(KeyCode::Char('A'), KeyModifiers::SHIFT),
+        );
+        let by_mouse_effect = click(&mut by_mouse, &km, &hits, &Target::FileAccept);
+
+        assert_eq!(by_key, by_mouse);
+        assert_eq!(by_key_effect, by_mouse_effect);
+        assert_eq!(frame(&by_key).0, frame(&by_mouse).0);
+        let Some(Effect::Accept(reqs)) = by_key_effect.1 else {
+            panic!("an accept effect: {by_key_effect:?}");
+        };
+        assert_eq!(reqs.len(), 1);
+        assert!(
+            matches!(reqs[0].1, AcceptRequest::File(_)),
+            "{:?}",
+            reqs[0].1
+        );
+    }
+
+    /// `ctrl-a` vs a click on the header's `[Accept All]`: one `AcceptRequest::All` per
+    /// listed root, each carrying that root's held pile; five files, so no modal.
+    #[test]
+    fn input_parity_accept_all() {
+        let km = Keymap::defaults();
+        let mut base = three_roots();
+        base.handle(Action::Resize(100, 30));
+        let (_, hits) = frame(&base);
+        let mut by_key = base.clone();
+        let mut by_mouse = base.clone();
+
+        let by_key_effect = press_key(
+            &mut by_key,
+            &km,
+            key_code(KeyCode::Char('a'), KeyModifiers::CONTROL),
+        );
+        let by_mouse_effect = click(&mut by_mouse, &km, &hits, &Target::HeaderAcceptAll);
+
+        assert_eq!(by_key, by_mouse);
+        assert_eq!(by_key_effect, by_mouse_effect);
+        assert_eq!(frame(&by_key).0, frame(&by_mouse).0);
+        assert!(by_key.confirm.is_none(), "five files ask nothing");
+        let Some(Effect::Accept(reqs)) = by_key_effect.1 else {
+            panic!("an accept effect: {by_key_effect:?}");
+        };
+        let expected: Vec<(std::path::PathBuf, AcceptRequest)> = base
+            .listed_roots()
+            .map(|v| (v.meta.path.clone(), AcceptRequest::All(v.pile.clone())))
+            .collect();
+        assert_eq!(reqs.len(), 3);
+        assert_eq!(reqs, expected, "exactly the held piles, in nav order");
     }
 }

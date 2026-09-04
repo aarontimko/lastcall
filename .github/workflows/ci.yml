@@ -50,7 +50,11 @@ jobs:
       - uses: extractions/setup-just@v4
       - uses: Swatinem/rust-cache@v2
       - run: just build
+      # The unit tier runs the store-backed proptests at 8 cases so every commit's hook is
+      # fast; CI keeps the pre-push width (docs/dev/testing.md, "Determinism rules").
       - run: just test-unit
+        env:
+          PROPTEST_CASES: 64
 
   integration:
     strategy:

@@ -1,7 +1,12 @@
-//! Phase 3 TUI snapshots (kickoff deliverable 8): sixteen scenes, each rendered through
+//! TUI snapshots: the sixteen Phase 3 scenes (its kickoff deliverable 8) and the Phase 4
+//! accept scenes (kickoff deliverable 6), each rendered through
 //! `ratatui::backend::TestBackend` from an `App` fed by a real engine over the shared
 //! fixture, and pinned as two `insta` snapshots — the symbol frame (`*_frame`, the
 //! backend's `Display`) and the style runs (`*_styles`, `render::styles`).
+//!
+//! The accept scenes drive the real `Engine::accept` from the reducer's own
+//! `Effect::Accept` requests (built from the held rows, as the loop does) and feed the
+//! results back through `App::accepted`.
 //!
 //! Every scene builds its own `fixture_parent` under a fresh temp dir (`<tmp>/W/`) with its
 //! own state dir, so the mutating scenes never see each other and nothing touches the real
@@ -11,15 +16,15 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use lastcall::tui::app::{App, RootMeta, Selection};
+use lastcall::tui::app::{App, Effect, RootMeta, Selection};
 use lastcall::tui::input::Action;
 use lastcall::tui::render::{render, styles};
-use lastcall_engine::engine::Engine;
+use lastcall_engine::engine::{Engine, EngineOptions};
 use lastcall_engine::env::Env;
 use lastcall_engine::ops::NoFault;
 use lastcall_engine::scan::{Annotation, Change, Pile};
 use lastcall_engine::watcher::EngineEvent;
-use lastcall_testkit::engine::open_engine;
+use lastcall_testkit::engine::{open_engine, open_engine_with};
 use lastcall_testkit::fixture_parent::{self, config};
 use lastcall_testkit::fixture_repo::{FixtureRepo, engine_env_for};
 use lastcall_testkit::tmp::TempDir;
@@ -73,6 +78,10 @@ impl Scene {
         open_engine(&self.parent, &self.env, &self.state, config())
     }
 
+    fn engine_with(&self, options: EngineOptions) -> Engine {
+        open_engine_with(&self.parent, &self.env, &self.state, config(), options)
+    }
+
     fn repo(&self, name: &str) -> FixtureRepo {
         FixtureRepo::open_in(TempDir::adopt(&self.parent), name)
     }
@@ -92,9 +101,9 @@ fn app_of(engine: &mut Engine) -> App {
     app.handle(Action::Resize(W, H));
     let metas = engine.roots().into_iter().map(RootMeta::of).collect();
     app.sync_roots(metas);
-    for (root, result) in engine.scan_all() {
+    for (root, seq, result) in engine.scan_all() {
         let pile = result.expect("scan succeeds");
-        app.apply(EngineEvent::Pile { root, pile });
+        app.apply(EngineEvent::Pile { root, seq, pile });
     }
     app
 }
@@ -103,6 +112,7 @@ fn rescan(app: &mut App, engine: &mut Engine, root: &Path) -> Pile {
     let pile = engine.scan(root).expect("scan succeeds");
     app.apply(EngineEvent::Pile {
         root: root.to_path_buf(),
+        seq: engine.scan_seq(),
         pile: pile.clone(),
     });
     pile
@@ -174,10 +184,17 @@ fn tui_nav_three_roots() {
         Some(Selection::Row(alpha.clone(), b"f1".to_vec()))
     );
     let (frame, _) = draw(&app, W, H);
-    // An unchanged pile changes nothing: same selection, same cursor, same bytes.
-    let before = app.clone();
+    // An unchanged pile changes nothing: same selection, same cursor, same bytes. Only
+    // the seq bookkeeping moves forward (the pile was current as of that scan).
+    let mut before = app.clone();
     let pile = engine.scan(&alpha).expect("scan");
-    let (changed, _) = app.apply(EngineEvent::Pile { root: alpha, pile });
+    let seq = engine.scan_seq();
+    before.seq.insert(alpha.clone(), seq);
+    let (changed, _) = app.apply(EngineEvent::Pile {
+        root: alpha,
+        seq,
+        pile,
+    });
     assert_eq!(changed, lastcall::tui::app::Changed::No);
     assert_eq!(app, before);
     assert_eq!(draw(&app, W, H).0, frame);
@@ -431,11 +448,308 @@ fn record_pile_fixture() {
     let scene = Scene::build();
     let mut engine = scene.engine();
     let mut piles: BTreeMap<String, Pile> = BTreeMap::new();
-    for (root, result) in engine.scan_all() {
+    for (root, _seq, result) in engine.scan_all() {
         let name = root.file_name().unwrap().to_string_lossy().into_owned();
         piles.insert(name, result.expect("scan ok"));
     }
     let out =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/piles_three_roots.json");
     std::fs::write(&out, serde_json::to_string_pretty(&piles).unwrap()).unwrap();
+}
+
+// ---- Phase 4: accept (kickoff deliverable 6) ---------------------------------------------
+
+/// Run the reducer's accept effect against the engine the way the loop does — every
+/// request through `Engine::accept`, errors as their text — and feed the results back.
+fn run_accept(app: &mut App, engine: &mut Engine, effect: Option<Effect>) {
+    let Some(Effect::Accept(reqs)) = effect else {
+        panic!("an accept effect, got {effect:?}");
+    };
+    let results = reqs
+        .into_iter()
+        .map(|(root, req)| {
+            let result = engine.accept(&root, req).map_err(|e| e.to_string());
+            (root, result)
+        })
+        .collect();
+    app.accepted(results);
+}
+
+fn status_text(app: &App) -> &str {
+    app.status.as_ref().map(|s| s.text.as_str()).unwrap_or("")
+}
+
+/// alpha with `f1` committed at 80 lines and marked seen, then lines `edits` changed:
+/// one hunk per edit (3-line context). `f2` is edited too when `f2_pending`.
+fn alpha_hunks(scene: &Scene, edits: &[usize], f2_pending: bool) -> (Engine, PathBuf) {
+    let alpha_repo = scene.repo("alpha");
+    let lines: Vec<String> = (1..=80).map(|i| format!("line {i}")).collect();
+    alpha_repo.write("f1", format!("{}\n", lines.join("\n")));
+    alpha_repo.git(&["add", "f1"]).unwrap();
+    let mut alpha_repo = alpha_repo;
+    alpha_repo.commit("agent: f1 to 80 lines").unwrap();
+    let mut engine = scene.engine();
+    let alpha = root_named(&engine, "alpha");
+    mark_seen(&mut engine, &alpha);
+    let mut edited = lines.clone();
+    for i in edits {
+        edited[i - 1] = format!("LINE {i} (edited)");
+    }
+    alpha_repo.write("f1", format!("{}\n", edited.join("\n")));
+    if f2_pending {
+        alpha_repo.write("f2", "b\nagent edit after seen\n");
+    }
+    (engine, alpha)
+}
+
+#[test]
+fn tui_accept_controls() {
+    let scene = Scene::build();
+    let (mut engine, alpha) = alpha_hunks(&scene, &[5, 45], false);
+    let mut app = app_of(&mut engine);
+    let row = app.roots[&alpha].row(b"f1").expect("f1 pending").clone();
+    assert_eq!(row.hunks.len(), 2, "{row:?}");
+    select_row(&mut app, &alpha, "f1");
+    app.handle(Action::Open);
+    let (frame, _) = draw(&app, W, H);
+    assert!(frame.contains("[Accept All]"), "{frame}");
+    assert!(frame.contains("[A accept file]"), "{frame}");
+    assert_eq!(frame.matches("[a accept]").count(), 2, "{frame}");
+    assert!(
+        frame.contains("a accept hunk  A accept file  ^A accept all"),
+        "{frame}"
+    );
+    snapshot("tui_accept_controls", &app, W, H);
+}
+
+/// §6.7: accepting the last hunk of a file advances to the next file. Three hunks
+/// accepted one by one from the cursor (index 0 each time: the next hunk slides into it);
+/// the third leaves `f1` clean and the selection lands on `f2`.
+#[test]
+fn tui_accept_last_hunk_advances() {
+    let scene = Scene::build();
+    let (mut engine, alpha) = alpha_hunks(&scene, &[5, 45, 78], true);
+    let mut app = app_of(&mut engine);
+    select_row(&mut app, &alpha, "f1");
+    app.handle(Action::Open);
+    assert_eq!(app.roots[&alpha].row(b"f1").unwrap().hunks.len(), 3);
+
+    let (_, effect) = app.handle(Action::Accept);
+    run_accept(&mut app, &mut engine, effect);
+    assert_eq!(status_text(&app), "accepted f1 · 2 hunks left");
+    assert_eq!(app.roots[&alpha].row(b"f1").unwrap().hunks.len(), 2);
+    assert_eq!(
+        app.selection,
+        Some(Selection::Row(alpha.clone(), b"f1".to_vec())),
+        "hunks remain: the cursor stays on f1"
+    );
+    assert_eq!(app.diff.hunk, 0);
+
+    let (_, effect) = app.handle(Action::Accept);
+    run_accept(&mut app, &mut engine, effect);
+    assert_eq!(status_text(&app), "accepted f1 · 1 hunk left");
+    assert_eq!(app.roots[&alpha].row(b"f1").unwrap().hunks.len(), 1);
+
+    let (_, effect) = app.handle(Action::Accept);
+    run_accept(&mut app, &mut engine, effect);
+    assert_eq!(status_text(&app), "accepted f1 · file complete");
+    assert!(app.roots[&alpha].row(b"f1").is_none(), "f1 is clean");
+    assert_eq!(
+        app.selection,
+        Some(Selection::Row(alpha.clone(), b"f2".to_vec())),
+        "advanced to the next file"
+    );
+    assert!(app.accepting.is_none());
+    snapshot("tui_accept_last_hunk_advances", &app, W, H);
+}
+
+/// §6.7: accepting a repo's last file collapses the repo out of the nav. alpha's `f1`
+/// then `f2` accepted whole; alpha unlists and the selection moves to beta's first row.
+#[test]
+fn tui_accept_last_file_collapses_repo() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    let alpha = root_named(&engine, "alpha");
+    let beta = root_named(&engine, "beta");
+    select_row(&mut app, &alpha, "f1");
+
+    let (_, effect) = app.handle(Action::AcceptFile);
+    run_accept(&mut app, &mut engine, effect);
+    assert_eq!(status_text(&app), "accepted f1");
+    assert_eq!(
+        app.selection,
+        Some(Selection::Row(alpha.clone(), b"f2".to_vec()))
+    );
+
+    let (_, effect) = app.handle(Action::AcceptFile);
+    run_accept(&mut app, &mut engine, effect);
+    assert_eq!(status_text(&app), "accepted f2");
+    assert!(
+        !app.roots[&alpha].listed(),
+        "alpha collapsed out of the nav"
+    );
+    assert_eq!(
+        app.selection,
+        Some(Selection::Row(beta.clone(), b"u1".to_vec())),
+        "the next listed root's first row"
+    );
+    assert!(engine.scan(&alpha).expect("scan").is_empty());
+    let (frame, _) = draw(&app, W, H);
+    assert!(frame.contains("lastcall  2 repos · 3 files"), "{frame}");
+    assert!(!frame.contains("alpha"), "{frame}");
+    snapshot("tui_accept_last_file_collapses_repo", &app, W, H);
+}
+
+/// §7.2 CAS refusal on screen: the request is built from the held row, the file changes
+/// underneath before the engine runs it, the engine refuses; the status line carries the
+/// `Refused` text and the row stays, now showing the newer content.
+#[test]
+fn tui_accept_refused() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    let alpha = root_named(&engine, "alpha");
+    select_row(&mut app, &alpha, "f1");
+    let (_, effect) = app.handle(Action::AcceptFile);
+    assert!(app.accepting.is_some());
+    let alpha_repo = scene.repo("alpha");
+    let f1 = alpha_repo.path().join("f1");
+    let mut text = std::fs::read_to_string(&f1).unwrap();
+    text.push_str("another edit, after the frame\n");
+    alpha_repo.write("f1", text);
+    run_accept(&mut app, &mut engine, effect);
+    assert_eq!(
+        status_text(&app),
+        "f1: changed since rendered; not accepted"
+    );
+    assert!(app.accepting.is_none());
+    let row = app.roots[&alpha].row(b"f1").expect("f1 still pending");
+    assert_eq!(
+        (row.added, row.deleted),
+        (2, 1),
+        "the pile shows the newer content: {row:?}"
+    );
+    assert_eq!(
+        app.selection,
+        Some(Selection::Row(alpha.clone(), b"f1".to_vec())),
+        "a refusal does not advance"
+    );
+    snapshot("tui_accept_refused", &app, W, H);
+}
+
+/// beta with 11 pending files, one of them the upstream group's `u1`: `a` on the root
+/// entry asks first, with the grouped/collapsed line. A 12th file's pile applied
+/// underneath shows `12 files` in the same modal (second frame, `_live`).
+#[test]
+fn tui_accept_all_confirm() {
+    let scene = Scene::build();
+    let beta_repo = scene.repo("beta");
+    for i in 1..=9 {
+        beta_repo.write(&format!("g{i:02}"), format!("generated {i}\n"));
+    }
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    let beta = root_named(&engine, "beta");
+    assert_eq!(app.roots[&beta].rows().len(), 11);
+    assert_eq!(
+        app.roots[&beta].row(b"u1").unwrap().annotation,
+        Some(Annotation::Upstream)
+    );
+    app.select(Some(Selection::Root(beta.clone())));
+    let (changed, effect) = app.handle(Action::Accept);
+    assert_eq!(changed, lastcall::tui::app::Changed::Yes);
+    assert_eq!(effect, None, "asks first");
+    assert!(app.confirm.is_some());
+    let (frame, _) = draw(&app, W, H);
+    assert!(frame.contains("Accept all 11 files in beta?"), "{frame}");
+    assert!(
+        frame.contains("1 grouped upstream · 0 collapsed"),
+        "{frame}"
+    );
+    assert!(frame.contains("y / ⏎ confirm    n / Esc cancel"), "{frame}");
+    snapshot("tui_accept_all_confirm", &app, W, H);
+
+    beta_repo.write("g10", "generated 10\n");
+    let pile = rescan(&mut app, &mut engine, &beta);
+    assert_eq!(pile.rows.len(), 12);
+    assert!(app.confirm.is_some(), "the modal stays open");
+    let (frame, _) = draw(&app, W, H);
+    assert!(frame.contains("Accept all 12 files in beta?"), "{frame}");
+    snapshot("tui_accept_all_confirm_live", &app, W, H);
+
+    // Confirm folds what is shown now: all twelve.
+    let (_, effect) = app.handle(Action::Confirm);
+    run_accept(&mut app, &mut engine, effect);
+    assert_eq!(status_text(&app), "accepted 12 files in beta");
+    assert!(!app.roots[&beta].listed());
+    assert!(engine.scan(&beta).expect("scan").is_empty());
+}
+
+/// G0 Q5: exactly 10 files accept without asking. Only alpha is pending (beta and notes
+/// marked seen), with `f1`, `f2` and eight generated files; `ctrl-a` folds it at once.
+#[test]
+fn tui_accept_all_no_confirm_at_10() {
+    let scene = Scene::build();
+    let alpha_repo = scene.repo("alpha");
+    for i in 1..=8 {
+        alpha_repo.write(&format!("g{i:02}"), format!("generated {i}\n"));
+    }
+    let mut engine = scene.engine();
+    let alpha = root_named(&engine, "alpha");
+    for name in ["beta", "notes"] {
+        let root = root_named(&engine, name);
+        mark_seen(&mut engine, &root);
+    }
+    let mut app = app_of(&mut engine);
+    assert_eq!(app.listed_roots().count(), 1);
+    assert_eq!(app.roots[&alpha].rows().len(), 10);
+    let (_, effect) = app.handle(Action::AcceptAll);
+    assert!(app.confirm.is_none(), "ten files ask nothing");
+    assert!(app.accepting.is_some());
+    run_accept(&mut app, &mut engine, effect);
+    assert_eq!(status_text(&app), "accepted 10 files in alpha");
+    assert!(app.listed_roots().next().is_none());
+    assert_eq!(app.selection, None);
+    assert!(engine.scan(&alpha).expect("scan").is_empty());
+    let (frame, _) = draw(&app, W, H);
+    assert!(frame.contains("nothing pending across 3 roots"), "{frame}");
+    snapshot("tui_accept_all_no_confirm_at_10", &app, W, H);
+}
+
+/// Ruling 1: an engine capped at 3 rows over alpha with 5 pending files shows the first
+/// three by path, `3+ files` in the nav and header, and the notice under the root's
+/// main-view header.
+#[test]
+fn tui_row_cap_notice() {
+    let scene = Scene::build();
+    let alpha_repo = scene.repo("alpha");
+    for i in 1..=3 {
+        alpha_repo.write(&format!("g{i}"), format!("generated {i}\n"));
+    }
+    let mut engine = scene.engine_with(EngineOptions {
+        row_cap: 3,
+        ..EngineOptions::default()
+    });
+    let mut app = app_of(&mut engine);
+    let alpha = root_named(&engine, "alpha");
+    let view = &app.roots[&alpha];
+    assert_eq!(view.pile.omitted, 2, "{:?}", view.pile);
+    assert_eq!(
+        view.rows()
+            .iter()
+            .map(|r| r.path_lossy())
+            .collect::<Vec<_>>(),
+        ["f1", "f2", "g1"]
+    );
+    assert!(app.any_truncated());
+    app.select(Some(Selection::Root(alpha.clone())));
+    let (frame, _) = draw(&app, W, H);
+    assert!(frame.contains("lastcall  3 repos · 6+ files"), "{frame}");
+    assert!(frame.contains("main · 3+ files"), "{frame}");
+    assert!(
+        frame.contains("3 files shown · 2 more changed paths not scanned (first 3 by path)"),
+        "{frame}"
+    );
+    snapshot("tui_row_cap_notice", &app, W, H);
 }

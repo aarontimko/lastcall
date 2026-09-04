@@ -86,7 +86,7 @@ pub fn build(parent: &Path, state_dir: &Path) -> Result<Built, GitError> {
         "three roots discovered under {}",
         parent.display()
     );
-    for (root, result) in &roots {
+    for (root, _seq, result) in &roots {
         assert!(
             result.is_ok(),
             "first sight of {} failed: {result:?}",

@@ -53,6 +53,19 @@ test-integration:
 test-e2e:
     cargo test --workspace --test 'test_e2e_*'
 
+# What the pre-push hook runs (`just hooks-install`): the integration tier, then the
+# store-backed proptests in ops::tests::proptests at 64 cases — the unit tier runs them
+# at 8 so every commit stays fast. Run it by hand before a push from a machine without
+# the hook. Each step says what it is doing; the first failure stops the push.
+test-prepush:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "--- test-prepush 1/2: just test-integration ---"
+    just test-integration
+    echo "--- test-prepush 2/2: PROPTEST_CASES=64 cargo test -p lastcall-engine --lib proptests ---"
+    PROPTEST_CASES=64 cargo test -p lastcall-engine --lib proptests
+    echo "--- test-prepush: green ---"
+
 # All three tiers, in order.
 # The scenario suites (docs/spec/01-scenarios.md, one test per ID) against real git.
 test-scenarios:
@@ -151,11 +164,12 @@ fixtures-sync:
 # Repo hygiene
 # ---------------------------------------------------------------------------------------
 
-# Enable the committed pre-commit hook (runs `just lint && just test-unit`).
+# Enable the committed hooks: pre-commit runs `just lint && just test-unit`, pre-push
+# runs `just test-prepush` (integration tier + 64-case proptests).
 hooks-install:
-    chmod +x .githooks/pre-commit
+    chmod +x .githooks/pre-commit .githooks/pre-push
     git config core.hooksPath .githooks
-    @echo "hooks installed: core.hooksPath=.githooks"
+    @echo "hooks installed: core.hooksPath=.githooks (pre-commit, pre-push)"
 
 # ---------------------------------------------------------------------------------------
 # Probes and demos (built-artifact passes exercise the release binary)
@@ -284,6 +298,8 @@ probe-tui:
     echo "export LASTCALL_CONFIG=$LASTCALL_CONFIG"
     echo "export LASTCALL_STATE_DIR=$LASTCALL_STATE_DIR"
     echo "--- (cd $dir/parent) lastcall tui --poll 1   [q quits; edit under $dir/parent from another shell] ---"
+    echo "--- accept keys work: a = hunk (or file/group/repo), A = file, ctrl-a = everything (y confirms above 10 files);"
+    echo "--- a relaunch with the same two exports shows what is still pending ---"
     (cd "$dir/parent" && "$OLDPWD/target/release/lastcall" tui --poll 1)
     echo "--- fixture left at $dir (rm -rf $dir when done) ---"
 
@@ -298,3 +314,15 @@ probe-tui-screen:
     cargo build --release -p lastcall
     LASTCALL_PROBE_BIN="$PWD/target/release/lastcall" \
         cargo test -p lastcall --test test_e2e_tui_pty probe_tui_screen -- --ignored --nocapture
+
+# The performance baseline (docs/dev/bench.md; not a gate): the four scenarios of
+# crates/lastcall/tests/test_bench.rs — 100 clones / 4,000 rows, one 100,000-line diff, a
+# 1,000-file burst under watch, a 50,000-file drop against the row cap — on the RELEASE
+# build only, one `BENCH <scenario> <metric>=<value>` stderr line per metric. Fixtures are
+# built outside the timed regions under temp dirs the test removes; about four minutes.
+bench:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --release -p lastcall
+    cargo test --release -p lastcall --test test_bench -- --ignored --nocapture --test-threads=1
+    echo "--- bench done: paste the BENCH lines above into docs/dev/bench.md with the machine block, date and commit ---" >&2

@@ -22,7 +22,9 @@ Phase 1 ships two subcommands: `lastcall config [--json]` (the effective configu
 notices) and `lastcall hello-herdr` (connect to a herdr session and stream what the client
 sees; see [`docs/dev/hello-herdr.md`](docs/dev/hello-herdr.md)). Phase 2 adds the headless
 review engine behind `lastcall status` and `lastcall watch`. Phase 3 adds the terminal UI:
-bare `lastcall` (or `lastcall tui`) shows every root's pile and updates it live.
+bare `lastcall` (or `lastcall tui`) shows every root's pile and updates it live. Phase 4
+adds accepting — hunk, file, group, repo, everything — which is what shrinks the pile and
+survives a restart.
 
 ## Try it
 
@@ -39,9 +41,18 @@ The left pane lists each repo (branch, file count) and its pending files with `+
 a diff, `n`/`p` step hunks, `f` shows full paths, `o` shows `org/repo`, `r` rescans, `?`
 lists every key, `q` quits; the mouse works too (click a row or a hunk header, drag the
 divider, wheel to scroll). Edit a file in another terminal and its counts change on screen
-within about a second. It is read-only in this phase: nothing is accepted, flagged or
-restored yet — Phase 4 adds accepting hunks, files and whole repos, which is what shrinks
-the pile. `lastcall tui --poll 2` polls every 2 s if filesystem events are late or missing.
+within about a second. Reviewing is accepting: `a` accepts the hunk under the cursor (or,
+on a file row without the diff focused, the file; on a group or repo entry, all of it), `A`
+accepts the selected file whole, `ctrl-a` (or a click on `[Accept All]`) accepts everything
+listed across every repo — above ten files a modal asks first (`y`/`enter` confirm,
+`n`/`esc` cancel). An accept is compare-and-swap against what was on screen: if the file
+changed underneath, the status says `changed since rendered; not accepted` and the row
+stays. The pile shrinks to `nothing pending`, and a relaunch on the same state dir starts
+from there, whatever the agent committed in between (an agent's commit moves HEAD, never
+your baseline). Not yet: flagging with a note and restoring (Phase 7), draft dirs and
+single-row lockfile/binary accepts (Phase 6), herdr status in the UI (Phase 5), editing in
+place (Phase 8). `lastcall tui --poll 2` polls every 2 s if filesystem events are late or
+missing.
 Keys are rebindable in `config.toml`, one spec or a list per action (the full grammar and
 table: [`docs/dev/tui.md`](docs/dev/tui.md)):
 

@@ -3,6 +3,7 @@ source: crates/lastcall/tests/test_e2e_tui_snapshots.rs
 expression: style
 ---
 0 0..37 Reset Reset BOLD
+0 39..51 Reset Reset DIM
 1 0..28 Cyan Reset -
 2 0..1 Cyan Reset -
 2 27..28 Cyan Reset -
@@ -57,4 +58,4 @@ expression: style
 27 0..1 Cyan Reset -
 27 27..28 Cyan Reset -
 28 0..28 Cyan Reset -
-29 0..65 Reset Reset DIM
+29 0..80 Reset Reset DIM

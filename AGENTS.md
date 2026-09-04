@@ -21,8 +21,10 @@ just test-scenarios         # the docs/spec/01-scenarios.md suites (real git, te
 just probe-status           # release binary: status + status --json over a three-root fixture
 just probe-tui              # release binary: the interactive TUI over the same fixture (--poll 1)
 just probe-tui-screen       # the PTY harness's transcript of the live-update demo (3 s)
+just bench                  # the performance baseline on the release build (docs/dev/bench.md; ~4 min; not a gate)
 just snapshots-update       # rewrite the TUI snapshots, then prove they pass; read every diff
-just hooks-install          # pre-commit = just lint && just test-unit
+just test-prepush           # what the pre-push hook runs: integration tier + 64-case proptests
+just hooks-install          # pre-commit = just lint && just test-unit; pre-push = just test-prepush
 ```
 
 Probes against the built binary: `just probe-config`, `just probe-hello`, `just probe-status`,
@@ -81,3 +83,11 @@ before touching `crates/lastcall/src/tui/` or either e2e test.
 
 Tiers, file naming, how skips are reported, and the isolation rules — including the sacred
 one: tests never touch the real herdr config or socket.
+
+### The performance baseline: `docs/dev/bench.md`
+
+The `just bench` numbers (four scenarios at the ruled sizes: 100 clones / 4,000 rows, a
+100,000-line diff, a 1,000-file burst under watch, a 50,000-file drop against the row cap)
+with the machine block and how each metric is taken. Read it before touching the scan
+pipeline or the watcher's timings, and re-run `just bench` after; targets are set at the
+Phase 9 kickoff, not here.

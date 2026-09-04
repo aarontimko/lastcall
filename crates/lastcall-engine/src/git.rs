@@ -256,15 +256,23 @@ fn run_command(
         cwd: cwd.clone(),
         message: e.to_string(),
     })?;
-    if let Some(bytes) = stdin
-        && let Some(mut pipe) = child.stdin.take()
-    {
-        // A child that exits early (bad argument) closes the pipe; that is reported through
-        // the exit status, not here.
-        let _ = pipe.write_all(bytes);
-        drop(pipe);
-    }
-    let out = child.wait_with_output().map_err(|e| GitError::Spawn {
+    // stdin is fed from its own thread while this one drains stdout and stderr: a batch
+    // command (`hash-object --stdin-paths`, `cat-file --batch`) answers each line as it
+    // reads it, so writing every input byte before reading any output deadlocks once both
+    // pipes are full (64 KiB each: a few thousand paths). A child that exits early (bad
+    // argument) closes the pipe; that is reported through the exit status, not here.
+    let out = std::thread::scope(|scope| {
+        if let Some(bytes) = stdin
+            && let Some(mut pipe) = child.stdin.take()
+        {
+            scope.spawn(move || {
+                let _ = pipe.write_all(bytes);
+                drop(pipe);
+            });
+        }
+        child.wait_with_output()
+    })
+    .map_err(|e| GitError::Spawn {
         argv: argv_strings(args),
         cwd,
         message: e.to_string(),
@@ -793,6 +801,28 @@ pub fn parse_batch_check(bytes: &[u8]) -> Vec<BatchCheck> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A batch child answers as it reads: `cat` over 300 KiB (more than both pipe buffers)
+    /// must round-trip. Before stdin was fed from its own thread this deadlocked — the S4
+    /// bench's 10,000-path `hash-object --stdin-paths` batch never returned — so the run is
+    /// bounded on a thread; the bound is a failure, never a wait the passing path takes.
+    #[test]
+    fn git_run_command_feeds_stdin_while_draining_stdout() {
+        let bytes: Vec<u8> = (0..300 * 1024).map(|i| b'a' + (i % 26) as u8).collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let input = bytes.clone();
+        std::thread::spawn(move || {
+            let out = run_command(Command::new("cat"), &[], Some(&input));
+            let _ = tx.send(out);
+        });
+        let out = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("cat returns within 5 s: the pipes did not deadlock")
+            .expect("cat runs");
+        assert_eq!(out.status, Some(0));
+        assert_eq!(out.stdout.len(), bytes.len());
+        assert_eq!(out.stdout, bytes);
+    }
 
     #[test]
     fn git_repo_allowlist_accepts_the_read_only_forms() {

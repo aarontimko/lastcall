@@ -44,6 +44,9 @@ pub struct RootStatus {
     pub seen_tree: Option<Oid>,
     pub seen_head: Option<Oid>,
     pub pending: Vec<RowStatus>,
+    /// Changed paths the row cap left unscanned (`Pile::omitted`); `0` when nothing was
+    /// cut. Additive in Phase 4 (`status_version` stays 1).
+    pub omitted: usize,
     pub groups: Vec<GroupStatus>,
     pub notices: Vec<String>,
 }
@@ -159,6 +162,7 @@ impl RootStatus {
             seen_tree: root.ledger.seen_tree.clone(),
             seen_head: root.ledger.seen_at.head_commit.clone(),
             pending,
+            omitted: pile.map(|p| p.omitted).unwrap_or(0),
             groups,
             notices,
         }
@@ -202,14 +206,14 @@ impl StatusReport {
                     .into_iter()
                     .map(|r| {
                         let result = engine.scan(&r);
-                        (r, result)
+                        (r, engine.scan_seq(), result)
                     })
                     .collect()
             }
             None => engine.scan_all(),
         };
         let mut roots = Vec::new();
-        for (path, result) in results {
+        for (path, _seq, result) in results {
             let Some(root) = engine.root(&path) else {
                 continue;
             };

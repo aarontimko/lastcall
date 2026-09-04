@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crossterm::event::Event;
-use lastcall_engine::engine::Engine;
+use lastcall_engine::engine::{AcceptRequest, Accepted, Engine};
 use lastcall_engine::scan::Pile;
 use lastcall_engine::watcher::{EngineEvent, EngineTimings, Watcher, blocking};
 use ratatui::Terminal;
@@ -36,7 +36,7 @@ use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 
 use super::app::{App, Changed, Effect, RootMeta};
-use super::input::{Action, Keymap, pointer, to_action};
+use super::input::{Action, Key, Keymap, modal_action, pointer, to_action};
 use super::render::{HitMap, Pane, render};
 use super::term;
 
@@ -50,8 +50,11 @@ pub const TICK: Duration = Duration::from_secs(1);
 /// Results of the engine work the loop spawned on the app's behalf.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Local {
-    /// One root's pile from a `Refresh` (`Engine::scan_all`).
-    Pile(PathBuf, Pile),
+    /// One root's pile from a `Refresh` (`Engine::scan_all`), with the seq of that scan so
+    /// the reducer can drop an older watcher pile that lands after it.
+    Pile(PathBuf, u64, Pile),
+    /// An `Effect::Accept` finished: one result per root it covered.
+    Accepted(Vec<(PathBuf, Result<Accepted, String>)>),
     /// The engine's roots after a `SyncRoots`.
     Roots(Vec<RootMeta>),
     /// The `Refresh` finished (all its piles were sent first).
@@ -87,8 +90,30 @@ impl Ui {
     /// Fold one terminal event in. Keys resolve through the keymap; a press resolves
     /// through the last hit map (nothing when there is none); the wheel moves the nav
     /// selection when the pointer is over the nav and scrolls the diff otherwise; a resize
-    /// invalidates the hit map before the app sees it.
+    /// invalidates the hit map before the app sees it. While the confirm modal is open only
+    /// its own keys, the `quit` keys and a resize get through; the mouse is dropped here
+    /// (the wheel over the nav would otherwise reach `move_selection` around the gate).
     pub fn event(&mut self, event: &Event) -> (Changed, Option<Effect>) {
+        // The confirm modal answers to its own keys (`y`/`Enter`, `n`/`Esc`), consulted
+        // before the keymap, and to the keymap's `quit` keys (`q` and ctrl-c quit by
+        // default, everywhere — the help overlay lets `Quit` through the same way); every
+        // other key is swallowed. `Esc` is the modal's cancel first, so it never quits.
+        // Every non-key event but `Resize` is dropped before it can touch the app.
+        if self.app.confirm.is_some() {
+            match event {
+                Event::Key(k) => {
+                    return match Key::of(k).and_then(modal_action) {
+                        Some(action) => self.app.handle(action),
+                        None => match to_action(event, &self.keymap) {
+                            Some(Action::Quit) => self.app.handle(Action::Quit),
+                            _ => (Changed::No, None),
+                        },
+                    };
+                }
+                Event::Resize(..) => {}
+                _ => return (Changed::No, None),
+            }
+        }
         let Some(action) = to_action(event, &self.keymap) else {
             return (Changed::No, None);
         };
@@ -127,7 +152,8 @@ impl Ui {
     /// Fold one finished piece of the loop's own engine work in.
     pub fn local(&mut self, local: Local) -> (Changed, Option<Effect>) {
         match local {
-            Local::Pile(root, pile) => self.app.apply(EngineEvent::Pile { root, pile }),
+            Local::Pile(root, seq, pile) => self.app.apply(EngineEvent::Pile { root, seq, pile }),
+            Local::Accepted(results) => (self.app.accepted(results), None),
             Local::Roots(metas) => (self.app.sync_roots(metas), None),
             Local::RefreshDone => (self.app.refresh_done(), None),
             Local::Notice(root, text) => self.app.apply(EngineEvent::Notice { root, text }),
@@ -244,9 +270,9 @@ fn spawn_refresh(engine: &Arc<Mutex<Engine>>, tx: mpsc::UnboundedSender<Local>) 
         let Some(results) = joined(scan, &tx, "refresh").await else {
             return;
         };
-        for (root, result) in results {
+        for (root, seq, result) in results {
             let local = match result {
-                Ok(pile) => Local::Pile(root, pile),
+                Ok(pile) => Local::Pile(root, seq, pile),
                 Err(e) => Local::Notice(Some(root), format!("scan failed: {e}")),
             };
             if tx.send(local).is_err() {
@@ -254,6 +280,33 @@ fn spawn_refresh(engine: &Arc<Mutex<Engine>>, tx: mpsc::UnboundedSender<Local>) 
             }
         }
         let _ = tx.send(Local::RefreshDone);
+    });
+}
+
+/// `Effect::Accept`: every root's `Engine::accept` (the op and its rescan) in one
+/// `blocking` closure, so one critical section covers the whole request and no watcher scan
+/// interleaves; the results come back as one `Local::Accepted`.
+fn spawn_accept(
+    engine: &Arc<Mutex<Engine>>,
+    tx: mpsc::UnboundedSender<Local>,
+    reqs: Vec<(PathBuf, AcceptRequest)>,
+) {
+    let engine = engine.clone();
+    tokio::spawn(async move {
+        let accept = tokio::spawn(async move {
+            blocking(&engine, move |e| {
+                reqs.into_iter()
+                    .map(|(root, req)| {
+                        let result = e.accept(&root, req).map_err(|e| e.to_string());
+                        (root, result)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+        });
+        if let Some(results) = joined(accept, &tx, "accept").await {
+            let _ = tx.send(Local::Accepted(results));
+        }
     });
 }
 
@@ -413,6 +466,9 @@ pub fn run(
                     Some(Effect::Quit) => break,
                     Some(Effect::Refresh) => spawn_refresh(&watcher.engine, local_tx.clone()),
                     Some(Effect::SyncRoots) => spawn_sync_roots(&watcher.engine, local_tx.clone()),
+                    Some(Effect::Accept(reqs)) => {
+                        spawn_accept(&watcher.engine, local_tx.clone(), reqs)
+                    }
                     None => {}
                 }
                 if changed == Changed::Yes {
@@ -487,6 +543,80 @@ mod tests {
         let mut app = three_roots();
         app.handle(Action::Resize(100, 30));
         Ui::new(app, Keymap::defaults())
+    }
+
+    fn frame_of(ui: &Ui) -> String {
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| {
+            render(&ui.app, f);
+        })
+        .unwrap();
+        term.backend().to_string()
+    }
+
+    /// The §11 hardening, at the loop's level: a watcher pile carrying a seq below the one
+    /// the accept applied — a scan that was already running when the accept took the lock
+    /// — reaches the app through either channel and leaves it, and the frame, untouched;
+    /// the next newer pile is applied as usual.
+    #[test]
+    fn run_stale_watcher_pile_after_accept_is_dropped() {
+        let mut ui = ui();
+        assert_eq!(
+            ui.local(Local::Pile(root("alpha"), 3, alpha_two_hunks())),
+            (Changed::Yes, None)
+        );
+        ui.app.select(Some(row("alpha", "f1")));
+        // Nav focus: `a` is accept-file.
+        let (_, effect) = ui.event(&key(KeyCode::Char('a')));
+        assert!(matches!(effect, Some(Effect::Accept(_))), "{effect:?}");
+        assert!(ui.app.accepting.is_some());
+        // The accept's own rescan comes back at seq 5 with `f1` gone.
+        let after_accept = without(pile("alpha"), &["f1"]);
+        assert_eq!(
+            ui.local(Local::Accepted(vec![accepted_ok(
+                "alpha",
+                5,
+                after_accept.clone()
+            )])),
+            (Changed::Yes, None)
+        );
+        assert!(ui.app.accepting.is_none());
+        assert_eq!(ui.app.selection, Some(row("alpha", "f2")), "advanced");
+        let before = ui.app.clone();
+        let frame = frame_of(&ui);
+        assert!(frame.contains("accepted f1"), "{frame}");
+
+        // The pre-accept scan lands late, through the refresh channel …
+        assert_eq!(
+            ui.local(Local::Pile(root("alpha"), 4, alpha_two_hunks())),
+            (Changed::No, None)
+        );
+        assert_eq!(ui.app, before);
+        assert_eq!(frame_of(&ui), frame);
+        // … and through the watcher's.
+        assert_eq!(
+            ui.engine(EngineEvent::Pile {
+                root: root("alpha"),
+                seq: 4,
+                pile: alpha_two_hunks(),
+            }),
+            (Changed::No, None)
+        );
+        assert_eq!(ui.app, before);
+        assert_eq!(frame_of(&ui), frame);
+        assert_eq!(ui.app.seq[&root("alpha")], 5);
+
+        // A newer scan is applied as ever.
+        assert_eq!(
+            ui.engine(EngineEvent::Pile {
+                root: root("alpha"),
+                seq: 6,
+                pile: alpha_two_hunks(),
+            }),
+            (Changed::Yes, None)
+        );
+        assert_eq!(ui.app.roots[&root("alpha")].rows().len(), 2);
+        assert_eq!(ui.app.seq[&root("alpha")], 6);
     }
 
     #[test]
@@ -665,6 +795,91 @@ mod tests {
         );
     }
 
+    /// Inside the confirm modal `q` and ctrl-c still quit (the Phase 3 ruling: they quit
+    /// by default, everywhere), `Esc` only cancels, and every other key is swallowed.
+    #[test]
+    fn run_quit_keys_quit_from_inside_the_modal_and_esc_only_cancels() {
+        let mut ui = ui();
+        ui.app.apply(pile_event("alpha", rows_n(11, 0, 0)));
+        ui.event(&key(KeyCode::Char('a')));
+        assert_eq!(ui.app.selection, None, "`a` with nothing selected: nothing");
+        assert_eq!(
+            ui.event(&Event::Key(KeyEvent::new(
+                KeyCode::Char('a'),
+                KeyModifiers::CONTROL
+            ))),
+            (Changed::Yes, None)
+        );
+        assert!(ui.app.confirm.is_some(), "11 files ask first");
+        let open = ui.app.clone();
+        for ev in [
+            key(KeyCode::Char('j')),
+            key(KeyCode::Char('a')),
+            key(KeyCode::Char('?')),
+            key(KeyCode::Char('r')),
+            key(KeyCode::Char('h')),
+        ] {
+            assert_eq!(ui.event(&ev), (Changed::No, None), "{ev:?} swallowed");
+            assert_eq!(ui.app, open);
+        }
+        assert_eq!(
+            ui.event(&key(KeyCode::Char('q'))),
+            (Changed::No, Some(Effect::Quit)),
+            "q quits from inside the modal"
+        );
+        assert_eq!(
+            ui.event(&Event::Key(KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL
+            ))),
+            (Changed::No, Some(Effect::Quit)),
+            "ctrl-c quits from inside the modal"
+        );
+        assert_eq!(ui.app, open, "asking to quit changes nothing");
+        assert_eq!(
+            ui.event(&key(KeyCode::Esc)),
+            (Changed::Yes, None),
+            "Esc cancels, never quits"
+        );
+        assert!(ui.app.confirm.is_none());
+        assert!(ui.app.accepting.is_none());
+    }
+
+    /// Under the modal the mouse is dropped before the app: the wheel over the nav (which
+    /// otherwise reaches `move_selection` directly), a press on a nav row, a drag and a
+    /// release all leave the app untouched; a resize still goes through and still
+    /// invalidates the hit map.
+    #[test]
+    fn run_mouse_is_dropped_under_the_modal_but_resize_passes() {
+        let mut ui = ui();
+        ui.app.apply(pile_event("alpha", rows_n(11, 0, 0)));
+        ui.app.select(Some(Selection::Root(root("alpha"))));
+        render_into(&mut ui);
+        let nav = ui.hits.as_ref().unwrap().nav.unwrap();
+        let main = ui.hits.as_ref().unwrap().main.unwrap();
+        assert_eq!(ui.event(&key(KeyCode::Char('a'))), (Changed::Yes, None));
+        assert!(ui.app.confirm.is_some(), "11 files ask first");
+        let open = ui.app.clone();
+        let (nx, ny) = (nav.x + 1, nav.y + 1);
+        for ev in [
+            mouse(MouseEventKind::ScrollDown, nx, ny),
+            mouse(MouseEventKind::ScrollUp, nx, ny),
+            mouse(MouseEventKind::ScrollDown, main.x + 1, main.y + 1),
+            mouse(MouseEventKind::Down(MouseButton::Left), nx, ny + 1),
+            mouse(MouseEventKind::Drag(MouseButton::Left), nx + 3, ny + 1),
+            mouse(MouseEventKind::Up(MouseButton::Left), nx + 3, ny + 1),
+            Event::FocusGained,
+        ] {
+            assert_eq!(ui.event(&ev), (Changed::No, None), "{ev:?} dropped");
+            assert_eq!(ui.app, open, "{ev:?} touched the app");
+        }
+        assert!(ui.hits.is_some(), "the hit map survives dropped events");
+        assert_eq!(ui.event(&Event::Resize(120, 40)), (Changed::Yes, None));
+        assert!(ui.hits.is_none(), "a resize still invalidates the hit map");
+        assert_eq!(ui.app.size, (120, 40));
+        assert!(ui.app.confirm.is_some(), "the modal is still open");
+    }
+
     #[test]
     fn run_local_results_feed_the_app() {
         let mut ui = Ui::new(App::new(), Keymap::defaults());
@@ -683,12 +898,12 @@ mod tests {
         assert_eq!(ui.event(&key(KeyCode::Char('r'))).1, Some(Effect::Refresh));
         assert!(ui.app.refreshing);
         assert_eq!(
-            ui.local(Local::Pile(root("alpha"), pile("alpha"))),
+            ui.local(Local::Pile(root("alpha"), 1, pile("alpha"))),
             (Changed::Yes, None)
         );
         assert!(ui.app.roots[&root("alpha")].listed());
         assert_eq!(
-            ui.local(Local::Pile(root("alpha"), pile("alpha"))),
+            ui.local(Local::Pile(root("alpha"), 1, pile("alpha"))),
             (Changed::No, None),
             "an unchanged pile is no change"
         );

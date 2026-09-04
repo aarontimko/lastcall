@@ -20,11 +20,12 @@ use crate::config::{Config, DraftInitial, Loaded, Resolved};
 use crate::env::Env;
 use crate::git::{self, GitError, Oid, RepoGit};
 use crate::headstate::{self, HeadState, TransitionFacts};
+use crate::hunks::Hunk;
 use crate::index::{IndexError, PrivateIndex};
 use crate::ledger::{
     self, Clock, Ledger, LedgerError, LedgerLock, LoadResult, SeenAt, SystemClock, TreeEntries,
 };
-use crate::ops::{Ops, OpsError};
+use crate::ops::{FaultInjector, NoFault, Ops, OpsError, Outcome, Rendered};
 use crate::paths::{Layout, ParentId, ParentMeta, RepoPaths, RootId};
 use crate::roots::{self, Badge, DiscoverInputs, Discovery, RootsChanged};
 use crate::scan::{self, Pile, ScanError, ScanInputs};
@@ -70,12 +71,19 @@ fn io_err(path: &Path, source: std::io::Error) -> EngineError {
     }
 }
 
+/// The default [`EngineOptions::row_cap`]: rows materialised per scan beyond the override
+/// paths (kickoff ruling; not a config key).
+pub const DEFAULT_ROW_CAP: usize = 10_000;
+
 /// Injectable knobs.
 #[derive(Clone)]
 pub struct EngineOptions {
     /// Compaction runs after a ledger write when more overrides than this carry a blob.
     pub compaction_threshold: usize,
     pub clock: Arc<dyn Clock + Send + Sync>,
+    /// Rows materialised per scan beyond the priority set (override paths); further
+    /// changed paths are counted in [`Pile::omitted`] with a notice, never hashed.
+    pub row_cap: usize,
 }
 
 impl Default for EngineOptions {
@@ -83,6 +91,7 @@ impl Default for EngineOptions {
         Self {
             compaction_threshold: 500,
             clock: Arc::new(SystemClock),
+            row_cap: DEFAULT_ROW_CAP,
         }
     }
 }
@@ -91,6 +100,7 @@ impl std::fmt::Debug for EngineOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EngineOptions")
             .field("compaction_threshold", &self.compaction_threshold)
+            .field("row_cap", &self.row_cap)
             .finish_non_exhaustive()
     }
 }
@@ -183,7 +193,36 @@ pub struct HeadChange {
     pub to: Option<Oid>,
     pub branch: Option<String>,
     pub notice: Option<String>,
+    /// The engine-global number of the scan that produced `pile` ([`Engine::scan_seq`]).
+    pub seq: u64,
     /// The pile from the scan that followed.
+    pub pile: Pile,
+}
+
+/// One accept as a UI asks for it (§6.3): every variant pins what the user looked at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcceptRequest {
+    /// Hunk `index` of `hunks` (the row's hunks as rendered) on `rendered`.
+    Hunk {
+        rendered: Rendered,
+        hunks: Vec<Hunk>,
+        index: usize,
+    },
+    /// One file; a deletion row (`rendered.oid == None`) accepts the deletion.
+    File(Rendered),
+    /// Several files in one ledger write.
+    Group(Vec<Rendered>),
+    /// Everything in the pile the user saw (a fold).
+    All(Pile),
+}
+
+/// What [`Engine::accept`] produced: the op's outcome (a refusal is data, never `Err`) and
+/// the pile of the rescan that followed, numbered like every other pile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Accepted {
+    pub outcome: Outcome,
+    /// [`Engine::scan_seq`] of `pile`.
+    pub seq: u64,
     pub pile: Pile,
 }
 
@@ -203,6 +242,10 @@ pub struct Engine {
     /// How many times discovery re-ran after open (a budget probe for tests).
     discovery_runs: u64,
     git_version: String,
+    /// Engine-global scan sequence number: `+1` per pile [`Engine::scan`] produces, whichever
+    /// root; every publisher of a pile carries it so a consumer can drop a pile older than
+    /// one it already holds (a `scan_all` result arriving after an accept's rescan).
+    scan_seq: u64,
 }
 
 impl Engine {
@@ -232,6 +275,7 @@ impl Engine {
             pending_nested: Vec::new(),
             discovery_runs: 0,
             git_version,
+            scan_seq: 0,
         };
         engine.rescan()?;
         Ok(engine)
@@ -292,6 +336,13 @@ impl Engine {
     /// Discovery re-runs since open (`rescan`, including those `scan_all` triggers).
     pub fn discovery_runs(&self) -> u64 {
         self.discovery_runs
+    }
+
+    /// The number of the most recent scan that produced a pile (engine-global, strictly
+    /// increasing across roots, `0` before the first). Read it under the same lock as the
+    /// [`Engine::scan`] it describes.
+    pub fn scan_seq(&self) -> u64 {
+        self.scan_seq
     }
 
     pub fn resolve_root(&self, path: &Path) -> Option<PathBuf> {
@@ -547,6 +598,7 @@ impl Engine {
     pub fn scan(&mut self, root: &Path) -> Result<Pile, EngineError> {
         let collapsed = self.collapsed.clone();
         let collapse_size = self.config.collapse_size_bytes;
+        let row_cap = self.options.row_cap;
         let state = self
             .roots
             .get_mut(root)
@@ -564,6 +616,7 @@ impl Engine {
             collapse_size_bytes: collapse_size,
             excluded_dirs: &state.excluded_dirs,
             index_tmp: &state.paths.index_tmp,
+            row_cap,
         })?;
         let mut pile = out.pile;
         if out.nested_repos != state.nested_repos {
@@ -597,12 +650,15 @@ impl Engine {
             }
         }
         state.last_pile = Some(pile.clone());
+        self.scan_seq += 1;
         Ok(pile)
     }
 
-    /// Scan every root (opening nested repositories discovered on the way).
-    pub fn scan_all(&mut self) -> Vec<(PathBuf, Result<Pile, EngineError>)> {
-        let mut results: BTreeMap<PathBuf, Result<Pile, EngineError>> = BTreeMap::new();
+    /// Scan every root (opening nested repositories discovered on the way). Each entry
+    /// carries the [`Engine::scan_seq`] of the scan that produced it (a failed scan reports
+    /// the number of the last one that succeeded; its pile is the error).
+    pub fn scan_all(&mut self) -> Vec<(PathBuf, u64, Result<Pile, EngineError>)> {
+        let mut results: BTreeMap<PathBuf, (u64, Result<Pile, EngineError>)> = BTreeMap::new();
         for _ in 0..3 {
             let todo: Vec<PathBuf> = self
                 .root_paths()
@@ -614,7 +670,7 @@ impl Engine {
             }
             for p in todo {
                 let r = self.scan(&p);
-                results.insert(p, r);
+                results.insert(p, (self.scan_seq, r));
             }
             // Discovery re-runs only when a scan saw the set of nested repos change (a
             // new `dir/` in `ls-files --others`), not on every call while one exists.
@@ -630,7 +686,10 @@ impl Engine {
                 _ => break,
             }
         }
-        let mut v: Vec<(PathBuf, Result<Pile, EngineError>)> = results.into_iter().collect();
+        let mut v: Vec<(PathBuf, u64, Result<Pile, EngineError>)> = results
+            .into_iter()
+            .map(|(p, (seq, r))| (p, seq, r))
+            .collect();
         v.sort_by(|a, b| a.0.as_os_str().cmp(b.0.as_os_str()));
         v
     }
@@ -659,6 +718,7 @@ impl Engine {
         let hint = headstate::last_reflog(&next.git_dir);
         self.roots.get_mut(root).expect("checked").head = next.clone();
         let pile = self.scan(root)?;
+        let seq = self.scan_seq;
         let facts = TransitionFacts {
             commits,
             files_differ: pile.rows.len(),
@@ -670,8 +730,60 @@ impl Engine {
             to: next.head.clone(),
             branch: next.branch.clone(),
             notice,
+            seq,
             pile,
         }))
+    }
+
+    /// Run one accept on `root` and rescan it: the op and the scan are one critical section
+    /// for whoever holds the engine (the watcher's mutex), so nothing observes the ledger
+    /// between them and the returned pile is the one the UI should show next. The path the
+    /// TUI takes; `Ok` with refusals is a normal outcome (the pile still shows the row).
+    pub fn accept(&mut self, root: &Path, req: AcceptRequest) -> Result<Accepted, EngineError> {
+        self.accept_with(root, req, &NoFault)
+    }
+
+    /// [`Engine::accept`] with a fault injector. An op that fails (`Err`) wrote nothing the
+    /// ledger's rename did not land; the engine re-reads the ledger the disk still has so
+    /// the next scan shows the pre-accept pile rather than the staged one.
+    pub fn accept_with(
+        &mut self,
+        root: &Path,
+        req: AcceptRequest,
+        fault: &dyn FaultInjector,
+    ) -> Result<Accepted, EngineError> {
+        let result = {
+            let mut ops = self.ops(root)?;
+            match &req {
+                AcceptRequest::Hunk {
+                    rendered,
+                    hunks,
+                    index,
+                } => ops.accept_hunk(rendered, hunks, *index, fault),
+                AcceptRequest::File(rendered) if rendered.oid.is_none() => {
+                    ops.accept_deletion(rendered, fault)
+                }
+                AcceptRequest::File(rendered) => ops.accept_file(rendered, fault),
+                AcceptRequest::Group(rows) => ops.accept_group(rows, fault),
+                AcceptRequest::All(pile) => ops.accept_all(pile, fault),
+            }
+        };
+        let outcome = match result {
+            Ok(o) => o,
+            Err(e) => {
+                if let Some(state) = self.roots.get_mut(root) {
+                    state.ledger_stamp = None;
+                    state.reload_ledger_if_changed();
+                }
+                return Err(EngineError::Ops(e));
+            }
+        };
+        let pile = self.scan(root)?;
+        Ok(Accepted {
+            outcome,
+            seq: self.scan_seq,
+            pile,
+        })
     }
 
     /// The accept operations for one root.
@@ -821,7 +933,7 @@ fn first_sight(
 pub(crate) mod tests {
     use super::*;
     use crate::config::ConfigSource;
-    use crate::ops::{NoFault, Rendered};
+    use crate::scan::{Change, Row};
     use crate::status::StatusReport;
     use crate::store::tests::fixture_env;
     use lastcall_testkit::fixture_repo::FixtureRepo;
@@ -851,9 +963,18 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn open_engine(repo: &FixtureRepo, state: &TempDir, config: Config) -> Engine {
+        open_engine_with(repo, state, config, EngineOptions::default())
+    }
+
+    pub(crate) fn open_engine_with(
+        repo: &FixtureRepo,
+        state: &TempDir,
+        config: Config,
+        options: EngineOptions,
+    ) -> Engine {
         let (loaded, resolved) = loaded_for(repo, state, config);
         let env = fixture_env(repo, state);
-        Engine::open(&loaded, &resolved, &env, EngineOptions::default()).unwrap()
+        Engine::open(&loaded, &resolved, &env, options).unwrap()
     }
 
     fn only_root(engine: &Engine) -> PathBuf {
@@ -932,6 +1053,326 @@ pub(crate) mod tests {
         // A fresh engine reads the same ledger.
         let mut engine = open_engine(&repo, &state, Config::default());
         assert!(engine.scan(&root).unwrap().is_empty());
+    }
+
+    /// A FixtureRepo `f1` with two separated edits (hunks at lines 1 and 10).
+    const F1_TWO_HUNKS: &str = "A1\na2\na3\na4\na5\na6\na7\na8\na9\nA10\n";
+
+    fn rendered_row(engine: &mut Engine, root: &Path, path: &[u8]) -> (Rendered, Row) {
+        let pile = engine.scan(root).unwrap();
+        let row = pile
+            .row(path)
+            .unwrap_or_else(|| panic!("{} is pending", String::from_utf8_lossy(path)))
+            .clone();
+        (Rendered::of(&row), row)
+    }
+
+    fn ledger_bytes(engine: &Engine, root: &Path) -> Vec<u8> {
+        std::fs::read(&engine.root(root).unwrap().paths.ledger).unwrap()
+    }
+
+    #[test]
+    fn engine_accept_hunk_leaves_the_other_hunk_pending_then_accept_file_clears_it() {
+        let repo = FixtureRepo::new("eng-acc-hunk").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let root = only_root(&engine);
+        repo.write("f1", F1_TWO_HUNKS);
+        let (rendered, row) = rendered_row(&mut engine, &root, b"f1");
+        assert_eq!(row.hunks.len(), 2);
+        let acc = engine
+            .accept(
+                &root,
+                AcceptRequest::Hunk {
+                    rendered,
+                    hunks: row.hunks.clone(),
+                    index: 0,
+                },
+            )
+            .unwrap();
+        assert!(acc.outcome.ok() && acc.outcome.written);
+        let left = acc.pile.row(b"f1").expect("still pending");
+        assert_eq!(left.hunks.len(), 1, "hunk 2 only: {:?}", left.hunks);
+        assert_eq!(left.hunks[0].change_lines(), row.hunks[1].change_lines());
+        assert_eq!(
+            engine.root(&root).unwrap().ledger.overrides["f1"].blob,
+            Some(Some(
+                engine
+                    .root(&root)
+                    .unwrap()
+                    .store
+                    .hash_bytes(b"A1\na2\na3\na4\na5\na6\na7\na8\na9\na10\n")
+                    .unwrap()
+            )),
+            "the override is baseline plus hunk 1"
+        );
+        let (rendered, _) = rendered_row(&mut engine, &root, b"f1");
+        let acc = engine.accept(&root, AcceptRequest::File(rendered)).unwrap();
+        assert!(acc.outcome.ok());
+        assert!(acc.pile.is_empty(), "{:?}", acc.pile.rows);
+        assert_eq!(
+            engine.scan(&root).unwrap(),
+            acc.pile,
+            "the returned pile is the rescan"
+        );
+    }
+
+    #[test]
+    fn engine_accept_file_with_no_oid_accepts_the_deletion() {
+        let repo = FixtureRepo::new("eng-acc-del").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let root = only_root(&engine);
+        repo.remove("f2");
+        let (rendered, row) = rendered_row(&mut engine, &root, b"f2");
+        assert_eq!((rendered.oid.as_ref(), row.change), (None, Change::Deleted));
+        let acc = engine.accept(&root, AcceptRequest::File(rendered)).unwrap();
+        assert!(acc.outcome.ok());
+        assert!(acc.pile.is_empty());
+        let o = &engine.root(&root).unwrap().ledger.overrides["f2"];
+        assert_eq!(o.blob, Some(None), "an absent override (§6.2 null)");
+    }
+
+    #[test]
+    fn engine_accept_group_clears_every_row_in_one_write() {
+        let repo = FixtureRepo::new("eng-acc-group").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let root = only_root(&engine);
+        repo.write("f2", "b2\n");
+        repo.write("f3", "c3\n");
+        repo.write("f1", "one\n");
+        let pile = engine.scan(&root).unwrap();
+        let rows: Vec<Rendered> = [b"f2".as_slice(), b"f3"]
+            .iter()
+            .map(|p| Rendered::of(pile.row(p).unwrap()))
+            .collect();
+        let before = engine.root(&root).unwrap().ledger.seen_at.at.clone();
+        let acc = engine.accept(&root, AcceptRequest::Group(rows)).unwrap();
+        assert!(acc.outcome.ok() && acc.outcome.written);
+        assert_eq!(scan::pile_lines(&acc.pile), vec!["f1".to_owned()]);
+        let ledger = &engine.root(&root).unwrap().ledger;
+        assert!(ledger.overrides.contains_key("f2") && ledger.overrides.contains_key("f3"));
+        assert_eq!(ledger.seen_at.at, before, "a group is not a fold");
+    }
+
+    #[test]
+    fn engine_accept_all_folds_the_snapshot_and_moves_seen_at() {
+        let mut repo = FixtureRepo::new("eng-acc-all").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let root = only_root(&engine);
+        repo.write("f1", "one\n");
+        repo.commit_files(&[("f2", "committed\n")], "B1").unwrap();
+        let snapshot = engine.scan(&root).unwrap();
+        assert_eq!(
+            scan::pile_lines(&snapshot),
+            vec!["f1".to_owned(), "f2".to_owned()]
+        );
+        let acc = engine.accept(&root, AcceptRequest::All(snapshot)).unwrap();
+        assert!(acc.outcome.ok());
+        assert!(acc.pile.is_empty(), "{:?}", acc.pile.rows);
+        let ledger = &engine.root(&root).unwrap().ledger;
+        assert!(
+            ledger.overrides.is_empty(),
+            "folded: {:?}",
+            ledger.overrides
+        );
+        assert_eq!(
+            ledger.seen_at.head_commit.as_ref().map(Oid::as_str),
+            Some(repo.head().unwrap().trim()),
+            "seen_at follows the fold"
+        );
+        let seen = ledger.seen_tree.clone().unwrap();
+        let entries = engine.root(&root).unwrap().store.ls_tree(&seen).unwrap();
+        let store = &engine.root(&root).unwrap().store;
+        assert_eq!(
+            entries[b"f1".as_slice()].1,
+            store.hash_bytes(b"one\n").unwrap()
+        );
+        assert_eq!(
+            entries[b"f2".as_slice()].1,
+            store.hash_bytes(b"committed\n").unwrap()
+        );
+    }
+
+    #[test]
+    fn engine_accept_refusal_is_ok_and_the_pile_still_shows_the_row() {
+        let repo = FixtureRepo::new("eng-acc-refuse").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let root = only_root(&engine);
+        repo.write("f1", "one\n");
+        let (rendered, _) = rendered_row(&mut engine, &root, b"f1");
+        // The file moved on between render and accept (§6.3 CAS).
+        repo.write("f1", "two\n");
+        let disk = ledger_bytes(&engine, &root);
+        let acc = engine.accept(&root, AcceptRequest::File(rendered)).unwrap();
+        assert_eq!(acc.outcome.refused.len(), 1, "{:?}", acc.outcome);
+        assert!(!acc.outcome.written);
+        let row = acc.pile.row(b"f1").expect("the row re-renders");
+        let store = &engine.root(&root).unwrap().store;
+        assert_eq!(
+            row.current.as_ref().map(|e| e.oid.clone()),
+            Some(store.hash_bytes(b"two\n").unwrap()),
+            "with the live content"
+        );
+        assert_eq!(ledger_bytes(&engine, &root), disk, "nothing written");
+    }
+
+    /// E1 in-process: at `AfterLedgerTmpWrite` the temp file vanishes (a crash before the
+    /// rename leaves the same on-disk state), so the rename fails.
+    struct DropTmp(PathBuf);
+
+    impl FaultInjector for DropTmp {
+        fn at(&self, point: crate::ops::FaultPoint) {
+            if point == crate::ops::FaultPoint::AfterLedgerTmpWrite {
+                std::fs::remove_file(&self.0).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn engine_accept_with_fault_at_ledger_tmp_write_is_err_and_the_next_scan_is_the_pre_accept_pile()
+     {
+        let repo = FixtureRepo::new("eng-acc-e1").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let root = only_root(&engine);
+        repo.write("f1", "one\n");
+        repo.write("f2", "b2\n");
+        let before = engine.scan(&root).unwrap();
+        let rendered = Rendered::of(before.row(b"f1").unwrap());
+        let disk = ledger_bytes(&engine, &root);
+        let tmp = engine
+            .root(&root)
+            .unwrap()
+            .paths
+            .ledger
+            .with_extension("json.tmp");
+        let err = engine
+            .accept_with(&root, AcceptRequest::File(rendered), &DropTmp(tmp))
+            .expect_err("the rename fails");
+        assert!(matches!(err, EngineError::Ops(_)), "{err}");
+        assert_eq!(
+            ledger_bytes(&engine, &root),
+            disk,
+            "on-disk ledger unchanged"
+        );
+        assert_eq!(
+            engine.scan(&root).unwrap(),
+            before,
+            "the next scan's pile is the pre-accept pile"
+        );
+        assert!(
+            !engine
+                .root(&root)
+                .unwrap()
+                .ledger
+                .overrides
+                .contains_key("f1"),
+            "the staged override did not survive the failure"
+        );
+    }
+
+    fn cap3(repo: &FixtureRepo, state: &TempDir) -> Engine {
+        let options = EngineOptions {
+            row_cap: 3,
+            ..EngineOptions::default()
+        };
+        open_engine_with(repo, state, Config::default(), options)
+    }
+
+    #[test]
+    fn engine_row_cap_shows_the_first_cap_paths_counts_the_rest_and_accept_all_folds_the_shown() {
+        let repo = FixtureRepo::new("eng-cap").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let mut engine = cap3(&repo, &state);
+        let root = only_root(&engine);
+        for n in ["n1", "n2", "n3", "n4", "n5"] {
+            repo.write(n, "new\n");
+        }
+        let pile = engine.scan(&root).unwrap();
+        assert_eq!(scan::pile_lines(&pile), ["n1", "n2", "n3"]);
+        assert_eq!(pile.omitted, 2);
+        assert_eq!(
+            pile.notices,
+            vec!["3 files shown · 2 more changed paths not scanned (first 3 by path)".to_owned()]
+        );
+        let acc = engine.accept(&root, AcceptRequest::All(pile)).unwrap();
+        assert!(acc.outcome.ok());
+        assert_eq!(
+            scan::pile_lines(&acc.pile),
+            ["n4", "n5"],
+            "the shown rows folded"
+        );
+        assert_eq!(acc.pile.omitted, 0);
+        assert!(acc.pile.notices.is_empty(), "{:?}", acc.pile.notices);
+    }
+
+    #[test]
+    fn engine_row_cap_override_row_is_priority_over_path_order() {
+        let repo = FixtureRepo::new("eng-cap-prio").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let mut engine = cap3(&repo, &state);
+        let root = only_root(&engine);
+        repo.write("zzz/late", "v1\n");
+        let (rendered, _) = rendered_row(&mut engine, &root, b"zzz/late");
+        let acc = engine.accept(&root, AcceptRequest::File(rendered)).unwrap();
+        assert!(acc.outcome.ok() && acc.pile.is_empty());
+        repo.write("zzz/late", "v2\n");
+        for n in ["aaa/1", "aaa/2", "aaa/3", "aaa/4"] {
+            repo.write(n, "new\n");
+        }
+        let pile = engine.scan(&root).unwrap();
+        assert!(
+            pile.row(b"zzz/late").is_some(),
+            "{:?}",
+            scan::pile_lines(&pile)
+        );
+        assert_eq!(
+            scan::pile_lines(&pile),
+            ["aaa/1", "aaa/2", "aaa/3", "zzz/late"],
+            "priority beats path order"
+        );
+        assert_eq!(pile.omitted, 1);
+        assert_eq!(
+            pile.notices,
+            vec!["4 files shown · 1 more changed paths not scanned (first 3 by path)".to_owned()]
+        );
+    }
+
+    #[test]
+    fn engine_scan_seq_is_monotone_across_scan_scan_all_inspect_head_and_accept() {
+        let mut repo = FixtureRepo::new("eng-seq").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let root = only_root(&engine);
+        let s0 = engine.scan_seq();
+        engine.scan(&root).unwrap();
+        assert_eq!(engine.scan_seq(), s0 + 1, "one scan, one step");
+        assert!(
+            engine.scan(Path::new("/no/such/root")).is_err() && engine.scan_seq() == s0 + 1,
+            "a scan that produced no pile takes no number"
+        );
+        let all = engine.scan_all();
+        assert_eq!(all.len(), 1);
+        let (_, seq, pile) = &all[0];
+        assert!(pile.is_ok());
+        assert_eq!(*seq, s0 + 2, "scan_all numbers each pile it returns");
+        assert_eq!(
+            engine.scan_seq(),
+            *seq,
+            "the engine's counter is the last pile's number"
+        );
+        repo.commit_files(&[("f1", "committed\n")], "B1").unwrap();
+        let change = engine.inspect_head(&root).unwrap().expect("HEAD moved");
+        assert_eq!(change.seq, s0 + 3, "inspect_head's scan is numbered too");
+        assert_eq!(engine.scan_seq(), change.seq);
+        let rendered = Rendered::of(change.pile.row(b"f1").unwrap());
+        let acc = engine.accept(&root, AcceptRequest::File(rendered)).unwrap();
+        assert_eq!(acc.seq, s0 + 4, "an accept's rescan is numbered too");
+        assert_eq!(engine.scan_seq(), acc.seq);
     }
 
     #[test]

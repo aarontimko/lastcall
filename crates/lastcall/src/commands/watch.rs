@@ -92,18 +92,20 @@ fn name(root: &std::path::Path) -> String {
 
 fn print_event(json: bool, event: &EngineEvent) {
     match event {
-        EngineEvent::Pile { root, pile } => {
+        EngineEvent::Pile { root, seq, pile } => {
             let rows: Vec<RowStatus> = pile.rows.iter().map(RowStatus::of).collect();
             print_line(
                 json,
                 &serde_json::json!({
                     "event": "pile",
                     "root": root,
+                    "seq": seq,
                     "pending": rows,
+                    "omitted": pile.omitted,
                     "notices": pile.notices,
                 }),
                 || {
-                    let mut s = format!("{}  {} pending", name(root), rows.len());
+                    let mut s = format!("{} #{seq}  {} pending", name(root), rows.len());
                     for r in &rows {
                         s.push_str(&format!("\n  {}", row_line(r)));
                     }

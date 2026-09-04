@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 
 use globset::GlobSet;
 
+use crate::count::with_thousands;
 use crate::git::{self, GitError, Mode, Oid, RepoGit};
 use crate::hunks::{self, Hunk};
 use crate::index::{IndexError, Other, PrivateIndex};
@@ -123,6 +124,10 @@ pub struct Pile {
     pub rows: Vec<Row>,
     /// Root-level notices produced by this scan.
     pub notices: Vec<String>,
+    /// Changed paths the row cap left unscanned (`0` when nothing was cut). Additive:
+    /// older JSON without it reads as `0`.
+    #[serde(default)]
+    pub omitted: usize,
 }
 
 impl Pile {
@@ -171,6 +176,10 @@ pub struct ScanInputs<'a> {
     pub case_insensitive: bool,
     pub collapsed_globs: &'a GlobSet,
     pub collapse_size_bytes: u64,
+    /// Rows materialised per scan beyond the priority set (override paths, where flags
+    /// live): the rest of the candidates, in path order, are neither hashed nor diffed,
+    /// only counted in [`Pile::omitted`].
+    pub row_cap: usize,
     /// Root-relative directories owned by other roots (draft roots inside this one); only
     /// `others` entries beneath them are excluded.
     pub excluded_dirs: &'a [Vec<u8>],
@@ -376,15 +385,22 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
         })
         .collect();
 
-    // 3. Current side, hashed in one batch.
-    let currents = store.hash_paths(&candidates);
+    // 3. The row cap, decided before any hashing: override paths (flags live there) are
+    // always materialised; every other candidate — diff-files, others, case-rule and
+    // unparsable paths alike — is taken in path order until `row_cap` rows exist, and
+    // what remains is only counted. `candidates` is path-ordered (it was a BTreeSet).
+    let (priority, rest): (Vec<Vec<u8>>, Vec<Vec<u8>>) = candidates.into_iter().partition(|p| {
+        std::str::from_utf8(p)
+            .ok()
+            .is_some_and(|s| inputs.ledger.overrides.contains_key(s))
+    });
 
     // 4. Baselines.
     let mut resolver = BaselineResolver::new(
         inputs.ledger,
         inputs.tree,
         store,
-        candidates.iter().map(Vec::as_slice),
+        priority.iter().chain(rest.iter()).map(Vec::as_slice),
     );
 
     let filemode = store.filemode();
@@ -396,74 +412,91 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
         }
     };
 
-    let mut rows: Vec<Row> = Vec::new();
-    for (path, current) in candidates.iter().zip(currents) {
-        let current = if forced_absent.contains(path) {
-            Current::Absent
-        } else {
-            current
-        };
-        let baseline = resolver.baseline(path);
-        let base_entry = match &baseline {
-            Baseline::Present { oid, mode } => Some(Entry {
-                oid: oid.clone(),
-                mode: *mode,
-            }),
-            Baseline::Absent | Baseline::Empty => None,
-        };
-        let flag = std::str::from_utf8(path)
-            .ok()
-            .and_then(|s| inputs.ledger.overrides.get(s))
-            .and_then(|o| o.flag.clone());
-        let is_conflicted = conflicted.contains(path);
-        let lossy = String::from_utf8_lossy(path).into_owned();
-        if std::str::from_utf8(path).is_err() {
-            notices.push(format!(
-                "{lossy}: non-UTF-8 path; shown pending, accept is refused in v1"
-            ));
-        }
-
-        let (change, cur_entry) = match current {
-            Current::Absent => match &base_entry {
-                Some(_) => (Change::Deleted, None),
-                None => continue, // nothing on either side
-            },
-            Current::Unhashable(reason) => {
-                notices.push(format!("{lossy}: cannot hash ({reason}); shown pending"));
-                let change = if reason.starts_with("typechange") {
-                    Change::Typechange
-                } else {
-                    Change::Unreadable
-                };
-                (change, None)
+    // Current side hashed in one batch per call; a row per path whose sides differ.
+    let mut materialise = |paths: &[Vec<u8>], rows: &mut Vec<Row>| {
+        let currents = store.hash_paths(paths);
+        for (path, current) in paths.iter().zip(currents) {
+            let current = if forced_absent.contains(path) {
+                Current::Absent
+            } else {
+                current
+            };
+            let baseline = resolver.baseline(path);
+            let base_entry = match &baseline {
+                Baseline::Present { oid, mode } => Some(Entry {
+                    oid: oid.clone(),
+                    mode: *mode,
+                }),
+                Baseline::Absent | Baseline::Empty => None,
+            };
+            let flag = std::str::from_utf8(path)
+                .ok()
+                .and_then(|s| inputs.ledger.overrides.get(s))
+                .and_then(|o| o.flag.clone());
+            let is_conflicted = conflicted.contains(path);
+            let lossy = String::from_utf8_lossy(path).into_owned();
+            if std::str::from_utf8(path).is_err() {
+                notices.push(format!(
+                    "{lossy}: non-UTF-8 path; shown pending, accept is refused in v1"
+                ));
             }
-            Current::Present { oid, mode } => {
-                let cur = Entry { oid, mode };
-                match &base_entry {
-                    None => (Change::Added, Some(cur)),
-                    Some(b) if b.oid != cur.oid => (Change::Modified, Some(cur)),
-                    Some(b) if norm(b.mode) != norm(cur.mode) => (Change::Mode, Some(cur)),
-                    Some(_) => continue, // equal: not pending
+
+            let (change, cur_entry) = match current {
+                Current::Absent => match &base_entry {
+                    Some(_) => (Change::Deleted, None),
+                    None => continue, // nothing on either side
+                },
+                Current::Unhashable(reason) => {
+                    notices.push(format!("{lossy}: cannot hash ({reason}); shown pending"));
+                    let change = if reason.starts_with("typechange") {
+                        Change::Typechange
+                    } else {
+                        Change::Unreadable
+                    };
+                    (change, None)
                 }
-            }
-        };
+                Current::Present { oid, mode } => {
+                    let cur = Entry { oid, mode };
+                    match &base_entry {
+                        None => (Change::Added, Some(cur)),
+                        Some(b) if b.oid != cur.oid => (Change::Modified, Some(cur)),
+                        Some(b) if norm(b.mode) != norm(cur.mode) => (Change::Mode, Some(cur)),
+                        Some(_) => continue, // equal: not pending
+                    }
+                }
+            };
 
-        let row = Row {
-            path: path.clone(),
-            change,
-            baseline: base_entry,
-            current: cur_entry,
-            added: 0,
-            deleted: 0,
-            hunks: Vec::new(),
-            annotation: None,
-            conflicted: is_conflicted,
-            collapsed: None,
-            flag,
-            rename: None,
-        };
-        rows.push(row);
+            let row = Row {
+                path: path.clone(),
+                change,
+                baseline: base_entry,
+                current: cur_entry,
+                added: 0,
+                deleted: 0,
+                hunks: Vec::new(),
+                annotation: None,
+                conflicted: is_conflicted,
+                collapsed: None,
+                flag,
+                rename: None,
+            };
+            rows.push(row);
+        }
+    };
+    let mut rows: Vec<Row> = Vec::new();
+    materialise(&priority, &mut rows);
+    let priority_rows = rows.len();
+    let mut taken = 0usize;
+    loop {
+        let room = inputs.row_cap.saturating_sub(rows.len() - priority_rows);
+        if room == 0 || taken == rest.len() {
+            break;
+        }
+        let end = (taken + room).min(rest.len());
+        materialise(&rest[taken..end], &mut rows);
+        taken = end;
     }
+    let omitted = rest.len() - taken;
     notices.append(&mut resolver.notices);
 
     // 4b. Content for every row through one `cat-file --batch`: rendering must not cost a
@@ -490,15 +523,22 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
         render_content(store, inputs, blobs.as_ref(), row, &mut notices)?;
     }
 
-    // 5. D5 rename pairing: only when the pile has both deletions and additions.
-    let has_del = rows.iter().any(|r| r.change == Change::Deleted);
+    // 5. D5 rename pairing: only when the pile has both deletions and additions. The
+    // candidates are the pile's own rows — a deletion's baseline may be an override blob
+    // (or the path may not be a row at all: an accepted deletion), so the seen tree is
+    // not the right "before" side.
+    let deleted: Vec<(Vec<u8>, Entry)> = rows
+        .iter()
+        .filter(|r| r.change == Change::Deleted)
+        .filter_map(|r| r.baseline.clone().map(|b| (r.path.clone(), b)))
+        .collect();
     let added: Vec<Vec<u8>> = rows
         .iter()
         .filter(|r| r.change == Change::Added && r.current.is_some())
         .map(|r| r.path.clone())
         .collect();
-    if has_del && !added.is_empty() {
-        match detect_renames(store, inputs.index, inputs.index_tmp, &added) {
+    if !deleted.is_empty() && !added.is_empty() {
+        match detect_renames(store, inputs.index_tmp, &deleted, &added) {
             Ok(pairs) => {
                 for (from, to, similarity) in pairs {
                     if let Some(r) = rows
@@ -526,8 +566,20 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
     }
 
     rows.sort_by(|a, b| a.path.cmp(&b.path));
+    if omitted > 0 {
+        notices.push(format!(
+            "{} files shown · {} more changed paths not scanned (first {} by path)",
+            with_thousands(rows.len()),
+            with_thousands(omitted),
+            with_thousands(inputs.row_cap)
+        ));
+    }
     Ok(ScanOutput {
-        pile: Pile { rows, notices },
+        pile: Pile {
+            rows,
+            notices,
+            omitted,
+        },
         nested_repos,
         hash_calls: store.git().hash_object_calls() - calls_before,
         refreshed,
@@ -616,20 +668,41 @@ fn render_content(
 /// `(from, to, similarity)` as reported by `diff -M`.
 type RenamePair = (Vec<u8>, Vec<u8>, u8);
 
-/// D5: a temp index that is a **copy of the refreshed private index**, `add -N` the added
-/// paths, then `diff -M -z --name-status`. Returns `(from, to, similarity)`.
+/// D5: a temp index holding exactly the pile's **deleted rows at their baselines**
+/// (`read-tree --empty` + `update-index --index-info`), `add -N` the added paths, then
+/// `diff -M -z --name-status`. Returns `(from, to, similarity)`.
+///
+/// The index is built from the rows, not copied from the private index: the private index
+/// is the seen tree, and the pile is `diff(tree ⊕ overrides, worktree)`. A copy would let
+/// `diff -M` pair an addition with a path the user already accepted as deleted (override
+/// `null`, no row), or score a deleted row against the tree's blob instead of its accepted
+/// one — and since compaction folds overrides into the tree, the pairing would then change
+/// across a fold that changes no baseline.
 fn detect_renames(
     store: &Store,
-    index: &PrivateIndex,
     index_tmp: &Path,
+    deleted: &[(Vec<u8>, Entry)],
     added: &[Vec<u8>],
 ) -> Result<Vec<RenamePair>, ScanError> {
     let _ = std::fs::remove_file(index_tmp);
-    std::fs::copy(index.path(), index_tmp).map_err(|e| StoreError::Io {
-        path: index_tmp.to_path_buf(),
-        source: e,
-    })?;
     let result = (|| -> Result<Vec<RenamePair>, ScanError> {
+        store
+            .git()
+            .run_with_index(index_tmp, &["read-tree", "--empty"])?;
+        let mut stdin = Vec::new();
+        for (path, e) in deleted {
+            stdin.extend_from_slice(e.mode.as_str().as_bytes());
+            stdin.push(b' ');
+            stdin.extend_from_slice(e.oid.as_str().as_bytes());
+            stdin.push(b'\t');
+            stdin.extend_from_slice(path);
+            stdin.push(0);
+        }
+        store.git().run_stdin(
+            Some(index_tmp),
+            &["update-index", "-z", "--index-info"],
+            &stdin,
+        )?;
         let mut args: Vec<OsString> = vec!["add".into(), "-N".into(), "--".into()];
         args.extend(added.iter().map(|p| OsString::from_vec(p.clone())));
         store.git().run_with_index(index_tmp, &args)?;
@@ -847,6 +920,7 @@ pub(crate) mod fixture_tests {
                 collapse_size_bytes: 1024,
                 excluded_dirs: &[],
                 index_tmp: &self.paths.index_tmp,
+                row_cap: crate::engine::DEFAULT_ROW_CAP,
             };
             super::scan(&inputs).unwrap()
         }
