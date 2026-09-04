@@ -1450,9 +1450,10 @@ mod tests {
         /// accept. Yields `(base, cur, marker_a, marker_b)` where the markers are the two
         /// changed lines on the current side, each unique in the file.
         fn two_hunk_file() -> impl Strategy<Value = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> {
-            (20..40usize, 0..6usize, 0..6usize).prop_map(|(n, da, db)| {
-                // Two spots at least ten lines apart, so three lines of context on each
-                // side can never let the two changes fall into one hunk.
+            (26..44usize, 0..6usize, 0..6usize).prop_map(|(n, da, db)| {
+                // `a` is at most 7 and `b` at least `n - 9`, so the two spots are never
+                // closer than 26 - 9 - 7 = 10 lines: three lines of context on each side
+                // plus one between can never let the changes fall into a single hunk.
                 let a = 2 + da;
                 let b = n - 3 - db;
                 let base: Vec<String> = (0..n).map(|i| format!("t{i}\n")).collect();
