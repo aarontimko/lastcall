@@ -17,6 +17,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
+use std::time::Duration;
 
 use crate::git::{GitError, Mode, Oid, RepoGit};
 use crate::headstate::current_head;
@@ -157,6 +158,9 @@ impl Outcome {
 }
 
 /// Everything the ops need for one root. The engine constructs one per call.
+/// The shipping lock budget, as `Engine::ops` sets it: 40 × 50 ms = 2 s.
+pub const DEFAULT_LOCK: (u32, Duration) = (ledger::LOCK_RETRIES, ledger::LOCK_BACKOFF);
+
 pub struct Ops<'a> {
     pub store: &'a Store,
     pub index: &'a PrivateIndex,
@@ -173,6 +177,11 @@ pub struct Ops<'a> {
     /// removed). Start empty: `commit` replays them onto the on-disk ledger under the lock
     /// and clears them, so two engines over one root never lose each other's writes.
     pub staged: BTreeMap<String, Option<Override>>,
+    /// How long `commit` waits for the root's ledger lock: [`ledger::LOCK_RETRIES`] ×
+    /// [`ledger::LOCK_BACKOFF`] = 2 s in the shipping engine (`Engine::ops` sets it).
+    /// A test that wants the `LockBusy` path shortens it rather than sleeping for two
+    /// seconds; nothing else has a reason to touch it.
+    pub lock: (u32, Duration),
 }
 
 impl Ops<'_> {
@@ -273,7 +282,7 @@ impl Ops<'_> {
     /// threshold.
     fn commit(&mut self, fault: &dyn FaultInjector) -> Result<bool, OpsError> {
         {
-            let _lock = LedgerLock::acquire(self.paths)?;
+            let _lock = LedgerLock::acquire_with(self.paths, self.lock.0, self.lock.1)?;
             self.merge_from_disk()?;
             let tmp = ledger::write_tmp(self.paths, self.ledger)?;
             fault.at(FaultPoint::AfterLedgerTmpWrite);
@@ -1211,6 +1220,7 @@ mod tests {
                     clock: &self.clock,
                     compaction_threshold: 500,
                     staged: BTreeMap::new(),
+                    lock: DEFAULT_LOCK,
                 }
             }
         }

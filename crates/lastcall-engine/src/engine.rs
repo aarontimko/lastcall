@@ -323,6 +323,20 @@ pub struct Engine {
     scan_seq: u64,
 }
 
+/// Take this process's temp index in every root it opened (Phase 5 deliverable 2a).
+///
+/// Each scan already unlinks it the moment it is done with it, so this only matters when a
+/// scan died between the `read-tree` and the `write-tree` - but a long-lived TUI over many
+/// roots would otherwise leave one such file per root behind until the hour-old sweep at the
+/// next open, and the sweep is the fallback for a *killed* process, not for a clean quit.
+impl Drop for Engine {
+    fn drop(&mut self) {
+        for state in self.roots.values() {
+            let _ = std::fs::remove_file(&state.paths.index_tmp);
+        }
+    }
+}
+
 impl Engine {
     /// Open the engine: check git, prepare the state dir, discover roots, open ledgers.
     pub fn open(
@@ -1000,6 +1014,7 @@ impl Engine {
             clock,
             compaction_threshold: threshold,
             staged: BTreeMap::new(),
+            lock: crate::ops::DEFAULT_LOCK,
         })
     }
 }
@@ -1519,6 +1534,178 @@ pub(crate) mod tests {
             acc.pile,
             "the returned pile is the rescan"
         );
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Several lastcall processes over one state dir (Phase 5 deliverable 2)
+    // -----------------------------------------------------------------------------------
+
+    /// Two engines over one root — two lastcall processes, as workspace scoping makes
+    /// normal — accept a different file each, neither having seen the other's write. Both
+    /// accepts must survive: `Ops::commit` re-reads the ledger under the lock and replays
+    /// its staged change onto it, so the second write is a merge and not a clobber.
+    #[test]
+    fn engine_two_engines_over_one_root_keep_both_accepts() {
+        let repo = FixtureRepo::new("eng-two").unwrap();
+        let state = TempDir::new("lc-eng-two");
+        repo.write("f1", "one edited\n");
+        repo.write("f2", "two edited\n");
+        let mut a = open_engine(&repo, &state, Config::default());
+        let mut b = open_engine(&repo, &state, Config::default());
+        let root = only_root(&a);
+        assert_eq!(only_root(&b), root, "the same root, the same state dir");
+
+        // Both scan first, so each holds the *pre-accept* ledger in memory: a commit that
+        // wrote its own in-memory copy would drop whichever accept landed first.
+        let (r1, _) = rendered_row(&mut a, &root, b"f1");
+        let (r2, _) = rendered_row(&mut b, &root, b"f2");
+        assert!(
+            a.accept(&root, AcceptRequest::File(r1))
+                .unwrap()
+                .outcome
+                .ok()
+        );
+        let acc = b.accept(&root, AcceptRequest::File(r2)).unwrap();
+        assert!(acc.outcome.ok());
+
+        // On disk, and after a third process opens the root cold.
+        let c = open_engine(&repo, &state, Config::default());
+        let overrides = &c.root(&root).unwrap().ledger.overrides;
+        assert!(
+            overrides.contains_key("f1"),
+            "engine A's accept survived: {overrides:?}"
+        );
+        assert!(
+            overrides.contains_key("f2"),
+            "engine B's accept survived: {overrides:?}"
+        );
+        assert!(
+            acc.pile.row(b"f1").is_none() && acc.pile.row(b"f2").is_none(),
+            "neither is pending any more: {:?}",
+            acc.pile.rows
+        );
+    }
+
+    /// A lock the test holds makes an accept fail with `LockBusy` — an `Err` off the
+    /// `Local::Accepted` path, never a `Refused` (a `Refused` carries a row path and renders
+    /// per row; this is a whole-root condition and belongs on the status line). Short
+    /// budget, so the test waits 20 ms rather than the shipping 2 s.
+    #[test]
+    fn engine_accept_under_a_held_ledger_lock_is_lock_busy_not_a_refusal() {
+        let repo = FixtureRepo::new("eng-busy").unwrap();
+        let state = TempDir::new("lc-eng-busy");
+        repo.write("f1", "edited\n");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let root = only_root(&engine);
+        let (rendered, _) = rendered_row(&mut engine, &root, b"f1");
+        let paths = engine.root(&root).unwrap().paths.clone();
+        let held = ledger::LedgerLock::acquire(&paths).unwrap();
+
+        let err = {
+            let mut ops = engine.ops(&root).unwrap();
+            ops.lock = (2, Duration::from_millis(10));
+            ops.accept_file(&rendered, &NoFault).unwrap_err()
+        };
+        assert!(
+            matches!(
+                &err,
+                OpsError::Ledger(ledger::LedgerError::LockBusy { retries: 2, path })
+                    if *path == paths.lock
+            ),
+            "{err:?}"
+        );
+        // The shipping budget is the doubled one, and the accept path really uses it.
+        assert_eq!(ledger::LOCK_RETRIES, 40);
+        assert_eq!(crate::ops::DEFAULT_LOCK, (40, Duration::from_millis(50)));
+        // What the engine hands the TUI is an `Err` carrying the lock path, and the TUI
+        // turns it into the `ledger busy in <root> — try again` status line.
+        let surfaced = EngineError::from(err);
+        assert!(
+            matches!(
+                surfaced,
+                EngineError::Ops(OpsError::Ledger(ledger::LedgerError::LockBusy { .. }))
+            ),
+            "{surfaced:?}"
+        );
+        assert_eq!(
+            surfaced.to_string(),
+            format!("could not take {} after 2 tries", paths.lock.display())
+        );
+
+        // Nothing reached the disk: the lock is taken before the merge and the tmp write.
+        let on_disk =
+            String::from_utf8_lossy(&std::fs::read(&paths.ledger).unwrap_or_default()).into_owned();
+        assert!(
+            !on_disk.contains("\"f1\""),
+            "nothing written unlocked: {on_disk}"
+        );
+        // The engine's own copy *is* dirty — the op staged the override before it tried to
+        // commit — and `Engine::accept_with` is what repairs it after an `Err`, by dropping
+        // the stamp and re-reading the ledger the disk still has. Same two lines here.
+        drop(held);
+        let state = engine.roots.get_mut(&root).unwrap();
+        state.ledger_stamp = None;
+        state.reload_ledger_if_changed();
+        assert!(
+            state.ledger.overrides.is_empty(),
+            "the staged accept is gone: {:?}",
+            state.ledger.overrides
+        );
+        assert!(
+            engine.scan(&root).unwrap().row(b"f1").is_some(),
+            "still pending"
+        );
+    }
+
+    /// Two engines scan one root at the same time. They share the persistent private index
+    /// (`<store>/index`, `index.tree`) on purpose — deliverable 2d keeps it shared — so this
+    /// is the test that the sharing holds: `PrivateIndex::refresh`'s retry absorbs git's own
+    /// `index.lock`, each process folds through its own `index.<pid>.tmp`, and the two piles
+    /// agree. A scan is read-only about the ledger, so agreement is the whole assertion.
+    #[test]
+    fn engine_two_engines_scan_one_root_concurrently_and_agree() {
+        let repo = FixtureRepo::new("eng-conc").unwrap();
+        let state = TempDir::new("lc-eng-conc");
+        for i in 0..12 {
+            repo.write(&format!("c{i}.txt"), format!("edited {i}\nsecond\n"));
+        }
+        let mut a = open_engine(&repo, &state, Config::default());
+        let mut b = open_engine(&repo, &state, Config::default());
+        let root = only_root(&a);
+        assert_ne!(
+            a.root(&root).unwrap().paths.index_tmp,
+            PathBuf::from("index.tmp"),
+            "the temp index is per-process"
+        );
+
+        let (pa, pb) = std::thread::scope(|s| {
+            let root_a = root.clone();
+            let root_b = root.clone();
+            let ha = s.spawn(move || {
+                let mut out = Vec::new();
+                for _ in 0..4 {
+                    out.push(a.scan(&root_a).unwrap());
+                }
+                out
+            });
+            let hb = s.spawn(move || {
+                let mut out = Vec::new();
+                for _ in 0..4 {
+                    out.push(b.scan(&root_b).unwrap());
+                }
+                out
+            });
+            (ha.join().unwrap(), hb.join().unwrap())
+        });
+
+        // Every scan on both sides saw the same 12 rows: no retry exhaustion, no half-index.
+        for (i, pile) in pa.iter().chain(pb.iter()).enumerate() {
+            assert_eq!(pile.rows.len(), 12, "scan {i}: {:?}", pile.rows);
+            assert_eq!(
+                pile.rows, pa[0].rows,
+                "scan {i} disagrees with the first scan"
+            );
+        }
     }
 
     #[test]

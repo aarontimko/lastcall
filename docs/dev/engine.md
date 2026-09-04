@@ -33,9 +33,11 @@ Ids are the first 16 hex chars of SHA-256 over the canonicalized path.
     store/           # bare git repo; objects/info/alternates → the user's objects dir (git roots)
     index            # private index seeded from the seen tree (a cache, never truth)
     index.tree       # the tree `index` was seeded from; mismatch with the ledger → reseed
-    index.tmp        # scratch index for accept-all / compaction folds
-    lock             # flock for ledger writes (20 × 50 ms, then the op errors); every write
-                     # reloads the on-disk ledger under it and replays the in-memory change,
+    index.<pid>.tmp  # scratch index for accept-all / compaction folds, one per process;
+                     # unlinked after each fold, on engine drop, and (an hour old, another
+                     # pid, never on Windows) by the sweep at the next store open
+    lock             # flock for ledger writes (40 × 50 ms = 2 s, then the op errors); every
+                     # write reloads the on-disk ledger under it and replays the in-memory change,
                      # so two engines over one root keep each other's accepts
 ```
 
@@ -144,7 +146,7 @@ Every rung shows *more* than the truth, never less, and says why in a notice:
 | `index.lock` held by another process | scan runs unrefreshed |
 | a path that cannot be hashed (unreadable, a socket, `git-lfs` missing) | an `Unhashable` row |
 | accept whose rendered oid/mode/baseline (oid **and** mode for hunks, so a stale mode hunk cannot apply twice) no longer matches the live file | refused, nothing written; the next scan shows the new state (A5/A6) |
-| ledger lock busy after 20 × 50 ms | the op errors; nothing is written unlocked |
+| ledger lock busy after 40 × 50 ms (2 s) | the op errors; nothing is written unlocked, and the TUI says `ledger busy in <root> — try again` with the row still pending |
 
 ## Accepting through the engine (Phase 4)
 

@@ -859,6 +859,7 @@ pub(crate) mod fixture_tests {
                 clock: &self.clock,
                 compaction_threshold: self.compaction_threshold,
                 staged: std::collections::BTreeMap::new(),
+                lock: crate::ops::DEFAULT_LOCK,
             }
         }
 
