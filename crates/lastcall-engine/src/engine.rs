@@ -481,12 +481,18 @@ impl Engine {
         // Each parent's `meta.json` is written **before** the pool starts: it is the one
         // piece of shared state an open touches, so writing it serially is what keeps the
         // pool free of any lock of its own (deliverable 1a).
-        for d in &to_open {
-            if let Err(e) = self.ensure_parent_meta(&d.parent) {
+        // A root whose parent `meta.json` cannot be written is not opened at all — one
+        // "cannot open" notice, and the root stays out of `roots` (as `open_root` did
+        // before the pool existed), rather than a notice for a root that is then open.
+        let mut to_open = to_open;
+        to_open.retain(|d| match self.ensure_parent_meta(&d.parent) {
+            Ok(()) => true,
+            Err(e) => {
                 self.notices
                     .push(format!("{}: cannot open: {e}", d.path.display()));
+                false
             }
-        }
+        });
         // Opened on up to `parallelism` threads; applied here, serially, in path order, so
         // the resulting state does not depend on which root finished first.
         let ctx = self.open_ctx();
@@ -1345,6 +1351,41 @@ pub(crate) mod tests {
         );
     }
 
+    /// A parent whose `meta.json` cannot be written is reported once per root and none of
+    /// its roots is opened — not a "cannot open" notice for a root that is then open, and
+    /// not two notices for one root (verifier (a) F2).
+    #[test]
+    fn engine_open_with_an_unwritable_parent_meta_opens_nothing_and_notices_once_per_root() {
+        let state = TempDir::new("lc-badmeta");
+        let (parent, env, repos, _dir) = six_roots(&state);
+        let engine = many_root_engine(&parent, &env, &state, 4);
+        let meta = {
+            let root = std::fs::canonicalize(repos[0].path()).unwrap();
+            let repo_dir = engine.root(&root).unwrap().paths.repo_dir.clone();
+            // `<parent>/repos/<id>` → the parent's dir is two levels up.
+            repo_dir.parent().unwrap().parent().unwrap().to_path_buf()
+        };
+        drop(engine);
+        let state2 = TempDir::new("lc-badmeta2");
+        let env2 = env.with_var("LASTCALL_STATE_DIR", state2.path().to_string_lossy());
+        let rel = meta.strip_prefix(state.path()).unwrap().to_path_buf();
+        let blocked = state2.path().join(&rel);
+        std::fs::create_dir_all(blocked.parent().unwrap()).unwrap();
+        std::fs::write(&blocked, b"not a directory").unwrap();
+
+        let engine = many_root_engine(&parent, &env2, &state2, 4);
+        assert!(engine.roots().is_empty(), "{:?}", engine.root_paths());
+        for repo in &repos {
+            let root = std::fs::canonicalize(repo.path()).unwrap();
+            let n = engine
+                .notices()
+                .iter()
+                .filter(|n| n.contains(&root.display().to_string()) && n.contains("cannot open"))
+                .count();
+            assert_eq!(n, 1, "{}: {:?}", root.display(), engine.notices());
+        }
+    }
+
     /// The per-root git process budget (Phase 5 deliverable 1c). Both figures are measured
     /// on the calling thread — `thread_spawn_count` rather than the process-wide counter,
     /// which is a race in a test binary that runs tests in parallel.
@@ -1379,10 +1420,15 @@ pub(crate) mod tests {
             "opening one root costs {open_spawns} git processes, budget 10"
         );
 
-        // One scan of one root, on this thread.
+        // One scan of one root, on this thread, in the bench's pile shape: an edit, an
+        // add and a delete together, so rename detection runs through `index.<pid>.tmp`
+        // — the most expensive scan shape, and the one S1/S1h measure (17 per root).
+        // An add alone costs 12, an edit alone 13; the ceiling guards the worst shape.
         let mut engine = engine;
         engine.scan(&root).unwrap();
+        repo.write("f1", "a1\nchanged\na3\na4\na5\na6\na7\na8\na9\na10\n");
         repo.write("budget.txt", "one\ntwo\nthree\n");
+        repo.remove("f3");
         let before = crate::git::thread_spawn_count();
         let pile = engine.scan(&root).unwrap();
         let scan_spawns = crate::git::thread_spawn_count() - before;
@@ -1390,15 +1436,16 @@ pub(crate) mod tests {
             "BUDGET scan_spawns_per_root={scan_spawns} rows={}",
             pile.rows.len()
         );
-        assert!(!pile.rows.is_empty());
-        // Measured, not aspirational. A scan is 12 today (read-tree seeding aside: one
-        // `update-index --refresh`, `diff-files`, three `ls-files`, the four-spawn head
-        // inspection, two `for-each-ref refs/remotes`, `hash-object --stdin-paths` and
-        // `cat-file --batch`). 1c reduces the *open*; the scan pipeline is not batchable
-        // without a redesign (see docs/dev/bench.md). The ceiling catches a regression.
+        assert_eq!(pile.rows.len(), 3, "edit, add and delete are three rows");
+        // Measured, not aspirational. This shape is 17 today (read-tree seeding aside:
+        // one `update-index --refresh`, `diff-files`, three `ls-files`, the four-spawn
+        // head inspection, two `for-each-ref refs/remotes`, `hash-object --stdin-paths`,
+        // `cat-file --batch`, and rename detection's passes over the temp index). 1c
+        // reduces the *open*; the scan pipeline is not batchable without a redesign
+        // (see docs/dev/bench.md). The ceiling catches a regression.
         assert!(
-            scan_spawns <= 15,
-            "scanning one root costs {scan_spawns} git processes, budget 15"
+            scan_spawns <= 18,
+            "scanning one root costs {scan_spawns} git processes, budget 18"
         );
     }
 
@@ -1660,8 +1707,12 @@ pub(crate) mod tests {
     /// Two engines scan one root at the same time. They share the persistent private index
     /// (`<store>/index`, `index.tree`) on purpose — deliverable 2d keeps it shared — so this
     /// is the test that the sharing holds: `PrivateIndex::refresh`'s retry absorbs git's own
-    /// `index.lock`, each process folds through its own `index.<pid>.tmp`, and the two piles
-    /// agree. A scan is read-only about the ledger, so agreement is the whole assertion.
+    /// `index.lock` and the two piles agree. A scan is read-only about the ledger, so
+    /// agreement is the whole assertion. Both engines live in this one process, so they
+    /// share `index.<pid>.tmp` too (it is per process, not per engine); the fixture is
+    /// adds only, so rename detection never touches the temp index here and the shared
+    /// path is not contended — two *processes* are what production has, and each gets
+    /// its own temp index by pid.
     #[test]
     fn engine_two_engines_scan_one_root_concurrently_and_agree() {
         let repo = FixtureRepo::new("eng-conc").unwrap();
