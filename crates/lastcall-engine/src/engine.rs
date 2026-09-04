@@ -18,7 +18,7 @@ use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 
 use crate::config::{Config, DraftInitial, Loaded, Resolved};
 use crate::env::Env;
-use crate::git::{self, GitError, Oid, RepoGit};
+use crate::git::{self, ConfigList, GitError, Oid, RepoGit};
 use crate::headstate::{self, HeadState, TransitionFacts};
 use crate::hunks::Hunk;
 use crate::index::{IndexError, PrivateIndex};
@@ -29,7 +29,7 @@ use crate::ops::{FaultInjector, NoFault, Ops, OpsError, Outcome, Rendered};
 use crate::paths::{Layout, ParentId, ParentMeta, RepoPaths, RootId};
 use crate::roots::{self, Badge, DiscoverInputs, Discovery, RootsChanged};
 use crate::scan::{self, Pile, ScanError, ScanInputs};
-use crate::store::{RootKind, Store, StoreError};
+use crate::store::{RepoFacts, RootKind, Store, StoreError};
 use crate::upstream::{self, Classifier};
 
 /// The oldest git the engine accepts (`--path-format=absolute`, `ls-files --others -z`
@@ -430,25 +430,47 @@ impl Engine {
             std::fs::write(&meta, text).map_err(|e| io_err(&meta, e))?;
         }
         let repo = (d.kind == RootKind::Git).then(|| RepoGit::new(&self.env, &d.path));
-        let (store, mut notices) = Store::open(&self.env, &d.path, d.kind, &paths, repo.as_ref())?;
-        let exclude_from = repo
-            .as_ref()
-            .and_then(|rg| rg.git_path("info/exclude").ok());
-        let index = PrivateIndex::new(store.git().clone(), &paths, d.kind, exclude_from);
-        let head = match &repo {
-            Some(rg) => headstate::inspect(rg)?,
-            None => HeadState::none(),
+        // Two spawns of the user's repo answer everything this open needs from it
+        // (deliverable 1c): one `config --list -z`, and the head inspection's batched
+        // `rev-parse` with the three git paths folded in. A config that cannot be read is
+        // a notice and an empty reading — the same fail-open the per-key reads had.
+        let mut notices = Vec::new();
+        let repo_config = match &repo {
+            Some(rg) => match rg.config_list() {
+                Ok(c) => c,
+                Err(e) => {
+                    notices.push(format!("cannot read the repository config: {e}"));
+                    ConfigList::default()
+                }
+            },
+            None => ConfigList::default(),
         };
-        let user_email = repo
-            .as_ref()
-            .and_then(|rg| rg.config_get("user.email").ok().flatten())
-            .filter(|e| !e.is_empty());
-        // `config --get` is allowlisted; `remote get-url origin` (§6.7) is not, and the two
-        // differ only under `url.<base>.insteadOf` rewriting.
-        let remote = repo
-            .as_ref()
-            .and_then(|rg| rg.config_get("remote.origin.url").ok().flatten())
-            .and_then(|url| remote_slug(&url));
+        const GIT_PATHS: [&str; 3] = ["objects", "info/attributes", "info/exclude"];
+        let (head, git_paths) = match &repo {
+            Some(rg) => headstate::inspect_with_paths(rg, &GIT_PATHS)?,
+            None => (HeadState::none(), Vec::new()),
+        };
+        let facts = repo.as_ref().map(|_| RepoFacts {
+            config: &repo_config,
+            objects_dir: git_paths[0].clone(),
+            info_attributes: git_paths[1].clone(),
+        });
+        let (store, store_notices) =
+            Store::open(&self.env, &d.path, d.kind, &paths, facts.as_ref())?;
+        notices.extend(store_notices);
+        let exclude_from = git_paths.get(2).cloned();
+        let index = PrivateIndex::new(store.git().clone(), &paths, d.kind, exclude_from);
+        let user_email = repo_config
+            .get("user.email")
+            .filter(|e| !e.is_empty())
+            .map(str::to_owned);
+        // `config --list` resolves exactly what `config --get` would; `remote get-url
+        // origin` (§6.7) is not allowlisted, and the two differ only under
+        // `url.<base>.insteadOf` rewriting.
+        let remote = repo_config
+            .get("remote.origin.url")
+            .filter(|u| !u.is_empty())
+            .and_then(remote_slug);
 
         // A `ledger.json.tmp` left by a crash between write and rename (E1) is garbage:
         // the rename never happened, so `ledger.json` is still the previous version. A
@@ -981,6 +1003,63 @@ pub(crate) mod tests {
         let roots = engine.roots();
         assert_eq!(roots.len(), 1, "{:?}", engine.root_paths());
         roots[0].path.clone()
+    }
+
+    /// The per-root git process budget (Phase 5 deliverable 1c). Both figures are measured
+    /// on the calling thread — `thread_spawn_count` rather than the process-wide counter,
+    /// which is a race in a test binary that runs tests in parallel.
+    ///
+    /// The budget is the point of the deliverable: if a later change reintroduces a
+    /// per-key `config --get` or a per-path `rev-parse`, these numbers move and this fails.
+    #[test]
+    fn engine_open_and_scan_stay_inside_the_per_root_git_budget() {
+        let repo = FixtureRepo::new("budget").unwrap();
+        let state = TempDir::new("lc-budget");
+        let (loaded, resolved) = loaded_for(&repo, &state, Config::default());
+        let env = fixture_env(&repo, &state);
+
+        // Discovery, then one root opened on this thread: the per-root open cost.
+        let engine = Engine::open(&loaded, &resolved, &env, EngineOptions::default()).unwrap();
+        let root = only_root(&engine);
+        let d = roots::DiscoveredRoot {
+            path: root.clone(),
+            kind: RootKind::Git,
+            parent: std::fs::canonicalize(repo.parent_dir()).unwrap(),
+            badge: None,
+        };
+        drop(engine);
+        let engine = Engine::open(&loaded, &resolved, &env, EngineOptions::default()).unwrap();
+        let before = crate::git::thread_spawn_count();
+        let opened = engine.open_root(&d).unwrap();
+        let open_spawns = crate::git::thread_spawn_count() - before;
+        drop(opened);
+        eprintln!("BUDGET open_spawns_per_root={open_spawns}");
+        assert!(
+            open_spawns <= 10,
+            "opening one root costs {open_spawns} git processes, budget 10"
+        );
+
+        // One scan of one root, on this thread.
+        let mut engine = engine;
+        engine.scan(&root).unwrap();
+        repo.write("budget.txt", "one\ntwo\nthree\n");
+        let before = crate::git::thread_spawn_count();
+        let pile = engine.scan(&root).unwrap();
+        let scan_spawns = crate::git::thread_spawn_count() - before;
+        eprintln!(
+            "BUDGET scan_spawns_per_root={scan_spawns} rows={}",
+            pile.rows.len()
+        );
+        assert!(!pile.rows.is_empty());
+        // Measured, not aspirational. A scan is 12 today (read-tree seeding aside: one
+        // `update-index --refresh`, `diff-files`, three `ls-files`, the four-spawn head
+        // inspection, two `for-each-ref refs/remotes`, `hash-object --stdin-paths` and
+        // `cat-file --batch`). 1c reduces the *open*; the scan pipeline is not batchable
+        // without a redesign (see docs/dev/bench.md). The ceiling catches a regression.
+        assert!(
+            scan_spawns <= 15,
+            "scanning one root costs {scan_spawns} git processes, budget 15"
+        );
     }
 
     #[test]

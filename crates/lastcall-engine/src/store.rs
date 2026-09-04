@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::env::Env;
-use crate::git::{self, BatchCheck, GitError, Mode, Oid, RepoGit, StoreGit};
+use crate::git::{self, BatchCheck, ConfigList, GitError, Mode, Oid, RepoGit, StoreGit};
 use crate::paths::RepoPaths;
 
 /// `git | draft`.
@@ -99,15 +99,45 @@ pub struct Store {
     filemode: bool,
 }
 
+/// Everything about the user's repository the store needs, read **once** by the caller.
+///
+/// Phase 5 deliverable 1c: before this, `Store::open` spawned seven `git` children of its
+/// own per root (`config --get core.excludesfile`, four `COPIED_CONFIG_KEYS` reads, and
+/// two `rev-parse --git-path`). All of it now comes from one `config --list -z` and one
+/// batched `rev-parse` the caller already ran for its head inspection.
+#[derive(Debug, Clone)]
+pub struct RepoFacts<'a> {
+    /// One `config --list -z` of the user's repository.
+    pub config: &'a ConfigList,
+    /// `rev-parse --git-path objects` — the object dir the alternate points at (the
+    /// common dir's for a linked worktree, D10).
+    pub objects_dir: PathBuf,
+    /// `rev-parse --git-path info/attributes`.
+    pub info_attributes: PathBuf,
+}
+
+impl<'a> RepoFacts<'a> {
+    /// Read the two git paths with a `--git-path` call each. The engine's `open_root`
+    /// folds them into the head inspection's batched `rev-parse` instead and builds the
+    /// struct literally; this is for callers with no inspection to fold them into.
+    pub fn read(git: &RepoGit, config: &'a ConfigList) -> Result<Self, GitError> {
+        Ok(Self {
+            config,
+            objects_dir: git.git_path("objects")?,
+            info_attributes: git.git_path("info/attributes")?,
+        })
+    }
+}
+
 impl Store {
-    /// Open (initializing when absent) the store for `root`. `repo_git` is `Some` for git
+    /// Open (initializing when absent) the store for `root`. `repo` is `Some` for git
     /// roots. Returns the store and any notices (a failed key copy is a notice, never fatal).
     pub fn open(
         env: &Env,
         root: &Path,
         kind: RootKind,
         paths: &RepoPaths,
-        repo_git: Option<&RepoGit>,
+        repo: Option<&RepoFacts<'_>>,
     ) -> Result<(Self, Vec<String>), StoreError> {
         let mut notices = Vec::new();
         std::fs::create_dir_all(&paths.repo_dir).map_err(|e| io_err(&paths.repo_dir, e))?;
@@ -117,56 +147,59 @@ impl Store {
         // A stale temp index from a crashed fold; read-tree would replace it anyway.
         let _ = std::fs::remove_file(&paths.index_tmp);
 
-        let excludes_file = match repo_git {
-            Some(rg) => match rg.config_get("core.excludesfile") {
-                Ok(v) => v.map(PathBuf::from),
-                Err(e) => {
-                    notices.push(format!("cannot read core.excludesfile: {e}"));
-                    None
-                }
-            },
-            None => None,
-        };
+        let excludes_file = repo
+            .and_then(|r| r.config.get("core.excludesfile"))
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from);
         let git =
             StoreGit::new(env, root, &paths.store, &paths.index).with_excludes_file(excludes_file);
+        // What the store's own config file already holds, in one spawn: every write below
+        // is skipped when the value already matches.
+        let store_config = git.config_list_local();
         // The store's own config pins the monitor/cache keys as well (a `git` run by hand
         // against the store must not start a daemon either). A failure is a notice: the
         // `-c` on every command still holds.
         for (key, value) in git::NEUTRALIZED_CONFIG {
+            if store_config.get(key) == Some(*value) {
+                continue;
+            }
             if let Err(e) = git.run(&["config", key, value]) {
                 notices.push(format!("cannot set {key} in the store: {e}"));
             }
         }
 
-        if let Some(rg) = repo_git {
+        if let Some(r) = repo {
             // Alternates → the user's object dir (the common dir for a linked worktree).
-            let objects = rg.git_path("objects")?;
             let info = paths.store.join("objects").join("info");
             std::fs::create_dir_all(&info).map_err(|e| io_err(&info, e))?;
             let alternates = info.join("alternates");
-            let mut line = objects.as_os_str().as_bytes().to_vec();
+            let mut line = r.objects_dir.as_os_str().as_bytes().to_vec();
             line.push(b'\n');
             std::fs::write(&alternates, line).map_err(|e| io_err(&alternates, e))?;
             // Normalization keys, at every open (the user may change them).
             for key in COPIED_CONFIG_KEYS {
-                match rg.config_get(key) {
-                    Ok(Some(v)) => {
-                        if let Err(e) = git.run(&["config", key, &v]) {
+                match r.config.get(key) {
+                    Some(v) => {
+                        if store_config.get(key) == Some(v) {
+                            continue;
+                        }
+                        if let Err(e) = git.run(&["config", key, v]) {
                             notices.push(format!("cannot copy {key} into the store: {e}"));
                         }
                     }
-                    Ok(None) => {
+                    None => {
                         // Unset in the user's config: unset ours (exit 5 = was not set).
-                        let _ = git.run_raw(None, &["config", "--unset", key], None);
+                        if store_config.get(key).is_some() {
+                            let _ = git.run_raw(None, &["config", "--unset", key], None);
+                        }
                     }
-                    Err(e) => notices.push(format!("cannot read {key}: {e}")),
                 }
             }
             // info/attributes: invisible to the store otherwise; a `* text=auto` living only
             // there would make every CRLF file churn.
-            let theirs = rg.git_path("info/attributes")?;
+            let theirs = &r.info_attributes;
             let ours = paths.store.join("info").join("attributes");
-            match std::fs::read(&theirs) {
+            match std::fs::read(theirs) {
                 Ok(bytes) => {
                     if let Some(parent) = ours.parent() {
                         std::fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
@@ -582,10 +615,60 @@ pub(crate) mod tests {
         let env = fixture_env(repo, state);
         let paths = RepoPaths::under(state.join("repo"));
         let rg = RepoGit::new(&env, repo.path());
+        let config = rg.config_list().unwrap();
+        let facts = RepoFacts::read(&rg, &config).unwrap();
         let (store, notices) =
-            Store::open(&env, repo.path(), RootKind::Git, &paths, Some(&rg)).unwrap();
+            Store::open(&env, repo.path(), RootKind::Git, &paths, Some(&facts)).unwrap();
         assert!(notices.is_empty(), "{notices:?}");
         (store, rg)
+    }
+
+    /// The one batched read must answer **exactly** what the seven `config --get` calls it
+    /// replaced answered, for every key the open consumes — against real git, with values
+    /// that contain the two bytes a naive `key=value` split would break on.
+    #[test]
+    fn store_config_list_agrees_with_config_get_for_every_key_the_open_reads() {
+        let repo = FixtureRepo::new("cfg").unwrap();
+        let state = TempDir::new("lc-cfg");
+        let env = fixture_env(&repo, &state);
+        let rg = RepoGit::new(&env, repo.path());
+        // A URL with `=` in its query, an excludesfile whose name contains `=`, a
+        // multi-valued key (last wins), and a key left unset.
+        repo.git(&["config", "remote.origin.url", "https://h.invalid/r?a=1&b=2"])
+            .unwrap();
+        repo.git(&["config", "core.excludesfile", "/tmp/ex=cludes"])
+            .unwrap();
+        repo.git(&["config", "user.email", "a@b.invalid"]).unwrap();
+        repo.git(&["config", "core.autocrlf", "input"]).unwrap();
+        repo.git(&["config", "--add", "core.ignorecase", "false"])
+            .unwrap();
+        repo.git(&["config", "--add", "core.ignorecase", "true"])
+            .unwrap();
+
+        let mut keys: Vec<&str> = vec![
+            "core.excludesfile",
+            "user.email",
+            "remote.origin.url",
+            "core.eol",
+        ];
+        keys.extend_from_slice(COPIED_CONFIG_KEYS);
+        let list = rg.config_list().unwrap();
+        for key in keys {
+            let want = rg.config_get(key).unwrap();
+            // `--get` on an unset key exits 1 (`None`); a key set to the empty string is
+            // `Some("")`. The map must make the same distinction.
+            assert_eq!(
+                list.get(key).map(str::to_owned),
+                want,
+                "config --list -z disagrees with config --get {key}"
+            );
+        }
+        assert_eq!(
+            list.get("core.ignorecase"),
+            Some("true"),
+            "the last value of a multi-valued key, like --get"
+        );
+        assert_eq!(list.get("no.such.key"), None);
     }
 
     #[test]

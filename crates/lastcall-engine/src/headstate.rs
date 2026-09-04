@@ -82,6 +82,22 @@ pub fn current_head(rg: &RepoGit) -> (Option<Oid>, Option<String>) {
 }
 
 pub fn inspect(rg: &RepoGit) -> Result<HeadState, GitError> {
+    Ok(inspect_with_paths(rg, &[])?.0)
+}
+
+/// [`inspect`] plus `rev-parse --git-path <name>` for each of `git_paths`, folded into the
+/// same batched call — the shape the engine's open uses so that one root costs **four** git
+/// spawns however many git paths it wants (Phase 5 deliverable 1c; before: six for the
+/// inspection alone, plus one per git path).
+///
+/// The batch holds only flags that cannot fail (`rev-parse` exits non-zero as a whole if
+/// any one flag does). `symbolic-ref -q --short HEAD` and the two `rev-parse -q --verify`
+/// calls therefore stay separate: their non-zero exit *is* the answer (an unborn HEAD, no
+/// merge in progress).
+pub fn inspect_with_paths(
+    rg: &RepoGit,
+    git_paths: &[&str],
+) -> Result<(HeadState, Vec<PathBuf>), GitError> {
     let head = rg.rev_parse_verify("HEAD")?;
     let branch = {
         let out = rg.run_raw(&["symbolic-ref", "-q", "--short", "HEAD"], None)?;
@@ -92,30 +108,38 @@ pub fn inspect(rg: &RepoGit) -> Result<HeadState, GitError> {
         }
     };
     let detached = head.is_some() && branch.is_none();
-    let git_dir = absolute_dir(rg, "--git-dir")?;
-    let common_dir = absolute_dir(rg, "--git-common-dir")?;
+
+    let mut flags: Vec<&str> = vec!["--git-dir", "--git-common-dir", "--is-shallow-repository"];
+    for name in git_paths {
+        flags.push("--git-path");
+        flags.push(name);
+    }
+    let lines = rg.rev_parse_batch(&flags, 3 + git_paths.len())?;
+    // Outputs pair by position: three fixed lines, then one per `--git-path <name>` pair.
+    let git_dir = canonical(&lines[0]);
+    let common_dir = canonical(&lines[1]);
+    let shallow = lines[2] == "true";
+    let paths: Vec<PathBuf> = lines[3..].iter().map(PathBuf::from).collect();
+
     let merge_head = rg.rev_parse_verify("MERGE_HEAD")?;
     let in_progress = in_progress_of(&git_dir);
-    let shallow = {
-        let out = rg.run_raw(&["rev-parse", "--is-shallow-repository"], None)?;
-        out.success() && out.stdout_trimmed() == "true"
-    };
-    Ok(HeadState {
-        head,
-        branch,
-        detached,
-        in_progress,
-        merge_head,
-        shallow,
-        git_dir,
-        common_dir,
-    })
+    Ok((
+        HeadState {
+            head,
+            branch,
+            detached,
+            in_progress,
+            merge_head,
+            shallow,
+            git_dir,
+            common_dir,
+        },
+        paths,
+    ))
 }
 
-fn absolute_dir(rg: &RepoGit, flag: &str) -> Result<PathBuf, GitError> {
-    let out = rg.run(&["rev-parse", "--path-format=absolute", flag])?;
-    let s = String::from_utf8_lossy(&out).trim().to_owned();
-    Ok(std::fs::canonicalize(&s).unwrap_or_else(|_| PathBuf::from(s)))
+fn canonical(s: &str) -> PathBuf {
+    std::fs::canonicalize(s).unwrap_or_else(|_| PathBuf::from(s))
 }
 
 /// Which operation is in progress, from the per-worktree git dir's marker files.
@@ -501,6 +525,83 @@ mod tests {
         assert_eq!(
             last_reflog(&d.git_dir).unwrap().message.split(':').next(),
             Some("checkout")
+        );
+    }
+
+    /// The batched `rev-parse` must answer exactly what the six separate calls answered,
+    /// including in a linked worktree (where `--git-dir` and `--git-common-dir` differ) and
+    /// on a detached HEAD, and it must cost four spawns, not six.
+    #[test]
+    fn headstate_batched_rev_parse_matches_the_separate_calls() {
+        use crate::store::tests::fixture_env;
+        use lastcall_testkit::fixture_repo::FixtureRepo;
+        use lastcall_testkit::tmp::TempDir;
+        let repo = FixtureRepo::new("batch").unwrap();
+        let state_dir = TempDir::new("lc-batch");
+        let env = fixture_env(&repo, &state_dir);
+        let rg = RepoGit::new(&env, repo.path());
+
+        const PATHS: [&str; 3] = ["objects", "info/attributes", "info/exclude"];
+        let before = crate::git::thread_spawn_count();
+        let (s, paths) = inspect_with_paths(&rg, &PATHS).unwrap();
+        let spawns = crate::git::thread_spawn_count() - before;
+        assert_eq!(
+            spawns, 4,
+            "HEAD verify, symbolic-ref, one batched rev-parse, MERGE_HEAD verify"
+        );
+        assert_eq!(paths.len(), PATHS.len(), "one line per --git-path");
+        // Positional pairing: each line is the path of the flag at the same position.
+        for (name, got) in PATHS.iter().zip(&paths) {
+            assert_eq!(got, &rg.git_path(name).unwrap(), "--git-path {name}");
+        }
+        // The batched answers equal the ones `inspect` alone produces.
+        let plain = inspect(&rg).unwrap();
+        assert_eq!(
+            (s.git_dir, s.common_dir, s.shallow),
+            (
+                plain.git_dir.clone(),
+                plain.common_dir.clone(),
+                plain.shallow
+            )
+        );
+        assert!(!plain.is_linked_worktree());
+
+        // A linked worktree: git_dir is under the common dir, and they must not collapse.
+        let wt = repo.parent_dir().join("wt");
+        repo.git(&["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "wtb"])
+            .unwrap();
+        let wrg = RepoGit::new(&env, &wt);
+        let (w, wpaths) = inspect_with_paths(&wrg, &PATHS).unwrap();
+        assert!(
+            w.is_linked_worktree(),
+            "{:?} vs {:?}",
+            w.git_dir,
+            w.common_dir
+        );
+        assert_ne!(w.git_dir, w.common_dir);
+        assert_eq!(w.branch.as_deref(), Some("wtb"));
+        // `objects` lives in the common dir; `info/exclude` is per-worktree only when the
+        // worktree has one, so assert against git's own answer rather than a guess.
+        for (name, got) in PATHS.iter().zip(&wpaths) {
+            assert_eq!(
+                got,
+                &wrg.git_path(name).unwrap(),
+                "linked --git-path {name}"
+            );
+        }
+
+        // Detached: the batch still returns its three lines (only the ref lookups change).
+        repo.checkout("--detach").unwrap();
+        let (d, dpaths) = inspect_with_paths(&rg, &PATHS).unwrap();
+        assert!(d.detached && d.branch.is_none());
+        assert_eq!(dpaths, paths, "paths do not depend on HEAD");
+
+        // A flag count that disagrees with the expected line count is a parse error, never
+        // a silently shifted answer.
+        let err = rg.rev_parse_batch(&["--git-dir", "--is-shallow-repository"], 3);
+        assert!(
+            matches!(err, Err(crate::git::GitError::Parse { .. })),
+            "{err:?}"
         );
     }
 }

@@ -251,7 +251,7 @@ mod tests {
     use super::*;
     use crate::git::RepoGit;
     use crate::store::tests::fixture_env;
-    use crate::store::{RootKind, Store};
+    use crate::store::{RepoFacts, RootKind, Store};
     use lastcall_testkit::fixture_repo::FixtureRepo;
     use lastcall_testkit::tmp::TempDir;
 
@@ -259,7 +259,10 @@ mod tests {
         let env = fixture_env(repo, state);
         let paths = RepoPaths::under(state.join("repo"));
         let rg = RepoGit::new(&env, repo.path());
-        let (store, _) = Store::open(&env, repo.path(), RootKind::Git, &paths, Some(&rg)).unwrap();
+        let config = rg.config_list().unwrap();
+        let facts = RepoFacts::read(&rg, &config).unwrap();
+        let (store, _) =
+            Store::open(&env, repo.path(), RootKind::Git, &paths, Some(&facts)).unwrap();
         let exclude = rg.git_path("info/exclude").unwrap();
         let index = PrivateIndex::new(store.git().clone(), &paths, RootKind::Git, Some(exclude));
         let tree = Oid::parse(repo.git(&["rev-parse", "HEAD^{tree}"]).unwrap().trim()).unwrap();
