@@ -342,6 +342,31 @@ async fn scan_root(
     }
 }
 
+/// Scan every root in one engine call — the bounded pool — and emit the piles in path
+/// order. One lock for the whole set instead of one per root.
+async fn scan_all_roots(engine: &Arc<Mutex<Engine>>, tx: &mpsc::Sender<EngineEvent>) -> bool {
+    let results = blocking(engine, |e| e.scan_all()).await;
+    for (root, seq, result) in results {
+        let ok = match result {
+            Ok(pile) => emit(tx, EngineEvent::Pile { root, seq, pile }).await,
+            Err(e) => {
+                emit(
+                    tx,
+                    EngineEvent::Notice {
+                        root: Some(root),
+                        text: format!("scan failed: {e}"),
+                    },
+                )
+                .await
+            }
+        };
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
 async fn inspect_root(
     engine: &Arc<Mutex<Engine>>,
     tx: &mpsc::Sender<EngineEvent>,
@@ -424,11 +449,18 @@ async fn run_loop(
         roots.clone(),
     ));
     let mut reinstall = false;
-    // Initial scans.
-    for r in roots.iter().map(|r| r.path.clone()).collect::<Vec<_>>() {
-        if !scan_root(&engine, &tx, r).await {
-            return;
-        }
+    // Initial scans. The first root is scanned on its own so the first pile reaches the
+    // screen as early as it ever did; the rest go through one `scan_all`, which runs them
+    // on the engine's bounded pool instead of one at a time behind the engine mutex
+    // (Phase 5 deliverable 1b — this loop was the whole gap between `first_pile_ms` and
+    // `first_frame_ms` on the 100-root bench).
+    if let Some(first) = roots.first().map(|r| r.path.clone())
+        && !scan_root(&engine, &tx, first).await
+    {
+        return;
+    }
+    if roots.len() > 1 && !scan_all_roots(&engine, &tx).await {
+        return;
     }
 
     let mut due: BTreeMap<PathBuf, Instant> = BTreeMap::new();
