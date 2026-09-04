@@ -2917,4 +2917,339 @@ mod tests {
         assert_eq!(hunk_block(&[mode.clone(), row.hunks[0].clone()], 0), 2);
         assert_eq!(hunk_block(&[mode.clone()], 0), 1, "the last hunk has none");
     }
+
+    // --- herdr (deliverables 5 and 8) ----------------------------------------------------
+
+    use super::super::herdr::testfix as hfix;
+    use super::super::herdr::{Attention, Dot, Ready, RootAgents, Scope, ToastShown};
+
+    /// `three_roots` with alpha emptied, herdr connected, and `derived` folded in.
+    fn with_herdr(derived: BTreeMap<PathBuf, RootAgents>) -> App {
+        let mut app = three_roots();
+        assert_eq!(
+            app.apply(pile_event_seq(
+                "alpha",
+                1,
+                without(pile("alpha"), &["f1", "f2"])
+            ))
+            .0,
+            Changed::Yes,
+            "alpha now has nothing pending"
+        );
+        app.handle(Action::Herdr(HerdrUpdate::Connected {
+            version: "0.8.2".to_owned(),
+            protocol: 21,
+        }));
+        app.handle(Action::Herdr(HerdrUpdate::Roots(derived)));
+        app
+    }
+
+    fn one(name: &str, status: Attention) -> BTreeMap<PathBuf, RootAgents> {
+        BTreeMap::from([(root(name), hfix::agents(status, 1, "w1:p1", "claude"))])
+    }
+
+    /// Ruling 4 + ruling 9: a repo with nothing pending is listed because its agent is
+    /// done, and the nav row says so instead of showing a pile.
+    #[test]
+    fn app_herdr_done_lists_a_root_with_nothing_pending() {
+        let app = with_herdr(one("alpha", Attention::Done));
+        assert!(
+            app.listed_roots().any(|v| v.meta.path == root("alpha")),
+            "a done agent lists its repo"
+        );
+        assert_eq!(
+            app.herdr.dot(&root("alpha")),
+            Some(Dot::Ready { acked: false })
+        );
+        assert!(app.nav_entries().contains(&Selection::Root(root("alpha"))));
+    }
+
+    /// Ruling 4: `working` and `idle` only annotate. A repo with nothing pending and a
+    /// working agent stays off the list; `blocked` puts it back on.
+    #[test]
+    fn app_herdr_working_annotates_but_blocked_lists() {
+        let app = with_herdr(one("alpha", Attention::Working));
+        assert!(
+            !app.listed_roots().any(|v| v.meta.path == root("alpha")),
+            "a working agent is not a reason to list an empty repo"
+        );
+        assert_eq!(app.herdr.dot(&root("alpha")), Some(Dot::Working));
+
+        let app = with_herdr(one("alpha", Attention::Blocked));
+        assert!(app.listed_roots().any(|v| v.meta.path == root("alpha")));
+        assert_eq!(app.herdr.dot(&root("alpha")), Some(Dot::Blocked));
+
+        let app = with_herdr(one("alpha", Attention::Idle));
+        assert!(!app.listed_roots().any(|v| v.meta.path == root("alpha")));
+        assert_eq!(app.herdr.dot(&root("alpha")), None);
+    }
+
+    /// Ruling 10: `d` is local and idempotent — the dot dims, herdr is never told, and the
+    /// repo stays listed. The name also leaves any pending toast window.
+    #[test]
+    fn app_herdr_ack_dims_the_flag_and_withdraws_the_toast() {
+        let mut app = with_herdr(one("alpha", Attention::Done));
+        app.select(Some(Selection::Root(root("alpha"))));
+        let (changed, effect) = app.handle(Action::Ack);
+        assert_eq!(changed, Changed::Yes);
+        assert_eq!(
+            effect,
+            Some(Effect::Toast(ToastRequest {
+                ready: Vec::new(),
+                dropped: vec!["alpha".to_owned()],
+            }))
+        );
+        assert_eq!(
+            app.herdr.dot(&root("alpha")),
+            Some(Dot::Ready { acked: true })
+        );
+        assert!(
+            app.listed_roots().any(|v| v.meta.path == root("alpha")),
+            "an acked flag still lists the repo; it only stops shouting"
+        );
+        assert_eq!(
+            app.handle(Action::Ack),
+            (Changed::No, None),
+            "acking twice is not news"
+        );
+        // Nothing about the ack reaches herdr: the only effect it can produce is the toast
+        // withdrawal, and the flag herdr sees is still `done`.
+        assert_eq!(
+            app.herdr.flag(&root("alpha")).unwrap().status,
+            Attention::Done
+        );
+    }
+
+    /// Deliverable 6: the reducer asks for a toast on the episodes that just opened, and
+    /// only while `[herdr] toast` is on.
+    #[test]
+    fn app_herdr_toast_effect_names_only_the_opened_episodes() {
+        let mut app = with_herdr(BTreeMap::new());
+        app.herdr.toast = true;
+        let (_, effect) = app.handle(Action::Herdr(HerdrUpdate::Roots(one(
+            "alpha",
+            Attention::Done,
+        ))));
+        assert_eq!(
+            effect,
+            Some(Effect::Toast(ToastRequest {
+                ready: vec!["alpha".to_owned()],
+                dropped: Vec::new(),
+            }))
+        );
+        // The same derivation again is the same episode: nothing to send.
+        let (_, effect) = app.handle(Action::Herdr(HerdrUpdate::Roots(one(
+            "alpha",
+            Attention::Done,
+        ))));
+        assert_eq!(effect, None);
+        // The agent went back to work: the episode closed, so the pending name is withdrawn.
+        let (_, effect) = app.handle(Action::Herdr(HerdrUpdate::Roots(one(
+            "alpha",
+            Attention::Working,
+        ))));
+        assert_eq!(
+            effect,
+            Some(Effect::Toast(ToastRequest {
+                ready: Vec::new(),
+                dropped: vec!["alpha".to_owned()],
+            }))
+        );
+
+        app.herdr.toast = false;
+        let (changed, effect) = app.handle(Action::Herdr(HerdrUpdate::Roots(one(
+            "alpha",
+            Attention::Done,
+        ))));
+        assert_eq!(changed, Changed::Yes, "the flag still lights");
+        assert_eq!(effect, None, "[herdr] toast = false sends nothing");
+    }
+
+    /// `g` hands the loop the winning agent's **pane id** — herdr's own public id, never a
+    /// display name — and the answer names the agent in the status line.
+    #[test]
+    fn app_herdr_jump_carries_the_pane_id_and_the_answer_is_a_status() {
+        let mut app = with_herdr(one("alpha", Attention::Done));
+        app.select(Some(Selection::Root(root("alpha"))));
+        assert_eq!(
+            app.handle(Action::Jump),
+            (Changed::No, Some(Effect::Focus("w1:p1".to_owned())))
+        );
+        app.handle(Action::Herdr(HerdrUpdate::Focused(Ok("claude".to_owned()))));
+        assert_eq!(status(&app), "focused claude in herdr");
+        app.handle(Action::Herdr(HerdrUpdate::Focused(Err(
+            "pane_not_found".to_owned()
+        ))));
+        assert_eq!(status(&app), "jump failed: pane_not_found");
+
+        // A root herdr says nothing about has nothing to jump to.
+        app.select(Some(Selection::Root(root("beta"))));
+        assert_eq!(app.handle(Action::Jump), (Changed::No, None));
+        assert_eq!(app.handle(Action::Ack), (Changed::No, None));
+    }
+
+    /// Deliverable 8: the scope hides the roots outside it, the notice counts exactly what
+    /// it hid, and `w` shows all. Without a derived scope `w` does nothing at all.
+    #[test]
+    fn app_herdr_scope_hides_roots_and_w_shows_all() {
+        let mut app = three_roots();
+        app.herdr.scoped = true;
+        assert_eq!(app.scope_notice(), None, "no scope, no notice");
+        assert_eq!(app.handle(Action::ScopeToggle), (Changed::No, None));
+
+        let scope = Scope {
+            label: "alpha".to_owned(),
+            roots: [root("alpha")].into_iter().collect(),
+        };
+        assert_eq!(
+            app.handle(Action::Herdr(HerdrUpdate::Scope(Some(scope.clone()))))
+                .0,
+            Changed::Yes
+        );
+        assert_eq!(
+            app.listed_roots()
+                .map(|v| v.meta.name.clone())
+                .collect::<Vec<_>>(),
+            vec!["alpha".to_owned()]
+        );
+        assert_eq!(app.scoped_out(), 2);
+        assert_eq!(
+            app.scope_notice().as_deref(),
+            Some("scope: alpha · 2 repos hidden (w shows all)"),
+            "the notice is mandatory whenever the scope hides anything"
+        );
+
+        assert_eq!(app.handle(Action::ScopeToggle).0, Changed::Yes);
+        assert_eq!(app.listed_roots().count(), 3, "w shows all");
+        assert_eq!(app.scope_notice(), None);
+        assert_eq!(
+            app.handle(Action::Herdr(HerdrUpdate::Scope(Some(scope)))),
+            (Changed::No, None),
+            "re-deriving the same scope while it is off is not a redraw"
+        );
+    }
+
+    /// The confirm modal and the help overlay are the user's own state: herdr news folds
+    /// in underneath them and never closes either.
+    #[test]
+    fn app_herdr_update_never_closes_the_modal_or_the_help() {
+        let mut app = three_roots();
+        app.apply(pile_event_seq("alpha", 1, rows_n(11, 0, 0)));
+        app.handle(Action::AcceptAll);
+        assert!(app.confirm.is_some(), "eleven files ask");
+        assert_eq!(
+            app.handle(Action::Herdr(HerdrUpdate::Roots(one(
+                "beta",
+                Attention::Done
+            ))))
+            .0,
+            Changed::Yes
+        );
+        assert!(app.confirm.is_some(), "the modal survives herdr news");
+        assert!(app.herdr.flag(&root("beta")).unwrap().ready.is_some());
+        app.handle(Action::Cancel);
+
+        app.handle(Action::Help);
+        assert!(app.help);
+        app.handle(Action::Herdr(HerdrUpdate::Reconnecting));
+        assert!(app.help, "the help overlay survives herdr news");
+        assert_eq!(app.herdr.link, Link::Reconnecting);
+    }
+
+    /// herdr can answer before the first scan does. A derivation naming a root the app has
+    /// not adopted yet is kept, and lights the moment `sync_roots` learns the root.
+    #[test]
+    fn app_herdr_update_before_sync_roots_is_kept() {
+        let mut app = App::new();
+        app.handle(Action::Herdr(HerdrUpdate::Connected {
+            version: "0.8.2".to_owned(),
+            protocol: 21,
+        }));
+        app.handle(Action::Herdr(HerdrUpdate::Roots(one(
+            "alpha",
+            Attention::Done,
+        ))));
+        assert!(
+            app.herdr.flag(&root("alpha")).is_some(),
+            "the flag is not dropped on the floor for want of a root"
+        );
+        assert_eq!(app.listed_roots().count(), 0, "no roots to list yet");
+
+        assert_eq!(app.sync_roots(vec![meta("alpha")]), Changed::Yes);
+        assert!(
+            app.listed_roots().any(|v| v.meta.path == root("alpha")),
+            "the moment the root exists, the flag lists it"
+        );
+        assert_eq!(
+            app.herdr.dot(&root("alpha")),
+            Some(Dot::Ready { acked: false })
+        );
+    }
+
+    /// A link that drops takes every dot with it (§6.6 degradation) but not the ack
+    /// episodes: reconnecting re-derives, and an ack the user already made still stands.
+    #[test]
+    fn app_herdr_reconnect_neutralises_the_dots_and_keeps_the_acks() {
+        let mut app = with_herdr(one("alpha", Attention::Done));
+        app.select(Some(Selection::Root(root("alpha"))));
+        app.handle(Action::Ack);
+        app.handle(Action::Herdr(HerdrUpdate::Reconnecting));
+        assert_eq!(app.herdr.dot(&root("alpha")), None);
+        assert_eq!(
+            app.herdr.flag(&root("alpha")).unwrap().ready,
+            Some(Ready { acked: true })
+        );
+        app.handle(Action::Herdr(HerdrUpdate::Connected {
+            version: "0.8.2".to_owned(),
+            protocol: 21,
+        }));
+        assert_eq!(
+            app.herdr.dot(&root("alpha")),
+            Some(Dot::Ready { acked: true })
+        );
+    }
+
+    /// A shown toast says so; a refusal is the task's debug log, not a banner.
+    #[test]
+    fn app_herdr_toast_verdict_only_speaks_when_it_was_shown() {
+        let mut app = three_roots();
+        app.handle(Action::Herdr(HerdrUpdate::Toast(Ok(ToastShown {
+            shown: false,
+            reason: "busy".to_owned(),
+        }))));
+        assert_eq!(status(&app), "");
+        assert_eq!(
+            app.handle(Action::Herdr(HerdrUpdate::Toast(Err("eof".to_owned())))),
+            (Changed::No, None)
+        );
+        app.handle(Action::Herdr(HerdrUpdate::Toast(Ok(ToastShown {
+            shown: true,
+            reason: String::new(),
+        }))));
+        assert_eq!(status(&app), "toast shown");
+    }
+
+    /// Clicking the header badge says what the link is doing, and says why when `mode = on`
+    /// made a failure visible.
+    #[test]
+    fn app_herdr_header_badge_click_names_the_link() {
+        let mut app = three_roots();
+        app.handle(Action::Herdr(HerdrUpdate::Connected {
+            version: "0.8.2".to_owned(),
+            protocol: 21,
+        }));
+        assert_eq!(app.hit(Target::HeaderHerdr).0, Changed::Yes);
+        assert_eq!(status(&app), "herdr 0.8.2");
+        app.handle(Action::Herdr(HerdrUpdate::Standalone {
+            reason: "no socket at /run/herdr.sock".to_owned(),
+        }));
+        app.hit(Target::HeaderHerdr);
+        assert_eq!(status(&app), "standalone: no socket at /run/herdr.sock");
+        // A silent standalone (the default `auto`) has nothing to say.
+        app.handle(Action::Herdr(HerdrUpdate::Standalone {
+            reason: String::new(),
+        }));
+        app.status = None;
+        assert_eq!(app.hit(Target::HeaderHerdr), (Changed::No, None));
+    }
 }

@@ -704,3 +704,561 @@ pub fn rederives(event: &HerdrEvent) -> bool {
             | HerdrEvent::PaneAssociation { .. }
     )
 }
+
+/// Cache builders shared by this module's tests and `app.rs`'s.
+#[cfg(test)]
+pub(crate) mod testfix {
+    use super::*;
+    use lastcall_engine::herdr::client::PaneRecord;
+    use lastcall_engine::herdr::wire::{PaneInfo, WorkspaceInfo};
+    use serde_json::json;
+
+    /// One agent-bearing pane. `status` is the *snapshot's* field; [`streaming`] adds the
+    /// per-pane stream's newer word, which `derive` must prefer.
+    pub fn pane(
+        pane_id: &str,
+        workspace: &str,
+        cwd: &str,
+        agent: Option<&str>,
+        status: &str,
+    ) -> PaneRecord {
+        let info: PaneInfo = serde_json::from_value(json!({
+            "pane_id": pane_id,
+            "terminal_id": "t",
+            "workspace_id": workspace,
+            "tab_id": "tab",
+            "focused": false,
+            "agent_status": status,
+            "revision": 0,
+            "agent": agent,
+            "cwd": cwd,
+        }))
+        .expect("pane fixture parses");
+        PaneRecord {
+            info,
+            provisional: false,
+            status: None,
+        }
+    }
+
+    /// The same pane with the per-pane status stream having said `stream` since.
+    pub fn streaming(mut record: PaneRecord, stream: &str) -> PaneRecord {
+        record.status = Some(serde_json::from_value(json!(stream)).expect("status parses"));
+        record
+    }
+
+    /// A pane whose `foreground_cwd` differs from its `cwd` (a `cd` inside the shell).
+    pub fn foregrounded(mut record: PaneRecord, foreground_cwd: &str) -> PaneRecord {
+        record.info.foreground_cwd = Some(foreground_cwd.to_owned());
+        record
+    }
+
+    pub fn cache(panes: Vec<PaneRecord>) -> Cache {
+        let mut cache = Cache {
+            version: "0.8.2".to_owned(),
+            protocol: 21,
+            ..Cache::default()
+        };
+        for pane in panes {
+            cache.panes.insert(pane.info.pane_id.clone(), pane);
+        }
+        cache
+    }
+
+    /// A workspace, optionally with the worktree provenance §6.6 prefers.
+    pub fn workspace(id: &str, label: &str, checkout: Option<&str>) -> WorkspaceInfo {
+        serde_json::from_value(json!({
+            "workspace_id": id,
+            "label": label,
+            "worktree": checkout.map(|c| json!({
+                "repo_key": "k", "repo_name": "repo", "repo_root": c, "checkout_path": c,
+            })),
+        }))
+        .expect("workspace fixture parses")
+    }
+
+    pub fn meta(path: &str, badge: Option<Badge>) -> RootMeta {
+        let path = PathBuf::from(path);
+        RootMeta {
+            name: path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            parent: path.parent().unwrap_or(Path::new("/")).to_path_buf(),
+            path,
+            kind: lastcall_engine::store::RootKind::Git,
+            badge,
+            branch: Some("main".to_owned()),
+            head: None,
+            in_progress: None,
+            remote: None,
+        }
+    }
+
+    pub fn agents(status: Attention, n: u32, pane: &str, agent: &str) -> RootAgents {
+        RootAgents {
+            status,
+            agents: n,
+            pane: Some(pane.to_owned()),
+            agent: Some(agent.to_owned()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testfix::*;
+    use super::*;
+    use lastcall_testkit::mock_herdr::{InMemoryHerdr, MockControl};
+    use serde_json::{Value, json};
+
+    const A: &str = "/W/alpha";
+    const B: &str = "/W/beta";
+    const NESTED: &str = "/W/alpha/vendor/nested";
+
+    fn roots() -> Vec<RootMeta> {
+        vec![meta(A, None), meta(B, None), meta(NESTED, None)]
+    }
+
+    /// The rollup priority is `blocked > done > working > idle > unknown` (deliverable 4),
+    /// and the derived `Ord` on `Attention` *is* that rule — so this is the test for it.
+    #[test]
+    fn herdr_attention_order_is_the_rollup_priority() {
+        let mut all = vec![
+            Attention::Done,
+            Attention::Unknown,
+            Attention::Blocked,
+            Attention::Idle,
+            Attention::Working,
+        ];
+        all.sort();
+        assert_eq!(
+            all,
+            vec![
+                Attention::Unknown,
+                Attention::Idle,
+                Attention::Working,
+                Attention::Done,
+                Attention::Blocked,
+            ]
+        );
+        assert_eq!(Attention::of(&AgentStatus::Done), Attention::Done);
+        assert_eq!(
+            Attention::of(&AgentStatus::Unknown("martian".to_owned())),
+            Attention::Unknown,
+            "a status the server invented is not an alert"
+        );
+    }
+
+    /// The §6.6 association: agent-bearing panes only, the deepest root wins, a pane under
+    /// no root is ignored, and the rollup keeps the pane id of the agent that won it.
+    #[test]
+    fn herdr_derive_rolls_up_agents_onto_the_deepest_root() {
+        let cache = cache(vec![
+            pane("p1", "w1", A, Some("claude"), "working"),
+            pane("p2", "w1", A, Some("codex"), "done"),
+            pane("p3", "w1", A, None, "done"),
+            pane("p4", "w1", NESTED, Some("claude"), "blocked"),
+            pane("p5", "w1", "/elsewhere", Some("claude"), "done"),
+        ]);
+        let derived = derive(&cache, &roots());
+        assert_eq!(
+            derived.keys().collect::<Vec<_>>(),
+            vec![&PathBuf::from(A), &PathBuf::from(NESTED)],
+            "a pane under no root is ignored, and the nested repo is its own root"
+        );
+        let alpha = &derived[Path::new(A)];
+        assert_eq!(alpha.agents, 2, "the agentless pane does not count");
+        assert_eq!(alpha.status, Attention::Done);
+        assert_eq!(alpha.pane.as_deref(), Some("p2"), "the winner's pane id");
+        assert_eq!(alpha.agent.as_deref(), Some("codex"));
+        assert_eq!(derived[Path::new(NESTED)].status, Attention::Blocked);
+    }
+
+    /// Two agents at the winning level: the first keeps the jump target, so `g` does not
+    /// flap between panes on every re-derivation.
+    #[test]
+    fn herdr_derive_keeps_the_first_agent_at_the_winning_level() {
+        let cache = cache(vec![
+            pane("p1", "w1", A, Some("claude"), "done"),
+            pane("p2", "w1", A, Some("codex"), "done"),
+        ]);
+        assert_eq!(
+            derive(&cache, &roots())[Path::new(A)].pane.as_deref(),
+            Some("p1")
+        );
+    }
+
+    /// §5.7: the per-pane stream is the live truth; the snapshot's own field is only the
+    /// fallback until the first frame lands. And `foreground_cwd` beats `cwd`.
+    #[test]
+    fn herdr_derive_prefers_the_status_stream_and_the_foreground_cwd() {
+        let cache = cache(vec![foregrounded(
+            streaming(pane("p1", "w1", A, Some("claude"), "working"), "done"),
+            NESTED,
+        )]);
+        let derived = derive(&cache, &roots());
+        assert_eq!(
+            derived.keys().collect::<Vec<_>>(),
+            vec![&PathBuf::from(NESTED)]
+        );
+        assert_eq!(derived[Path::new(NESTED)].status, Attention::Done);
+    }
+
+    /// Ruling 1: provenance first. The workspace's `checkout_path` anchors the scope and
+    /// every root whose badge links it comes along — a pane sitting in an unrelated repo
+    /// does not widen it.
+    #[test]
+    fn herdr_scope_prefers_provenance_over_pane_cwd() {
+        let mut cache = cache(vec![pane("p1", "w1", B, Some("claude"), "working")]);
+        cache
+            .workspaces
+            .insert("w1".to_owned(), workspace("w1", "alpha", Some(A)));
+        let roots = vec![
+            meta(A, None),
+            meta(B, None),
+            meta(NESTED, Some(Badge::WorktreeOf(PathBuf::from(A)))),
+        ];
+        let scope = derive_scope(&cache, &roots, "w1").expect("provenance places the workspace");
+        assert_eq!(scope.label, "alpha");
+        assert_eq!(
+            scope.roots,
+            [PathBuf::from(A), PathBuf::from(NESTED)]
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            "the checkout plus what its badges link, and not beta"
+        );
+    }
+
+    /// No provenance we can place: fall back to where this workspace's panes actually are,
+    /// and to no scope at all (no notice, nothing hidden) when even that is empty.
+    #[test]
+    fn herdr_scope_falls_back_to_pane_cwd_then_to_nothing() {
+        let mut cache = cache(vec![
+            pane("p1", "w1", B, Some("claude"), "working"),
+            pane("p2", "w2", A, Some("claude"), "working"),
+        ]);
+        cache
+            .workspaces
+            .insert("w1".to_owned(), workspace("w1", "", Some("/not/a/root")));
+        let scope = derive_scope(&cache, &roots(), "w1").expect("containment finds beta");
+        assert_eq!(
+            scope.label, "w1",
+            "an unlabelled workspace is named by its id"
+        );
+        assert_eq!(
+            scope.roots,
+            [PathBuf::from(B)].into_iter().collect::<BTreeSet<_>>()
+        );
+
+        cache.panes.clear();
+        assert_eq!(derive_scope(&cache, &roots(), "w1"), None);
+        assert_eq!(
+            derive_scope(&cache, &roots(), "nobody"),
+            None,
+            "a workspace id the snapshot does not know scopes nothing"
+        );
+    }
+
+    /// Ruling 9 + ruling 10: `done` opens exactly one episode; an ack survives further
+    /// derivations that still say `done`; any non-`done` rollup ends it, so the next `done`
+    /// alerts again. Only the opened edges are toast-worthy.
+    #[test]
+    fn herdr_ready_episode_opens_once_and_a_non_done_rollup_ends_it() {
+        let mut view = HerdrView::default();
+        let done = || BTreeMap::from([(PathBuf::from(A), agents(Attention::Done, 1, "p1", "cl"))]);
+        let delta = view.apply_roots(done());
+        assert_eq!(delta.opened, vec![PathBuf::from(A)]);
+        assert_eq!(
+            view.flag(Path::new(A)).unwrap().ready,
+            Some(Ready { acked: false })
+        );
+
+        // A second `done` derivation is the same episode: no second alert.
+        assert_eq!(view.apply_roots(done()), ReadyDelta::default());
+
+        assert!(view.ack(Path::new(A)));
+        assert!(!view.ack(Path::new(A)), "acking twice changes nothing");
+        assert_eq!(view.apply_roots(done()).opened, Vec::<PathBuf>::new());
+        assert_eq!(
+            view.flag(Path::new(A)).unwrap().ready,
+            Some(Ready { acked: true }),
+            "the ack survives a re-derivation that still says done"
+        );
+
+        let working =
+            BTreeMap::from([(PathBuf::from(A), agents(Attention::Working, 1, "p1", "cl"))]);
+        assert_eq!(view.apply_roots(working).closed, vec![PathBuf::from(A)]);
+        assert_eq!(view.flag(Path::new(A)).unwrap().ready, None);
+        assert_eq!(
+            view.apply_roots(done()).opened,
+            vec![PathBuf::from(A)],
+            "the next done is a new episode and alerts again"
+        );
+
+        // A root that loses its agents entirely also ends its episode.
+        assert_eq!(
+            view.apply_roots(BTreeMap::new()).closed,
+            vec![PathBuf::from(A)]
+        );
+    }
+
+    /// Ruling 4: `done` and `blocked` are worth listing a repo with nothing pending;
+    /// `working`, `idle` and `unknown` only annotate one that is listed already.
+    #[test]
+    fn herdr_only_ready_and_blocked_list_a_repo_on_their_own() {
+        for (status, listed) in [
+            (Attention::Done, true),
+            (Attention::Blocked, true),
+            (Attention::Working, false),
+            (Attention::Idle, false),
+            (Attention::Unknown, false),
+        ] {
+            let mut view = HerdrView::default();
+            view.apply_roots(BTreeMap::from([(
+                PathBuf::from(A),
+                agents(status, 1, "p1", "cl"),
+            )]));
+            assert_eq!(
+                view.flag(Path::new(A)).unwrap().attention(),
+                listed,
+                "{status:?}"
+            );
+        }
+    }
+
+    /// §6.6 degradation: a link that is not live has no current data, so every dot goes
+    /// neutral rather than lying about a status nobody is refreshing.
+    #[test]
+    fn herdr_dots_go_neutral_while_the_link_is_not_live() {
+        let mut view = HerdrView::default();
+        view.apply_roots(BTreeMap::from([
+            (PathBuf::from(A), agents(Attention::Done, 1, "p1", "cl")),
+            (PathBuf::from(B), agents(Attention::Blocked, 1, "p2", "cl")),
+            (
+                PathBuf::from(NESTED),
+                agents(Attention::Idle, 1, "p3", "cl"),
+            ),
+        ]));
+        view.link = Link::Connected {
+            version: "0.8.2".to_owned(),
+        };
+        assert_eq!(view.dot(Path::new(A)), Some(Dot::Ready { acked: false }));
+        view.ack(Path::new(A));
+        assert_eq!(view.dot(Path::new(A)), Some(Dot::Ready { acked: true }));
+        assert_eq!(view.dot(Path::new(B)), Some(Dot::Blocked));
+        assert_eq!(view.dot(Path::new(NESTED)), None, "idle draws nothing");
+        for link in [
+            Link::Reconnecting,
+            Link::Standalone {
+                reason: String::new(),
+            },
+            Link::Off,
+        ] {
+            view.link = link;
+            assert_eq!(view.dot(Path::new(A)), None);
+            assert_eq!(view.dot(Path::new(B)), None);
+        }
+    }
+
+    /// `w` only bites while a scope was derived, and it hides exactly the roots outside it.
+    #[test]
+    fn herdr_scope_gates_membership_only_while_it_is_on() {
+        let mut view = HerdrView::default();
+        assert!(view.in_scope(Path::new(B)), "no scope hides nothing");
+        view.scoped = true;
+        view.scope = Some(Scope {
+            label: "alpha".to_owned(),
+            roots: [PathBuf::from(A)].into_iter().collect(),
+        });
+        assert!(view.in_scope(Path::new(A)));
+        assert!(!view.in_scope(Path::new(B)));
+        view.scoped = false;
+        assert!(view.in_scope(Path::new(B)), "w shows all");
+        assert_eq!(view.active_scope(), None);
+    }
+
+    /// §5.9: a repo name is untrusted text. Control characters and newlines cannot forge a
+    /// second line, runs of whitespace fold, and both fields are capped.
+    #[test]
+    fn herdr_toast_text_sanitises_and_caps() {
+        let (title, body) = toast_text(&["al\npha\u{7}  two".to_owned()]);
+        assert_eq!(title, "lastcall: al pha two ready for review");
+        assert_eq!(body, "al pha two");
+
+        let (title, body) = toast_text(&["alpha".to_owned(), "beta".to_owned()]);
+        assert_eq!(title, "lastcall: 2 repos ready for review");
+        assert_eq!(body, "alpha, beta");
+
+        let long = "x".repeat(500);
+        let (title, body) = toast_text(&[long.clone(), long]);
+        assert!(
+            title.chars().count() <= TOAST_TITLE_MAX,
+            "the count form never grows: {title}"
+        );
+        assert_eq!(body.chars().count(), TOAST_BODY_MAX);
+        assert!(body.ends_with('…'));
+    }
+
+    // --- the toast task, on a paused clock (deliverable 6) -------------------------------
+
+    fn shown() -> Value {
+        json!({"shown": true, "reason": ""})
+    }
+
+    fn refused(reason: &str) -> Value {
+        json!({"shown": false, "reason": reason})
+    }
+
+    /// The task, with a mock whose `notification.show` answers `results` in order.
+    #[allow(clippy::type_complexity)]
+    fn toaster(
+        results: Vec<Value>,
+    ) -> (
+        MockControl,
+        mpsc::UnboundedSender<ToastMsg>,
+        mpsc::UnboundedReceiver<HerdrUpdate>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let mock = InMemoryHerdr::builder()
+            .canned_seq(wire::method::NOTIFICATION_SHOW, results)
+            .in_memory();
+        let control = mock.control();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (utx, urx) = mpsc::unbounded_channel();
+        (control, tx, urx, tokio::spawn(toast_loop(mock, rx, utx)))
+    }
+
+    /// When each `notification.show` arrived, on the virtual clock.
+    fn shows(control: &MockControl) -> Vec<Duration> {
+        control
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == wire::method::NOTIFICATION_SHOW)
+            .map(|r| r.at)
+            .collect()
+    }
+
+    fn last_params(control: &MockControl) -> Value {
+        control
+            .requests()
+            .into_iter()
+            .rfind(|r| r.method == wire::method::NOTIFICATION_SHOW)
+            .expect("a notification.show")
+            .params
+    }
+
+    /// Ruling 5: everything that goes ready inside the 7 s window is one notification, and
+    /// the window is trailing — a second name inside it moves the deadline out.
+    #[tokio::test(start_paused = true)]
+    async fn herdr_toast_coalesces_a_window_into_one_notification() {
+        let (control, tx, mut updates, task) = toaster(vec![shown()]);
+        tx.send(ToastMsg::Ready("alpha".to_owned())).unwrap();
+        tokio::time::sleep(TOAST_DELAY / 2).await;
+        tx.send(ToastMsg::Ready("beta".to_owned())).unwrap();
+        tx.send(ToastMsg::Ready("beta".to_owned())).unwrap();
+        tokio::time::sleep(TOAST_DELAY * 2).await;
+
+        assert_eq!(shows(&control).len(), 1, "one window, one request");
+        let params = last_params(&control);
+        assert_eq!(params["title"], "lastcall: 2 repos ready for review");
+        assert_eq!(params["body"], "alpha, beta", "each name once, in order");
+        assert_eq!(params["sound"], "done");
+        assert_eq!(
+            updates.recv().await,
+            Some(HerdrUpdate::Toast(Ok(ToastShown {
+                shown: true,
+                reason: String::new()
+            })))
+        );
+        drop(tx);
+        task.await.unwrap();
+    }
+
+    /// An ack inside the window withdraws that name; when it was the only one, no request
+    /// is sent at all — the user has already seen it.
+    #[tokio::test(start_paused = true)]
+    async fn herdr_toast_drops_an_acked_name_and_sends_nothing_when_empty() {
+        let (control, tx, _updates, task) = toaster(vec![shown()]);
+        tx.send(ToastMsg::Ready("alpha".to_owned())).unwrap();
+        tx.send(ToastMsg::Ready("beta".to_owned())).unwrap();
+        tokio::time::sleep(TOAST_DELAY / 2).await;
+        tx.send(ToastMsg::Drop("alpha".to_owned())).unwrap();
+        tokio::time::sleep(TOAST_DELAY * 2).await;
+        assert_eq!(shows(&control).len(), 1);
+        assert_eq!(
+            last_params(&control)["title"],
+            "lastcall: beta ready for review"
+        );
+
+        control.clear_requests();
+        tx.send(ToastMsg::Ready("gamma".to_owned())).unwrap();
+        tokio::time::sleep(TOAST_DELAY / 2).await;
+        tx.send(ToastMsg::Drop("gamma".to_owned())).unwrap();
+        tokio::time::sleep(TOAST_DELAY * 3).await;
+        assert!(shows(&control).is_empty(), "an emptied window is not sent");
+        drop(tx);
+        task.await.unwrap();
+    }
+
+    /// Ruling 5: `busy` and `rate_limited` earn exactly one retry, 5 s later — and never a
+    /// third request, however many times herdr says busy.
+    #[tokio::test(start_paused = true)]
+    async fn herdr_toast_retries_once_on_busy_and_never_a_third_time() {
+        let (control, tx, mut updates, task) = toaster(vec![refused("busy"), refused("busy")]);
+        tx.send(ToastMsg::Ready("alpha".to_owned())).unwrap();
+        tokio::time::sleep(TOAST_DELAY + TOAST_RETRY * 4).await;
+        let at = shows(&control);
+        assert_eq!(at.len(), 2, "one retry, never a third: {at:?}");
+        assert_eq!(at[1] - at[0], TOAST_RETRY, "the retry waits exactly 5 s");
+        assert!(
+            updates.try_recv().is_err(),
+            "a refused toast is not a banner"
+        );
+        drop(tx);
+        task.await.unwrap();
+    }
+
+    /// Any other verdict is herdr's decision, not a transient: dropped without a retry.
+    #[tokio::test(start_paused = true)]
+    async fn herdr_toast_drops_a_non_retryable_refusal() {
+        let (control, tx, mut updates, task) = toaster(vec![refused("do_not_disturb"), shown()]);
+        tx.send(ToastMsg::Ready("alpha".to_owned())).unwrap();
+        tokio::time::sleep(TOAST_DELAY + TOAST_RETRY * 4).await;
+        assert_eq!(shows(&control).len(), 1, "no retry");
+        assert!(updates.try_recv().is_err());
+        drop(tx);
+        task.await.unwrap();
+    }
+
+    /// Deliverable 4's trigger set, and the events that only change the badge.
+    #[test]
+    fn herdr_event_mapping_splits_badge_news_from_rederivation() {
+        let connected = HerdrEvent::Connected {
+            version: "0.8.2".to_owned(),
+            protocol: 21,
+        };
+        assert_eq!(
+            update_of(&connected),
+            Some(HerdrUpdate::Connected {
+                version: "0.8.2".to_owned(),
+                protocol: 21
+            })
+        );
+        assert!(rederives(&connected), "connecting re-derives everything");
+        assert_eq!(
+            update_of(&HerdrEvent::Disconnected {
+                reason: "eof".to_owned()
+            }),
+            Some(HerdrUpdate::Reconnecting)
+        );
+        assert_eq!(
+            update_of(&HerdrEvent::Standalone {
+                notice: "protocol 99".to_owned()
+            }),
+            Some(HerdrUpdate::Standalone {
+                reason: "protocol 99".to_owned()
+            })
+        );
+    }
+}

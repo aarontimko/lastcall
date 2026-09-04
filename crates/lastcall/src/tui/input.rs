@@ -551,6 +551,7 @@ mod tests {
     use lastcall_engine::engine::AcceptRequest;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use std::collections::BTreeMap;
 
     fn key(c: char) -> Event {
         Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
@@ -1394,6 +1395,52 @@ mod tests {
             matches!(reqs[0].1, AcceptRequest::File(_)),
             "{:?}",
             reqs[0].1
+        );
+    }
+
+    /// `d` vs a click on the nav dot: both select the root and ack it, and land on one
+    /// `App`. Ruling 10's ack is local, so the only effect either produces is the toast
+    /// withdrawal.
+    #[test]
+    fn input_parity_ack() {
+        let km = Keymap::defaults();
+        let mut base = three_roots();
+        base.handle(Action::Resize(100, 30));
+        // alpha has nothing pending; herdr says its agent is done, so it is listed anyway.
+        base.apply(pile_event_seq(
+            "alpha",
+            1,
+            without(pile("alpha"), &["f1", "f2"]),
+        ));
+        base.handle(Action::Herdr(HerdrUpdate::Connected {
+            version: "0.8.2".to_owned(),
+            protocol: 21,
+        }));
+        base.handle(Action::Herdr(HerdrUpdate::Roots(BTreeMap::from([(
+            root("alpha"),
+            crate::tui::herdr::testfix::agents(
+                crate::tui::herdr::Attention::Done,
+                1,
+                "w1:p1",
+                "claude",
+            ),
+        )]))));
+        let (_, hits) = frame(&base);
+        let mut by_key = base.clone();
+        let mut by_mouse = base.clone();
+
+        // The key path selects the root first, exactly as the click does.
+        by_key.select(Some(Selection::Root(root("alpha"))));
+        let by_key_effect = press_key(&mut by_key, &km, key('d'));
+        let by_mouse_effect = click(&mut by_mouse, &km, &hits, &Target::RootDot(root("alpha")));
+
+        assert_eq!(by_key, by_mouse);
+        assert_eq!(by_key_effect, by_mouse_effect);
+        assert_eq!(frame(&by_key).0, frame(&by_mouse).0);
+        assert_eq!(
+            by_key.herdr.dot(&root("alpha")),
+            Some(crate::tui::herdr::Dot::Ready { acked: true }),
+            "both paths dim the flag"
         );
     }
 

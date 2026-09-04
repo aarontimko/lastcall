@@ -1287,6 +1287,44 @@ mod tests {
         );
     }
 
+    /// The Phase 5 seams: `canned_seq` answers in order with the last one repeating, and
+    /// every request records the **tokio**-clock gap since the mock was built, so a test
+    /// under `tokio::time::pause()` can assert a retry waited exactly its delay.
+    #[tokio::test(start_paused = true)]
+    async fn mock_canned_seq_serves_in_order_and_records_the_virtual_arrival() {
+        let mock = InMemoryHerdr::builder()
+            .canned_seq(
+                "notification.show",
+                vec![
+                    json!({"shown": false, "reason": "busy"}),
+                    json!({"shown": true, "reason": ""}),
+                ],
+            )
+            .canned("notification.show", json!({"shown": false, "reason": "no"}))
+            .in_memory();
+        let first = mock.request("notification.show", json!({})).await.unwrap();
+        assert_eq!(first["reason"], "busy", "the sequence beats `canned`");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let second = mock.request("notification.show", json!({})).await.unwrap();
+        assert_eq!(second["shown"], true);
+        let third = mock.request("notification.show", json!({})).await.unwrap();
+        assert_eq!(third["shown"], true, "the last result repeats");
+
+        let at: Vec<Duration> = mock
+            .control()
+            .requests()
+            .into_iter()
+            .map(|r| r.at)
+            .collect();
+        assert_eq!(at[0], Duration::ZERO);
+        assert_eq!(
+            at[1] - at[0],
+            Duration::from_secs(5),
+            "virtual time, not zero"
+        );
+        assert_eq!(at[2], at[1]);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn mock_in_memory_streams_script_then_live_then_server_close() {
         let mock = InMemoryHerdr::builder()
