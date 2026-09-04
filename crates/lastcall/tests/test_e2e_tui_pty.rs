@@ -1093,6 +1093,23 @@ fn pty_herdr_flag_ack_jump() {
     rt.block_on(mock.shutdown());
 }
 
+/// One `worktree_created` line in herdr's lifecycle envelope (the same shape the D7
+/// integration scene pushes).
+fn worktree_created_line(path: &Path, branch: &str) -> String {
+    serde_json::json!({
+        "event": "worktree_created",
+        "data": {
+            "workspace": {"workspace_id": "w1", "label": "alpha"},
+            "worktree": {
+                "path": path.to_string_lossy(),
+                "branch": branch,
+                "is_linked_worktree": true
+            }
+        }
+    })
+    .to_string()
+}
+
 /// Review (b) F3: the link opens on its own task, so a socket that accepts and never
 /// answers cannot hold the loop. `HERDR_SOCKET_PATH` is authoritative and unprobed, so the
 /// whole 5 s request timeout of the protocol guard is spent against a stalled mock — and a
@@ -1138,6 +1155,98 @@ fn pty_herdr_a_stalled_socket_does_not_hold_the_keys() {
         "PTY herdr: quit mid-connect in {:.3?} (the guard's timeout is 5 s)",
         t.elapsed()
     ));
+    assert_clean_exit(&pty, since);
+    rt.block_on(mock.shutdown());
+}
+
+/// Review (b) F4: deliverable 7 **through the loop**. The engine watches roots, not the
+/// parent, and `--poll 300` parks the discovery backstop five minutes out, so a checkout
+/// made after startup can reach the nav only through the loop's `worktree_due` arm — the
+/// debounce it holds, and the `request_rescan` it then asks for.
+#[test]
+fn pty_herdr_worktree_created_reaches_the_nav_through_the_loop() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let alpha = std::fs::canonicalize(fx.parent.join("alpha")).expect("alpha exists");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime for the mock");
+    let sock = fx.state.join("herdr.sock");
+    let mock = rt.block_on(async {
+        MockHerdr::builder()
+            .snapshot(herdr_snapshot(&alpha))
+            .serve(&sock)
+            .await
+            .expect("bind the mock socket")
+    });
+    let control = mock.control();
+
+    let Ok(mut pty) = fx
+        .command(&bin())
+        .args(["tui", "--poll", "300"])
+        .env("HERDR_SOCKET_PATH", &sock)
+        .spawn()
+    else {
+        note("SKIP: this host cannot open a pty");
+        return;
+    };
+    wait_first_piles(&mut pty);
+    pty.wait_for_text("herdr 0.8.2", LONG)
+        .unwrap_or_else(|e| panic!("the header names the link: {e}"));
+    // The lifecycle subscription has to be up or the line goes nowhere.
+    let subscribed = Instant::now();
+    while control.lifecycle_streams_open() == 0 {
+        assert!(
+            subscribed.elapsed() < LONG,
+            "the client never subscribed to the lifecycle stream: {:?}",
+            control.methods()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // The user runs `git worktree add` in a herdr pane: a real linked checkout, with
+    // something pending in it, under the same parent the TUI is watching.
+    let repo = fx.repo("alpha");
+    let checkout = fx.parent.join("alpha-wt");
+    repo.git(&[
+        "worktree",
+        "add",
+        "-b",
+        "wt",
+        &checkout.to_string_lossy(),
+        "HEAD",
+    ])
+    .expect("git worktree add");
+    std::fs::write(
+        checkout.join("f1"),
+        "worktree edit
+",
+    )
+    .expect("edit in the new checkout");
+    assert!(
+        !pty.screen_text().contains("alpha-wt"),
+        "nothing has told the loop about the checkout yet"
+    );
+
+    let t = Instant::now();
+    control.push_lifecycle(worktree_created_line(&checkout, "wt"));
+    let took = pty
+        .wait_for_text("alpha-wt", LONG)
+        .unwrap_or_else(|e| panic!("the new checkout never reached the nav: {e}"));
+    note(&format!(
+        "PTY herdr: worktree_created to a listed root in {took:.3?} \
+         (discovery backstop parked at 300 s)"
+    ));
+    assert!(
+        t.elapsed() < Duration::from_secs(60),
+        "the trigger, not the backstop"
+    );
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
     assert_clean_exit(&pty, since);
     rt.block_on(mock.shutdown());
 }
