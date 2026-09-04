@@ -265,6 +265,25 @@ impl PaneInfo {
     pub fn is_agent_bearing(&self) -> bool {
         self.agent.is_some()
     }
+
+    /// Does `newer` differ from `self` only in fields nothing downstream reads (§11)?
+    ///
+    /// A terminal writes its title on every prompt, and `revision`, `scroll` and `tokens`
+    /// move with the cursor; none of them changes a root's rollup, its scope or its dot. The
+    /// comparison is by exclusion — every *other* field is compared, so a field added to
+    /// `PaneInfo` later counts as a real change until someone lists it here on purpose.
+    pub fn differs_only_cosmetically(&self, newer: &PaneInfo) -> bool {
+        let mut probe = newer.clone();
+        probe.title.clone_from(&self.title);
+        probe.terminal_title.clone_from(&self.terminal_title);
+        probe
+            .terminal_title_stripped
+            .clone_from(&self.terminal_title_stripped);
+        probe.revision = self.revision;
+        probe.scroll.clone_from(&self.scroll);
+        probe.tokens.clone_from(&self.tokens);
+        probe == *self
+    }
 }
 
 /// `WorkspaceInfo` (schema line 1071). `number` is a positional index that renumbers on
