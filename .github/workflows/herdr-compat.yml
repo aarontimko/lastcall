@@ -58,7 +58,9 @@ jobs:
         run: just test-integration-herdr-latest
 
       - name: File one issue for the drift
-        if: failure() && steps.subset.outcome == 'failure'
+        # Never from a pull_request run: a red PR would file `drift: <pinned>` while latest ==
+        # pinned, and that one open issue would then suppress the real Monday alert.
+        if: failure() && steps.subset.outcome == 'failure' && github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.herdr.outputs.version }}

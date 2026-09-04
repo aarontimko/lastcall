@@ -76,6 +76,22 @@ fn raw_snapshot(sock: &Path, id: &str) -> String {
     .expect("raw snapshot line")
 }
 
+/// `<bin> --version` → `herdr 0.8.2`; the last token is what `ping` answers as `version`.
+/// Read from the binary, never pinned as a literal, so `just test-integration-herdr-latest`
+/// measures drift against a newer release instead of failing on the version string
+/// (verifier (c) F1).
+fn version_of(bin: &Path) -> String {
+    let out = std::process::Command::new(bin)
+        .arg("--version")
+        .output()
+        .expect("herdr --version");
+    let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    line.split_whitespace()
+        .last()
+        .unwrap_or_else(|| panic!("`herdr --version` printed nothing: {line:?}"))
+        .to_string()
+}
+
 fn say(msg: &str) {
     let mut err = std::io::stderr();
     let _ = err.write_all(format!("herdr-real: {msg}\n").as_bytes());
@@ -146,18 +162,16 @@ async fn herdr_real_ping_bootstrap_events_and_done_derivation() {
     assert!(sock.as_os_str().len() < 100, "socket path under 100 bytes");
     let t = SocketTransport::new(&sock, TIMEOUT);
 
-    // 1. ping: version 0.8.2 and a supported protocol. The published v0.8.2 asset answers
-    //    protocol 20 (the spec's 21 is herdr master post-release; see guard::SUPPORTED_PROTOCOLS).
+    // 1. ping: the binary's own version and a supported protocol. The published v0.8.2 asset
+    //    answers protocol 20 (the spec's 21 is herdr master post-release); any member of
+    //    guard::SUPPORTED_PROTOCOLS is accepted so the same test runs against the latest release.
+    let expected_version = version_of(herdr.bin());
     let pong = guard::ping(&t).await.expect("ping");
-    assert_eq!(pong.version, "0.8.2", "{pong:?}");
+    assert_eq!(pong.version, expected_version, "{pong:?}");
     assert!(
         guard::SUPPORTED_PROTOCOLS.contains(&pong.protocol),
         "{pong:?} not in {:?}",
         guard::SUPPORTED_PROTOCOLS
-    );
-    assert_eq!(
-        pong.protocol, 20,
-        "the pinned v0.8.2 release asset answers protocol 20: {pong:?}"
     );
     assert!(guard::compare(&pong).is_ok());
     say(&format!(
@@ -231,7 +245,7 @@ async fn herdr_real_ping_bootstrap_events_and_done_derivation() {
     })
     .await
     .expect("Connected within the deadline");
-    assert_eq!(connected, ("0.8.2".to_string(), pong.protocol));
+    assert_eq!(connected, (expected_version.clone(), pong.protocol));
     let cache = handle.snapshot().expect("snapshot installed");
     assert!(
         !cache.workspaces.is_empty(),
@@ -777,7 +791,12 @@ async fn herdr_real_done_flip_heals_within_fallback() {
     while Instant::now() < settle_deadline {
         match tokio::time::timeout(Duration::from_millis(800), rx.recv()).await {
             Err(_) => break, // quiet
-            Ok(Some(event)) => trace.push(format!("settle: {event:?}")),
+            Ok(Some(event)) => {
+                if matches!(event, HerdrEvent::Connected { .. }) {
+                    connects += 1;
+                }
+                trace.push(format!("settle: {event:?}"));
+            }
             Ok(None) => panic!("client ended while settling"),
         }
     }
@@ -846,8 +865,9 @@ async fn herdr_real_done_flip_heals_within_fallback() {
         "the filter must have eaten the tab_focused announcing the flip; dropped {dropped:?}"
     );
     assert!(
-        trace.iter().any(|l| l.starts_with("Resync(")),
-        "the heal must be preceded by a resync; trace: {trace:?}"
+        trace.iter().any(|l| l == "Resync(Snapshot)"),
+        "the heal must come through the fallback's full resync — a `Resync(PaneGet(..))` \
+         would mean a status stream closed and healed it in ~200 ms instead; trace: {trace:?}"
     );
 
     // 6. And it healed without a reconnect: one Connected, one lifecycle subscription.
@@ -861,8 +881,8 @@ async fn herdr_real_done_flip_heals_within_fallback() {
         "exactly one lifecycle stream was ever opened"
     );
     assert!(
-        !trace.iter().any(|l| l.starts_with("Disconnected")),
-        "no disconnect; trace: {trace:?}"
+        !trace.iter().any(|l| l.contains("Disconnected")),
+        "no disconnect, before or after the focus; trace: {trace:?}"
     );
     let forwarded = stats.forwarded_names();
     assert!(
@@ -1067,6 +1087,29 @@ async fn herdr_real_disconnect_reconnect_converges() {
     );
     assert_eq!(after.version, first_connect.0);
     assert_eq!(after.protocol, first_connect.1);
+    // herdr restores the session on respawn, so the pane and workspace id sets alone cannot
+    // tell the stale cache from the new server's snapshot (verifier (c) F2). The root pane's
+    // agent status can: it was driven to `done` before the stop, and the new server reports
+    // whatever it restored (`unknown` with v0.8.2). The cache takes a pane's status from
+    // `panes[].agent_status`, so compare against that field of the fresh snapshot.
+    let fresh_root_status: Option<AgentStatus> = fresh["panes"]
+        .as_array()
+        .expect("panes[]")
+        .iter()
+        .find(|p| p["pane_id"].as_str() == Some(root_pane.as_str()))
+        .map(|p| AgentStatus::parse(p["agent_status"].as_str().expect("agent_status")));
+    assert_eq!(
+        after.status_of(&root_pane).cloned(),
+        fresh_root_status,
+        "the cache must carry the new server's status for the root pane"
+    );
+    assert_ne!(
+        after.status_of(&root_pane),
+        before.status_of(&root_pane),
+        "the status must have changed across the restart ({:?} before), or this assertion \
+         proves nothing about convergence",
+        before.status_of(&root_pane)
+    );
     assert_eq!(
         after.focused_workspace_id.as_deref(),
         fresh["focused_workspace_id"].as_str()

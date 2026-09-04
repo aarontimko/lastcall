@@ -192,9 +192,10 @@ otherwise be announced through and re-serves the rest — `EventStream::new` tak
 client cannot tell. And the test *settles* first: it waits for 800 ms of quiet on the push
 stream before focusing the tab, because herdr announces a new tab's pane asynchronously long
 after `tab.create` returned, and any lifecycle event schedules a 200 ms coalesced resync that
-would heal the flip for the wrong reason. After the focus it asserts that the heal took at
-least the configured `fallback` (3 s in this test, so a run takes about that), that no
-reconnect happened, and that herdr forwarded **nothing** in between: if it ever does, the
+would heal the flip for the wrong reason. After the focus it asserts that the heal arrived
+within `fallback + 1 s` (3 s + 1 s in this test; the interval timer is mid-period when the
+tab is focused, so a run heals in about 2 s) and came through a full `Resync(Snapshot)`, that
+no reconnect happened, and that herdr forwarded **nothing** in between: if it ever does, the
 filter list is incomplete or herdr found another way to announce the flip, and the assertion
 message says to report it rather than to widen the filter.
 
@@ -269,8 +270,8 @@ budgets); the Phase 9 kickoff sets the targets against these numbers.
 
 ## How skips are reported
 
-The real-herdr tests need the pinned binary, and that unset variable is the **only** skip
-they may take — everything else is a failure (see the subset section above). Without
+The real-herdr tests need the pinned binary, and that variable being unset or empty is the
+**only** skip they may take — everything else is a failure (see the subset section above). Without
 `LASTCALL_TEST_HERDR_BIN` each writes
 `SKIP: LASTCALL_TEST_HERDR_BIN unset (run: just test-integration-herdr)` with
 `stderr().write_all` (libtest swallows `eprintln!` of passing tests) and returns; `just
