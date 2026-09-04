@@ -428,7 +428,11 @@ pub struct SnapshotResult {
     pub snapshot: SessionSnapshot,
 }
 
-/// `pane.get` → `{"type":"pane","pane":{...}}`.
+/// `pane.get` → `{"type":"pane_info","pane":{...}}`.
+///
+/// (The tag was written `"pane"` here through Phase 4; the pinned schema fixture says
+/// `pane_info`, and so does the real server. Nothing read the tag, so only the comment was
+/// ever wrong.)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PaneResult {
     pub pane: PaneInfo,

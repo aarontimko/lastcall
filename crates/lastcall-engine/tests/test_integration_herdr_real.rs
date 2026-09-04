@@ -22,6 +22,7 @@ use lastcall_engine::herdr::client::{Client, ClientOptions, ClientTimings, Herdr
 use lastcall_engine::herdr::guard;
 use lastcall_engine::herdr::transport::{EventStream, SocketTransport, Transport, TransportError};
 use lastcall_engine::herdr::wire::{self, AgentStatus, Event, Subscription};
+use lastcall_testkit::herdr_schema;
 use lastcall_testkit::herdr_spawn::{
     HerdrIsolation, SpawnedHerdr, herdr_bin_from_env, write_skip_notice,
 };
@@ -1083,4 +1084,117 @@ async fn herdr_real_disconnect_reconnect_converges() {
     ));
     handle.shutdown().await;
     say("G6 done");
+}
+
+// ---------------------------------------------------------------------------------------
+// Phase 5 deliverable 11b — the consumed-surface drift check
+// ---------------------------------------------------------------------------------------
+
+/// The committed projection of the pinned release's API surface.
+const CONSUMED_SURFACE: &str =
+    include_str!("../../lastcall-testkit/fixtures/herdr/schema/consumed-surface.json");
+
+/// **Deliverable 11b.** `<bin> api schema --json`, projected onto what we consume, must equal
+/// `consumed-surface.json`.
+///
+/// Against the pinned binary this is a tautology that guards the *generator* (a projection that
+/// silently stopped following `$ref`s would still round-trip, so the fixture's own counts are
+/// asserted too). Its real job is `just test-integration-herdr-latest` in the weekly compat
+/// workflow, where the binary is herdr's **latest** release: there, a diff is the drift alert.
+///
+/// `api schema --json` starts no server and reads no socket, so this test spawns nothing.
+#[test]
+fn herdr_real_schema_consumed_surface_unchanged() {
+    let Some(bin) = herdr_bin_from_env() else {
+        write_skip_notice();
+        return;
+    };
+    let version = std::process::Command::new(&bin)
+        .arg("--version")
+        .output()
+        .expect("herdr --version");
+    let version = String::from_utf8_lossy(&version.stdout).trim().to_string();
+
+    let out = std::process::Command::new(&bin)
+        .args(["api", "schema", "--json"])
+        .output()
+        .expect("herdr api schema --json");
+    assert!(
+        out.status.success(),
+        "`herdr api schema --json` exited {:?}: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    let schema: Value = serde_json::from_slice(&out.stdout).expect("schema is JSON");
+
+    let actual = herdr_schema::project(&schema).unwrap_or_else(|e| {
+        panic!(
+            "{version} does not answer the surface we consume: {e}\n\
+             (that is itself the drift report — a method, event or type we call is gone)"
+        )
+    });
+    let expected: Value = serde_json::from_str(CONSUMED_SURFACE).expect("fixture is JSON");
+
+    say(&format!(
+        "schema: {version} protocol {} schema_version {}, {} methods / {} events / {} defs",
+        actual["protocol"],
+        actual["schema_version"],
+        actual["methods"]
+            .as_object()
+            .map_or(0, serde_json::Map::len),
+        actual["events"].as_object().map_or(0, serde_json::Map::len),
+        actual["defs"].as_object().map_or(0, serde_json::Map::len),
+    ));
+
+    let differences = herdr_schema::diff(&expected, &actual);
+    assert!(
+        differences.is_empty(),
+        "herdr compat drift: {version} differs from the pinned consumed surface \
+         (crates/lastcall-testkit/fixtures/herdr/schema/consumed-surface.json) in {} place(s):\n  {}\n\
+         \nIf this is a herdr upgrade we are adopting, re-pin with `just herdr-schema-fixture` \
+         and update the provenance file. If it is the weekly compat job, it is telling you a \
+         future herdr will break lastcall.",
+        differences.len(),
+        differences.join("\n  ")
+    );
+
+    // The fixture must actually contain the surface, not an empty husk that always matches.
+    let methods = expected["methods"].as_object().expect("methods object");
+    assert_eq!(
+        methods.len(),
+        herdr_schema::CONSUMED_METHODS.len(),
+        "every consumed method is pinned"
+    );
+    for (method, result) in herdr_schema::CONSUMED_METHODS {
+        assert_eq!(
+            methods[method]["result"], result,
+            "`{method}` still answers `{result}`"
+        );
+        assert!(
+            expected["results"].get(result).is_some(),
+            "the `{result}` result schema is pinned"
+        );
+    }
+    assert_eq!(
+        expected["events"]
+            .as_object()
+            .map_or(0, serde_json::Map::len),
+        wire::LIFECYCLE_SUBSCRIPTIONS.len(),
+        "all 15 §5.4 lifecycle events are pinned"
+    );
+    assert_eq!(
+        expected["pinned_enums"]["AgentStatus"],
+        json!(["idle", "working", "blocked", "done", "unknown"]),
+        "the status vocabulary every dot and rollup depends on"
+    );
+    assert_eq!(
+        expected["pinned_enums"]["NotificationShowSound"],
+        json!(["none", "done", "request"]),
+        "our toast sends `done`; the engine type stays lenient, the fixture is what notices"
+    );
+    assert!(
+        expected["defs"].as_object().is_some_and(|d| d.len() > 20),
+        "the transitive type closure is pinned, not just the entry points"
+    );
+    say("schema: consumed surface unchanged");
 }
