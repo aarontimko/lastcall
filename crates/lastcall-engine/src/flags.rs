@@ -5,7 +5,7 @@
 //! [`export`] renders one [`Flag`] as that message — deterministic, byte-frozen by the
 //! golden `crates/lastcall/tests/golden/flag_export.md`.
 //!
-//! ```text
+//! ````text
 //! lastcall flag · <root basename> · <root-relative path> · hunk 2 of 3 · 2026-09-05T18:04:00Z
 //! note: why is this unwrap safe?
 //!
@@ -15,7 +15,7 @@
 //! -old
 //! +new
 //! ```
-//! ```
+//! ````
 //!
 //! A file flag omits the `hunk n of m` segment and the diff block. A batch is the exports
 //! joined by a blank line ([`export_all`]).
