@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-use lastcall::tui::app::{App, Changed, Effect, RootMeta, Selection};
+use lastcall::tui::app::{App, Changed, Effect, FlagKind, RootMeta, Selection};
 use lastcall::tui::input::Keymap;
 use lastcall::tui::run::{Local, Ui, herdr_fold, spawn_flag, spawn_stage};
 use lastcall_engine::herdr::client::{Client, ClientOptions, ClientTimings};
@@ -147,7 +147,19 @@ async fn loop_flag_with_one_agent_reaches_pane_send_text() {
         matches!(connected, HerdrEvent::Connected { .. }),
         "{connected:?}"
     );
-    let cache = handle.snapshot().expect("the client installed a cache");
+    // The cache is installed by the client's own task, which `Connected` can beat to this
+    // one — under the whole integration tier's parallel load it does. Wait for it rather
+    // than racing it.
+    let cache = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(c) = handle.snapshot() {
+                return c;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the client installed a cache");
 
     // The loop's fold. Without `HerdrUpdate::Agents` (F1) this is where the send dies: the
     // candidate list stays empty and `App::flagged` takes the export-file arm.
@@ -176,21 +188,29 @@ async fn loop_flag_with_one_agent_reaches_pane_send_text() {
         path,
         note,
         hunk,
+        label,
     }) = effect
     else {
         panic!("Enter sends the flag: {effect:?}");
     };
     assert_eq!(note, "this looks wrong");
+    assert_eq!(
+        label, "f2",
+        "the write carries the words its answer will use"
+    );
 
     // The loop's dispatch for that effect, and its answer.
     let (tx, mut rx) = mpsc::unbounded_channel();
-    spawn_flag(&engine, tx.clone(), root, path, note, hunk);
+    spawn_flag(&engine, tx.clone(), root, path, note, hunk, label);
     let flagged = next_local(&mut rx).await;
-    assert!(matches!(&flagged, Local::Flagged(_, Ok(_))), "{flagged:?}");
+    assert!(
+        matches!(&flagged, Local::Flagged { kind: FlagKind::Flag { label }, result: Ok(_), .. } if label == "f2"),
+        "{flagged:?}"
+    );
     let (_, effect) = ui.local(flagged);
     let Some(Effect::Stage {
         pane_id,
-        label,
+        flag,
         export,
     }) = effect
     else {
@@ -203,9 +223,12 @@ async fn loop_flag_with_one_agent_reaches_pane_send_text() {
     );
 
     // …and the dispatch for *that* effect, which is the socket call.
-    spawn_stage(Some(transport.clone()), tx, pane_id, label, export.clone());
+    spawn_stage(Some(transport.clone()), tx, pane_id, flag, export.clone());
     let staged = next_local(&mut rx).await;
-    assert!(matches!(&staged, Local::Staged(_, Ok(()))), "{staged:?}");
+    assert!(
+        matches!(&staged, Local::Staged { result: Ok(()), .. }),
+        "{staged:?}"
+    );
     ui.local(staged);
 
     let sent = mock

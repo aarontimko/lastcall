@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use lastcall::tui::app::{AcceptFailed, App, Changed, Effect, RootMeta, Selection};
+use lastcall::tui::app::{AcceptFailed, App, Changed, Effect, FlagKind, RootMeta, Selection};
 use lastcall::tui::herdr::{AgentCandidate, Attention, Dot, HerdrUpdate, RootAgents, Scope};
 use lastcall::tui::input::{Action, NoteKey, PickKey};
 use lastcall::tui::render::{render, styles};
@@ -1192,13 +1192,14 @@ fn flag_here(app: &mut App, engine: &mut Engine, note: &str) {
         path,
         note,
         hunk,
+        label,
     }) = effect
     else {
         panic!("a flag effect: {effect:?}");
     };
     let flagged = engine.flag(&root, &path, &note, hunk).expect("flag");
     assert!(flagged.outcome.refused.is_empty(), "{:?}", flagged.outcome);
-    app.flagged(root, Ok(flagged));
+    app.flagged(root, FlagKind::Flag { label }, Ok(flagged));
 }
 
 /// One agent pane herdr could stage to.

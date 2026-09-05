@@ -260,6 +260,9 @@ pub enum Effect {
         /// The hunk **as it was rendered** when `m` was pressed, with the total the export
         /// names. `None` flags the file.
         hunk: Option<RenderedHunk>,
+        /// What the status line calls this flag (`f1`, `f1 hunk 2`). It travels with the
+        /// write so its answer can name it without `App` holding a slot (F2).
+        label: String,
     },
     /// Clear every flag on one path (`Engine::unflag`); the answer is `Local::Flagged` with
     /// an empty export.
@@ -268,17 +271,20 @@ pub enum Effect {
         path: Vec<u8>,
     },
     /// `pane.send_text` the export into one agent pane, bracketed-paste wrapped: it lands
-    /// in the input box unsubmitted and the human presses Enter. `label` is what the status
-    /// line calls the agent.
+    /// in the input box unsubmitted and the human presses Enter. The agent's own label is
+    /// already on the optimistic status line; what travels is `flag`, the words a *failed*
+    /// send has to name (F2).
     Stage {
         pane_id: String,
-        label: String,
+        flag: String,
         export: String,
     },
     /// No agent to stage to: append the export to this root's export file under the state
     /// dir. The one file the TUI writes, and the only writer of it.
     Export {
         root: PathBuf,
+        /// The flag this export is of, for the answer's status line (F2).
+        label: String,
         export: String,
     },
     /// `agent.focus` on this pane id (herdr's own public id, never a name); the result
@@ -476,10 +482,21 @@ pub struct Picker {
     pub selected: usize,
 }
 
-/// A flag whose send has not been decided yet: the words its status line will use.
+/// Which of the two ledger writes a [`Local::Flagged`](super::run::Local) answers, and —
+/// for a flag — the words its status line will use.
+///
+/// Carried in the message rather than read off a slot on `App` (verifier (b) F2). Two flag
+/// writes can be in flight at once — `m` again while a send is out, or `m` then `shift-m`
+/// on the same row, whose two blocking tasks the engine's mutex does not order — and a slot
+/// that only says "a send is pending" mis-routes whichever answer arrives second: the
+/// second flag was reported as `flags cleared` and never sent, and an unflag that overtook
+/// its flag appended a blank entry to the day's export file.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Flagging {
-    pub label: String,
+pub enum FlagKind {
+    /// `m`: a note was written, and its export still has to reach an agent or the file.
+    Flag { label: String },
+    /// `shift-m`: the row's flags were cleared. Nothing to send.
+    Unflag,
 }
 
 /// What the confirm modal is asking about. One modal, two operations: the title and the
@@ -600,9 +617,6 @@ pub struct App {
     pub note: Option<NoteEntry>,
     /// The agent picker, if open (deliverable 10).
     pub picker: Option<Picker>,
-    /// The flag whose send is still being decided (staged, picked or exported), so the
-    /// verdict's status line can name what was flagged.
-    pub flagging: Option<Flagging>,
     /// The confirm modal, if open: every action but `Tick`/`Resize`/`Confirm`/`Cancel`/
     /// `Quit` is ignored while it is (`Quit` passes as it does through the help overlay:
     /// `q` and ctrl-c quit by default, everywhere).
@@ -648,7 +662,6 @@ impl App {
             restoring: None,
             note: None,
             picker: None,
-            flagging: None,
             confirm: None,
             herdr: HerdrView::default(),
             expanded: None,
@@ -1368,14 +1381,12 @@ impl App {
                 // The target was captured when `m` was pressed and is used as it was: a
                 // pile that landed meanwhile cannot move the flag onto another hunk (F14).
                 let entry = self.note.take().expect("checked above");
-                self.flagging = Some(Flagging {
-                    label: entry.target.status_label(),
-                });
                 let effect = Effect::Flag {
                     root: entry.target.root().to_path_buf(),
                     path: entry.target.path().to_vec(),
                     note: entry.text,
                     hunk: entry.target.rendered_hunk(),
+                    label: entry.target.status_label(),
                 };
                 (Changed::Yes, Some(effect))
             }
@@ -1407,14 +1418,12 @@ impl App {
             PickKey::Cancel => {
                 // The flag is already on disk; only the send is dropped.
                 let label = self.picker.take().expect("checked above").label;
-                self.flagging = None;
                 self.set_status(format!("flagged {label} · not sent"));
                 (Changed::Yes, None)
             }
             PickKey::Send => {
                 let picker = self.picker.take().expect("checked above");
                 let Some(agent) = picker.candidates.get(picker.selected).cloned() else {
-                    self.flagging = None;
                     self.set_status(format!("flagged {} · not sent", picker.label));
                     return (Changed::Yes, None);
                 };
@@ -1422,14 +1431,11 @@ impl App {
                     "flagged {} · staged to {}",
                     picker.label, agent.label
                 ));
-                self.flagging = Some(Flagging {
-                    label: picker.label,
-                });
                 (
                     Changed::Yes,
                     Some(Effect::Stage {
                         pane_id: agent.pane_id,
-                        label: agent.label,
+                        flag: picker.label,
                         export: picker.export,
                     }),
                 )
@@ -1440,8 +1446,16 @@ impl App {
     /// The loop's answer to an `Effect::Flag` or `Effect::Unflag`: the pile lands like any
     /// other, then the **send** is decided from the candidates the last derivation found —
     /// one agent stages straight away, several open the picker, none writes the export file.
-    pub fn flagged(&mut self, root: PathBuf, flagged: FlagResult) -> (Changed, Option<Effect>) {
-        let pending = self.flagging.take();
+    ///
+    /// `kind` says which write this answers and, for a flag, what to call it. It comes from
+    /// the effect the loop dispatched, so two writes in flight cannot be confused for one
+    /// another (verifier (b) F2); an unflag is not a send that was cancelled.
+    pub fn flagged(
+        &mut self,
+        root: PathBuf,
+        kind: FlagKind,
+        flagged: FlagResult,
+    ) -> (Changed, Option<Effect>) {
         let flagged = match flagged {
             Ok(f) => f,
             Err(AcceptFailed::LedgerBusy) => {
@@ -1463,7 +1477,7 @@ impl App {
             .iter()
             .map(|r| r.message("flagged"))
             .collect();
-        let Some(Flagging { label }) = pending else {
+        let FlagKind::Flag { label } = kind else {
             // An unflag: nothing to send, and the row's `⚑` is gone from the pile above.
             if refusals.is_empty() {
                 self.set_status("flags cleared");
@@ -1476,29 +1490,33 @@ impl App {
             self.set_status(refusal_text(&refusals));
             return (Changed::Yes, None);
         }
+        if flagged.export.is_empty() {
+            // Nothing was rendered to send — a refusal the engine did not classify, or a
+            // path that flagged nothing. An empty export is never written to the day's
+            // file as a blank entry (F2).
+            self.set_status(format!("flagged {label} · not sent"));
+            return (Changed::Yes, None);
+        }
         let candidates = self.herdr.candidates(&root);
         match candidates.len() {
-            0 => {
-                self.flagging = Some(Flagging { label });
-                (
-                    Changed::Yes,
-                    Some(Effect::Export {
-                        root,
-                        export: flagged.export,
-                    }),
-                )
-            }
+            0 => (
+                Changed::Yes,
+                Some(Effect::Export {
+                    root,
+                    label,
+                    export: flagged.export,
+                }),
+            ),
             1 => {
                 let agent = candidates.into_iter().next().expect("one candidate");
                 self.set_status(format!("flagged {label} · staged to {}", agent.label));
-                // Held until the send is answered, so a failure can name the flag that is
-                // on disk rather than only the pane that would not take it.
-                self.flagging = Some(Flagging { label });
                 (
                     Changed::Yes,
                     Some(Effect::Stage {
                         pane_id: agent.pane_id,
-                        label: agent.label,
+                        // The words a failed send has to name: the flag is on disk either
+                        // way, so the pane that would not take it is not the whole story.
+                        flag: label,
                         export: flagged.export,
                     }),
                 )
@@ -1517,34 +1535,26 @@ impl App {
     }
 
     /// The loop's answer to an `Effect::Stage`: the flag is already on disk, so a failure
-    /// is a status line and nothing more.
-    pub fn staged(&mut self, label: String, result: Result<(), String>) -> Changed {
-        let flag = self.flagging.take().map(|f| f.label);
+    /// is a status line and nothing more. `flag` came back with the answer (F2), so a
+    /// second flag started meanwhile cannot lend this one its words.
+    pub fn staged(&mut self, flag: String, result: Result<(), String>) -> Changed {
         match result {
-            // The optimistic line is already on screen (`start_stage` wrote it), so a
-            // success has nothing to add.
+            // The optimistic line is already on screen (`flagged` wrote it), so a success
+            // has nothing to add.
             Ok(()) => Changed::No,
             Err(reason) => {
-                match flag {
-                    Some(flag) => {
-                        self.set_status(format!("flagged {flag} · send failed: {reason}"))
-                    }
-                    None => self.set_status(format!("send failed: {reason} ({label})")),
-                }
+                self.set_status(format!("flagged {flag} · send failed: {reason}"));
                 Changed::Yes
             }
         }
     }
 
     /// The loop's answer to an `Effect::Export`: the fallback file was written, or was not.
-    pub fn exported(&mut self, result: Result<PathBuf, String>) -> Changed {
-        let prefix = match self.flagging.take() {
-            Some(f) => format!("flagged {} · ", f.label),
-            None => String::new(),
-        };
+    /// `label` travelled with the effect for the same reason `staged`'s does (F2).
+    pub fn exported(&mut self, label: String, result: Result<PathBuf, String>) -> Changed {
         match result {
-            Ok(path) => self.set_status(format!("{prefix}export → {}", path.display())),
-            Err(e) => self.set_status(format!("{prefix}export failed: {e}")),
+            Ok(path) => self.set_status(format!("flagged {label} · export → {}", path.display())),
+            Err(e) => self.set_status(format!("flagged {label} · export failed: {e}")),
         }
         Changed::Yes
     }
@@ -4610,6 +4620,13 @@ mod tests {
         })
     }
 
+    /// The kind the loop builds for an `Effect::Flag` with this label.
+    fn flag_of(label: &str) -> FlagKind {
+        FlagKind::Flag {
+            label: label.to_owned(),
+        }
+    }
+
     /// One clean `Restored` answer.
     fn restored_ok(seq: u64, pile: Pile) -> RestoreResult {
         Ok(Restored {
@@ -4883,6 +4900,7 @@ mod tests {
                 path: b"f1".to_vec(),
                 note: String::new(),
                 hunk: None,
+                label: "f1".to_owned(),
             })
         );
 
@@ -4954,17 +4972,24 @@ mod tests {
         app.select(Some(row("alpha", "f1")));
         app.handle(Action::Flag);
         app.handle(Action::Note(NoteKey::Insert("why?".to_owned())));
-        app.handle(Action::Note(NoteKey::Send));
-        assert!(app.flagging.is_some(), "the send is still to be decided");
+        let (_, flag) = app.handle(Action::Note(NoteKey::Send));
+        assert!(
+            matches!(flag, Some(Effect::Flag { ref label, .. }) if label == "f1"),
+            "the write carries its own words: {flag:?}"
+        );
 
-        let (changed, effect) = app.flagged(root("alpha"), flagged_ok("EXPORT", 1, pile("alpha")));
+        let (changed, effect) = app.flagged(
+            root("alpha"),
+            flag_of("f1"),
+            flagged_ok("EXPORT", 1, pile("alpha")),
+        );
         assert_eq!(changed, Changed::Yes);
         assert!(app.picker.is_none(), "one candidate is not a question");
         assert_eq!(
             effect,
             Some(Effect::Stage {
                 pane_id: "w1:p1".to_owned(),
-                label: "claude".to_owned(),
+                flag: "f1".to_owned(),
                 export: "EXPORT".to_owned(),
             })
         );
@@ -4988,7 +5013,11 @@ mod tests {
         app.handle(Action::Flag);
         app.handle(Action::Note(NoteKey::Send));
 
-        let (changed, effect) = app.flagged(root("alpha"), flagged_ok("EXPORT", 1, pile("alpha")));
+        let (changed, effect) = app.flagged(
+            root("alpha"),
+            flag_of("f1"),
+            flagged_ok("EXPORT", 1, pile("alpha")),
+        );
         assert_eq!((changed, effect), (Changed::Yes, None), "it asks, silently");
         let picker = app.picker.as_ref().expect("the picker is open");
         assert_eq!(picker.candidates.len(), 2);
@@ -5011,7 +5040,7 @@ mod tests {
             effect,
             Some(Effect::Stage {
                 pane_id: "w2:p3".to_owned(),
-                label: "codex".to_owned(),
+                flag: "f1".to_owned(),
                 export: "EXPORT".to_owned(),
             })
         );
@@ -5033,31 +5062,39 @@ mod tests {
         app.handle(Action::Flag);
         app.handle(Action::Note(NoteKey::Send));
 
-        let (changed, effect) = app.flagged(root("alpha"), flagged_ok("EXPORT", 1, pile("alpha")));
+        let (changed, effect) = app.flagged(
+            root("alpha"),
+            flag_of("f1"),
+            flagged_ok("EXPORT", 1, pile("alpha")),
+        );
         assert_eq!(changed, Changed::Yes);
         assert!(app.picker.is_none());
         assert_eq!(
             effect,
             Some(Effect::Export {
                 root: root("alpha"),
+                label: "f1".to_owned(),
                 export: "EXPORT".to_owned(),
-            })
+            }),
+            "the flag's words travel with the write"
         );
-        assert!(app.flagging.is_some(), "the flag's words wait for the path");
 
         let out = PathBuf::from("/S/exports/alpha/2026-09-05.md");
-        assert_eq!(app.exported(Ok(out.clone())), Changed::Yes);
+        assert_eq!(app.exported("f1".to_owned(), Ok(out.clone())), Changed::Yes);
         assert_eq!(
             status(&app),
             format!("flagged f1 · export → {}", out.display())
         );
-        assert!(app.flagging.is_none());
 
         // A write that failed says which flag it was and why.
         app.handle(Action::Flag);
         app.handle(Action::Note(NoteKey::Send));
-        app.flagged(root("alpha"), flagged_ok("EXPORT", 2, pile("alpha")));
-        app.exported(Err("permission denied".to_owned()));
+        app.flagged(
+            root("alpha"),
+            flag_of("f1"),
+            flagged_ok("EXPORT", 2, pile("alpha")),
+        );
+        app.exported("f1".to_owned(), Err("permission denied".to_owned()));
         assert_eq!(
             status(&app),
             "flagged f1 · export failed: permission denied"
@@ -5077,11 +5114,15 @@ mod tests {
         app.select(Some(row("alpha", "f1")));
         app.handle(Action::Flag);
         app.handle(Action::Note(NoteKey::Send));
-        app.flagged(root("alpha"), flagged_ok("EXPORT", 1, pile("alpha")));
+        app.flagged(
+            root("alpha"),
+            flag_of("f1"),
+            flagged_ok("EXPORT", 1, pile("alpha")),
+        );
         assert_eq!(status(&app), "flagged f1 · staged to claude");
 
         assert_eq!(
-            app.staged("claude".to_owned(), Err("pane is gone".to_owned())),
+            app.staged("f1".to_owned(), Err("pane is gone".to_owned())),
             Changed::Yes
         );
         assert_eq!(status(&app), "flagged f1 · send failed: pane is gone");
@@ -5093,9 +5134,153 @@ mod tests {
         // A send that landed adds nothing: the optimistic line is already on screen.
         app.handle(Action::Flag);
         app.handle(Action::Note(NoteKey::Send));
-        app.flagged(root("alpha"), flagged_ok("EXPORT", 2, pile("alpha")));
-        assert_eq!(app.staged("claude".to_owned(), Ok(())), Changed::No);
+        app.flagged(
+            root("alpha"),
+            flag_of("f1"),
+            flagged_ok("EXPORT", 2, pile("alpha")),
+        );
+        assert_eq!(app.staged("f1".to_owned(), Ok(())), Changed::No);
         assert_eq!(status(&app), "flagged f1 · staged to claude");
+    }
+
+    /// Verifier (b) F2, probe 1. A stage is in flight (the socket is slow) when the
+    /// reviewer flags a second row. The stage's answer must not consume the second
+    /// flag's identity: `f2` was flagged, not cleared, and its export still has to go
+    /// somewhere.
+    #[test]
+    fn app_flag_answer_during_a_stage_in_flight_is_not_reported_as_cleared() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.handle(agents_of(
+            "alpha",
+            vec![agent("w1:p1", "claude", "lastcall")],
+        ));
+
+        // f1 is flagged and staged; `pane.send_text` has not answered yet.
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Flag);
+        app.handle(Action::Note(NoteKey::Send));
+        let (_, effect) = app.flagged(
+            root("alpha"),
+            flag_of("f1"),
+            flagged_ok("EXPORT-F1", 1, pile("alpha")),
+        );
+        assert!(matches!(effect, Some(Effect::Stage { .. })), "{effect:?}");
+
+        // The reviewer does not wait for the socket: f2 gets its own note.
+        app.select(Some(row("alpha", "f2")));
+        app.handle(Action::Flag);
+        app.handle(Action::Note(NoteKey::Send));
+
+        // f1's send lands, then f2's ledger write.
+        assert_eq!(app.staged("f1".to_owned(), Ok(())), Changed::No);
+        let (_, effect) = app.flagged(
+            root("alpha"),
+            flag_of("f2"),
+            flagged_ok("EXPORT-F2", 2, pile("alpha")),
+        );
+        assert_eq!(
+            effect,
+            Some(Effect::Stage {
+                pane_id: "w1:p1".to_owned(),
+                flag: "f2".to_owned(),
+                export: "EXPORT-F2".to_owned(),
+            }),
+            "f2's export is staged, not swallowed"
+        );
+        assert_eq!(status(&app), "flagged f2 · staged to claude");
+    }
+
+    /// Verifier (b) F2, probe 2. Standalone: an export is in flight when the reviewer
+    /// flags a second row. Each answer carries its own label, so the file that was
+    /// written is named by the flag that was in it.
+    #[test]
+    fn app_flag_answer_during_an_export_in_flight_keeps_its_own_label() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Flag);
+        app.handle(Action::Note(NoteKey::Send));
+        let (_, effect) = app.flagged(
+            root("alpha"),
+            flag_of("f1"),
+            flagged_ok("EXPORT-F1", 1, pile("alpha")),
+        );
+        assert!(matches!(effect, Some(Effect::Export { .. })), "{effect:?}");
+
+        app.select(Some(row("alpha", "f2")));
+        app.handle(Action::Flag);
+        app.handle(Action::Note(NoteKey::Send));
+
+        let out = PathBuf::from("/S/exports/alpha/2026-09-05.md");
+        app.exported("f1".to_owned(), Ok(out.clone()));
+        assert_eq!(
+            status(&app),
+            format!("flagged f1 · export → {}", out.display()),
+            "the export answer names the flag whose text it wrote"
+        );
+
+        let (_, effect) = app.flagged(
+            root("alpha"),
+            flag_of("f2"),
+            flagged_ok("EXPORT-F2", 2, pile("alpha")),
+        );
+        assert_eq!(
+            effect,
+            Some(Effect::Export {
+                root: root("alpha"),
+                label: "f2".to_owned(),
+                export: "EXPORT-F2".to_owned(),
+            }),
+            "f2's export is written too"
+        );
+    }
+
+    /// Verifier (b) F2, probe 3. `m` then `shift-m` on the same row: two independent
+    /// blocking tasks, and the engine's mutex does not order them. The unflag's answer
+    /// arrives first and must be read as an unflag — never as the flag's send, which
+    /// would append an empty entry to the day's export file.
+    #[test]
+    fn app_unflag_answer_before_the_flag_answer_writes_no_blank_export() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Flag);
+        app.handle(Action::Note(NoteKey::Send));
+        let (_, unflag) = app.handle(Action::Unflag);
+        assert_eq!(
+            unflag,
+            Some(Effect::Unflag {
+                root: root("alpha"),
+                path: b"f1".to_vec(),
+            })
+        );
+
+        // The unflag's ledger write finishes first; its export is empty by construction.
+        let (_, effect) = app.flagged(
+            root("alpha"),
+            FlagKind::Unflag,
+            flagged_ok("", 2, pile("alpha")),
+        );
+        assert_eq!(effect, None, "an unflag has nothing to send");
+        assert_eq!(status(&app), "flags cleared");
+
+        // The flag's own answer still goes where it was always going.
+        let (_, effect) = app.flagged(
+            root("alpha"),
+            flag_of("f1"),
+            flagged_ok("EXPORT-F1", 3, pile("alpha")),
+        );
+        assert_eq!(
+            effect,
+            Some(Effect::Export {
+                root: root("alpha"),
+                label: "f1".to_owned(),
+                export: "EXPORT-F1".to_owned(),
+            })
+        );
+        app.exported("f1".to_owned(), Ok(PathBuf::from("/S/x.md")));
+        assert_eq!(status(&app), "flagged f1 · export → /S/x.md");
     }
 
     /// A key event as the terminal reports it.
@@ -5138,7 +5323,6 @@ mod tests {
             assert_eq!(feed(&mut app, &newline), (Changed::Yes, None));
             feed(&mut app, &note_char('2'));
             assert_eq!(app.note.as_ref().expect("open").text, "one\n2");
-            assert!(app.flagging.is_none(), "nothing is written yet");
 
             let (_, effect) = feed(&mut app, &enter);
             assert!(app.note.is_none(), "Enter closes it");
@@ -5166,7 +5350,7 @@ mod tests {
             (Changed::Yes, None),
             "Esc writes nothing"
         );
-        assert!(app.note.is_none() && app.flagging.is_none());
+        assert!(app.note.is_none(), "Esc closes the note and writes nothing");
     }
 
     /// A bracketed paste is one event carrying many characters, newlines included. It is
@@ -5248,7 +5432,6 @@ mod tests {
         let ctrl_c = note_key_event(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert_eq!(note_action(&ctrl_c, &km), Some(Action::Quit));
         let (_, effect) = app.handle(Action::Quit);
-        assert_eq!(effect, Some(Effect::Quit));
-        assert!(app.flagging.is_none(), "quitting writes no flag");
+        assert_eq!(effect, Some(Effect::Quit), "quitting writes no flag");
     }
 }

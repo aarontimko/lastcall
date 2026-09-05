@@ -328,8 +328,9 @@ it rather than showing an empty list.
 `pane.send_text`, so the payload lands in the agent's input buffer and waits for the human
 to press Enter. No trailing newline — that would be the submit we are avoiding. A send that
 fails is a status line and nothing more (`flagged f1 · send failed: <reason>`): the flag is
-in the ledger either way, which is why `App.flagging` holds the flag's label until `staged`
-answers.
+in the ledger either way, which is why the flag's own label travels with the send —
+`Effect::Stage { flag, .. }` → `Local::Staged { flag, .. }` — rather than being read back
+off `App` when the answer lands.
 
 **The fallback file** is the one file the TUI writes:
 
@@ -344,6 +345,15 @@ name the file it expects. The status line names the path it wrote:
 
 `shift-m` (`unflag`) clears **every** flag on the selected file — Phase 7 has no per-flag
 removal — and says `flags cleared`.
+
+**Every answer carries its own kind and label.** Two flag writes can be in flight at once —
+`m` again while a send is still out, or `m` then `shift-m` on the same row, whose two
+blocking tasks the engine's mutex does not order — so `Local::Flagged` carries `FlagKind`
+(`Flag { label }` or `Unflag`), built from the effect the loop dispatched, and `Staged` and
+`Exported` carry the flag's words with them. Nothing about a flag is read back off a slot on
+`App` when its answer lands: an unflag is never mistaken for a cancelled send (which would
+append a blank entry to the day's export file), and a second flag is never reported as
+`flags cleared` and then dropped. An empty export is never sent by any route.
 
 ### Where flags show
 

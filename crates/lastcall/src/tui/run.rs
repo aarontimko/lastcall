@@ -45,7 +45,7 @@ use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 
 use super::app::{
-    AcceptFailed, AcceptResult, App, Changed, Effect, FlagResult, RestoreResult, RootMeta,
+    AcceptFailed, AcceptResult, App, Changed, Effect, FlagKind, FlagResult, RestoreResult, RootMeta,
 };
 use super::herdr::{self, HerdrLink, HerdrPlan, HerdrUpdate, Link, ToastMsg};
 use super::input::{
@@ -76,13 +76,28 @@ pub enum Local {
     /// An `Effect::Restore` finished. Shaped like `Accepted` though a restore covers one
     /// root, so the two reducers read the same way.
     Restored(Vec<(PathBuf, RestoreResult)>),
-    /// An `Effect::Flag` or `Effect::Unflag` finished: the root it covered and the ledger
-    /// write's answer. One root, never a list — a flag is always one path.
-    Flagged(PathBuf, FlagResult),
-    /// An `Effect::Stage` finished: the agent's label and whether `pane.send_text` landed.
-    Staged(String, Result<(), String>),
-    /// An `Effect::Export` finished: the file the export was appended to, or why not.
-    Exported(Result<PathBuf, String>),
+    /// An `Effect::Flag` or `Effect::Unflag` finished: the root it covered, **which of the
+    /// two it was** (with the flag's words), and the ledger write's answer. One root, never
+    /// a list — a flag is always one path.
+    ///
+    /// The kind is built from the effect that started this write rather than read off a
+    /// slot on `App`, so two writes in flight cannot be told apart wrongly (F2).
+    Flagged {
+        root: PathBuf,
+        kind: FlagKind,
+        result: FlagResult,
+    },
+    /// An `Effect::Stage` finished: the flag's words and whether `pane.send_text` landed.
+    Staged {
+        flag: String,
+        result: Result<(), String>,
+    },
+    /// An `Effect::Export` finished: the flag's words, and the file the export was appended
+    /// to or why not.
+    Exported {
+        label: String,
+        result: Result<PathBuf, String>,
+    },
     /// The engine's roots after a `SyncRoots`.
     Roots(Vec<RootMeta>),
     /// The `Refresh` finished (all its piles were sent first).
@@ -222,9 +237,9 @@ impl Ui {
             Local::Pile(root, seq, pile) => self.app.apply(EngineEvent::Pile { root, seq, pile }),
             Local::Accepted(results) => (self.app.accepted(results), None),
             Local::Restored(results) => (self.app.restored(results), None),
-            Local::Flagged(root, flagged) => self.app.flagged(root, flagged),
-            Local::Staged(label, result) => (self.app.staged(label, result), None),
-            Local::Exported(result) => (self.app.exported(result), None),
+            Local::Flagged { root, kind, result } => self.app.flagged(root, kind, result),
+            Local::Staged { flag, result } => (self.app.staged(flag, result), None),
+            Local::Exported { label, result } => (self.app.exported(label, result), None),
             Local::Roots(metas) => (self.app.sync_roots(metas), None),
             Local::RefreshDone => (self.app.refresh_done(), None),
             Local::Notice(root, text) => self.app.apply(EngineEvent::Notice { root, text }),
@@ -593,6 +608,7 @@ pub fn spawn_flag(
     path: Vec<u8>,
     note: String,
     hunk: Option<RenderedHunk>,
+    label: String,
 ) {
     let engine = engine.clone();
     let back = root.clone();
@@ -605,14 +621,18 @@ pub fn spawn_flag(
             .await
         });
         if let Some(result) = joined(task, &tx, "flag").await {
-            let _ = tx.send(Local::Flagged(back, result));
+            let _ = tx.send(Local::Flagged {
+                root: back,
+                kind: FlagKind::Flag { label },
+                result,
+            });
         }
     });
 }
 
 /// `Effect::Unflag`: [`Engine::unflag`] under the same lock discipline. Its answer is a
-/// `Local::Flagged` too — an unflag is a flag write with an empty export, and `App::flagged`
-/// tells them apart by whether a send was pending.
+/// `Local::Flagged` too — an unflag is a flag write with an empty export — carrying
+/// [`FlagKind::Unflag`] so the reducer reads it as one however it is interleaved (F2).
 fn spawn_unflag(
     engine: &Arc<Mutex<Engine>>,
     tx: mpsc::UnboundedSender<Local>,
@@ -629,7 +649,11 @@ fn spawn_unflag(
             .await
         });
         if let Some(result) = joined(task, &tx, "unflag").await {
-            let _ = tx.send(Local::Flagged(back, result));
+            let _ = tx.send(Local::Flagged {
+                root: back,
+                kind: FlagKind::Unflag,
+                result,
+            });
         }
     });
 }
@@ -644,7 +668,7 @@ pub fn spawn_stage(
     transport: Option<SocketTransport>,
     tx: mpsc::UnboundedSender<Local>,
     pane_id: String,
-    label: String,
+    flag: String,
     export: String,
 ) {
     tokio::spawn(async move {
@@ -652,7 +676,7 @@ pub fn spawn_stage(
             Some(t) => herdr::stage(&t, &pane_id, &export).await,
             None => Err("no herdr link".to_owned()),
         };
-        let _ = tx.send(Local::Staged(label, result));
+        let _ = tx.send(Local::Staged { flag, result });
     });
 }
 
@@ -667,6 +691,7 @@ fn spawn_export(
     state_dir: PathBuf,
     date: String,
     root: PathBuf,
+    label: String,
     export: String,
 ) {
     tokio::spawn(async move {
@@ -692,7 +717,7 @@ fn spawn_export(
             Ok(r) => r,
             Err(e) => Err(e.to_string()),
         };
-        let _ = tx.send(Local::Exported(result));
+        let _ = tx.send(Local::Exported { label, result });
     });
 }
 
@@ -1164,6 +1189,7 @@ pub fn run(
                             path,
                             note,
                             hunk,
+                            label,
                         } => spawn_flag(
                             &watcher.engine,
                             local_tx.clone(),
@@ -1171,26 +1197,32 @@ pub fn run(
                             path,
                             note,
                             hunk,
+                            label,
                         ),
                         Effect::Unflag { root, path } => {
                             spawn_unflag(&watcher.engine, local_tx.clone(), root, path)
                         }
                         Effect::Stage {
                             pane_id,
-                            label,
+                            flag,
                             export,
                         } => spawn_stage(
                             link.transport.clone(),
                             local_tx.clone(),
                             pane_id,
-                            label,
+                            flag,
                             export,
                         ),
-                        Effect::Export { root, export } => spawn_export(
+                        Effect::Export {
+                            root,
+                            label,
+                            export,
+                        } => spawn_export(
                             local_tx.clone(),
                             state_dir.clone(),
                             export_date(&clock),
                             root,
+                            label,
                             export,
                         ),
                         Effect::Expand(root, row) => {
