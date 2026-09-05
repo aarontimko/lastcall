@@ -1022,14 +1022,17 @@ fn render_row_body(
             let body = area.height.saturating_sub(1).saturating_sub(footer as u16);
             // No per-hunk `[a accept]` inside an expansion: a collapsed row is a single
             // accept (§6.3), so a hunk control there would promise something the reducer
-            // will not do. The row's own `[A accept file]` is the only accept on screen.
+            // will not do. The row's own `[A accept file]` is the only accept on screen,
+            // and `[u restore]` goes with it — the row carries no hunks, so a hunk restore
+            // there would ask about nothing (verifier (b) F5). `[m flag]` stays: `m` on an
+            // expansion hunk quotes that hunk, and the row's flags read beside it.
             render_hunks(
                 app,
                 buf,
                 Rect::new(area.x, area.y + 1, area.width, body),
                 &exp.view.hunks,
-                &[],
-                false,
+                &row.flags,
+                HunkControls::FlagOnly,
                 hits,
             );
             if footer == 1 && area.height >= 2 {
@@ -1049,11 +1052,31 @@ fn render_row_body(
         }
         _ => {}
     }
-    render_hunks(app, buf, area, &row.hunks, &row.flags, true, hits);
+    render_hunks(
+        app,
+        buf,
+        area,
+        &row.hunks,
+        &row.flags,
+        HunkControls::All,
+        hits,
+    );
 }
 
-/// Draw `hunks` into `area` from the app's diff cursor, with the `[a accept]` control and
-/// the selected-hunk band. The list is the row's own hunks, or a collapsed row's expansion
+/// Which controls a hunk header carries — and, with them, which hit targets are registered
+/// for it. A control that is not drawn is not clickable: the two are one decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HunkControls {
+    /// A row's own hunks: `[a accept]`, `[u restore]`, `[m flag]`.
+    All,
+    /// A collapsed row's expansion: `[m flag]` only. Accepting or restoring one hunk of a
+    /// row that carries none is not something the reducer will do (§6.3, and the
+    /// expansion's line cap), so the labels that promise it are not drawn.
+    FlagOnly,
+}
+
+/// Draw `hunks` into `area` from the app's diff cursor, with the header controls and the
+/// selected-hunk band. The list is the row's own hunks, or a collapsed row's expansion
 /// ([`App::view_hunks`] decides which the cursor is bounded by).
 fn render_hunks(
     app: &App,
@@ -1061,7 +1084,7 @@ fn render_hunks(
     area: Rect,
     hunks: &[Hunk],
     flags: &[Flag],
-    accept_controls: bool,
+    controls: HunkControls,
     hits: &mut HitMap,
 ) {
     if hunks.is_empty() || area.height == 0 {
@@ -1096,33 +1119,28 @@ fn render_hunks(
                 } else {
                     dim()
                 };
-                let labels = [
-                    format!("[{} accept]", control_key(app, "accept")),
-                    format!("[{} restore]", control_key(app, "restore")),
-                    format!("[{} flag]", control_key(app, "flag")),
-                ];
+                let mut labels = Vec::with_capacity(3);
+                let mut targets = Vec::with_capacity(3);
+                if controls == HunkControls::All {
+                    labels.push(format!("[{} accept]", control_key(app, "accept")));
+                    targets.push(Target::HunkAccept(h));
+                    labels.push(format!("[{} restore]", control_key(app, "restore")));
+                    targets.push(Target::HunkRestore(h));
+                }
+                labels.push(format!("[{} flag]", control_key(app, "flag")));
+                targets.push(Target::HunkFlag(h));
+                let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
                 if let Some(note) = flag_note_for(flags, hunk) {
                     // The note reads beside the header it is about, so the reader sees what
                     // they already said here before they say it again — in the room left
                     // once the controls are reserved, because a flagged hunk is exactly the
                     // one whose `[m flag]` and `[u restore]` the reader still wants.
-                    let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
-                    let budget = if accept_controls {
-                        marker_budget(area.width, line.width(), &refs)
-                    } else {
-                        (area.width as usize).saturating_sub(line.width())
-                    };
+                    let budget = marker_budget(area.width, line.width(), &refs);
                     if let Some(text) = flag_marker(&note, budget) {
                         line.spans.push(Span::styled(text, style));
                     }
                 }
-                if accept_controls {
-                    let targets = [
-                        Target::HunkAccept(h),
-                        Target::HunkRestore(h),
-                        Target::HunkFlag(h),
-                    ];
-                    let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+                {
                     let at = right_align_run(&mut line, &refs, area.width, style);
                     for ((x, label), target) in at.into_iter().zip(&labels).zip(targets) {
                         if let Some(x) = x {
@@ -2174,6 +2192,56 @@ mod tests {
         }
         let (frame, _) = frame_of(&app, 100, 30);
         assert!(frame.contains("[z accept]"), "{frame}");
+    }
+
+    /// Verifier (b) F5: an expansion hunk header carries `[m flag]` and nothing else.
+    ///
+    /// `m` there quotes the hunk under the cursor, so the control that says so is drawn and
+    /// registered. Accept stays off (a collapsed row is a single accept, §6.3) and restore
+    /// with it — the row carries no hunks, so `[u restore]` would open `Restore f1 · 0
+    /// hunks?`. Whole-file restore is still `U`.
+    #[test]
+    fn render_expansion_hunks_offer_flag_but_no_accept_or_restore() {
+        let mut app = three_roots();
+        app.apply(pile_event_seq("alpha", 1, alpha_collapsed(Collapsed::Glob)));
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Open);
+        let asked = app.selected_row().expect("f1").clone();
+        app.set_expanded(root("alpha"), &asked, expansion_of(3, 0));
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut hits = HitMap::default();
+        terminal
+            .draw(|f| {
+                hits = render(&app, f);
+            })
+            .unwrap();
+        let frame = terminal.backend().to_string();
+        assert!(frame.contains("collapsed (glob)"), "{frame}");
+        assert_eq!(
+            frame.matches("[m flag]").count(),
+            3,
+            "one per hunk:\n{frame}"
+        );
+        assert!(!frame.contains("[a accept]"), "{frame}");
+        assert!(!frame.contains("[u restore]"), "{frame}");
+
+        let has = |t: Target| hits.targets.iter().any(|(_, x)| *x == t);
+        for h in 0..3 {
+            assert!(has(Target::HunkFlag(h)), "hunk {h} has a flag target");
+            assert!(
+                !has(Target::HunkRestore(h)),
+                "hunk {h} has no restore target"
+            );
+            assert!(!has(Target::HunkAccept(h)), "hunk {h} has no accept target");
+        }
+        // A click on the control flags that hunk, not the file.
+        let (rect, _) = hits
+            .targets
+            .iter()
+            .find(|(_, t)| *t == Target::HunkFlag(1))
+            .expect("hunk 2's control");
+        assert_eq!(hits.at(rect.x, rect.y), Some(&Target::HunkFlag(1)));
     }
 
     /// The sponsor's ruling: exactly one blank line between consecutive hunks (none before

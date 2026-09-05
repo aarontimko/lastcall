@@ -387,7 +387,7 @@ Defaults (`input::DEFAULT_KEYMAP`, in help-overlay order):
 | `accept_all` | `ctrl-a` | accept everything listed, every root (asks above 10 files) | |
 | `restore` | `u` | put the hunk under the diff cursor back to its baseline (a hunkless, deleted, or one-hunk added row: the file, which asks) | the same hunk |
 | `restore_file` | `shift-u` | put the selected file back whole — always asks first | |
-| `flag` | `m` | flag it with a note: the hunk under the diff cursor, or the file from the nav | the same hunk |
+| `flag` | `m` | flag it with a note: the hunk under the diff cursor (an expansion's hunk counts), or the file from the nav | the same hunk |
 | `unflag` | `shift-m` | clear every flag on the selected file | |
 | `expand` | `e` | expand the selected collapsed row into hunks ("Collapsed rows" below) | |
 | `ack` | `d` | ack the selected root's herdr ready flag ("herdr in the UI" below) | |
@@ -445,7 +445,11 @@ nav, and in the main pane one dimmed line instead of a diff —
 story is unchanged and deliberately whole-row: `a` on a collapsed row takes the file (there
 is no hunk to point at) and `A` does the same, which is why an expansion draws **no
 per-hunk `[a accept]` control** — the row header's `[A accept file]` is the only accept on
-that screen.
+that screen. `[u restore]` is off there for the same reason and one more: the row carries no
+hunks, so a hunk restore would ask about nothing; whole-file restore is `U` (verifier (b)
+F5). **`[m flag]` stays.** A flag only quotes — `m` on hunk 2 of 3 of an expansion writes a
+flag about that hunk and the export says `hunk 2 of 3` — so `flag_target` reads
+`App::view_hunks`, the hunks on screen, where accept and restore read the row.
 
 - `e` (or a click on `[e expand]`) emits `Effect::Expand(root, Box<Row>)`; the loop runs
   `Engine::hunks_of` off the UI task and hands the result back as `Local::Expanded`. The

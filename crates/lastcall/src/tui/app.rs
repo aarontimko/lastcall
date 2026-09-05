@@ -1300,18 +1300,25 @@ impl App {
     }
 
     /// What `m` flags, captured from the row on screen **now**: the hunk under the diff
-    /// cursor when the row has content hunks and the diff has focus, else the file. A
+    /// cursor when the diff has focus and there is a content hunk there, else the file. A
     /// deletion row's single hunk is not a hunk to discuss, so the nav's answer and the
     /// diff's agree there: the file.
+    ///
+    /// The hunks it reads are the ones **on screen** ([`App::view_hunks`]) — a collapsed
+    /// row's expansion when `e` opened one, else the row's own. Accept and restore stay
+    /// whole-row on a collapsed row (§6.3, and the expansion's line cap), but a flag only
+    /// quotes: `m` on hunk 2 of 3 of an expansion is about that hunk, and the export says
+    /// `hunk 2 of 3` (verifier (b) F5).
     pub fn flag_target(&self) -> Option<FlagTarget> {
         let Selection::Row(root, path) = self.selection.clone()? else {
             return None;
         };
         let row = self.roots.get(&root)?.row(&path)?;
-        let content = row.hunks.iter().filter(|h| !h.is_mode_change()).count();
+        let hunks = self.view_hunks();
+        let content = hunks.iter().filter(|h| !h.is_mode_change()).count();
         if self.effective_focus() == Focus::Diff && row.change != Change::Deleted && content > 0 {
-            let index = self.diff.hunk.min(row.hunks.len() - 1);
-            let hunk = &row.hunks[index];
+            let index = self.diff.hunk.min(hunks.len() - 1);
+            let hunk = &hunks[index];
             // The mode hunk is not content: there is nothing to quote, so `m` on it flags
             // the file (the same rule the export's `of` count follows).
             if !hunk.is_mode_change() {
@@ -4956,6 +4963,54 @@ mod tests {
             (hunk.hunk.index, hunk.of),
             (2, 3),
             "as captured, not as now"
+        );
+    }
+
+    /// Verifier (b) F5: `e` then `m` on hunk 2 of 3 quotes **that** hunk.
+    ///
+    /// Accept and restore stay whole-row on a collapsed row — a collapsed row is one
+    /// accept (§6.3) and the expansion's line cap makes a partial restore unsound — but
+    /// quoting an expansion hunk writes nothing and is exactly what the reader who pressed
+    /// `e` is asking about.
+    #[test]
+    fn app_flag_on_an_expansion_hunk_carries_that_hunk() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.apply(pile_event_seq("alpha", 1, alpha_collapsed(Collapsed::Glob)));
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Open);
+        let asked = app.selected_row().expect("f1").clone();
+        app.set_expanded(root("alpha"), &asked, expansion_of(3, 0));
+        app.handle(Action::HunkNext);
+        assert_eq!(app.diff.hunk, 1, "the cursor is on hunk 2 of 3");
+
+        let target = app.flag_target().expect("a target");
+        let FlagTarget::Hunk { hunk, of, .. } = &target else {
+            panic!("the hunk under the cursor, not the file: {target:?}");
+        };
+        assert_eq!((hunk.index, *of), (1, 3));
+        assert_eq!(target.label(), "f1 · hunk 2 of 3");
+
+        // …and the write carries it, so the export quotes that hunk and counts `of 3`.
+        app.handle(Action::Flag);
+        let (_, effect) = app.handle(Action::Note(NoteKey::Send));
+        let Some(Effect::Flag { hunk, label, .. }) = effect else {
+            panic!("a flag effect: {effect:?}");
+        };
+        let hunk = hunk.expect("the expansion hunk, not the file");
+        assert_eq!((hunk.hunk.index, hunk.of), (1, 3));
+        assert_eq!(label, "f1 hunk 2");
+
+        // Accept and restore are untouched: the row is still one of each.
+        assert!(
+            matches!(app.accept_scope(), Some(AcceptScope::File { .. })),
+            "{:?}",
+            app.accept_scope()
+        );
+        assert!(
+            matches!(app.restore_scope(), Some(RestoreScope::File { .. })),
+            "{:?}",
+            app.restore_scope()
         );
     }
 
