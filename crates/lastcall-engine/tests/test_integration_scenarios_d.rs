@@ -594,6 +594,119 @@ fn scenario_d4_restore_deletion_refuses_on_a_case_collision() {
     assert_pile!(s.engine, s.root, "F1|f1", "both sides still pending");
 }
 
+/// The same clobber D4 guards against, one code point past ASCII (verifier F1).
+///
+/// The old rule folded with `eq_ignore_ascii_case`, which says `école.md` and `École.md`
+/// are different names. APFS says they are the same one, so the rename landed on the
+/// user's renamed file and replaced its content with the baseline. The fold question now
+/// goes to the filesystem, so this refuses.
+#[test]
+fn scenario_d4_restore_deletion_refuses_on_a_unicode_case_collision() {
+    let mut s = Fresh::new("d4-restore-unicode");
+    if !probe_case_insensitive(&s.root) {
+        eprintln!(
+            "SKIP scenario_d4_restore_deletion_refuses_on_a_unicode_case_collision: {} is case-sensitive",
+            s.root.display()
+        );
+        return;
+    }
+    let lower = "école.md";
+    let upper = "École.md";
+    s.repo.write(lower, "one\n");
+    assert!(
+        s.accept_file(lower).ok(),
+        "the baseline is the accepted blob"
+    );
+    assert_pile!(s.engine, s.root, "");
+
+    std::fs::rename(s.repo.path().join(lower), s.repo.path().join(upper)).unwrap();
+    let newer = b"the user's newer content\n";
+    std::fs::write(s.repo.path().join(upper), newer).unwrap();
+    assert_eq!(s.row(lower).change, Change::Deleted);
+
+    let out = s.restore_file(lower);
+    match out.outcome.refused.first() {
+        Some(r @ Refused::StillPresent { collides_with, .. }) => {
+            assert_eq!(
+                collides_with.as_deref(),
+                Some(upper.as_bytes()),
+                "the colliding entry is named by its real bytes"
+            );
+            assert!(
+                r.message("restored").contains(upper),
+                "the message names it: {}",
+                r.message("restored")
+            );
+        }
+        other => panic!("expected a Unicode case-collision refusal, got {other:?}"),
+    }
+    assert_eq!(
+        s.bytes_at(upper),
+        newer,
+        "the newer bytes survive — this is the data loss the ASCII fold allowed"
+    );
+}
+
+/// APFS is normalization-*insensitive* as well as case-insensitive: `café.md` written NFD
+/// and read back NFC is one file, so the same filesystem-answers-it rule has to cover
+/// normalization and not only case (verifier F1).
+///
+/// **A git root cannot reach this through a row**, and the test says so with evidence:
+/// `core.precomposeunicode` is on by default on macOS, so git precomposes every path it
+/// reports and lastcall only ever sees the NFC name — there is no NFD row to restore. The
+/// guard still has to hold, because [`lastcall_engine::restore::collision`] is what stands
+/// between `rename(temp, name)` and the user's file on **every** root, including a draft
+/// root, whose raw-byte content model has no git in front of it to normalize anything. So
+/// the rule is asserted directly, over a real working directory on the real filesystem.
+#[test]
+fn scenario_d4_restore_deletion_refuses_on_an_nfd_nfc_collision() {
+    let mut s = Fresh::new("d4-restore-nfd");
+    if !probe_case_insensitive(&s.root) {
+        eprintln!(
+            "SKIP scenario_d4_restore_deletion_refuses_on_an_nfd_nfc_collision: {} is case-sensitive",
+            s.root.display()
+        );
+        return;
+    }
+    // `e` + U+0301 (decomposed) vs the precomposed `é`. Different bytes, one grapheme.
+    let nfd = "cafe\u{0301}.md";
+    let nfc = "caf\u{00e9}.md";
+    assert_ne!(nfd.as_bytes(), nfc.as_bytes());
+
+    // The evidence for the paragraph above: created with the decomposed name on disk,
+    // reported by the scan under the precomposed one.
+    s.repo.write(nfd, "one\n");
+    assert_eq!(
+        s.row(nfc).path,
+        nfc.as_bytes(),
+        "git precomposes: the NFD name on disk is reported NFC, so no NFD row exists"
+    );
+    s.repo.remove(nfd);
+    assert_pile!(s.engine, s.root, "");
+
+    // Now the shape the guard exists for: the file on disk carries one normalization and
+    // the *other* name resolves onto it. This is the state in which a deletion restore
+    // must not `rename` over the user's file.
+    let newer = b"the user's newer content\n";
+    s.repo.write(nfc, newer);
+    let collides = lastcall_engine::restore::collision(&s.root, nfd.as_bytes(), true);
+    assert_eq!(
+        collides.as_deref(),
+        Some(nfc.as_bytes()),
+        "the NFD name is taken, and the precomposed entry is what is in the way"
+    );
+    // The byte-exact half is unconditional, and the negative case still says no.
+    assert_eq!(
+        lastcall_engine::restore::collision(&s.root, nfc.as_bytes(), true).as_deref(),
+        Some(nfc.as_bytes())
+    );
+    assert_eq!(
+        lastcall_engine::restore::collision(&s.root, "unrelated.md".as_bytes(), true),
+        None
+    );
+    assert_eq!(s.bytes_at(nfc), newer, "nothing was written over it");
+}
+
 #[test]
 fn scenario_d11_restore_of_a_unicode_and_space_path() {
     let mut s = Fresh::new("d11-restore");

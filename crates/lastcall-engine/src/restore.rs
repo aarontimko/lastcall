@@ -151,28 +151,56 @@ pub fn create_parents(root: &Path, rel: &[u8]) -> Result<(), WriteError> {
 
 /// The entry in `rel`'s parent directory that would collide with `rel`'s own name, if any.
 ///
-/// Byte-exact always; **and** case-folded when the root's filesystem folds case. A
-/// byte-only rule would call `f1` absent while `F1` sits beside it, and `rename(temp, "f1")`
-/// on APFS would then fold onto `F1` and clobber the case-renamed file rather than refuse
-/// (review F6; D4).
+/// Byte-exact always; **and**, on a root whose filesystem folds names, whatever that
+/// filesystem itself resolves the name onto. A byte-only rule would call `f1` absent while
+/// `F1` sits beside it, and `rename(temp, "f1")` on APFS would then fold onto `F1` and
+/// clobber the case-renamed file rather than refuse (review F6; D4).
+///
+/// **The filesystem answers the fold question, not us** (verifier F1). An
+/// `eq_ignore_ascii_case` fold is a guess about the mount's rules, and it is wrong one code
+/// point past ASCII: APFS folds full Unicode case (`école` ↔ `École`) *and* is
+/// normalization-insensitive (NFC `café` ↔ NFD `café`), so an ASCII fold called the name
+/// free and the rename clobbered the user's renamed file. Instead: when no entry matches
+/// byte-for-byte, `symlink_metadata(parent/name)` **succeeding** is itself the collision —
+/// the filesystem resolved the name onto something that is there. The colliding entry is
+/// then named by walking `read_dir` for the one whose `(dev, ino)` equals the lstat'd
+/// pair, which covers case, normalization and any future fold rule with no crate and no
+/// table.
 ///
 /// An unreadable or missing parent is "nothing collides" — the caller recreates it.
 pub fn collision(root: &Path, rel: &[u8], case_insensitive: bool) -> Option<Vec<u8>> {
+    use std::os::unix::fs::MetadataExt;
     let rel_path = Path::new(OsStr::from_bytes(rel));
     let name = rel_path.file_name()?.as_bytes().to_vec();
     let parent = root.join(rel_path.parent().unwrap_or(Path::new("")));
     let entries = std::fs::read_dir(&parent).ok()?;
-    let mut folded: Option<Vec<u8>> = None;
+    let mut others: Vec<Vec<u8>> = Vec::new();
     for entry in entries.flatten() {
         let found = entry.file_name().into_vec();
         if found == name {
             return Some(found);
         }
-        if case_insensitive && folded.is_none() && found.eq_ignore_ascii_case(&name) {
-            folded = Some(found);
+        others.push(found);
+    }
+    if !case_insensitive {
+        return None;
+    }
+    // Nothing matches byte-for-byte. Ask the filesystem whether the name is nevertheless
+    // taken; on a case-sensitive root this simply fails, which is why the probe's answer
+    // still gates the question rather than the platform.
+    let meta = std::fs::symlink_metadata(parent.join(OsStr::from_bytes(&name))).ok()?;
+    let (dev, ino) = (meta.dev(), meta.ino());
+    for found in others {
+        if let Ok(m) = std::fs::symlink_metadata(parent.join(OsStr::from_bytes(&found)))
+            && m.dev() == dev
+            && m.ino() == ino
+        {
+            return Some(found);
         }
     }
-    folded
+    // The name resolves onto something we could not name (a racing rename, a directory we
+    // cannot lstat through). It is still taken, so it is still a refusal.
+    Some(name)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -462,12 +490,40 @@ mod tests {
         let tmp = TempDir::new("lc-restore-collide");
         let root = tmp.path();
         std::fs::write(root.join("F1"), b"x").unwrap();
+        // Byte-exact, always, whatever the mount does.
         assert_eq!(collision(root, b"F1", false).as_deref(), Some(&b"F1"[..]));
+        // `case_insensitive: false` never asks the filesystem.
         assert_eq!(collision(root, b"f1", false), None);
-        assert_eq!(collision(root, b"f1", true).as_deref(), Some(&b"F1"[..]));
         assert_eq!(collision(root, b"other", true), None);
         // A missing parent collides with nothing.
         assert_eq!(collision(root, b"nope/f1", true), None);
+
+        // The fold half is the filesystem's answer, not an ASCII table's (verifier F1), so
+        // it is asserted only where the filesystem actually folds — and the SKIP is printed
+        // rather than hidden behind `#[ignore]`.
+        if !crate::scan::probe_case_insensitive(root) {
+            println!("SKIP restore_collision fold half: {root:?} is case-sensitive");
+            return;
+        }
+        assert_eq!(collision(root, b"f1", true).as_deref(), Some(&b"F1"[..]));
+
+        // One code point past ASCII — the exact class the ASCII fold got wrong.
+        std::fs::write(root.join("École.md"), b"x").unwrap();
+        assert_eq!(
+            collision(root, "école.md".as_bytes(), true).as_deref(),
+            Some("École.md".as_bytes()),
+            "a Unicode case fold is a collision, and the entry that is in the way is named"
+        );
+
+        // NFC vs NFD: the same grapheme, different bytes, one file on APFS.
+        let nfc = "café.md"; // e + U+0301 composed
+        let nfd = "cafe\u{0301}.md"; // e followed by the combining acute
+        assert_ne!(nfc.as_bytes(), nfd.as_bytes(), "the fixture must differ");
+        std::fs::write(root.join(nfc), b"x").unwrap();
+        assert!(
+            collision(root, nfd.as_bytes(), true).is_some(),
+            "an NFD name that resolves onto the NFC file is a collision"
+        );
     }
 
     #[test]
