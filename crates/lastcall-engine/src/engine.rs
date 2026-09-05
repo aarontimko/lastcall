@@ -23,7 +23,8 @@ use crate::headstate::{self, HeadState, TransitionFacts};
 use crate::hunks::{self, Hunk};
 use crate::index::{IndexError, PrivateIndex};
 use crate::ledger::{
-    self, Clock, Ledger, LedgerError, LedgerLock, LoadResult, SeenAt, SystemClock, TreeEntries,
+    self, Clock, FlagHunk, Ledger, LedgerError, LedgerLock, LoadResult, SeenAt, SystemClock,
+    TreeEntries,
 };
 use crate::ops::{FaultInjector, NoFault, Ops, OpsError, Outcome, Rendered};
 use crate::paths::{Layout, ParentId, ParentMeta, RepoPaths, RootId};
@@ -325,6 +326,21 @@ pub enum RestoreRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Restored {
     pub outcome: Outcome,
+    /// [`Engine::scan_seq`] of `pile`.
+    pub seq: u64,
+    pub pile: Pile,
+}
+
+/// What [`Engine::flag`] and [`Engine::unflag`] produced.
+///
+/// `export` is the paste-ready message for the flag that was just written
+/// ([`crate::flags::export`]) — computed here rather than in the UI because only the engine
+/// has both the flag's `created_at` and the rescanned row the `hunk n of m` count comes
+/// from. An `unflag`, or a refusal, leaves it empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Flagged {
+    pub outcome: Outcome,
+    pub export: String,
     /// [`Engine::scan_seq`] of `pile`.
     pub seq: u64,
     pub pile: Pile,
@@ -1200,6 +1216,119 @@ impl Engine {
         })
     }
 
+    /// Flag `path` — optionally one hunk of it — with a note, and render the export.
+    ///
+    /// Op-then-rescan like [`Engine::accept_with`], though a flag never changes a baseline:
+    /// the rescan is what puts the new `⚑` on the row the UI is about to draw, and it is
+    /// also where `hunk n of **m**` comes from — [`crate::ledger::FlagHunk`] stores the hunk
+    /// the user flagged, not the shape of the diff it came from, so the count is read off
+    /// the row. If the row has gone by then (the file was reverted underneath), the export
+    /// falls back to `hunk n` with no total rather than inventing one.
+    pub fn flag(
+        &mut self,
+        root: &Path,
+        path: &[u8],
+        note: &str,
+        hunk: Option<FlagHunk>,
+    ) -> Result<Flagged, EngineError> {
+        self.flag_with(root, path, note, hunk, &NoFault)
+    }
+
+    /// [`Engine::flag`] with a fault injector.
+    pub fn flag_with(
+        &mut self,
+        root: &Path,
+        path: &[u8],
+        note: &str,
+        hunk: Option<FlagHunk>,
+        fault: &dyn FaultInjector,
+    ) -> Result<Flagged, EngineError> {
+        let had_hunk = hunk.is_some();
+        let (outcome, written) = {
+            let mut ops = self.ops(root)?;
+            match ops.flag(path, note, hunk, fault) {
+                Ok(o) => {
+                    // The flag as the ledger now holds it: `created_at` is the op's clock
+                    // reading, which the UI has no way to reproduce.
+                    let flag = String::from_utf8(path.to_vec())
+                        .ok()
+                        .and_then(|k| ops.ledger.overrides.get(&k))
+                        .and_then(|o| o.flags.last())
+                        .cloned();
+                    (o, flag)
+                }
+                Err(e) => {
+                    if let Some(state) = self.roots.get_mut(root) {
+                        state.ledger_stamp = None;
+                        state.reload_ledger_if_changed();
+                    }
+                    return Err(EngineError::Ops(e));
+                }
+            }
+        };
+        let pile = self.scan(root)?;
+        let export = match written {
+            Some(flag) => {
+                let of = had_hunk
+                    .then(|| pile.row(path).map(|r| r.hunks.len()))
+                    .flatten();
+                crate::flags::export(
+                    &crate::flags::ExportContext {
+                        root: root
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| root.to_string_lossy().into_owned()),
+                        of,
+                        attribution: None,
+                    },
+                    path,
+                    &flag,
+                )
+            }
+            None => String::new(),
+        };
+        Ok(Flagged {
+            outcome,
+            export,
+            seq: self.scan_seq,
+            pile,
+        })
+    }
+
+    /// Clear **every** flag on `path`. The export is empty: there is nothing to send.
+    pub fn unflag(&mut self, root: &Path, path: &[u8]) -> Result<Flagged, EngineError> {
+        self.unflag_with(root, path, &NoFault)
+    }
+
+    /// [`Engine::unflag`] with a fault injector.
+    pub fn unflag_with(
+        &mut self,
+        root: &Path,
+        path: &[u8],
+        fault: &dyn FaultInjector,
+    ) -> Result<Flagged, EngineError> {
+        let outcome = {
+            let mut ops = self.ops(root)?;
+            match ops.unflag(path, fault) {
+                Ok(o) => o,
+                Err(e) => {
+                    if let Some(state) = self.roots.get_mut(root) {
+                        state.ledger_stamp = None;
+                        state.reload_ledger_if_changed();
+                    }
+                    return Err(EngineError::Ops(e));
+                }
+            }
+        };
+        let pile = self.scan(root)?;
+        Ok(Flagged {
+            outcome,
+            export: String::new(),
+            seq: self.scan_seq,
+            pile,
+        })
+    }
+
     /// The accept operations for one root.
     pub fn ops(&mut self, root: &Path) -> Result<Ops<'_>, EngineError> {
         let threshold = self.options.compaction_threshold;
@@ -1739,6 +1868,78 @@ pub(crate) mod tests {
 
     fn ledger_bytes(engine: &Engine, root: &Path) -> Vec<u8> {
         std::fs::read(&engine.root(root).unwrap().paths.ledger).unwrap()
+    }
+
+    /// Deliverable 5: the seam the TUI reducer calls. The export is built from the flag the
+    /// ledger just took (its `created_at`, which the UI cannot reproduce) and the `of` count
+    /// from the rescanned row — and the flag is on disk whatever happens to the send.
+    #[test]
+    fn engine_flag_returns_the_export_for_the_flag_it_just_wrote() {
+        let repo = FixtureRepo::new("eng-flag").unwrap();
+        let state = TempDir::new("lc-eng-flag");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let root = only_root(&engine);
+        repo.write("f1", F1_TWO_HUNKS);
+        let (_, row) = rendered_row(&mut engine, &root, b"f1");
+        assert_eq!(row.hunks.len(), 2);
+        let hunk = FlagHunk {
+            index: 1,
+            header: "@@ -9,2 +9,2 @@".into(),
+            text: "-a10\n+A10\n".into(),
+        };
+        let out = engine
+            .flag(&root, b"f1", "why is this changed?", Some(hunk))
+            .unwrap();
+        assert!(out.outcome.ok() && out.outcome.written);
+        let base = root.file_name().unwrap().to_string_lossy().into_owned();
+        let created = engine.root(&root).unwrap().ledger.overrides["f1"].flags[0]
+            .created_at
+            .clone();
+        assert_eq!(
+            out.export,
+            format!(
+                "lastcall flag · {base} · f1 · hunk 2 of 2 · {created}\n\
+                 note: why is this changed?\n\n\
+                 ```diff\n@@ -9,2 +9,2 @@\n-a10\n+A10\n```"
+            )
+        );
+        assert_eq!(out.seq, engine.scan_seq);
+        assert_eq!(out.pile.row(b"f1").unwrap().flags.len(), 1);
+
+        // A second, file-level flag: no hunk segment, no diff block, and it appends.
+        let out = engine.flag(&root, b"f1", "and this file", None).unwrap();
+        assert!(!out.export.contains("```") && !out.export.contains("hunk"));
+        assert!(out.export.ends_with("note: and this file"));
+        assert_eq!(out.pile.row(b"f1").unwrap().flags.len(), 2);
+
+        // Unflag clears all of them and has nothing to send.
+        let out = engine.unflag(&root, b"f1").unwrap();
+        assert!(out.outcome.ok() && out.export.is_empty());
+        assert!(out.pile.row(b"f1").unwrap().flags.is_empty());
+        assert!(
+            !engine
+                .root(&root)
+                .unwrap()
+                .ledger
+                .overrides
+                .contains_key("f1")
+        );
+    }
+
+    /// A refused flag (a non-UTF-8 path is not a ledger key) is data, not `Err`, and its
+    /// export is empty — there is no flag to send.
+    #[test]
+    fn engine_flag_refused_has_no_export() {
+        let repo = FixtureRepo::new("eng-flag-bad").unwrap();
+        let state = TempDir::new("lc-eng-flag-bad");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let root = only_root(&engine);
+        let out = engine.flag(&root, b"bad\xff", "n", None).unwrap();
+        assert!(matches!(
+            out.outcome.refused[..],
+            [crate::ops::Refused::NonUtf8Path { .. }]
+        ));
+        assert!(!out.outcome.written && out.export.is_empty());
     }
 
     #[test]
