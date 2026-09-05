@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use lastcall_engine::config::Config;
-use lastcall_engine::engine::{Engine, EngineOptions};
+use lastcall_engine::engine::{Engine, EngineOptions, RestoreRequest, Restored};
 use lastcall_engine::ops::{NoFault, Outcome, Rendered};
 use lastcall_engine::scan::{Pile, Row};
 use lastcall_testkit::engine::{open_engine, open_engine_with};
@@ -131,6 +131,36 @@ impl Fresh {
             .unwrap()
             .accept_hunk(&rendered, &row.hunks, index, &NoFault)
             .expect("accept_hunk")
+    }
+
+    /// Restore the whole file (or, on a deletion row, put the file back) through
+    /// [`Engine::restore`], so the scenarios exercise the same critical section the TUI
+    /// will: the op and the rescan together.
+    pub fn restore_file(&mut self, path: &str) -> Restored {
+        let rendered = Rendered::of(&self.row(path));
+        self.engine
+            .restore(&self.root, RestoreRequest::File(rendered))
+            .expect("restore file")
+    }
+
+    /// Restore one hunk of `path`.
+    pub fn restore_hunk(&mut self, path: &str, index: usize) -> Restored {
+        let row = self.row(path);
+        self.engine
+            .restore(
+                &self.root,
+                RestoreRequest::Hunk {
+                    rendered: Rendered::of(&row),
+                    hunks: row.hunks.clone(),
+                    index,
+                },
+            )
+            .expect("restore hunk")
+    }
+
+    /// The bytes on disk at `rel`, read without following a symlink at the leaf.
+    pub fn bytes_at(&self, rel: &str) -> Vec<u8> {
+        std::fs::read(self.repo.path().join(rel)).expect("read the working file")
     }
 
     /// `inspect_head` and return the notice (panics when HEAD did not move).

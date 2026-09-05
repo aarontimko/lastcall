@@ -4,6 +4,7 @@
 mod common;
 
 use common::Fresh;
+use lastcall_engine::engine::RestoreRequest;
 use lastcall_engine::git::Oid;
 use lastcall_engine::ops::{NoFault, Refused, Rendered};
 use lastcall_engine::scan::Change;
@@ -225,6 +226,105 @@ fn scenario_a7_accept_deletion_and_recreate() {
     let row = pile.row(b"f3").unwrap();
     assert_eq!(row.change, Change::Added);
     assert!(row.baseline.is_none(), "baseline is absent");
+}
+
+#[test]
+fn scenario_a7_restore_deletion_recreates_the_baseline_blob() {
+    let mut s = Fresh::new("a7-restore");
+    let baseline_bytes = s.bytes_at("f3");
+    s.repo.remove("f3");
+    let pile = assert_pile!(s.engine, s.root, "f3", "A7 deletion pending");
+    let row = pile.row(b"f3").unwrap();
+    assert_eq!(row.change, Change::Deleted);
+    let baseline_oid = row
+        .baseline
+        .as_ref()
+        .expect("a deletion has a baseline")
+        .oid
+        .clone();
+
+    let out = s.restore_file("f3");
+    assert!(out.outcome.ok(), "{:?}", out.outcome);
+    assert!(
+        !out.outcome.written,
+        "a restore never writes the ledger: the baseline stays where it was"
+    );
+    // Byte-identical to the baseline blob, and hash-compared: the file that comes back is
+    // the object the store still holds, not a re-render of it.
+    assert_eq!(s.bytes_at("f3"), baseline_bytes);
+    assert_eq!(
+        s.store().hash_bytes(&s.bytes_at("f3")).unwrap(),
+        baseline_oid,
+        "the recreated file hashes to the baseline blob"
+    );
+    assert_pile!(s.engine, s.root, "", "A7 restore clears the deletion row");
+    assert!(
+        !s.ledger().overrides.contains_key("f3"),
+        "no override was created by the restore"
+    );
+}
+
+/// Gate item 1, engine half: the mid-review mutation. An agent writes to the file between
+/// the frame the human is looking at and the key they press. The restore must refuse and
+/// leave the agent's bytes alone — the CAS is the whole guard, and this is the case it
+/// exists for.
+#[test]
+fn scenario_gate1_mid_review_mutation_refuses_the_restore_and_keeps_the_mutated_bytes() {
+    let mut s = Fresh::new("gate1");
+    s.repo
+        .write("f1", "A1\na2\na3\na4\na5\na6\na7\na8\na9\nA10\n");
+    // The frame the human is reading.
+    let row = s.row("f1");
+    assert_eq!(row.hunks.len(), 2);
+    let rendered = Rendered::of(&row);
+
+    // The agent writes again while they read it.
+    let mutated = b"A1\na2\na3\na4\na5\na6\na7\na8\na9\nA10\nAGENT WROTE THIS\n";
+    s.repo.write("f1", mutated);
+
+    let restored = s
+        .engine
+        .restore(
+            &s.root,
+            RestoreRequest::Hunk {
+                rendered,
+                hunks: row.hunks.clone(),
+                index: 0,
+            },
+        )
+        .expect("restore");
+    assert!(
+        matches!(&restored.outcome.refused[..], [Refused::Moved { path, .. }] if path == b"f1"),
+        "{:?}",
+        restored.outcome
+    );
+    assert_eq!(
+        s.bytes_at("f1"),
+        mutated,
+        "byte compare: the agent's write survived untouched"
+    );
+    assert!(!restored.outcome.written, "no ledger write");
+    // The pile that comes back is the rescan, so the human sees the new delta rather than
+    // the frame they acted on.
+    let after = restored.pile.row(b"f1").expect("f1 is still pending");
+    assert_eq!(after.hunks.len(), 2);
+    assert!(
+        after.hunks[1]
+            .lines
+            .iter()
+            .any(|(_, l)| l == b"AGENT WROTE THIS\n"),
+        "the returned pile shows the new delta: {:?}",
+        after.hunks
+    );
+    assert_eq!(
+        Refused::Moved {
+            path: b"f1".to_vec(),
+            live: None
+        }
+        .message("restored"),
+        "f1: changed since rendered; not restored",
+        "the wording the PTY half (deliverable 11) asserts on the status line"
+    );
 }
 
 #[test]
