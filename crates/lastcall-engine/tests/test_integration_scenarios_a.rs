@@ -6,6 +6,7 @@ mod common;
 use common::Fresh;
 use lastcall_engine::engine::RestoreRequest;
 use lastcall_engine::git::Oid;
+use lastcall_engine::ledger::FlagHunk;
 use lastcall_engine::ops::{NoFault, Refused, Rendered};
 use lastcall_engine::scan::Change;
 use lastcall_testkit::assert_pile;
@@ -338,15 +339,16 @@ fn scenario_a8_flag_with_note_retained_through_accept_all() {
         .engine
         .ops(&s.root)
         .unwrap()
-        .flag(b"f1", "why is this unwrap safe?", &NoFault)
+        .flag(b"f1", "why is this unwrap safe?", None, &NoFault)
         .unwrap();
     assert!(out.ok());
     let pile = assert_pile!(s.engine, s.root, "f1");
     let row = pile.row(b"f1").unwrap();
     assert_eq!(
-        row.flag.as_ref().map(|f| f.note.as_str()),
+        row.flags.first().map(|f| f.note.as_str()),
         Some("why is this unwrap safe?")
     );
+    assert!(row.flags[0].hunk.is_none(), "a file flag carries no hunk");
     assert_eq!(row.baseline, before.baseline, "baseline unchanged");
     assert_eq!(row.hunks, before.hunks, "hunks unchanged");
     let over = &s.ledger().overrides["f1"];
@@ -360,7 +362,69 @@ fn scenario_a8_flag_with_note_retained_through_accept_all() {
         .expect("flag retained as flag-only");
     assert!(over.blob.is_none());
     assert_eq!(
-        over.flag.as_ref().map(|f| f.note.as_str()),
-        Some("why is this unwrap safe?")
+        over.flags
+            .iter()
+            .map(|f| f.note.as_str())
+            .collect::<Vec<_>>(),
+        vec!["why is this unwrap safe?"]
     );
+}
+
+/// A8, extended (Amendment v1.7): two **hunk** flags on one file are both retained through
+/// accept-all, oldest first, each with the hunk text as it was on screen.
+#[test]
+fn scenario_a8_two_hunk_flags_on_one_file_survive_accept_all() {
+    let mut s = Fresh::new("a8-hunks");
+    s.repo
+        .write("f1", "A1\na2\na3\na4\na5\na6\na7\na8\na9\nA10\n");
+    let pile = assert_pile!(s.engine, s.root, "f1");
+    let row = pile.row(b"f1").unwrap();
+    assert_eq!(row.hunks.len(), 2, "an edit at each end is two hunks");
+    let capture = |h: &lastcall_engine::hunks::Hunk| FlagHunk {
+        index: h.index,
+        header: format!(
+            "@@ -{},{} +{},{} @@",
+            h.old_range.start + 1,
+            h.old_range.len(),
+            h.new_range.start + 1,
+            h.new_range.len()
+        ),
+        text: String::from_utf8_lossy(
+            &h.lines
+                .iter()
+                .flat_map(|(_, l)| l.clone())
+                .collect::<Vec<u8>>(),
+        )
+        .into_owned(),
+    };
+    let (h0, h1) = (capture(&row.hunks[0]), capture(&row.hunks[1]));
+    for (note, hunk) in [("first line?", h0.clone()), ("last line?", h1.clone())] {
+        assert!(
+            s.engine
+                .ops(&s.root)
+                .unwrap()
+                .flag(b"f1", note, Some(hunk), &NoFault)
+                .unwrap()
+                .ok()
+        );
+    }
+    let pile = assert_pile!(s.engine, s.root, "f1");
+    let row = pile.row(b"f1").unwrap();
+    assert_eq!(
+        row.flags
+            .iter()
+            .map(|f| f.note.as_str())
+            .collect::<Vec<_>>(),
+        vec!["first line?", "last line?"],
+        "oldest first"
+    );
+    assert!(s.accept_all().ok());
+    assert_pile!(s.engine, s.root, "");
+    let over = s.ledger().overrides.get("f1").expect("flags retained");
+    assert!(over.blob.is_none(), "accept-all left a flag-only override");
+    assert_eq!(over.flags.len(), 2);
+    assert_eq!(over.flags[0].hunk.as_ref().unwrap(), &h0);
+    assert_eq!(over.flags[1].hunk.as_ref().unwrap(), &h1);
+    // The captured text is what was on screen, not a re-derivation from a moved file.
+    assert!(over.flags[0].hunk.as_ref().unwrap().text.contains("A1"));
 }

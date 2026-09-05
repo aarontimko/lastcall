@@ -100,7 +100,10 @@ pub struct Row {
     pub annotation: Option<Annotation>,
     pub conflicted: bool,
     pub collapsed: Option<Collapsed>,
-    pub flag: Option<Flag>,
+    /// Every flag on the path, oldest first (Amendment v1.7). A file flag has `hunk: None`.
+    /// `#[serde(default)]` so recorded-pile fixtures written before v1.7 still load.
+    #[serde(default)]
+    pub flags: Vec<Flag>,
     pub rename: Option<Rename>,
 }
 
@@ -435,10 +438,11 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
                 }),
                 Baseline::Absent | Baseline::Empty => None,
             };
-            let flag = std::str::from_utf8(path)
+            let flags = std::str::from_utf8(path)
                 .ok()
                 .and_then(|s| inputs.ledger.overrides.get(s))
-                .and_then(|o| o.flag.clone());
+                .map(|o| o.flags.clone())
+                .unwrap_or_default();
             let is_conflicted = conflicted.contains(path);
             let lossy = String::from_utf8_lossy(path).into_owned();
             if std::str::from_utf8(path).is_err() {
@@ -483,7 +487,7 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
                 annotation: None,
                 conflicted: is_conflicted,
                 collapsed: None,
-                flag,
+                flags,
                 rename: None,
             };
             rows.push(row);
@@ -1100,10 +1104,7 @@ pub(crate) mod fixture_tests {
             Override {
                 blob: Some(Some(other)),
                 mode: Some(Mode::Regular),
-                flag: Some(Flag {
-                    note: "look".into(),
-                    created_at: "t".into(),
-                }),
+                flags: vec![Flag::file("look", "t")],
                 updated_at: "t".into(),
             },
         );
@@ -1116,7 +1117,7 @@ pub(crate) mod fixture_tests {
         assert_eq!(pile_lines(&pile), vec!["f1", "f2"]);
         let f1 = pile.row(b"f1").unwrap();
         assert_eq!(f1.change, Change::Modified);
-        assert_eq!(f1.flag.as_ref().unwrap().note, "look");
+        assert_eq!(f1.flags[0].note, "look");
         repo.remove("f2");
         assert_eq!(pile_lines(&h.scan().pile), vec!["f1"]);
     }

@@ -75,7 +75,7 @@
         "annotation": null,
         "conflicted": false,
         "collapsed": null,
-        "flag": null,
+        "flags": [],
         "rename": null
       },
       {
@@ -135,7 +135,7 @@
         "annotation": null,
         "conflicted": false,
         "collapsed": null,
-        "flag": null,
+        "flags": [],
         "rename": null
       }
     ],
@@ -183,7 +183,7 @@
         "annotation": "upstream",
         "conflicted": false,
         "collapsed": null,
-        "flag": null,
+        "flags": [],
         "rename": null
       },
       {
@@ -242,7 +242,7 @@
         "annotation": "mixed",
         "conflicted": false,
         "collapsed": null,
-        "flag": null,
+        "flags": [],
         "rename": null
       }
     ],
@@ -319,7 +319,7 @@
         "annotation": null,
         "conflicted": false,
         "collapsed": null,
-        "flag": null,
+        "flags": [],
         "rename": null
       }
     ],

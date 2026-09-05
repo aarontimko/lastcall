@@ -682,7 +682,7 @@ fn nav_row_line(row: &Row, full_paths: bool, width: usize) -> Line<'static> {
     if row.collapsed.is_some() {
         markers.push_str(" ⊟");
     }
-    if row.flag.is_some() {
+    if !row.flags.is_empty() {
         markers.push_str(" ⚑");
     }
     let conflict = if row.conflicted { "  [conflict]" } else { "" };
@@ -865,7 +865,7 @@ fn row_header(row: &Row) -> Line<'static> {
         ))),
         None => {}
     }
-    if let Some(f) = &row.flag {
+    if let Some(f) = row.flags.first() {
         spans.push(Span::raw(format!("  ⚑ {}", f.note)));
     }
     Line::from(spans)

@@ -2578,7 +2578,7 @@ pub(crate) mod tests {
             annotation: None,
             conflicted: false,
             collapsed: Some(crate::scan::Collapsed::Glob),
-            flag: None,
+            flags: Vec::new(),
             rename: None,
         };
         let err = engine

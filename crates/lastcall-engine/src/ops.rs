@@ -24,8 +24,8 @@ use crate::headstate::current_head;
 use crate::hunks::{self, Hunk};
 use crate::index::{IndexError, PrivateIndex};
 use crate::ledger::{
-    self, Baseline, BaselineResolver, Clock, Flag, Ledger, LedgerError, LedgerLock, LoadResult,
-    Override, SeenAt, TreeEntries,
+    self, Baseline, BaselineResolver, Clock, Flag, FlagHunk, Ledger, LedgerError, LedgerLock,
+    LoadResult, Override, SeenAt, TreeEntries,
 };
 use crate::paths::RepoPaths;
 use crate::scan::{Entry, Pile, Row};
@@ -282,7 +282,7 @@ impl Ops<'_> {
             .or_insert(Override {
                 blob: None,
                 mode: None,
-                flag: None,
+                flags: Vec::new(),
                 updated_at: now.clone(),
             });
         if equals_tree {
@@ -1088,11 +1088,16 @@ impl Ops<'_> {
         Ok(())
     }
 
-    /// Set a flag on `path` (A8's Phase 2 slice). Never touches `blob`.
+    /// Append a flag to `path` (A8; Amendment v1.7). Never touches `blob`.
+    ///
+    /// Appends rather than replaces: a review raises several questions about one file, and
+    /// the second one must not silently eat the first. `hunk` carries the rendered hunk for
+    /// a per-hunk flag and is `None` for a file flag.
     pub fn flag(
         &mut self,
         path: &[u8],
         note: &str,
+        hunk: Option<FlagHunk>,
         fault: &dyn FaultInjector,
     ) -> Result<Outcome, OpsError> {
         let key = match Self::key(path) {
@@ -1112,12 +1117,13 @@ impl Ops<'_> {
             .or_insert(Override {
                 blob: None,
                 mode: None,
-                flag: None,
+                flags: Vec::new(),
                 updated_at: now.clone(),
             });
-        entry.flag = Some(Flag {
+        entry.flags.push(Flag {
             note: note.to_owned(),
             created_at: now.clone(),
+            hunk,
         });
         entry.updated_at = now;
         let staged = entry.clone();
@@ -1130,7 +1136,10 @@ impl Ops<'_> {
         })
     }
 
-    /// Clear the flag on `path`; an override left with nothing is removed.
+    /// Clear **every** flag on `path`; an override left with nothing is removed.
+    ///
+    /// All of them and not one: Phase 7's TUI has no per-flag removal, so "unflag" is the
+    /// undo for the whole path.
     pub fn unflag(&mut self, path: &[u8], fault: &dyn FaultInjector) -> Result<Outcome, OpsError> {
         let key = match Self::key(path) {
             Ok(k) => k,
@@ -1144,7 +1153,7 @@ impl Ops<'_> {
         let Some(entry) = self.ledger.overrides.get_mut(&key) else {
             return Ok(Outcome::default());
         };
-        entry.flag = None;
+        entry.flags.clear();
         entry.updated_at = self.clock.now_iso8601();
         if entry.is_empty() {
             self.ledger.overrides.remove(&key);
@@ -1201,11 +1210,11 @@ mod tests {
         assert!(a.ledger.overrides.is_empty());
         assert!(a.scan().pile.is_empty(), "f2's accept survived a's fold");
         // A flag set by one side survives an accept by the other.
-        assert!(b.ops().flag(b"f3", "look", &NoFault).unwrap().ok());
+        assert!(b.ops().flag(b"f3", "look", None, &NoFault).unwrap().ok());
         repo.write("f1", "one more\n");
         let r1 = rendered(&a, b"f1");
         assert!(a.ops().accept_file(&r1, &NoFault).unwrap().ok());
-        assert!(a.ledger.overrides["f3"].flag.is_some());
+        assert!(!a.ledger.overrides["f3"].flags.is_empty());
     }
 
     #[test]
@@ -1461,7 +1470,7 @@ mod tests {
         repo.write("f3", "accepted\n");
         let r3 = rendered(&h, b"f3");
         h.ops().accept_file(&r3, &NoFault).unwrap();
-        h.ops().flag(b"f3", "keep me", &NoFault).unwrap();
+        h.ops().flag(b"f3", "keep me", None, &NoFault).unwrap();
         repo.write("f1", "one\n");
         repo.remove("f2");
         repo.write("new.txt", "n\n");
@@ -1488,7 +1497,7 @@ mod tests {
         assert_ne!(h.ledger.seen_tree.as_ref().unwrap(), &before_tree);
         assert_eq!(h.ledger.blob_override_count(), 0);
         let o = h.ledger.overrides.get("f3").unwrap();
-        assert_eq!(o.flag.as_ref().unwrap().note, "keep me");
+        assert_eq!(o.flags[0].note, "keep me");
         assert!(o.blob.is_none() && o.mode.is_none());
         let head = Oid::parse(repo.head().unwrap().trim()).unwrap();
         assert_eq!(h.ledger.seen_at.head_commit, Some(head));
@@ -1540,27 +1549,17 @@ mod tests {
         let repo = FixtureRepo::new("ops-flag").unwrap();
         let state = TempDir::new("lc-ops");
         let mut h = Harness::new(&repo, &state);
-        h.ops().flag(b"f1", "note", &NoFault).unwrap();
+        h.ops().flag(b"f1", "note", None, &NoFault).unwrap();
         let o = h.ledger.overrides.get("f1").unwrap();
         assert!(o.blob.is_none());
         assert!(h.scan().pile.is_empty(), "a flag alone is not pending");
         repo.write("f1", "x\n");
-        assert_eq!(
-            h.scan()
-                .pile
-                .row(b"f1")
-                .unwrap()
-                .flag
-                .as_ref()
-                .unwrap()
-                .note,
-            "note"
-        );
+        assert_eq!(h.scan().pile.row(b"f1").unwrap().flags[0].note, "note");
         h.ops().unflag(b"f1", &NoFault).unwrap();
         assert!(!h.ledger.overrides.contains_key("f1"));
         let out = h.ops().unflag(b"nope", &NoFault).unwrap();
         assert!(!out.written);
-        let out = h.ops().flag(b"bad\xff", "n", &NoFault).unwrap();
+        let out = h.ops().flag(b"bad\xff", "n", None, &NoFault).unwrap();
         assert!(matches!(out.refused[0], Refused::NonUtf8Path { .. }));
     }
 
