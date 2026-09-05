@@ -532,6 +532,38 @@ mode) and by `lastcall config` (exit 2, so a bad table is visible headlessly):
 The effective table is what the hint line and the help overlay show (`App.keymap`), so a
 user sees their own bindings, not the defaults.
 
+## Design pass inputs: the responsive rules (for the Phase 9 Claude Design pass)
+
+The sponsor ruled at the Phase 7 close (§10 2026-09-05) that the bottom hint line and the
+rest of the layout's fine-tuning belong to the Claude Design pass at the Phase 9 kickoff,
+and that until then each phase makes its own judgment call and **records the dynamic
+behaviour here** — "below N columns this happens, above N that happens" — so the pass can
+review the screen holistically rather than one frame at a time. Every rule below is a
+threshold in `render.rs`/`app.rs` with the snapshot that pins it; a phase that adds a
+rule adds a row. Nothing here is a promise about the final design.
+
+| Surface | Rule as built (Phase ≤ 7) | Pinned by |
+|---|---|---|
+| Whole frame | below `MIN_SIZE` = 40×10 the frame is only `too small: 40×10 min` and the hit map is empty | `tui_too_small_30x8`, `render_too_small_is_one_line` |
+| Header | `lastcall  N repos · N files · N hunks  [Accept All]` + the watch notice right-aligned; when both do not fit (about 60 columns) the `[Accept All]` control is dropped and the notice kept (`^A` duplicates the control; nothing else says what is watched) | `tui_narrow_60x20` |
+| Nav pane | outer width `App.nav_width`, 16..=60 (default 28), draggable; hidden below `NAV_MIN_COLS` = 70 columns, when the diff takes the whole body and has focus; keeps its scroll offset across selection changes | `tui_narrow_60x20`, `tui_nav_*` |
+| Hint line (status bar) | built from the keymap in two tiers: tier 2 (`Tab focus`, `r refresh`) is dropped below 70 columns or whenever the line would not fit, then tier 1 (the file and global accept hints, `d ack`/`g jump`/`w scope` when applicable); the accept hint follows the selection (`a accept hunk  A accept file` / `a/A accept file` / `a accept group` / `a accept all in <root>`); while a confirm modal is open the line is exactly `y confirm  n cancel  q quit`; the Phase 7 keys (`u`, `U`, `m`, `M`) are **not** on the hint line — they live on the hunk controls, the `?` overlay and the modal's own key row | `tui_status_line_head_notice`, `render_hints_and_help_follow_the_app_keymap` |
+| Status bar vs hints | the latest engine notice with its age replaces the hints for `STATUS_TTL` = 30 s, then the hints return | `tui_status_line_head_notice` |
+| Scope notice | `scope: <ws> · N repos hidden (w shows all)` (43 columns) crowds the header at 100 columns — carried to the pass since Phase 5 | `tui_herdr_scope_notice`, `tui_herdr_scope_notice_with_status` |
+| File header controls | `[A accept file] [U restore file]` right-aligned as one run; a run that does not fit is retried without its last label, so a narrow pane loses the newest control first and `[A accept file]` goes last | `tui_accept_controls`, `tui_narrow_60x20` |
+| Hunk header controls | `[a accept] [u restore] [m flag]` with the same drop-from-the-right rule; on an expansion hunk of a collapsed row only `[m flag]` is offered (restore of such a row stays whole-file); at 60 columns all three still fit but crowd the header — the worker flagged this for the pass | `tui_narrow_60x20`, `tui_diff_view_collapsed_expanded` |
+| Flag marker | `  ⚑ <first line of the note>` on the file and hunk header in whatever columns remain after the path and the control run (`marker_budget`); nothing is drawn when fewer than the prefix fits | `tui_diff_view_flagged_hunk`, `tui_nav_flag_counts` |
+| Help overlay (`?`) | one column while the rows fit the height; two columns when they do not **and** the width allows (about 100 columns with these descriptions), gutter 3; when neither fits (80×30 and below with this keymap) it clips key rows from the bottom, never the blank/`SELECT_NOTE`/`any key closes` footer (three rows reserved); at 80×24 the quit rows are among the clipped | `tui_help_overlay` (100×30), `tui_help_overlay_tall` (100×45), `render_help_uses_two_columns_only_when_one_does_not_fit` |
+| Confirm modal | centered box, one question row from the scope; an accept shows live counts, a restore shows the one row; hint line switches to the modal's keys | `tui_restore_confirm`, `render_confirm_modal_shows_live_counts` |
+| Note modal | centered, `NOTE_WIDTH` = 60 columns (clamped to the frame minus 4, floor 8), a fixed `NOTE_ROWS` = 5-line text area that scrolls to keep the caret visible, plus title, target line and the key row `⏎ send   ^J newline   Esc cancel`; bracketed paste is on only while it is open | `tui_note_modal`, PTY `pty_flag_note_exports_when_standalone` |
+| Agent picker | centered, width = widest row + 4, height = rows + 2, both clamped to the frame; first row says the flag is already saved and `Esc` costs only the send; key row `↑↓ choose   ⏎ send   Esc cancel` | `tui_agent_picker` |
+| Collapsed rows | `collapsed (binary) · +a −d · not expandable` / `collapsed (size)` with `[e expand]`; expansion capped at 2,000 lines with `… N lines omitted` | `tui_nav_collapsed_*`, `tui_diff_view_collapsed*` |
+
+Open design questions the pass should take, in the order they have come up: whether the
+hint line should carry `u`/`m` (or go to a second tier) once the width allows; whether a
+two-column overlay is the right answer for a keymap that keeps growing; the 60-column
+header crowding; the scope notice at 100 columns; and the select-to-copy cue Phase 8 adds.
+
 ## herdr in the UI (Phase 5)
 
 lastcall runs standalone; launched inside a herdr pane it also shows what the agents are
