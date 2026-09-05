@@ -34,6 +34,12 @@ lint:
     cargo fmt --all --check
     cargo clippy --workspace --all-targets -- -D warnings
     cargo check -p lastcall-engine --no-default-features
+    # Safe wrappers only: `nix`, never a direct `libc` call or dependency. A raw
+    # `libc::open` would be `unsafe`, and `unsafe_code = "forbid"` is workspace-wide —
+    # this grep catches the dependency edge before someone reaches for the escape hatch
+    # (docs/spec/96-phase7-kickoff.md, design review F3).
+    ! grep -rn --include='*.rs' 'libc::' crates
+    ! grep -rn --include='Cargo.toml' '^libc' crates
 
 # The canonical unit suite: in-module #[cfg(test)] only. Deterministic, no network, no
 # sockets except the in-test mock, no git repos except temp fixtures.

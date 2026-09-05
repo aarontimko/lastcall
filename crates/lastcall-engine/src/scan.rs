@@ -374,8 +374,14 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
     // applies to every candidate whichever list it came from: an absent cone path is a
     // cone even when an override or `diff-files` names it.
     let root_dir = inputs.store.root();
+    // A restore's in-flight temp file (`restore::RESTORE_TEMP_GLOB`) is never a row: it
+    // exists for the microseconds between `create_new` and `rename`, and a second lastcall
+    // scanning in that window would otherwise show it as an added file the user could
+    // accept. A ghost left by a crash is hidden for the same reason and swept by the next
+    // restore of that name (review F8).
     let candidates: Vec<Vec<u8>> = candidates
         .into_iter()
+        .filter(|p| !crate::restore::is_restore_temp_path(p))
         .filter(|p| {
             !skip.contains(p)
                 || root_dir
@@ -858,6 +864,7 @@ pub(crate) mod fixture_tests {
                 tree: &mut self.tree_entries,
                 clock: &self.clock,
                 compaction_threshold: self.compaction_threshold,
+                case_insensitive: self.case_insensitive,
                 staged: std::collections::BTreeMap::new(),
                 lock: crate::ops::DEFAULT_LOCK,
             }
@@ -1055,6 +1062,29 @@ pub(crate) mod fixture_tests {
         let b = h.scan().pile;
         assert_eq!(a, b);
         assert_eq!(pile_lines(&b), vec!["added.txt", "f1", "f3"]);
+    }
+
+    #[test]
+    fn scan_ignores_restore_temp_files() {
+        let repo = FixtureRepo::new("scan-restore-temp").unwrap();
+        let state = TempDir::new("lc-scan");
+        let h = Harness::new(&repo, &state);
+        // A restore in flight in another lastcall process, and a ghost from one that was
+        // killed between `create_new` and `rename` (F8). Neither is ever a row: a row is
+        // something the user could accept, and these are lastcall's own scratch.
+        repo.write(".f1.lastcall-restore-4242-0", "half-written\n");
+        repo.write("d/.f2.lastcall-restore-4242-1", "half-written\n");
+        // A file that merely looks similar is a real file and keeps its row.
+        repo.write("f1.lastcall-restore-4242-0", "a real file\n");
+        let pile = h.scan().pile;
+        assert!(
+            pile.row(b".f1.lastcall-restore-4242-0").is_none(),
+            "{}",
+            pile_lines(&pile).join(" ")
+        );
+        assert!(pile.row(b"d/.f2.lastcall-restore-4242-1").is_none());
+        assert!(pile.row(b"f1.lastcall-restore-4242-0").is_some());
+        assert_eq!(crate::ops::RESTORE_TEMP_GLOB, ".*.lastcall-restore-*");
     }
 
     #[test]

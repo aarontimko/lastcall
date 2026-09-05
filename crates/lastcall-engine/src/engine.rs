@@ -303,6 +303,33 @@ pub enum AcceptRequest {
     All(Pile),
 }
 
+/// One restore as a UI asks for it (§6.3). The same rendered tokens an accept pins, and
+/// deliberately fewer variants: there is no restore-group and no restore-all — undoing
+/// everything at once is `git checkout`, and lastcall does not own that gesture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestoreRequest {
+    /// Hunk `index` of `hunks` goes back to the baseline; the other hunks stay.
+    Hunk {
+        rendered: Rendered,
+        hunks: Vec<Hunk>,
+        index: usize,
+    },
+    /// One file; a deletion row (`rendered.oid == None`) puts the file back.
+    File(Rendered),
+}
+
+/// What [`Engine::restore`] produced. The same shape as [`Accepted`] — a refusal is data,
+/// never `Err` — with one difference worth stating: `outcome.written` is always `false`,
+/// because a restore never writes the ledger. What it changed is the working tree, and
+/// `pile` is the rescan that shows the result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Restored {
+    pub outcome: Outcome,
+    /// [`Engine::scan_seq`] of `pile`.
+    pub seq: u64,
+    pub pile: Pile,
+}
+
 /// What [`Engine::accept`] produced: the op's outcome (a refusal is data, never `Err`) and
 /// the pile of the rescan that followed, numbered like every other pile.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1120,6 +1147,59 @@ impl Engine {
         })
     }
 
+    /// Put one hunk or one file back to its baseline in the working tree (§6.3).
+    ///
+    /// The same op-then-rescan critical section as [`Engine::accept_with`], for the same
+    /// reason: the pile the caller gets back is the state *after* the write, so a hunk
+    /// restore's remaining hunks and a file restore's cleared row are visible without a
+    /// second round trip. The rescan is also the §11 mitigation for the hash-then-rename
+    /// window — if the file moved inside it, the next pile says so.
+    pub fn restore(&mut self, root: &Path, req: RestoreRequest) -> Result<Restored, EngineError> {
+        self.restore_with(root, req, &NoFault)
+    }
+
+    /// [`Engine::restore`] with a fault injector.
+    pub fn restore_with(
+        &mut self,
+        root: &Path,
+        req: RestoreRequest,
+        fault: &dyn FaultInjector,
+    ) -> Result<Restored, EngineError> {
+        let result = {
+            let mut ops = self.ops(root)?;
+            match &req {
+                RestoreRequest::Hunk {
+                    rendered,
+                    hunks,
+                    index,
+                } => ops.restore_hunk(rendered, hunks, *index, fault),
+                RestoreRequest::File(rendered) if rendered.oid.is_none() => {
+                    ops.restore_deletion(rendered, fault)
+                }
+                RestoreRequest::File(rendered) => ops.restore_file(rendered, fault),
+            }
+        };
+        let outcome = match result {
+            Ok(o) => o,
+            Err(e) => {
+                // A restore writes no ledger, so there is nothing staged to roll back —
+                // but the reload costs one read and keeps the failure path identical to
+                // accept's, which is worth more than the read.
+                if let Some(state) = self.roots.get_mut(root) {
+                    state.ledger_stamp = None;
+                    state.reload_ledger_if_changed();
+                }
+                return Err(EngineError::Ops(e));
+            }
+        };
+        let pile = self.scan(root)?;
+        Ok(Restored {
+            outcome,
+            seq: self.scan_seq,
+            pile,
+        })
+    }
+
     /// The accept operations for one root.
     pub fn ops(&mut self, root: &Path) -> Result<Ops<'_>, EngineError> {
         let threshold = self.options.compaction_threshold;
@@ -1128,6 +1208,7 @@ impl Engine {
             .roots
             .get_mut(root)
             .ok_or_else(|| EngineError::NoSuchRoot(root.to_path_buf()))?;
+        let case_insensitive = state.case_insensitive;
         Ok(Ops {
             store: &state.store,
             index: &state.index,
@@ -1137,6 +1218,7 @@ impl Engine {
             tree: &mut state.tree,
             clock,
             compaction_threshold: threshold,
+            case_insensitive,
             staged: BTreeMap::new(),
             lock: crate::ops::DEFAULT_LOCK,
         })

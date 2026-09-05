@@ -21,6 +21,10 @@ tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 notify.workspace = true
+# Deliverable 1's write path: `O_NOFOLLOW` from `nix::fcntl::OFlag` and the dead-pid probe
+# from `nix::sys::signal::kill`. Safe wrappers only — direct `libc` is forbidden
+# workspace-wide (AGENTS.md; `just lint` greps for it).
+nix = { workspace = true, features = ["fs", "signal"] }
 similar = "3.2.0"
 globset = "0.4.20"
 sha2 = "0.11.0"

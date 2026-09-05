@@ -17,6 +17,7 @@ pub mod index;
 pub mod ledger;
 pub mod ops;
 pub mod paths;
+pub mod restore;
 pub mod roots;
 pub mod scan;
 pub mod status;
