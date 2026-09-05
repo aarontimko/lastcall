@@ -1406,6 +1406,9 @@ impl App {
                     "flagged {} · staged to {}",
                     picker.label, agent.label
                 ));
+                self.flagging = Some(Flagging {
+                    label: picker.label,
+                });
                 (
                     Changed::Yes,
                     Some(Effect::Stage {
@@ -1472,6 +1475,9 @@ impl App {
             1 => {
                 let agent = candidates.into_iter().next().expect("one candidate");
                 self.set_status(format!("flagged {label} · staged to {}", agent.label));
+                // Held until the send is answered, so a failure can name the flag that is
+                // on disk rather than only the pane that would not take it.
+                self.flagging = Some(Flagging { label });
                 (
                     Changed::Yes,
                     Some(Effect::Stage {
@@ -2709,6 +2715,8 @@ pub(crate) mod testfix {
 mod tests {
     use super::testfix::*;
     use super::*;
+    use crate::tui::input::note_action;
+    use crossterm::event::{Event, KeyCode, KeyModifiers};
     use lastcall_engine::roots::RootsChanged;
     /// Phase 6 deliverable 4: `e` is silent where it has nothing to do — a binary row
     /// (never expandable), a row that is not collapsed at all, a group, and a row already
@@ -4571,5 +4579,608 @@ mod tests {
         assert_eq!(range_label(0, 0), "0,0");
         assert_eq!(range_label(4, 0), "4,0");
         assert_eq!(range_label(9, 1), "10", "git omits `,1`");
+    }
+
+    // ---- restore and flag (Phase 7) -----------------------------------------------------
+
+    /// One `Flagged` answer: a clean outcome, the export the engine computed, and `pile` as
+    /// the rescan that followed.
+    fn flagged_ok(export: &str, seq: u64, pile: Pile) -> FlagResult {
+        Ok(Flagged {
+            outcome: lastcall_engine::ops::Outcome::default(),
+            export: export.to_owned(),
+            seq,
+            pile,
+        })
+    }
+
+    /// One clean `Restored` answer.
+    fn restored_ok(seq: u64, pile: Pile) -> RestoreResult {
+        Ok(Restored {
+            outcome: lastcall_engine::ops::Outcome::default(),
+            seq,
+            pile,
+        })
+    }
+
+    fn agent(pane: &str, label: &str, workspace: &str) -> AgentCandidate {
+        AgentCandidate {
+            pane_id: pane.to_owned(),
+            label: label.to_owned(),
+            status: Attention::Idle,
+            workspace_label: workspace.to_owned(),
+        }
+    }
+
+    /// The herdr news that gives `name`'s root exactly these candidates.
+    fn agents_of(name: &str, list: Vec<AgentCandidate>) -> Action {
+        let mut map = BTreeMap::new();
+        map.insert(root(name), list);
+        Action::Herdr(HerdrUpdate::Agents(map))
+    }
+
+    /// alpha's pile with `f1` turned into the change `f1` is not: a deletion (whose one
+    /// hunk is the file) or an addition (which has no baseline to go back to).
+    fn alpha_as(change: Change) -> Pile {
+        let mut p = pile("alpha");
+        p.rows[0].change = change;
+        match change {
+            Change::Deleted => p.rows[0].current = None,
+            Change::Added => p.rows[0].baseline = None,
+            _ => {}
+        }
+        p
+    }
+
+    /// `u` needs a hunk to point at. A collapsed row has none on the row itself, so the
+    /// restore is the whole file — and a whole file asks first, exactly as `shift-u` does.
+    #[test]
+    fn app_restore_on_a_hunkless_row_is_the_whole_file() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.apply(pile_event_seq("alpha", 1, alpha_collapsed(Collapsed::Glob)));
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Open);
+
+        let scope = app.restore_scope().expect("a scope on a selected row");
+        assert!(
+            matches!(scope, RestoreScope::File { hunks: 0, .. }),
+            "no hunk to point at: {scope:?}"
+        );
+        assert_eq!(
+            app.handle(Action::Restore),
+            (Changed::Yes, None),
+            "the whole file asks first"
+        );
+        assert_eq!(
+            app.confirm_restore(),
+            Some(&scope),
+            "and asks about exactly that scope"
+        );
+
+        // An expansion held beside the row does not turn `u` back into a hunk restore: the
+        // row still carries no hunks, and `a`/`A` follow the same rule (Phase 6).
+        let asked = app.selected_row().expect("f1").clone();
+        app.handle(Action::Confirm);
+        app.set_expanded(root("alpha"), &asked, expansion_of(3, 0));
+        assert_eq!(app.view_hunks().len(), 3, "three hunks are on screen");
+        assert!(matches!(
+            app.restore_scope(),
+            Some(RestoreScope::File { .. })
+        ));
+    }
+
+    /// The asking rule, both halves on one app: `shift-u` opens the confirm and yields no
+    /// effect until `y`; `u` on a hunk starts straight away. A whole file going back is the
+    /// bigger surprise, so only it asks (kickoff ruling item 2).
+    #[test]
+    fn app_restore_file_asks_first_and_restore_hunk_does_not() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.apply(pile_event_seq("alpha", 1, alpha_hunks(3)));
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Open);
+        app.handle(Action::HunkNext);
+
+        // The hunk half: no modal, an effect at once, and the hunk the cursor was on.
+        let (changed, effect) = app.handle(Action::Restore);
+        assert_eq!(changed, Changed::Yes);
+        assert!(app.confirm.is_none(), "a hunk restore never asks");
+        let Some(Effect::Restore(reqs)) = effect else {
+            panic!("a restore effect: {effect:?}");
+        };
+        assert_eq!(reqs.len(), 1, "a restore is never more than one root");
+        assert!(
+            matches!(reqs[0].1, RestoreRequest::Hunk { index: 1, .. }),
+            "{:?}",
+            reqs[0].1
+        );
+        assert_eq!(status(&app), "restoring…");
+
+        // Nothing else starts while that one is in flight.
+        assert_eq!(app.handle(Action::RestoreFile), (Changed::Yes, None));
+        assert_eq!(status(&app), RESTORE_IN_PROGRESS);
+        app.restored(vec![(root("alpha"), restored_ok(2, alpha_hunks(2)))]);
+        assert_eq!(status(&app), "restored f1 hunk 2");
+
+        // The file half: the modal first, `n` drops it without an effect, `y` starts it.
+        let (changed, effect) = app.handle(Action::RestoreFile);
+        assert_eq!((changed, effect), (Changed::Yes, None), "the modal asks");
+        assert!(app.confirm_restore().is_some());
+        assert_eq!(app.handle(Action::Cancel), (Changed::Yes, None));
+        assert!(app.confirm.is_none(), "n closes it");
+        assert!(app.restoring.is_none(), "and starts nothing");
+
+        app.handle(Action::RestoreFile);
+        let (_, effect) = app.handle(Action::Confirm);
+        let Some(Effect::Restore(reqs)) = effect else {
+            panic!("y starts it: {effect:?}");
+        };
+        assert!(matches!(reqs[0].1, RestoreRequest::File(_)), "{reqs:?}");
+    }
+
+    /// Restoring a file that is not in the baseline **removes** it, so the question says
+    /// so: `Delete f1?`, not `Restore f1?` (kickoff deliverable 9, F16). The status line
+    /// afterwards uses the same vocabulary.
+    #[test]
+    fn app_restore_of_an_added_file_asks_with_the_delete_wording() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.apply(pile_event_seq("alpha", 1, alpha_as(Change::Added)));
+        app.select(Some(row("alpha", "f1")));
+
+        app.handle(Action::RestoreFile);
+        let scope = app.confirm_restore().expect("it asks").clone();
+        assert!(
+            matches!(scope, RestoreScope::File { added: true, .. }),
+            "{scope:?}"
+        );
+        assert_eq!(
+            restore_question(&scope),
+            "Delete f1? (added since baseline)"
+        );
+
+        app.handle(Action::Confirm);
+        app.restored(vec![(
+            root("alpha"),
+            restored_ok(2, without(pile("alpha"), &["f1"])),
+        )]);
+        assert_eq!(status(&app), "removed f1 (added since baseline)");
+
+        // A modified file keeps the plain wording, so the two are told apart by the words.
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::RestoreFile);
+        assert_eq!(
+            restore_question(app.confirm_restore().expect("it asks")),
+            "Restore f1 · 1 hunk?"
+        );
+    }
+
+    /// A deletion row's one hunk is the whole file (F16), so `u` on it is a file restore —
+    /// which means it asks, and its question says the file was deleted.
+    #[test]
+    fn app_restore_on_a_deletion_row_is_the_file_and_asks() {
+        let deleted = |app: &mut App| {
+            app.handle(Action::Resize(100, 30));
+            app.apply(pile_event_seq("alpha", 1, alpha_as(Change::Deleted)));
+            app.select(Some(row("alpha", "f1")));
+            app.handle(Action::Open);
+        };
+        let mut app = three_roots();
+        deleted(&mut app);
+        assert!(
+            !app.selected_row().expect("f1").hunks.is_empty(),
+            "the row does have a hunk — it is just not one to restore alone"
+        );
+
+        assert_eq!(app.handle(Action::Restore), (Changed::Yes, None));
+        let scope = app.confirm_restore().expect("u asks here").clone();
+        assert!(
+            matches!(scope, RestoreScope::File { deleted: true, .. }),
+            "{scope:?}"
+        );
+        assert_eq!(restore_question(&scope), "Restore f1? (deleted)");
+
+        // `shift-u` on the same row is the same scope: the two keys agree on a deletion.
+        let mut by_file = three_roots();
+        deleted(&mut by_file);
+        by_file.handle(Action::RestoreFile);
+        assert_eq!(by_file.confirm_restore(), Some(&scope));
+    }
+
+    /// `m` flags what is on screen: from the nav there is no hunk under a cursor, so the
+    /// flag is the file; from the diff it is the hunk the cursor is on, captured with the
+    /// header and body the reader was looking at.
+    #[test]
+    fn app_flag_from_the_nav_carries_no_hunk_and_from_the_diff_carries_the_cursor_hunk() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.apply(pile_event_seq("alpha", 1, alpha_hunks(3)));
+        app.select(Some(row("alpha", "f1")));
+        assert_eq!(app.effective_focus(), Focus::Nav);
+
+        let (changed, effect) = app.handle(Action::Flag);
+        assert_eq!((changed, effect), (Changed::Yes, None), "the note opens");
+        let target = app.note.as_ref().expect("open").target.clone();
+        assert!(matches!(target, FlagTarget::File { .. }), "{target:?}");
+        assert_eq!(target.rendered_hunk(), None, "the file, not a hunk");
+        assert_eq!(target.label(), "f1 (file)");
+        let (_, effect) = app.handle(Action::Note(NoteKey::Send));
+        assert_eq!(
+            effect,
+            Some(Effect::Flag {
+                root: root("alpha"),
+                path: b"f1".to_vec(),
+                note: String::new(),
+                hunk: None,
+            })
+        );
+
+        // The same row from the diff, cursor on the third hunk.
+        app.handle(Action::Open);
+        app.handle(Action::HunkNext);
+        app.handle(Action::HunkNext);
+        assert_eq!(app.diff.hunk, 2);
+        app.handle(Action::Flag);
+        let target = app.note.as_ref().expect("open").target.clone();
+        assert_eq!(target.label(), "f1 · hunk 3 of 3");
+        let rendered = target.rendered_hunk().expect("a hunk flag");
+        assert_eq!(rendered.of, 3, "content hunks, as the screen counted them");
+        assert_eq!(rendered.hunk.index, 2);
+        assert_eq!(
+            rendered.hunk.header,
+            hunk_header(&app.view_hunks()[2]),
+            "the header the reader was looking at"
+        );
+    }
+
+    /// F14: the target is captured when `m` is pressed. A pile that lands while the note is
+    /// open — an agent still writing — may reorder or remove hunks; the flag must not move
+    /// onto a different one, and must still be written when the reader presses Enter.
+    #[test]
+    fn app_note_modal_keeps_the_hunk_it_opened_on_across_a_pile() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.apply(pile_event_seq("alpha", 1, alpha_hunks(3)));
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Open);
+        app.handle(Action::HunkNext);
+        app.handle(Action::HunkNext);
+        app.handle(Action::Flag);
+        let opened = app.note.as_ref().expect("open").target.clone();
+        assert_eq!(opened.label(), "f1 · hunk 3 of 3");
+
+        // The agent rewrites the file: one hunk left, and the cursor is clamped onto it.
+        app.apply(pile_event_seq("alpha", 2, alpha_hunks(1)));
+        assert_eq!(
+            app.note.as_ref().expect("still open").target,
+            opened,
+            "the pile does not move the flag"
+        );
+        assert_eq!(app.view_hunks().len(), 1, "the screen did move on");
+
+        let (_, effect) = app.handle(Action::Note(NoteKey::Send));
+        let Some(Effect::Flag { hunk, .. }) = effect else {
+            panic!("a flag effect: {effect:?}");
+        };
+        let hunk = hunk.expect("the hunk it opened on");
+        assert_eq!(
+            (hunk.hunk.index, hunk.of),
+            (2, 3),
+            "as captured, not as now"
+        );
+    }
+
+    /// One agent under the root: there is nothing to ask, so the export is staged and the
+    /// status line names the agent it went to.
+    #[test]
+    fn app_flagged_with_one_agent_stages_without_asking() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.handle(agents_of(
+            "alpha",
+            vec![agent("w1:p1", "claude", "lastcall")],
+        ));
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Flag);
+        app.handle(Action::Note(NoteKey::Insert("why?".to_owned())));
+        app.handle(Action::Note(NoteKey::Send));
+        assert!(app.flagging.is_some(), "the send is still to be decided");
+
+        let (changed, effect) = app.flagged(root("alpha"), flagged_ok("EXPORT", 1, pile("alpha")));
+        assert_eq!(changed, Changed::Yes);
+        assert!(app.picker.is_none(), "one candidate is not a question");
+        assert_eq!(
+            effect,
+            Some(Effect::Stage {
+                pane_id: "w1:p1".to_owned(),
+                label: "claude".to_owned(),
+                export: "EXPORT".to_owned(),
+            })
+        );
+        assert_eq!(status(&app), "flagged f1 · staged to claude");
+    }
+
+    /// Two agents: lastcall never picks for the reader, so the picker opens and the export
+    /// is held until one is chosen. Esc drops the send and keeps the flag.
+    #[test]
+    fn app_flagged_with_two_agents_opens_the_picker() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.handle(agents_of(
+            "alpha",
+            vec![
+                agent("w1:p1", "claude", "lastcall"),
+                agent("w2:p3", "codex", "spike"),
+            ],
+        ));
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Flag);
+        app.handle(Action::Note(NoteKey::Send));
+
+        let (changed, effect) = app.flagged(root("alpha"), flagged_ok("EXPORT", 1, pile("alpha")));
+        assert_eq!((changed, effect), (Changed::Yes, None), "it asks, silently");
+        let picker = app.picker.as_ref().expect("the picker is open");
+        assert_eq!(picker.candidates.len(), 2);
+        assert_eq!(picker.selected, 0);
+        assert_eq!(picker.label, "f1");
+
+        // Esc drops the send and says so; the flag itself is already on disk.
+        let mut cancelled = app.clone();
+        assert_eq!(
+            cancelled.handle(Action::Pick(PickKey::Cancel)),
+            (Changed::Yes, None)
+        );
+        assert!(cancelled.picker.is_none());
+        assert_eq!(status(&cancelled), "flagged f1 · not sent");
+
+        // Down then Enter sends to the second pane.
+        app.handle(Action::Pick(PickKey::Down));
+        let (_, effect) = app.handle(Action::Pick(PickKey::Send));
+        assert_eq!(
+            effect,
+            Some(Effect::Stage {
+                pane_id: "w2:p3".to_owned(),
+                label: "codex".to_owned(),
+                export: "EXPORT".to_owned(),
+            })
+        );
+        assert_eq!(status(&app), "flagged f1 · staged to codex");
+    }
+
+    /// No agent under this root: the export goes to the fallback file under the state dir —
+    /// the one file the TUI writes — and the status names it.
+    #[test]
+    fn app_flagged_with_no_link_writes_the_export_file() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        // An agent under another root is not a candidate for this one.
+        app.handle(agents_of(
+            "beta",
+            vec![agent("w1:p1", "claude", "lastcall")],
+        ));
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Flag);
+        app.handle(Action::Note(NoteKey::Send));
+
+        let (changed, effect) = app.flagged(root("alpha"), flagged_ok("EXPORT", 1, pile("alpha")));
+        assert_eq!(changed, Changed::Yes);
+        assert!(app.picker.is_none());
+        assert_eq!(
+            effect,
+            Some(Effect::Export {
+                root: root("alpha"),
+                export: "EXPORT".to_owned(),
+            })
+        );
+        assert!(app.flagging.is_some(), "the flag's words wait for the path");
+
+        let out = PathBuf::from("/S/exports/alpha/2026-09-05.md");
+        assert_eq!(app.exported(Ok(out.clone())), Changed::Yes);
+        assert_eq!(
+            status(&app),
+            format!("flagged f1 · export → {}", out.display())
+        );
+        assert!(app.flagging.is_none());
+
+        // A write that failed says which flag it was and why.
+        app.handle(Action::Flag);
+        app.handle(Action::Note(NoteKey::Send));
+        app.flagged(root("alpha"), flagged_ok("EXPORT", 2, pile("alpha")));
+        app.exported(Err("permission denied".to_owned()));
+        assert_eq!(
+            status(&app),
+            "flagged f1 · export failed: permission denied"
+        );
+    }
+
+    /// A send that did not land loses nothing: the flag is in the ledger either way, so the
+    /// status names the flag **and** the reason rather than reporting a lost note.
+    #[test]
+    fn app_stage_failure_keeps_the_flag_and_names_the_reason() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.handle(agents_of(
+            "alpha",
+            vec![agent("w1:p1", "claude", "lastcall")],
+        ));
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Flag);
+        app.handle(Action::Note(NoteKey::Send));
+        app.flagged(root("alpha"), flagged_ok("EXPORT", 1, pile("alpha")));
+        assert_eq!(status(&app), "flagged f1 · staged to claude");
+
+        assert_eq!(
+            app.staged("claude".to_owned(), Err("pane is gone".to_owned())),
+            Changed::Yes
+        );
+        assert_eq!(status(&app), "flagged f1 · send failed: pane is gone");
+        assert!(
+            app.roots[&root("alpha")].row(b"f1").is_some(),
+            "the row is still pending: a flag does not accept it"
+        );
+
+        // A send that landed adds nothing: the optimistic line is already on screen.
+        app.handle(Action::Flag);
+        app.handle(Action::Note(NoteKey::Send));
+        app.flagged(root("alpha"), flagged_ok("EXPORT", 2, pile("alpha")));
+        assert_eq!(app.staged("claude".to_owned(), Ok(())), Changed::No);
+        assert_eq!(status(&app), "flagged f1 · staged to claude");
+    }
+
+    /// A key event as the terminal reports it.
+    fn note_key_event(code: KeyCode, modifiers: KeyModifiers) -> Event {
+        Event::Key(crossterm::event::KeyEvent::new(code, modifiers))
+    }
+
+    fn note_char(c: char) -> Event {
+        note_key_event(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    /// The note modal's line discipline. Enter sends; the bindings a terminal reports for a
+    /// deliberate line break (`Ctrl-J` everywhere, `Alt-Enter` and `Shift-Enter` where they
+    /// are reported at all) break the line instead; Esc closes it and writes nothing.
+    #[test]
+    fn app_note_modal_enter_sends_ctrl_j_and_alt_enter_break_the_line_esc_cancels() {
+        let km = Keymap::defaults();
+        let open = || {
+            let mut app = three_roots();
+            app.handle(Action::Resize(100, 30));
+            app.select(Some(row("alpha", "f1")));
+            app.handle(Action::Flag);
+            app
+        };
+        let feed = |app: &mut App, event: &Event| {
+            let action = note_action(event, &km).expect("the modal answers it");
+            app.handle(action)
+        };
+        let enter = note_key_event(KeyCode::Enter, KeyModifiers::NONE);
+
+        for newline in [
+            note_key_event(KeyCode::Char('j'), KeyModifiers::CONTROL),
+            note_key_event(KeyCode::Enter, KeyModifiers::ALT),
+            note_key_event(KeyCode::Enter, KeyModifiers::SHIFT),
+        ] {
+            let mut app = open();
+            for c in "one".chars() {
+                feed(&mut app, &note_char(c));
+            }
+            assert_eq!(feed(&mut app, &newline), (Changed::Yes, None));
+            feed(&mut app, &note_char('2'));
+            assert_eq!(app.note.as_ref().expect("open").text, "one\n2");
+            assert!(app.flagging.is_none(), "nothing is written yet");
+
+            let (_, effect) = feed(&mut app, &enter);
+            assert!(app.note.is_none(), "Enter closes it");
+            let Some(Effect::Flag { note, .. }) = effect else {
+                panic!("Enter sends: {effect:?}");
+            };
+            assert_eq!(note, "one\n2", "both lines, as typed");
+        }
+
+        // Backspace walks back a character at a time; Esc throws the lot away.
+        let backspace = note_key_event(KeyCode::Backspace, KeyModifiers::NONE);
+        let mut app = open();
+        feed(&mut app, &note_char('x'));
+        feed(&mut app, &backspace);
+        assert_eq!(app.note.as_ref().expect("open").text, "");
+        assert_eq!(
+            feed(&mut app, &backspace),
+            (Changed::No, None),
+            "nothing to delete, nothing to draw"
+        );
+        feed(&mut app, &note_char('y'));
+        let (changed, effect) = feed(&mut app, &note_key_event(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(
+            (changed, effect),
+            (Changed::Yes, None),
+            "Esc writes nothing"
+        );
+        assert!(app.note.is_none() && app.flagging.is_none());
+    }
+
+    /// A bracketed paste is one event carrying many characters, newlines included. It is
+    /// inserted whole and never taken as the Enter that sends — the guard that stops a
+    /// pasted multi-line note from firing off its first line.
+    #[test]
+    fn app_note_modal_paste_event_inserts_and_never_sends() {
+        let km = Keymap::defaults();
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Flag);
+
+        let pasted = "first line\nsecond line\n";
+        let action = note_action(&Event::Paste(pasted.to_owned()), &km).expect("paste is handled");
+        assert_eq!(action, Action::Note(NoteKey::Insert(pasted.to_owned())));
+        let (changed, effect) = app.handle(action);
+        assert_eq!(
+            (changed, effect),
+            (Changed::Yes, None),
+            "inserted, not sent"
+        );
+        let note = app.note.as_ref().expect("still open");
+        assert_eq!(note.text, pasted);
+        assert_eq!(note.cursor, pasted.len(), "the caret is after the paste");
+
+        // A second paste lands after the first, and Enter is still what sends.
+        app.handle(note_action(&Event::Paste("third".to_owned()), &km).expect("handled"));
+        let (_, effect) = app.handle(Action::Note(NoteKey::Send));
+        let Some(Effect::Flag { note, .. }) = effect else {
+            panic!("a flag effect: {effect:?}");
+        };
+        assert_eq!(note, "first line\nsecond line\nthird");
+    }
+
+    /// While the note is open the keymap is off: `q` and `a` are text, not quit and accept.
+    /// `Ctrl-C` is the exception — a modal must never be a trap you cannot leave — and it
+    /// quits without writing the note.
+    #[test]
+    fn app_note_modal_swallows_keymap_keys_but_ctrl_c_quits() {
+        let km = Keymap::defaults();
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Flag);
+
+        for c in "qa?rewfo".chars() {
+            assert_eq!(
+                note_action(&note_char(c), &km),
+                Some(Action::Note(NoteKey::Insert(c.to_string()))),
+                "{c} is text inside the modal"
+            );
+            app.handle(Action::Note(NoteKey::Insert(c.to_string())));
+        }
+        assert_eq!(app.note.as_ref().expect("open").text, "qa?rewfo");
+        assert!(!app.help, "no key escaped to the keymap");
+        assert!(app.confirm.is_none());
+
+        // A shifted letter is still a letter: `A` types an `A`, it does not accept the file.
+        assert_eq!(
+            note_action(
+                &note_key_event(KeyCode::Char('A'), KeyModifiers::SHIFT),
+                &km
+            ),
+            Some(Action::Note(NoteKey::Insert("A".to_owned())))
+        );
+
+        // Bindings the modal has no use for are swallowed rather than reaching the keymap.
+        for event in [
+            note_key_event(KeyCode::Tab, KeyModifiers::NONE),
+            note_key_event(KeyCode::PageDown, KeyModifiers::NONE),
+            note_key_event(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            note_key_event(KeyCode::Left, KeyModifiers::NONE),
+        ] {
+            assert_eq!(note_action(&event, &km), None, "{event:?} does nothing");
+        }
+
+        // Ctrl-C is the one binding that still fires, and it does not write the note.
+        let ctrl_c = note_key_event(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(note_action(&ctrl_c, &km), Some(Action::Quit));
+        let (_, effect) = app.handle(Action::Quit);
+        assert_eq!(effect, Some(Effect::Quit));
+        assert!(app.flagging.is_none(), "quitting writes no flag");
     }
 }
