@@ -20,7 +20,7 @@ use crate::config::{Config, DraftInitial, Loaded, Resolved};
 use crate::env::Env;
 use crate::git::{self, ConfigList, GitError, Oid, RepoGit};
 use crate::headstate::{self, HeadState, TransitionFacts};
-use crate::hunks::Hunk;
+use crate::hunks::{self, Hunk};
 use crate::index::{IndexError, PrivateIndex};
 use crate::ledger::{
     self, Clock, Ledger, LedgerError, LedgerLock, LoadResult, SeenAt, SystemClock, TreeEntries,
@@ -28,7 +28,7 @@ use crate::ledger::{
 use crate::ops::{FaultInjector, NoFault, Ops, OpsError, Outcome, Rendered};
 use crate::paths::{Layout, ParentId, ParentMeta, RepoPaths, RootId};
 use crate::roots::{self, Badge, DiscoverInputs, Discovery, RootsChanged};
-use crate::scan::{self, Pile, ScanError, ScanInputs};
+use crate::scan::{self, Pile, Row, ScanError, ScanInputs};
 use crate::store::{RepoFacts, RootKind, Store, StoreError};
 use crate::upstream::{self, Classifier};
 
@@ -910,6 +910,40 @@ impl Engine {
         v
     }
 
+    /// The hunks of one **collapsed** row, computed on demand and capped at
+    /// [`hunks::EXPAND_LINE_CAP`] body lines (§10 2026-09-05 ruling 1; Phase 6
+    /// deliverable 4). The `e` key's engine half — never part of a scan, because the
+    /// whole point of a collapsed class is that a lockfile rewrite does not pay a second
+    /// Myers pass on every rescan.
+    ///
+    /// The diff is computed from **the row's own** `baseline`/`current` oids, not from a
+    /// fresh resolution, so the expansion shows exactly the delta the row's counts were
+    /// rendered from even if the file has moved since. An oid the store cannot produce
+    /// reads as an empty side (invariant 2: over-show, never hide).
+    ///
+    /// The result is a view. It is never written back onto the [`Row`]: `accept_file` and
+    /// `accept_all` must stay whole-row for a collapsed path (§6.3 "single accept").
+    pub fn hunks_of(&self, root: &Path, row: &Row) -> Result<hunks::Expanded, EngineError> {
+        let state = self
+            .roots
+            .get(root)
+            .ok_or_else(|| EngineError::NoSuchRoot(root.to_path_buf()))?;
+        let mut wanted: Vec<Oid> = [&row.baseline, &row.current]
+            .into_iter()
+            .flatten()
+            .map(|e| e.oid.clone())
+            .collect();
+        wanted.sort();
+        wanted.dedup();
+        let blobs = state.store.cat_blobs(&wanted)?;
+        let side = |e: &Option<crate::scan::Entry>| -> Vec<u8> {
+            e.as_ref()
+                .and_then(|entry| blobs.get(&entry.oid).cloned())
+                .unwrap_or_default()
+        };
+        Ok(hunks::expand(&side(&row.baseline), &side(&row.current)))
+    }
+
     /// Re-inspect HEAD; when it moved (or an operation finished), scan and describe it.
     pub fn inspect_head(&mut self, root: &Path) -> Result<Option<HeadChange>, EngineError> {
         let state = self
@@ -1439,13 +1473,17 @@ pub(crate) mod tests {
         assert_eq!(pile.rows.len(), 3, "edit, add and delete are three rows");
         // Measured, not aspirational. This shape is 17 today (read-tree seeding aside:
         // one `update-index --refresh`, `diff-files`, three `ls-files`, the four-spawn
-        // head inspection, two `for-each-ref refs/remotes`, `hash-object --stdin-paths`,
-        // `cat-file --batch`, and rename detection's passes over the temp index). 1c
-        // reduces the *open*; the scan pipeline is not batchable without a redesign
-        // (see docs/dev/bench.md). The ceiling catches a regression.
+        // head inspection, **one** `for-each-ref refs/remotes` for the classification
+        // key, `hash-object --stdin-paths`, `cat-file --batch`, and rename detection's
+        // passes over the temp index). Phase 6 deliverable 5 removed the second listing:
+        // this shape re-uses a memoized classification, so it paid one listing already,
+        // but every scan whose key moved (a fetch, a commit) paid two and now pays one —
+        // `engine_classification_lists_remote_refs_once_per_scan` is the assertion, and
+        // the ceiling here tightened 18 → 17 to hold the win. 1c reduces the *open*; the
+        // scan pipeline is not batchable without a redesign (see docs/dev/bench.md).
         assert!(
-            scan_spawns <= 18,
-            "scanning one root costs {scan_spawns} git processes, budget 18"
+            scan_spawns <= 17,
+            "scanning one root costs {scan_spawns} git processes, budget 17"
         );
     }
 
@@ -2212,6 +2250,159 @@ pub(crate) mod tests {
         assert_eq!(
             scan::pile_lines(&engine.scan(&root).unwrap()),
             ["f1 upstream"]
+        );
+    }
+
+    /// Phase 6 deliverable 4: `e` on a collapsed row asks the engine for its hunks. The
+    /// scan still skips the second Myers pass; the expansion is computed from the row's
+    /// own oids, on demand, and never lands on the row.
+    #[test]
+    fn engine_hunks_of_expands_a_collapsed_row_without_touching_the_pile() {
+        let mut repo = FixtureRepo::new("eng-expand").unwrap();
+        let before: String = (0..40)
+            .map(|i| format!("  \"pkg-{i}\": \"1.0.0\",\n"))
+            .collect();
+        repo.commit_files(&[("package-lock.json", before.as_str())], "lock")
+            .unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let root = only_root(&engine);
+        let after: String = (0..40)
+            .map(|i| {
+                if i == 7 {
+                    "  \"pkg-7\": \"2.0.0\",\n".to_owned()
+                } else {
+                    format!("  \"pkg-{i}\": \"1.0.0\",\n")
+                }
+            })
+            .collect();
+        repo.write("package-lock.json", after);
+        let pile = engine.scan(&root).unwrap();
+        let row = pile.row(b"package-lock.json").unwrap().clone();
+        assert_eq!(row.collapsed, Some(crate::scan::Collapsed::Glob));
+        assert!(row.hunks.is_empty(), "the scan skips the hunk pass");
+
+        let expanded = engine.hunks_of(&root, &row).unwrap();
+        assert_eq!(expanded.omitted_lines, 0);
+        assert_eq!(expanded.hunks.len(), 1);
+        let inserted: Vec<String> = expanded.hunks[0]
+            .lines
+            .iter()
+            .filter(|(t, _)| *t == crate::hunks::Tag::Insert)
+            .map(|(_, l)| String::from_utf8_lossy(l).into_owned())
+            .collect();
+        assert_eq!(inserted, ["  \"pkg-7\": \"2.0.0\",\n"]);
+        // The pile is untouched: accept stays whole-row for a collapsed path.
+        assert!(
+            engine
+                .scan(&root)
+                .unwrap()
+                .row(b"package-lock.json")
+                .unwrap()
+                .hunks
+                .is_empty()
+        );
+    }
+
+    /// The cap is enforced where the UI reads it, not only in `hunks::truncate`.
+    #[test]
+    fn engine_hunks_of_caps_a_whole_file_rewrite() {
+        let mut repo = FixtureRepo::new("eng-expand-cap").unwrap();
+        let before: String = (0..3_000)
+            .map(|i| format!("  \"pkg-{i}\": \"1.0.0\",\n"))
+            .collect();
+        repo.commit_files(&[("package-lock.json", before.as_str())], "lock")
+            .unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let root = only_root(&engine);
+        let after: String = (0..3_000)
+            .map(|i| format!("  \"pkg-{i}\": \"9.9.9\",\n"))
+            .collect();
+        repo.write("package-lock.json", after);
+        let pile = engine.scan(&root).unwrap();
+        let row = pile.row(b"package-lock.json").unwrap().clone();
+        assert_eq!(row.collapsed, Some(crate::scan::Collapsed::Glob));
+
+        let expanded = engine.hunks_of(&root, &row).unwrap();
+        let shown: usize = expanded.hunks.iter().map(|h| h.lines.len()).sum();
+        assert_eq!(shown, crate::hunks::EXPAND_LINE_CAP);
+        assert!(
+            expanded.omitted_lines > 0,
+            "the footer has something to say"
+        );
+        assert_eq!(
+            shown + expanded.omitted_lines,
+            row.added + row.deleted,
+            "every body line of this rewrite is a change line"
+        );
+    }
+
+    /// An unknown root is an error, not a panic or an empty expansion.
+    #[test]
+    fn engine_hunks_of_on_an_unknown_root_is_no_such_root() {
+        let repo = FixtureRepo::new("eng-expand-noroot").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let engine = open_engine(&repo, &state, Config::default());
+        let row = Row {
+            path: b"x".to_vec(),
+            change: Change::Modified,
+            baseline: None,
+            current: None,
+            added: 0,
+            deleted: 0,
+            hunks: vec![],
+            annotation: None,
+            conflicted: false,
+            collapsed: Some(crate::scan::Collapsed::Glob),
+            flag: None,
+            rename: None,
+        };
+        let err = engine
+            .hunks_of(Path::new("/nope/not/a/root"), &row)
+            .unwrap_err();
+        assert!(matches!(err, EngineError::NoSuchRoot(_)), "{err:?}");
+    }
+
+    /// Phase 6 deliverable 5 (§11 "`for-each-ref refs/remotes` twice per scan"): the
+    /// listing that builds the memo key is the listing the classification is computed
+    /// with, so a scan lists the remote refs exactly once whether or not it recomputes.
+    #[test]
+    fn engine_classification_lists_remote_refs_once_per_scan() {
+        let repo = FixtureRepo::new("eng-refs-once").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let engine = open_engine(&repo, &state, Config::default());
+        let root = only_root(&engine);
+        let rs = engine.root(&root).unwrap();
+        let rg = rs.repo.as_ref().expect("a git root has a repo runner");
+        let live = headstate::inspect(rg).unwrap();
+
+        // `classify` no longer runs a listing of its own: with the caller's listing in
+        // hand, the no-seen-head early return spawns nothing at all (it cost one
+        // `for-each-ref` before this deliverable), and the key records what it was given.
+        let before = crate::git::thread_spawn_count();
+        let class = upstream::classify(rg, None, &live, None, "given".to_owned()).unwrap();
+        assert_eq!(
+            crate::git::thread_spawn_count() - before,
+            0,
+            "classify runs no git process before its early return"
+        );
+        assert_eq!(class.key.remotes, "given");
+
+        // And the memoized path costs exactly the one listing that builds the key.
+        let mut classifier = Classifier::default();
+        let seen_head = rs.seen_head().cloned();
+        classifier
+            .get(rg, seen_head.as_ref(), &live, None)
+            .expect("first classification");
+        let before = crate::git::thread_spawn_count();
+        classifier
+            .get(rg, seen_head.as_ref(), &live, None)
+            .expect("cached classification");
+        assert_eq!(
+            crate::git::thread_spawn_count() - before,
+            1,
+            "one `for-each-ref refs/remotes` per scan, and nothing else when cached"
         );
     }
 
