@@ -82,9 +82,12 @@ impl Classifier {
         state: &HeadState,
         user_email: Option<&str>,
     ) -> Result<&Classification, GitError> {
-        let key = ClassifyKey::of(seen_head, state, remote_refs(rg)?);
+        // One `for-each-ref refs/remotes` per scan: the listing that builds the key is the
+        // listing `classify` keys its result on (§10 2026-09-04, Phase 6 deliverable 5).
+        let remotes = remote_refs(rg)?;
+        let key = ClassifyKey::of(seen_head, state, remotes.clone());
         if self.cached.as_ref().is_none_or(|c| c.key != key) {
-            self.cached = Some(classify(rg, seen_head, state, user_email)?);
+            self.cached = Some(classify(rg, seen_head, state, user_email, remotes)?);
         }
         Ok(self.cached.as_ref().expect("just filled"))
     }
@@ -144,14 +147,18 @@ pub fn parse_log(bytes: &[u8]) -> Vec<LogEntry> {
     out
 }
 
-/// Compute the classification now (see the module docs).
+/// Compute the classification now (see the module docs). `remotes` is the caller's own
+/// `for-each-ref refs/remotes` listing ([`remote_refs`]) — passed in rather than re-run so
+/// one scan lists the remote refs exactly once, and so the key records the listing this
+/// classification was actually computed against.
 pub fn classify(
     rg: &RepoGit,
     seen_head: Option<&Oid>,
     state: &HeadState,
     user_email: Option<&str>,
+    remotes: String,
 ) -> Result<Classification, GitError> {
-    let key = ClassifyKey::of(seen_head, state, remote_refs(rg)?);
+    let key = ClassifyKey::of(seen_head, state, remotes);
     let mut heads: Vec<Oid> = Vec::new();
     heads.extend(state.head.clone());
     heads.extend(state.merge_head.clone());
