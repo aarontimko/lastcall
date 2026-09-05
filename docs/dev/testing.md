@@ -40,7 +40,8 @@ lib + 6 binary main = **422**, the Phase 7 floor; Phase 7 (the engine half: rest
 the export renderer and the ledger's 1.1 schema; then the TUI half: the two-column overlay,
 restore, the note modal, the picker and the export fallback, whose reducer tests are the last
 13 of the binary lib's count): 255 engine + 34 testkit + 187 binary lib + 6 binary main =
-**482**).
+**482**; then the verifier (b) review-fix pass, which added seven reducer and render tests
+for F1–F5: 255 engine + 34 testkit + 194 binary lib + 6 binary main = **489**).
 The suite never shrinks across commits. One recorded exception: at the Phase 2 code review
 the three filesystem-live watcher tests (up to 30 s waits, real FSEvents) left the unit tier
 for `crates/lastcall-engine/tests/test_integration_watcher.rs` because they contradicted the
