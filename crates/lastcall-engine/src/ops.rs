@@ -680,6 +680,54 @@ impl Ops<'_> {
         Ok(baseline)
     }
 
+    /// Refuse a restore whose worktree bytes are **not reproducible** from the blob they
+    /// hashed to (verifier F2).
+    ///
+    /// Everything a restore writes goes out through `cat-file --filters`, which is what
+    /// `git checkout` would write. Under `text=auto eol=crlf` that reproduces the user's
+    /// CRLF file exactly. Under **bare** `* text=auto` on a native-LF platform it does not:
+    /// git cleans CRLF to LF on the way in and writes LF on the way out, so a file the user
+    /// keeps with CRLF endings comes back LF. Restoring one hunk of such a file rewrote
+    /// every line ending in it, and — because the canonical blob then matched — the pile
+    /// came back clean, so lastcall could not even show what it had done (invariant 2,
+    /// "over-show, never hide").
+    ///
+    /// The guard is a round trip: materialise the **current** oid (the one the entry CAS
+    /// just verified) through the same filters and compare with the live bytes. Equal means
+    /// the worktree representation is reproducible and a restore can write it back
+    /// faithfully; different means it is not, and lastcall refuses rather than normalising
+    /// the user's line endings behind their back. One extra `cat-file` per restore, and it
+    /// refuses only the genuinely lossy case.
+    ///
+    /// Exempt, all for want of content to compare: draft roots (raw-byte model, no
+    /// filters), symlinks (the blob is the link text), deletion restores (`oid == None`,
+    /// nothing on disk) and mode-only restores (which return before this).
+    fn round_trip_guard(&self, rendered: &Rendered) -> Result<(), Refused> {
+        if self.store.kind() != RootKind::Git || rendered.mode == Some(Mode::Symlink) {
+            return Ok(());
+        }
+        let Some(oid) = rendered.oid.as_ref() else {
+            return Ok(());
+        };
+        let full = self.store.root().join(OsStr::from_bytes(&rendered.path));
+        // Unreadable is the entry CAS's business, not this guard's.
+        let Ok(live) = std::fs::read(&full) else {
+            return Ok(());
+        };
+        let refuse = |reason: &str| {
+            Err(Refused::Unhashable {
+                path: rendered.path.clone(),
+                reason: reason.to_string(),
+            })
+        };
+        match crate::restore::materialise(self.store, oid, &rendered.path) {
+            Ok(back) if back == live => Ok(()),
+            Ok(_) => refuse("eol conversion is not round-trippable"),
+            // A conversion we cannot run is never a licence to write.
+            Err(_) => refuse("cannot reproduce the worktree bytes"),
+        }
+    }
+
     /// The bytes `content` should become on disk at `path`: through git's smudge/eol
     /// conversion on a git root, unchanged on a draft root (F2).
     fn restore_bytes(&self, path: &[u8], content: &[u8]) -> Result<Vec<u8>, OpsError> {
@@ -826,6 +874,11 @@ impl Ops<'_> {
                 }),
             };
         }
+        // Before any temp file exists: the user's bytes must be reproducible from the blob
+        // we are about to splice into, or nothing is written at all (F2).
+        if let Err(r) = self.round_trip_guard(rendered) {
+            return refuse(r);
+        }
         let base_bytes = match &baseline {
             Baseline::Present { oid, .. } => self.store.cat_blob(oid)?,
             Baseline::Absent | Baseline::Empty => Vec::new(),
@@ -873,6 +926,13 @@ impl Ops<'_> {
             Ok(b) => b,
             Err(r) => return refuse(r),
         };
+        // A removal has no representation to preserve; every other arm writes bytes over
+        // the user's file and must prove the round trip first (F2).
+        let removes = matches!(&baseline, Baseline::Absent)
+            || matches!(&baseline, Baseline::Empty if self.empty_baseline_means_absent());
+        if !removes && let Err(r) = self.round_trip_guard(rendered) {
+            return refuse(r);
+        }
         let mut before = Self::second_cas(rendered, self.store, fault);
         match &baseline {
             Baseline::Absent => self.restore_write(&rendered.path, None, None, &mut before),
@@ -1703,6 +1763,29 @@ mod tests {
             other => panic!("expected a filter refusal, got {other:?}"),
         }
         assert_eq!(std::fs::read(repo.path().join("f1")).unwrap(), b"edited\n");
+    }
+
+    /// The round-trip guard (F2) refuses only the genuinely lossy case. A plain LF file
+    /// under the same bare `* text=auto` that refuses a CRLF file round-trips exactly —
+    /// clean to LF, smudge to LF — so it restores as it always did. Without this the guard
+    /// would be a blanket refusal of every `text=auto` repo, which is most of them.
+    #[test]
+    fn ops_restore_under_bare_text_auto_still_restores_a_plain_lf_file() {
+        let mut repo = FixtureRepo::new("ops-restore-lf").unwrap();
+        repo.write(".gitattributes", "* text=auto\n");
+        repo.write("lf.txt", "a\nb\nc\n");
+        repo.commit("attrs").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        repo.write("lf.txt", "a\nB\nc\n");
+        let r = rendered(&h, b"lf.txt");
+        let out = h.ops().restore_file(&r, &NoFault).unwrap();
+        assert!(out.ok(), "an LF file is round-trippable: {out:?}");
+        assert_eq!(
+            std::fs::read(repo.path().join("lf.txt")).unwrap(),
+            b"a\nb\nc\n",
+            "restored to the baseline, endings untouched"
+        );
     }
 
     #[test]

@@ -564,6 +564,59 @@ fn scenario_d3_crlf_restore_keeps_crlf() {
     assert_pile!(s.engine, s.root, "", "D3 restore clears the row");
 }
 
+/// The D3 case `scenario_d3_crlf_restore_keeps_crlf` deliberately steps around: **bare**
+/// `* text=auto`, where the worktree representation is *not* reproducible from the blob.
+///
+/// Git cleans the user's CRLF file to an LF blob on the way in and writes LF on the way
+/// out, so `cat-file --filters` cannot put the CRLF back. Restoring one hunk used to
+/// rewrite all three line endings and then report a clean pile, so the damage was invisible
+/// as well as unasked-for. The round-trip guard refuses instead (verifier F2, ruled option
+/// (a)): restore never normalises line endings behind the user's back.
+#[test]
+fn scenario_d3_crlf_restore_under_bare_text_auto_is_refused() {
+    let mut repo = FixtureRepo::new("d3-restore-bare").unwrap();
+    repo.commit_files(
+        &[
+            (".gitattributes", "* text=auto\n"),
+            ("crlf.txt", "a\r\nb\r\nc\r\n"),
+        ],
+        "crlf",
+    )
+    .unwrap();
+    let mut s = Fresh::over(repo, Config::default(), EngineOptions::default(), false);
+    let original = s.bytes_at("crlf.txt");
+    assert_eq!(original, b"a\r\nb\r\nc\r\n", "the worktree keeps CRLF");
+
+    let edited = "a\r\nB\r\nc\r\n";
+    s.repo.write("crlf.txt", edited);
+    let pile_before = s.scan();
+    let row = s.row("crlf.txt");
+    assert_eq!(row.hunks.len(), 1, "one changed line");
+
+    let out = s.restore_hunk("crlf.txt", 0);
+    match out.outcome.refused.first() {
+        Some(r @ Refused::Unhashable { reason, .. }) => {
+            assert_eq!(reason, "eol conversion is not round-trippable");
+            assert!(
+                r.message("restored").ends_with("not restored"),
+                "the refusal says what did not happen: {}",
+                r.message("restored")
+            );
+        }
+        other => panic!("expected a round-trip refusal, got {other:?}"),
+    }
+    assert_eq!(
+        s.bytes_at("crlf.txt"),
+        edited.as_bytes(),
+        "the user's bytes are untouched — including the two endings the restore would have rewritten"
+    );
+    assert_eq!(
+        common::pile_string(&s.scan()),
+        common::pile_string(&pile_before),
+        "the pile is unchanged: nothing was hidden"
+    );
+}
+
 #[test]
 fn scenario_d4_restore_deletion_refuses_on_a_case_collision() {
     let mut s = Fresh::new("d4-restore");
