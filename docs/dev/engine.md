@@ -384,8 +384,10 @@ guards stand between the request and the write, in this order:
 2. **The round-trip guard** (verifier F2). Before any temp file exists, the baseline blob is
    materialised through the store's own eol conversion and compared with the bytes on disk.
    If they differ — a `text=auto` root whose worktree holds CRLF that git would rewrite —
-   the restore is refused (`Unhashable`, "eol conversion is not round-trippable") rather
-   than silently rewriting the user's line endings. Restore never normalises behind the
+   the restore is refused (`Refused::NotRoundTrippable`, `<path>: eol conversion is not
+   round-trippable; not restored`) rather than silently rewriting the user's line endings.
+   Its own variant, not an `Unhashable` reason: the file hashed perfectly well — hashing it
+   is how the guard knows — and the status line should not say otherwise (verifier (b) F7). Restore never normalises behind the
    user's back.
 3. **The hunk CAS** (verifier F3). The file not having moved is not enough: `hunks::expand`
    truncates at a line cap, so an expanded collapsed row can hand over a *partial* hunk

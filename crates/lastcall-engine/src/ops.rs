@@ -103,6 +103,11 @@ pub enum Refused {
     BaselineMoved { path: Vec<u8> },
     /// The path cannot be hashed (typechange, EACCES, failing filter).
     Unhashable { path: Vec<u8>, reason: String },
+    /// The baseline blob does not come back through the store's eol conversion as the bytes
+    /// on disk, so writing it would rewrite the user's line endings behind their back
+    /// (verifier F2's guard). Its own variant rather than an `Unhashable` reason because
+    /// the file hashed perfectly well — hashing it is how the guard knows (verifier (b) F7).
+    NotRoundTrippable { path: Vec<u8> },
     /// `accept_deletion` on a path that still exists (A7), or a deletion **restore** whose
     /// name is taken. `collides_with` names the directory entry that is in the way when it
     /// is not the path's own name byte-for-byte — on a case-folding root `f1` is refused
@@ -144,6 +149,12 @@ impl Refused {
             }
             Refused::Unhashable { path, reason } => {
                 format!("{}: cannot hash ({reason}); not {verb}", lossy(path))
+            }
+            Refused::NotRoundTrippable { path } => {
+                format!(
+                    "{}: eol conversion is not round-trippable; not {verb}",
+                    lossy(path)
+                )
             }
             Refused::StillPresent {
                 path,
@@ -736,7 +747,9 @@ impl Ops<'_> {
         };
         match crate::restore::materialise(self.store, oid, &rendered.path) {
             Ok(back) if back == live => Ok(()),
-            Ok(_) => refuse("eol conversion is not round-trippable"),
+            Ok(_) => Err(Refused::NotRoundTrippable {
+                path: rendered.path.clone(),
+            }),
             // A conversion we cannot run is never a licence to write.
             Err(_) => refuse("cannot reproduce the worktree bytes"),
         }

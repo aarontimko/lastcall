@@ -595,12 +595,12 @@ fn scenario_d3_crlf_restore_under_bare_text_auto_is_refused() {
 
     let out = s.restore_hunk("crlf.txt", 0);
     match out.outcome.refused.first() {
-        Some(r @ Refused::Unhashable { reason, .. }) => {
-            assert_eq!(reason, "eol conversion is not round-trippable");
-            assert!(
-                r.message("restored").ends_with("not restored"),
-                "the refusal says what did not happen: {}",
-                r.message("restored")
+        // Verifier (b) F7: the refusal is its own variant, and its message does not claim
+        // the file could not be hashed — hashing it is how the guard knows.
+        Some(r @ Refused::NotRoundTrippable { .. }) => {
+            assert_eq!(
+                r.message("restored"),
+                "crlf.txt: eol conversion is not round-trippable; not restored"
             );
         }
         other => panic!("expected a round-trip refusal, got {other:?}"),
