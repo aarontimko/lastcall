@@ -1168,8 +1168,57 @@ fn keys_label(specs: &[impl AsRef<str>]) -> String {
 }
 
 /// The keymap's rows, then the modal's fixed keys, then the mouse note.
+/// Spaces between the two columns of the wide help overlay.
+const HELP_GUTTER: usize = 3;
+
+/// The key rows as the overlay's body: one column, or two when one does not fit.
+///
+/// The overlay has grown a keymap row at a time and it now overflows a 30-line terminal —
+/// and it overflows *silently*, because the body is drawn with `take(inner.height)`: the
+/// rows past the bottom are simply not there, and the help that is supposed to be the
+/// answer to "what are the keys" stops naming half of them. Two columns are the cheapest
+/// fix that keeps every row on screen.
+///
+/// The trigger is the overflow itself (`rows + 4 > area.height`, the same arithmetic the
+/// caller's `height` clamps with) plus enough width for a second column. Order reads **down
+/// the first column, then down the second** — the keymap's own order, so a reader looking
+/// for a key finds it where the config file has it. A short terminal that is also narrow
+/// gets one column and the old truncation; there is nothing better to do with 40 columns.
+fn help_columns(keys: &[String], area: Rect) -> Vec<String> {
+    // `+ 2` for the blank and SELECT_NOTE below the body, `+ 4` for the border, the pad and
+    // the `any key closes` line — the overlay's fixed overhead.
+    if keys.len() + 2 + 4 <= area.height as usize {
+        return keys.to_vec();
+    }
+    let split = keys.len().div_ceil(2);
+    let (left, right) = keys.split_at(split);
+    let width_of = |rows: &[String]| rows.iter().map(|r| r.width()).max().unwrap_or(0);
+    // Each column is only as wide as its own rows need. Padding both to the widest row in
+    // the whole table would cost the columns the very width the second one needs.
+    let stride = width_of(left) + HELP_GUTTER;
+    if stride + width_of(right) + 4 > area.width as usize {
+        // Two columns would have to be truncated to fit, which is the failure this is
+        // fixing. One column and the old vertical clipping is no worse.
+        return keys.to_vec();
+    }
+    left.iter()
+        .enumerate()
+        .map(|(i, l)| match right.get(i) {
+            Some(r) => {
+                let mut line = l.clone();
+                line.push_str(&" ".repeat(stride - l.width()));
+                line.push_str(r);
+                line
+            }
+            // An odd count leaves the last left-column row alone rather than padding it to
+            // a column width nothing sits beside.
+            None => l.clone(),
+        })
+        .collect()
+}
+
 fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
-    let mut rows: Vec<String> = app
+    let keys: Vec<String> = app
         .keymap
         .iter()
         .map(|(name, specs)| (name.as_str(), keys_label(specs)))
@@ -1180,6 +1229,7 @@ fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
         )
         .map(|(name, keys)| format!("{keys:<14} {}", Action::describe(name)))
         .collect();
+    let mut rows = help_columns(&keys, area);
     rows.push(String::new());
     rows.push(SELECT_NOTE.to_owned());
     let width = (rows.iter().map(|r| r.width()).max().unwrap_or(0) + 4).min(area.width as usize);
@@ -1633,6 +1683,89 @@ mod tests {
         assert!(frame.contains("Esc / h / ←    back"), "{frame}");
         // Ruling 3: the mouse note, until Phase 8's select-to-copy.
         assert!(frame.contains(SELECT_NOTE), "{frame}");
+    }
+
+    /// Deliverable 8: the overlay goes to two columns rather than losing rows off the
+    /// bottom.
+    ///
+    /// `take(inner.height)` truncates in silence, so a 30-line terminal showed a "keys"
+    /// panel that did not list the keys. The trigger is the overflow, not the row count, so
+    /// the same keymap in a taller terminal keeps the one-column form.
+    #[test]
+    fn render_help_uses_two_columns_only_when_one_does_not_fit() {
+        let mut app = App::new();
+        // 31 rows total: the keymap's own, plus filler, plus the two modal rows. Named
+        // explicitly so the layout under test does not drift with the keymap's length.
+        let modal = MODAL_KEYS.len();
+        while app.keymap.len() + modal < 31 {
+            let n = app.keymap.len();
+            app.keymap
+                .push((format!("filler_{n}"), vec![format!("f{n}")]));
+        }
+        app.keymap.truncate(31 - modal);
+        assert_eq!(app.keymap.len() + modal, 31);
+        app.help = true;
+
+        // Short: two columns, and every row is on screen.
+        let (frame, _) = frame_of(&app, 100, 30);
+        let first = &app.keymap[0].0;
+        let last_left = &app.keymap[31usize.div_ceil(2) - 1].0;
+        let first_right = &app.keymap[31usize.div_ceil(2)].0;
+        let row_of = |name: &str| -> String {
+            let d = Action::describe(name);
+            frame
+                .lines()
+                .find(|l| l.contains(d) && !d.is_empty())
+                .unwrap_or_else(|| panic!("no row for {name} ({d:?}) in\n{frame}"))
+                .to_owned()
+        };
+        // The first row of each column shares a line: order runs down, then across.
+        let top = row_of(first);
+        assert!(
+            top.contains(Action::describe(first_right)),
+            "column one's first row and column two's first row share a line:\n{top}"
+        );
+        assert!(
+            !row_of(last_left).contains(Action::describe(first)),
+            "and the columns are not one long row"
+        );
+        for (name, _) in &app.keymap {
+            let d = Action::describe(name);
+            if !d.is_empty() {
+                assert!(
+                    frame.contains(d),
+                    "row {name:?} fell off the overlay:\n{frame}"
+                );
+            }
+        }
+        assert!(frame.contains(SELECT_NOTE), "{frame}");
+        assert!(frame.contains("any key closes"), "{frame}");
+
+        // Tall: the same rows fit in one column, so nothing is doubled up.
+        let (tall, _) = frame_of(&app, 100, 45);
+        let top = tall
+            .lines()
+            .find(|l| l.contains(Action::describe(first)))
+            .unwrap();
+        assert!(
+            !top.contains(Action::describe(first_right)),
+            "one column at 45 lines:\n{top}"
+        );
+        for (name, _) in &app.keymap {
+            let d = Action::describe(name);
+            if !d.is_empty() {
+                assert!(tall.contains(d), "row {name:?} missing:\n{tall}");
+            }
+        }
+
+        // Narrow and short: one column is all there is room for, truncation and all.
+        let keys: Vec<String> = (0..31).map(|i| format!("k{i:<12} does a thing")).collect();
+        assert_eq!(
+            help_columns(&keys, Rect::new(0, 0, 40, 30)).len(),
+            31,
+            "40 columns cannot hold two"
+        );
+        assert_eq!(help_columns(&keys, Rect::new(0, 0, 100, 30)).len(), 16);
     }
 
     /// Under the modal the hint line names only the keys that work there: the modal's

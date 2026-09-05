@@ -321,6 +321,22 @@ frames, and they join `tui_accept_controls`, `tui_herdr_scope_notice` and `tui_h
 the pass's input at the Phase 9 kickoff. Nothing in the status line, the header ladder or
 the scope notice moved.
 
+Phase 7 answers that sizing question rather than deferring it: the overlay is **two
+columns** when one column does not fit. `render_help` builds the key rows, then
+`help_columns` measures them — one column stands while `rows + 2 + 4 <= area.height` (the
+`+ 2` is the blank line and `SELECT_NOTE`, the `+ 4` the border, the pad and the `any key
+closes` line); past that it splits the rows in half with `div_ceil`, pads column one to its
+own widest row plus `HELP_GUTTER` (3 spaces) and joins column two beside it. Reading order
+runs **down column one, then down column two** — not across — so the keymap's order is
+still the order you read. If the two columns plus the border would not fit the width, the
+overlay stays one column and clips as before: narrow beats scrambled. `SELECT_NOTE` and
+`any key closes` are never columnised; they stay full width under the body. The frames are
+`tui_help_overlay` (100×30) and `tui_help_overlay_tall` (100×45): 23 rows still fit one
+column at 30 lines, and Phase 7's four new keys (`u`, `U`, `m`, `M`) take it to 27, which
+is where the split starts — the tall frame is the control that keeps one column pinned.
+The pair is the design pass's input on whether a two-column box is the right answer for a
+keymap that keeps growing.
+
 ### The `[keys]` table (`config.toml`)
 
 ```toml

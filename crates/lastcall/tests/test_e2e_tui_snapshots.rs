@@ -593,6 +593,23 @@ fn tui_help_overlay() {
     snapshot("tui_help_overlay", &app, W, H);
 }
 
+/// The same overlay with room to breathe: one column, every row on its own line.
+///
+/// The two-column form (deliverable 8) is a response to a terminal too short to hold the
+/// rows, so the tall terminal is the control — it proves the layout switched for the reason
+/// claimed and not because the table grew.
+#[test]
+fn tui_help_overlay_tall() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    app.handle(Action::NavDown);
+    app.handle(Action::NavDown);
+    app.handle(Action::Help);
+    assert!(app.help);
+    snapshot("tui_help_overlay_tall", &app, W, 45);
+}
+
 #[test]
 fn tui_narrow_60x20() {
     let scene = Scene::build();
