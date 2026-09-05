@@ -1769,6 +1769,37 @@ fn pty_flag_note_exports_when_standalone() {
         "still the modal, not a quit"
     );
 
+    // Verifier (b) F6: the two ways a note gets a second line, through the real crossterm
+    // reader rather than through `note_action`. A raw `0x0a` is what a terminal sends for
+    // `Ctrl-J`, the modal's newline…
+    pty.send(b"\n").expect("ctrl-j");
+    pty.send("and so does the next one".as_bytes())
+        .expect("line two");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        s.contents().contains("and so does the next one")
+    })
+    .unwrap_or_else(|e| panic!("the second line is echoed: {e}"));
+
+    // …and a bracketed paste is one event carrying newlines of its own. This is the
+    // failure `tui.md` calls the worst this modal has: firing off the first line and
+    // dropping the rest. Nothing is sent until the `\r` below. (The `Ctrl-J` first is the
+    // reader opening a line for it; the paste itself brings only its own newline.)
+    pty.send(b"\n").expect("ctrl-j");
+    pty.send(b"\x1b[200~pasted line 3\npasted line 4\x1b[201~")
+        .expect("the paste");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        s.contents().contains("pasted line 4")
+    })
+    .unwrap_or_else(|e| panic!("the pasted lines are echoed: {e}"));
+    assert!(
+        pty.screen_text().contains("f1 · hunk 2 of 2"),
+        "still the modal: the paste's newlines did not send it"
+    );
+
+    /// The note as the four lines are typed, pasted and echoed above.
+    const NOTE: &str =
+        "this line looks wrong · q\nand so does the next one\npasted line 3\npasted line 4";
+
     let t = Instant::now();
     pty.send(b"\r").expect("enter");
     pty.wait_for(OVERLOADED, |s| {
@@ -1790,20 +1821,22 @@ fn pty_flag_note_exports_when_standalone() {
     let ledger = fx.ledger("alpha");
     let flags = &ledger["overrides"]["f1"]["flags"];
     assert_eq!(flags.as_array().map(Vec::len), Some(1), "{ledger}");
-    assert_eq!(
-        flags[0]["note"].as_str(),
-        Some("this line looks wrong · q"),
-        "{ledger}"
-    );
+    assert_eq!(flags[0]["note"].as_str(), Some(NOTE), "{ledger}");
     assert_eq!(flags[0]["hunk"]["index"].as_u64(), Some(1), "{ledger}");
     assert_eq!(
         ledger["overrides"]["f1"]["flag"]["note"].as_str(),
-        Some("this line looks wrong · q"),
+        Some(NOTE),
         "the 1.0 mirror is written too: {ledger}"
     );
 
     let path = export_file(&fx.state, "alpha");
     let actual = normalise_export(&std::fs::read_to_string(&path).expect("the export file"));
+    for line in NOTE.lines() {
+        assert!(
+            actual.contains(line),
+            "every line of the note reaches the export:\n{actual}"
+        );
+    }
     if std::env::var_os("LASTCALL_UPDATE_GOLDEN").is_some() {
         std::fs::write(FLAG_EXPORT_PTY_GOLDEN, &actual).expect("write golden");
         note(&format!("golden rewritten: {FLAG_EXPORT_PTY_GOLDEN}"));

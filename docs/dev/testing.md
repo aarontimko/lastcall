@@ -180,7 +180,12 @@ hunk, then the file, comparing the bytes on disk with the baseline blob),
 `pty_restore_refused_when_the_file_moved` (the file is renamed under the running loop and
 the refusal is read off the status line), `pty_restore_deletion_recreates_the_file`, and
 `pty_flag_note_exports_when_standalone`, which types a note into the modal with **no herdr
-link** and reads the export back out of the state dir against `flag_export_pty.md`. No PTY
+link** and reads the export back out of the state dir against `flag_export_pty.md`. The note
+it types is four lines and gets there both ways a note can: a raw `0x0a` (what the terminal
+sends for `Ctrl-J`) and a bracketed paste carrying a newline of its own, both through the
+real crossterm reader — so the failure `tui.md` calls the worst this modal has, firing off
+the first line and dropping the rest, is now proven absent end to end and not only in the
+reducer (verifier (b) F6). No PTY
 scene talks to herdr: only `just test-integration-herdr` proves the real pane. The staged
 send is covered in three places, and it takes all three — verifier (b) F1 found that the two
 end tests both passed while the middle was missing, because nothing in the loop built
