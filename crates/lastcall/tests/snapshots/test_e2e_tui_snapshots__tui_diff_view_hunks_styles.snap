@@ -10,7 +10,7 @@ expression: style
 2 28..30 Reset Reset BOLD
 2 35..37 Green Reset -
 2 38..40 Red Reset -
-2 84..99 Reset Reset DIM
+2 67..99 Reset Reset DIM
 2 99..100 Cyan Reset -
 3 27..28 Cyan Reset -
 3 28..99 Reset Reset REVERSED
@@ -51,7 +51,7 @@ expression: style
 12 27..28 Cyan Reset -
 12 99..100 Cyan Reset -
 13 27..45 Cyan Reset -
-13 89..99 Reset Reset DIM
+13 68..99 Reset Reset DIM
 13 99..100 Cyan Reset -
 14 12..14 Green Reset -
 14 15..17 Red Reset -

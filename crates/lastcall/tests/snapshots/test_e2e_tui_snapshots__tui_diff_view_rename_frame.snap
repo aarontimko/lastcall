@@ -5,7 +5,7 @@ expression: frame
 "lastcall  3 repos · 5 files · 5 hunks  standalone  [Accept All]                           watching W"
 "┌──────────────────────────┬───────────────────────────────────────────────────────────────────────┐"
 "│alpha                     │d/new.rs  A  +10 −0  (renamed from d/old.rs 90%)        [A accept file]│"
-"│  main · 2 files          │@@ -0,0 +1,10 @@                                             [a accept]│"
+"│  main · 2 files          │@@ -0,0 +1,10 @@                        [a accept] [u restore] [m flag]│"
 "│  A new.rs  +10 −0        │+l1                                                                    │"
 "│  D old.rs  +0 −10        │+L2                                                                    │"
 "│──────────────────────────│+l3                                                                    │"

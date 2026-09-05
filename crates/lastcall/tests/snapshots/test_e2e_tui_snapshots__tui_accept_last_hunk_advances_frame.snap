@@ -4,8 +4,8 @@ expression: frame
 ---
 "lastcall  3 repos · 4 files · 4 hunks  standalone  [Accept All]                           watching W"
 "┌──────────────────────────┬───────────────────────────────────────────────────────────────────────┐"
-"│alpha                     │f2  M  +1 −1                                            [A accept file]│"
-"│  main · 1 file           │@@ -1,2 +1,2 @@                                              [a accept]│"
+"│alpha                     │f2  M  +1 −1                           [A accept file] [U restore file]│"
+"│  main · 1 file           │@@ -1,2 +1,2 @@                         [a accept] [u restore] [m flag]│"
 "│  M f2  +1 −1             │ b                                                                     │"
 "│──────────────────────────│-agent edit                                                            │"
 "│beta                      │+agent edit after seen                                                 │"

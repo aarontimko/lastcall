@@ -4,7 +4,7 @@ expression: frame
 ---
 "lastcall  3 repos · 4 files · 3 hunks  standalone  [Accept All]                           watching W"
 "┌──────────────────────────┬───────────────────────────────────────────────────────────────────────┐"
-"│alpha                     │package-lock.json  M  +1,400 −1,400                     [A accept file]│"
+"│alpha                     │package-lock.json  M  +1,400 −1,400    [A accept file] [U restore file]│"
 "│  main · 1 file           │collapsed (glob) · +1,400 −1,400                             [e expand]│"
 "│  M pack… ⊟  +1,400 −1,400│@@ -1,1400 +1,600 @@                                                   │"
 "│──────────────────────────│-    "pkg-0": { "version": "1.0.0" },                                  │"

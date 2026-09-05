@@ -813,9 +813,15 @@ fn render_main(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
                 .get(root)
                 .and_then(|v| v.row(path).map(|r| (v, r)))
             {
-                let mut header = row_header(row);
                 let control = format!("[{} accept file]", control_key(app, "accept_file"));
                 let restore = format!("[{} restore file]", control_key(app, "restore_file"));
+                // The header is built knowing what will be right-aligned after it, so the
+                // flag marker takes the leftover and not the controls' room.
+                let used = row_header(row, 0).width();
+                let mut header = row_header(
+                    row,
+                    marker_budget(area.width, used, &[control.as_str(), restore.as_str()]),
+                );
                 // Two controls here, not three: `[m flag]` is a hunk control, and the nav's
                 // own `m` (which flags the file) has no header line to hang off.
                 let at = right_align_run(
@@ -877,7 +883,7 @@ fn push_notices(lines: &mut Vec<Line<'static>>, notices: &[String]) {
 }
 
 /// `<path>  <letter>  +a −d  [annotation]  (renamed from <old> 90%)`
-fn row_header(row: &Row) -> Line<'static> {
+fn row_header(row: &Row, budget: usize) -> Line<'static> {
     let mut spans = vec![
         Span::styled(row.path_lossy(), bold()),
         Span::raw(format!("  {}  ", letter(row.change))),
@@ -903,9 +909,37 @@ fn row_header(row: &Row) -> Line<'static> {
         None => {}
     }
     if let Some(f) = row.flags.first() {
-        spans.push(Span::raw(format!("  ⚑ {}", f.note)));
+        // Bounded, and the first line only. A note is whatever the reviewer typed — it can
+        // be a paragraph, and it can contain newlines — and this is a one-line header with
+        // the file's controls right-aligned after it. `budget` is what is left once those
+        // are reserved, so the marker never costs the reader a control.
+        if let Some(text) = flag_marker(&f.note, budget) {
+            spans.push(Span::raw(text));
+        }
     }
     Line::from(spans)
+}
+
+/// `  ⚑ <the note's first line>` in at most `budget` columns, or `None` when there is not
+/// enough room to say anything. Shared by the file header and the hunk header so both mark
+/// a flag the same way.
+fn flag_marker(note: &str, budget: usize) -> Option<String> {
+    const PREFIX: usize = 4; // "  ⚑ "
+    if budget < PREFIX + 2 {
+        return None;
+    }
+    let first = note.lines().next().unwrap_or("");
+    if first.is_empty() {
+        return None;
+    }
+    Some(format!("  ⚑ {}", ellipsize(first, budget - PREFIX)))
+}
+
+/// What is left of `width` for a flag marker on a line already holding `used` columns and
+/// about to get a right-aligned run of `controls` (which `right_align` pads by two).
+fn marker_budget(width: u16, used: usize, controls: &[&str]) -> usize {
+    let run = controls.join(" ").width() + 2;
+    (width as usize).saturating_sub(used + run)
 }
 
 fn render_row_body(
@@ -1057,27 +1091,32 @@ fn render_hunks(
             let row_rect = Rect::new(area.x, area.y + y, area.width, 1);
             if within == 0 {
                 hits.targets.push((row_rect, Target::DiffHunk(h)));
-                if let Some(note) = flag_note_for(flags, hunk) {
-                    // The note reads beside the header it is about, so the reader sees what
-                    // they already said here before they say it again. It takes a third of
-                    // the pane at most — the controls right-align after it, and their own
-                    // fallback drops one at a time if even that was too generous.
-                    line.spans.push(Span::styled(
-                        format!("  ⚑ {}", ellipsize(&note, (area.width / 3).max(4) as usize)),
-                        dim(),
-                    ));
-                }
                 let style = if h == current {
                     Style::new().add_modifier(Modifier::REVERSED)
                 } else {
                     dim()
                 };
+                let labels = [
+                    format!("[{} accept]", control_key(app, "accept")),
+                    format!("[{} restore]", control_key(app, "restore")),
+                    format!("[{} flag]", control_key(app, "flag")),
+                ];
+                if let Some(note) = flag_note_for(flags, hunk) {
+                    // The note reads beside the header it is about, so the reader sees what
+                    // they already said here before they say it again — in the room left
+                    // once the controls are reserved, because a flagged hunk is exactly the
+                    // one whose `[m flag]` and `[u restore]` the reader still wants.
+                    let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+                    let budget = if accept_controls {
+                        marker_budget(area.width, line.width(), &refs)
+                    } else {
+                        (area.width as usize).saturating_sub(line.width())
+                    };
+                    if let Some(text) = flag_marker(&note, budget) {
+                        line.spans.push(Span::styled(text, style));
+                    }
+                }
                 if accept_controls {
-                    let labels = [
-                        format!("[{} accept]", control_key(app, "accept")),
-                        format!("[{} restore]", control_key(app, "restore")),
-                        format!("[{} flag]", control_key(app, "flag")),
-                    ];
                     let targets = [
                         Target::HunkAccept(h),
                         Target::HunkRestore(h),

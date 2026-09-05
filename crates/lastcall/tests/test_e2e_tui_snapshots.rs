@@ -17,8 +17,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use lastcall::tui::app::{AcceptFailed, App, Changed, Effect, RootMeta, Selection};
-use lastcall::tui::herdr::{Attention, Dot, HerdrUpdate, RootAgents, Scope};
-use lastcall::tui::input::Action;
+use lastcall::tui::herdr::{AgentCandidate, Attention, Dot, HerdrUpdate, RootAgents, Scope};
+use lastcall::tui::input::{Action, NoteKey, PickKey};
 use lastcall::tui::render::{render, styles};
 use lastcall_engine::engine::{Engine, EngineOptions};
 use lastcall_engine::env::Env;
@@ -1169,4 +1169,151 @@ fn tui_herdr_scope_notice_with_status() {
     assert!(row.contains("repos hidden"), "{row}");
     assert!(row.contains("accepted f1 in alpha"), "{row}");
     snapshot("tui_herdr_scope_notice_with_status", &app, W, H);
+}
+
+// --- Phase 7: restore and flag ----------------------------------------------------------
+
+/// Flag whatever the cursor is on, exactly as the loop does it: `m`, the note a character
+/// at a time, Enter, then the engine call the effect asked for and its answer fed back.
+/// Nothing here reaches around the reducer — the frames are of an `App` the loop could
+/// have produced.
+fn flag_here(app: &mut App, engine: &mut Engine, note: &str) {
+    assert_eq!(
+        app.handle(Action::Flag).0,
+        Changed::Yes,
+        "the note modal opens"
+    );
+    for c in note.chars() {
+        app.handle(Action::Note(NoteKey::Insert(c.to_string())));
+    }
+    let (_, effect) = app.handle(Action::Note(NoteKey::Send));
+    let Some(Effect::Flag {
+        root,
+        path,
+        note,
+        hunk,
+    }) = effect
+    else {
+        panic!("a flag effect: {effect:?}");
+    };
+    let flagged = engine.flag(&root, &path, &note, hunk).expect("flag");
+    assert!(flagged.outcome.refused.is_empty(), "{:?}", flagged.outcome);
+    app.flagged(root, Ok(flagged));
+}
+
+/// One agent pane herdr could stage to.
+fn candidate(pane: &str, label: &str, workspace: &str, status: Attention) -> AgentCandidate {
+    AgentCandidate {
+        pane_id: pane.to_owned(),
+        label: label.to_owned(),
+        status,
+        workspace_label: workspace.to_owned(),
+    }
+}
+
+/// The note modal over the diff: what is being flagged, the note as typed (two lines, the
+/// caret at the end), and the keys that end it.
+#[test]
+fn tui_note_modal() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    let alpha = root_named(&engine, "alpha");
+    select_row(&mut app, &alpha, "f1");
+    app.handle(Action::Open);
+    app.handle(Action::Flag);
+    for c in "this rewrite loses the guard\nwhy?".chars() {
+        app.handle(Action::Note(NoteKey::Insert(c.to_string())));
+    }
+    assert!(app.note.is_some());
+    snapshot("tui_note_modal", &app, W, H);
+}
+
+/// Two agents under one root: the picker asks which, naming each pane's workspace and
+/// status, and says what the flag it is sending was.
+#[test]
+fn tui_agent_picker() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    let alpha = root_named(&engine, "alpha");
+    let mut candidates = BTreeMap::new();
+    candidates.insert(
+        alpha.clone(),
+        vec![
+            candidate("w1:p1", "claude", "lastcall", Attention::Blocked),
+            candidate("w2:p3", "codex", "spike", Attention::Working),
+        ],
+    );
+    app.handle(Action::Herdr(HerdrUpdate::Agents(candidates)));
+    select_row(&mut app, &alpha, "f1");
+    app.handle(Action::Open);
+    flag_here(&mut app, &mut engine, "which of you wrote this?");
+    assert!(app.picker.is_some(), "two candidates open the picker");
+    app.handle(Action::Pick(PickKey::Down));
+    snapshot("tui_agent_picker", &app, W, H);
+}
+
+/// `U` on a file with hunks: the confirm modal in its restore form — a different title and
+/// a different question from the accept it shares a box with.
+#[test]
+fn tui_restore_confirm() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    let alpha = root_named(&engine, "alpha");
+    select_row(&mut app, &alpha, "f1");
+    app.handle(Action::Open);
+    app.handle(Action::RestoreFile);
+    assert!(app.confirm.is_some(), "a file restore asks first");
+    snapshot("tui_restore_confirm", &app, W, H);
+}
+
+/// A flagged hunk keeps its header and gains the note's first line beside it, so the
+/// reader sees what they already said here before they say it again.
+#[test]
+fn tui_diff_view_flagged_hunk() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    let alpha = root_named(&engine, "alpha");
+    select_row(&mut app, &alpha, "f1");
+    app.handle(Action::Open);
+    flag_here(
+        &mut app,
+        &mut engine,
+        "this loses the guard\nsecond line, not shown",
+    );
+    let row = app.roots[&alpha].row(b"f1").expect("f1 still pending");
+    assert_eq!(row.flags.len(), 1, "{row:?}");
+    assert!(row.flags[0].hunk.is_some(), "a hunk flag: {row:?}");
+    snapshot("tui_diff_view_flagged_hunk", &app, W, H);
+}
+
+/// The nav's own marker: one flag is `⚑`, two on the same file are `⚑2`. The count is the
+/// only thing that says a row has more than one note without opening it.
+#[test]
+fn tui_nav_flag_counts() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    let alpha = root_named(&engine, "alpha");
+
+    // f2 has one hunk: flag the file from the nav, which carries no hunk.
+    select_row(&mut app, &alpha, "f2");
+    flag_here(&mut app, &mut engine, "is this even needed?");
+
+    // f1: two flags on the one hunk it has, so the row reads `⚑2`.
+    select_row(&mut app, &alpha, "f1");
+    app.handle(Action::Open);
+    flag_here(&mut app, &mut engine, "the guard is gone");
+    flag_here(&mut app, &mut engine, "and the test with it");
+    let f1 = app.roots[&alpha].row(b"f1").expect("f1 pending");
+    assert_eq!(f1.flags.len(), 2, "{f1:?}");
+    let f2 = app.roots[&alpha].row(b"f2").expect("f2 pending");
+    assert_eq!(f2.flags.len(), 1, "{f2:?}");
+    assert!(f2.flags[0].hunk.is_none(), "the nav flags the file: {f2:?}");
+
+    app.select(Some(Selection::Root(alpha.clone())));
+    snapshot("tui_nav_flag_counts", &app, W, H);
 }
