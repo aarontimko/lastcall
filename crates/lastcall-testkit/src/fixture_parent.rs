@@ -27,6 +27,11 @@ use crate::tmp::TempDir;
 /// The draft dir's name under `W`; the config's `draft_dirs` entry.
 pub const DRAFT_DIR: &str = "notes";
 
+/// The **opt-in** gitignored draft dir inside `W/alpha` ([`add_draft_root`]).
+pub const DRAFT_SUBDIR: &str = "_drafts";
+/// The file [`add_draft_root`] puts in it.
+pub const DRAFT_SUBDIR_FILE: &str = "reply.md";
+
 /// What the builder created; every path is as given (not canonicalized).
 #[derive(Debug, Clone)]
 pub struct Built {
@@ -57,6 +62,82 @@ pub fn config_toml(parent: &Path) -> String {
 /// Write [`config_toml`] to `path`.
 pub fn write_config(path: &Path, parent: &Path) -> std::io::Result<()> {
     std::fs::write(path, config_toml(parent))
+}
+
+/// [`config`] plus the opt-in `_drafts` entry — the config a scene that called
+/// [`add_draft_root`] must use, in-process and in its `config.toml` alike.
+pub fn draft_config() -> Config {
+    Config {
+        draft_dirs: vec![DRAFT_DIR.to_owned(), DRAFT_SUBDIR.to_owned()],
+        ..Config::default()
+    }
+}
+
+/// The `config.toml` text for [`draft_config`] with `parent_dirs = [parent]`.
+pub fn draft_config_toml(parent: &Path) -> String {
+    format!(
+        "parent_dirs = [\"{}\"]\ndraft_dirs = [\"{DRAFT_DIR}\", \"{DRAFT_SUBDIR}\"]\n",
+        parent.display()
+    )
+}
+
+/// Write [`draft_config_toml`] to `path`.
+pub fn write_draft_config(path: &Path, parent: &Path) -> std::io::Result<()> {
+    std::fs::write(path, draft_config_toml(parent))
+}
+
+/// The Phase 6 draft-root scenes' **opt-in fourth root** (kickoff deliverable 1): a
+/// gitignored `_drafts/` inside `W/alpha`, holding `reply.md` at `baseline`, first-sighted
+/// (all four roots, `draft_initial = seen`) so a later edit is the pending delta rather
+/// than the baseline. Returns the draft root's canonical path.
+///
+/// This is deliberately **not** part of [`build`] and never will be. The status golden,
+/// all 59 `.snap` files (`3 repos` in every header), every PTY scene (`scanning 3 roots…`)
+/// and `test_integration_herdr_worktree.rs` assert three roots; a fourth root in the shared
+/// fixture breaks all of them at once. A scene that wants one calls this, and must then use
+/// [`draft_config`] / [`draft_config_toml`] everywhere it opens an engine — including the
+/// `config.toml` the binary reads, or the child would discover only three roots.
+///
+/// `alpha`'s own pile grows by the `.gitignore` this writes (a file added after alpha's
+/// first sight is pending, like any other): that is the shape of a real gitignored draft
+/// dir, and a caller that cares can accept it.
+pub fn add_draft_root(
+    built: &Built,
+    state_dir: &Path,
+    baseline: &str,
+) -> Result<PathBuf, GitError> {
+    let gitignore = built.alpha.join(".gitignore");
+    let mut text = std::fs::read_to_string(&gitignore).unwrap_or_default();
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(&format!("{DRAFT_SUBDIR}/\n"));
+    edit(&gitignore, &text).map_err(|e| io(&gitignore, &e))?;
+
+    let drafts = built.alpha.join(DRAFT_SUBDIR);
+    std::fs::create_dir_all(&drafts).map_err(|e| io(&drafts, &e))?;
+    let reply = drafts.join(DRAFT_SUBDIR_FILE);
+    edit(&reply, baseline).map_err(|e| io(&reply, &e))?;
+
+    // First sight of the new root, at `baseline`, before anything edits it.
+    let env = engine_env_for(&built.parent, &built.home, state_dir);
+    let mut engine = open_engine(&built.parent, &env, state_dir, draft_config());
+    let roots = engine.scan_all();
+    assert_eq!(
+        roots.len(),
+        4,
+        "four roots discovered under {} once `_drafts` is configured",
+        built.parent.display()
+    );
+    for (root, _seq, result) in &roots {
+        assert!(
+            result.is_ok(),
+            "first sight of {} failed: {result:?}",
+            root.display()
+        );
+    }
+    drop(engine);
+    std::fs::canonicalize(&drafts).map_err(|e| io(&drafts, &e))
 }
 
 fn edit(path: &Path, contents: &str) -> std::io::Result<()> {

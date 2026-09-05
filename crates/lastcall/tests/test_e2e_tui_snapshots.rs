@@ -26,7 +26,7 @@ use lastcall_engine::ops::NoFault;
 use lastcall_engine::scan::{Annotation, Change, Pile};
 use lastcall_engine::watcher::EngineEvent;
 use lastcall_testkit::engine::{open_engine, open_engine_with};
-use lastcall_testkit::fixture_parent::{self, config};
+use lastcall_testkit::fixture_parent::{self, config, draft_config};
 use lastcall_testkit::fixture_repo::{FixtureRepo, engine_env_for};
 use lastcall_testkit::tmp::TempDir;
 use ratatui::Terminal;
@@ -40,6 +40,9 @@ struct Scene {
     parent: PathBuf,
     state: PathBuf,
     env: Env,
+    /// What `fixture_parent::build` created; `None` for [`Scene::clean`], which has no
+    /// alpha/beta/notes to hand `add_draft_root`.
+    built: Option<fixture_parent::Built>,
 }
 
 impl Scene {
@@ -52,9 +55,10 @@ impl Scene {
         let env = engine_env_for(&built.parent, &built.home, &state);
         Scene {
             _tmp: tmp,
-            parent: built.parent,
+            parent: built.parent.clone(),
             state,
             env,
+            built: Some(built),
         }
     }
 
@@ -72,6 +76,7 @@ impl Scene {
             parent,
             state,
             env,
+            built: None,
         }
     }
 
@@ -81,6 +86,19 @@ impl Scene {
 
     fn engine_with(&self, options: EngineOptions) -> Engine {
         open_engine_with(&self.parent, &self.env, &self.state, config(), options)
+    }
+
+    /// An engine over the **four**-root config: only for a scene that called
+    /// [`fixture_parent::add_draft_root`] (Phase 6 deliverable 1(c)).
+    fn engine_with_draft_root(&self) -> Engine {
+        open_engine(&self.parent, &self.env, &self.state, draft_config())
+    }
+
+    /// The scene-owned fourth root, first-sighted at `baseline`; see
+    /// [`fixture_parent::add_draft_root`] for why it is never in the shared fixture.
+    fn add_draft_root(&self, baseline: &str) -> PathBuf {
+        let built = self.built.as_ref().expect("a Scene::build fixture");
+        fixture_parent::add_draft_root(built, &self.state, baseline).expect("the fourth root")
     }
 
     fn repo(&self, name: &str) -> FixtureRepo {
@@ -315,6 +333,39 @@ fn tui_diff_view_mode_change() {
     assert_eq!(app.selected_row().unwrap().change, Change::Mode);
     app.handle(Action::Open);
     snapshot("tui_diff_view_mode_change", &app, W, H);
+}
+
+/// Phase 6 deliverable 1(c): the diff view of a **draft root's** two-hunk row, so one
+/// frame shows hunks under a `draft`-labelled root (`tui_nav_three_roots` already shows a
+/// pending draft root beside a git root, but with no hunks open). The fourth root is the
+/// scene's own — `fixture_parent::build` and its three-root assertion are untouched, so
+/// every other snapshot still reads `3 repos`.
+#[test]
+fn tui_draft_root_hunks() {
+    let scene = Scene::build();
+    let baseline: String = (1..=20).map(|i| format!("line {i}\n")).collect();
+    let drafts = scene.add_draft_root(&baseline);
+    // The agent edits two lines six apart: two hunks at CONTEXT 3, not one merged hunk.
+    let edited: String = (1..=20)
+        .map(|i| match i {
+            2 | 18 => format!("line {i} edited by the agent\n"),
+            _ => format!("line {i}\n"),
+        })
+        .collect();
+    std::fs::write(drafts.join("reply.md"), edited).expect("the agent's edit");
+
+    let mut engine = scene.engine_with_draft_root();
+    let mut app = app_of(&mut engine);
+    select_row(&mut app, &drafts, "reply.md");
+    let row = app.selected_row().expect("the draft row");
+    assert_eq!(row.hunks.len(), 2, "two hunks under the draft root");
+    assert_eq!(row.collapsed, None, "a small text draft is not collapsed");
+    assert_eq!(
+        app.roots[&drafts].meta.branch, None,
+        "a draft root has no branch; the label line reads `draft`"
+    );
+    app.handle(Action::Open);
+    snapshot("tui_draft_root_hunks", &app, W, H);
 }
 
 #[test]

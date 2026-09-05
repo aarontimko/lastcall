@@ -157,6 +157,32 @@ impl Fixture {
         }
     }
 
+    /// [`Fixture::build`] plus **this scene's own** fourth root (Phase 6 deliverable
+    /// 1(b)): `W/alpha/_drafts/reply.md` at `baseline`, first-sighted in-process before
+    /// the binary ever runs — the child's own first sight would otherwise take the
+    /// *edited* file as the baseline and show nothing pending — and a `config.toml`
+    /// naming both draft dirs, so the child discovers four roots. The shared fixture and
+    /// its three-root assertion are untouched.
+    fn with_draft_root(baseline: &str) -> (Fixture, PathBuf) {
+        let w = TempDir::new("lc-pty-w");
+        let state = TempDir::new("lc-pty-state");
+        let parent = w.join("W");
+        let built = fixture_parent::build(&parent, state.path()).expect("fixture builds");
+        let drafts = fixture_parent::add_draft_root(&built, state.path(), baseline)
+            .expect("the scene's fourth root");
+        let config = state.join("config.toml");
+        fixture_parent::write_draft_config(&config, &parent).expect("config written");
+        let fx = Fixture {
+            parent,
+            state: state.path().to_path_buf(),
+            home: built.home,
+            config,
+            _w: w,
+            _state: state,
+        };
+        (fx, drafts)
+    }
+
     fn command(&self, bin: &Path) -> PtyCommand {
         PtyCommand::new(bin).cwd(&self.parent).isolated_lastcall(
             &self.home,
@@ -863,6 +889,141 @@ fn pty_accept_loop_and_restart() {
     pty.wait_for_text("1 repo · 1 file · 1 hunk", Duration::from_secs(5))
         .unwrap_or_else(|e| panic!("header after the re-edit: {e}"));
     note(&format!("PTY relaunch edit-to-screen {took:.3?}"));
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}
+
+/// The draft file's 20-line baseline (F1's shape): two later edits six lines apart are two
+/// hunks at `CONTEXT` 3, not one merged hunk.
+fn draft_baseline() -> String {
+    (1..=20).map(|i| format!("line {i}\n")).collect()
+}
+
+/// The agent's edit: lines 2 and 18 rewritten — two hunks.
+fn draft_edited() -> String {
+    (1..=20)
+        .map(|i| match i {
+            2 | 18 => format!("line {i} edited by the agent\n"),
+            _ => format!("line {i}\n"),
+        })
+        .collect()
+}
+
+/// Move the nav selection down until the diff pane shows `header`. The number of steps
+/// depends on `alpha`'s own pending rows, which this scene deliberately does not pin (the
+/// `.gitignore` it writes is one of them); the diff pane follows the selection without
+/// `⏎`, so this needs the nav focus only.
+fn select_until(pty: &mut PtyTui, header: &str) {
+    for _ in 0..16 {
+        if pty
+            .wait_for(Duration::from_millis(400), |s| {
+                s.contents().contains(header)
+            })
+            .is_ok()
+        {
+            return;
+        }
+        pty.send(b"j").expect("j");
+    }
+    panic!("never selected {header}:\n{}", pty.screen_text());
+}
+
+/// Phase 6 gate item 1, through the real binary: a **gitignored draft file inside a git
+/// repo** goes pending, is reviewed one hunk at a time, and the fold survives a restart.
+/// The engine half is `scenario_f1_gitignored_draft_dir_inside_a_repo`; this is the same
+/// sequence a reviewer performs — `⏎`, `a`, `q`, relaunch, `A` — over a **fourth root the
+/// scene owns**, so `fixture_parent::build`'s three-root assertion, the status golden and
+/// all 59 snapshots stay exactly as they are.
+#[test]
+fn pty_draft_root_hunk_accept_and_restart() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (fx, drafts) = Fixture::with_draft_root(&draft_baseline());
+    let reply = drafts.join("reply.md");
+    // The agent edits the draft after first sight: two hunks pending.
+    std::fs::write(&reply, draft_edited()).expect("the agent's edit");
+
+    let Some(mut pty) = fx.spawn_tui(&bin()) else {
+        return;
+    };
+    pty.wait_for(LONG, |s| s.contents().contains("M reply.md  +2 −2"))
+        .unwrap_or_else(|e| panic!("the draft row: {e}"));
+    let raw = pty.raw();
+    assert!(
+        find_words(&raw, &["scanning", "4", "roots…"]).is_some(),
+        "the child discovered the scene's fourth root"
+    );
+    let text = pty.screen_text();
+    assert!(
+        text.contains("_drafts"),
+        "the draft root is in the nav:\n{text}"
+    );
+    assert!(
+        text.contains("draft · 1 file"),
+        "the row sits under the `draft` label:\n{text}"
+    );
+
+    // `⏎` opens the row: two hunks, the agent's two edited lines.
+    select_until(&mut pty, "reply.md  M  +2 −2");
+    pty.send(b"\r").expect("open");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        let t = s.contents();
+        t.matches("@@ -").count() == 2
+            && t.contains("+line 2 edited by the agent")
+            && t.contains("+line 18 edited by the agent")
+    })
+    .unwrap_or_else(|e| panic!("two hunks open: {e}"));
+
+    // `a` accepts the first hunk; the second stays pending.
+    let t = Instant::now();
+    pty.send(b"a").expect("a");
+    pty.wait_for(OVERLOADED, |s| {
+        status_is(s, "accepted reply.md · 1 hunk left")
+            && s.contents().contains("M reply.md  +1 −1")
+    })
+    .unwrap_or_else(|e| panic!("accept the first hunk: {e}"));
+    note(&format!(
+        "PTY draft root: hunk accepted after {:.3?}",
+        t.elapsed()
+    ));
+    let text = pty.screen_text();
+    assert!(
+        !text.contains("+line 2 edited by the agent"),
+        "the accepted hunk is gone:\n{text}"
+    );
+    assert!(
+        text.contains("+line 18 edited by the agent"),
+        "the untouched hunk remains:\n{text}"
+    );
+
+    // `q`, then a second process over the same state dir: the same one hunk.
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+    drop(pty);
+
+    let Some(mut pty) = fx.spawn_tui(&bin()) else {
+        return;
+    };
+    pty.wait_for(LONG, |s| s.contents().contains("M reply.md  +1 −1"))
+        .unwrap_or_else(|e| panic!("the relaunch shows the remaining hunk: {e}"));
+    select_until(&mut pty, "reply.md  M  +1 −1");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        let t = s.contents();
+        t.matches("@@ -").count() == 1 && t.contains("+line 18 edited by the agent")
+    })
+    .unwrap_or_else(|e| panic!("one hunk after the restart: {e}"));
+
+    // `A` takes the file whole: the draft root empties.
+    pty.send(b"A").expect("A");
+    pty.wait_for(OVERLOADED, |s| {
+        status_is(s, "accepted reply.md") && !s.contents().contains("M reply.md")
+    })
+    .unwrap_or_else(|e| panic!("accept the file: {e}"));
     let since = pty.raw().len();
     pty.send(b"q").expect("q");
     let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
