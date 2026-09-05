@@ -101,9 +101,15 @@ ten, and a herdr resync that re-derives an identical root map is now no draw at 
   `for` and drop the rest of the pass's work, and the seeded case is asserted
   (`run_drain_stops_at_quit_and_at_a_fatal`). `Local::Fatal` becomes `Stop::Fatal` the same
   way.
-- **`DRAIN_CAP` = 256** events per pass. Past it the drain returns with the rest still
-  queued, so a pathological producer cannot starve the frame
+- **`DRAIN_CAP` = 256** round-robin rounds per pass — each round polls the input, engine,
+  local and herdr queues once, so a pass folds at most 1,024 events. Past it the drain
+  returns with the rest still queued, so a pathological producer cannot starve the frame
   (`run_drain_stops_at_the_cap`).
+- **A drained `worktree.*` event arms the 500 ms discovery debounce** exactly as one that
+  woke the `select!` does (`Pass::worktree`); only the timer firing rescans. Otherwise the
+  second event of a checkout burst, drained behind the first, would rescan at once and
+  cancel the timer the first had armed
+  (`run_drain_reports_a_worktree_event_for_the_debounce_not_for_a_rescan`).
 - **Press pushback.** A left `Press` that arrives once the pass is already
   `Changed::Yes` is **held**, not folded: it would be hit-tested against a `HitMap` from a
   frame the user never saw. It is replayed as the first event of the next pass, against the
@@ -284,8 +290,14 @@ that screen.
   matches the counts on screen.
 - `App.expanded: Option<Expansion>` holds `{ root, path, baseline, current, view }` — one
   at a time, and `App::expansion()` returns it only while the selection still points at
-  that row. A newer pile whose oids differ clears it, so a stale expansion cannot outlive
-  the delta it was computed from.
+  that row. A newer pile whose oids differ clears it, and an answer that lands after such
+  a pile is dropped rather than stored — the request's row travels back with
+  `Local::Expanded` and `set_expanded` compares its oids to the row's — so a stale
+  expansion cannot outlive the delta it was computed from
+  (`app_expansion_answer_for_moved_oids_is_dropped`).
+- A mode-only change on a collapsed row has no content hunks; the header names it
+  (`collapsed (glob) · +0 −0 · mode 100644 → 100755`) and `e` shows the synthetic mode
+  hunk.
 - **Binary is never expandable.** The line reads `collapsed (binary) · +a −d · not
   expandable`, no control is drawn and no hit target is registered, and `e` on such a row
   is a silent no-op — no effect, no redraw. `e` is equally silent on a row that is not
@@ -297,10 +309,13 @@ that screen.
   line, so a truncated expansion can never scroll its own warning off the screen.
 
 **Design-pass input** (§10 2026-09-05 ruling 3: Phases 6–8 add no new layout concept
-without a note here naming it). Phase 6 adds two: the **collapsed-row body** — a dimmed
+without a note here naming it). Phase 6 adds three: the **collapsed-row body** — a dimmed
 status line carrying a right-aligned `[e expand]` control, with hunks and a cap footer
-under it — and the **retained nav offset**, which changes when the list scrolls rather than
-what it looks like. The snapshots `tui_draft_root_hunks`, `tui_nav_collapsed_lockfile`,
+under it — the **retained nav offset**, which changes when the list scrolls rather than
+what it looks like — and the **help overlay's height**: the `expand` row makes it 31
+entries, so on a 30-row terminal the box now starts on the header row
+(`tui_help_overlay`); one more action (Phase 7's flag and restore) covers the hint line and
+two more clip `any key closes`, so the overlay's sizing is pass input, not just its rows. The snapshots `tui_draft_root_hunks`, `tui_nav_collapsed_lockfile`,
 `tui_nav_collapsed_binary_and_size` and `tui_diff_view_collapsed_expanded` are those
 frames, and they join `tui_accept_controls`, `tui_herdr_scope_notice` and `tui_herdr_scope_notice_with_status` as
 the pass's input at the Phase 9 kickoff. Nothing in the status line, the header ladder or

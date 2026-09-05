@@ -92,7 +92,7 @@ pub fn write_draft_config(path: &Path, parent: &Path) -> std::io::Result<()> {
 /// than the baseline. Returns the draft root's canonical path.
 ///
 /// This is deliberately **not** part of [`build`] and never will be. The status golden,
-/// all 59 `.snap` files (`3 repos` in every header), every PTY scene (`scanning 3 roots…`)
+/// every three-root `.snap` (`3 repos` in the header), every PTY scene (`scanning 3 roots…`)
 /// and `test_integration_herdr_worktree.rs` assert three roots; a fourth root in the shared
 /// fixture breaks all of them at once. A scene that wants one calls this, and must then use
 /// [`draft_config`] / [`draft_config_toml`] everywhere it opens an engine — including the
