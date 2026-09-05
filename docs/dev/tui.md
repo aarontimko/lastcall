@@ -237,9 +237,16 @@ Accept is one of the three answers a reviewer has. The other two are "put that b
   is always the file. There is no restore-group and no restore-all: undoing a whole tree at
   once is not a gesture lastcall offers, which is why `Effect::Restore` carries a `Vec` that
   never holds more than one request.
-- **Only the file half asks.** A hunk restore starts immediately; a file restore opens the
-  confirm modal first. The CAS is the guard either way and the content a restore drops stays
-  addressable in the private store, but a whole file going back is the bigger surprise. The
+- **A restore asks whenever it removes something.** A hunk restore starts immediately; a
+  file restore opens the confirm modal first. The CAS is the guard either way and the
+  content a restore drops stays addressable in the private store, but a whole file going
+  back is the bigger surprise. The one row where `u` is *not* a hunk restore is an **added**
+  file whose whole content is one hunk: restoring that hunk is the engine's removal path
+  (`ops_restore_hunk_on_an_added_file_removes_it`), so `restore_scope` returns the file
+  scope and the delete question opens (verifier (b) F3 — it used to delete the file with no
+  question and then report `restored f1 hunk 1` about a path that was gone). An added row
+  with several content hunks keeps the hunk scope: there a hunk restore really is partial.
+  The
   modal is the accept modal with a different scope — `ConfirmScope::{Accept, Restore}` — so
   there is one modal, one key set and one hint line. `confirm_counts` stays accept-only
   (F11): a restore covers one row, so there is nothing to tally, and the question comes from
@@ -368,7 +375,7 @@ Defaults (`input::DEFAULT_KEYMAP`, in help-overlay order):
 | `accept` | `a` | on a file row: the one hunk under the diff cursor (a hunkless row — binary, collapsed, deleted, unreadable — whole); on a group: the group; on a root: every row of it (asks above 10 files) | the same hunk |
 | `accept_file` | `shift-a` | accept the selected file whole — the only key that does | |
 | `accept_all` | `ctrl-a` | accept everything listed, every root (asks above 10 files) | |
-| `restore` | `u` | put the hunk under the diff cursor back to its baseline (a hunkless or deleted row: the file, which asks) | the same hunk |
+| `restore` | `u` | put the hunk under the diff cursor back to its baseline (a hunkless, deleted, or one-hunk added row: the file, which asks) | the same hunk |
 | `restore_file` | `shift-u` | put the selected file back whole — always asks first | |
 | `flag` | `m` | flag it with a note: the hunk under the diff cursor, or the file from the nav | the same hunk |
 | `unflag` | `shift-m` | clear every flag on the selected file | |

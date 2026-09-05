@@ -61,9 +61,9 @@ missing.
 ### Put it back
 
 Accepting is one of three answers. `u` puts the hunk under the cursor back to what it was
-before the agent touched it; `shift-u` puts the whole file back and asks first (on a file
-that was *added* since your baseline the question says `Delete f1?`, because that is what
-putting it back means). Restoring writes only the working tree — it is not an undo of an
+before the agent touched it; `shift-u` puts the whole file back and asks first. On a file
+that was *added* since your baseline, putting it back means removing it, so both keys ask
+and the question says `Delete f1?`. Restoring writes only the working tree — it is not an undo of an
 accept, and a file that changed underneath is refused rather than overwritten.
 
 ### Flag and discuss

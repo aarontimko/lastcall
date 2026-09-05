@@ -1663,6 +1663,65 @@ fn pty_restore_deletion_recreates_the_file() {
     assert_clean_exit(&pty, since);
 }
 
+/// Verifier (b) F3, through the binary: `u` on an **added** file is a deletion, so it asks
+/// — and `n` leaves the file exactly as it was.
+///
+/// The reducer test (`app_restore_hunk_on_an_added_file_asks_to_delete`) pins the routing;
+/// this pins the consequence, which is what the finding was actually about: before the fix
+/// this keystroke removed a file the reviewer had never been asked about, and then reported
+/// `restored added.txt hunk 1` for a path that no longer existed.
+#[test]
+fn pty_restore_added_file_asks_then_n_keeps_it() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    // A file the agent added after first sight: one whole-file insert hunk, no baseline.
+    let added = fx.parent.join("alpha/added.txt");
+    const BODY: &str = "the agent wrote this\nand this\n";
+    std::fs::write(&added, BODY).expect("the agent adds a file");
+
+    let Some(mut pty) = fx.spawn_tui(&bin()) else {
+        return;
+    };
+    wait_first_piles(&mut pty);
+    pty.wait_for_text("A added.txt", LONG)
+        .unwrap_or_else(|e| panic!("the added row: {e}"));
+    select_until(&mut pty, "added.txt  A");
+
+    // `u` on the row's one content hunk: the question, not the deletion.
+    pty.send(b"u").expect("u");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        s.contents()
+            .contains("Delete added.txt? (added since baseline)")
+    })
+    .unwrap_or_else(|e| panic!("the delete confirm: {e}"));
+    assert!(
+        added.exists(),
+        "the question is on screen and nothing has been written"
+    );
+
+    let t = Instant::now();
+    pty.send(b"n").expect("n");
+    pty.wait_for(OVERLOADED, |s| {
+        !s.contents().contains("Delete added.txt?") && s.contents().contains("A added.txt")
+    })
+    .unwrap_or_else(|e| panic!("n closes the question and keeps the row: {e}"));
+    note(&format!(
+        "PTY added-file restore: declined after {:.3?}",
+        t.elapsed()
+    ));
+    assert_eq!(
+        std::fs::read_to_string(&added).expect("added.txt is still there"),
+        BODY,
+        "n kept the file, bytes and all"
+    );
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}
+
 /// `m`, a note, Enter — with no herdr to send to. The flag lands in the ledger, the row
 /// grows its `⚑`, and the export is appended to the fallback file under the state dir,
 /// which is compared against `flag_export_pty.md`.

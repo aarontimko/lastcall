@@ -1043,10 +1043,26 @@ impl App {
     /// content hunks, else the selected row whole. A **deletion** row's single hunk is the
     /// file (F16), so `u` on it is a file restore and asks like `shift-u` does. Groups and
     /// root entries have no restore: there is no restore-group and no restore-all.
+    ///
+    /// An **added** file whose whole content is one hunk is the same case seen from the
+    /// other side (verifier (b) F3): restoring that hunk is not "put a hunk back", it is
+    /// `restore_file`'s removal path — the engine's own
+    /// `ops_restore_hunk_on_an_added_file_removes_it` says so. Routing it to the hunk scope
+    /// deleted the file with no confirm at all and then reported `restored f1 hunk 1` for a
+    /// file that no longer existed. Kickoff ruling item 2 says a restore that *deletes* an
+    /// added file asks, so the whole-row scope is the honest one: the confirm reads
+    /// `Delete <path>? (added since baseline)` and the status line `removed <path> (added
+    /// since baseline)` (decision (l)). The mode hunk is not content, exactly as
+    /// `flag_target` counts it; an added row carrying more than one content hunk (an
+    /// expansion) keeps the hunk scope, because there a hunk restore really is partial.
     pub fn restore_scope(&self) -> Option<RestoreScope> {
         match self.selection.clone()? {
             Selection::Row(root, path) => {
                 let row = self.roots.get(&root)?.row(&path)?;
+                let content = row.hunks.iter().filter(|h| !h.is_mode_change()).count();
+                if row.change == Change::Added && content == 1 {
+                    return Some(restore_file_of(root, row));
+                }
                 if row.change != Change::Deleted && !row.hunks.is_empty() {
                     Some(RestoreScope::Hunk {
                         root,
@@ -4756,6 +4772,58 @@ mod tests {
             restore_question(app.confirm_restore().expect("it asks")),
             "Restore f1 · 1 hunk?"
         );
+    }
+
+    /// Verifier (b) F3: `u` on an **added** file is a deletion, so it asks — the route
+    /// `app_restore_of_an_added_file_asks_with_the_delete_wording` never covered, because it
+    /// drives `RestoreFile` only. Before the fix `u` here emitted `Effect::Restore(Hunk)`
+    /// straight away, the engine took its removal path, and the status line said
+    /// `restored f1 hunk 1` about a file that was gone.
+    ///
+    /// The diff has focus and the cursor is on the row's one content hunk — the worst case,
+    /// because that is exactly where a hunk restore would otherwise be right.
+    #[test]
+    fn app_restore_hunk_on_an_added_file_asks_to_delete() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.apply(pile_event_seq("alpha", 1, alpha_as(Change::Added)));
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Open);
+        assert_eq!(app.effective_focus(), Focus::Diff);
+
+        let scope = app.restore_scope().expect("a scope on a selected row");
+        assert!(
+            matches!(scope, RestoreScope::File { added: true, .. }),
+            "the whole file, not its one hunk: {scope:?}"
+        );
+        assert_eq!(
+            restore_question(&scope),
+            "Delete f1? (added since baseline)"
+        );
+
+        // `u` asks, and writes nothing until the answer.
+        let (_, effect) = app.handle(Action::Restore);
+        assert!(effect.is_none(), "nothing is removed yet: {effect:?}");
+        assert!(app.confirm_restore().is_some(), "the question is on screen");
+
+        // `n` keeps the file.
+        let (_, effect) = app.handle(Action::Cancel);
+        assert!(effect.is_none(), "{effect:?}");
+        assert!(app.confirm_restore().is_none());
+
+        // `u` again, then `y`: one whole-file request, and the removal wording.
+        app.handle(Action::Restore);
+        let (_, effect) = app.handle(Action::Confirm);
+        let Some(Effect::Restore(reqs)) = effect else {
+            panic!("y starts it: {effect:?}");
+        };
+        assert_eq!(reqs.len(), 1);
+        assert!(matches!(reqs[0].1, RestoreRequest::File(_)), "{reqs:?}");
+        app.restored(vec![(
+            root("alpha"),
+            restored_ok(2, without(pile("alpha"), &["f1"])),
+        )]);
+        assert_eq!(status(&app), "removed f1 (added since baseline)");
     }
 
     /// A deletion row's one hunk is the whole file (F16), so `u` on it is a file restore —
