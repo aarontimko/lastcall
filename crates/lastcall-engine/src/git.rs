@@ -81,6 +81,28 @@ pub fn thread_spawn_count() -> u64 {
     THREAD_SPAWNS.with(std::cell::Cell::get)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only: the argv of every git child this thread spawns while [`recording_argv`]
+    /// is on. The counter above answers "how many"; a budget that names one subcommand
+    /// (Phase 6 deliverable 5's single `for-each-ref refs/remotes`) needs "which", and a
+    /// count arithmetic cannot tell one listing from two.
+    static THREAD_ARGV: std::cell::RefCell<Option<Vec<Vec<String>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test-only: run `f`, returning its value and the argv of every git child the calling
+/// thread spawned during it. Not nestable (the inner call takes the log).
+#[cfg(test)]
+pub fn recording_argv<T>(f: impl FnOnce() -> T) -> (T, Vec<Vec<String>>) {
+    THREAD_ARGV.with(|c| *c.borrow_mut() = Some(Vec::new()));
+    let out = f();
+    let log = THREAD_ARGV
+        .with(|c| c.borrow_mut().take())
+        .unwrap_or_default();
+    (out, log)
+}
+
 /// The minimum git version every plumbing flag we use exists in (`--path-format=absolute`
 /// is 2.31).
 pub const MIN_GIT_VERSION: (u32, u32) = (2, 31);
@@ -254,6 +276,12 @@ fn run_command(
     use std::io::Write;
     SPAWNS.fetch_add(1, Ordering::Relaxed);
     THREAD_SPAWNS.with(|c| c.set(c.get() + 1));
+    #[cfg(test)]
+    THREAD_ARGV.with(|c| {
+        if let Some(log) = c.borrow_mut().as_mut() {
+            log.push(argv_strings(args));
+        }
+    });
     let cwd = cmd
         .get_current_dir()
         .map(Path::to_path_buf)

@@ -2439,9 +2439,15 @@ pub(crate) mod tests {
     /// Phase 6 deliverable 5 (§11 "`for-each-ref refs/remotes` twice per scan"): the
     /// listing that builds the memo key is the listing the classification is computed
     /// with, so a scan lists the remote refs exactly once whether or not it recomputes.
+    ///
+    /// Verifier (a) F2: the **recompute** path is the one §11 was about (before this
+    /// deliverable `get` listed once for the key and `classify` listed again for the same
+    /// key), so the last third moves the key the way
+    /// `engine_upstream_labels_follow_remote_refs_without_head_moving` does — a coworker
+    /// push plus a fetch, HEAD unmoved — and counts that `get`.
     #[test]
     fn engine_classification_lists_remote_refs_once_per_scan() {
-        let repo = FixtureRepo::new("eng-refs-once").unwrap();
+        let mut repo = FixtureRepo::new("eng-refs-once").unwrap();
         let state = TempDir::new("lc-eng-state");
         let engine = open_engine(&repo, &state, Config::default());
         let root = only_root(&engine);
@@ -2464,9 +2470,16 @@ pub(crate) mod tests {
         // And the memoized path costs exactly the one listing that builds the key.
         let mut classifier = Classifier::default();
         let seen_head = rs.seen_head().cloned();
-        classifier
+        assert!(
+            seen_head.is_some(),
+            "first sight recorded a seen head, so `classify` does real work below"
+        );
+        let first = classifier
             .get(rg, seen_head.as_ref(), &live, None)
-            .expect("first classification");
+            .expect("first classification")
+            .key
+            .remotes
+            .clone();
         let before = crate::git::thread_spawn_count();
         classifier
             .get(rg, seen_head.as_ref(), &live, None)
@@ -2475,6 +2488,40 @@ pub(crate) mod tests {
             crate::git::thread_spawn_count() - before,
             1,
             "one `for-each-ref refs/remotes` per scan, and nothing else when cached"
+        );
+
+        // The key moves without HEAD moving: `origin/main` catches up under us.
+        repo.coworker_push(1).unwrap();
+        repo.git(&["fetch", "-q", "origin"]).unwrap();
+        assert_eq!(
+            headstate::inspect(rg).unwrap(),
+            live,
+            "the fetch moved refs/remotes, not HEAD"
+        );
+        // Counted by **argv**, not by arithmetic on a total: two listings and one listing
+        // differ by a spawn either way, so only the subcommand names tell them apart.
+        let (moved, argv) = crate::git::recording_argv(|| {
+            classifier
+                .get(rg, seen_head.as_ref(), &live, None)
+                .expect("recomputed classification")
+                .key
+                .remotes
+                .clone()
+        });
+        assert_ne!(moved, first, "the listing moved, so the memo missed");
+        let listings = argv
+            .iter()
+            .filter(|a| {
+                a.iter().any(|w| w == "for-each-ref") && a.iter().any(|w| w == "refs/remotes")
+            })
+            .count();
+        assert_eq!(
+            listings, 1,
+            "one listing on the recompute path; argv: {argv:?}"
+        );
+        assert!(
+            argv.iter().any(|a| a.iter().any(|w| w == "rev-list")),
+            "the recompute really ran classify's own work; argv: {argv:?}"
         );
     }
 
