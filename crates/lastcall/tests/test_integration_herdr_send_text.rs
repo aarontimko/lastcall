@@ -26,6 +26,9 @@ use serde_json::{Value, json};
 const TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a screen state may take to settle before the assertion gives up.
 const SETTLE: Duration = Duration::from_secs(20);
+/// How long a *negative* claim waits before it is believed — the grace an unstaged payload
+/// would need to execute and print. The positive control below runs well inside it.
+const SETTLE_WINDOW: Duration = Duration::from_millis(1500);
 /// A prompt nothing else on the screen can be mistaken for.
 const PROMPT: &str = "LCPROMPT";
 
@@ -123,10 +126,18 @@ async fn herdr_real_send_text_lands_unsubmitted() {
 
     // The gesture under test.
     stage(&t, &pane, "echo ONE\necho TWO").await.expect("stage");
-    let staged = wait_for(&t, &pane, "the staged text on the prompt", |s| {
+    wait_for(&t, &pane, "the staged text on the prompt", |s| {
         s.contains("echo ONE") && s.contains("echo TWO")
     })
     .await;
+    // Nothing ran *yet* is a weaker claim than nothing ran: give the shell a settle window
+    // it would need only if the paste were going to execute, then read the screen again.
+    tokio::time::sleep(SETTLE_WINDOW).await;
+    let staged = screen(&t, &pane).await;
+    assert!(
+        staged.contains("echo ONE") && staged.contains("echo TWO"),
+        "the staged lines left the prompt:\n{staged}"
+    );
     assert_eq!(
         output_lines(&staged, "ONE"),
         0,
@@ -151,10 +162,13 @@ async fn herdr_real_send_text_lands_unsubmitted() {
     // `echo FOUR`, which has no newline after it, is left on the prompt). The markers are
     // the whole feature, not decoration.
     send_raw(&t, &pane, "echo THREE\necho FOUR").await;
+    // Both halves of the screen state are waited for, not just the first: under load the
+    // `THREE` output can land a frame before the trailing `echo FOUR` is drawn, and asserting
+    // on the screen that merely satisfied the first half is the race that made this flake.
     let bare = wait_for(&t, &pane, "the unmarked payload running by itself", |s| {
-        output_lines(s, "THREE") > 0
+        output_lines(s, "THREE") > 0 && s.contains("echo FOUR")
     })
     .await;
-    assert!(bare.contains("echo FOUR"), "{bare}");
+    assert_eq!(output_lines(&bare, "THREE"), 1, "{bare}");
     say("without the markers the same text runs — the wrapping is what stages it");
 }
