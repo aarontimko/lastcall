@@ -206,6 +206,8 @@ pub enum Stop {
 #[derive(Debug, Default, PartialEq)]
 pub struct Pass {
     pub changed: Changed,
+    /// The first source that made this pass worth drawing; the `cause=` of the `draw` probe.
+    pub cause: Option<&'static str>,
     pub effects: Vec<Effect>,
     pub stop: Option<Stop>,
     /// A herdr event in this pass asked for a discovery rescan (`worktree.*`).
@@ -220,13 +222,21 @@ impl Pass {
     /// A pass seeded with what the `select!` arm folded. It goes through [`Pass::fold`] so
     /// the seed obeys every rule the drained events do — in particular a `q` that arrives as
     /// the pass's *first* event is a `Stop::Quit`, not an effect for the dispatch loop.
-    fn of(changed: Changed, effect: Option<Effect>) -> Self {
+    fn of(source: &'static str, changed: Changed, effect: Option<Effect>) -> Self {
         let mut pass = Self::default();
-        pass.fold((changed, effect));
+        pass.fold(source, (changed, effect));
         pass
     }
 
-    fn fold(&mut self, (changed, effect): (Changed, Option<Effect>)) {
+    /// Fold one event's outcome in. `source` is one of `input`, `engine`, `local`, `herdr`,
+    /// `timer`, `tick`: deliverable 8's `fold source= changed=` probe, and the `cause=` the
+    /// draw that follows reports — the first source that made the pass worth drawing, which
+    /// is the question "why did the screen just repaint?" answers with.
+    fn fold(&mut self, source: &'static str, (changed, effect): (Changed, Option<Effect>)) {
+        tracing::debug!(source, changed = ?changed, "fold");
+        if changed == Changed::Yes && self.cause.is_none() {
+            self.cause = Some(source);
+        }
         self.changed = self.changed.or(changed);
         match effect {
             Some(Effect::Quit) => self.stop = Some(Stop::Quit),
@@ -269,13 +279,13 @@ pub(crate) fn drain(ui: &mut Ui, sources: &mut Sources<'_>, link: &mut Herdr, pa
                 pass.held = Some(event);
                 return;
             }
-            pass.fold(ui.event(&event));
+            pass.fold("input", ui.event(&event));
         }
         if pass.stop.is_none()
             && let Ok(event) = sources.engine.try_recv()
         {
             any = true;
-            pass.fold(ui.engine(event));
+            pass.fold("engine", ui.engine(event));
         }
         if pass.stop.is_none()
             && let Ok(local) = sources.local.try_recv()
@@ -287,10 +297,10 @@ pub(crate) fn drain(ui: &mut Ui, sources: &mut Sources<'_>, link: &mut Herdr, pa
                     return;
                 }
                 Local::Roots(metas) => {
-                    pass.fold(ui.local(Local::Roots(metas)));
-                    pass.fold(herdr_rederive(ui, link));
+                    pass.fold("local", ui.local(Local::Roots(metas)));
+                    pass.fold("local", herdr_rederive(ui, link));
                 }
-                other => pass.fold(ui.local(other)),
+                other => pass.fold("local", ui.local(other)),
             }
         }
         if pass.stop.is_none()
@@ -300,10 +310,10 @@ pub(crate) fn drain(ui: &mut Ui, sources: &mut Sources<'_>, link: &mut Herdr, pa
             any = true;
             pass.rescan |= herdr::triggers_rescan(&event);
             if let Some(update) = herdr::update_of(&event) {
-                pass.fold(ui.app.handle(Action::Herdr(update)));
+                pass.fold("herdr", ui.app.handle(Action::Herdr(update)));
             }
             if herdr::rederives(&event) {
-                pass.fold(herdr_rederive(ui, link));
+                pass.fold("herdr", herdr_rederive(ui, link));
             }
         }
         if !any {
@@ -762,11 +772,11 @@ pub fn run(
                 // Copied out so the timer future borrows nothing a handler assigns to.
                 let due = worktree_due;
                 let mut rescan = false;
-                let (changed, effect) = match held.take() {
-                    Some(event) => ui.event(&event),
+                let (source, (changed, effect)) = match held.take() {
+                    Some(event) => ("input", ui.event(&event)),
                     None => tokio::select! {
                     _ = signals.recv() => break,
-                    event = watcher.events.recv() => match event {
+                    event = watcher.events.recv() => ("engine", match event {
                         Some(event) => ui.engine(event),
                         None => {
                             tracing::warn!("watcher ended; exiting");
@@ -774,12 +784,12 @@ pub fn run(
                             draw(&mut terminal, &mut ui)?;
                             break;
                         }
-                    },
-                    event = input_rx.recv() => match event {
+                    }),
+                    event = input_rx.recv() => ("input", match event {
                         Some(event) => ui.event(&event),
                         None => break, // the reader thread died
-                    },
-                    local = local_rx.recv() => match local {
+                    }),
+                    local = local_rx.recv() => ("local", match local {
                         Some(Local::Fatal(text)) => {
                             fatal = Some(text);
                             break;
@@ -792,8 +802,8 @@ pub fn run(
                         }
                         Some(local) => ui.local(local),
                         None => (Changed::No, None),
-                    },
-                    event = herdr_recv(&mut link.events) => match event {
+                    }),
+                    event = herdr_recv(&mut link.events) => ("herdr", match event {
                         Some(event) => {
                             if herdr::triggers_rescan(&event) {
                                 worktree_due =
@@ -818,8 +828,8 @@ pub fn run(
                             link.events = None;
                             (Changed::No, None)
                         }
-                    },
-                    opened = connect_ready(&mut connecting) => match opened {
+                    }),
+                    opened = connect_ready(&mut connecting) => ("herdr", match opened {
                         // The badge itself comes later, with the client's `Connected`.
                         Some(Ok(open)) => {
                             link = Herdr::adopt(open, local_tx.clone());
@@ -831,7 +841,7 @@ pub fn run(
                             (changed, None)
                         }
                         None => (Changed::No, None),
-                    },
+                    }),
                     _ = async {
                         match due {
                             Some(at) => tokio::time::sleep_until(at).await,
@@ -839,14 +849,14 @@ pub fn run(
                         }
                     } => {
                         rescan = true;
-                        (Changed::No, None)
+                        ("timer", (Changed::No, None))
                     }
-                    _ = tick.tick() => ui.app.handle(Action::Tick),
+                    _ = tick.tick() => ("tick", ui.app.handle(Action::Tick)),
                     },
                 };
                 // Everything else already queued joins this pass, so a burst of piles or a
                 // wheel spin costs one frame rather than one frame each (deliverable 6).
-                let mut pass = Pass::of(changed, effect);
+                let mut pass = Pass::of(source, changed, effect);
                 {
                     let mut sources = Sources {
                         engine: &mut watcher.events,
@@ -910,7 +920,16 @@ pub fn run(
                     None => {}
                 }
                 if pass.changed == Changed::Yes {
+                    // Deliverable 8: one line per repaint, saying why and how long. A
+                    // `draw` per pile in a burst is the symptom deliverable 6 removed, and
+                    // this is how the sponsor sees it stay removed.
+                    let started = std::time::Instant::now();
                     draw(&mut terminal, &mut ui)?;
+                    tracing::debug!(
+                        cause = pass.cause.unwrap_or("unknown"),
+                        ms = started.elapsed().as_millis() as u64,
+                        "draw"
+                    );
                 }
             }
             // A connect still in flight has nothing left to deliver.
@@ -1026,7 +1045,7 @@ mod tests {
         }
 
         fn drain_into(&mut self, ui: &mut Ui, seed: (Changed, Option<Effect>)) -> Pass {
-            let mut pass = Pass::of(seed.0, seed.1);
+            let mut pass = Pass::of("select", seed.0, seed.1);
             let mut sources = Sources {
                 engine: &mut self.engine_rx,
                 input: &mut self.input_rx,
@@ -1096,6 +1115,11 @@ mod tests {
             .unwrap();
         let pass = wires.drain_into(&mut ui, (Changed::No, None));
         assert_eq!(pass.changed, Changed::Yes, "the page key moved something");
+        assert_eq!(
+            pass.cause,
+            Some("input"),
+            "deliverable 8: the draw reports the source that earned it"
+        );
         let held = pass.held.expect("the press stayed queued");
         assert!(is_press(&held));
         assert_ne!(
@@ -1125,7 +1149,7 @@ mod tests {
     fn run_drain_stops_at_quit_and_at_a_fatal() {
         // The seed obeys the same rule: a `q` pressed with an empty queue never reaches the
         // effect dispatch, it *is* the stop.
-        let seeded = Pass::of(Changed::No, Some(Effect::Quit));
+        let seeded = Pass::of("input", Changed::No, Some(Effect::Quit));
         assert_eq!(seeded.stop, Some(Stop::Quit));
         assert!(seeded.effects.is_empty());
         {

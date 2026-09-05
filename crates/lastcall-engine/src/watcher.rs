@@ -82,6 +82,18 @@ fn scanned(first_seen: &mut BTreeMap<PathBuf, Instant>, root: &Path) {
     first_seen.remove(root);
 }
 
+/// Deliverable 8's watcher probes. The loop's decisions are invisible from the outside —
+/// an event that scheduled nothing and an event that never arrived look identical on
+/// screen — so each one gets a `debug` line with stable field names.
+///
+/// `reason` is a closed vocabulary: `event` (a filesystem event under the root), `head`
+/// (HEAD moved, so `inspect_head` scanned), `rescan` (the discovery backstop, a watcher
+/// error, or a root set that changed) and `refresh` (the initial scans and the catch-up
+/// after watches install).
+fn trace_scan_due(root: &Path, reason: &'static str) {
+    tracing::debug!(root = %root.display(), reason, "scan due");
+}
+
 /// What the watcher publishes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EngineEvent {
@@ -219,6 +231,17 @@ enum Scheduled {
     Scan(PathBuf),
     Head(PathBuf),
     Ignore,
+}
+
+impl Scheduled {
+    /// The `scheduled=` field of the `watch event` probe.
+    fn label(&self) -> &'static str {
+        match self {
+            Scheduled::Scan(_) => "scan",
+            Scheduled::Head(_) => "head",
+            Scheduled::Ignore => "ignore",
+        }
+    }
 }
 
 fn classify_path(path: &Path, roots: &[RootWatch], ignore: &globset::GlobSet) -> Scheduled {
@@ -443,7 +466,13 @@ async fn inspect_root(
     root: PathBuf,
 ) -> Inspected {
     let r = root.clone();
-    match blocking(engine, move |e| e.inspect_head(&r)).await {
+    let inspected = blocking(engine, move |e| e.inspect_head(&r)).await;
+    tracing::debug!(
+        root = %root.display(),
+        changed = matches!(inspected, Ok(Some(_))),
+        "head inspect"
+    );
+    match inspected {
         Ok(Some(HeadChange {
             root,
             from,
@@ -453,6 +482,7 @@ async fn inspect_root(
             seq,
             pile,
         })) => {
+            trace_scan_due(&root, "head");
             let alive = emit(
                 tx,
                 EngineEvent::Head {
@@ -598,11 +628,13 @@ async fn run_loop(
                                     done.alive
                                 } else {
                                     scanned(&mut first_seen, &r.path);
+                                    trace_scan_due(&r.path, "refresh");
                                     scan_root(&engine, &tx, r.path).await
                                 };
                                 if !ok { return; }
                             }
                             rescan.reset();
+                            tracing::debug!(roots = roots.len(), "watch installed");
                             let text = format!(
                                 "watching {} ({} root{})",
                                 watched.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", "),
@@ -623,17 +655,27 @@ async fn run_loop(
                     Err(e) => {
                         if !emit(&tx, EngineEvent::Notice { root: None, text: format!("watcher error, rescanning: {e}") }).await { return; }
                         let now = Instant::now();
-                        for r in &roots { due.insert(r.path.clone(), now); }
+                        for r in &roots { trace_scan_due(&r.path, "rescan"); due.insert(r.path.clone(), now); }
                     }
                     Ok(ev) => {
                         if ev.need_rescan() {
                             let now = Instant::now();
-                            for r in &roots { due.insert(r.path.clone(), now); }
+                            for r in &roots { trace_scan_due(&r.path, "rescan"); due.insert(r.path.clone(), now); }
                         }
                         if actionable(&ev.kind) {
                             for p in &ev.paths {
-                                match classify_path(p, &roots, &ignore) {
-                                    Scheduled::Scan(root) => { schedule(&mut due, &mut first_seen, root, Instant::now(), &timings); }
+                                let scheduled = classify_path(p, &roots, &ignore);
+                                tracing::debug!(
+                                    path = %p.display(),
+                                    kind = ?ev.kind,
+                                    scheduled = scheduled.label(),
+                                    "watch event"
+                                );
+                                match scheduled {
+                                    Scheduled::Scan(root) => {
+                                        trace_scan_due(&root, "event");
+                                        schedule(&mut due, &mut first_seen, root, Instant::now(), &timings);
+                                    }
                                     Scheduled::Head(root) => { head_due.insert(root); }
                                     Scheduled::Ignore => {}
                                 }
@@ -654,6 +696,7 @@ async fn run_loop(
         }
 
         if std::mem::take(&mut rescan_now) {
+            tracing::debug!("rescan backstop");
             let changed = blocking(&engine, |e| e.rescan()).await;
             match changed {
                 Ok(changed) => {
@@ -692,6 +735,7 @@ async fn run_loop(
             }
             let now = Instant::now();
             for r in &roots {
+                trace_scan_due(&r.path, "rescan");
                 due.insert(r.path.clone(), now);
             }
         }
@@ -979,6 +1023,13 @@ mod tests {
             matches!(is("/w/main/.git/worktrees/wt/HEAD"), Scheduled::Head(r) if r == Path::new("/w/wt"))
         );
         assert!(matches!(is("/elsewhere/z"), Scheduled::Ignore));
+
+        // Deliverable 8: the `scheduled=` field of the `watch event` probe is exactly this
+        // three-word vocabulary, so a log can be grepped for the events that scheduled
+        // nothing — the shape of "my edit never reached the screen".
+        assert_eq!(is("/w/a/src/x.rs").label(), "scan");
+        assert_eq!(is("/w/a/.git/HEAD").label(), "head");
+        assert_eq!(is("/w/a/vendor/x").label(), "ignore");
     }
 
     /// A main worktree and its linked worktree are both roots: the linked worktree's git

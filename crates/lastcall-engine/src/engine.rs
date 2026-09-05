@@ -378,7 +378,14 @@ impl Engine {
             git_version,
             scan_seq: 0,
         };
+        let started = std::time::Instant::now();
         engine.rescan()?;
+        // Deliverable 8: the one number a "lastcall took forever to start" report needs.
+        tracing::debug!(
+            roots = engine.roots.len(),
+            ms = started.elapsed().as_millis() as u64,
+            "open done"
+        );
         Ok(engine)
     }
 
@@ -788,6 +795,21 @@ struct ScanCtx {
 /// `scan_seq` is deliberately *not* touched here. It is the engine's ordering of scans, and
 /// assigning it inside the pool would make it depend on which worker finished first; the
 /// serial apply step in [`Engine::scan_all`] hands it out in path order instead.
+/// Deliverable 8's engine probe: one `scan done` line per scanned root, with the four field
+/// names a diagnosis reads — which root, how long, how many rows came back, and the
+/// engine-global `seq` that orders the piles. Emitted at `debug`, so it costs nothing until
+/// `LASTCALL_LOG=debug` asks for it, and emitted from the **serial** step of `scan_all` as
+/// well as from `scan`, so the `seq` in the line is the one the pile carries.
+fn trace_scan_done(root: &Path, started: &std::time::Instant, rows: usize, seq: u64) {
+    tracing::debug!(
+        root = %root.display(),
+        ms = started.elapsed().as_millis() as u64,
+        rows,
+        seq,
+        "scan done"
+    );
+}
+
 fn scan_root(state: &mut RootState, ctx: &ScanCtx) -> Result<Pile, EngineError> {
     state.reload_ledger_if_changed();
     let out = scan::scan(&ScanInputs {
@@ -851,12 +873,14 @@ impl Engine {
     /// Scan one root: candidates → rows → annotation.
     pub fn scan(&mut self, root: &Path) -> Result<Pile, EngineError> {
         let ctx = self.scan_ctx();
+        let started = std::time::Instant::now();
         let state = self
             .roots
             .get_mut(root)
             .ok_or_else(|| EngineError::NoSuchRoot(root.to_path_buf()))?;
         let pile = scan_root(state, &ctx)?;
         self.scan_seq += 1;
+        trace_scan_done(root, &started, pile.rows.len(), self.scan_seq);
         Ok(pile)
     }
 
@@ -887,9 +911,19 @@ impl Engine {
                 .map(|(p, s)| (p.clone(), s))
                 .collect();
             states.sort_by(|a, b| a.0.as_os_str().cmp(b.0.as_os_str()));
-            let scanned = parallel_map(states, width, |(p, state)| (p, scan_root(state, &ctx)));
-            for (p, r) in scanned {
+            let scanned = parallel_map(states, width, |(p, state)| {
+                let started = std::time::Instant::now();
+                let r = scan_root(state, &ctx);
+                (p, started, r)
+            });
+            for (p, started, r) in scanned {
                 self.scan_seq += 1;
+                trace_scan_done(
+                    &p,
+                    &started,
+                    r.as_ref().map(|pile| pile.rows.len()).unwrap_or(0),
+                    self.scan_seq,
+                );
                 results.insert(p, (self.scan_seq, r));
             }
             // A root that is in `todo` but no longer in `roots` cannot happen (both come
