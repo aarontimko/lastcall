@@ -1370,10 +1370,15 @@ fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
         // Too narrow for two columns *and* too short for one (80×30 with this keymap): the
         // overlay clips, and what it clips is key rows — never the footer. A reader who
         // cannot see every key can still see what the mouse does and how to leave.
-        rows.truncate(cap.saturating_sub(2));
+        //
+        // Three rows are reserved, not two: the blank, `SELECT_NOTE`, **and** the
+        // `any key closes` line below them, which is drawn only where the body does not
+        // reach. Reserving two put the body's last row on the footer's row, so the footer
+        // was the thing the clip dropped (verifier (b) F4).
+        rows.truncate(cap.saturating_sub(3));
         rows.push(String::new());
         rows.push(SELECT_NOTE.to_owned());
-        rows.truncate(cap);
+        rows.truncate(cap.saturating_sub(1));
     }
     for (i, row) in rows.iter().take(cap).enumerate() {
         buf.set_stringn(
@@ -2035,6 +2040,23 @@ mod tests {
             "40 columns cannot hold two"
         );
         assert_eq!(help_columns(&keys, Rect::new(0, 0, 100, 30)).len(), 16);
+
+        // Verifier (b) F4. 80 columns is the standard width and has no room for a second
+        // column (the widest left row plus the widest right row plus the gutter and the
+        // border come to 100), so the overlay clips there. What it clips is **key rows**:
+        // the mouse note and `any key closes` are reserved out of the truncation, because a
+        // reader who cannot see every key still has to be able to leave.
+        let mut narrow = App::new();
+        narrow.help = true;
+        for (w, h) in [(80u16, 30u16), (80, 24)] {
+            let (frame, _) = frame_of(&narrow, w, h);
+            assert!(frame.contains("any key closes"), "{w}x{h}:\n{frame}");
+            assert!(frame.contains(SELECT_NOTE), "{w}x{h}:\n{frame}");
+        }
+        // At 30 lines the clip stops after the quit row — the one a reader who opened the
+        // overlay by accident needs most.
+        let (frame, _) = frame_of(&narrow, 80, 30);
+        assert!(frame.contains("q / Ctrl-C     quit"), "{frame}");
     }
 
     /// Under the modal the hint line names only the keys that work there: the modal's

@@ -418,8 +418,11 @@ modal keys, a single column runs off the bottom of a 30-row terminal, so
 *and* the pair fits the width — each column sized to its own widest row, because padding both
 to the widest row in the table costs the second column the width it needs. If two columns
 would themselves have to be truncated, one column is no worse, and it stays. The vertical
-clipping that follows eats key rows, never the footer, so the shift-drag note
-(`render::SELECT_NOTE`) is always the last line of the box.
+clipping that follows eats key rows, never the footer: **three** rows are reserved out of
+the truncation — the blank, the shift-drag note (`render::SELECT_NOTE`) and the
+`any key closes` line — so both survive at any size the overlay is drawn at. At 80 columns,
+the standard width, the pair does not fit and the overlay clips: at 30 lines it reaches the
+`quit` row, at 24 it stops earlier, and the footer is there either way (verifier (b) F4).
 
 Mouse: a left press on a nav entry selects it; on a hunk header it selects that hunk; on a
 hunk header's `[a accept]` it accepts that hunk, on `[u restore]` it restores it and on
@@ -490,7 +493,11 @@ own widest row plus `HELP_GUTTER` (3 spaces) and joins column two beside it. Rea
 runs **down column one, then down column two** — not across — so the keymap's order is
 still the order you read. If the two columns plus the border would not fit the width, the
 overlay stays one column and clips as before: narrow beats scrambled. `SELECT_NOTE` and
-`any key closes` are never columnised; they stay full width under the body. The frames are
+`any key closes` are never columnised; they stay full width under the body, and the
+truncation reserves all three of their rows (`cap - 3`, then `cap - 1`) rather than letting
+the body's last row land on the footer's. Two columns need about 100 columns with these
+descriptions, so 80 clips; shortening them to fit 80 would cost about twenty columns across
+ten rows and was not worth the truth. The frames are
 `tui_help_overlay` (100×30) and `tui_help_overlay_tall` (100×45): 23 rows still fit one
 column at 30 lines, and Phase 7's four new keys (`u`, `U`, `m`, `M`) take it to 27, which
 is where the split starts — the tall frame is the control that keeps one column pinned.
