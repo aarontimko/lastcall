@@ -54,7 +54,10 @@ mod tests {
         let one = poll_timings(Some(0));
         assert_eq!(one.head_poll, Duration::from_secs(1));
         assert_eq!(one.rescan, Duration::from_secs(1));
+        // `--poll` moves the two backstops and nothing else: the debounce and its 3 s
+        // starvation cap (Amendment v1.6) are hardcoded, so they survive it unchanged.
         assert_eq!(one.debounce, default.debounce);
+        assert_eq!(one.debounce_max, default.debounce_max);
         let five = poll_timings(Some(5));
         assert_eq!(five.head_poll, Duration::from_secs(5));
         assert_eq!(five.rescan, Duration::from_secs(5));
