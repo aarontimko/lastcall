@@ -548,6 +548,16 @@ async fn run_loop(
 
     let mut due: BTreeMap<PathBuf, Instant> = BTreeMap::new();
     // When each root's current burst of worktree events began; the starvation cap's input.
+    //
+    // It is **loop-local on purpose**, which means a scan the loop did not initiate does
+    // not end the window (verifier (a) F7): the TUI's own `watcher::blocking(|e|
+    // e.scan(root))` — `Effect::Refresh`, and the rescan an accept leaves behind — is
+    // invisible here, so a burst window opened before such a scan still fires its cap up
+    // to `debounce_max` later. The cost is bounded at one redundant scan per window, whose
+    // pile is unchanged and so is `Changed::No` at the app, and the window then resets.
+    // Accepted, same class and same bound as `inspect_root` leaving `due` in place on a
+    // HeadChange; the alternative is sharing this map across a task boundary for a scan
+    // that has already happened.
     let mut first_seen: BTreeMap<PathBuf, Instant> = BTreeMap::new();
     let mut head_due: BTreeSet<PathBuf> = BTreeSet::new();
     let mut head_poll = tokio::time::interval(timings.head_poll);
@@ -723,9 +733,17 @@ mod tests {
     ///
     /// The model is the loop's own: the `select!` wakes at whichever comes first, the
     /// event or `sleep_until(next_due)`, and the drain at the end of the pass scans every
-    /// root whose deadline has passed. At a tie the timer wins, which is what
-    /// `sleep_until` gives when a deadline is reached exactly (the `head_change_at` hook
-    /// stands in for a HEAD-change scan arriving between events).
+    /// root whose deadline has passed (the `head_change_at` hook stands in for a
+    /// HEAD-change scan arriving between events).
+    ///
+    /// **Ties are the simulator's, not the loop's** (verifier (a) F6): the real
+    /// `tokio::select!` above has no `biased;`, so when an event lands exactly on a
+    /// deadline either arm may win, and the two orders differ by nothing that matters —
+    /// timer first scans in this pass and the event opens the next window, so a
+    /// `Changed::No` scan may follow 750 ms later; event first schedules a deadline that
+    /// is already past and the same pass's drain scans it, carrying the tie event's own
+    /// content. This model resolves the tie to the timer so the expected offsets below are
+    /// a single sequence; `biased;` is deliberately *not* added to the loop for it.
     fn replay(events_ms: &[u64], head_change_at: Option<u64>, timings: &EngineTimings) -> Vec<u64> {
         let t0 = Instant::now();
         let root = PathBuf::from("/w/alpha");
