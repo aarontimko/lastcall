@@ -81,6 +81,13 @@ test-scenarios:
 golden-update:
     LASTCALL_UPDATE_GOLDEN=1 cargo test -p lastcall --test test_integration_status_golden
 
+# Rewrite the flag-export goldens (crates/lastcall/tests/golden/flag_export*.md), then
+# prove they pass. `flag_export.md` is written by an engine unit test with a FixedClock
+# (the binary has no clock override); `flag_export_pty.md` by the TUI's PTY scene.
+flag-export-golden:
+    LASTCALL_UPDATE_GOLDEN=1 cargo test -p lastcall-engine --lib flags::tests::flags_export_matches_the_golden
+    cargo test -p lastcall-engine --lib flags::
+
 # Rewrite the Phase 3 TUI snapshots (crates/lastcall/tests/snapshots/), then prove they pass.
 snapshots-update:
     INSTA_UPDATE=always cargo test -p lastcall --test test_e2e_tui_snapshots || true

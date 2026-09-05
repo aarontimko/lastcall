@@ -8,6 +8,7 @@ pub mod config;
 pub mod count;
 pub mod engine;
 pub mod env;
+pub mod flags;
 pub mod git;
 pub mod headstate;
 #[cfg(feature = "herdr")]
