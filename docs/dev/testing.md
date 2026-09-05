@@ -181,9 +181,18 @@ hunk, then the file, comparing the bytes on disk with the baseline blob),
 the refusal is read off the status line), `pty_restore_deletion_recreates_the_file`, and
 `pty_flag_note_exports_when_standalone`, which types a note into the modal with **no herdr
 link** and reads the export back out of the state dir against `flag_export_pty.md`. No PTY
-scene talks to herdr: only `just test-integration-herdr` proves the real pane, and the
-staged send has its own reducer coverage (`app_flagged_with_one_agent_stages_without_asking`
-and the picker tests) plus the mock-socket integration tests. The scenes are serialized (one
+scene talks to herdr: only `just test-integration-herdr` proves the real pane. The staged
+send is covered in three places, and it takes all three — verifier (b) F1 found that the two
+end tests both passed while the middle was missing, because nothing in the loop built
+`HerdrUpdate::Agents` and the send was unreachable in the binary. The reducer's decision
+(`app_flagged_with_one_agent_stages_without_asking` and the picker tests) injects the
+candidates; `herdr_stage_wraps_the_export_in_bracketed_paste_markers` pins the request's
+shape against an in-memory mock; and **`loop_flag_with_one_agent_reaches_pane_send_text`
+(`tests/test_integration_loop_flag_stage.rs`) is the only test that joins them** — a real
+client over the mock socket, the loop's own `run::herdr_fold`, `Ui::event` for the
+keystrokes, and `run::spawn_flag` / `run::spawn_stage` for the effects, asserting the
+bracketed-paste `pane.send_text` that lands on the socket. A send test that injects its own
+candidates proves the reducer, never the wiring. The scenes are serialized (one
 mutex); the whole file is about 45 s. Timing lines go to `stderr().write_all` so they survive libtest's
 capture — run it with `-- --nocapture` to see them. If the live-update assertion fails on a
 loaded host, report the measured numbers; do not loosen the budget.

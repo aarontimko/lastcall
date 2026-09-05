@@ -20,6 +20,7 @@
 //! the tty and nothing in the restore sequence wakes it, so it polls with a 50 ms timeout
 //! under a stop flag and exits on its own shortly after the loop ends.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -34,7 +35,7 @@ use crossterm::event::{
 use lastcall_engine::engine::{AcceptRequest, Engine, RenderedHunk, RestoreRequest};
 use lastcall_engine::env::Env;
 use lastcall_engine::herdr::HerdrEvent;
-use lastcall_engine::herdr::client::ClientHandle;
+use lastcall_engine::herdr::client::{Cache, ClientHandle};
 use lastcall_engine::herdr::transport::SocketTransport;
 use lastcall_engine::hunks::Expanded;
 use lastcall_engine::scan::{Pile, Row};
@@ -582,7 +583,10 @@ fn spawn_restore(
 /// `Effect::Flag`: the ledger write and its rescan in one `blocking` closure, the same
 /// shape as `spawn_accept`. The engine renders the export (only it has the flag's
 /// `created_at`), so the answer carries the paste-ready text the send will use.
-fn spawn_flag(
+///
+/// Public for the same reason [`herdr_fold`] is: `tests/test_integration_loop_flag_stage.rs`
+/// drives the loop's own dispatch rather than a hand-written stand-in for it.
+pub fn spawn_flag(
     engine: &Arc<Mutex<Engine>>,
     tx: mpsc::UnboundedSender<Local>,
     root: PathBuf,
@@ -633,7 +637,10 @@ fn spawn_unflag(
 /// `Effect::Stage`: `pane.send_text` the export into one agent pane, bracketed-paste
 /// wrapped by [`herdr::stage`] so it lands unsubmitted. No link means no send: the flag is
 /// already on disk, and `App::staged` says so.
-fn spawn_stage(
+///
+/// Public for the same reason [`herdr_fold`] is: `tests/test_integration_loop_flag_stage.rs`
+/// drives the loop's own dispatch rather than a hand-written stand-in for it.
+pub fn spawn_stage(
     transport: Option<SocketTransport>,
     tx: mpsc::UnboundedSender<Local>,
     pane_id: String,
@@ -840,15 +847,44 @@ fn herdr_rederive(ui: &mut Ui, link: &Herdr) -> (Changed, Option<Effect>) {
     let Some(cache) = link.handle.as_ref().and_then(ClientHandle::snapshot) else {
         return (Changed::No, None);
     };
+    herdr_fold(ui, &cache, link.workspace_id.as_deref())
+}
+
+/// The socket-free half of [`herdr_rederive`]: one snapshot in, three folds out. Split out
+/// and public so a test can drive it — a `ClientHandle` only exists behind a live client,
+/// and the loop is exactly where verifier (b) F1 found the missing emitter
+/// (`tests/test_integration_loop_flag_stage.rs` takes a real client's snapshot through it).
+///
+/// **Three** updates, not two: the rollup (`Roots`) answers "how is this root doing?" and
+/// the candidate map (`Agents`) answers "which agent could take this export?". Nothing else
+/// builds `HerdrUpdate::Agents`, so leaving it out left `HerdrView::candidates` empty
+/// forever and every flag fell through to the export file — the staged send and the picker
+/// were dead code in the built binary. Re-derived on every snapshot, exactly like the
+/// rollup, so a pane that appears or goes away moves both.
+///
+/// `agents_for(.., None)` walks **every** workspace: the `w` scope narrowing belongs to
+/// `HerdrView::candidates`, which already applies it to whatever this map holds.
+pub fn herdr_fold(
+    ui: &mut Ui,
+    cache: &Cache,
+    workspace_id: Option<&str>,
+) -> (Changed, Option<Effect>) {
     let metas: Vec<RootMeta> = ui.app.roots.values().map(|v| v.meta.clone()).collect();
-    let scope = link
-        .workspace_id
-        .as_deref()
-        .and_then(|id| herdr::derive_scope(&cache, &metas, id));
-    let roots = herdr::derive(&cache, &metas);
+    let scope = workspace_id.and_then(|id| herdr::derive_scope(cache, &metas, id));
+    let roots = herdr::derive(cache, &metas);
+    let agents: BTreeMap<PathBuf, Vec<herdr::AgentCandidate>> = metas
+        .iter()
+        .map(|m| {
+            (
+                m.path.clone(),
+                herdr::agents_for(cache, &metas, &m.path, None),
+            )
+        })
+        .collect();
     let (c1, _) = ui.app.handle(Action::Herdr(HerdrUpdate::Scope(scope)));
     let (c2, effect) = ui.app.handle(Action::Herdr(HerdrUpdate::Roots(roots)));
-    (c1.or(c2), effect)
+    let (c3, _) = ui.app.handle(Action::Herdr(HerdrUpdate::Agents(agents)));
+    (c1.or(c2).or(c3), effect)
 }
 
 /// `Effect::Focus`: `agent.focus` off the UI task; the verdict comes back as
@@ -1569,6 +1605,49 @@ mod tests {
             left += 1;
         }
         assert_eq!(left, 8);
+    }
+
+    /// Verifier (b) F1: the loop's fold of one herdr snapshot has to emit the **candidate
+    /// map** as well as the rollup, or `HerdrView::candidates` is empty forever and the
+    /// staged send and the picker are unreachable in the built binary — every flag falls
+    /// through to the export file whatever herdr shows.
+    ///
+    /// One agent pane under `/W/alpha` and one under `/W/beta`: after the fold each root
+    /// has exactly its own candidate, which is the input `App::flagged`'s `1 =>` arm reads.
+    #[test]
+    fn run_drain_rederive_sends_the_agent_candidates_beside_the_roots() {
+        use crate::tui::herdr::testfix::{cache, pane};
+
+        let mut ui = ui();
+        assert!(
+            ui.app.herdr.candidates(&root("alpha")).is_empty(),
+            "no snapshot has been folded yet"
+        );
+
+        let snapshot = cache(vec![
+            pane("p-alpha", "ws1", "/W/alpha", Some("claude"), "working"),
+            pane("p-beta", "ws1", "/W/beta", Some("claude"), "idle"),
+            // Not agent-bearing: a plain shell in the same root is not a send target.
+            pane("p-shell", "ws1", "/W/alpha", None, "unknown"),
+        ]);
+        let (changed, _) = herdr_fold(&mut ui, &snapshot, None);
+        assert_eq!(changed, Changed::Yes);
+
+        assert_eq!(ui.app.herdr.candidates(&root("alpha")).len(), 1);
+        assert_eq!(
+            ui.app.herdr.candidates(&root("alpha"))[0].pane_id,
+            "p-alpha"
+        );
+        assert_eq!(ui.app.herdr.candidates(&root("beta")).len(), 1);
+        // A root with no agent under it gets an entry, and it is empty — the export-file
+        // fallback, which is what the `0 =>` arm is for.
+        assert!(ui.app.herdr.candidates(&root("notes")).is_empty());
+
+        // The map re-derives on every snapshot, like the rollup: the pane goes away and so
+        // does the candidate.
+        let (changed, _) = herdr_fold(&mut ui, &cache(vec![]), None);
+        assert_eq!(changed, Changed::Yes);
+        assert!(ui.app.herdr.candidates(&root("alpha")).is_empty());
     }
 
     /// The §11 hardening, at the loop's level: a watcher pile carrying a seq below the one
