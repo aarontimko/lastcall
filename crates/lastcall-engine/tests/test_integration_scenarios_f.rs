@@ -6,7 +6,7 @@ mod common;
 use common::Fresh;
 use lastcall_engine::config::{Config, DraftInitial};
 use lastcall_engine::engine::EngineOptions;
-use lastcall_engine::ops::NoFault;
+use lastcall_engine::ops::{NoFault, Rendered};
 use lastcall_engine::store::RootKind;
 use lastcall_testkit::assert_pile;
 use lastcall_testkit::engine::{open_engine, pile_string};
@@ -43,6 +43,100 @@ fn scenario_f1_gitignored_draft_dir_inside_a_repo() {
     assert_pile!(s.engine, draft, "", "F1 accept all");
     s.restart();
     assert_pile!(s.engine, draft, "");
+
+    // Phase 6 gate item 1: the same gitignored draft file goes pending, is reviewed one
+    // hunk at a time, and every step survives a restart. A 20-line baseline so two edits
+    // six lines apart are two hunks at CONTEXT 3 and not one merged hunk.
+    let baseline: String = (1..=20).map(|i| format!("line {i}\n")).collect();
+    s.repo.write("_drafts/reply.md", &baseline);
+    assert_pile!(
+        s.engine,
+        draft,
+        "reply.md",
+        "F1 the 20-line baseline is pending"
+    );
+    assert!(accept_file(&mut s, &draft, "reply.md").ok());
+    assert_pile!(
+        s.engine,
+        draft,
+        "",
+        "F1 the 20-line baseline is the seen point"
+    );
+
+    // The second edit: two regions far enough apart to be two hunks.
+    let edited: String = (1..=20)
+        .map(|i| match i {
+            2 => "line 2 edited by the agent\n".to_owned(),
+            18 => "line 18 edited by the agent\n".to_owned(),
+            _ => format!("line {i}\n"),
+        })
+        .collect();
+    s.repo.write("_drafts/reply.md", &edited);
+    let pile = assert_pile!(s.engine, draft, "reply.md", "F1 hunk-review: pending");
+    let row = pile.row(b"reply.md").unwrap();
+    assert_eq!(row.hunks.len(), 2, "F1: the second edit is two hunks");
+    assert_eq!(
+        row.collapsed, None,
+        "F1: a small text draft is not collapsed"
+    );
+
+    // Accept the first hunk only; the second stays pending.
+    let rendered = Rendered::of(row);
+    let out = s
+        .engine
+        .ops(&draft)
+        .unwrap()
+        .accept_hunk(&rendered, &row.hunks, 0, &NoFault)
+        .unwrap();
+    assert!(out.ok(), "F1 accept_hunk: {out:?}");
+    let after = assert_pile!(s.engine, draft, "reply.md", "F1 one hunk left");
+    let left = remaining_hunk(&after);
+    assert_eq!(
+        left, "line 18 edited by the agent\n",
+        "F1: the accepted hunk is gone, the untouched one remains"
+    );
+
+    // …and survives a restart: the ledger override is the baseline, recomputed fresh.
+    s.restart();
+    let after_restart = assert_pile!(s.engine, draft, "reply.md", "F1 restart keeps the hunk");
+    assert_eq!(
+        remaining_hunk(&after_restart),
+        left,
+        "F1: the same remaining hunk after a restart"
+    );
+
+    // Accept the file: the row clears, and stays clear across a second restart.
+    assert!(accept_file(&mut s, &draft, "reply.md").ok());
+    assert_pile!(s.engine, draft, "", "F1 accept_file clears the row");
+    s.restart();
+    assert_pile!(s.engine, draft, "", "F1 accepted, after a second restart");
+}
+
+/// `accept_file` against an arbitrary root of `s` (`Fresh::accept_file` targets the git root).
+fn accept_file(s: &mut Fresh, root: &std::path::Path, path: &str) -> lastcall_engine::ops::Outcome {
+    let pile = s.engine.scan(root).expect("scan");
+    let row = pile
+        .row(path.as_bytes())
+        .unwrap_or_else(|| panic!("{path} is not pending: {}", pile_string(&pile)));
+    let rendered = Rendered::of(row);
+    s.engine
+        .ops(root)
+        .unwrap()
+        .accept_file(&rendered, &NoFault)
+        .expect("accept_file")
+}
+
+/// The single insert line of the pile's one remaining hunk.
+fn remaining_hunk(pile: &lastcall_engine::scan::Pile) -> String {
+    let row = pile.row(b"reply.md").expect("reply.md is pending");
+    assert_eq!(row.hunks.len(), 1, "exactly one hunk left: {:?}", row.hunks);
+    let inserts: Vec<String> = row.hunks[0]
+        .lines
+        .iter()
+        .filter(|(t, _)| *t == lastcall_engine::hunks::Tag::Insert)
+        .map(|(_, l)| String::from_utf8_lossy(l).into_owned())
+        .collect();
+    inserts.join("")
 }
 
 #[test]
