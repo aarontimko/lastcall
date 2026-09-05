@@ -17,11 +17,11 @@ use lastcall_engine::count::with_thousands;
 use lastcall_engine::engine::{AcceptRequest, Accepted, EngineError, RootState};
 use lastcall_engine::git::Oid;
 use lastcall_engine::headstate::InProgress;
-use lastcall_engine::hunks::Hunk;
+use lastcall_engine::hunks::{Expanded, Hunk};
 use lastcall_engine::ledger::LedgerError;
 use lastcall_engine::ops::{OpsError, Rendered};
 use lastcall_engine::roots::Badge;
-use lastcall_engine::scan::{Annotation, Change, Group, Pile, Row};
+use lastcall_engine::scan::{Annotation, Change, Collapsed, Entry, Group, Pile, Row};
 use lastcall_engine::store::RootKind;
 use lastcall_engine::watcher::EngineEvent;
 
@@ -177,6 +177,9 @@ pub enum Target {
     FileAccept,
     /// The `[a accept]` hint on hunk `i`'s header line.
     HunkAccept(usize),
+    /// The `[e expand]` control on a collapsed row's header line (Phase 6 deliverable 4);
+    /// only drawn for `Glob`/`Size`, so a click can never reach a binary row.
+    Expand,
     /// A root row's herdr dot: a click there acks the flag (deliverable 5).
     RootDot(PathBuf),
     /// The header's herdr badge: a click shows the full standalone reason.
@@ -237,6 +240,26 @@ pub enum Effect {
     Focus(String),
     /// Tell the toast task which ready episodes opened and which ended (deliverable 6).
     Toast(ToastRequest),
+    /// `Engine::hunks_of` for one collapsed row, off the UI task; the answer comes back as
+    /// `Local::Expanded`. The **row** travels, not just its path: the expansion is computed
+    /// from the oids the row was rendered from, so it shows exactly the delta the counts
+    /// describe even if the file moved since (Phase 6 deliverable 4). Boxed because a `Row`
+    /// is an order of magnitude wider than every other variant.
+    Expand(PathBuf, Box<Row>),
+}
+
+/// One collapsed row's on-demand hunks, held beside the pile and never on the [`Row`]:
+/// `accept_scope` and `apply_pile` do not read it, so `a`/`A` stay whole-row for a
+/// collapsed path (§6.3 "single accept") and a newer pile cannot collapse the view
+/// mid-read. Cleared when the selection leaves the row, and when a newer pile changes the
+/// row's oids — which is why the oids it was computed from travel with it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Expansion {
+    pub root: PathBuf,
+    pub path: Vec<u8>,
+    pub baseline: Option<Entry>,
+    pub current: Option<Entry>,
+    pub view: Expanded,
 }
 
 /// What one accept covers (§6.7): the key to the status text, the confirm modal's live
@@ -362,6 +385,9 @@ pub struct App {
     /// Everything herdr says, and the local ack episodes (Phase 5). Socket-free: the
     /// reducer never sees the client's own types.
     pub herdr: HerdrView,
+    /// The one collapsed row whose hunks `e` fetched, if any. A view, never a baseline;
+    /// see [`Expansion`].
+    pub expanded: Option<Expansion>,
     /// The effective key bindings, `(action name, key specs)` in `DEFAULT_KEYMAP` order.
     /// Seeded from the defaults; worker 3b replaces it after `Keymap::from_config` so the
     /// hint line and the help overlay show the user's own bindings.
@@ -395,6 +421,7 @@ impl App {
             accepting: None,
             confirm: None,
             herdr: HerdrView::default(),
+            expanded: None,
             // The canonical spellings (`shift-a` shows as `A`), as `Keymap::table` gives.
             keymap: Keymap::defaults().table(),
         }
@@ -473,6 +500,113 @@ impl App {
         match &self.selection {
             Some(Selection::Row(root, path)) => self.roots.get(root)?.row(path),
             _ => None,
+        }
+    }
+
+    /// The expansion showing for the **selected** row, if any. `render_diff` and the diff
+    /// cursor read it; `accept_scope` never does.
+    pub fn expansion(&self) -> Option<&Expansion> {
+        let exp = self.expanded.as_ref()?;
+        match &self.selection {
+            Some(Selection::Row(root, path)) if *root == exp.root && *path == exp.path => Some(exp),
+            _ => None,
+        }
+    }
+
+    /// The hunks the diff pane is showing for the selected row: the expansion's when one is
+    /// held for it, else the row's own. Every diff-cursor bound goes through this, so `n`,
+    /// `p` and the wheel work inside an expansion exactly as they do in a normal diff.
+    /// **Accept does not**: `accept_scope` reads `row.hunks`, so a collapsed row stays a
+    /// single accept however much of it is on screen (§6.3).
+    pub fn view_hunks(&self) -> &[Hunk] {
+        if let Some(exp) = self.expansion() {
+            return &exp.view.hunks;
+        }
+        match self.selected_row() {
+            Some(row) => &row.hunks,
+            None => &[],
+        }
+    }
+
+    /// Whether a row can be expanded at all: collapsed, and not by being binary.
+    fn expandable(row: &Row) -> bool {
+        matches!(row.collapsed, Some(Collapsed::Glob) | Some(Collapsed::Size))
+    }
+
+    /// `e`: ask the loop for the selected collapsed row's hunks. A no-op — no effect and no
+    /// draw — on a binary row, on a row that is not collapsed, and on a row already
+    /// expanded, so the key is silent exactly where it has nothing to do.
+    fn request_expand(&mut self) -> (Changed, Option<Effect>) {
+        let Some(Selection::Row(root, path)) = self.selection.clone() else {
+            return (Changed::No, None);
+        };
+        let Some(row) = self.selected_row() else {
+            return (Changed::No, None);
+        };
+        if !Self::expandable(row) {
+            return (Changed::No, None);
+        }
+        if self
+            .expanded
+            .as_ref()
+            .is_some_and(|e| e.root == root && e.path == path)
+        {
+            return (Changed::No, None);
+        }
+        (
+            Changed::No,
+            Some(Effect::Expand(root, Box::new(row.clone()))),
+        )
+    }
+
+    /// An `Effect::Expand` came back. It is dropped unless the row is still selected and
+    /// still carries the oids it was computed from — a pile that landed meanwhile makes the
+    /// answer a diff of something the screen is no longer showing.
+    pub fn set_expanded(&mut self, root: PathBuf, path: Vec<u8>, view: Expanded) -> Changed {
+        let matches_selection = matches!(
+            &self.selection,
+            Some(Selection::Row(r, p)) if *r == root && *p == path
+        );
+        let Some(row) = self
+            .roots
+            .get(&root)
+            .and_then(|v| v.row(&path))
+            .filter(|_| matches_selection)
+        else {
+            return Changed::No;
+        };
+        let next = Expansion {
+            root,
+            path,
+            baseline: row.baseline.clone(),
+            current: row.current.clone(),
+            view,
+        };
+        if self.expanded.as_ref() == Some(&next) {
+            return Changed::No;
+        }
+        self.expanded = Some(next);
+        self.clamp_cursor();
+        Changed::Yes
+    }
+
+    /// Drop the expansion when it no longer describes what is on screen: the selection left
+    /// the row, the row is gone, or a newer pile changed its oids.
+    fn drop_stale_expansion(&mut self) {
+        let Some(exp) = &self.expanded else {
+            return;
+        };
+        let selected = matches!(
+            &self.selection,
+            Some(Selection::Row(r, p)) if *r == exp.root && *p == exp.path
+        );
+        let same_oids = self
+            .roots
+            .get(&exp.root)
+            .and_then(|v| v.row(&exp.path))
+            .is_some_and(|row| row.baseline == exp.baseline && row.current == exp.current);
+        if !selected || !same_oids {
+            self.expanded = None;
         }
     }
 
@@ -587,6 +721,7 @@ impl App {
         if let Some(n) = fresh {
             self.set_status(n);
         }
+        self.drop_stale_expansion();
         self.reconcile_selection();
         Changed::Yes
     }
@@ -1000,6 +1135,7 @@ impl App {
         }
         self.selection = next;
         self.diff = DiffCursor::default();
+        self.drop_stale_expansion();
         Changed::Yes
     }
 
@@ -1033,12 +1169,14 @@ impl App {
     }
 
     fn clamp_cursor(&mut self) {
-        let Some(row) = self.selected_row() else {
+        if self.selected_row().is_none() {
             self.diff = DiffCursor::default();
             return;
+        }
+        let (hunks, lines) = {
+            let h = self.view_hunks();
+            (h.len(), diff_lines(h))
         };
-        let hunks = row.hunks.len();
-        let lines = diff_len(row);
         self.diff.hunk = self.diff.hunk.min(hunks.saturating_sub(1));
         self.diff.scroll = self.diff.scroll.min(lines.saturating_sub(1));
     }
@@ -1067,10 +1205,10 @@ impl App {
     // ---- diff cursor ---------------------------------------------------------------------
 
     fn scroll_by(&mut self, delta: isize) -> Changed {
-        let Some(row) = self.selected_row() else {
+        if self.selected_row().is_none() {
             return Changed::No;
-        };
-        let max = diff_len(row).saturating_sub(1) as isize;
+        }
+        let max = diff_lines(self.view_hunks()).saturating_sub(1) as isize;
         let next = (self.diff.scroll as isize + delta).clamp(0, max) as usize;
         if next == self.diff.scroll {
             return Changed::No;
@@ -1081,15 +1219,15 @@ impl App {
 
     /// Move the hunk cursor and scroll so its header is the first visible line.
     fn move_hunk(&mut self, delta: isize) -> Changed {
-        let Some(row) = self.selected_row() else {
-            return Changed::No;
+        let (len, offsets) = {
+            let h = self.view_hunks();
+            (h.len(), hunk_offsets(h))
         };
-        if row.hunks.is_empty() {
+        if len == 0 {
             return Changed::No;
         }
-        let max = row.hunks.len() as isize - 1;
+        let max = len as isize - 1;
         let next = (self.diff.hunk as isize + delta).clamp(0, max) as usize;
-        let offsets = hunk_offsets(&row.hunks);
         let scroll = offsets[next];
         if next == self.diff.hunk && scroll == self.diff.scroll {
             return Changed::No;
@@ -1165,6 +1303,7 @@ impl App {
             },
             HunkNext => self.move_hunk(1),
             HunkPrev => self.move_hunk(-1),
+            Expand => return self.request_expand(),
             ToggleFullPaths => {
                 self.full_paths = !self.full_paths;
                 Changed::Yes
@@ -1381,6 +1520,8 @@ impl App {
                 _ => Changed::No,
             },
             Target::FileAccept => return self.handle(Action::AcceptFile),
+            // The control is only drawn on an expandable row, so the click is the key.
+            Target::Expand => return self.handle(Action::Expand),
             Target::HunkAccept(i) => {
                 // The cursor first lands on hunk `i` exactly as a click on its header
                 // does, then the accept is the one `a` would do there.
@@ -1400,10 +1541,7 @@ impl App {
                 // Same cursor as `HunkNext`/`HunkPrev` landing on hunk `i`: the header
                 // becomes the first visible line, so a click and a key yield equal `App`s.
                 let focus = self.set_focus(Focus::Diff);
-                let offsets = self
-                    .selected_row()
-                    .map(|r| hunk_offsets(&r.hunks))
-                    .unwrap_or_default();
+                let offsets = hunk_offsets(self.view_hunks());
                 if i < offsets.len() && i != self.diff.hunk {
                     self.diff.hunk = i;
                     self.diff.scroll = offsets[i];
@@ -1482,11 +1620,15 @@ pub fn hunk_offsets(hunks: &[Hunk]) -> Vec<usize> {
     out
 }
 
-/// Total diff lines of a row, counting the blank separator lines.
+/// Total diff lines of a hunk list, counting the blank separator lines.
+pub fn diff_lines(hunks: &[Hunk]) -> usize {
+    (0..hunks.len()).map(|i| hunk_block(hunks, i)).sum()
+}
+
+/// Total diff lines of a row's own hunks. The diff pane may be showing an expansion
+/// instead ([`App::view_hunks`]); this is the row's shape, not the screen's.
 pub fn diff_len(row: &Row) -> usize {
-    (0..row.hunks.len())
-        .map(|i| hunk_block(&row.hunks, i))
-        .sum()
+    diff_lines(&row.hunks)
 }
 
 pub fn short(oid: &Oid) -> String {
@@ -1663,6 +1805,30 @@ pub(crate) mod testfix {
     pub fn row(root: &str, path: &str) -> Selection {
         Selection::Row(self::root(root), path.as_bytes().to_vec())
     }
+
+    /// alpha's pile with `f1` collapsed as `kind` and its hunks cleared, exactly as the
+    /// scan leaves a collapsed row (Phase 6 deliverable 4).
+    pub fn alpha_collapsed(kind: Collapsed) -> Pile {
+        let mut p = pile("alpha");
+        p.rows[0].collapsed = Some(kind);
+        p.rows[0].hunks.clear();
+        p
+    }
+
+    /// An expansion answer of `n` one-line hunks, `omitted` body lines short of the whole.
+    pub fn expansion_of(n: usize, omitted: usize) -> Expanded {
+        let template = pile("alpha").rows[0].hunks[0].clone();
+        Expanded {
+            hunks: (0..n)
+                .map(|i| {
+                    let mut h = template.clone();
+                    h.index = i;
+                    h
+                })
+                .collect(),
+            omitted_lines: omitted,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1670,6 +1836,126 @@ mod tests {
     use super::testfix::*;
     use super::*;
     use lastcall_engine::roots::RootsChanged;
+    /// Phase 6 deliverable 4: `e` is silent where it has nothing to do — a binary row
+    /// (never expandable), a row that is not collapsed at all, a group, and a row already
+    /// expanded. No effect means no engine work; `Changed::No` means no draw.
+    #[test]
+    fn app_expand_is_a_no_op_off_a_collapsed_row() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        // A plain hunk row.
+        app.select(Some(row("alpha", "f1")));
+        assert_eq!(app.handle(Action::Expand), (Changed::No, None));
+        // A binary row.
+        app.apply(pile_event_seq(
+            "alpha",
+            1,
+            alpha_collapsed(Collapsed::Binary),
+        ));
+        app.select(Some(row("alpha", "f1")));
+        assert_eq!(app.handle(Action::Expand), (Changed::No, None));
+        assert!(app.expanded.is_none());
+        // A group entry.
+        app.select(Some(Selection::Group(root("beta"), Annotation::Upstream)));
+        assert_eq!(app.handle(Action::Expand), (Changed::No, None));
+    }
+
+    /// `e` on a `Glob`/`Size` row asks the engine once, with the row itself so the
+    /// expansion is computed from the oids the screen showed. The answer lives beside the
+    /// pile: the row keeps no hunks, so `a` and `A` are still one whole-row accept.
+    #[test]
+    fn app_expand_holds_the_hunks_beside_the_row_and_accept_stays_whole_row() {
+        for kind in [Collapsed::Glob, Collapsed::Size] {
+            let mut app = three_roots();
+            app.handle(Action::Resize(100, 30));
+            app.apply(pile_event_seq("alpha", 1, alpha_collapsed(kind)));
+            app.select(Some(row("alpha", "f1")));
+            let (changed, effect) = app.handle(Action::Expand);
+            assert_eq!(changed, Changed::No, "asking draws nothing");
+            let Some(Effect::Expand(asked_root, asked_row)) = effect else {
+                panic!("an expand effect: {effect:?}");
+            };
+            assert_eq!(asked_root, root("alpha"));
+            assert_eq!(asked_row.path, b"f1");
+            assert_eq!(asked_row.collapsed, Some(kind));
+
+            let view = expansion_of(3, 0);
+            assert_eq!(
+                app.set_expanded(root("alpha"), b"f1".to_vec(), view.clone()),
+                Changed::Yes
+            );
+            assert_eq!(app.view_hunks().len(), 3, "the diff pane shows the hunks");
+            assert!(
+                app.selected_row().unwrap().hunks.is_empty(),
+                "never written back onto the row"
+            );
+            assert!(
+                matches!(app.accept_scope(), Some(AcceptScope::File { .. })),
+                "a collapsed row is one accept however much is on screen: {:?}",
+                app.accept_scope()
+            );
+            // Asking again while the same expansion is held is a second no-op.
+            assert_eq!(app.handle(Action::Expand), (Changed::No, None));
+            // The hunk cursor is bounded by the expansion, not by the row's empty list.
+            assert_eq!(app.handle(Action::HunkNext).0, Changed::Yes);
+            assert_eq!(app.diff.hunk, 1);
+        }
+    }
+
+    /// The expansion is a view of one row at one moment: it goes when the selection leaves
+    /// the row, and when a newer pile moves that row's oids.
+    #[test]
+    fn app_expansion_is_dropped_by_a_new_selection_or_new_oids() {
+        let collapsed = alpha_collapsed(Collapsed::Glob);
+        let expand = |app: &mut App| {
+            app.select(Some(row("alpha", "f1")));
+            assert_eq!(
+                app.set_expanded(root("alpha"), b"f1".to_vec(), expansion_of(2, 0)),
+                Changed::Yes
+            );
+        };
+
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.apply(pile_event_seq("alpha", 1, collapsed.clone()));
+        expand(&mut app);
+        app.select(Some(row("alpha", "f2")));
+        assert!(app.expanded.is_none(), "the selection left the row");
+
+        // A pile that repeats the same oids keeps it: nothing the reader is looking at moved.
+        expand(&mut app);
+        let mut same = collapsed.clone();
+        same.notices.push("alpha: something else".to_owned());
+        app.apply(pile_event_seq("alpha", 2, same));
+        assert!(app.expanded.is_some(), "same oids, same expansion");
+
+        // A pile whose row has a new current oid drops it.
+        let mut moved = collapsed.clone();
+        moved.rows[0].current.as_mut().unwrap().oid =
+            Oid::parse(&"a".repeat(40)).expect("a well-formed oid");
+        app.apply(pile_event_seq("alpha", 3, moved));
+        assert!(app.expanded.is_none(), "the row's content moved under it");
+
+        // So does the row disappearing entirely.
+        expand(&mut app);
+        app.apply(pile_event_seq("alpha", 4, without(collapsed, &["f1"])));
+        assert!(app.expanded.is_none(), "the row is gone");
+    }
+
+    /// An answer that arrives after the reader moved on is dropped, not shown: it is a
+    /// diff of something no longer selected.
+    #[test]
+    fn app_expansion_answer_for_another_row_is_dropped() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.apply(pile_event_seq("alpha", 1, alpha_collapsed(Collapsed::Glob)));
+        app.select(Some(row("alpha", "f2")));
+        assert_eq!(
+            app.set_expanded(root("alpha"), b"f1".to_vec(), expansion_of(2, 0)),
+            Changed::No
+        );
+        assert!(app.expanded.is_none());
+    }
 
     fn status(app: &App) -> &str {
         app.status.as_ref().map(|s| s.text.as_str()).unwrap_or("")

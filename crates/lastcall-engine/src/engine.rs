@@ -68,6 +68,12 @@ pub enum EngineError {
     /// so the expansion refuses instead and the caller says "refresh".
     #[error("blob {oid} is missing from the store for {}", root.display())]
     MissingBlob { root: PathBuf, oid: String },
+    /// An on-demand expansion reached a [`crate::scan::Collapsed::Binary`] row. There is no
+    /// text diff to show and rendering NUL bytes into a terminal is worse than nothing, so
+    /// the expansion refuses. The TUI never sends the request (`e` is a no-op on a binary
+    /// row); this is the engine-side guard behind that.
+    #[error("{path} is binary; there is no text expansion")]
+    BinaryRow { root: PathBuf, path: String },
 }
 
 fn io_err(path: &Path, source: std::io::Error) -> EngineError {
@@ -942,6 +948,12 @@ impl Engine {
             .roots
             .get(root)
             .ok_or_else(|| EngineError::NoSuchRoot(root.to_path_buf()))?;
+        if row.collapsed == Some(crate::scan::Collapsed::Binary) {
+            return Err(EngineError::BinaryRow {
+                root: root.to_path_buf(),
+                path: row.path_lossy(),
+            });
+        }
         let mut wanted: Vec<Oid> = [&row.baseline, &row.current]
             .into_iter()
             .flatten()
@@ -964,7 +976,22 @@ impl Engine {
                 }
             }
         };
-        Ok(hunks::expand(&side(&row.baseline)?, &side(&row.current)?))
+        let mut out = hunks::expand(&side(&row.baseline)?, &side(&row.current)?);
+        // A collapsed row never reaches `render_content`'s mode-change synthesis (it
+        // returns at the collapse early-out, `scan.rs`), so a `chmod +x` on a lockfile is a
+        // row with zero content hunks. Without this the expansion would be an empty pane
+        // for the one change the row is about; the gate is the scan's own.
+        if let (Some(b), Some(c)) = (&row.baseline, &row.current)
+            && b.mode != c.mode
+            && (state.store.filemode()
+                || b.mode == crate::git::Mode::Symlink
+                || c.mode == crate::git::Mode::Symlink)
+        {
+            let mut h = hunks::Hunk::mode_change(b.mode.as_str(), c.mode.as_str());
+            h.index = out.hunks.len();
+            out.hunks.push(h);
+        }
+        Ok(out)
     }
 
     /// Re-inspect HEAD; when it moved (or an operation finished), scan and describe it.
@@ -2358,6 +2385,63 @@ pub(crate) mod tests {
             shown + expanded.omitted_lines,
             row.added + row.deleted,
             "every body line of this rewrite is a change line"
+        );
+    }
+
+    /// Verifier (a) F4: `e` must never reach a binary row. The TUI's key is a no-op there,
+    /// and the engine refuses too rather than diffing NUL bytes into a terminal.
+    #[test]
+    fn engine_hunks_of_refuses_a_binary_row() {
+        let mut repo = FixtureRepo::new("eng-expand-binary").unwrap();
+        repo.commit_files(&[("img.png", "placeholder\n")], "seed")
+            .unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let root = only_root(&engine);
+        let mut png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR".to_vec();
+        png.resize(4_096, b'\x42');
+        repo.write("img.png", &png);
+        let pile = engine.scan(&root).unwrap();
+        let row = pile.row(b"img.png").unwrap().clone();
+        assert_eq!(row.collapsed, Some(crate::scan::Collapsed::Binary));
+        let err = engine.hunks_of(&root, &row).unwrap_err();
+        match err {
+            EngineError::BinaryRow { path, .. } => assert_eq!(path, "img.png"),
+            other => panic!("expected BinaryRow, got {other:?}"),
+        }
+    }
+
+    /// Verifier (a) F5: a mode-only change on a **collapsed** row carries no content hunk —
+    /// `render_content` synthesises the mode hunk only after the collapse early return — so
+    /// without this the expansion would be an empty pane for the one thing that changed.
+    #[test]
+    fn engine_hunks_of_shows_a_mode_only_change_on_a_collapsed_row() {
+        let mut repo = FixtureRepo::new("eng-expand-mode").unwrap();
+        repo.commit_files(&[("package-lock.json", "{\"v\":1}\n")], "lock")
+            .unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let root = only_root(&engine);
+        repo.git(&["update-index", "--chmod=+x", "package-lock.json"])
+            .unwrap();
+        repo.git(&["checkout-index", "-f", "package-lock.json"])
+            .unwrap();
+        let pile = engine.scan(&root).unwrap();
+        let Some(row) = pile.row(b"package-lock.json") else {
+            // A filesystem or a `core.filemode=false` clone that cannot carry the exec bit
+            // has nothing to show; the rule under test is the one the scan uses.
+            assert!(!engine.roots[&root].store.filemode(), "{pile:?}");
+            return;
+        };
+        let row = row.clone();
+        assert_eq!(row.collapsed, Some(crate::scan::Collapsed::Glob));
+        assert!(row.hunks.is_empty(), "the scan writes no hunks here");
+        let expanded = engine.hunks_of(&root, &row).unwrap();
+        assert_eq!(expanded.hunks.len(), 1, "{expanded:?}");
+        assert!(
+            expanded.hunks[0].is_mode_change(),
+            "the expansion says what changed: {:?}",
+            expanded.hunks[0]
         );
     }
 

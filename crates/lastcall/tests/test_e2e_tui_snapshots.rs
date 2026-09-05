@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use lastcall::tui::app::{AcceptFailed, App, Effect, RootMeta, Selection};
+use lastcall::tui::app::{AcceptFailed, App, Changed, Effect, RootMeta, Selection};
 use lastcall::tui::herdr::{Attention, Dot, HerdrUpdate, RootAgents, Scope};
 use lastcall::tui::input::Action;
 use lastcall::tui::render::{render, styles};
@@ -488,6 +488,47 @@ fn tui_nav_collapsed_binary_and_size() {
     );
     app.handle(Action::Open);
     snapshot("tui_nav_collapsed_binary_and_size", &app, W, H);
+}
+
+/// Phase 6 deliverable 4: the same collapsed row after `e`. The header keeps the collapsed
+/// summary and its `[e expand]` control; under it are the real hunks the engine computed on
+/// demand, and the cap footer says what the 2,000-line budget dropped. The expansion is fed
+/// in exactly as the loop does it — `Effect::Expand` → `Engine::hunks_of` → `set_expanded`.
+#[test]
+fn tui_diff_view_collapsed_expanded() {
+    let before: String = (0..1_400)
+        .map(|i| format!("    \"pkg-{i}\": {{ \"version\": \"1.0.{i}\" }},\n"))
+        .collect();
+    let scene = Scene::build();
+    let mut alpha_repo = scene.repo("alpha");
+    alpha_repo
+        .commit_files(&[("package-lock.json", before.as_str())], "lock")
+        .unwrap();
+    let mut engine = scene.engine();
+    let alpha = root_named(&engine, "alpha");
+    mark_seen(&mut engine, &alpha);
+    let after: String = (0..1_400)
+        .map(|i| format!("    \"pkg-{i}\": {{ \"version\": \"2.4.{i}\" }},\n"))
+        .collect();
+    alpha_repo.write("package-lock.json", &after);
+
+    let mut app = app_of(&mut engine);
+    select_row(&mut app, &alpha, "package-lock.json");
+    let row = app.selected_row().unwrap().clone();
+    assert_eq!(row.collapsed, Some(Collapsed::Glob));
+    let (changed, effect) = app.handle(Action::Expand);
+    assert_eq!(changed, Changed::No, "asking for hunks draws nothing");
+    let Some(Effect::Expand(root, asked)) = effect else {
+        panic!("an expand effect: {effect:?}");
+    };
+    let view = engine.hunks_of(&root, &asked).expect("the expansion");
+    assert!(view.omitted_lines > 0, "a whole-file rewrite hits the cap");
+    assert_eq!(
+        app.set_expanded(root, asked.path.clone(), view),
+        Changed::Yes
+    );
+    app.handle(Action::Open);
+    snapshot("tui_diff_view_collapsed_expanded", &app, W, H);
 }
 
 #[test]

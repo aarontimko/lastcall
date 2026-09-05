@@ -5,7 +5,7 @@ expression: frame
 "lastcall  3 repos · 6 files · 4 hunks  standalone  [Accept All]                           watching W"
 "┌──────────────────────────┬───────────────────────────────────────────────────────────────────────┐"
 "│alpha                     │img.png  M  +3 −1                                       [A accept file]│"
-"│  main · 3 files          │collapsed (binary) · +3 −1 · expands in a later phase                  │"
+"│  main · 3 files          │collapsed (binary) · +3 −1 · not expandable                            │"
 "│  M at_limit.txt  +1 −1   │                                                                       │"
 "│  M img.png ⊟  +3 −1      │                                                                       │"
 "│  M over_limit.t… ⊟  +1 −0│                                                                       │"

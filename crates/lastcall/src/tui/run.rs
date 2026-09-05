@@ -33,7 +33,8 @@ use lastcall_engine::env::Env;
 use lastcall_engine::herdr::HerdrEvent;
 use lastcall_engine::herdr::client::ClientHandle;
 use lastcall_engine::herdr::transport::SocketTransport;
-use lastcall_engine::scan::Pile;
+use lastcall_engine::hunks::Expanded;
+use lastcall_engine::scan::{Pile, Row};
 use lastcall_engine::watcher::{EngineEvent, EngineTimings, Watcher, blocking};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -75,6 +76,8 @@ pub enum Local {
     Fatal(String),
     /// A herdr request the loop made off the UI task came back (`agent.focus`, a toast).
     Herdr(HerdrUpdate),
+    /// An `Effect::Expand` finished: one collapsed row's on-demand hunks (deliverable 4).
+    Expanded(PathBuf, Vec<u8>, Expanded),
 }
 
 /// The terminal-free core of the loop: the app, the keymap, and the hit map of the last
@@ -173,6 +176,7 @@ impl Ui {
                 (Changed::No, Some(Effect::Quit))
             }
             Local::Herdr(update) => self.app.handle(Action::Herdr(update)),
+            Local::Expanded(root, path, view) => (self.app.set_expanded(root, path, view), None),
         }
     }
 
@@ -333,6 +337,35 @@ fn spawn_accept(
         if let Some(results) = joined(accept, &tx, "accept").await {
             let _ = tx.send(Local::Accepted(results));
         }
+    });
+}
+
+/// `Effect::Expand`: one collapsed row's hunks off the UI task (deliverable 4). The row
+/// travels with the request, so the diff is computed from the oids the screen was showing;
+/// a failure is a notice, never a fatal — the row is still there to accept whole.
+fn spawn_expand(
+    engine: &Arc<Mutex<Engine>>,
+    tx: mpsc::UnboundedSender<Local>,
+    root: PathBuf,
+    row: Box<Row>,
+) {
+    let engine = engine.clone();
+    tokio::spawn(async move {
+        let task = tokio::spawn(async move {
+            blocking(&engine, move |e| {
+                let view = e.hunks_of(&root, &row);
+                (root, row.path.clone(), view)
+            })
+            .await
+        });
+        let Some((root, path, view)) = joined(task, &tx, "expand").await else {
+            return;
+        };
+        let local = match view {
+            Ok(view) => Local::Expanded(root, path, view),
+            Err(e) => Local::Notice(Some(root), format!("expand failed: {e}")),
+        };
+        let _ = tx.send(local);
     });
 }
 
@@ -681,6 +714,9 @@ pub fn run(
                     Some(Effect::SyncRoots) => spawn_sync_roots(&watcher.engine, local_tx.clone()),
                     Some(Effect::Accept(reqs)) => {
                         spawn_accept(&watcher.engine, local_tx.clone(), reqs)
+                    }
+                    Some(Effect::Expand(root, row)) => {
+                        spawn_expand(&watcher.engine, local_tx.clone(), root, row)
                     }
                     Some(Effect::Focus(pane)) => {
                         let label = ui

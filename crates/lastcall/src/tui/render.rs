@@ -11,7 +11,7 @@
 use std::collections::BTreeSet;
 
 use lastcall_engine::count::with_thousands;
-use lastcall_engine::hunks::{Hunk, Tag};
+use lastcall_engine::hunks::{EXPAND_LINE_CAP, Hunk, Tag};
 use lastcall_engine::scan::{Change, Collapsed, Rename, Row};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -23,7 +23,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::app::{
     AcceptScope, App, Focus, MIN_SIZE, NAV_MIN_COLS, RootView, Selection, Target, annotation_name,
-    diff_len, hunk_offsets, plural,
+    diff_lines, hunk_offsets, plural,
 };
 use super::herdr::{Dot, Link};
 use super::input::{Action, MODAL_KEYS};
@@ -884,36 +884,101 @@ fn render_row_body(
             return;
         }
         (_, Some(kind)) => {
-            let kind = match kind {
+            // The collapsed header, and under it the expansion when `e` fetched one
+            // (Phase 6 deliverable 4). A binary row shows no control: there is nothing
+            // text-shaped to expand, so the key and the click are both no-ops there.
+            let name = match kind {
                 Collapsed::Glob => "glob",
                 Collapsed::Binary => "binary",
                 Collapsed::Size => "size",
             };
-            let text = format!(
-                "collapsed ({kind}) · +{} −{} · expands in a later phase",
-                with_thousands(row.added),
-                with_thousands(row.deleted)
+            let tail = if kind == Collapsed::Binary {
+                " · not expandable"
+            } else {
+                ""
+            };
+            let mut line = single(
+                format!(
+                    "collapsed ({name}) · +{} −{}{tail}",
+                    with_thousands(row.added),
+                    with_thousands(row.deleted)
+                ),
+                dim(),
             );
-            buf.set_line(area.x, area.y, &single(text, dim()), area.width);
+            if kind != Collapsed::Binary {
+                let control = format!("[{} expand]", control_key(app, "expand"));
+                if let Some(x) = right_align(&mut line, &control, area.width, dim()) {
+                    hits.targets.push((
+                        Rect::new(area.x + x, area.y, control.width() as u16, 1),
+                        Target::Expand,
+                    ));
+                }
+            }
+            buf.set_line(area.x, area.y, &line, area.width);
+            let Some(exp) = app.expansion() else {
+                return;
+            };
+            // The cap footer owns the last line whenever it has something to say, so a
+            // truncated expansion can never scroll its own warning off the screen.
+            let footer = usize::from(exp.view.omitted_lines > 0);
+            let body = area.height.saturating_sub(1).saturating_sub(footer as u16);
+            // No per-hunk `[a accept]` inside an expansion: a collapsed row is a single
+            // accept (§6.3), so a hunk control there would promise something the reducer
+            // will not do. The row's own `[A accept file]` is the only accept on screen.
+            render_hunks(
+                app,
+                buf,
+                Rect::new(area.x, area.y + 1, area.width, body),
+                &exp.view.hunks,
+                false,
+                hits,
+            );
+            if footer == 1 && area.height >= 2 {
+                let text = format!(
+                    "… {} lines omitted (cap {})",
+                    with_thousands(exp.view.omitted_lines),
+                    with_thousands(EXPAND_LINE_CAP)
+                );
+                buf.set_line(
+                    area.x,
+                    area.y + area.height - 1,
+                    &single(text, dim()),
+                    area.width,
+                );
+            }
             return;
         }
         _ => {}
     }
-    if row.hunks.is_empty() {
+    render_hunks(app, buf, area, &row.hunks, true, hits);
+}
+
+/// Draw `hunks` into `area` from the app's diff cursor, with the `[a accept]` control and
+/// the selected-hunk band. The list is the row's own hunks, or a collapsed row's expansion
+/// ([`App::view_hunks`] decides which the cursor is bounded by).
+fn render_hunks(
+    app: &App,
+    buf: &mut Buffer,
+    area: Rect,
+    hunks: &[Hunk],
+    accept_controls: bool,
+    hits: &mut HitMap,
+) {
+    if hunks.is_empty() || area.height == 0 {
         return;
     }
-    let total = diff_len(row);
-    let offsets = hunk_offsets(&row.hunks);
+    let total = diff_lines(hunks);
+    let offsets = hunk_offsets(hunks);
     let scroll = app.diff.scroll.min(total.saturating_sub(1));
-    let current = app.diff.hunk.min(row.hunks.len() - 1);
+    let current = app.diff.hunk.min(hunks.len() - 1);
     // The hunk containing `scroll`, and the line within it.
     let mut h = offsets.partition_point(|&o| o <= scroll).saturating_sub(1);
     let mut within = scroll - offsets[h];
     let mut y = 0u16;
-    while y < area.height && h < row.hunks.len() {
-        let hunk = &row.hunks[h];
+    while y < area.height && h < hunks.len() {
+        let hunk = &hunks[h];
         let height = super::app::hunk_height(hunk);
-        let block = super::app::hunk_block(&row.hunks, h);
+        let block = super::app::hunk_block(hunks, h);
         while within < block && y < area.height {
             // `block` is the hunk's own lines plus, for every hunk but the last, the blank
             // separator line: nothing to draw, it just spaces the sections apart.
@@ -926,17 +991,19 @@ fn render_row_body(
             let row_rect = Rect::new(area.x, area.y + y, area.width, 1);
             if within == 0 {
                 hits.targets.push((row_rect, Target::DiffHunk(h)));
-                let control = format!("[{} accept]", control_key(app, "accept"));
                 let style = if h == current {
                     Style::new().add_modifier(Modifier::REVERSED)
                 } else {
                     dim()
                 };
-                if let Some(x) = right_align(&mut line, &control, area.width, style) {
-                    hits.targets.push((
-                        Rect::new(area.x + x, area.y + y, control.width() as u16, 1),
-                        Target::HunkAccept(h),
-                    ));
+                if accept_controls {
+                    let control = format!("[{} accept]", control_key(app, "accept"));
+                    if let Some(x) = right_align(&mut line, &control, area.width, style) {
+                        hits.targets.push((
+                            Rect::new(area.x + x, area.y + y, control.width() as u16, 1),
+                            Target::HunkAccept(h),
+                        ));
+                    }
                 }
                 if h == current {
                     band(&mut line, area.width, style);
@@ -1263,7 +1330,7 @@ fn modifier_names(m: Modifier) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::app::{Changed, testfix::*};
+    use super::super::app::{Changed, diff_len, testfix::*};
     use super::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -1277,6 +1344,64 @@ mod tests {
             .unwrap();
         let buf = terminal.backend().buffer().clone();
         (terminal.backend().to_string(), styles(&buf))
+    }
+
+    /// Phase 6 deliverable 4: the collapsed row's header offers `[e expand]`, the answer
+    /// replaces the empty pane with hunks, and a truncated answer says so on the last line
+    /// — where scrolling can never push the warning off the screen.
+    #[test]
+    fn render_collapsed_row_offers_expand_and_shows_the_cap_footer() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.apply(pile_event_seq(
+            "alpha",
+            1,
+            alpha_collapsed(lastcall_engine::scan::Collapsed::Glob),
+        ));
+        app.select(Some(row("alpha", "f1")));
+        let (before, _) = frame_of(&app, 100, 30);
+        assert!(before.contains("collapsed (glob)"), "{before}");
+        assert!(before.contains("[e expand]"), "{before}");
+        assert!(
+            !before.contains("@@ -"),
+            "nothing is expanded yet: {before}"
+        );
+
+        app.set_expanded(root("alpha"), b"f1".to_vec(), expansion_of(2, 1_234));
+        let (after, _) = frame_of(&app, 100, 30);
+        assert!(
+            after.contains("collapsed (glob)"),
+            "the header stays: {after}"
+        );
+        assert!(after.contains("@@ -"), "the hunks are on screen: {after}");
+        assert!(
+            after.contains("… 1,234 lines omitted (cap 2,000)"),
+            "{after}"
+        );
+
+        // A whole answer has no footer.
+        app.set_expanded(root("alpha"), b"f1".to_vec(), expansion_of(2, 0));
+        let (whole, _) = frame_of(&app, 100, 30);
+        assert!(!whole.contains("lines omitted"), "{whole}");
+    }
+
+    /// A binary row says why there is nothing to expand and draws no control.
+    #[test]
+    fn render_binary_row_offers_no_expand_control() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.apply(pile_event_seq(
+            "alpha",
+            1,
+            alpha_collapsed(lastcall_engine::scan::Collapsed::Binary),
+        ));
+        app.select(Some(row("alpha", "f1")));
+        let (frame, _) = frame_of(&app, 100, 30);
+        assert!(
+            frame.contains("collapsed (binary)") && frame.contains("not expandable"),
+            "{frame}"
+        );
+        assert!(!frame.contains("expand]"), "{frame}");
     }
 
     #[test]
