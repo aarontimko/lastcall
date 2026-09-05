@@ -23,7 +23,7 @@ use lastcall::tui::render::{render, styles};
 use lastcall_engine::engine::{Engine, EngineOptions};
 use lastcall_engine::env::Env;
 use lastcall_engine::ops::NoFault;
-use lastcall_engine::scan::{Annotation, Change, Pile};
+use lastcall_engine::scan::{Annotation, Change, Collapsed, Pile};
 use lastcall_engine::watcher::EngineEvent;
 use lastcall_testkit::engine::{open_engine, open_engine_with};
 use lastcall_testkit::fixture_parent::{self, config, draft_config};
@@ -382,6 +382,112 @@ fn tui_diff_view_collapsed() {
     assert!(app.selected_row().unwrap().collapsed.is_some());
     app.handle(Action::Open);
     snapshot("tui_diff_view_collapsed", &app, W, H);
+}
+
+/// Phase 6 gate item 2(b): `npm install` rewrites a 4,000-line lockfile and the reviewer
+/// sees **one** row with live four-digit counts, under the frozen default `collapsed_globs`
+/// (no config override), plus the collapsed diff view for it.
+#[test]
+fn tui_nav_collapsed_lockfile() {
+    let before: String = (0..4_000)
+        .map(|i| format!("    \"pkg-{i}\": {{ \"version\": \"1.0.{i}\" }},\n"))
+        .collect();
+    let scene = Scene::build();
+    let mut alpha_repo = scene.repo("alpha");
+    alpha_repo
+        .commit_files(&[("package-lock.json", before.as_str())], "lock")
+        .unwrap();
+    let mut engine = scene.engine();
+    let alpha = root_named(&engine, "alpha");
+    mark_seen(&mut engine, &alpha);
+
+    // Two thirds of the versions move and 213 packages are added: the counts are large,
+    // four digits, and deliberately unequal so the frame proves both are live.
+    let after: String = (0..4_000)
+        .map(|i| {
+            let v = if i % 3 == 0 { "1.0" } else { "2.4" };
+            format!("    \"pkg-{i}\": {{ \"version\": \"{v}.{i}\" }},\n")
+        })
+        .chain((0..213).map(|i| format!("    \"new-{i}\": {{ \"version\": \"1.0.0\" }},\n")))
+        .collect();
+    assert!(
+        after.len() < 512 * 1024,
+        "under collapse_size_bytes, so the glob is the reason: {}",
+        after.len()
+    );
+    alpha_repo.write("package-lock.json", &after);
+
+    let mut app = app_of(&mut engine);
+    select_row(&mut app, &alpha, "package-lock.json");
+    let row = app.selected_row().unwrap();
+    assert_eq!(row.collapsed, Some(Collapsed::Glob));
+    assert!(row.hunks.is_empty(), "a collapsed row carries no hunks");
+    assert!(row.added > 2_000 && row.deleted > 2_000 && row.added != row.deleted);
+    app.handle(Action::Open);
+    snapshot("tui_nav_collapsed_lockfile", &app, W, H);
+}
+
+/// Phase 6 gate item 3(b): the two size/binary collapse classes at the **frozen default**
+/// `collapse_size_bytes` (512 KiB), with the boundary row beside them — 524,288 bytes is
+/// not collapsed and keeps its hunks, 524,289 is `Size`, the PNG is `Binary`. The diff view
+/// is on the binary row.
+#[test]
+fn tui_nav_collapsed_binary_and_size() {
+    const LIMIT: usize = 512 * 1024;
+    // 32 bytes per line, so LIMIT is a whole number of lines.
+    let line = |c: char| format!("{}\n", std::iter::repeat_n(c, 31).collect::<String>());
+    let at_limit: String = std::iter::repeat_n(line('a'), LIMIT / 32).collect();
+    assert_eq!(at_limit.len(), LIMIT);
+    let mut png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR".to_vec();
+    png.resize(2 * 1024 * 1024, b'\x42');
+
+    let scene = Scene::build();
+    let mut alpha_repo = scene.repo("alpha");
+    alpha_repo
+        .commit_files(
+            &[
+                ("img.png", "placeholder\n"),
+                ("at_limit.txt", at_limit.as_str()),
+                ("over_limit.txt", at_limit.as_str()),
+            ],
+            "seed",
+        )
+        .unwrap();
+    let mut engine = scene.engine();
+    let alpha = root_named(&engine, "alpha");
+    assert_eq!(engine.config().collapse_size_bytes, LIMIT as u64);
+    mark_seen(&mut engine, &alpha);
+
+    alpha_repo.write("img.png", &png);
+    let mut changed_at_limit = at_limit.clone();
+    changed_at_limit.replace_range(0..32, &line('b'));
+    alpha_repo.write("at_limit.txt", &changed_at_limit);
+    alpha_repo.write("over_limit.txt", format!("{at_limit}x"));
+
+    let mut app = app_of(&mut engine);
+    select_row(&mut app, &alpha, "at_limit.txt");
+    let boundary = app.selected_row().unwrap();
+    assert_eq!(
+        boundary.collapsed, None,
+        "524,288 bytes is not over the limit"
+    );
+    assert!(
+        !boundary.hunks.is_empty(),
+        "the boundary row keeps its hunks"
+    );
+    select_row(&mut app, &alpha, "over_limit.txt");
+    assert_eq!(
+        app.selected_row().unwrap().collapsed,
+        Some(Collapsed::Size),
+        "one byte over"
+    );
+    select_row(&mut app, &alpha, "img.png");
+    assert_eq!(
+        app.selected_row().unwrap().collapsed,
+        Some(Collapsed::Binary)
+    );
+    app.handle(Action::Open);
+    snapshot("tui_nav_collapsed_binary_and_size", &app, W, H);
 }
 
 #[test]
