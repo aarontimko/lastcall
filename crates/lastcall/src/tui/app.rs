@@ -15,20 +15,21 @@ use std::time::{Duration, Instant};
 
 use lastcall_engine::count::with_thousands;
 use lastcall_engine::engine::{
-    AcceptRequest, Accepted, EngineError, RestoreRequest, Restored, RootState,
+    AcceptRequest, Accepted, EngineError, Flagged, RenderedHunk, RestoreRequest, Restored,
+    RootState,
 };
 use lastcall_engine::git::Oid;
 use lastcall_engine::headstate::InProgress;
-use lastcall_engine::hunks::{Expanded, Hunk};
-use lastcall_engine::ledger::LedgerError;
+use lastcall_engine::hunks::{Expanded, Hunk, Tag};
+use lastcall_engine::ledger::{FlagHunk, LedgerError};
 use lastcall_engine::ops::{OpsError, Rendered};
 use lastcall_engine::roots::Badge;
 use lastcall_engine::scan::{Annotation, Change, Collapsed, Entry, Group, Pile, Row};
 use lastcall_engine::store::RootKind;
 use lastcall_engine::watcher::EngineEvent;
 
-use super::herdr::{HerdrUpdate, HerdrView, Link, ToastRequest};
-use super::input::{Action, Keymap};
+use super::herdr::{AgentCandidate, HerdrUpdate, HerdrView, Link, ToastRequest};
+use super::input::{Action, Keymap, NoteKey, PickKey};
 
 pub const NAV_WIDTH_DEFAULT: u16 = 28;
 pub const NAV_WIDTH_MIN: u16 = 16;
@@ -183,6 +184,8 @@ pub enum Target {
     FileRestore,
     /// The `[u restore]` hint on hunk `i`'s header line, beside `[a accept]`.
     HunkRestore(usize),
+    /// The `[m flag]` hint on hunk `i`'s header line, last in the run.
+    HunkFlag(usize),
     /// The `[e expand]` control on a collapsed row's header line (Phase 6 deliverable 4);
     /// only drawn for `Glob`/`Size`, so a click can never reach a binary row.
     Expand,
@@ -248,6 +251,36 @@ pub enum Effect {
     /// group and no all variant — undoing a whole tree at once is not lastcall's gesture —
     /// so the vector never holds more than one request.
     Restore(Vec<(PathBuf, RestoreRequest)>),
+    /// Write one flag through `Engine::flag`, off the UI task; the answer is
+    /// `Local::Flagged`, which carries the paste-ready export.
+    Flag {
+        root: PathBuf,
+        path: Vec<u8>,
+        note: String,
+        /// The hunk **as it was rendered** when `m` was pressed, with the total the export
+        /// names. `None` flags the file.
+        hunk: Option<RenderedHunk>,
+    },
+    /// Clear every flag on one path (`Engine::unflag`); the answer is `Local::Flagged` with
+    /// an empty export.
+    Unflag {
+        root: PathBuf,
+        path: Vec<u8>,
+    },
+    /// `pane.send_text` the export into one agent pane, bracketed-paste wrapped: it lands
+    /// in the input box unsubmitted and the human presses Enter. `label` is what the status
+    /// line calls the agent.
+    Stage {
+        pane_id: String,
+        label: String,
+        export: String,
+    },
+    /// No agent to stage to: append the export to this root's export file under the state
+    /// dir. The one file the TUI writes, and the only writer of it.
+    Export {
+        root: PathBuf,
+        export: String,
+    },
     /// `agent.focus` on this pane id (herdr's own public id, never a name); the result
     /// comes back as `HerdrUpdate::Focused`.
     Focus(String),
@@ -353,6 +386,102 @@ pub struct Restoring {
     pub scope: RestoreScope,
 }
 
+/// What a flag is being written against, **captured when `m` was pressed** and never
+/// re-read afterwards: a pile landing while the note is open must not move the flag onto a
+/// different hunk (kickoff F14).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FlagTarget {
+    Hunk {
+        root: PathBuf,
+        path: Vec<u8>,
+        /// The row as it was on screen, kept so the engine seam takes the same tokens an
+        /// accept or a restore would.
+        rendered: Rendered,
+        hunk: FlagHunk,
+        /// **Content** hunks the row showed: the `of m` the export names.
+        of: usize,
+    },
+    File {
+        root: PathBuf,
+        path: Vec<u8>,
+    },
+}
+
+impl FlagTarget {
+    pub fn root(&self) -> &Path {
+        match self {
+            FlagTarget::Hunk { root, .. } | FlagTarget::File { root, .. } => root,
+        }
+    }
+
+    pub fn path(&self) -> &[u8] {
+        match self {
+            FlagTarget::Hunk { path, .. } | FlagTarget::File { path, .. } => path,
+        }
+    }
+
+    /// The modal's first line, and the words the status line uses for the flag afterwards:
+    /// `f1 · hunk 2 of 3` or `f1 (file)`.
+    pub fn label(&self) -> String {
+        let lossy = String::from_utf8_lossy(self.path()).into_owned();
+        match self {
+            FlagTarget::Hunk { hunk, of, .. } => {
+                format!("{lossy} · hunk {} of {of}", hunk.index + 1)
+            }
+            FlagTarget::File { .. } => format!("{lossy} (file)"),
+        }
+    }
+
+    /// The shorter form the status line uses: `f1 hunk 2` / `f1`.
+    pub fn status_label(&self) -> String {
+        let lossy = String::from_utf8_lossy(self.path()).into_owned();
+        match self {
+            FlagTarget::Hunk { hunk, .. } => format!("{lossy} hunk {}", hunk.index + 1),
+            FlagTarget::File { .. } => lossy,
+        }
+    }
+
+    /// The rendered hunk the engine seam takes, `None` for a file flag.
+    pub fn rendered_hunk(&self) -> Option<RenderedHunk> {
+        match self {
+            FlagTarget::Hunk { hunk, of, .. } => Some(RenderedHunk {
+                hunk: hunk.clone(),
+                of: *of,
+            }),
+            FlagTarget::File { .. } => None,
+        }
+    }
+}
+
+/// The note modal: what is being flagged, and the note as typed so far.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteEntry {
+    pub target: FlagTarget,
+    pub text: String,
+    /// Insertion point as a **byte** offset into `text`, always on a char boundary.
+    pub cursor: usize,
+}
+
+/// The agent picker: which pane the export goes to when more than one is a candidate. The
+/// flag is already on disk by the time this opens, so `Esc` loses nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Picker {
+    /// The root the flag was written against; the candidates are re-derived for it when
+    /// herdr's news lands while the picker is open.
+    pub root: PathBuf,
+    /// The words the status line uses for the flag this picker is sending.
+    pub label: String,
+    pub export: String,
+    pub candidates: Vec<AgentCandidate>,
+    pub selected: usize,
+}
+
+/// A flag whose send has not been decided yet: the words its status line will use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Flagging {
+    pub label: String,
+}
+
 /// What the confirm modal is asking about. One modal, two operations: the title and the
 /// first row come from the variant, and `confirm_counts` stays accept-only (F11) — a
 /// restore covers one row, so there is nothing to tally.
@@ -400,6 +529,9 @@ pub type AcceptResult = Result<Accepted, AcceptFailed>;
 /// message), and a second enum spelling the same two cases would only have to be kept in
 /// step with the first.
 pub type RestoreResult = Result<Restored, AcceptFailed>;
+
+/// One root's flag (or unflag) result, on the same terms.
+pub type FlagResult = Result<Flagged, AcceptFailed>;
 
 /// Why one root's accept failed.
 ///
@@ -464,6 +596,13 @@ pub struct App {
     /// from `accepting` because the two write different things — the ledger and the working
     /// tree — and neither should silently stand in for the other in the status line.
     pub restoring: Option<Restoring>,
+    /// The note modal, if open. While it is, every key edits the note except `ctrl-c`.
+    pub note: Option<NoteEntry>,
+    /// The agent picker, if open (deliverable 10).
+    pub picker: Option<Picker>,
+    /// The flag whose send is still being decided (staged, picked or exported), so the
+    /// verdict's status line can name what was flagged.
+    pub flagging: Option<Flagging>,
     /// The confirm modal, if open: every action but `Tick`/`Resize`/`Confirm`/`Cancel`/
     /// `Quit` is ignored while it is (`Quit` passes as it does through the help overlay:
     /// `q` and ctrl-c quit by default, everywhere).
@@ -507,6 +646,9 @@ impl App {
             seq: BTreeMap::new(),
             accepting: None,
             restoring: None,
+            note: None,
+            picker: None,
+            flagging: None,
             confirm: None,
             herdr: HerdrView::default(),
             expanded: None,
@@ -1128,6 +1270,263 @@ impl App {
         (Changed::Yes, Some(Effect::Accept(reqs)))
     }
 
+    /// What `m` flags, captured from the row on screen **now**: the hunk under the diff
+    /// cursor when the row has content hunks and the diff has focus, else the file. A
+    /// deletion row's single hunk is not a hunk to discuss, so the nav's answer and the
+    /// diff's agree there: the file.
+    pub fn flag_target(&self) -> Option<FlagTarget> {
+        let Selection::Row(root, path) = self.selection.clone()? else {
+            return None;
+        };
+        let row = self.roots.get(&root)?.row(&path)?;
+        let content = row.hunks.iter().filter(|h| !h.is_mode_change()).count();
+        if self.effective_focus() == Focus::Diff && row.change != Change::Deleted && content > 0 {
+            let index = self.diff.hunk.min(row.hunks.len() - 1);
+            let hunk = &row.hunks[index];
+            // The mode hunk is not content: there is nothing to quote, so `m` on it flags
+            // the file (the same rule the export's `of` count follows).
+            if !hunk.is_mode_change() {
+                return Some(FlagTarget::Hunk {
+                    root,
+                    path: path.clone(),
+                    rendered: Rendered::of(row),
+                    hunk: FlagHunk {
+                        index,
+                        header: hunk_header(hunk),
+                        text: hunk_body(hunk),
+                    },
+                    of: content,
+                });
+            }
+        }
+        Some(FlagTarget::File { root, path })
+    }
+
+    /// `m`: open the note modal on what `flag_target` names.
+    fn open_note(&mut self) -> (Changed, Option<Effect>) {
+        let Some(target) = self.flag_target() else {
+            return (Changed::No, None);
+        };
+        self.note = Some(NoteEntry {
+            target,
+            text: String::new(),
+            cursor: 0,
+        });
+        (Changed::Yes, None)
+    }
+
+    /// One keystroke inside the note modal. Enter is the only exit that writes.
+    fn note_key(&mut self, key: NoteKey) -> (Changed, Option<Effect>) {
+        let Some(entry) = self.note.as_mut() else {
+            return (Changed::No, None);
+        };
+        match key {
+            NoteKey::Insert(text) => {
+                entry.text.insert_str(entry.cursor, &text);
+                entry.cursor += text.len();
+                (Changed::Yes, None)
+            }
+            NoteKey::Newline => {
+                entry.text.insert(entry.cursor, '\n');
+                entry.cursor += 1;
+                (Changed::Yes, None)
+            }
+            NoteKey::Backspace => {
+                let cut = entry.text[..entry.cursor]
+                    .chars()
+                    .next_back()
+                    .map(char::len_utf8)
+                    .unwrap_or(0);
+                if cut == 0 {
+                    return (Changed::No, None);
+                }
+                entry.cursor -= cut;
+                entry.text.remove(entry.cursor);
+                (Changed::Yes, None)
+            }
+            NoteKey::Cancel => {
+                self.note = None;
+                (Changed::Yes, None)
+            }
+            NoteKey::Send => {
+                // The target was captured when `m` was pressed and is used as it was: a
+                // pile that landed meanwhile cannot move the flag onto another hunk (F14).
+                let entry = self.note.take().expect("checked above");
+                self.flagging = Some(Flagging {
+                    label: entry.target.status_label(),
+                });
+                let effect = Effect::Flag {
+                    root: entry.target.root().to_path_buf(),
+                    path: entry.target.path().to_vec(),
+                    note: entry.text,
+                    hunk: entry.target.rendered_hunk(),
+                };
+                (Changed::Yes, Some(effect))
+            }
+        }
+    }
+
+    /// `shift-m`: clear every flag on the selected file.
+    fn unflag_selected(&mut self) -> (Changed, Option<Effect>) {
+        let Some(Selection::Row(root, path)) = self.selection.clone() else {
+            return (Changed::No, None);
+        };
+        (Changed::Yes, Some(Effect::Unflag { root, path }))
+    }
+
+    /// One keystroke inside the agent picker.
+    fn pick_key(&mut self, key: PickKey) -> (Changed, Option<Effect>) {
+        let Some(picker) = self.picker.as_mut() else {
+            return (Changed::No, None);
+        };
+        match key {
+            PickKey::Up => {
+                picker.selected = picker.selected.saturating_sub(1);
+                (Changed::Yes, None)
+            }
+            PickKey::Down => {
+                picker.selected = (picker.selected + 1).min(picker.candidates.len() - 1);
+                (Changed::Yes, None)
+            }
+            PickKey::Cancel => {
+                // The flag is already on disk; only the send is dropped.
+                let label = self.picker.take().expect("checked above").label;
+                self.flagging = None;
+                self.set_status(format!("flagged {label} · not sent"));
+                (Changed::Yes, None)
+            }
+            PickKey::Send => {
+                let picker = self.picker.take().expect("checked above");
+                let Some(agent) = picker.candidates.get(picker.selected).cloned() else {
+                    self.flagging = None;
+                    self.set_status(format!("flagged {} · not sent", picker.label));
+                    return (Changed::Yes, None);
+                };
+                self.set_status(format!(
+                    "flagged {} · staged to {}",
+                    picker.label, agent.label
+                ));
+                (
+                    Changed::Yes,
+                    Some(Effect::Stage {
+                        pane_id: agent.pane_id,
+                        label: agent.label,
+                        export: picker.export,
+                    }),
+                )
+            }
+        }
+    }
+
+    /// The loop's answer to an `Effect::Flag` or `Effect::Unflag`: the pile lands like any
+    /// other, then the **send** is decided from the candidates the last derivation found —
+    /// one agent stages straight away, several open the picker, none writes the export file.
+    pub fn flagged(&mut self, root: PathBuf, flagged: FlagResult) -> (Changed, Option<Effect>) {
+        let pending = self.flagging.take();
+        let flagged = match flagged {
+            Ok(f) => f,
+            Err(AcceptFailed::LedgerBusy) => {
+                self.set_status(format!(
+                    "ledger busy in {} — try again",
+                    self.root_name(&root)
+                ));
+                return (Changed::Yes, None);
+            }
+            Err(AcceptFailed::Other(e)) => {
+                self.set_status(format!("{}: {e}", self.root_name(&root)));
+                return (Changed::Yes, None);
+            }
+        };
+        self.apply_pile(root.clone(), flagged.seq, flagged.pile);
+        let refusals: Vec<String> = flagged
+            .outcome
+            .refused
+            .iter()
+            .map(|r| r.message("flagged"))
+            .collect();
+        let Some(Flagging { label }) = pending else {
+            // An unflag: nothing to send, and the row's `⚑` is gone from the pile above.
+            if refusals.is_empty() {
+                self.set_status("flags cleared");
+            } else {
+                self.set_status(refusal_text(&refusals));
+            }
+            return (Changed::Yes, None);
+        };
+        if !refusals.is_empty() {
+            self.set_status(refusal_text(&refusals));
+            return (Changed::Yes, None);
+        }
+        let candidates = self.herdr.candidates(&root);
+        match candidates.len() {
+            0 => {
+                self.flagging = Some(Flagging { label });
+                (
+                    Changed::Yes,
+                    Some(Effect::Export {
+                        root,
+                        export: flagged.export,
+                    }),
+                )
+            }
+            1 => {
+                let agent = candidates.into_iter().next().expect("one candidate");
+                self.set_status(format!("flagged {label} · staged to {}", agent.label));
+                (
+                    Changed::Yes,
+                    Some(Effect::Stage {
+                        pane_id: agent.pane_id,
+                        label: agent.label,
+                        export: flagged.export,
+                    }),
+                )
+            }
+            _ => {
+                self.picker = Some(Picker {
+                    root,
+                    label,
+                    export: flagged.export,
+                    candidates,
+                    selected: 0,
+                });
+                (Changed::Yes, None)
+            }
+        }
+    }
+
+    /// The loop's answer to an `Effect::Stage`: the flag is already on disk, so a failure
+    /// is a status line and nothing more.
+    pub fn staged(&mut self, label: String, result: Result<(), String>) -> Changed {
+        let flag = self.flagging.take().map(|f| f.label);
+        match result {
+            // The optimistic line is already on screen (`start_stage` wrote it), so a
+            // success has nothing to add.
+            Ok(()) => Changed::No,
+            Err(reason) => {
+                match flag {
+                    Some(flag) => {
+                        self.set_status(format!("flagged {flag} · send failed: {reason}"))
+                    }
+                    None => self.set_status(format!("send failed: {reason} ({label})")),
+                }
+                Changed::Yes
+            }
+        }
+    }
+
+    /// The loop's answer to an `Effect::Export`: the fallback file was written, or was not.
+    pub fn exported(&mut self, result: Result<PathBuf, String>) -> Changed {
+        let prefix = match self.flagging.take() {
+            Some(f) => format!("flagged {} · ", f.label),
+            None => String::new(),
+        };
+        match result {
+            Ok(path) => self.set_status(format!("{prefix}export → {}", path.display())),
+            Err(e) => self.set_status(format!("{prefix}export failed: {e}")),
+        }
+        Changed::Yes
+    }
+
     /// `Restore`/`RestoreFile`: refuse while one runs, ask before a **file** restore (a
     /// whole row goes back, or an added file is removed), never before a hunk restore —
     /// the CAS is the guard and the content the hunk removes stays addressable in the
@@ -1534,6 +1933,17 @@ impl App {
     /// Fold one user action in.
     pub fn handle(&mut self, action: Action) -> (Changed, Option<Effect>) {
         use Action::*;
+        // The note modal owns the keyboard: `Ui::event` resolves every key through
+        // `note_action` before the keymap, so the only actions that reach here are its own
+        // edits, a quit, and the events that pass through every modal.
+        if self.note.is_some() && !matches!(action, Tick | Resize(..) | Note(_) | Quit | Herdr(_)) {
+            return (Changed::No, None);
+        }
+        // The picker, on the same terms. A `Herdr` update re-derives its candidates below.
+        if self.picker.is_some() && !matches!(action, Tick | Resize(..) | Pick(_) | Quit | Herdr(_))
+        {
+            return (Changed::No, None);
+        }
         // `Herdr` passes both gates: news from the herdr task is not a keystroke, and it
         // must never close the confirm modal or the help overlay (deliverable 5).
         if self.confirm.is_some()
@@ -1633,6 +2043,10 @@ impl App {
                 Some(scope) => return self.request_restore(scope),
                 None => Changed::No,
             },
+            Flag => return self.open_note(),
+            Unflag => return self.unflag_selected(),
+            Note(key) => return self.note_key(key),
+            Pick(key) => return self.pick_key(key),
             // `Confirm` here is `Action::Confirm` (`use Action::*` above), so the modal's
             // own scope is matched inside rather than in the pattern.
             Confirm => match self.confirm.clone().map(|c| c.scope) {
@@ -1758,6 +2172,30 @@ impl App {
                 self.herdr.link = Link::Standalone { reason };
                 (Changed::Yes, None)
             }
+            // The picker is live: a pane that appeared or went away while it is open
+            // changes the list under the cursor, so the selection is clamped to it.
+            HerdrUpdate::Agents(candidates) => {
+                if self.herdr.candidates == candidates {
+                    return (Changed::No, None);
+                }
+                self.herdr.candidates = candidates;
+                if let Some(picker) = self.picker.take() {
+                    let candidates = self.herdr.candidates(&picker.root);
+                    // Every candidate gone: there is nobody to send to, so the picker
+                    // closes rather than showing an empty list. The flag is already on disk.
+                    if candidates.is_empty() {
+                        self.set_status(format!("flagged {} · not sent", picker.label));
+                    } else {
+                        let selected = picker.selected.min(candidates.len() - 1);
+                        self.picker = Some(Picker {
+                            candidates,
+                            selected,
+                            ..picker
+                        });
+                    }
+                }
+                (Changed::Yes, None)
+            }
             HerdrUpdate::Roots(derived) => {
                 let delta = self.herdr.apply_roots(derived);
                 self.reconcile_selection();
@@ -1805,7 +2243,8 @@ impl App {
 
     /// Fold a resolved mouse target in (the loop maps `Press(x, y)` through the `HitMap`).
     pub fn hit(&mut self, target: Target) -> (Changed, Option<Effect>) {
-        if self.confirm.is_some() {
+        // A click under any modal is ignored, exactly as it is under the confirm.
+        if self.confirm.is_some() || self.note.is_some() || self.picker.is_some() {
             return (Changed::No, None);
         }
         if self.help {
@@ -1849,6 +2288,12 @@ impl App {
                 // land on one `App` (`input_parity_restore`).
                 self.hit(Target::DiffHunk(i));
                 return self.handle(Action::Restore);
+            }
+            Target::HunkFlag(i) => {
+                // The same two steps again, so `m` and a click on `[m flag]` open the note
+                // modal on one `App` (`input_parity_flag`).
+                self.hit(Target::DiffHunk(i));
+                return self.handle(Action::Flag);
             }
             Target::NavRoot(root) => self
                 .select(Some(Selection::Root(root)))
@@ -1913,6 +2358,68 @@ impl App {
 }
 
 // ---- diff geometry (shared with render) --------------------------------------------------
+
+/// The hunk's header line as both the diff pane and the flag export spell it: `@@ -a,b
+/// +c,d @@`, or `mode a → b` for the synthetic mode hunk. One function so a flag quotes
+/// exactly the line the reader saw.
+pub fn hunk_header(hunk: &Hunk) -> String {
+    if hunk.is_mode_change() {
+        return format!(
+            "mode {} → {}",
+            mode_of(&hunk.lines[0].1),
+            mode_of(&hunk.lines[1].1)
+        );
+    }
+    format!(
+        "@@ -{} +{} @@",
+        range_label(hunk.old_range.start, hunk.old_range.len()),
+        range_label(hunk.new_range.start, hunk.new_range.len())
+    )
+}
+
+/// The hunk's body as the export quotes it: every line with its `+`/`-`/space prefix,
+/// newline-terminated. The same text the diff pane draws, minus the colour.
+pub fn hunk_body(hunk: &Hunk) -> String {
+    let mut out = String::new();
+    for (tag, bytes) in &hunk.lines {
+        out.push(match tag {
+            Tag::Context => ' ',
+            Tag::Insert => '+',
+            Tag::Delete => '-',
+        });
+        out.push_str(&hunk_line_text(bytes));
+        out.push('\n');
+    }
+    out
+}
+
+pub fn mode_of(line: &[u8]) -> String {
+    String::from_utf8_lossy(line)
+        .trim()
+        .trim_start_matches("mode ")
+        .to_owned()
+}
+
+/// git's `start[,len]`: 1-based start for a non-empty range, the preceding line for an
+/// empty one, and `,len` omitted when it is 1 (as `git diff` prints it).
+pub fn range_label(start: usize, len: usize) -> String {
+    match len {
+        0 => format!("{start},0"),
+        1 => format!("{}", start + 1),
+        _ => format!("{},{len}", start + 1),
+    }
+}
+
+/// One quoted diff line: lossy UTF-8 with its terminator trimmed, so a CRLF file does not
+/// put a stray `^M` in the export. Tabs stay tabs here — the diff pane expands them to
+/// four spaces for the screen, but a flag quotes the file's own bytes.
+fn hunk_line_text(bytes: &[u8]) -> String {
+    let mut s = String::from_utf8_lossy(bytes).into_owned();
+    while s.ends_with('\n') || s.ends_with('\r') {
+        s.pop();
+    }
+    s
+}
 
 /// Lines a hunk occupies in the diff: its header plus its lines; a mode-change hunk is the
 /// single line `mode a → b`.
@@ -4057,5 +4564,12 @@ mod tests {
         }));
         app.status = None;
         assert_eq!(app.hit(Target::HeaderHerdr), (Changed::No, None));
+    }
+    #[test]
+    fn app_range_label_matches_git() {
+        assert_eq!(range_label(0, 3), "1,3");
+        assert_eq!(range_label(0, 0), "0,0");
+        assert_eq!(range_label(4, 0), "4,0");
+        assert_eq!(range_label(9, 1), "10", "git omits `,1`");
     }
 }

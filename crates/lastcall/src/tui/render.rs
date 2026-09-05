@@ -12,6 +12,7 @@ use std::collections::BTreeSet;
 
 use lastcall_engine::count::with_thousands;
 use lastcall_engine::hunks::{EXPAND_LINE_CAP, Hunk, Tag};
+use lastcall_engine::ledger::Flag;
 use lastcall_engine::scan::{Change, Collapsed, Rename, Row};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -23,12 +24,20 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::app::{
     AcceptScope, App, Focus, MIN_SIZE, NAV_MIN_COLS, RootView, Selection, Target, annotation_name,
-    diff_lines, hunk_offsets, plural, restore_question,
+    diff_lines, hunk_header, hunk_offsets, plural, restore_question,
 };
 use super::herdr::{Dot, Link};
 use super::input::{Action, MODAL_KEYS};
 
 pub const TOO_SMALL: &str = "too small: 40×10 min";
+/// The note modal's box: wide enough for a sentence, narrow enough to sit over the diff.
+pub const NOTE_WIDTH: u16 = 60;
+/// Text-area height, fixed so the box does not resize while the note is being typed.
+pub const NOTE_ROWS: u16 = 5;
+/// The insertion point, drawn into the text (see `render_note`).
+pub const NOTE_CARET: &str = "▌";
+pub const NOTE_KEYS: &str = "⏎ send   ^J newline   Esc cancel";
+pub const PICK_KEYS: &str = "↑↓ choose   ⏎ send   Esc cancel";
 pub const NO_SELECTION: &str = "select a file (↑↓ or click) · ? for help";
 /// What a flag-only root (no pending rows) shows instead of a file list, in the nav and
 /// in the diff pane, so `Enter` has somewhere to land. `<status>` is herdr's own word.
@@ -174,6 +183,14 @@ pub fn render(app: &App, frame: &mut Frame<'_>) -> HitMap {
     }
     if app.confirm.is_some() {
         render_confirm(app, buf, area);
+    }
+    // The note and the picker are the top layer: only one is ever open, and neither can be
+    // open with the confirm (a flag never asks).
+    if app.note.is_some() {
+        render_note(app, buf, area);
+    }
+    if app.picker.is_some() {
+        render_picker(app, buf, area);
     }
     hits
 }
@@ -682,8 +699,12 @@ fn nav_row_line(row: &Row, full_paths: bool, width: usize) -> Line<'static> {
     if row.collapsed.is_some() {
         markers.push_str(" ⊟");
     }
-    if !row.flags.is_empty() {
-        markers.push_str(" ⚑");
+    // One flag is a bare glyph; several carry the count, so `⚑2` says at a glance that the
+    // row has more than one note on it without opening the diff.
+    match row.flags.len() {
+        0 => {}
+        1 => markers.push_str(" ⚑"),
+        n => markers.push_str(&format!(" ⚑{n}")),
     }
     let conflict = if row.conflicted { "  [conflict]" } else { "" };
     let counts_added = format!("+{}", with_thousands(row.added));
@@ -795,8 +816,15 @@ fn render_main(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
                 let mut header = row_header(row);
                 let control = format!("[{} accept file]", control_key(app, "accept_file"));
                 let restore = format!("[{} restore file]", control_key(app, "restore_file"));
-                let (at_accept, at_restore) =
-                    right_align_pair(&mut header, &control, &restore, area.width, dim());
+                // Two controls here, not three: `[m flag]` is a hunk control, and the nav's
+                // own `m` (which flags the file) has no header line to hang off.
+                let at = right_align_run(
+                    &mut header,
+                    &[control.as_str(), restore.as_str()],
+                    area.width,
+                    dim(),
+                );
+                let (at_accept, at_restore) = (at[0], at[1]);
                 if let Some(x) = at_accept {
                     hits.targets.push((
                         Rect::new(area.x + x, area.y, control.width() as u16, 1),
@@ -966,6 +994,7 @@ fn render_row_body(
                 buf,
                 Rect::new(area.x, area.y + 1, area.width, body),
                 &exp.view.hunks,
+                &[],
                 false,
                 hits,
             );
@@ -986,7 +1015,7 @@ fn render_row_body(
         }
         _ => {}
     }
-    render_hunks(app, buf, area, &row.hunks, true, hits);
+    render_hunks(app, buf, area, &row.hunks, &row.flags, true, hits);
 }
 
 /// Draw `hunks` into `area` from the app's diff cursor, with the `[a accept]` control and
@@ -997,6 +1026,7 @@ fn render_hunks(
     buf: &mut Buffer,
     area: Rect,
     hunks: &[Hunk],
+    flags: &[Flag],
     accept_controls: bool,
     hits: &mut HitMap,
 ) {
@@ -1027,27 +1057,41 @@ fn render_hunks(
             let row_rect = Rect::new(area.x, area.y + y, area.width, 1);
             if within == 0 {
                 hits.targets.push((row_rect, Target::DiffHunk(h)));
+                if let Some(note) = flag_note_for(flags, hunk) {
+                    // The note reads beside the header it is about, so the reader sees what
+                    // they already said here before they say it again. It takes a third of
+                    // the pane at most — the controls right-align after it, and their own
+                    // fallback drops one at a time if even that was too generous.
+                    line.spans.push(Span::styled(
+                        format!("  ⚑ {}", ellipsize(&note, (area.width / 3).max(4) as usize)),
+                        dim(),
+                    ));
+                }
                 let style = if h == current {
                     Style::new().add_modifier(Modifier::REVERSED)
                 } else {
                     dim()
                 };
                 if accept_controls {
-                    let control = format!("[{} accept]", control_key(app, "accept"));
-                    let restore = format!("[{} restore]", control_key(app, "restore"));
-                    let (at_accept, at_restore) =
-                        right_align_pair(&mut line, &control, &restore, area.width, style);
-                    if let Some(x) = at_accept {
-                        hits.targets.push((
-                            Rect::new(area.x + x, area.y + y, control.width() as u16, 1),
-                            Target::HunkAccept(h),
-                        ));
-                    }
-                    if let Some(x) = at_restore {
-                        hits.targets.push((
-                            Rect::new(area.x + x, area.y + y, restore.width() as u16, 1),
-                            Target::HunkRestore(h),
-                        ));
+                    let labels = [
+                        format!("[{} accept]", control_key(app, "accept")),
+                        format!("[{} restore]", control_key(app, "restore")),
+                        format!("[{} flag]", control_key(app, "flag")),
+                    ];
+                    let targets = [
+                        Target::HunkAccept(h),
+                        Target::HunkRestore(h),
+                        Target::HunkFlag(h),
+                    ];
+                    let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+                    let at = right_align_run(&mut line, &refs, area.width, style);
+                    for ((x, label), target) in at.into_iter().zip(&labels).zip(targets) {
+                        if let Some(x) = x {
+                            hits.targets.push((
+                                Rect::new(area.x + x, area.y + y, label.width() as u16, 1),
+                                target,
+                            ));
+                        }
                     }
                 }
                 if h == current {
@@ -1061,6 +1105,21 @@ fn render_hunks(
         h += 1;
         within = 0;
     }
+}
+
+/// The first line of the newest note flagged **on this hunk**, or `None`.
+///
+/// Matched on the header text the flag stored, not on the hunk's index: the index is where
+/// the hunk was when it was flagged, and one edit above it moves every later hunk down. The
+/// header carries the ranges, so it identifies the hunk within the file, and a flag whose
+/// header no longer appears simply shows no marker rather than marking the wrong hunk.
+fn flag_note_for(flags: &[Flag], hunk: &Hunk) -> Option<String> {
+    let header = hunk_header(hunk);
+    flags
+        .iter()
+        .rev()
+        .find(|f| f.hunk.as_ref().is_some_and(|h| h.header == header))
+        .map(|f| f.note.lines().next().unwrap_or("").to_owned())
 }
 
 /// Make `line` a full-width band: pad it out to `width` and put `style` under every span,
@@ -1088,22 +1147,36 @@ fn control_key(app: &App, action: &str) -> String {
 /// Append `control` right-aligned on `line` within `width` columns, at least two columns
 /// after the text; returns its x offset, or `None` when it would not fit (then the line
 /// is left as it was).
-/// Two controls right-aligned as one run, `first` then `second` with a space between, so
-/// the second call cannot land on top of the first (both would right-align to the same
-/// edge). When the pair does not fit, `first` alone is placed — a narrow pane keeps the
-/// accept it has always had rather than losing both.
-fn right_align_pair(
+/// Several controls right-aligned as **one** run, space-separated, so a second call cannot
+/// land on top of the first (each would right-align to the same edge). Returns one x offset
+/// per label, in order.
+///
+/// A run that does not fit is retried without its last label, then without its last two, and
+/// so on: a narrow pane loses the newest control rather than all of them, and `[a accept]`
+/// — the oldest, and the one the hint line names first — is the last to go. The labels a
+/// retry dropped come back `None`, and nothing is drawn for them (no hit target either, so
+/// a click there falls through to the hunk header underneath).
+fn right_align_run(
     line: &mut Line<'static>,
-    first: &str,
-    second: &str,
+    labels: &[&str],
     width: u16,
     style: Style,
-) -> (Option<u16>, Option<u16>) {
-    match right_align(line, &format!("{first} {second}"), width, style) {
-        Some(x) => (Some(x), Some(x + first.width() as u16 + 1)),
-        // `right_align` leaves the line untouched when it refuses, so this is a clean retry.
-        None => (right_align(line, first, width, style), None),
+) -> Vec<Option<u16>> {
+    for n in (1..=labels.len()).rev() {
+        let run = labels[..n].join(" ");
+        // `right_align` leaves the line untouched when it refuses, so each try is clean.
+        if let Some(x) = right_align(line, &run, width, style) {
+            let mut out = Vec::with_capacity(labels.len());
+            let mut at = x;
+            for label in &labels[..n] {
+                out.push(Some(at));
+                at += label.width() as u16 + 1;
+            }
+            out.resize(labels.len(), None);
+            return out;
+        }
     }
+    vec![None; labels.len()]
 }
 
 fn right_align(line: &mut Line<'static>, control: &str, width: u16, style: Style) -> Option<u16> {
@@ -1122,19 +1195,7 @@ fn right_align(line: &mut Line<'static>, control: &str, width: u16, style: Style
 /// change), then the hunk's lines with their `+`/`-`/space prefix.
 fn hunk_line(hunk: &Hunk, i: usize, current: bool) -> Line<'static> {
     if i == 0 {
-        let text = if hunk.is_mode_change() {
-            format!(
-                "mode {} → {}",
-                mode_of(&hunk.lines[0].1),
-                mode_of(&hunk.lines[1].1)
-            )
-        } else {
-            format!(
-                "@@ -{} +{} @@",
-                range_label(hunk.old_range.start, hunk.old_range.len()),
-                range_label(hunk.new_range.start, hunk.new_range.len())
-            )
-        };
+        let text = hunk_header(hunk);
         let style = if current {
             Style::new().add_modifier(Modifier::REVERSED)
         } else {
@@ -1148,23 +1209,6 @@ fn hunk_line(hunk: &Hunk, i: usize, current: bool) -> Line<'static> {
         Tag::Context => Line::from(format!(" {text}")),
         Tag::Insert => Line::from(Span::styled(format!("+{text}"), green())),
         Tag::Delete => Line::from(Span::styled(format!("-{text}"), red())),
-    }
-}
-
-fn mode_of(line: &[u8]) -> String {
-    String::from_utf8_lossy(line)
-        .trim()
-        .trim_start_matches("mode ")
-        .to_owned()
-}
-
-/// git's `start[,len]`: 1-based start for a non-empty range, the preceding line for an
-/// empty one, and `,len` omitted when it is 1 (as `git diff` prints it).
-fn range_label(start: usize, len: usize) -> String {
-    match len {
-        0 => format!("{start},0"),
-        1 => format!("{}", start + 1),
-        _ => format!("{},{len}", start + 1),
     }
 }
 
@@ -1282,7 +1326,17 @@ fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
         .border_style(focused_border());
     let inner = block.inner(rect);
     block.render(rect, buf);
-    for (i, row) in rows.iter().take(inner.height as usize).enumerate() {
+    let cap = inner.height as usize;
+    if rows.len() > cap {
+        // Too narrow for two columns *and* too short for one (80×30 with this keymap): the
+        // overlay clips, and what it clips is key rows — never the footer. A reader who
+        // cannot see every key can still see what the mouse does and how to leave.
+        rows.truncate(cap.saturating_sub(2));
+        rows.push(String::new());
+        rows.push(SELECT_NOTE.to_owned());
+        rows.truncate(cap);
+    }
+    for (i, row) in rows.iter().take(cap).enumerate() {
         buf.set_stringn(
             inner.x + 1,
             inner.y + i as u16,
@@ -1365,6 +1419,141 @@ fn render_confirm(app: &App, buf: &mut Buffer, area: Rect) {
             style,
         );
     }
+}
+
+/// The note modal: what is being flagged, the note being typed, and the keys that end it.
+///
+/// The text area is a fixed [`NOTE_ROWS`] lines high whatever is typed, so the box does not
+/// jump under the reader's hands as the note grows; past that it scrolls to keep the caret
+/// (`▌`) in view. The caret is drawn into the text rather than set on the terminal so that
+/// one `App` renders to one buffer — the snapshot tier can see where the cursor is.
+fn render_note(app: &App, buf: &mut Buffer, area: Rect) {
+    let Some(note) = &app.note else {
+        return;
+    };
+    let width = NOTE_WIDTH.min(area.width.saturating_sub(4)).max(8);
+    // border + target + blank + text + blank + keys
+    let height = (NOTE_ROWS + 6).min(area.height);
+    let rect = centered(area, width, height);
+    let inner = modal_block(" flag ", rect, buf);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let text_width = inner.width.saturating_sub(2) as usize;
+    let mut rows: Vec<(String, Style)> = vec![
+        (ellipsize(&note.target.label(), text_width), bold()),
+        (String::new(), Style::new()),
+    ];
+    let wrapped = caret_lines(&note.text, note.cursor, text_width.max(1));
+    // The window ends at the caret's line, so a note longer than the box scrolls with it.
+    let caret_at = wrapped
+        .iter()
+        .position(|l| l.contains(NOTE_CARET))
+        .unwrap_or(0);
+    let top = (caret_at + 1).saturating_sub(NOTE_ROWS as usize);
+    for i in 0..NOTE_ROWS as usize {
+        let line = wrapped.get(top + i).cloned().unwrap_or_default();
+        rows.push((line, Style::new()));
+    }
+    rows.push((String::new(), Style::new()));
+    rows.push((NOTE_KEYS.to_owned(), dim()));
+    for (i, (row, style)) in rows.iter().take(inner.height as usize).enumerate() {
+        buf.set_stringn(
+            inner.x + 1,
+            inner.y + i as u16,
+            row,
+            inner.width.saturating_sub(1) as usize,
+            *style,
+        );
+    }
+}
+
+/// The agent picker: which pane the export goes to. The flag is already on disk when this
+/// opens, so `Esc` costs only the send — which the first row says out loud.
+fn render_picker(app: &App, buf: &mut Buffer, area: Rect) {
+    let Some(picker) = &app.picker else {
+        return;
+    };
+    let mut rows: Vec<(String, Style)> = vec![
+        (format!("flagged {} — send to:", picker.label), bold()),
+        (String::new(), Style::new()),
+    ];
+    for (i, c) in picker.candidates.iter().enumerate() {
+        let mark = if i == picker.selected { "▸ " } else { "  " };
+        rows.push((
+            format!(
+                "{mark}{} · {} · {}",
+                c.label,
+                c.workspace_label,
+                c.status.as_str()
+            ),
+            if i == picker.selected {
+                bold()
+            } else {
+                Style::new()
+            },
+        ));
+    }
+    rows.push((String::new(), Style::new()));
+    rows.push((PICK_KEYS.to_owned(), dim()));
+    let width =
+        (rows.iter().map(|(r, _)| r.width()).max().unwrap_or(0) + 4).min(area.width as usize);
+    let height = (rows.len() + 2).min(area.height as usize);
+    let rect = centered(area, width as u16, height as u16);
+    let inner = modal_block(" send to ", rect, buf);
+    for (i, (row, style)) in rows.iter().take(inner.height as usize).enumerate() {
+        buf.set_stringn(
+            inner.x + 1,
+            inner.y + i as u16,
+            row,
+            inner.width.saturating_sub(1) as usize,
+            *style,
+        );
+    }
+}
+
+/// `text` split into display lines of at most `width` columns, with [`NOTE_CARET`] inserted
+/// at byte offset `cursor`. Explicit newlines break first, then each paragraph is hard-wrapped
+/// at the column — a note is prose, and a word cut in half is still readable, while a
+/// wrapping rule that hides the caret is not.
+fn caret_lines(text: &str, cursor: usize, width: usize) -> Vec<String> {
+    let mut with_caret = text.to_owned();
+    with_caret.insert_str(cursor.min(with_caret.len()), NOTE_CARET);
+    let mut out = Vec::new();
+    for para in with_caret.split('\n') {
+        let mut line = String::new();
+        for c in para.chars() {
+            if line.width() + c.width().unwrap_or(0) > width {
+                out.push(std::mem::take(&mut line));
+            }
+            line.push(c);
+        }
+        out.push(line);
+    }
+    out
+}
+
+/// A `width`×`height` rect centred in `area`, clamped to it.
+fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    )
+}
+
+/// Clear `rect`, draw the focused border with `title`, and hand back the inside.
+fn modal_block(title: &'static str, rect: Rect, buf: &mut Buffer) -> Rect {
+    Clear.render(rect, buf);
+    let block = Block::bordered()
+        .title(title)
+        .border_style(focused_border());
+    let inner = block.inner(rect);
+    block.render(rect, buf);
+    inner
 }
 
 // ---- helpers -----------------------------------------------------------------------------
@@ -1647,14 +1836,6 @@ mod tests {
     }
 
     #[test]
-    fn render_range_label_matches_git() {
-        assert_eq!(range_label(0, 3), "1,3");
-        assert_eq!(range_label(0, 0), "0,0");
-        assert_eq!(range_label(4, 0), "4,0");
-        assert_eq!(range_label(9, 1), "10", "git omits `,1`");
-    }
-
-    #[test]
     fn render_plural() {
         assert_eq!(plural(0, "file"), "0 files");
         assert_eq!(plural(1, "file"), "1 file");
@@ -1714,7 +1895,11 @@ mod tests {
         assert!(frame.contains("? help  x quit"), "{frame}");
         assert!(!frame.contains("q quit"), "{frame}");
         app.help = true;
-        let (frame, _) = frame_of(&app, 80, 30);
+        // 100 wide, not 80: at 80 the table has no room for a second column and the
+        // overlay clips (see `render_help_uses_two_columns_only_when_one_does_not_fit`).
+        // This test is about the overlay following the keymap, so it uses a frame that
+        // shows every row.
+        let (frame, _) = frame_of(&app, 100, 30);
         assert!(frame.contains("x              quit"), "{frame}");
         assert!(!frame.contains("q / Ctrl-C"), "{frame}");
         assert!(

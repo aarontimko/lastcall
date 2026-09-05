@@ -84,6 +84,15 @@ pub enum Action {
     Restore,
     /// Restore the selected row whole, whichever pane has focus.
     RestoreFile,
+    /// Open the note modal on the hunk under the cursor (a file, from the nav).
+    Flag,
+    /// Clear every flag on the selected file.
+    Unflag,
+    /// One edit inside the note modal. Never key-bound: while the modal is open every key
+    /// is resolved by [`note_action`] before the keymap is consulted.
+    Note(NoteKey),
+    /// One move inside the agent picker. Never key-bound, for the same reason.
+    Pick(PickKey),
     /// Answer the confirm modal (`y` / `Enter`); nothing outside it.
     Confirm,
     /// Dismiss the confirm modal (`n` / `Esc`); nothing outside it.
@@ -96,6 +105,92 @@ pub enum Action {
     ScopeToggle,
     /// News from the herdr task. Never key-bound; the loop's fourth `select!` arm makes it.
     Herdr(HerdrUpdate),
+}
+
+/// What one keystroke does to the note being typed.
+///
+/// `Insert` carries a string, not a char, because a bracketed paste arrives as one
+/// `Event::Paste` and must land as one edit — never as a send, whatever it contains.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoteKey {
+    Insert(String),
+    Backspace,
+    /// A line break inside the note: `ctrl-j` everywhere, `alt`/`shift`-Enter where the
+    /// terminal reports them.
+    Newline,
+    /// Enter: write the flag and close the modal.
+    Send,
+    /// Esc: close the modal, write nothing.
+    Cancel,
+}
+
+/// What one keystroke does in the agent picker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickKey {
+    Up,
+    Down,
+    /// Enter: stage the export into the selected pane.
+    Send,
+    /// Esc: leave the flag written and stage nothing.
+    Cancel,
+}
+
+/// The note modal's action for one key event, consulted before the keymap while
+/// `App.note` is open (deliverable 10).
+///
+/// Every printable key types; `ctrl-j` breaks the line, and so do `alt-`/`shift-Enter`
+/// **where the terminal reports them** — with no keyboard-enhancement flags Shift-Enter is
+/// byte-identical to Enter, which is why `ctrl-j` is the one that is promised. Esc cancels,
+/// Enter sends. Everything else is swallowed, except a **non-printable** `quit` binding
+/// (`ctrl-c` by default), which quits as it does under the confirm modal — a printable one
+/// (`q`) types its letter, because a note is text.
+pub fn note_action(event: &Event, keymap: &Keymap) -> Option<Action> {
+    if let Event::Paste(text) = event {
+        return Some(Action::Note(NoteKey::Insert(text.clone())));
+    }
+    let Event::Key(k) = event else {
+        return None;
+    };
+    let key = Key::of(k)?;
+    let note = match key.code {
+        KeyCode::Enter if key.alt || key.shift => NoteKey::Newline,
+        KeyCode::Enter => NoteKey::Send,
+        KeyCode::Esc => NoteKey::Cancel,
+        KeyCode::Backspace => NoteKey::Backspace,
+        KeyCode::Char('j') if key.ctrl => NoteKey::Newline,
+        KeyCode::Char(c) if !key.ctrl && !key.alt => NoteKey::Insert(c.to_string()),
+        _ => return quit_only(keymap, key),
+    };
+    Some(Action::Note(note))
+}
+
+/// The picker's action for one key event, on the same terms as [`note_action`]. The picker
+/// shows a list, so `j`/`k` move it as they do in the nav.
+pub fn pick_action(event: &Event, keymap: &Keymap) -> Option<Action> {
+    let Event::Key(k) = event else {
+        return None;
+    };
+    let key = Key::of(k)?;
+    let pick = match key.code {
+        KeyCode::Up => PickKey::Up,
+        KeyCode::Down => PickKey::Down,
+        KeyCode::Char('k') if !key.ctrl && !key.alt => PickKey::Up,
+        KeyCode::Char('j') if !key.ctrl && !key.alt => PickKey::Down,
+        KeyCode::Enter => PickKey::Send,
+        KeyCode::Esc => PickKey::Cancel,
+        _ => return quit_only(keymap, key),
+    };
+    Some(Action::Pick(pick))
+}
+
+/// `Action::Quit` when `key` is a **non-printable** quit binding, else nothing: the escape
+/// hatch a text-entry modal keeps open.
+fn quit_only(keymap: &Keymap, key: Key) -> Option<Action> {
+    let printable = matches!(key.code, KeyCode::Char(_)) && !key.ctrl && !key.alt;
+    match keymap.lookup(key) {
+        Some(Action::Quit) if !printable => Some(Action::Quit),
+        _ => None,
+    }
 }
 
 /// Action name (the `[keys]` config key) → default key specs, in help-overlay order.
@@ -117,6 +212,8 @@ pub const DEFAULT_KEYMAP: &[(&str, &[&str])] = &[
     ("accept_all", &["ctrl-a"]),
     ("restore", &["u"]),
     ("restore_file", &["shift-u"]),
+    ("flag", &["m"]),
+    ("unflag", &["shift-m"]),
     ("ack", &["d"]),
     ("jump", &["g"]),
     ("scope", &["w"]),
@@ -171,6 +268,8 @@ impl Action {
             "accept_all" => Action::AcceptAll,
             "restore" => Action::Restore,
             "restore_file" => Action::RestoreFile,
+            "flag" => Action::Flag,
+            "unflag" => Action::Unflag,
             "ack" => Action::Ack,
             "jump" => Action::Jump,
             "scope" => Action::ScopeToggle,
@@ -199,8 +298,10 @@ impl Action {
             "accept" => "accept the hunk or the selected entry",
             "accept_file" => "accept the whole file",
             "accept_all" => "accept everything listed",
-            "restore" => "restore the hunk under the cursor",
-            "restore_file" => "restore the selected file",
+            "restore" => "restore the hunk",
+            "restore_file" => "restore the whole file",
+            "flag" => "flag it with a note",
+            "unflag" => "clear the file's flags",
             "ack" => "ack the agent flag",
             "jump" => "jump to the agent in herdr",
             "scope" => "workspace scope on/off",
@@ -1238,6 +1339,10 @@ mod tests {
             (Action::AcceptAll, "key"),
             (Action::Restore, "key"),
             (Action::RestoreFile, "key"),
+            (Action::Flag, "key"),
+            (Action::Unflag, "key"),
+            (Action::Note(NoteKey::Send), "modal-note"),
+            (Action::Pick(PickKey::Send), "modal-note"),
             (Action::Ack, "key"),
             (Action::Jump, "key"),
             (Action::ScopeToggle, "key"),
@@ -1294,14 +1399,18 @@ mod tests {
             | Action::AcceptAll
             | Action::Restore
             | Action::RestoreFile
+            | Action::Flag
+            | Action::Unflag
+            | Action::Note(_)
+            | Action::Pick(_)
             | Action::Confirm
             | Action::Cancel
             | Action::Ack
             | Action::Jump
             | Action::ScopeToggle
-            | Action::Herdr(_) => 33,
+            | Action::Herdr(_) => 37,
         };
-        assert_eq!(table.len(), 33);
+        assert_eq!(table.len(), 37);
     }
 
     #[test]
@@ -1487,6 +1596,35 @@ mod tests {
             "{:?}",
             reqs[0].1
         );
+    }
+
+    /// `m` on hunk 2 vs a click on that hunk's `[m flag]`. Both open the note modal on the
+    /// same target, and neither writes anything until Enter — the flag's key/mouse parity.
+    #[test]
+    fn input_parity_flag() {
+        let km = Keymap::defaults();
+        let mut base = three_roots();
+        base.handle(Action::Resize(100, 30));
+        base.apply(pile_event("alpha", alpha_hunks(3)));
+        base.select(Some(row("alpha", "f1")));
+        base.handle(Action::Open);
+        let (_, hits) = frame(&base);
+        let mut by_key = base.clone();
+        let mut by_mouse = base;
+
+        press_key(&mut by_key, &km, key('n'));
+        press_key(&mut by_key, &km, key('n'));
+        assert_eq!(by_key.diff.hunk, 2);
+        let by_key_effect = press_key(&mut by_key, &km, key('m'));
+        let by_mouse_effect = click(&mut by_mouse, &km, &hits, &Target::HunkFlag(2));
+
+        assert_eq!(by_key, by_mouse);
+        assert_eq!(by_key_effect, by_mouse_effect);
+        assert_eq!(frame(&by_key).0, frame(&by_mouse).0);
+        assert_eq!(by_key_effect.1, None, "the modal collects the note first");
+        let note = by_key.note.as_ref().expect("the note modal is open");
+        assert_eq!(note.target.status_label(), "f1 hunk 3");
+        assert!(note.text.is_empty());
     }
 
     /// `e` vs a click on the `[e expand]` control of a collapsed row: both ask the engine

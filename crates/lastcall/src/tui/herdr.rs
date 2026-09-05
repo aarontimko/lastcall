@@ -156,6 +156,11 @@ pub enum HerdrUpdate {
     Reconnecting,
     /// The whole association, re-derived; replaces what the view holds.
     Roots(BTreeMap<PathBuf, RootAgents>),
+    /// Every agent the export could be staged to, per root ([`agents_for`], across every
+    /// workspace). Sent beside `Roots` from the same snapshot: the rollup answers "how is
+    /// this root doing?" and this answers "which agent?", and the picker needs the second
+    /// (deliverable 10).
+    Agents(BTreeMap<PathBuf, Vec<AgentCandidate>>),
     /// The whole scope, re-derived; `None` when nothing identifies a workspace.
     Scope(Option<Scope>),
     /// A `notification.show` came back. `Ok` carries herdr's verdict.
@@ -243,6 +248,8 @@ pub struct HerdrView {
     pub scoped: bool,
     /// `true` while `[herdr] toast` is on and a link exists: what `Effect::Toast` needs.
     pub toast: bool,
+    /// Every candidate pane per root, across every workspace, from the last derivation.
+    pub candidates: BTreeMap<PathBuf, Vec<AgentCandidate>>,
 }
 
 impl HerdrView {
@@ -253,6 +260,23 @@ impl HerdrView {
     /// The scope actually in force: `None` when none was derived or `w` turned it off.
     pub fn active_scope(&self) -> Option<&Scope> {
         self.scope.as_ref().filter(|_| self.scoped)
+    }
+
+    /// The agents a flag on `root` could be staged to, narrowed to the active workspace
+    /// when the `w` scope is on — the picker then covers the ground the nav does. The map
+    /// itself is derived across every workspace, so turning the scope off widens it again
+    /// without waiting for a re-derivation (F15).
+    pub fn candidates(&self, root: &Path) -> Vec<AgentCandidate> {
+        let all = self.candidates.get(root).cloned().unwrap_or_default();
+        match self.active_scope() {
+            // `Scope::label` and `AgentCandidate::workspace_label` are the same expression
+            // over the same snapshot — the workspace's label, its id when it has none.
+            Some(scope) => all
+                .into_iter()
+                .filter(|c| c.workspace_label == scope.label)
+                .collect(),
+            None => all,
+        }
     }
 
     /// Whether `root` survives the active scope. Everything survives when none is active.
