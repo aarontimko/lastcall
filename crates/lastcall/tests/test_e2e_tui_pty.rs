@@ -1429,3 +1429,339 @@ fn pty_herdr_worktree_created_reaches_the_nav_through_the_loop() {
     assert_clean_exit(&pty, since);
     rt.block_on(mock.shutdown());
 }
+
+// --- Phase 7: restore and flag through the real terminal -------------------------------
+
+/// `f1` as the fixture first sighted it: the bytes a restore must put back, byte for byte.
+const F1_BASELINE: &str = "a1\na2\na3\na4\na5\na6\na7\na8\na9\na10\n";
+
+/// The golden the standalone flag scene writes, with the clock and the root normalised.
+const FLAG_EXPORT_PTY_GOLDEN: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/golden/flag_export_pty.md"
+);
+
+/// `<state>/exports/<root>/<date>.md` — the one file the TUI writes. Found by listing
+/// rather than by naming the date, so the scene does not race the clock over midnight.
+fn export_file(state: &Path, root: &str) -> PathBuf {
+    let dir = state.join("exports").join(root);
+    let mut found: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    found.sort();
+    assert_eq!(
+        found.len(),
+        1,
+        "one export file in {}: {found:?}",
+        dir.display()
+    );
+    found.pop().expect("one file")
+}
+
+/// The export with everything a clock or a temp dir decides replaced: the `created_at`
+/// field becomes `<T>` and the root field `<R>`, so the golden is about the *shape* of the
+/// message the agent receives, which is what the human reads.
+fn normalise_export(text: &str) -> String {
+    // `split`, not `lines`: the trailing blank line is the separator the append writes, and
+    // the golden is the place that pins it.
+    text.split('\n')
+        .map(|line| {
+            let Some(rest) = line.strip_prefix("lastcall flag · ") else {
+                return line.to_owned();
+            };
+            let mut fields: Vec<&str> = rest.split(" · ").collect();
+            if let Some(first) = fields.first_mut() {
+                *first = "<R>";
+            }
+            if let Some(last) = fields.last_mut() {
+                *last = "<T>";
+            }
+            format!("lastcall flag · {}", fields.join(" · "))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `u` then `U` on the same file: one hunk goes back, then the rest, and the file on disk
+/// is the baseline byte for byte.
+///
+/// The point of the scene is the **bytes**, not the screen: `restore` is the one gesture
+/// that writes into the reviewer's working tree, and a diff that renders as clean is not
+/// the same claim as a file that is identical to what the agent started from.
+#[test]
+fn pty_restore_hunk_then_file_bytes_match_baseline() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let alpha = fx.repo("alpha");
+    // Line 1 and line 10 rewritten: two hunks at CONTEXT 3, one to restore and one to leave.
+    alpha.write("f1", F1_TWO_HUNKS);
+
+    let Some(mut pty) = fx.spawn_tui(&bin()) else {
+        return;
+    };
+    wait_first_piles(&mut pty);
+    pty.send(b"jj\r").expect("keys");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        let t = s.contents();
+        t.contains("f1  M  +2 −2") && t.matches("@@ -").count() == 2
+    })
+    .unwrap_or_else(|e| panic!("f1 open with two hunks: {e}"));
+    assert!(
+        pty.screen_text().contains("[u restore]"),
+        "the hunk control is on screen:\n{}",
+        pty.screen_text()
+    );
+
+    // (1) `u` on the first hunk: no modal — a content hunk restore never asks.
+    let t = Instant::now();
+    pty.send(b"u").expect("u");
+    pty.wait_for(OVERLOADED, |s| {
+        status_is(s, "restored f1 hunk 1") && s.contents().contains("M f1  +1 −1")
+    })
+    .unwrap_or_else(|e| panic!("restore hunk: {e}"));
+    note(&format!(
+        "PTY restore hunk: status + row after {:.3?}",
+        t.elapsed()
+    ));
+    let on_disk = std::fs::read(fx.parent.join("alpha/f1")).expect("read f1");
+    assert_eq!(
+        String::from_utf8_lossy(&on_disk),
+        "a1\na2\na3\na4\na5\na6\na7\na8\na9\nA10\n",
+        "the first hunk went back and the second stayed"
+    );
+
+    // (2) `U` on the file: this one asks, and the modal says which file.
+    pty.send(b"U").expect("U");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        s.contents().contains("Restore f1 · 1 hunk?")
+    })
+    .unwrap_or_else(|e| panic!("the restore confirm: {e}"));
+    let t = Instant::now();
+    pty.send(b"y").expect("y");
+    pty.wait_for(OVERLOADED, |s| {
+        status_is(s, "restored f1") && !s.contents().contains("M f1")
+    })
+    .unwrap_or_else(|e| panic!("restore file: {e}"));
+    note(&format!(
+        "PTY restore file: f1 gone after {:.3?}",
+        t.elapsed()
+    ));
+    let on_disk = std::fs::read(fx.parent.join("alpha/f1")).expect("read f1");
+    assert_eq!(
+        String::from_utf8_lossy(&on_disk),
+        F1_BASELINE,
+        "the working tree is the baseline, byte for byte"
+    );
+    // A restore is not an accept: nothing was folded into the ledger.
+    assert_eq!(fx.ledger("alpha")["overrides"], serde_json::json!({}));
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}
+
+/// The file moves between the frame and the keystroke: the restore is refused by name, the
+/// working tree is untouched, and the rescan that follows makes the next `u` land.
+#[test]
+fn pty_restore_refused_when_the_file_moved() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let Some(mut pty) = fx.spawn_tui(&bin()) else {
+        return;
+    };
+    wait_first_piles(&mut pty);
+    pty.send(b"jj\r").expect("keys");
+    pty.wait_for_text("f1  M  +1 −1", Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("f1 open: {e}"));
+
+    fx.append("alpha/f1", "moved after render\n");
+    let before = std::fs::read(fx.parent.join("alpha/f1")).expect("read f1");
+    let t = Instant::now();
+    pty.send(b"u").expect("u");
+    pty.wait_for(OVERLOADED, |s| {
+        status_is(s, "f1: changed since rendered; not restored")
+    })
+    .unwrap_or_else(|e| panic!("refusal status: {e}"));
+    note(&format!(
+        "PTY restore refused: status after {:.3?}",
+        t.elapsed()
+    ));
+    assert_eq!(
+        std::fs::read(fx.parent.join("alpha/f1")).expect("read f1"),
+        before,
+        "a refused restore writes nothing at all"
+    );
+    assert!(pty.screen_text().contains("M f1"), "the row remains");
+
+    // The rescan re-renders the row; the same key now restores what is on screen.
+    pty.wait_for_text("M f1  +2 −1", OVERLOADED)
+        .unwrap_or_else(|e| panic!("the rescan shows the new counts: {e}"));
+    let t = Instant::now();
+    pty.send(b"u").expect("u");
+    pty.wait_for(OVERLOADED, |s| status_is(s, "restored f1 hunk 1"))
+        .unwrap_or_else(|e| panic!("restore after the rescan: {e}"));
+    note(&format!(
+        "PTY restore after refusal: status after {:.3?}",
+        t.elapsed()
+    ));
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}
+
+/// A deletion row: `u` is the whole file (there is no hunk to pick), it asks with the
+/// `(deleted)` wording, and `y` puts the file back on disk.
+#[test]
+fn pty_restore_deletion_recreates_the_file() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let f3 = fx.parent.join("alpha/f3");
+    std::fs::remove_file(&f3).expect("the agent deletes f3");
+
+    let Some(mut pty) = fx.spawn_tui(&bin()) else {
+        return;
+    };
+    wait_first_piles(&mut pty);
+    pty.wait_for_text("D f3", LONG)
+        .unwrap_or_else(|e| panic!("the deletion row: {e}"));
+    select_until(&mut pty, "f3  D");
+
+    // `u`, not `U`: on a deletion row the hunk key is the file key, because a deletion has
+    // no hunk worth picking.
+    pty.send(b"u").expect("u");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        s.contents().contains("Restore f3? (deleted)")
+    })
+    .unwrap_or_else(|e| panic!("the deletion confirm: {e}"));
+    let t = Instant::now();
+    pty.send(b"y").expect("y");
+    pty.wait_for(OVERLOADED, |s| {
+        status_is(s, "restored f3") && !s.contents().contains("D f3")
+    })
+    .unwrap_or_else(|e| panic!("restore deletion: {e}"));
+    note(&format!(
+        "PTY restore deletion: f3 back after {:.3?}",
+        t.elapsed()
+    ));
+    assert_eq!(
+        std::fs::read_to_string(&f3).expect("f3 exists again"),
+        "c\n",
+        "the file is back at its baseline content"
+    );
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}
+
+/// `m`, a note, Enter — with no herdr to send to. The flag lands in the ledger, the row
+/// grows its `⚑`, and the export is appended to the fallback file under the state dir,
+/// which is compared against `flag_export_pty.md`.
+///
+/// This is the only scene that proves the export the *binary* produces: the engine's own
+/// golden is written from a unit test with a fixed clock, and neither one alone shows that
+/// what the reviewer typed reaches the file they can paste from.
+#[test]
+fn pty_flag_note_exports_when_standalone() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let alpha = fx.repo("alpha");
+    alpha.write("f1", F1_TWO_HUNKS);
+
+    let Some(mut pty) = fx.spawn_tui(&bin()) else {
+        return;
+    };
+    wait_first_piles(&mut pty);
+    pty.send(b"jj\r").expect("keys");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        let t = s.contents();
+        t.contains("f1  M  +2 −2") && t.matches("@@ -").count() == 2
+    })
+    .unwrap_or_else(|e| panic!("f1 open with two hunks: {e}"));
+
+    // Hunk 2, so the export's `hunk 2 of 2` is not the trivial first one.
+    pty.send(b"n").expect("n");
+    pty.send(b"m").expect("m");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        let t = s.contents();
+        t.contains("f1 · hunk 2 of 2") && t.contains("⏎ send")
+    })
+    .unwrap_or_else(|e| panic!("the note modal: {e}"));
+
+    // `q` is a printable character inside the modal, not the quit key: typing the note is
+    // the proof that the field swallows the keymap.
+    pty.send("this line looks wrong · q".as_bytes())
+        .expect("the note");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        s.contents().contains("this line looks wrong")
+    })
+    .unwrap_or_else(|e| panic!("the note is echoed: {e}"));
+    assert!(
+        pty.screen_text().contains("f1 · hunk 2 of 2"),
+        "still the modal, not a quit"
+    );
+
+    let t = Instant::now();
+    pty.send(b"\r").expect("enter");
+    pty.wait_for(OVERLOADED, |s| {
+        let (_, cols) = s.size();
+        s.rows(0, cols)
+            .last()
+            .is_some_and(|r| r.contains("flagged f1 hunk 2 · export → "))
+    })
+    .unwrap_or_else(|e| panic!("the export status: {e}"));
+    note(&format!(
+        "PTY flag standalone: export status after {:.3?}",
+        t.elapsed()
+    ));
+    // The row keeps its hunks — a flag changes nothing but the ledger — and gains the mark.
+    pty.wait_for_text("M f1 ⚑", Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("the nav flag marker: {e}"));
+
+    // `flags` is the 1.1 list; `flag` beside it is the 1.0 mirror, which has no hunk field.
+    let ledger = fx.ledger("alpha");
+    let flags = &ledger["overrides"]["f1"]["flags"];
+    assert_eq!(flags.as_array().map(Vec::len), Some(1), "{ledger}");
+    assert_eq!(
+        flags[0]["note"].as_str(),
+        Some("this line looks wrong · q"),
+        "{ledger}"
+    );
+    assert_eq!(flags[0]["hunk"]["index"].as_u64(), Some(1), "{ledger}");
+    assert_eq!(
+        ledger["overrides"]["f1"]["flag"]["note"].as_str(),
+        Some("this line looks wrong · q"),
+        "the 1.0 mirror is written too: {ledger}"
+    );
+
+    let path = export_file(&fx.state, "alpha");
+    let actual = normalise_export(&std::fs::read_to_string(&path).expect("the export file"));
+    if std::env::var_os("LASTCALL_UPDATE_GOLDEN").is_some() {
+        std::fs::write(FLAG_EXPORT_PTY_GOLDEN, &actual).expect("write golden");
+        note(&format!("golden rewritten: {FLAG_EXPORT_PTY_GOLDEN}"));
+    } else {
+        let expected = std::fs::read_to_string(FLAG_EXPORT_PTY_GOLDEN).unwrap_or_else(|e| {
+            panic!("read {FLAG_EXPORT_PTY_GOLDEN}: {e} (run `just flag-export-golden`)")
+        });
+        assert!(
+            actual == expected,
+            "the export file differs from the golden (run `just flag-export-golden` if \
+             intended)\n--- expected ---\n{expected}\n--- actual ---\n{actual}"
+        );
+    }
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}

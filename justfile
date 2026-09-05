@@ -87,6 +87,8 @@ golden-update:
 flag-export-golden:
     LASTCALL_UPDATE_GOLDEN=1 cargo test -p lastcall-engine --lib flags::tests::flags_export_matches_the_golden
     cargo test -p lastcall-engine --lib flags::
+    LASTCALL_UPDATE_GOLDEN=1 cargo test -p lastcall --test test_e2e_tui_pty -- pty_flag_note_exports_when_standalone
+    cargo test -p lastcall --test test_e2e_tui_pty -- pty_flag_note_exports_when_standalone
 
 # Rewrite the Phase 3 TUI snapshots (crates/lastcall/tests/snapshots/), then prove they pass.
 snapshots-update:
