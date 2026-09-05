@@ -14,6 +14,11 @@
 //!   directory, `O_CREAT | O_EXCL | O_NOFOLLOW`, written and `sync_all`'d, renamed over the
 //!   path. The rename is atomic and replaces a symlink at the leaf rather than writing
 //!   through it. On any error after the temp file exists it is removed.
+//! - **The directory is a descriptor, not a path** (verifier F7). The parent is opened
+//!   `O_DIRECTORY | O_NOFOLLOW` once, and the create, the rename and the cleanup unlink are
+//!   all relative to that descriptor (`openat`, `renameat`, `unlinkat`). A path is
+//!   re-resolved on every syscall, so a directory swapped between the create and the rename
+//!   sent both the write and its cleanup somewhere else.
 //! - **Bytes go through git's smudge/eol conversion** (review F2). Our blobs are canonical
 //!   git blobs — `hash-object -w` ran with cwd = root, so `text=auto` and `filter=lfs`
 //!   already cleaned them (§6.4) — and writing them raw would rewrite a CRLF file LF or
@@ -327,9 +332,15 @@ pub fn sweep(root: &Path, rel: &[u8]) {
     }
 }
 
-/// Create the temp file beside `rel` with `O_CREAT | O_EXCL | O_NOFOLLOW`.
-fn create_temp(root: &Path, rel: &[u8]) -> Result<(PathBuf, std::fs::File), WriteError> {
-    use std::os::unix::fs::OpenOptionsExt;
+/// Open `rel`'s parent directory `O_DIRECTORY | O_NOFOLLOW` and return it with `rel`'s
+/// basename.
+///
+/// Every later step of the write names the temp file **relative to this descriptor** rather
+/// than by path (verifier F7). A descriptor keeps pointing at the directory that was
+/// verified; a path is re-resolved on every call, so a directory swapped for a symlink after
+/// the temp file was created sent the `rename` — and the cleanup `unlink` — somewhere else
+/// entirely, leaving the temp file behind as a ghost in a directory nothing looks at.
+fn open_parent(root: &Path, rel: &[u8]) -> Result<(std::os::fd::OwnedFd, Vec<u8>), WriteError> {
     let rel_path = Path::new(OsStr::from_bytes(rel));
     let name = rel_path
         .file_name()
@@ -337,23 +348,54 @@ fn create_temp(root: &Path, rel: &[u8]) -> Result<(PathBuf, std::fs::File), Writ
         .as_bytes()
         .to_vec();
     let parent = root.join(rel_path.parent().unwrap_or(Path::new("")));
+    let fd = nix::fcntl::open(
+        &parent,
+        nix::fcntl::OFlag::O_RDONLY
+            | nix::fcntl::OFlag::O_DIRECTORY
+            | nix::fcntl::OFlag::O_NOFOLLOW
+            | nix::fcntl::OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::empty(),
+    )
+    .map_err(|e| match e {
+        // The parent is a symlink, or not a directory at all: whatever it is, it is not
+        // what the preflight walked.
+        nix::errno::Errno::ELOOP | nix::errno::Errno::ENOTDIR => WriteError::Moved,
+        e => WriteError::io(&parent, std::io::Error::from(e)),
+    })?;
+    Ok((fd, name))
+}
+
+/// Create the temp file in `dirfd` with `O_CREAT | O_EXCL | O_NOFOLLOW`, returning its
+/// basename and the open file.
+fn create_temp(
+    dirfd: &std::os::fd::OwnedFd,
+    parent: &Path,
+    name: &[u8],
+) -> Result<(Vec<u8>, std::fs::File), WriteError> {
     let pid = std::process::id();
     for n in 0u32..64 {
         let mut base = vec![b'.'];
-        base.extend_from_slice(&name);
+        base.extend_from_slice(name);
         base.extend_from_slice(MARK);
         base.extend_from_slice(format!("{pid}-{n}").as_bytes());
-        let temp = parent.join(OsStr::from_bytes(&base));
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
-            .mode(0o600)
-            .open(&temp)
-        {
-            Ok(f) => return Ok((temp, f)),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(WriteError::io(&temp, e)),
+        match nix::fcntl::openat(
+            dirfd,
+            OsStr::from_bytes(&base),
+            nix::fcntl::OFlag::O_WRONLY
+                | nix::fcntl::OFlag::O_CREAT
+                | nix::fcntl::OFlag::O_EXCL
+                | nix::fcntl::OFlag::O_NOFOLLOW
+                | nix::fcntl::OFlag::O_CLOEXEC,
+            nix::sys::stat::Mode::from_bits_truncate(0o600),
+        ) {
+            Ok(fd) => return Ok((base, std::fs::File::from(fd))),
+            Err(nix::errno::Errno::EEXIST) => continue,
+            Err(e) => {
+                return Err(WriteError::io(
+                    &parent.join(OsStr::from_bytes(&base)),
+                    std::io::Error::from(e),
+                ));
+            }
         }
     }
     Err(WriteError::Refuse(
@@ -377,21 +419,37 @@ pub fn write_bytes(
     use std::io::Write;
     let root = store.root();
     let full = root.join(OsStr::from_bytes(rel));
+    let rel_path = Path::new(OsStr::from_bytes(rel));
+    let parent = root.join(rel_path.parent().unwrap_or(Path::new("")));
     sweep(root, rel);
-    let (temp, mut file) = create_temp(root, rel)?;
+    // From here on the directory is a descriptor, not a path, and every step below names
+    // the temp file inside it (F7).
+    let (dirfd, name) = open_parent(root, rel)?;
+    let (temp_name, mut file) = create_temp(&dirfd, &parent, &name)?;
+    let temp = parent.join(OsStr::from_bytes(&temp_name));
     let result = (|| -> Result<(), WriteError> {
         file.write_all(bytes)
             .map_err(|e| WriteError::io(&temp, e))?;
         file.sync_all().map_err(|e| WriteError::io(&temp, e))?;
-        drop(file);
         let bits = perm_bits(&full, mode, store.filemode());
-        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(bits))
-            .map_err(|e| WriteError::io(&temp, e))?;
+        nix::sys::stat::fchmod(&file, nix::sys::stat::Mode::from_bits_truncate(bits as _))
+            .map_err(|e| WriteError::io(&temp, std::io::Error::from(e)))?;
+        drop(file);
         before_rename()?;
-        std::fs::rename(&temp, &full).map_err(|e| WriteError::io(&temp, e))
+        nix::fcntl::renameat(
+            &dirfd,
+            OsStr::from_bytes(&temp_name),
+            &dirfd,
+            OsStr::from_bytes(&name),
+        )
+        .map_err(|e| WriteError::io(&temp, std::io::Error::from(e)))
     })();
     if result.is_err() {
-        let _ = std::fs::remove_file(&temp);
+        let _ = nix::unistd::unlinkat(
+            &dirfd,
+            OsStr::from_bytes(&temp_name),
+            nix::unistd::UnlinkatFlags::NoRemoveDir,
+        );
     }
     result
 }

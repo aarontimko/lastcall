@@ -781,6 +781,15 @@ impl Ops<'_> {
             if fault.fails_at(FaultPoint::AfterTempWrite) {
                 return Err(crate::restore::WriteError::Refuse("fault injected".into()));
             }
+            // The parent chain was walked in the preflight, before the first CAS, and the
+            // temp file has been sitting on disk since then. A directory swapped for a
+            // symlink in that window is invisible to the hash compare below — `hash_path`
+            // resolves through the new parent, and a decoy holding identical bytes makes
+            // the CAS agree (verifier F7). So the walk runs again, here, with the rename
+            // one statement away.
+            if crate::restore::check_parent_chain(store.root(), &rendered.path).is_err() {
+                return Err(crate::restore::WriteError::Moved);
+            }
             match store.hash_path(&rendered.path) {
                 Current::Present { oid, mode } => {
                     if rendered.oid.as_ref() == Some(&oid) && rendered.mode == Some(mode) {
@@ -1926,6 +1935,86 @@ mod tests {
         let out = h.ops().restore_file(&r, &NoFault).unwrap();
         assert!(out.ok(), "{out:?}");
         assert_eq!(std::fs::read(repo.path().join("f1")).unwrap(), baseline);
+    }
+
+    /// The parent directory is swapped for a symlink while the temp file is on disk
+    /// (verifier F7, probe P2).
+    ///
+    /// Two things went wrong at once and each is fatal on its own. The second CAS only
+    /// hashed the *path*, and `hash_path` resolves through the new parent — so a decoy
+    /// directory holding the same bytes made the compare agree and the restore wrote the
+    /// baseline into a directory the user never pointed at. And the rename and the cleanup
+    /// unlink were both by path too, so they went to the decoy while the temp file stayed
+    /// behind in the real directory forever.
+    #[test]
+    fn ops_restore_parent_swapped_after_temp_write_is_moved_and_leaves_no_ghost() {
+        /// Swaps `d` for a symlink to a decoy with identical bytes, once, at the moment the
+        /// temp file exists and the rename has not happened.
+        struct SwapParent {
+            root: std::path::PathBuf,
+            live: Vec<u8>,
+            done: std::cell::Cell<bool>,
+        }
+
+        impl FaultInjector for SwapParent {
+            fn at(&self, point: FaultPoint) {
+                if point != FaultPoint::AfterTempWrite || self.done.replace(true) {
+                    return;
+                }
+                let d = self.root.join("d");
+                std::fs::rename(&d, self.root.join("d_real")).unwrap();
+                let decoy = self.root.join("d_decoy");
+                std::fs::create_dir(&decoy).unwrap();
+                // The same bytes and the same mode: the point is that the CAS *agrees*.
+                std::fs::write(decoy.join("f1"), &self.live).unwrap();
+                std::os::unix::fs::symlink("d_decoy", &d).unwrap();
+            }
+        }
+
+        let repo = FixtureRepo::new("ops-restore-swap").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        repo.write("d/f1", "base\n");
+        h.mark_seen();
+        repo.write("d/f1", "edited\n");
+        let r = rendered(&h, b"d/f1");
+        let swap = SwapParent {
+            root: repo.path().to_path_buf(),
+            live: b"edited\n".to_vec(),
+            done: std::cell::Cell::new(false),
+        };
+
+        let out = h.ops().restore_file(&r, &swap).unwrap();
+        assert!(swap.done.get(), "the swap must actually have fired");
+        assert!(!out.ok(), "a swapped parent is a refusal: {out:?}");
+        assert_eq!(
+            out.refused,
+            vec![Refused::Moved {
+                path: b"d/f1".to_vec(),
+                live: None
+            }],
+            "and the refusal is Moved, not an Io error"
+        );
+
+        // The directory that was verified is the one every step of the write acted in, so
+        // the temp file was unlinked from it — no ghost, and nothing else left behind.
+        let mut real: Vec<String> = std::fs::read_dir(repo.path().join("d_real"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        real.sort();
+        assert_eq!(real, vec!["f1".to_string()]);
+        assert_eq!(
+            std::fs::read(repo.path().join("d_real/f1")).unwrap(),
+            b"edited\n",
+            "the rename never happened"
+        );
+        assert_eq!(
+            std::fs::read(repo.path().join("d_decoy/f1")).unwrap(),
+            b"edited\n",
+            "and nothing was written through the symlink into the decoy"
+        );
+        assert!(temp_ghosts(repo.path()).is_empty());
     }
 
     #[test]
