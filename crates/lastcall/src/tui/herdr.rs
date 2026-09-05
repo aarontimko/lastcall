@@ -592,20 +592,34 @@ pub async fn focus<T: Transport>(transport: &T, pane_id: &str) -> Result<(), Str
         .map_err(|e| e.to_string())
 }
 
+/// What ends every staged payload, inside the paste markers: the export's last line gets its
+/// newline and a blank line follows, so the next flag staged into the same buffer starts on a
+/// line of its own and reads as a separate block. Pasted text, not a keystroke — nothing here
+/// submits.
+pub const STAGE_TAIL: &str = "\n\n";
+
 /// `pane.send_text` on `pane_id`, wrapped in bracketed-paste markers (deliverable 6).
 ///
 /// **Staged, not sent.** The markers make an interactive shell or agent CLI treat the whole
 /// payload as pasted text: it lands in the input buffer, however many newlines it holds, and
 /// waits for the human to press Enter. That is the whole point of the gesture — lastcall
-/// hands the agent the note, the human decides when to submit it. No trailing newline: one
-/// would be a keystroke after the paste ended, which is the submit we are avoiding.
+/// hands the agent the note, the human decides when to submit it.
+///
+/// The payload ends with [`STAGE_TAIL`] — a newline that closes the export's last line and
+/// a blank line after it — **inside** the markers, so it is pasted text like the rest and
+/// never the Enter we are avoiding. The sponsor's Gate 7 run (§10 2026-09-05) staged three
+/// flags into one pane and found each closing fence running straight into the next flag's
+/// header on the same line; a Markdown reader nested flags two and three inside the first
+/// code block. The original design left the newline out for fear of submitting, but the
+/// export already carries dozens of newlines in its diff: an application that did not honour
+/// the paste markers would have submitted at the first of them, so the tail adds no risk.
 ///
 /// The markers are part of `text` because herdr sends the bytes through verbatim, and the
 /// *application* on the far side interprets them — the tty line discipline never does (F7).
 pub async fn stage<T: Transport>(transport: &T, pane_id: &str, text: &str) -> Result<(), String> {
     let params = serde_json::to_value(wire::PaneSendTextParams {
         pane_id: pane_id.to_owned(),
-        text: format!("{BRACKETED_PASTE_START}{text}{BRACKETED_PASTE_END}"),
+        text: format!("{BRACKETED_PASTE_START}{text}{STAGE_TAIL}{BRACKETED_PASTE_END}"),
     })
     .map_err(|e| e.to_string())?;
     transport
@@ -1139,8 +1153,9 @@ mod tests {
     // --- staging (deliverable 6) ---------------------------------------------------------
 
     /// The exact request. The markers have to be inside `text` — herdr passes the bytes
-    /// through and the *application* on the far side is what interprets them (F7) — and
-    /// there is no trailing newline: one would be the Enter we are deliberately not pressing.
+    /// through and the *application* on the far side is what interprets them (F7) — and the
+    /// separator that ends the payload sits inside them too, so it is paste and not the Enter
+    /// we are deliberately not pressing.
     #[tokio::test]
     async fn herdr_stage_wraps_the_export_in_bracketed_paste_markers() {
         let mock = InMemoryHerdr::builder()
@@ -1154,11 +1169,18 @@ mod tests {
             req.params,
             json!({
                 "pane_id": "p1",
-                "text": "\u{1b}[200~echo ONE\necho TWO\u{1b}[201~",
+                "text": "\u{1b}[200~echo ONE\necho TWO\n\n\u{1b}[201~",
             })
         );
         let text = req.params["text"].as_str().unwrap();
-        assert!(!text.ends_with('\n'), "a newline would submit it");
+        assert!(
+            text.ends_with(&format!("{STAGE_TAIL}{BRACKETED_PASTE_END}")),
+            "the separator is inside the markers: {text:?}"
+        );
+        assert!(
+            !text.ends_with('\n'),
+            "a newline after the markers would submit it"
+        );
     }
 
     /// `pane_not_found` reaches the caller as the reason the status line prints; the flag is

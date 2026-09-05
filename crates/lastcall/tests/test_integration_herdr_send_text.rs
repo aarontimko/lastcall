@@ -150,7 +150,10 @@ async fn herdr_real_send_text_lands_unsubmitted() {
     .await;
     say("interactive shell is up");
 
-    // The gesture under test.
+    // The gesture under test. The payload that reaches the shell is the two lines plus
+    // `STAGE_TAIL` — a newline and a blank line, inside the markers — so what sits on the
+    // prompt is a three-line buffer whose last line is empty; the pasted newlines are text to
+    // a bracketed-paste line editor, and the assertions below are what say so.
     stage(&t, &pane, "echo ONE\necho TWO").await.expect("stage");
     wait_for(&t, &pane, "the staged text on the prompt", |s| {
         s.contains("echo ONE") && s.contains("echo TWO")
@@ -170,7 +173,7 @@ async fn herdr_real_send_text_lands_unsubmitted() {
         "a staged paste must not run — `ONE` appeared as output:\n{staged}"
     );
     assert_eq!(output_lines(&staged, "TWO"), 0, "{staged}");
-    say("both lines sit on the prompt, unsubmitted");
+    say("both lines sit on the prompt, unsubmitted, with the separator pasted after them");
 
     // ...and one Enter runs the whole buffer, once.
     send_raw(&t, &pane, "\r").await;

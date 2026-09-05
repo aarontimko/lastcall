@@ -24,6 +24,7 @@ use std::time::Duration;
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use lastcall::tui::app::{App, Changed, Effect, FlagKind, RootMeta, Selection};
+use lastcall::tui::herdr::STAGE_TAIL;
 use lastcall::tui::input::Keymap;
 use lastcall::tui::run::{Local, Ui, herdr_fold, spawn_flag, spawn_stage};
 use lastcall_engine::herdr::client::{Client, ClientOptions, ClientTimings};
@@ -245,12 +246,13 @@ async fn loop_flag_with_one_agent_reaches_pane_send_text() {
     );
     assert!(
         text.ends_with("\u{1b}[201~"),
-        "…and closes it, with no trailing newline to submit it: {text:?}"
+        "…and closes it, with no keystroke after the paste to submit it: {text:?}"
     );
     assert_eq!(
         &text[6..text.len() - 6],
-        export,
-        "the bytes between the markers are the export the reducer produced"
+        format!("{export}{STAGE_TAIL}"),
+        "the bytes between the markers are the export the reducer produced plus the \
+         separator that keeps the next staged flag on a line of its own"
     );
     assert!(text.contains("this looks wrong"), "{text:?}");
 

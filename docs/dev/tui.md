@@ -326,7 +326,15 @@ it rather than showing an empty list.
 
 **Staged, not sent.** `herdr::stage` wraps the export in bracketed-paste markers and calls
 `pane.send_text`, so the payload lands in the agent's input buffer and waits for the human
-to press Enter. No trailing newline — that would be the submit we are avoiding. A send that
+to press Enter. The payload ends with `STAGE_TAIL` (a newline and a blank line) **inside**
+the markers: the closing fence gets its own line and the next flag staged into the same
+buffer starts a block of its own. The sponsor's Gate 7 run found three flags running together
+— each closing fence followed on the same line by the next `lastcall flag ·` header, which a
+Markdown reader nests inside the first code block — because the first design left the
+newline out for fear of submitting. Inside bracketed paste a newline is text; and the diff
+already carries dozens, so an application that ignored the markers would have submitted long
+before the tail. The real-pane proof (`herdr_real_send_text_lands_unsubmitted`) stages the
+tail with the rest and shows nothing runs until Enter. A send that
 fails is a status line and nothing more (`flagged f1 · send failed: <reason>`): the flag is
 in the ledger either way, which is why the flag's own label travels with the send —
 `Effect::Stage { flag, .. }` → `Local::Staged { flag, .. }` — rather than being read back
