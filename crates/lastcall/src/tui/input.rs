@@ -78,6 +78,12 @@ pub enum Action {
     AcceptFile,
     /// Accept every row of every listed root.
     AcceptAll,
+    /// Put back what the cursor is on (§6.3): on a row with content hunks in the diff, the
+    /// one hunk under the cursor; else the selected row whole. A deletion row's single
+    /// hunk *is* the file, so `u` on it restores the file (kickoff F16).
+    Restore,
+    /// Restore the selected row whole, whichever pane has focus.
+    RestoreFile,
     /// Answer the confirm modal (`y` / `Enter`); nothing outside it.
     Confirm,
     /// Dismiss the confirm modal (`n` / `Esc`); nothing outside it.
@@ -109,6 +115,8 @@ pub const DEFAULT_KEYMAP: &[(&str, &[&str])] = &[
     ("accept", &["a"]),
     ("accept_file", &["shift-a"]),
     ("accept_all", &["ctrl-a"]),
+    ("restore", &["u"]),
+    ("restore_file", &["shift-u"]),
     ("ack", &["d"]),
     ("jump", &["g"]),
     ("scope", &["w"]),
@@ -161,6 +169,8 @@ impl Action {
             "accept" => Action::Accept,
             "accept_file" => Action::AcceptFile,
             "accept_all" => Action::AcceptAll,
+            "restore" => Action::Restore,
+            "restore_file" => Action::RestoreFile,
             "ack" => Action::Ack,
             "jump" => Action::Jump,
             "scope" => Action::ScopeToggle,
@@ -189,6 +199,8 @@ impl Action {
             "accept" => "accept the hunk or the selected entry",
             "accept_file" => "accept the whole file",
             "accept_all" => "accept everything listed",
+            "restore" => "restore the hunk under the cursor",
+            "restore_file" => "restore the selected file",
             "ack" => "ack the agent flag",
             "jump" => "jump to the agent in herdr",
             "scope" => "workspace scope on/off",
@@ -555,7 +567,7 @@ mod tests {
     use crate::tui::app::testfix::*;
     use crate::tui::app::{App, Changed, Effect, Focus, Selection, Target};
     use crate::tui::render::{HitMap, render};
-    use lastcall_engine::engine::AcceptRequest;
+    use lastcall_engine::engine::{AcceptRequest, RestoreRequest};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::collections::BTreeMap;
@@ -752,7 +764,7 @@ mod tests {
 
     #[test]
     fn input_override_replaces_defaults_rather_than_appending() {
-        let km = Keymap::from_config(&keys(&[("quit", &["x"]), ("scroll_up", &["u"])])).unwrap();
+        let km = Keymap::from_config(&keys(&[("quit", &["x"]), ("scroll_up", &["v"])])).unwrap();
         assert_eq!(to_action(&key('x'), &km), Some(Action::Quit));
         assert_eq!(to_action(&key('q'), &km), None, "q no longer quits");
         assert_eq!(
@@ -760,7 +772,7 @@ mod tests {
             None,
             "ctrl-c no longer quits either: the entry replaced both defaults"
         );
-        assert_eq!(to_action(&key('u'), &km), Some(Action::ScrollUp(1)));
+        assert_eq!(to_action(&key('v'), &km), Some(Action::ScrollUp(1)));
         let table = km.table();
         let quit = table.iter().position(|(n, _)| n == "quit").unwrap();
         assert_eq!(table[quit].1, vec!["x".to_owned()]);
@@ -771,7 +783,7 @@ mod tests {
         );
         assert_eq!(
             table.last().unwrap(),
-            &("scroll_up".to_owned(), vec!["u".to_owned()]),
+            &("scroll_up".to_owned(), vec!["v".to_owned()]),
             "a newly bound action is appended"
         );
         let untouched = table.iter().find(|(n, _)| n == "nav_up").unwrap();
@@ -961,9 +973,11 @@ mod tests {
         for (_, specs) in DEFAULT_KEYMAP {
             for spec in *specs {
                 let key = Key::parse(spec).unwrap();
-                // `shift-a` is the one default spelled by its modifier (a bare `A` would
-                // case-fold onto `a`); its canonical form is `A`, and it round-trips.
-                let canonical = if *spec == "shift-a" { "A" } else { *spec };
+                // `shift-a` and `shift-u` are the defaults spelled by their modifier (a
+                // bare `A` would case-fold onto `a`); the canonical form is the capital,
+                // and it round-trips.
+                let upper = spec.strip_prefix("shift-").map(str::to_uppercase);
+                let canonical = upper.as_deref().unwrap_or(spec);
                 assert_eq!(key.spec(), canonical, "default {spec} is canonical");
             }
         }
@@ -1222,6 +1236,8 @@ mod tests {
             (Action::Accept, "key"),
             (Action::AcceptFile, "key"),
             (Action::AcceptAll, "key"),
+            (Action::Restore, "key"),
+            (Action::RestoreFile, "key"),
             (Action::Ack, "key"),
             (Action::Jump, "key"),
             (Action::ScopeToggle, "key"),
@@ -1276,14 +1292,16 @@ mod tests {
             | Action::Accept
             | Action::AcceptFile
             | Action::AcceptAll
+            | Action::Restore
+            | Action::RestoreFile
             | Action::Confirm
             | Action::Cancel
             | Action::Ack
             | Action::Jump
             | Action::ScopeToggle
-            | Action::Herdr(_) => 31,
+            | Action::Herdr(_) => 33,
         };
-        assert_eq!(table.len(), 31);
+        assert_eq!(table.len(), 33);
     }
 
     #[test]
@@ -1402,6 +1420,70 @@ mod tests {
         assert_eq!(reqs.len(), 1);
         assert!(
             matches!(reqs[0].1, AcceptRequest::File(_)),
+            "{:?}",
+            reqs[0].1
+        );
+    }
+
+    /// `u` on hunk 2 vs a click on that hunk's `[u restore]`, and `U` vs a click on the
+    /// header's `[U restore file]`. Both halves land on one `App`, one `Effect` and one
+    /// frame — the working-tree write has the same key/mouse parity as the accept beside it.
+    #[test]
+    fn input_parity_restore() {
+        let km = Keymap::defaults();
+        let mut base = three_roots();
+        base.handle(Action::Resize(100, 30));
+        base.apply(pile_event("alpha", alpha_hunks(3)));
+        base.select(Some(row("alpha", "f1")));
+        base.handle(Action::Open);
+        let (_, hits) = frame(&base);
+        let mut by_key = base.clone();
+        let mut by_mouse = base.clone();
+
+        press_key(&mut by_key, &km, key('n'));
+        press_key(&mut by_key, &km, key('n'));
+        assert_eq!(by_key.diff.hunk, 2);
+        let by_key_effect = press_key(&mut by_key, &km, key('u'));
+        let by_mouse_effect = click(&mut by_mouse, &km, &hits, &Target::HunkRestore(2));
+
+        assert_eq!(by_key, by_mouse);
+        assert_eq!(by_key_effect, by_mouse_effect);
+        assert_eq!(frame(&by_key).0, frame(&by_mouse).0);
+        let Some(Effect::Restore(reqs)) = by_key_effect.1 else {
+            panic!("a restore effect: {by_key_effect:?}");
+        };
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].0, root("alpha"));
+        match &reqs[0].1 {
+            RestoreRequest::Hunk { index, hunks, .. } => {
+                assert_eq!((*index, hunks.len()), (2, 3));
+            }
+            other => panic!("a hunk request: {other:?}"),
+        }
+        assert!(by_key.restoring.is_some(), "the restore is in flight");
+        assert!(by_key.confirm.is_none(), "a hunk restore never asks");
+
+        // The file half: `U` and the header control both open the confirm, so neither
+        // starts a restore on its own.
+        let mut by_key = base.clone();
+        let mut by_mouse = base;
+        let by_key_effect = press_key(
+            &mut by_key,
+            &km,
+            key_code(KeyCode::Char('U'), KeyModifiers::SHIFT),
+        );
+        let by_mouse_effect = click(&mut by_mouse, &km, &hits, &Target::FileRestore);
+        assert_eq!(by_key, by_mouse);
+        assert_eq!(by_key_effect, by_mouse_effect);
+        assert_eq!(frame(&by_key).0, frame(&by_mouse).0);
+        assert_eq!(by_key_effect.1, None, "the modal asks first");
+        assert!(by_key.confirm.is_some(), "a file restore asks");
+        let (_, effect) = by_key.handle(Action::Confirm);
+        let Some(Effect::Restore(reqs)) = effect else {
+            panic!("y starts the restore: {effect:?}");
+        };
+        assert!(
+            matches!(reqs[0].1, RestoreRequest::File(_)),
             "{:?}",
             reqs[0].1
         );

@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crossterm::event::{Event, MouseButton, MouseEvent, MouseEventKind};
-use lastcall_engine::engine::{AcceptRequest, Engine};
+use lastcall_engine::engine::{AcceptRequest, Engine, RestoreRequest};
 use lastcall_engine::env::Env;
 use lastcall_engine::herdr::HerdrEvent;
 use lastcall_engine::herdr::client::ClientHandle;
@@ -40,7 +40,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 
-use super::app::{AcceptFailed, AcceptResult, App, Changed, Effect, RootMeta};
+use super::app::{AcceptFailed, AcceptResult, App, Changed, Effect, RestoreResult, RootMeta};
 use super::herdr::{self, HerdrLink, HerdrPlan, HerdrUpdate, Link, ToastMsg};
 use super::input::{Action, Key, Keymap, modal_action, pointer, to_action};
 use super::render::{HitMap, Pane, render};
@@ -65,6 +65,9 @@ pub enum Local {
     Pile(PathBuf, u64, Pile),
     /// An `Effect::Accept` finished: one result per root it covered.
     Accepted(Vec<(PathBuf, AcceptResult)>),
+    /// An `Effect::Restore` finished. Shaped like `Accepted` though a restore covers one
+    /// root, so the two reducers read the same way.
+    Restored(Vec<(PathBuf, RestoreResult)>),
     /// The engine's roots after a `SyncRoots`.
     Roots(Vec<RootMeta>),
     /// The `Refresh` finished (all its piles were sent first).
@@ -170,6 +173,7 @@ impl Ui {
         match local {
             Local::Pile(root, seq, pile) => self.app.apply(EngineEvent::Pile { root, seq, pile }),
             Local::Accepted(results) => (self.app.accepted(results), None),
+            Local::Restored(results) => (self.app.restored(results), None),
             Local::Roots(metas) => (self.app.sync_roots(metas), None),
             Local::RefreshDone => (self.app.refresh_done(), None),
             Local::Notice(root, text) => self.app.apply(EngineEvent::Notice { root, text }),
@@ -494,6 +498,33 @@ fn spawn_accept(
         });
         if let Some(results) = joined(accept, &tx, "accept").await {
             let _ = tx.send(Local::Accepted(results));
+        }
+    });
+}
+
+/// `Effect::Restore`: the working-tree write, off the UI task, in one `blocking` closure so
+/// the op and its rescan are one critical section — the same shape as `spawn_accept`, and
+/// the only place in the TUI that reaches `Engine::restore`.
+fn spawn_restore(
+    engine: &Arc<Mutex<Engine>>,
+    tx: mpsc::UnboundedSender<Local>,
+    reqs: Vec<(PathBuf, RestoreRequest)>,
+) {
+    let engine = engine.clone();
+    tokio::spawn(async move {
+        let restore = tokio::spawn(async move {
+            blocking(&engine, move |e| {
+                reqs.into_iter()
+                    .map(|(root, req)| {
+                        let result = e.restore(&root, req).map_err(|e| AcceptFailed::of(&e));
+                        (root, result)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+        });
+        if let Some(results) = joined(restore, &tx, "restore").await {
+            let _ = tx.send(Local::Restored(results));
         }
     });
 }
@@ -901,6 +932,9 @@ pub fn run(
                         Effect::SyncRoots => spawn_sync_roots(&watcher.engine, local_tx.clone()),
                         Effect::Accept(reqs) => {
                             spawn_accept(&watcher.engine, local_tx.clone(), reqs)
+                        }
+                        Effect::Restore(reqs) => {
+                            spawn_restore(&watcher.engine, local_tx.clone(), reqs)
                         }
                         Effect::Expand(root, row) => {
                             spawn_expand(&watcher.engine, local_tx.clone(), root, row)

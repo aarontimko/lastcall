@@ -23,7 +23,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::app::{
     AcceptScope, App, Focus, MIN_SIZE, NAV_MIN_COLS, RootView, Selection, Target, annotation_name,
-    diff_lines, hunk_offsets, plural,
+    diff_lines, hunk_offsets, plural, restore_question,
 };
 use super::herdr::{Dot, Link};
 use super::input::{Action, MODAL_KEYS};
@@ -794,10 +794,19 @@ fn render_main(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
             {
                 let mut header = row_header(row);
                 let control = format!("[{} accept file]", control_key(app, "accept_file"));
-                if let Some(x) = right_align(&mut header, &control, area.width, dim()) {
+                let restore = format!("[{} restore file]", control_key(app, "restore_file"));
+                let (at_accept, at_restore) =
+                    right_align_pair(&mut header, &control, &restore, area.width, dim());
+                if let Some(x) = at_accept {
                     hits.targets.push((
                         Rect::new(area.x + x, area.y, control.width() as u16, 1),
                         Target::FileAccept,
+                    ));
+                }
+                if let Some(x) = at_restore {
+                    hits.targets.push((
+                        Rect::new(area.x + x, area.y, restore.width() as u16, 1),
+                        Target::FileRestore,
                     ));
                 }
                 lines.push(header);
@@ -1025,10 +1034,19 @@ fn render_hunks(
                 };
                 if accept_controls {
                     let control = format!("[{} accept]", control_key(app, "accept"));
-                    if let Some(x) = right_align(&mut line, &control, area.width, style) {
+                    let restore = format!("[{} restore]", control_key(app, "restore"));
+                    let (at_accept, at_restore) =
+                        right_align_pair(&mut line, &control, &restore, area.width, style);
+                    if let Some(x) = at_accept {
                         hits.targets.push((
                             Rect::new(area.x + x, area.y + y, control.width() as u16, 1),
                             Target::HunkAccept(h),
+                        ));
+                    }
+                    if let Some(x) = at_restore {
+                        hits.targets.push((
+                            Rect::new(area.x + x, area.y + y, restore.width() as u16, 1),
+                            Target::HunkRestore(h),
                         ));
                     }
                 }
@@ -1070,6 +1088,24 @@ fn control_key(app: &App, action: &str) -> String {
 /// Append `control` right-aligned on `line` within `width` columns, at least two columns
 /// after the text; returns its x offset, or `None` when it would not fit (then the line
 /// is left as it was).
+/// Two controls right-aligned as one run, `first` then `second` with a space between, so
+/// the second call cannot land on top of the first (both would right-align to the same
+/// edge). When the pair does not fit, `first` alone is placed — a narrow pane keeps the
+/// accept it has always had rather than losing both.
+fn right_align_pair(
+    line: &mut Line<'static>,
+    first: &str,
+    second: &str,
+    width: u16,
+    style: Style,
+) -> (Option<u16>, Option<u16>) {
+    match right_align(line, &format!("{first} {second}"), width, style) {
+        Some(x) => (Some(x), Some(x + first.width() as u16 + 1)),
+        // `right_align` leaves the line untouched when it refuses, so this is a clean retry.
+        None => (right_align(line, first, width, style), None),
+    }
+}
+
 fn right_align(line: &mut Line<'static>, control: &str, width: u16, style: Style) -> Option<u16> {
     let used = line.width();
     let need = used + 2 + control.width();
@@ -1266,28 +1302,37 @@ fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
     }
 }
 
-/// The confirm modal (§6.7), centered like the help overlay. Its numbers come from
-/// `App::confirm_counts`, i.e. the held piles as they are at this frame: `Accept all <N>
-/// files in <root>?` (one root) or `across <R> repos?`, then `<g> grouped upstream · <c>
-/// collapsed` only when either is non-zero, then the modal's keys.
+/// The confirm modal (§6.7), centered like the help overlay. One box, two operations: the
+/// title is ` accept ` or ` restore ` and the first row comes from the scope.
+///
+/// An accept's numbers come from `App::confirm_counts`, i.e. the held piles as they are at
+/// this frame: `Accept all <N> files in <root>?` (one root) or `across <R> repos?`, then
+/// `<g> grouped upstream · <c> collapsed` only when either is non-zero. A restore covers one
+/// row, so it has one question row and nothing to tally (F11).
 fn render_confirm(app: &App, buf: &mut Buffer, area: Rect) {
-    let Some(counts) = app.confirm_counts() else {
-        return;
+    let (title, mut rows) = match app.confirm_restore() {
+        Some(scope) => (" restore ", vec![restore_question(scope)]),
+        None => {
+            let Some(counts) = app.confirm_counts() else {
+                return;
+            };
+            let target = match counts.roots.as_slice() {
+                [one] => format!("in {one}"),
+                many => format!("across {}", plural(many.len(), "repo")),
+            };
+            let mut rows = vec![format!(
+                "Accept all {} {target}?",
+                plural(counts.files, "file")
+            )];
+            if counts.grouped > 0 || counts.collapsed > 0 {
+                rows.push(format!(
+                    "{} grouped upstream · {} collapsed",
+                    counts.grouped, counts.collapsed
+                ));
+            }
+            (" accept ", rows)
+        }
     };
-    let target = match counts.roots.as_slice() {
-        [one] => format!("in {one}"),
-        many => format!("across {}", plural(many.len(), "repo")),
-    };
-    let mut rows = vec![format!(
-        "Accept all {} {target}?",
-        plural(counts.files, "file")
-    )];
-    if counts.grouped > 0 || counts.collapsed > 0 {
-        rows.push(format!(
-            "{} grouped upstream · {} collapsed",
-            counts.grouped, counts.collapsed
-        ));
-    }
     rows.push(String::new());
     rows.push(
         MODAL_KEYS
@@ -1306,7 +1351,7 @@ fn render_confirm(app: &App, buf: &mut Buffer, area: Rect) {
     );
     Clear.render(rect, buf);
     let block = Block::bordered()
-        .title(" accept ")
+        .title(title)
         .border_style(focused_border());
     let inner = block.inner(rect);
     block.render(rect, buf);

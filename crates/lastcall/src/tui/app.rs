@@ -14,7 +14,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use lastcall_engine::count::with_thousands;
-use lastcall_engine::engine::{AcceptRequest, Accepted, EngineError, RootState};
+use lastcall_engine::engine::{
+    AcceptRequest, Accepted, EngineError, RestoreRequest, Restored, RootState,
+};
 use lastcall_engine::git::Oid;
 use lastcall_engine::headstate::InProgress;
 use lastcall_engine::hunks::{Expanded, Hunk};
@@ -177,6 +179,10 @@ pub enum Target {
     FileAccept,
     /// The `[a accept]` hint on hunk `i`'s header line.
     HunkAccept(usize),
+    /// The `[U restore file]` hint on the main view's header line, beside `[A accept file]`.
+    FileRestore,
+    /// The `[u restore]` hint on hunk `i`'s header line, beside `[a accept]`.
+    HunkRestore(usize),
     /// The `[e expand]` control on a collapsed row's header line (Phase 6 deliverable 4);
     /// only drawn for `Glob`/`Size`, so a click can never reach a binary row.
     Expand,
@@ -237,6 +243,11 @@ pub enum Effect {
     /// the results to [`App::accepted`]. Every request is built from the held `RootView`
     /// (§6.3): `Rendered::of` on a held row, `All` on the held pile.
     Accept(Vec<(PathBuf, AcceptRequest)>),
+    /// Run `Engine::restore` for the one root it covers and feed the result to
+    /// [`App::restored`]. A `Vec` for the same shape as `Accept`, though a restore has no
+    /// group and no all variant — undoing a whole tree at once is not lastcall's gesture —
+    /// so the vector never holds more than one request.
+    Restore(Vec<(PathBuf, RestoreRequest)>),
     /// `agent.focus` on this pane id (herdr's own public id, never a name); the result
     /// comes back as `HerdrUpdate::Focused`.
     Focus(String),
@@ -298,12 +309,65 @@ pub struct Accepting {
     pub files: Vec<(PathBuf, usize)>,
 }
 
-/// The confirm modal. Only the scope is stored: the numbers it shows are recomputed from
-/// the held piles at every render ([`App::confirm_counts`]), so a pile applied underneath
+/// What one restore covers (§6.3). Deliberately fewer variants than [`AcceptScope`]: there
+/// is no restore-group and no restore-all, so a restore is one hunk or one file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestoreScope {
+    /// Hunk `index` (0-based) of the `hunks` the row showed when the restore was asked.
+    Hunk {
+        root: PathBuf,
+        path: Vec<u8>,
+        index: usize,
+        hunks: usize,
+    },
+    /// One row whole. `deleted` is a pending deletion going back on disk; `added` is a file
+    /// that is not in the baseline at all, so putting it back **removes** it — which is why
+    /// the two carry different confirm wording (kickoff deliverable 9, F16).
+    File {
+        root: PathBuf,
+        path: Vec<u8>,
+        deleted: bool,
+        added: bool,
+        hunks: usize,
+    },
+}
+
+impl RestoreScope {
+    pub fn root(&self) -> &Path {
+        match self {
+            RestoreScope::Hunk { root, .. } | RestoreScope::File { root, .. } => root,
+        }
+    }
+
+    pub fn path(&self) -> &[u8] {
+        match self {
+            RestoreScope::Hunk { path, .. } | RestoreScope::File { path, .. } => path,
+        }
+    }
+}
+
+/// A restore the loop is running: the scope is all it takes to write the status line, since
+/// a restore covers exactly one row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Restoring {
+    pub scope: RestoreScope,
+}
+
+/// What the confirm modal is asking about. One modal, two operations: the title and the
+/// first row come from the variant, and `confirm_counts` stays accept-only (F11) — a
+/// restore covers one row, so there is nothing to tally.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfirmScope {
+    Accept(AcceptScope),
+    Restore(RestoreScope),
+}
+
+/// The confirm modal. Only the scope is stored: an accept's numbers are recomputed from the
+/// held piles at every render ([`App::confirm_counts`]), so a pile applied underneath
 /// changes them and `Confirm` folds exactly what is shown.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Confirm {
-    pub scope: AcceptScope,
+    pub scope: ConfirmScope,
 }
 
 /// What a scope covers right now, from the held piles.
@@ -322,12 +386,20 @@ pub struct ConfirmCounts {
 pub const CONFIRM_ABOVE: usize = 10;
 pub const ACCEPT_IN_PROGRESS: &str = "accept in progress";
 pub const NOTHING_TO_ACCEPT: &str = "nothing to accept";
+pub const RESTORE_IN_PROGRESS: &str = "restore in progress";
+pub const NOTHING_TO_RESTORE: &str = "nothing to restore";
 
 /// How long a status notice stays on the status line before the key hints return.
 pub const STATUS_TTL: Duration = Duration::from_secs(30);
 
 /// One root's accept result, as the loop hands it to the reducer.
 pub type AcceptResult = Result<Accepted, AcceptFailed>;
+
+/// One root's restore result. The failure classification is shared with accept: the two ops
+/// fail for the same reasons (a busy ledger while the op takes the root, anything else by
+/// message), and a second enum spelling the same two cases would only have to be kept in
+/// step with the first.
+pub type RestoreResult = Result<Restored, AcceptFailed>;
 
 /// Why one root's accept failed.
 ///
@@ -388,6 +460,10 @@ pub struct App {
     pub seq: BTreeMap<PathBuf, u64>,
     /// The accept the loop is running, if any; a second one is refused meanwhile.
     pub accepting: Option<Accepting>,
+    /// The restore the loop is running, if any; a second one is refused meanwhile. Separate
+    /// from `accepting` because the two write different things — the ledger and the working
+    /// tree — and neither should silently stand in for the other in the status line.
+    pub restoring: Option<Restoring>,
     /// The confirm modal, if open: every action but `Tick`/`Resize`/`Confirm`/`Cancel`/
     /// `Quit` is ignored while it is (`Quit` passes as it does through the help overlay:
     /// `q` and ctrl-c quit by default, everywhere).
@@ -430,6 +506,7 @@ impl App {
             orphan_piles: BTreeMap::new(),
             seq: BTreeMap::new(),
             accepting: None,
+            restoring: None,
             confirm: None,
             herdr: HerdrView::default(),
             expanded: None,
@@ -820,6 +897,71 @@ impl App {
         }
     }
 
+    /// What `Restore` (`u`) covers: the hunk under the diff cursor on a row that has
+    /// content hunks, else the selected row whole. A **deletion** row's single hunk is the
+    /// file (F16), so `u` on it is a file restore and asks like `shift-u` does. Groups and
+    /// root entries have no restore: there is no restore-group and no restore-all.
+    pub fn restore_scope(&self) -> Option<RestoreScope> {
+        match self.selection.clone()? {
+            Selection::Row(root, path) => {
+                let row = self.roots.get(&root)?.row(&path)?;
+                if row.change != Change::Deleted && !row.hunks.is_empty() {
+                    Some(RestoreScope::Hunk {
+                        root,
+                        path,
+                        index: self.diff.hunk.min(row.hunks.len() - 1),
+                        hunks: row.hunks.len(),
+                    })
+                } else {
+                    Some(restore_file_of(root, row))
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// What `RestoreFile` (`shift-u`) covers: the selected row whole, whichever pane has
+    /// focus. Never a group and never a root, for the same reason.
+    pub fn restore_file_scope(&self) -> Option<RestoreScope> {
+        match self.selection.clone()? {
+            Selection::Row(root, path) => {
+                let row = self.roots.get(&root)?.row(&path)?;
+                Some(restore_file_of(root, row))
+            }
+            _ => None,
+        }
+    }
+
+    /// The one request a restore scope means right now, built from the held `RootView` and
+    /// nothing else. Empty when the scope no longer covers a row.
+    pub fn restore_requests(&self, scope: &RestoreScope) -> Vec<(PathBuf, RestoreRequest)> {
+        let mut out = Vec::new();
+        match scope {
+            RestoreScope::Hunk {
+                root, path, index, ..
+            } => {
+                if let Some(row) = self.roots.get(root).and_then(|v| v.row(path))
+                    && *index < row.hunks.len()
+                {
+                    out.push((
+                        root.clone(),
+                        RestoreRequest::Hunk {
+                            rendered: Rendered::of(row),
+                            hunks: row.hunks.clone(),
+                            index: *index,
+                        },
+                    ));
+                }
+            }
+            RestoreScope::File { root, path, .. } => {
+                if let Some(row) = self.roots.get(root).and_then(|v| v.row(path)) {
+                    out.push((root.clone(), RestoreRequest::File(Rendered::of(row))));
+                }
+            }
+        }
+        out
+    }
+
     /// The requests a scope means right now, one per root covered, each built from the
     /// held `RootView` and nothing else. Empty when the scope no longer covers anything.
     pub fn accept_requests(&self, scope: &AcceptScope) -> Vec<(PathBuf, AcceptRequest)> {
@@ -916,7 +1058,20 @@ impl App {
 
     /// The confirm modal's numbers, from the held piles as they are now.
     pub fn confirm_counts(&self) -> Option<ConfirmCounts> {
-        self.confirm.as_ref().map(|c| self.counts_of(&c.scope))
+        match self.confirm.as_ref()?.scope {
+            ConfirmScope::Accept(ref scope) => Some(self.counts_of(scope)),
+            // A restore covers one row: there is nothing to tally, and the modal's rows
+            // come from the scope itself (F11).
+            ConfirmScope::Restore(_) => None,
+        }
+    }
+
+    /// The restore the confirm modal is asking about, if it is asking about one.
+    pub fn confirm_restore(&self) -> Option<&RestoreScope> {
+        match self.confirm.as_ref()?.scope {
+            ConfirmScope::Restore(ref scope) => Some(scope),
+            ConfirmScope::Accept(_) => None,
+        }
     }
 
     fn group_rows(&self, root: &Path, kind: Annotation) -> Vec<&Row> {
@@ -942,7 +1097,9 @@ impl App {
             return (Changed::Yes, None);
         }
         if counts.files > CONFIRM_ABOVE {
-            self.confirm = Some(Confirm { scope });
+            self.confirm = Some(Confirm {
+                scope: ConfirmScope::Accept(scope),
+            });
             return (Changed::Yes, None);
         }
         self.start_accept(scope)
@@ -969,6 +1126,127 @@ impl App {
         self.accepting = Some(Accepting { scope, files });
         self.set_status("accepting…");
         (Changed::Yes, Some(Effect::Accept(reqs)))
+    }
+
+    /// `Restore`/`RestoreFile`: refuse while one runs, ask before a **file** restore (a
+    /// whole row goes back, or an added file is removed), never before a hunk restore —
+    /// the CAS is the guard and the content the hunk removes stays addressable in the
+    /// private store (kickoff ruling item 2).
+    fn request_restore(&mut self, scope: RestoreScope) -> (Changed, Option<Effect>) {
+        if self.restoring.is_some() {
+            self.set_status(RESTORE_IN_PROGRESS);
+            return (Changed::Yes, None);
+        }
+        if self.restore_requests(&scope).is_empty() {
+            self.set_status(NOTHING_TO_RESTORE);
+            return (Changed::Yes, None);
+        }
+        if matches!(scope, RestoreScope::File { .. }) {
+            self.confirm = Some(Confirm {
+                scope: ConfirmScope::Restore(scope),
+            });
+            return (Changed::Yes, None);
+        }
+        self.start_restore(scope)
+    }
+
+    /// Build the request from the held view and hand it to the loop.
+    fn start_restore(&mut self, scope: RestoreScope) -> (Changed, Option<Effect>) {
+        let reqs = self.restore_requests(&scope);
+        if reqs.is_empty() {
+            self.set_status(NOTHING_TO_RESTORE);
+            return (Changed::Yes, None);
+        }
+        self.restoring = Some(Restoring {
+            scope: scope.clone(),
+        });
+        self.set_status("restoring…");
+        (Changed::Yes, Some(Effect::Restore(reqs)))
+    }
+
+    /// The loop's answer to an `Effect::Restore`: the pile goes through the same path as a
+    /// watcher pile (seq included), the §6.7 advance rule runs for the selection the restore
+    /// was asked from, `restoring` clears and one status line says what happened.
+    ///
+    /// Refusals are worded with `restored`, not `accepted`: nothing was written, and the
+    /// sentence has to say which operation did not happen.
+    pub fn restored(&mut self, results: Vec<(PathBuf, RestoreResult)>) -> Changed {
+        let inflight = self.restoring.take();
+        let before = self.selection.clone();
+        let mut changed = if inflight.is_some() {
+            Changed::Yes
+        } else {
+            Changed::No
+        };
+        let mut refusals: Vec<String> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+        let mut ok = false;
+        for (root, result) in results {
+            match result {
+                Ok(res) => {
+                    refusals.extend(res.outcome.refused.iter().map(|r| r.message("restored")));
+                    ok = true;
+                    changed = changed.or(self.apply_pile(root, res.seq, res.pile));
+                }
+                Err(AcceptFailed::LedgerBusy) => errors.push(format!(
+                    "ledger busy in {} — try again",
+                    self.root_name(&root)
+                )),
+                Err(AcceptFailed::Other(e)) => {
+                    errors.push(format!("{}: {e}", self.root_name(&root)))
+                }
+            }
+        }
+        let Some(Restoring { scope }) = inflight else {
+            return changed;
+        };
+        let taken = refusals.is_empty() && errors.is_empty();
+        self.advance_after_restore(&scope, before, taken);
+        let mut parts = Vec::new();
+        if taken && ok {
+            parts.push(restored_text(&scope));
+        }
+        if !refusals.is_empty() {
+            parts.push(refusal_text(&refusals));
+        }
+        parts.extend(errors);
+        self.set_status(parts.join(" · "));
+        Changed::Yes
+    }
+
+    /// §6.7 after a restore's pile came back, the accept rule with one scope translated:
+    /// the row the restore was asked on is gone → advance from it; a hunk restore that was
+    /// taken and left hunks in the row keeps the cursor index, clamped.
+    fn advance_after_restore(
+        &mut self,
+        scope: &RestoreScope,
+        before: Option<Selection>,
+        taken: bool,
+    ) {
+        let equivalent = match scope {
+            RestoreScope::Hunk {
+                root,
+                path,
+                index,
+                hunks,
+            } => AcceptScope::Hunk {
+                root: root.clone(),
+                path: path.clone(),
+                index: *index,
+                hunks: *hunks,
+            },
+            RestoreScope::File {
+                root,
+                path,
+                deleted,
+                ..
+            } => AcceptScope::File {
+                root: root.clone(),
+                path: path.clone(),
+                deleted: *deleted,
+            },
+        };
+        self.advance_after(&equivalent, before, taken);
     }
 
     /// The loop's answer to an `Effect::Accept`: every root's pile goes through the same
@@ -1347,15 +1625,33 @@ impl App {
                 None => Changed::No,
             },
             AcceptAll => return self.request_accept(AcceptScope::All),
-            Confirm => match self.confirm.clone() {
-                Some(_) if self.accepting.is_some() => {
+            Restore => match self.restore_scope() {
+                Some(scope) => return self.request_restore(scope),
+                None => Changed::No,
+            },
+            RestoreFile => match self.restore_file_scope() {
+                Some(scope) => return self.request_restore(scope),
+                None => Changed::No,
+            },
+            // `Confirm` here is `Action::Confirm` (`use Action::*` above), so the modal's
+            // own scope is matched inside rather than in the pattern.
+            Confirm => match self.confirm.clone().map(|c| c.scope) {
+                Some(ConfirmScope::Accept(_)) if self.accepting.is_some() => {
                     // Re-checked here: the modal stays open, the status says why.
                     self.set_status(ACCEPT_IN_PROGRESS);
                     Changed::Yes
                 }
-                Some(confirm) => {
+                Some(ConfirmScope::Restore(_)) if self.restoring.is_some() => {
+                    self.set_status(RESTORE_IN_PROGRESS);
+                    Changed::Yes
+                }
+                Some(ConfirmScope::Accept(scope)) => {
                     self.confirm = None;
-                    return self.start_accept(confirm.scope);
+                    return self.start_accept(scope);
+                }
+                Some(ConfirmScope::Restore(scope)) => {
+                    self.confirm = None;
+                    return self.start_restore(scope);
                 }
                 None => Changed::No,
             },
@@ -1539,6 +1835,7 @@ impl App {
                 _ => Changed::No,
             },
             Target::FileAccept => return self.handle(Action::AcceptFile),
+            Target::FileRestore => return self.handle(Action::RestoreFile),
             // The control is only drawn on an expandable row, so the click is the key.
             Target::Expand => return self.handle(Action::Expand),
             Target::HunkAccept(i) => {
@@ -1546,6 +1843,12 @@ impl App {
                 // does, then the accept is the one `a` would do there.
                 self.hit(Target::DiffHunk(i));
                 return self.handle(Action::Accept);
+            }
+            Target::HunkRestore(i) => {
+                // The same two steps as `HunkAccept`, so `u` and a click on `[u restore]`
+                // land on one `App` (`input_parity_restore`).
+                self.hit(Target::DiffHunk(i));
+                return self.handle(Action::Restore);
             }
             Target::NavRoot(root) => self
                 .select(Some(Selection::Root(root)))
@@ -1677,6 +1980,51 @@ fn file_scope(root: PathBuf, row: &Row) -> AcceptScope {
         root,
         path: row.path.clone(),
         deleted: row.change == Change::Deleted,
+    }
+}
+
+/// The whole-row restore scope for `row`, with the two facts the confirm wording turns on.
+fn restore_file_of(root: PathBuf, row: &Row) -> RestoreScope {
+    RestoreScope::File {
+        root,
+        path: row.path.clone(),
+        deleted: row.change == Change::Deleted,
+        added: row.change == Change::Added,
+        hunks: row.hunks.len(),
+    }
+}
+
+/// The status line for a restore that went through.
+fn restored_text(scope: &RestoreScope) -> String {
+    let lossy = |p: &[u8]| String::from_utf8_lossy(p).into_owned();
+    match scope {
+        // 1-based, like the diff's own `hunk n of m`: the reader counts from one.
+        RestoreScope::Hunk { path, index, .. } => {
+            format!("restored {} hunk {}", lossy(path), index + 1)
+        }
+        RestoreScope::File { path, added, .. } if *added => {
+            format!("removed {} (added since baseline)", lossy(path))
+        }
+        RestoreScope::File { path, .. } => format!("restored {}", lossy(path)),
+    }
+}
+
+/// The confirm modal's first row for a restore, and the only place its wording lives.
+pub fn restore_question(scope: &RestoreScope) -> String {
+    let lossy = |p: &[u8]| String::from_utf8_lossy(p).into_owned();
+    match scope {
+        RestoreScope::Hunk { path, index, .. } => {
+            format!("Restore {} hunk {}?", lossy(path), index + 1)
+        }
+        RestoreScope::File { path, added, .. } if *added => {
+            format!("Delete {}? (added since baseline)", lossy(path))
+        }
+        RestoreScope::File { path, deleted, .. } if *deleted => {
+            format!("Restore {}? (deleted)", lossy(path))
+        }
+        RestoreScope::File { path, hunks, .. } => {
+            format!("Restore {} · {}?", lossy(path), plural(*hunks, "hunk"))
+        }
     }
 }
 
@@ -2401,7 +2749,7 @@ mod tests {
         assert_eq!(
             eleven.confirm,
             Some(Confirm {
-                scope: AcceptScope::All
+                scope: ConfirmScope::Accept(AcceptScope::All)
             }),
             "11 asks"
         );
