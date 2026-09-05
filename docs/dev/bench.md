@@ -429,6 +429,112 @@ Phase 4 ruling 2) leaves the 28-column nav no room for the extension, so the row
 `M big.…`. The scenario's own numbers were never wrong — the wait was — and the assertion
 is now `M big`. S1, S3 and S4 were unaffected and their lines are from the single full run.
 
+## Phase 7 (run E): restore and flag are off the scan path
+
+`docs/spec/96-phase7-kickoff.md`. Phase 7 adds two engine seams (`Engine::restore`,
+`Engine::flag`/`unflag`) and the TUI half that reaches them. Both are **on-demand**: they
+run when a key is pressed, never inside a scan or a draw, and neither adds a git process to
+the scan the way `hunks_of` does not. This run exists to show that — the counts are the
+evidence, not the milliseconds.
+
+Machine block: unchanged from above except the date (2026-09-05) and the commit (this
+branch's tip). Command: `just bench` (all five scenarios, `--test-threads=1`), **one** run,
+so read it against run D's counts rather than as a new baseline.
+
+### The counts did not move
+
+| scenario | metric | run D (before) | run E (after) |
+|---|---|---|---|
+| S1 | `open_spawns` | 1102 | 1102 |
+| S1 | `scan_all_spawns` | 1600 | 1600 |
+| S1 | `rows` / `roots` | 4000 / 100 | 4000 / 100 |
+| S1h | `open_spawns` / `scan_all_spawns` | 552 / 800 | 552 / 800 |
+| S2 | `scan_spawns` / `hunks` | 16 / 2 | 16 / 2 |
+| S3 | `files` | 1000 | 1000 |
+| S4 | `scan_spawns` | 15 | 15 |
+| S4 | `rows_shown` / `omitted` | 10000 / 40000 | 10000 / 40000 |
+
+Every spawn, row and file count is bit-identical to run D. That is the claim this run is
+here to support: a phase that writes the working tree and the ledger from a keystroke costs
+the scan nothing.
+
+### Wall times, with a caveat
+
+| scenario | metric | run D | run E | Δ |
+|---|---|---|---|---|
+| S1 | `open_ms` | 3682 | 4142 | +12.5 % |
+| S1 | `scan_all_ms` | 3853 | 3991 | +3.6 % |
+| S1 | `first_frame_ms` | 7533 | 8319 | +10.4 % |
+| S1h | `scan_all_ms` | 2999 | 3183 | +6.1 % |
+| S1h | `first_frame_ms` | 3994 | 4429 | +10.9 % |
+| S2 | `scan_ms` | 206 | 237 | +15.0 % |
+| S3 | `settle_ms` | 1539 | 1566 | +1.8 % |
+| S3_events | `settle_ms` | 1528 | 1543 | +1.0 % |
+| S4 | `scan_ms` | 1540 | 1669 | +8.4 % |
+| S4 | `settle_ms` | 5123 | 5344 | +4.3 % |
+
+These are **above** the ±2 % band the Variance section records for metrics over 100 ms, and
+this run is a single run on a machine that was not idle — the same workstation was running
+the phase's own builds and test tiers. Two things say the difference is load and not code.
+First, the counts above are identical, so no scenario is doing more work. Second, the
+spread tracks how git-heavy a scenario is: S3, which spawns no git per file, is unchanged
+(+1.0 % / +1.8 %), while the process-spawn-heavy S1 and S2 move most — process creation is
+what a busy machine slows down. `peak_rss_kb` moves both ways within its ±15 % band (S2
+53680 → 47392, S4 78608 → 85632).
+
+The honest reading: this run establishes that Phase 7 changed no counts. It does not
+re-establish the wall-time baseline. The next phase that wants one should follow the
+"Re-running" note below — quiet machine, two runs — and compare against run D's times, not
+these.
+
+### The raw `BENCH` lines
+
+```text
+BENCH S1 open_ms=4142
+BENCH S1 open_spawns=1102
+BENCH S1 roots=100
+BENCH S1 rows=4000
+BENCH S1 scan_all_ms=3991
+BENCH S1 scan_all_spawns=1600
+BENCH S1 first_pile_ms=4744
+BENCH S1 first_frame_ms=8319
+BENCH S1 peak_rss_kb=20448
+BENCH S1h open_ms=2160
+BENCH S1h open_spawns=552
+BENCH S1h roots=50
+BENCH S1h rows=4000
+BENCH S1h scan_all_ms=3183
+BENCH S1h scan_all_spawns=800
+BENCH S1h first_pile_ms=2465
+BENCH S1h first_frame_ms=4429
+BENCH S1h peak_rss_kb=19696
+BENCH S2 file_bytes=1100001
+BENCH S2 hunks=2
+BENCH S2 scan_ms=237
+BENCH S2 scan_spawns=16
+BENCH S2 open_ms=15
+BENCH S2 hunk_next_ms=15
+BENCH S2 page_down_ms=13
+BENCH S2 peak_rss_kb=47392
+BENCH S2_default_config open_ms=15
+BENCH S3 files=1000
+BENCH S3 settle_ms=1566
+BENCH S3 peak_rss_kb=10592
+BENCH S3_events files=1000
+BENCH S3_events settle_ms=1543
+BENCH S3_events peak_rss_kb=9168
+BENCH S4 capped_count_ms=3609
+BENCH S4 settle_ms=5344
+BENCH S4 peak_rss_kb=85632
+BENCH S4 scan_ms=1669
+BENCH S4 scan_spawns=15
+BENCH S4 rows_shown=10000
+BENCH S4 omitted=40000
+```
+
+All five scenarios passed in one invocation (`5 passed; 0 failed`, 111 s of measured time
+after a 55 s fixture build): unlike run D, S2's assertion needed no second pass.
+
 ## What the first run found
 
 The first full run hung in S4: with more than about 4,000 paths in one batch, the engine's

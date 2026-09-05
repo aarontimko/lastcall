@@ -1235,11 +1235,11 @@ impl Engine {
     /// Flag `path` — optionally one hunk of it — with a note, and render the export.
     ///
     /// Op-then-rescan like [`Engine::accept_with`], though a flag never changes a baseline:
-    /// the rescan is what puts the new `⚑` on the row the UI is about to draw, and it is
-    /// also where `hunk n of **m**` comes from — [`crate::ledger::FlagHunk`] stores the hunk
-    /// the user flagged, not the shape of the diff it came from, so the count is read off
-    /// the row. If the row has gone by then (the file was reverted underneath), the export
-    /// falls back to `hunk n` with no total rather than inventing one.
+    /// the rescan is what puts the new `⚑` on the row the UI is about to draw. The
+    /// `hunk n of **m**` total does **not** come from it — [`RenderedHunk::of`] carries the
+    /// count the caller had on screen (verifier F5), because a rescan reads the file as it
+    /// is now and an agent that rewrote it between the render and the keystroke would
+    /// otherwise produce a `hunk 2 of 1` that never existed.
     pub fn flag(
         &mut self,
         root: &Path,

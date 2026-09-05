@@ -339,6 +339,141 @@ client that applies piles from several sources — a refresh, the watcher, its o
 to drop one that is older than what it already shows (the TUI's reducer, Phase 4
 deliverable 5).
 
+## Restore and flag (Phase 7)
+
+Two more one-method seams, on the same terms as `accept`: the client hands over what it
+rendered, the engine runs the op and a rescan in one critical section, and the answer
+carries the post-write pile.
+
+```rust
+pub enum RestoreRequest {
+    Hunk { rendered: Rendered, hunks: Vec<Hunk>, index: usize },
+    File(Rendered),        // `rendered.oid == None` is the deletion form: put the file back
+}
+pub struct Restored { pub outcome: Outcome, pub seq: u64, pub pile: Pile }
+pub struct RenderedHunk { pub hunk: FlagHunk, pub of: usize }
+pub struct Flagged { pub outcome: Outcome, pub export: String, pub seq: u64, pub pile: Pile }
+
+impl Engine {
+    pub fn restore(&mut self, root: &Path, req: RestoreRequest) -> Result<Restored, EngineError>;
+    pub fn flag(&mut self, root: &Path, path: &[u8], note: &str, hunk: Option<RenderedHunk>)
+        -> Result<Flagged, EngineError>;
+    pub fn unflag(&mut self, root: &Path, path: &[u8]) -> Result<Flagged, EngineError>;
+}
+```
+
+Each has a `*_with(.., &dyn FaultInjector)` twin for the E1 seam, exactly as `accept_with`
+does; production passes `NoFault`. A refusal is data (`Outcome::refused`) and still `Ok`;
+`Err` is storage failure only, and the failure path reloads the ledger from disk the same
+way accept's does.
+
+### Restore writes the working tree, never the ledger
+
+`Restored.outcome.written` is always `false`. A restore's whole effect is on disk: it puts
+one hunk or one file back to the baseline the ledger already describes, so there is nothing
+to record. That also means **restore is not undo-of-accept** — an accepted file is blessed
+in the ledger and no longer pending, and `u` on a row it no longer shows is not a gesture
+the TUI can make.
+
+**Restore hunk `k` is `baseline ⊕ every content hunk but k`.** No reverse-apply and no
+second diff implementation: while the live CAS holds, the file's current bytes *are*
+`baseline ⊕ all hunks`, so dropping `k` from that selection is exactly "undo hunk k". Four
+guards stand between the request and the write, in this order:
+
+1. **The entry CAS** (`cas_live`) — the file is still the row that was rendered.
+2. **The round-trip guard** (verifier F2). Before any temp file exists, the baseline blob is
+   materialised through the store's own eol conversion and compared with the bytes on disk.
+   If they differ — a `text=auto` root whose worktree holds CRLF that git would rewrite —
+   the restore is refused (`Unhashable`, "eol conversion is not round-trippable") rather
+   than silently rewriting the user's line endings. Restore never normalises behind the
+   user's back.
+3. **The hunk CAS** (verifier F3). The file not having moved is not enough: `hunks::expand`
+   truncates at a line cap, so an expanded collapsed row can hand over a *partial* hunk
+   list, and `baseline ⊕ a fragment` would discard every edit the cap dropped while both
+   file-level CASes passed. Reassembling the whole list and hashing it is an exact test — it
+   equals the current oid precisely when nothing is missing — and a mismatch is
+   `Refused::Incomplete`.
+4. **The second CAS**, at the rename, as every other write has.
+
+Two shapes are special-cased. The synthetic **mode hunk** is never in the selection
+(`apply_hunks` would splice its literal `mode 100755` bytes in at offset 0, design review
+F1): restoring it moves the mode alone, writing no bytes at all, and on a root that ignores
+the executable bit it does nothing. An **added file's** single content hunk *is* the file
+(verifier F4), so "everything but hunk 0" would write a zero-byte file and leave the row
+pending; that case takes `restore_file`'s removal path instead.
+
+**An absent baseline removes the file.** `empty_baseline_means_absent()` is
+`ledger.seen_tree.is_some()` (decision 4 / verifier F17): a ledger that has a seen tree
+records absence as the empty tree entry, so an empty baseline there means "this file was not
+in the baseline" and restoring it deletes the file. Without a seen tree the same value means
+"empty file", and restoring writes zero bytes. `restore_hunk` follows the same predicate as
+`restore_file`, so the two never disagree about one row.
+
+The refusal vocabulary is shared with accept and reads with the verb the caller passes —
+`Refused::message("restored")`: `Moved`, `BaselineMoved`, `Unhashable`, `StillPresent` (the
+deletion form: the file is back on disk already), `NonUtf8Path`, `NoSuchHunk`, `Conflicted`,
+`Incomplete`.
+
+### Flag appends, unflag clears the path
+
+`Ops::flag` **appends** to `overrides[path].flags` and never touches `blob`: one review
+raises several questions about one file, and the second must not eat the first. `unflag`
+clears every flag on the path — Phase 7's UI has no per-flag removal, so "unflag" is the
+undo for the whole path — and an override left with nothing else is removed. Both write the
+ledger (`written: true`) through the same staged-then-commit path as an accept, and both
+rescan afterwards: the rescan is what puts the new `⚑` on the row the UI is about to draw.
+
+A flag is stored as `Flag { note, created_at, hunk: Option<FlagHunk> }` with
+`FlagHunk { index, header, text }` — the hunk as it was **rendered**, not a pointer into a
+diff that will have moved by the time anyone reads it. `SCHEMA_VERSION` is `"1.1"` and every
+write stamps it. The JSON carries both `flags` (the 1.1 list, hunks included) and `flag`
+(the 1.0 mirror of `flags[0]`, **without** its `hunk`); `flag` is written as `null`, never
+omitted, when there are no flags.
+
+`of` — the `m` in `hunk n of m` — travels **from the caller** in `RenderedHunk` (verifier
+F5). Deriving it from the flag's own rescan meant the header and text came from the screen
+while the total came from the file as it is now, which produced shapes like `hunk 2 of 1`
+when an agent rewrote the file between the render and the keystroke. The caller has the
+number that was true when the user looked, and that is the only one the export may name.
+
+### The export
+
+`Flagged.export` is the paste-ready message, rendered by `flags::export` — in the engine
+because only the engine has the flag's `created_at`. It is byte-frozen by
+`crates/lastcall/tests/golden/flag_export.md`:
+
+````text
+lastcall flag · <root basename> · <root-relative path> · hunk 2 of 3 · 2026-09-05T18:04:00Z
+note: why is this unwrap safe?
+
+```diff
+@@ -10,7 +10,8 @@
+ context
+-old
++new
+```
+````
+
+A file flag omits the `hunk n of m` segment and the diff block. An `unflag`, or a refusal,
+leaves `export` empty.
+
+Two rules make it safe to paste into a live terminal:
+
+- **Control bytes render in caret form** (F13, F9, decision 10) — in *every* rendered field:
+  root, path, timestamp, attribution, note, hunk header and hunk text. The export goes
+  through bracketed-paste markers and the *application* decides where the paste ends, so a
+  single `\x1b[201~` in the payload would close it early and let the rest arrive as
+  keystrokes. C0 below `0x20` other than `\n` and `\t` becomes `^X` (`^[` for ESC), DEL
+  becomes `^?`, and C1 `U+0080..=U+009F` becomes the caret form of its ESC equivalent (`^[[`
+  for CSI) — a terminal in UTF-8 mode reads a raw `\u{9b}` as CSI, so C0 alone was not the
+  whole hazard.
+- **The fence is as long as it needs to be** (D1): one backtick longer than the longest
+  leading run any line inside it starts with, minimum three. A diff line that is exactly
+  ` ``` ` would otherwise close the block and spill the rest of the hunk into prose.
+
+`ExportContext.attribution` (`last touched by <agent> · session <id>`) is always `None` in
+Phase 7; Phase 8 provides it.
+
 ## `status --json` schema (`status_version: 1`)
 
 ```json

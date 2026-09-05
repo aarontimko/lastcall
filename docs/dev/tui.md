@@ -223,6 +223,134 @@ from what the user is looking at:
   `y confirm  n cancel  q quit` — exactly the keys that work there, the `quit` label being
   the user's own binding (`render_hint_line_under_the_modal_names_only_its_keys`).
 
+## Restore and flag (Phase 7)
+
+Accept is one of the three answers a reviewer has. The other two are "put that back" and
+"I have a question about this" — `u` / `shift-u` and `m` / `shift-m`.
+
+### Restore (`u`, `shift-u`)
+
+- **Scope** (`App::restore_scope`, `RestoreScope`): the same shape as `accept_scope` with two
+  variants instead of five. `u` on a row with content hunks is the hunk under the diff
+  cursor; on a hunkless row (binary, collapsed, unreadable) it is the file; on a **deletion**
+  row it is also the file, because a deletion row's single hunk *is* the file (F16). `shift-u`
+  is always the file. There is no restore-group and no restore-all: undoing a whole tree at
+  once is not a gesture lastcall offers, which is why `Effect::Restore` carries a `Vec` that
+  never holds more than one request.
+- **Only the file half asks.** A hunk restore starts immediately; a file restore opens the
+  confirm modal first. The CAS is the guard either way and the content a restore drops stays
+  addressable in the private store, but a whole file going back is the bigger surprise. The
+  modal is the accept modal with a different scope — `ConfirmScope::{Accept, Restore}` — so
+  there is one modal, one key set and one hint line. `confirm_counts` stays accept-only
+  (F11): a restore covers one row, so there is nothing to tally, and the question comes from
+  `restore_question(scope)`, the only place its wording lives:
+
+  | row | question |
+  |---|---|
+  | modified, 3 hunks | `Restore f1 · 3 hunks?` |
+  | deleted | `Restore f1? (deleted)` |
+  | added since the baseline | `Delete f1? (added since baseline)` |
+
+  The third is not a euphemism to soften: restoring a file the baseline does not have
+  **removes** it, and the status line afterwards says `removed f1 (added since baseline)`.
+- **One at a time**, like accept: `App.restoring` holds the scope in flight and a second
+  restore is ignored with `restore in progress`.
+- **Completion** (`App::restored`): the pile goes through `apply_pile` (seq included), the
+  §6.7 advance rule runs for the selection the restore was asked from, and one status line
+  says what happened — `restored f1 hunk 2`, `restored f1`, `removed f1 (added since
+  baseline)`. Refusals read with their own verb (`Refused::message("restored")`), because a
+  sentence has to say which operation did not happen.
+- The TUI **never opens a worktree file for writing**. Every byte a restore writes goes
+  through `Engine::restore`, and every flag through `Engine::flag`/`unflag`:
+  `rg -n 'e\.(restore|flag|unflag)\(' crates/lastcall/src` finds only `run.rs`'s effect
+  handlers. The one file the TUI opens for writing is the export fallback under the state
+  dir (below).
+
+### Flag (`m`), and the note modal
+
+`m` opens the note modal on what `App::flag_target` names: the hunk under the diff cursor
+when the diff has focus and the row has content hunks, else the file. The synthetic mode
+hunk is not content — there is nothing to quote — so `m` on it flags the file.
+
+**The target is captured when `m` is pressed and never re-read** (F14). Piles keep landing
+while the note is being typed: an agent still writing can reorder the hunks or remove the
+one the note is about, and the flag must not follow. `NoteEntry.target` holds the `Rendered`
+row, the `FlagHunk` (index, header, body) and the `of` count as they were on screen; Enter
+writes exactly that.
+
+The modal's key discipline (`input::note_action`):
+
+| key | effect |
+|---|---|
+| any printable character | inserted — the keymap is off, so `q` types a `q` |
+| `Enter` | send: `Effect::Flag`, the modal closes |
+| `Ctrl-J` | newline (works in every terminal) |
+| `Alt-Enter`, `Shift-Enter` | newline, where the terminal reports the modifier at all |
+| `Backspace` | delete the character before the caret |
+| `Esc` | cancel — nothing is written |
+| the `quit` binding, non-printable only | quit (`Ctrl-C` by default): a modal is never a trap |
+| anything else | swallowed |
+
+**Bracketed paste is on for the modal's lifetime and no longer.** The loop enables it when
+`app.note` becomes `Some` and disables it when the modal closes, so a paste arrives as one
+`Event::Paste` carrying every newline it holds — inserted whole, never mistaken for the
+`Enter` that sends. A pasted multi-line note that fired off its first line and dropped the
+rest would be the worst failure this modal has, and the paste event is what prevents it.
+Mouse clicks are ignored while the modal is open: there is nothing on it to click.
+
+### The send decision
+
+The flag is written first — `Effect::Flag` → `Engine::flag` → `Local::Flagged` — and only
+then does the loop decide where the export goes, from the candidates the last herdr
+derivation found for that root (`HerdrView::candidates`, narrowed by the `w` scope when it
+is on, so the picker covers the ground the nav does):
+
+| candidates | what happens |
+|---|---|
+| exactly one | `Effect::Stage` at once — there is nothing to ask |
+| more than one | the picker modal; `↑↓`/`kj` choose, `Enter` sends, `Esc` drops the send |
+| none, or standalone | `Effect::Export` — the fallback file |
+
+lastcall never picks an agent for the reader. **The flag is on disk before any of this**, so
+`Esc` on the picker loses nothing: the status says `flagged f1 · not sent` and the row keeps
+its `⚑`. The picker is live — a pane that appears or goes away while it is open changes the
+list under the cursor, and the selection is clamped to it; every candidate going away closes
+it rather than showing an empty list.
+
+**Staged, not sent.** `herdr::stage` wraps the export in bracketed-paste markers and calls
+`pane.send_text`, so the payload lands in the agent's input buffer and waits for the human
+to press Enter. No trailing newline — that would be the submit we are avoiding. A send that
+fails is a status line and nothing more (`flagged f1 · send failed: <reason>`): the flag is
+in the ledger either way, which is why `App.flagging` holds the flag's label until `staged`
+answers.
+
+**The fallback file** is the one file the TUI writes:
+
+```text
+<state_dir>/exports/<root basename>/<YYYY-MM-DD>.md
+```
+
+Appended to, never truncated, with a blank line between entries; the date comes from the
+**engine's clock**, not `SystemTime::now()`, which is what lets a test with a `FixedClock`
+name the file it expects. The status line names the path it wrote:
+`flagged f1 · export → /…/exports/alpha/2026-09-05.md`.
+
+`shift-m` (`unflag`) clears **every** flag on the selected file — Phase 7 has no per-flag
+removal — and says `flags cleared`.
+
+### Where flags show
+
+- The nav row carries `⚑` for one flag and `⚑2` for two or more: the count is the only thing
+  that says a row has more than one note without opening it.
+- The file header and the flagged hunk's header carry `⚑ <the note's first line>`, dimmed.
+  Only the first line, and only in the room left once the right-aligned controls are
+  reserved (`render::marker_budget` / `flag_marker`) — a note is whatever the reviewer typed,
+  and a flagged row is exactly the one whose `[u restore]` and `[m flag]` they still want.
+- The hunk marker matches on the **header text** the flag stored, not on its index: the index
+  is where the hunk was when it was flagged, and one edit above it moves every later hunk
+  down. A flag whose header no longer appears simply shows no marker rather than marking the
+  wrong hunk.
+
 ## Keys
 
 Defaults (`input::DEFAULT_KEYMAP`, in help-overlay order):
@@ -240,6 +368,10 @@ Defaults (`input::DEFAULT_KEYMAP`, in help-overlay order):
 | `accept` | `a` | on a file row: the one hunk under the diff cursor (a hunkless row — binary, collapsed, deleted, unreadable — whole); on a group: the group; on a root: every row of it (asks above 10 files) | the same hunk |
 | `accept_file` | `shift-a` | accept the selected file whole — the only key that does | |
 | `accept_all` | `ctrl-a` | accept everything listed, every root (asks above 10 files) | |
+| `restore` | `u` | put the hunk under the diff cursor back to its baseline (a hunkless or deleted row: the file, which asks) | the same hunk |
+| `restore_file` | `shift-u` | put the selected file back whole — always asks first | |
+| `flag` | `m` | flag it with a note: the hunk under the diff cursor, or the file from the nav | the same hunk |
+| `unflag` | `shift-m` | clear every flag on the selected file | |
 | `expand` | `e` | expand the selected collapsed row into hunks ("Collapsed rows" below) | |
 | `ack` | `d` | ack the selected root's herdr ready flag ("herdr in the UI" below) | |
 | `jump` | `g` | focus the selected root's agent in herdr | |
@@ -260,11 +392,22 @@ without touching the selection, and a hidden nav (below 70 columns) can never ho
 
 The confirm modal answers `y` / `enter` (confirm) and `n` / `esc` (cancel) — fixed
 (`input::MODAL_KEYS`), not `[keys]` names, listed last in the help overlay — plus the
-`quit` keys, which quit from inside it; nothing else.
+`quit` keys, which quit from inside it; nothing else. The note modal and the agent picker
+have their own key sets, printed on the modal itself ("Restore and flag" above).
+
+**The help overlay is two columns when one does not fit.** With 27 bindable rows plus the
+modal keys, a single column runs off the bottom of a 30-row terminal, so
+`render::help_columns` splits the rows in half whenever one column would overflow the height
+*and* the pair fits the width — each column sized to its own widest row, because padding both
+to the widest row in the table costs the second column the width it needs. If two columns
+would themselves have to be truncated, one column is no worse, and it stays. The vertical
+clipping that follows eats key rows, never the footer, so the shift-drag note
+(`render::SELECT_NOTE`) is always the last line of the box.
 
 Mouse: a left press on a nav entry selects it; on a hunk header it selects that hunk; on a
-hunk header's `[a accept]` it accepts that hunk, on the main view's `[A accept file]` the
-file, on the header's `[Accept All]` everything listed; on the diff body it focuses the
+hunk header's `[a accept]` it accepts that hunk, on `[u restore]` it restores it and on
+`[m flag]` it opens the note modal on it; on the main view's `[A accept file]` /
+`[U restore file]` the file, on the header's `[Accept All]` everything listed; on the diff body it focuses the
 diff; dragging the divider resizes the nav (clamped to 16..=60); the wheel scrolls the pane
 under the pointer, three lines a notch.
 
@@ -669,5 +812,7 @@ rg -n 'last_pile|scan_all\(|\.scan\(' crates/lastcall/src/tui/app.rs   # nothing
 rg -n 'println!|eprintln!|print!' crates/lastcall/src/tui   # nothing (the messages are in commands/)
 rg -n 'thread::sleep|tokio::time::sleep' crates/lastcall/src/tui   # nothing
 rg -n 'lastcall_engine::herdr' crates/lastcall/src/tui     # only tui/herdr.rs and tui/run.rs (the task side); never app.rs or render.rs
+rg -n 'e\.(restore|flag|unflag)\(' crates/lastcall/src     # only tui/run.rs (restore and flag reach the engine through one seam)
+rg -n 'OpenOptions|File::create|fs::write' crates/lastcall/src   # tui/term.rs (the log file) and tui/run.rs (the export fallback); no worktree file is ever opened for writing
 cargo tree -e normal -p lastcall -p lastcall-engine | grep -c testkit   # 0
 ```

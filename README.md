@@ -27,6 +27,8 @@ adds accepting — hunk, file, group, repo, everything — which is what shrinks
 survives a restart. Phase 5 adds the herdr overlay (below). Phase 6 adds draft dirs (a directory that is not a git repo, reviewed as
 a root of its own) and collapsed rows: a lockfile, a binary or a very large file is one
 accept, not a wall of hunks, and `e` expands one on demand when you do want to read it.
+Phase 7 adds the other two answers a reviewer has: restoring a hunk or a file to what it
+was, and flagging one with a note that goes straight to the agent that wrote it.
 
 ## Try it
 
@@ -54,9 +56,44 @@ single `⊟` row instead of a diff: `a` or `A` accepts it whole, and `e` expands
 lockfile/large-file kind into real hunks (up to 2,000 lines; a binary is never expandable).
 The pile shrinks to `nothing pending`, and a relaunch on the same state dir starts
 from there, whatever the agent committed in between (an agent's commit moves HEAD, never
-your baseline). Not yet: flagging with a note and restoring (Phase 7), editing in place
-(Phase 8). `lastcall tui --poll 2` polls every 2 s if filesystem events are late or
+your baseline). Not yet: editing in place (Phase 8). `lastcall tui --poll 2` polls every 2 s if filesystem events are late or
 missing.
+### Put it back
+
+Accepting is one of three answers. `u` puts the hunk under the cursor back to what it was
+before the agent touched it; `shift-u` puts the whole file back and asks first (on a file
+that was *added* since your baseline the question says `Delete f1?`, because that is what
+putting it back means). Restoring writes only the working tree — it is not an undo of an
+accept, and a file that changed underneath is refused rather than overwritten.
+
+### Flag and discuss
+
+`m` opens a note on the hunk under the cursor (or on the file, from the repo list). Type,
+press Enter — `Ctrl-J` for a newline, `Esc` to throw it away — and lastcall writes the flag
+into the ledger and hands the agent a paste-ready message: the header line, your note, and
+the hunk itself in a fenced diff block.
+
+````text
+lastcall flag · some-repo · src/parse.rs · hunk 2 of 3 · 2026-09-05T18:04:00Z
+note: why is this unwrap safe? the caller can pass an empty slice
+
+```diff
+@@ -10,7 +10,8 @@
+ let n = parse(s);
+-    n.unwrap()
++    n.expect("parsed above")
+ }
+```
+````
+
+Where it goes depends on what is around. In a herdr session with exactly one agent under
+that repo it is **staged** into that agent's input box — pasted, not submitted, so you press
+Enter yourself. With several, lastcall asks which one rather than guessing. With no herdr
+link, it is appended to `~/.local/state/lastcall/exports/<repo>/<date>.md`, ready to paste by
+hand. The flag is written before any of this, so cancelling the send loses nothing: the row
+keeps its `⚑` (`⚑2` for two notes) and the note reads beside the hunk it is about.
+`shift-m` clears a file's flags.
+
 Keys are rebindable in `config.toml`, one spec or a list per action (the full grammar and
 table: [`docs/dev/tui.md`](docs/dev/tui.md)):
 
