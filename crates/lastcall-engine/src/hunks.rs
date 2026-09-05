@@ -14,6 +14,12 @@ use similar::{Algorithm, DiffOp, capture_diff_slices, group_diff_ops};
 /// Unified-diff context lines (git's default).
 pub const CONTEXT: usize = 3;
 
+/// The cap on an on-demand expansion of a collapsed row (§10 2026-09-05 ruling 1): hunk
+/// **body lines**, context included, hunk separators excluded. A lockfile rewrite is
+/// tens of thousands of lines; the reader wants the shape, not the whole file, and the
+/// expansion is held in the UI's memory rather than in the pile.
+pub const EXPAND_LINE_CAP: usize = 2_000;
+
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
@@ -157,6 +163,61 @@ pub fn diff(old: &[u8], new: &[u8]) -> Vec<Hunk> {
         .collect()
 }
 
+/// A collapsed row's hunks, computed on demand and truncated at [`EXPAND_LINE_CAP`]
+/// (Phase 6 deliverable 4). Never stored on a [`crate::scan::Row`]: accept stays whole-row
+/// for a collapsed path (§6.3 "single accept"), so these hunks are a view, not a baseline.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct Expanded {
+    pub hunks: Vec<Hunk>,
+    /// Body lines the cap dropped; 0 when the whole diff fits.
+    pub omitted_lines: usize,
+}
+
+/// Diff `old` against `new` and truncate at [`EXPAND_LINE_CAP`].
+pub fn expand(old: &[u8], new: &[u8]) -> Expanded {
+    truncate(diff(old, new), EXPAND_LINE_CAP)
+}
+
+/// Keep whole hunks while the body-line budget lasts, then keep the prefix of the hunk
+/// that overruns it (so one enormous hunk still shows something), reporting how many body
+/// lines were dropped. The truncated hunk's ranges are narrowed to the lines it kept, so a
+/// rendered `@@` header never claims lines that are not on screen. `index` is preserved:
+/// nothing accepts through an expansion, and a stable index keeps the view addressable.
+pub fn truncate(hunks: Vec<Hunk>, cap: usize) -> Expanded {
+    let total: usize = hunks.iter().map(|h| h.lines.len()).sum();
+    if total <= cap {
+        return Expanded {
+            hunks,
+            omitted_lines: 0,
+        };
+    }
+    let mut kept: Vec<Hunk> = Vec::new();
+    let mut used = 0usize;
+    for hunk in hunks {
+        if used == cap {
+            break;
+        }
+        let room = cap - used;
+        if hunk.lines.len() <= room {
+            used += hunk.lines.len();
+            kept.push(hunk);
+            continue;
+        }
+        let mut part = hunk;
+        part.lines.truncate(room);
+        let old_kept = part.lines.iter().filter(|(t, _)| *t != Tag::Insert).count();
+        let new_kept = part.lines.iter().filter(|(t, _)| *t != Tag::Delete).count();
+        part.old_range = part.old_range.start..part.old_range.start + old_kept;
+        part.new_range = part.new_range.start..part.new_range.start + new_kept;
+        used = cap;
+        kept.push(part);
+    }
+    Expanded {
+        hunks: kept,
+        omitted_lines: total - used,
+    }
+}
+
 /// (added, deleted) line counts, equal to `git diff --numstat`.
 pub fn counts(old: &[u8], new: &[u8]) -> (usize, usize) {
     let old_lines = split_lines(old);
@@ -215,6 +276,83 @@ mod tests {
 
     fn s(t: &str) -> Vec<u8> {
         t.as_bytes().to_vec()
+    }
+
+    /// `n` lines named `<prefix>i\n`, joined.
+    fn lines_of(prefix: &str, range: std::ops::Range<usize>) -> Vec<u8> {
+        range
+            .map(|i| format!("{prefix}{i}\n"))
+            .collect::<String>()
+            .into_bytes()
+    }
+
+    #[test]
+    fn hunks_expand_under_the_cap_omits_nothing() {
+        let old = lines_of("line ", 0..50);
+        let mut new_lines: Vec<String> = (0..50).map(|i| format!("line {i}\n")).collect();
+        new_lines[10] = "line 10 edited\n".to_owned();
+        new_lines[40] = "line 40 edited\n".to_owned();
+        let new = new_lines.concat().into_bytes();
+        let expanded = expand(&old, &new);
+        assert_eq!(expanded.hunks, diff(&old, &new), "nothing was truncated");
+        assert_eq!(expanded.hunks.len(), 2);
+        assert_eq!(expanded.omitted_lines, 0);
+    }
+
+    #[test]
+    fn hunks_truncate_keeps_whole_hunks_while_the_budget_lasts() {
+        // Three hunks of 10 body lines each, capped at 25: two whole, then five lines of
+        // the third; five of its lines and none of a fourth are the omission.
+        let hunks: Vec<Hunk> = (0..3)
+            .map(|index| Hunk {
+                index,
+                old_range: index * 100..index * 100 + 10,
+                new_range: index * 100..index * 100 + 10,
+                lines: (0..10)
+                    .map(|l| {
+                        let tag = if l < 4 { Tag::Context } else { Tag::Insert };
+                        (tag, format!("h{index} l{l}\n").into_bytes())
+                    })
+                    .collect(),
+            })
+            .collect();
+        let out = truncate(hunks.clone(), 25);
+        assert_eq!(out.hunks.len(), 3);
+        assert_eq!(out.hunks[0], hunks[0], "whole");
+        assert_eq!(out.hunks[1], hunks[1], "whole");
+        assert_eq!(out.hunks[2].lines.len(), 5, "the prefix of the third");
+        assert_eq!(out.hunks[2].index, 2, "indexes are preserved");
+        // Four context + one insert kept: the old side shows 4 lines, the new side 5.
+        assert_eq!(out.hunks[2].old_range, 200..204);
+        assert_eq!(out.hunks[2].new_range, 200..205);
+        assert_eq!(out.omitted_lines, 5);
+
+        // Exactly at the cap: nothing is truncated and nothing is reported omitted.
+        let exact = truncate(hunks.clone(), 30);
+        assert_eq!(exact.hunks, hunks);
+        assert_eq!(exact.omitted_lines, 0);
+    }
+
+    #[test]
+    fn hunks_expand_caps_one_enormous_hunk_at_the_line_cap() {
+        // A lockfile rewrite: every line changes, so the whole file is one hunk.
+        let old = lines_of("old ", 0..5_000);
+        let new = lines_of("new ", 0..5_000);
+        let full = diff(&old, &new);
+        assert_eq!(full.len(), 1, "one contiguous replace");
+        let body: usize = full.iter().map(|h| h.lines.len()).sum();
+        assert_eq!(body, 10_000, "5,000 deletes + 5,000 inserts");
+
+        let expanded = expand(&old, &new);
+        let shown: usize = expanded.hunks.iter().map(|h| h.lines.len()).sum();
+        assert_eq!(
+            shown, EXPAND_LINE_CAP,
+            "the reader sees the cap, not nothing"
+        );
+        assert_eq!(expanded.omitted_lines, body - EXPAND_LINE_CAP);
+        // The narrowed header never claims lines that are not on screen.
+        let h = &expanded.hunks[0];
+        assert_eq!(h.old_range.len() + h.new_range.len(), EXPAND_LINE_CAP);
     }
 
     #[test]

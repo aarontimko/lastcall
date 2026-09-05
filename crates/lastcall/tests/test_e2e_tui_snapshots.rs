@@ -16,17 +16,17 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use lastcall::tui::app::{AcceptFailed, App, Effect, RootMeta, Selection};
+use lastcall::tui::app::{AcceptFailed, App, Changed, Effect, RootMeta, Selection};
 use lastcall::tui::herdr::{Attention, Dot, HerdrUpdate, RootAgents, Scope};
 use lastcall::tui::input::Action;
 use lastcall::tui::render::{render, styles};
 use lastcall_engine::engine::{Engine, EngineOptions};
 use lastcall_engine::env::Env;
 use lastcall_engine::ops::NoFault;
-use lastcall_engine::scan::{Annotation, Change, Pile};
+use lastcall_engine::scan::{Annotation, Change, Collapsed, Pile};
 use lastcall_engine::watcher::EngineEvent;
 use lastcall_testkit::engine::{open_engine, open_engine_with};
-use lastcall_testkit::fixture_parent::{self, config};
+use lastcall_testkit::fixture_parent::{self, config, draft_config};
 use lastcall_testkit::fixture_repo::{FixtureRepo, engine_env_for};
 use lastcall_testkit::tmp::TempDir;
 use ratatui::Terminal;
@@ -40,6 +40,9 @@ struct Scene {
     parent: PathBuf,
     state: PathBuf,
     env: Env,
+    /// What `fixture_parent::build` created; `None` for [`Scene::clean`], which has no
+    /// alpha/beta/notes to hand `add_draft_root`.
+    built: Option<fixture_parent::Built>,
 }
 
 impl Scene {
@@ -52,9 +55,10 @@ impl Scene {
         let env = engine_env_for(&built.parent, &built.home, &state);
         Scene {
             _tmp: tmp,
-            parent: built.parent,
+            parent: built.parent.clone(),
             state,
             env,
+            built: Some(built),
         }
     }
 
@@ -72,6 +76,7 @@ impl Scene {
             parent,
             state,
             env,
+            built: None,
         }
     }
 
@@ -81,6 +86,19 @@ impl Scene {
 
     fn engine_with(&self, options: EngineOptions) -> Engine {
         open_engine_with(&self.parent, &self.env, &self.state, config(), options)
+    }
+
+    /// An engine over the **four**-root config: only for a scene that called
+    /// [`fixture_parent::add_draft_root`] (Phase 6 deliverable 1(c)).
+    fn engine_with_draft_root(&self) -> Engine {
+        open_engine(&self.parent, &self.env, &self.state, draft_config())
+    }
+
+    /// The scene-owned fourth root, first-sighted at `baseline`; see
+    /// [`fixture_parent::add_draft_root`] for why it is never in the shared fixture.
+    fn add_draft_root(&self, baseline: &str) -> PathBuf {
+        let built = self.built.as_ref().expect("a Scene::build fixture");
+        fixture_parent::add_draft_root(built, &self.state, baseline).expect("the fourth root")
     }
 
     fn repo(&self, name: &str) -> FixtureRepo {
@@ -317,6 +335,39 @@ fn tui_diff_view_mode_change() {
     snapshot("tui_diff_view_mode_change", &app, W, H);
 }
 
+/// Phase 6 deliverable 1(c): the diff view of a **draft root's** two-hunk row, so one
+/// frame shows hunks under a `draft`-labelled root (`tui_nav_three_roots` already shows a
+/// pending draft root beside a git root, but with no hunks open). The fourth root is the
+/// scene's own — `fixture_parent::build` and its three-root assertion are untouched, so
+/// every other snapshot still reads `3 repos`.
+#[test]
+fn tui_draft_root_hunks() {
+    let scene = Scene::build();
+    let baseline: String = (1..=20).map(|i| format!("line {i}\n")).collect();
+    let drafts = scene.add_draft_root(&baseline);
+    // The agent edits two lines six apart: two hunks at CONTEXT 3, not one merged hunk.
+    let edited: String = (1..=20)
+        .map(|i| match i {
+            2 | 18 => format!("line {i} edited by the agent\n"),
+            _ => format!("line {i}\n"),
+        })
+        .collect();
+    std::fs::write(drafts.join("reply.md"), edited).expect("the agent's edit");
+
+    let mut engine = scene.engine_with_draft_root();
+    let mut app = app_of(&mut engine);
+    select_row(&mut app, &drafts, "reply.md");
+    let row = app.selected_row().expect("the draft row");
+    assert_eq!(row.hunks.len(), 2, "two hunks under the draft root");
+    assert_eq!(row.collapsed, None, "a small text draft is not collapsed");
+    assert_eq!(
+        app.roots[&drafts].meta.branch, None,
+        "a draft root has no branch; the label line reads `draft`"
+    );
+    app.handle(Action::Open);
+    snapshot("tui_draft_root_hunks", &app, W, H);
+}
+
 #[test]
 fn tui_diff_view_collapsed() {
     let scene = Scene::build();
@@ -331,6 +382,150 @@ fn tui_diff_view_collapsed() {
     assert!(app.selected_row().unwrap().collapsed.is_some());
     app.handle(Action::Open);
     snapshot("tui_diff_view_collapsed", &app, W, H);
+}
+
+/// Phase 6 gate item 2(b): `npm install` rewrites a 4,000-line lockfile and the reviewer
+/// sees **one** row with live four-digit counts, under the frozen default `collapsed_globs`
+/// (no config override), plus the collapsed diff view for it.
+#[test]
+fn tui_nav_collapsed_lockfile() {
+    let before: String = (0..4_000)
+        .map(|i| format!("    \"pkg-{i}\": {{ \"version\": \"1.0.{i}\" }},\n"))
+        .collect();
+    let scene = Scene::build();
+    let mut alpha_repo = scene.repo("alpha");
+    alpha_repo
+        .commit_files(&[("package-lock.json", before.as_str())], "lock")
+        .unwrap();
+    let mut engine = scene.engine();
+    let alpha = root_named(&engine, "alpha");
+    mark_seen(&mut engine, &alpha);
+
+    // Two thirds of the versions move and 213 packages are added: the counts are large,
+    // four digits, and deliberately unequal so the frame proves both are live.
+    let after: String = (0..4_000)
+        .map(|i| {
+            let v = if i % 3 == 0 { "1.0" } else { "2.4" };
+            format!("    \"pkg-{i}\": {{ \"version\": \"{v}.{i}\" }},\n")
+        })
+        .chain((0..213).map(|i| format!("    \"new-{i}\": {{ \"version\": \"1.0.0\" }},\n")))
+        .collect();
+    assert!(
+        after.len() < 512 * 1024,
+        "under collapse_size_bytes, so the glob is the reason: {}",
+        after.len()
+    );
+    alpha_repo.write("package-lock.json", &after);
+
+    let mut app = app_of(&mut engine);
+    select_row(&mut app, &alpha, "package-lock.json");
+    let row = app.selected_row().unwrap();
+    assert_eq!(row.collapsed, Some(Collapsed::Glob));
+    assert!(row.hunks.is_empty(), "a collapsed row carries no hunks");
+    assert!(row.added > 2_000 && row.deleted > 2_000 && row.added != row.deleted);
+    app.handle(Action::Open);
+    snapshot("tui_nav_collapsed_lockfile", &app, W, H);
+}
+
+/// Phase 6 gate item 3(b): the two size/binary collapse classes at the **frozen default**
+/// `collapse_size_bytes` (512 KiB), with the boundary row beside them — 524,288 bytes is
+/// not collapsed and keeps its hunks, 524,289 is `Size`, the PNG is `Binary`. The diff view
+/// is on the binary row.
+#[test]
+fn tui_nav_collapsed_binary_and_size() {
+    const LIMIT: usize = 512 * 1024;
+    // 32 bytes per line, so LIMIT is a whole number of lines.
+    let line = |c: char| format!("{}\n", std::iter::repeat_n(c, 31).collect::<String>());
+    let at_limit: String = std::iter::repeat_n(line('a'), LIMIT / 32).collect();
+    assert_eq!(at_limit.len(), LIMIT);
+    let mut png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR".to_vec();
+    png.resize(2 * 1024 * 1024, b'\x42');
+
+    let scene = Scene::build();
+    let mut alpha_repo = scene.repo("alpha");
+    alpha_repo
+        .commit_files(
+            &[
+                ("img.png", "placeholder\n"),
+                ("at_limit.txt", at_limit.as_str()),
+                ("over_limit.txt", at_limit.as_str()),
+            ],
+            "seed",
+        )
+        .unwrap();
+    let mut engine = scene.engine();
+    let alpha = root_named(&engine, "alpha");
+    assert_eq!(engine.config().collapse_size_bytes, LIMIT as u64);
+    mark_seen(&mut engine, &alpha);
+
+    alpha_repo.write("img.png", &png);
+    let mut changed_at_limit = at_limit.clone();
+    changed_at_limit.replace_range(0..32, &line('b'));
+    alpha_repo.write("at_limit.txt", &changed_at_limit);
+    alpha_repo.write("over_limit.txt", format!("{at_limit}x"));
+
+    let mut app = app_of(&mut engine);
+    select_row(&mut app, &alpha, "at_limit.txt");
+    let boundary = app.selected_row().unwrap();
+    assert_eq!(
+        boundary.collapsed, None,
+        "524,288 bytes is not over the limit"
+    );
+    assert!(
+        !boundary.hunks.is_empty(),
+        "the boundary row keeps its hunks"
+    );
+    select_row(&mut app, &alpha, "over_limit.txt");
+    assert_eq!(
+        app.selected_row().unwrap().collapsed,
+        Some(Collapsed::Size),
+        "one byte over"
+    );
+    select_row(&mut app, &alpha, "img.png");
+    assert_eq!(
+        app.selected_row().unwrap().collapsed,
+        Some(Collapsed::Binary)
+    );
+    app.handle(Action::Open);
+    snapshot("tui_nav_collapsed_binary_and_size", &app, W, H);
+}
+
+/// Phase 6 deliverable 4: the same collapsed row after `e`. The header keeps the collapsed
+/// summary and its `[e expand]` control; under it are the real hunks the engine computed on
+/// demand, and the cap footer says what the 2,000-line budget dropped. The expansion is fed
+/// in exactly as the loop does it — `Effect::Expand` → `Engine::hunks_of` → `set_expanded`.
+#[test]
+fn tui_diff_view_collapsed_expanded() {
+    let before: String = (0..1_400)
+        .map(|i| format!("    \"pkg-{i}\": {{ \"version\": \"1.0.{i}\" }},\n"))
+        .collect();
+    let scene = Scene::build();
+    let mut alpha_repo = scene.repo("alpha");
+    alpha_repo
+        .commit_files(&[("package-lock.json", before.as_str())], "lock")
+        .unwrap();
+    let mut engine = scene.engine();
+    let alpha = root_named(&engine, "alpha");
+    mark_seen(&mut engine, &alpha);
+    let after: String = (0..1_400)
+        .map(|i| format!("    \"pkg-{i}\": {{ \"version\": \"2.4.{i}\" }},\n"))
+        .collect();
+    alpha_repo.write("package-lock.json", &after);
+
+    let mut app = app_of(&mut engine);
+    select_row(&mut app, &alpha, "package-lock.json");
+    let row = app.selected_row().unwrap().clone();
+    assert_eq!(row.collapsed, Some(Collapsed::Glob));
+    let (changed, effect) = app.handle(Action::Expand);
+    assert_eq!(changed, Changed::No, "asking for hunks draws nothing");
+    let Some(Effect::Expand(root, asked)) = effect else {
+        panic!("an expand effect: {effect:?}");
+    };
+    let view = engine.hunks_of(&root, &asked).expect("the expansion");
+    assert!(view.omitted_lines > 0, "a whole-file rewrite hits the cap");
+    assert_eq!(app.set_expanded(root, &asked, view), Changed::Yes);
+    app.handle(Action::Open);
+    snapshot("tui_diff_view_collapsed_expanded", &app, W, H);
 }
 
 #[test]

@@ -47,6 +47,10 @@ pub enum Action {
     FocusToggle,
     HunkNext,
     HunkPrev,
+    /// Ask the engine for the hunks of the selected **collapsed** row (`Effect::Expand`).
+    /// A no-op — no effect, no draw — on a binary row and on any row that is not collapsed
+    /// (Phase 6 deliverable 4).
+    Expand,
     /// Scroll the diff up `n` lines (the wheel; the loop sends `NavUp` when the pointer is
     /// over the nav instead).
     ScrollUp(u16),
@@ -99,6 +103,7 @@ pub const DEFAULT_KEYMAP: &[(&str, &[&str])] = &[
     ("focus_toggle", &["tab"]),
     ("hunk_next", &["n", "]"]),
     ("hunk_prev", &["p", "["]),
+    ("expand", &["e"]),
     ("toggle_full_paths", &["f"]),
     ("toggle_remote", &["o"]),
     ("accept", &["a"]),
@@ -150,6 +155,7 @@ impl Action {
             "hunk_prev" => Action::HunkPrev,
             "scroll_up" => Action::ScrollUp(1),
             "scroll_down" => Action::ScrollDown(1),
+            "expand" => Action::Expand,
             "toggle_full_paths" => Action::ToggleFullPaths,
             "toggle_remote" => Action::ToggleRemote,
             "accept" => Action::Accept,
@@ -177,6 +183,7 @@ impl Action {
             "focus_toggle" => "toggle focus",
             "hunk_next" => "next hunk",
             "hunk_prev" => "previous hunk",
+            "expand" => "expand a collapsed file",
             "toggle_full_paths" => "full paths",
             "toggle_remote" => "show org/repo",
             "accept" => "accept the hunk or the selected entry",
@@ -1204,6 +1211,7 @@ mod tests {
             (Action::FocusToggle, "key"),
             (Action::HunkNext, "key"),
             (Action::HunkPrev, "key"),
+            (Action::Expand, "key"),
             (Action::ScrollUp(3), "wheel"),
             (Action::ScrollDown(3), "wheel"),
             (Action::ToggleFullPaths, "key"),
@@ -1252,6 +1260,7 @@ mod tests {
             | Action::FocusToggle
             | Action::HunkNext
             | Action::HunkPrev
+            | Action::Expand
             | Action::ScrollUp(_)
             | Action::ScrollDown(_)
             | Action::ToggleFullPaths
@@ -1272,9 +1281,9 @@ mod tests {
             | Action::Ack
             | Action::Jump
             | Action::ScopeToggle
-            | Action::Herdr(_) => 30,
+            | Action::Herdr(_) => 31,
         };
-        assert_eq!(table.len(), 30);
+        assert_eq!(table.len(), 31);
     }
 
     #[test]
@@ -1396,6 +1405,59 @@ mod tests {
             "{:?}",
             reqs[0].1
         );
+    }
+
+    /// `e` vs a click on the `[e expand]` control of a collapsed row: both ask the engine
+    /// for the same row and land on one `App` (§6.7 parity). On a **binary** row the
+    /// control is not drawn at all, so there is nothing to click and the key is a no-op —
+    /// the two paths agree there too.
+    #[test]
+    fn input_parity_expand() {
+        let km = Keymap::defaults();
+        let mut base = three_roots();
+        base.handle(Action::Resize(100, 30));
+        base.apply(pile_event_seq(
+            "alpha",
+            1,
+            alpha_collapsed(lastcall_engine::scan::Collapsed::Glob),
+        ));
+        base.select(Some(row("alpha", "f1")));
+        let (_, hits) = frame(&base);
+        let mut by_key = base.clone();
+        let mut by_mouse = base;
+
+        let by_key_effect = press_key(&mut by_key, &km, key('e'));
+        let by_mouse_effect = click(&mut by_mouse, &km, &hits, &Target::Expand);
+
+        assert_eq!(by_key, by_mouse);
+        assert_eq!(by_key_effect, by_mouse_effect);
+        assert_eq!(frame(&by_key).0, frame(&by_mouse).0);
+        let Some(Effect::Expand(root_asked, row_asked)) = by_key_effect.1 else {
+            panic!("an expand effect: {by_key_effect:?}");
+        };
+        assert_eq!(root_asked, root("alpha"));
+        assert_eq!(row_asked.path, b"f1");
+
+        // Binary: no control on screen, and the key does nothing.
+        let mut binary = three_roots();
+        binary.handle(Action::Resize(100, 30));
+        binary.apply(pile_event_seq(
+            "alpha",
+            1,
+            alpha_collapsed(lastcall_engine::scan::Collapsed::Binary),
+        ));
+        binary.select(Some(row("alpha", "f1")));
+        let (_, binary_hits) = frame(&binary);
+        assert!(
+            !binary_hits
+                .targets
+                .iter()
+                .any(|(_, t)| *t == Target::Expand),
+            "a binary row offers no expand control"
+        );
+        let before = binary.clone();
+        assert_eq!(press_key(&mut binary, &km, key('e')), (Changed::No, None));
+        assert_eq!(binary, before);
     }
 
     /// `d` vs a click on the nav dot: both select the root and ack it, and land on one

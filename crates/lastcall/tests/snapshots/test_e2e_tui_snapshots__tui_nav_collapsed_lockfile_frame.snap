@@ -2,13 +2,11 @@
 source: crates/lastcall/tests/test_e2e_tui_snapshots.rs
 expression: frame
 ---
-"lastcall  3 repos · 6 files · 5 hunks  standalone  [Accept All]                           watching W"
+"lastcall  3 repos · 4 files · 3 hunks  standalone  [Accept All]                           watching W"
 "┌──────────────────────────┬───────────────────────────────────────────────────────────────────────┐"
-"│alpha                     │Cargo.lock  A  +3 −0                                    [A accept file]│"
-"│  main · 3 files          │collapsed (glob) · +3 −0                                     [e expand]│"
-"│  A Cargo.lock ⊟  +3 −0   │                                                                       │"
-"│  M f1  +1 −1             │                                                                       │"
-"│  M f2  +1 −0             │                                                                       │"
+"│alpha                     │package-lock.json  M  +2,879 −2,666                     [A accept file]│"
+"│  main · 1 file           │collapsed (glob) · +2,879 −2,666                             [e expand]│"
+"│  M pack… ⊟  +2,879 −2,666│                                                                       │"
 "│──────────────────────────│                                                                       │"
 "│beta                      │                                                                       │"
 "│  main · 2 files          │                                                                       │"
@@ -19,6 +17,8 @@ expression: frame
 "│notes                     │                                                                       │"
 "│  draft · 1 file          │                                                                       │"
 "│  M n2.md  +2 −0          │                                                                       │"
+"│                          │                                                                       │"
+"│                          │                                                                       │"
 "│                          │                                                                       │"
 "│                          │                                                                       │"
 "│                          │                                                                       │"

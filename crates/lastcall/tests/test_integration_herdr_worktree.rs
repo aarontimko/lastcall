@@ -80,6 +80,7 @@ async fn herdr_worktree_created_rescans_within_the_debounce_not_the_backstop() {
         debounce: Duration::from_millis(100),
         head_poll: BACKSTOP,
         rescan: BACKSTOP,
+        ..EngineTimings::default()
     });
     wait_live(&mut watcher).await;
 

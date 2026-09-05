@@ -2,13 +2,13 @@
 source: crates/lastcall/tests/test_e2e_tui_snapshots.rs
 expression: frame
 ---
-"lastcall  3 repos · 6 files · 5 hunks  standalone  [Accept All]                           watching W"
+"lastcall  3 repos · 6 files · 4 hunks  standalone  [Accept All]                           watching W"
 "┌──────────────────────────┬───────────────────────────────────────────────────────────────────────┐"
-"│alpha                     │Cargo.lock  A  +3 −0                                    [A accept file]│"
-"│  main · 3 files          │collapsed (glob) · +3 −0                                     [e expand]│"
-"│  A Cargo.lock ⊟  +3 −0   │                                                                       │"
-"│  M f1  +1 −1             │                                                                       │"
-"│  M f2  +1 −0             │                                                                       │"
+"│alpha                     │img.png  M  +3 −1                                       [A accept file]│"
+"│  main · 3 files          │collapsed (binary) · +3 −1 · not expandable                            │"
+"│  M at_limit.txt  +1 −1   │                                                                       │"
+"│  M img.png ⊟  +3 −1      │                                                                       │"
+"│  M over_limit.t… ⊟  +1 −0│                                                                       │"
 "│──────────────────────────│                                                                       │"
 "│beta                      │                                                                       │"
 "│  main · 2 files          │                                                                       │"

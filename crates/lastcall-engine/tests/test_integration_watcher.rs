@@ -49,6 +49,7 @@ async fn watcher_commit_without_file_activity_triggers_head_inspection() {
         debounce: Duration::from_millis(100),
         head_poll: Duration::from_millis(250),
         rescan: Duration::from_secs(60),
+        ..EngineTimings::default()
     });
     // The initial scan.
     let first = next_event(&mut w, Duration::from_secs(5))
@@ -114,6 +115,7 @@ async fn watcher_worktree_edit_schedules_a_scan_without_polling() {
         debounce: Duration::from_millis(100),
         head_poll: Duration::from_secs(60),
         rescan: Duration::from_secs(60),
+        ..EngineTimings::default()
     });
     let first = next_event(&mut w, Duration::from_secs(5))
         .await
@@ -152,6 +154,7 @@ async fn watcher_ignore_globs_do_not_hide_tracked_edits() {
         debounce: Duration::from_millis(100),
         head_poll: Duration::from_secs(60),
         rescan: Duration::from_millis(1500),
+        ..EngineTimings::default()
     });
     let first = next_event(&mut w, Duration::from_secs(5))
         .await
@@ -201,6 +204,7 @@ async fn watcher_request_rescan_finds_a_new_root_without_waiting_for_the_backsto
         debounce: Duration::from_millis(100),
         head_poll: Duration::from_secs(60),
         rescan: Duration::from_secs(60),
+        ..EngineTimings::default()
     });
     wait_live(&mut w).await;
 

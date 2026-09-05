@@ -424,7 +424,9 @@ fn bench_s2_diff_100k_lines() {
     bench(S, "scan_spawns", spawns);
 
     let mut pty = b.tui(&["tui", "--poll", "1"]);
-    pty.wait_for_text("M big.txt", LONG)
+    // `M big` and not `M big.txt`: `+99,989 −99,989` (thousands separators, ruling 2)
+    // leaves the 28-column nav no room for the extension, so the name renders `big.…`.
+    pty.wait_for_text("M big", LONG)
         .unwrap_or_else(|e| panic!("the row: {e}"));
     let t = Instant::now();
     pty.send(b"jj\r").expect("open");

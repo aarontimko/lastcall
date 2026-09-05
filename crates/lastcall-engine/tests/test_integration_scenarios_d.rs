@@ -192,6 +192,53 @@ fn scenario_d7_collapsed_glob() {
     assert_pile!(s.engine, s.root, "");
 }
 
+/// D7 at the scenario's own size: `npm install` rewrites a 4,000-line lockfile. The row is
+/// one accept, the counts are still live (thousands added and deleted), and nothing under
+/// the frozen default `collapsed_globs` was overridden. Phase 6 gate item 2.
+#[test]
+fn scenario_d7_lockfile_churn_is_one_accept_row() {
+    let before: String = (0..4_000)
+        .map(|i| format!("    \"pkg-{i}\": {{ \"version\": \"1.0.{i}\" }},\n"))
+        .collect();
+    let mut repo = FixtureRepo::new("d7-churn").unwrap();
+    repo.commit_files(&[("package-lock.json", before.as_str())], "lock")
+        .unwrap();
+    // The frozen defaults: no `collapsed_globs` or `collapse_size_bytes` override.
+    let mut s = Fresh::over(repo, Config::default(), EngineOptions::default(), false);
+    // `npm install`: most versions move, so most lines are rewritten in place.
+    let after: String = (0..4_000)
+        .map(|i| {
+            if i % 3 == 0 {
+                format!("    \"pkg-{i}\": {{ \"version\": \"1.0.{i}\" }},\n")
+            } else {
+                format!("    \"pkg-{i}\": {{ \"version\": \"2.4.{i}\" }},\n")
+            }
+        })
+        .collect();
+    s.repo.write("package-lock.json", &after);
+    assert!(
+        after.len() < 512 * 1024,
+        "the lockfile is under collapse_size_bytes, so Glob is the reason: {}",
+        after.len()
+    );
+
+    let pile = assert_pile!(s.engine, s.root, "package-lock.json");
+    assert_eq!(pile.rows.len(), 1, "one row, not thousands of hunks");
+    let row = pile.row(b"package-lock.json").unwrap();
+    assert_eq!(row.collapsed, Some(Collapsed::Glob));
+    assert!(row.hunks.is_empty(), "collapsed rows carry no hunks");
+    assert!(
+        row.added + row.deleted > 3_000,
+        "the counts stay live on a collapsed row: +{} −{}",
+        row.added,
+        row.deleted
+    );
+
+    // One accept clears the whole row (§6.3 "single accept").
+    assert!(s.accept_file("package-lock.json").ok());
+    assert_pile!(s.engine, s.root, "");
+}
+
 #[test]
 fn scenario_d8_binary_and_oversize_collapse() {
     let mut repo = FixtureRepo::new("d8").unwrap();
@@ -220,6 +267,107 @@ fn scenario_d8_binary_and_oversize_collapse() {
     );
     assert!(pile.rows.iter().all(|r| r.hunks.is_empty()));
     assert!(s.accept_all().ok());
+    assert_pile!(s.engine, s.root, "");
+}
+
+/// D8 at the **frozen default** `collapse_size_bytes` (512 KiB, no override): the 2 MB
+/// binary and the 600 KiB generated file of the scenario, plus the boundary the code's
+/// strict `>` defines — 524,288 bytes is not collapsed, 524,289 is. Phase 6 gate item 3.
+#[test]
+fn scenario_d8_binary_and_oversize_at_the_frozen_default() {
+    const LIMIT: usize = 512 * 1024; // 524,288
+    const BINARY_PROBE_WINDOW: usize = 8_000;
+
+    // `line` is 32 bytes with its terminator, so LIMIT is a whole number of lines and
+    // "one byte over" is a one-byte unterminated tail rather than a whole extra line.
+    let line = |c: char| format!("{}\n", std::iter::repeat_n(c, 31).collect::<String>());
+    let at_limit: String = std::iter::repeat_n(line('a'), LIMIT / 32).collect();
+    assert_eq!(at_limit.len(), LIMIT);
+
+    // A 2 MB PNG-shaped blob: the magic, then the IHDR length word whose NUL bytes land
+    // inside the binary probe window (git's heuristic is a NUL in the first 8,000 bytes).
+    let mut png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR".to_vec();
+    png.resize(2 * 1024 * 1024, b'\x42');
+    assert!(
+        png[..BINARY_PROBE_WINDOW].contains(&0),
+        "NUL in the probe window"
+    );
+    // A 600 KiB generated file, text throughout.
+    let generated: String = (0..31_000)
+        .map(|i| format!("generated line {i}\n"))
+        .collect();
+    assert!(
+        generated.len() > 600 * 1024 && generated.len() < 700 * 1024,
+        "≈600 KiB of text: {}",
+        generated.len()
+    );
+
+    let mut repo = FixtureRepo::new("d8-default").unwrap();
+    repo.commit_files(
+        &[
+            ("img.png", "placeholder\n"),
+            ("generated.txt", "seed\n"),
+            ("at_limit.txt", at_limit.as_str()),
+            ("over_limit.txt", at_limit.as_str()),
+        ],
+        "seed",
+    )
+    .unwrap();
+    // No config override: this is what a user gets out of the box.
+    let mut s = Fresh::over(repo, Config::default(), EngineOptions::default(), false);
+    assert_eq!(s.engine.config().collapse_size_bytes, LIMIT as u64);
+
+    s.repo.write("img.png", &png);
+    s.repo.write("generated.txt", &generated);
+    // Exactly at the limit on both sides: `>` is strict, so this is a normal hunk row.
+    let mut changed_at_limit = at_limit.clone();
+    changed_at_limit.replace_range(0..32, &line('b'));
+    assert_eq!(changed_at_limit.len(), LIMIT);
+    s.repo.write("at_limit.txt", &changed_at_limit);
+    // One byte over on the new side.
+    let over = format!("{at_limit}x");
+    assert_eq!(over.len(), LIMIT + 1);
+    s.repo.write("over_limit.txt", &over);
+
+    let pile = assert_pile!(
+        s.engine,
+        s.root,
+        "at_limit.txt|generated.txt|img.png|over_limit.txt"
+    );
+    assert_eq!(
+        pile.row(b"img.png").unwrap().collapsed,
+        Some(Collapsed::Binary),
+        "a 2 MB file with a NUL in its first bytes is Binary"
+    );
+    assert_eq!(
+        pile.row(b"generated.txt").unwrap().collapsed,
+        Some(Collapsed::Size),
+        "a 600 KiB text file is over the 512 KiB default"
+    );
+    assert_eq!(
+        pile.row(b"at_limit.txt").unwrap().collapsed,
+        None,
+        "524,288 bytes is not over 524,288"
+    );
+    assert!(
+        !pile.row(b"at_limit.txt").unwrap().hunks.is_empty(),
+        "a row at the boundary keeps its hunks"
+    );
+    assert_eq!(
+        pile.row(b"over_limit.txt").unwrap().collapsed,
+        Some(Collapsed::Size),
+        "524,289 bytes is over the limit"
+    );
+    for path in [&b"img.png"[..], b"generated.txt", b"over_limit.txt"] {
+        let row = pile.row(path).unwrap();
+        assert!(
+            row.hunks.is_empty(),
+            "{} is collapsed, so it carries no hunks",
+            row.path_lossy()
+        );
+    }
+
+    assert!(s.accept_all_snapshot(&pile).ok());
     assert_pile!(s.engine, s.root, "");
 }
 

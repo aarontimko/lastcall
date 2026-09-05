@@ -27,13 +27,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crossterm::event::Event;
+use crossterm::event::{Event, MouseButton, MouseEvent, MouseEventKind};
 use lastcall_engine::engine::{AcceptRequest, Engine};
 use lastcall_engine::env::Env;
 use lastcall_engine::herdr::HerdrEvent;
 use lastcall_engine::herdr::client::ClientHandle;
 use lastcall_engine::herdr::transport::SocketTransport;
-use lastcall_engine::scan::Pile;
+use lastcall_engine::hunks::Expanded;
+use lastcall_engine::scan::{Pile, Row};
 use lastcall_engine::watcher::{EngineEvent, EngineTimings, Watcher, blocking};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -75,6 +76,10 @@ pub enum Local {
     Fatal(String),
     /// A herdr request the loop made off the UI task came back (`agent.focus`, a toast).
     Herdr(HerdrUpdate),
+    /// An `Effect::Expand` finished: one collapsed row's on-demand hunks (deliverable 4).
+    /// The row `hunks_of` was given travels back with the answer, so the app can tell an
+    /// answer for the oids on screen from one for oids a pile has since replaced.
+    Expanded(PathBuf, Box<Row>, Expanded),
 }
 
 /// The terminal-free core of the loop: the app, the keymap, and the hit map of the last
@@ -173,13 +178,170 @@ impl Ui {
                 (Changed::No, Some(Effect::Quit))
             }
             Local::Herdr(update) => self.app.handle(Action::Herdr(update)),
+            Local::Expanded(root, row, view) => (self.app.set_expanded(root, &row, view), None),
         }
     }
 
     /// Record the hit map a render produced.
     pub fn rendered(&mut self, hits: HitMap) {
+        // Deliverable 9: only a frame that actually drew the nav has an offset to report.
+        // A `None` means the nav was not on screen (below `NAV_MIN_COLS`), and the app keeps
+        // the offset it had, so widening the window returns the reader where they were.
+        if let Some(top) = hits.nav_top {
+            self.app.nav_top = top;
+        }
         self.hits = Some(hits);
     }
+}
+
+/// Round-robin **rounds** one pass drains beyond the event the `select!` woke on; a round
+/// polls each of the four sources once, so a pass folds at most four times this many
+/// events. A pass that keeps folding forever is a pass that never draws, so the drain stops
+/// here whatever is still queued — the next iteration picks the rest up (deliverable 6).
+pub const DRAIN_CAP: usize = 256;
+
+/// Why a pass ended the loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Stop {
+    /// `Effect::Quit`: the user asked to leave.
+    Quit,
+    /// `Local::Fatal`: an engine task died; the panic hook already restored the terminal.
+    Fatal(String),
+}
+
+/// One turn of the loop: everything folded since the last frame, and what it asks for.
+/// The loop runs `effects` in order, breaks on `stop`, and draws **once** when
+/// `changed == Yes` — not once per event (deliverable 6).
+#[derive(Debug, Default, PartialEq)]
+pub struct Pass {
+    pub changed: Changed,
+    /// The first source that made this pass worth drawing; the `cause=` of the `draw` probe.
+    pub cause: Option<&'static str>,
+    pub effects: Vec<Effect>,
+    pub stop: Option<Stop>,
+    /// A herdr `worktree.*` event was drained in this pass. The loop **arms** the
+    /// `WORKTREE_DEBOUNCE` timer for it exactly as the `select!` arm does for the event it
+    /// woke on — never a rescan on the spot, which would bypass the Phase 5 debounce and
+    /// cancel a timer an earlier event of the same burst had armed (verifier (b) F2).
+    pub worktree: bool,
+    /// A mouse press the drain refused to fold because the pass already has something to
+    /// draw. It is folded at the top of the next iteration, **after** the frame, so a press
+    /// always resolves against the hit map of a frame the user actually saw.
+    pub held: Option<Event>,
+}
+
+impl Pass {
+    /// A pass seeded with what the `select!` arm folded. It goes through [`Pass::fold`] so
+    /// the seed obeys every rule the drained events do — in particular a `q` that arrives as
+    /// the pass's *first* event is a `Stop::Quit`, not an effect for the dispatch loop.
+    fn of(source: &'static str, changed: Changed, effect: Option<Effect>) -> Self {
+        let mut pass = Self::default();
+        pass.fold(source, (changed, effect));
+        pass
+    }
+
+    /// Fold one event's outcome in. `source` is one of `input`, `engine`, `local`, `herdr`,
+    /// `timer`, `tick`: deliverable 8's `fold source= changed=` probe, and the `cause=` the
+    /// draw that follows reports — the first source that made the pass worth drawing, which
+    /// is the question "why did the screen just repaint?" answers with.
+    fn fold(&mut self, source: &'static str, (changed, effect): (Changed, Option<Effect>)) {
+        tracing::debug!(source, changed = ?changed, "fold");
+        if changed == Changed::Yes && self.cause.is_none() {
+            self.cause = Some(source);
+        }
+        self.changed = self.changed.or(changed);
+        match effect {
+            Some(Effect::Quit) => self.stop = Some(Stop::Quit),
+            Some(other) => self.effects.push(other),
+            None => {}
+        }
+    }
+}
+
+/// The loop's event queues, by mutable reference so a test can build them with
+/// `mpsc::unbounded_channel` / `mpsc::channel` and drive [`drain`] without a `Watcher`,
+/// a terminal or a runtime.
+pub(crate) struct Sources<'a> {
+    pub engine: &'a mut mpsc::Receiver<EngineEvent>,
+    pub input: &'a mut mpsc::UnboundedReceiver<Event>,
+    pub local: &'a mut mpsc::UnboundedReceiver<Local>,
+}
+
+/// Fold every event already queued into `pass`, up to [`DRAIN_CAP`], so a burst of piles or
+/// a wheel spin costs one frame instead of one frame each.
+///
+/// The rules, in the order they matter:
+///
+/// - `Effect::Quit` and `Local::Fatal` end the drain at once; whatever is still queued is
+///   never folded, because the loop is leaving.
+/// - A mouse `Press` ends the drain **once the pass has something to draw**, and is handed
+///   back in `Pass::held` rather than folded: a press resolves through the hit map of the
+///   last drawn frame, so folding it behind an undrawn change would resolve it against a
+///   frame nobody saw. Every other input event — keys, the wheel, resizes — folds freely.
+/// - Sources are polled round-robin and the drain ends when a whole round is empty.
+pub(crate) fn drain(ui: &mut Ui, sources: &mut Sources<'_>, link: &mut Herdr, pass: &mut Pass) {
+    for _ in 0..DRAIN_CAP {
+        if pass.stop.is_some() || pass.held.is_some() {
+            return;
+        }
+        let mut any = false;
+        if let Ok(event) = sources.input.try_recv() {
+            any = true;
+            if is_press(&event) && pass.changed == Changed::Yes {
+                pass.held = Some(event);
+                return;
+            }
+            pass.fold("input", ui.event(&event));
+        }
+        if pass.stop.is_none()
+            && let Ok(event) = sources.engine.try_recv()
+        {
+            any = true;
+            pass.fold("engine", ui.engine(event));
+        }
+        if pass.stop.is_none()
+            && let Ok(local) = sources.local.try_recv()
+        {
+            any = true;
+            match local {
+                Local::Fatal(text) => {
+                    pass.stop = Some(Stop::Fatal(text));
+                    return;
+                }
+                Local::Roots(metas) => {
+                    pass.fold("local", ui.local(Local::Roots(metas)));
+                    pass.fold("local", herdr_rederive(ui, link));
+                }
+                other => pass.fold("local", ui.local(other)),
+            }
+        }
+        if pass.stop.is_none()
+            && let Some(rx) = link.events.as_mut()
+            && let Ok(event) = rx.try_recv()
+        {
+            any = true;
+            pass.worktree |= herdr::triggers_rescan(&event);
+            if let Some(update) = herdr::update_of(&event) {
+                pass.fold("herdr", ui.app.handle(Action::Herdr(update)));
+            }
+            if herdr::rederives(&event) {
+                pass.fold("herdr", herdr_rederive(ui, link));
+            }
+        }
+        if !any {
+            return;
+        }
+    }
+}
+
+fn is_press(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            ..
+        })
+    )
 }
 
 /// The quit sequence's three steps, in the only safe order (see [`shut_down`]).
@@ -336,6 +498,35 @@ fn spawn_accept(
     });
 }
 
+/// `Effect::Expand`: one collapsed row's hunks off the UI task (deliverable 4). The row
+/// travels with the request, so the diff is computed from the oids the screen was showing;
+/// a failure is a notice, never a fatal — the row is still there to accept whole.
+fn spawn_expand(
+    engine: &Arc<Mutex<Engine>>,
+    tx: mpsc::UnboundedSender<Local>,
+    root: PathBuf,
+    row: Box<Row>,
+) {
+    let engine = engine.clone();
+    tokio::spawn(async move {
+        let task = tokio::spawn(async move {
+            blocking(&engine, move |e| {
+                let view = e.hunks_of(&root, &row);
+                (root, row, view)
+            })
+            .await
+        });
+        let Some((root, row, view)) = joined(task, &tx, "expand").await else {
+            return;
+        };
+        let local = match view {
+            Ok(view) => Local::Expanded(root, row, view),
+            Err(e) => Local::Notice(Some(root), format!("expand failed: {e}")),
+        };
+        let _ = tx.send(local);
+    });
+}
+
 /// `Effect::SyncRoots`: re-read every root's metadata off the UI task.
 fn spawn_sync_roots(engine: &Arc<Mutex<Engine>>, tx: mpsc::UnboundedSender<Local>) {
     let engine = engine.clone();
@@ -367,7 +558,7 @@ async fn joined<T>(
 /// The loop's half of the herdr link: what it needs to derive, to request, and to stop.
 /// The reducer sees none of this (§6.6).
 #[derive(Default)]
-struct Herdr {
+pub(crate) struct Herdr {
     handle: Option<ClientHandle>,
     transport: Option<SocketTransport>,
     events: Option<mpsc::Receiver<HerdrEvent>>,
@@ -586,13 +777,18 @@ pub fn run(
             let mut fatal: Option<String> = None;
             // Set by a `worktree.*` event, fired once the burst has been quiet this long.
             let mut worktree_due: Option<tokio::time::Instant> = None;
+            // A press the previous pass refused to fold (see [`drain`]): folded here,
+            // after that pass drew, so it resolves against the frame the user saw.
+            let mut held: Option<Event> = None;
             loop {
                 // Copied out so the timer future borrows nothing a handler assigns to.
                 let due = worktree_due;
                 let mut rescan = false;
-                let (changed, effect) = tokio::select! {
+                let (source, (changed, effect)) = match held.take() {
+                    Some(event) => ("input", ui.event(&event)),
+                    None => tokio::select! {
                     _ = signals.recv() => break,
-                    event = watcher.events.recv() => match event {
+                    event = watcher.events.recv() => ("engine", match event {
                         Some(event) => ui.engine(event),
                         None => {
                             tracing::warn!("watcher ended; exiting");
@@ -600,12 +796,12 @@ pub fn run(
                             draw(&mut terminal, &mut ui)?;
                             break;
                         }
-                    },
-                    event = input_rx.recv() => match event {
+                    }),
+                    event = input_rx.recv() => ("input", match event {
                         Some(event) => ui.event(&event),
                         None => break, // the reader thread died
-                    },
-                    local = local_rx.recv() => match local {
+                    }),
+                    local = local_rx.recv() => ("local", match local {
                         Some(Local::Fatal(text)) => {
                             fatal = Some(text);
                             break;
@@ -618,8 +814,8 @@ pub fn run(
                         }
                         Some(local) => ui.local(local),
                         None => (Changed::No, None),
-                    },
-                    event = herdr_recv(&mut link.events) => match event {
+                    }),
+                    event = herdr_recv(&mut link.events) => ("herdr", match event {
                         Some(event) => {
                             if herdr::triggers_rescan(&event) {
                                 worktree_due =
@@ -644,8 +840,8 @@ pub fn run(
                             link.events = None;
                             (Changed::No, None)
                         }
-                    },
-                    opened = connect_ready(&mut connecting) => match opened {
+                    }),
+                    opened = connect_ready(&mut connecting) => ("herdr", match opened {
                         // The badge itself comes later, with the client's `Connected`.
                         Some(Ok(open)) => {
                             link = Herdr::adopt(open, local_tx.clone());
@@ -657,7 +853,7 @@ pub fn run(
                             (changed, None)
                         }
                         None => (Changed::No, None),
-                    },
+                    }),
                     _ = async {
                         match due {
                             Some(at) => tokio::time::sleep_until(at).await,
@@ -665,48 +861,92 @@ pub fn run(
                         }
                     } => {
                         rescan = true;
-                        (Changed::No, None)
+                        ("timer", (Changed::No, None))
                     }
-                    _ = tick.tick() => ui.app.handle(Action::Tick),
+                    _ = tick.tick() => ("tick", ui.app.handle(Action::Tick)),
+                    },
                 };
+                // Everything else already queued joins this pass, so a burst of piles or a
+                // wheel spin costs one frame rather than one frame each (deliverable 6).
+                let mut pass = Pass::of(source, changed, effect);
+                {
+                    let mut sources = Sources {
+                        engine: &mut watcher.events,
+                        input: &mut input_rx,
+                        local: &mut local_rx,
+                    };
+                    drain(&mut ui, &mut sources, &mut link, &mut pass);
+                }
+                held = pass.held.take();
                 if rescan {
                     // Deliverable 7: the event is only a trigger — `roots::discover` decides
                     // what is a root, and `RootsChanged` + the new pile take the usual path.
                     worktree_due = None;
                     watcher.request_rescan();
                 }
-                match effect {
-                    Some(Effect::Quit) => break,
-                    Some(Effect::Refresh) => spawn_refresh(&watcher.engine, local_tx.clone()),
-                    Some(Effect::SyncRoots) => spawn_sync_roots(&watcher.engine, local_tx.clone()),
-                    Some(Effect::Accept(reqs)) => {
-                        spawn_accept(&watcher.engine, local_tx.clone(), reqs)
-                    }
-                    Some(Effect::Focus(pane)) => {
-                        let label = ui
-                            .app
-                            .herdr
-                            .roots
-                            .values()
-                            .find(|f| f.pane.as_deref() == Some(pane.as_str()))
-                            .map(|f| f.agent_label())
-                            .unwrap_or_else(|| pane.clone());
-                        spawn_focus(link.transport.clone(), local_tx.clone(), pane, label);
-                    }
-                    Some(Effect::Toast(request)) => {
-                        if let Some(tx) = &link.toast {
-                            for (root, name) in request.ready {
-                                let _ = tx.send(ToastMsg::Ready { root, name });
-                            }
-                            for root in request.dropped {
-                                let _ = tx.send(ToastMsg::Drop(root));
+                if pass.worktree {
+                    // A drained `worktree.*` event (re)arms the debounce, after the timer
+                    // check above so an event that shares a pass with the timer firing
+                    // opens the next window rather than being folded into the old one.
+                    worktree_due = Some(tokio::time::Instant::now() + WORKTREE_DEBOUNCE);
+                }
+                let mut stop = pass.stop;
+                for effect in pass.effects {
+                    match effect {
+                        // `Pass::of` and `Pass::fold` both route a quit into `Pass::stop`, so
+                        // this arm is belt and braces — and never a `break`, which would only
+                        // leave this `for` and drop the rest of the pass's effects.
+                        Effect::Quit => stop = Some(Stop::Quit),
+                        Effect::Refresh => spawn_refresh(&watcher.engine, local_tx.clone()),
+                        Effect::SyncRoots => spawn_sync_roots(&watcher.engine, local_tx.clone()),
+                        Effect::Accept(reqs) => {
+                            spawn_accept(&watcher.engine, local_tx.clone(), reqs)
+                        }
+                        Effect::Expand(root, row) => {
+                            spawn_expand(&watcher.engine, local_tx.clone(), root, row)
+                        }
+                        Effect::Focus(pane) => {
+                            let label = ui
+                                .app
+                                .herdr
+                                .roots
+                                .values()
+                                .find(|f| f.pane.as_deref() == Some(pane.as_str()))
+                                .map(|f| f.agent_label())
+                                .unwrap_or_else(|| pane.clone());
+                            spawn_focus(link.transport.clone(), local_tx.clone(), pane, label);
+                        }
+                        Effect::Toast(request) => {
+                            if let Some(tx) = &link.toast {
+                                for (root, name) in request.ready {
+                                    let _ = tx.send(ToastMsg::Ready { root, name });
+                                }
+                                for root in request.dropped {
+                                    let _ = tx.send(ToastMsg::Drop(root));
+                                }
                             }
                         }
                     }
+                }
+                match stop {
+                    Some(Stop::Quit) => break,
+                    Some(Stop::Fatal(text)) => {
+                        fatal = Some(text);
+                        break;
+                    }
                     None => {}
                 }
-                if changed == Changed::Yes {
+                if pass.changed == Changed::Yes {
+                    // Deliverable 8: one line per repaint, saying why and how long. A
+                    // `draw` per pile in a burst is the symptom deliverable 6 removed, and
+                    // this is how the sponsor sees it stay removed.
+                    let started = std::time::Instant::now();
                     draw(&mut terminal, &mut ui)?;
+                    tracing::debug!(
+                        cause = pass.cause.unwrap_or("unknown"),
+                        ms = started.elapsed().as_millis() as u64,
+                        "draw"
+                    );
                 }
             }
             // A connect still in flight has nothing left to deliver.
@@ -791,6 +1031,278 @@ mod tests {
         })
         .unwrap();
         term.backend().to_string()
+    }
+
+    /// Channels a `drain` test drives: the three loop queues plus the herdr link, none of
+    /// which needs a `Watcher`, a terminal or a runtime.
+    struct Wires {
+        engine_tx: mpsc::Sender<EngineEvent>,
+        engine_rx: mpsc::Receiver<EngineEvent>,
+        input_tx: mpsc::UnboundedSender<Event>,
+        input_rx: mpsc::UnboundedReceiver<Event>,
+        local_tx: mpsc::UnboundedSender<Local>,
+        local_rx: mpsc::UnboundedReceiver<Local>,
+        link: Herdr,
+    }
+
+    impl Wires {
+        fn new() -> Self {
+            let (engine_tx, engine_rx) = mpsc::channel(512);
+            let (input_tx, input_rx) = mpsc::unbounded_channel();
+            let (local_tx, local_rx) = mpsc::unbounded_channel();
+            Self {
+                engine_tx,
+                engine_rx,
+                input_tx,
+                input_rx,
+                local_tx,
+                local_rx,
+                link: Herdr::default(),
+            }
+        }
+
+        fn drain_into(&mut self, ui: &mut Ui, seed: (Changed, Option<Effect>)) -> Pass {
+            let mut pass = Pass::of("select", seed.0, seed.1);
+            let mut sources = Sources {
+                engine: &mut self.engine_rx,
+                input: &mut self.input_rx,
+                local: &mut self.local_rx,
+            };
+            drain(ui, &mut sources, &mut self.link, &mut pass);
+            pass
+        }
+    }
+
+    /// Deliverable 9: `Ui::rendered` is where the frame's nav offset becomes the app's, and
+    /// it writes back **only** what a frame that drew the nav reported. Below
+    /// `NAV_MIN_COLS` there is no nav pane and therefore no offset, so a narrow window must
+    /// not reset one the reader will see again when it widens.
+    #[test]
+    fn run_nav_offset_is_written_back_only_by_a_frame_that_drew_the_nav() {
+        fn draw_at(ui: &mut Ui, w: u16, h: u16) -> Option<usize> {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            let mut hits = HitMap::default();
+            term.draw(|f| hits = render(&ui.app, f)).unwrap();
+            let reported = hits.nav_top;
+            ui.rendered(hits);
+            reported
+        }
+
+        let mut app = App::new();
+        app.sync_roots(vec![meta("alpha")]);
+        app.apply(pile_event("alpha", rows_n(60, 0, 0)));
+        app.handle(Action::Resize(100, 30));
+        let mut ui = Ui::new(app, Keymap::defaults());
+
+        // A selection deep in the list scrolls the nav and the offset lands on the app.
+        ui.app.select(Some(row("alpha", "p50")));
+        assert!(draw_at(&mut ui, 100, 30).is_some());
+        let scrolled = ui.app.nav_top;
+        assert!(scrolled > 0, "the nav scrolled to reach p50");
+
+        // 60 columns is under `NAV_MIN_COLS`: no nav, nothing to report, nothing written.
+        ui.app.handle(Action::Resize(60, 30));
+        assert_eq!(draw_at(&mut ui, 60, 30), None, "no nav pane, no offset");
+        assert_eq!(
+            ui.app.nav_top, scrolled,
+            "the offset survived the narrow frame"
+        );
+
+        // Wide again, and the reader is where they were.
+        ui.app.handle(Action::Resize(100, 30));
+        assert_eq!(draw_at(&mut ui, 100, 30), Some(scrolled));
+        assert_eq!(ui.app.nav_top, scrolled);
+    }
+
+    /// Deliverable 6(a): a burst of piles is **one** pass and therefore one frame. Before
+    /// the drain the loop drew once per `Changed::Yes`, so a rescan of many roots repainted
+    /// the screen once per root.
+    #[test]
+    fn run_drain_folds_a_burst_of_piles_into_one_pass() {
+        let mut ui = ui();
+        let mut wires = Wires::new();
+        // Both pile sources at once: the drain is round-robin, and the highest `seq` wins
+        // whichever queue it arrived on.
+        for seq in 1..=17u64 {
+            let pile = alpha_hunks(seq as usize);
+            if seq % 2 == 0 {
+                wires
+                    .engine_tx
+                    .try_send(EngineEvent::Pile {
+                        root: root("alpha"),
+                        seq,
+                        pile,
+                    })
+                    .unwrap();
+            } else {
+                wires
+                    .local_tx
+                    .send(Local::Pile(root("alpha"), seq, pile))
+                    .unwrap();
+            }
+        }
+        let pass = wires.drain_into(&mut ui, (Changed::No, None));
+        assert_eq!(pass.changed, Changed::Yes);
+        assert!(pass.stop.is_none() && pass.held.is_none());
+        assert!(pass.effects.is_empty(), "{:?}", pass.effects);
+        // The last pile won, and one render serves all seventeen.
+        assert_eq!(ui.app.roots[&root("alpha")].pile.rows[0].hunks.len(), 17);
+        render_into(&mut ui);
+        // Nothing is left queued: the whole burst was folded.
+        let after = wires.drain_into(&mut ui, (Changed::No, None));
+        assert_eq!(after, Pass::default());
+    }
+
+    /// A press must resolve against a frame the user saw. The key ahead of it in the queue
+    /// moves the page, so folding the press in the same pass would resolve it through the
+    /// hit map of the **old** frame; the drain hands it back instead, and the loop folds it
+    /// after drawing. The click then lands where the drawn frame says it does.
+    #[test]
+    fn run_drain_holds_a_press_behind_an_undrawn_change() {
+        let mut ui = ui();
+        render_into(&mut ui);
+        ui.app.select(Some(row("alpha", "f1")));
+        render_into(&mut ui);
+        let (x, y) = target_center(&ui, &Target::NavRow(root("beta"), b"u1".to_vec()));
+
+        let mut wires = Wires::new();
+        wires.input_tx.send(key(KeyCode::PageDown)).unwrap();
+        wires
+            .input_tx
+            .send(mouse(MouseEventKind::Down(MouseButton::Left), x, y))
+            .unwrap();
+        let pass = wires.drain_into(&mut ui, (Changed::No, None));
+        assert_eq!(pass.changed, Changed::Yes, "the page key moved something");
+        assert_eq!(
+            pass.cause,
+            Some("input"),
+            "deliverable 8: the draw reports the source that earned it"
+        );
+        let held = pass.held.expect("the press stayed queued");
+        assert!(is_press(&held));
+        assert_ne!(
+            ui.app.selection,
+            Some(row("beta", "u1")),
+            "the press has not been folded yet"
+        );
+
+        // The loop draws, then folds the held press against that frame.
+        render_into(&mut ui);
+        ui.event(&held);
+        assert_eq!(ui.app.selection, Some(row("beta", "u1")));
+
+        // A wheel event behind the same change folds freely: it needs no hit map.
+        wires.input_tx.send(key(KeyCode::PageUp)).unwrap();
+        wires
+            .input_tx
+            .send(mouse(MouseEventKind::ScrollDown, x, y))
+            .unwrap();
+        let pass = wires.drain_into(&mut ui, (Changed::No, None));
+        assert!(pass.held.is_none(), "the wheel is not a press");
+    }
+
+    /// `Quit` and `Local::Fatal` end the drain where they are: whatever is behind them is
+    /// never folded, because the loop is leaving.
+    #[test]
+    fn run_drain_stops_at_quit_and_at_a_fatal() {
+        // The seed obeys the same rule: a `q` pressed with an empty queue never reaches the
+        // effect dispatch, it *is* the stop.
+        let seeded = Pass::of("input", Changed::No, Some(Effect::Quit));
+        assert_eq!(seeded.stop, Some(Stop::Quit));
+        assert!(seeded.effects.is_empty());
+        {
+            let mut ui = ui();
+            let mut wires = Wires::new();
+            wires.input_tx.send(key(KeyCode::Char('r'))).unwrap();
+            wires.input_tx.send(key(KeyCode::Char('q'))).unwrap();
+            for seq in 1..=5 {
+                wires
+                    .local_tx
+                    .send(Local::Pile(root("alpha"), seq, alpha_hunks(seq as usize)))
+                    .unwrap();
+            }
+            let pass = wires.drain_into(&mut ui, (Changed::No, None));
+            assert_eq!(pass.stop, Some(Stop::Quit));
+            assert!(
+                matches!(pass.effects.as_slice(), [Effect::Refresh]),
+                "the refresh ahead of the quit still runs: {:?}",
+                pass.effects
+            );
+        }
+        {
+            let mut ui = ui();
+            let mut wires = Wires::new();
+            wires.local_tx.send(Local::RefreshDone).unwrap();
+            wires
+                .local_tx
+                .send(Local::Fatal("accept failed: panic".to_owned()))
+                .unwrap();
+            wires
+                .local_tx
+                .send(Local::Pile(root("alpha"), 9, alpha_hunks(3)))
+                .unwrap();
+            let pass = wires.drain_into(&mut ui, (Changed::No, None));
+            assert_eq!(
+                pass.stop,
+                Some(Stop::Fatal("accept failed: panic".to_owned()))
+            );
+            assert_eq!(
+                ui.app.roots[&root("alpha")].pile.rows[0].hunks.len(),
+                1,
+                "the pile behind the fatal was never folded"
+            );
+        }
+    }
+
+    /// Verifier (b) F2: a `worktree.*` event that reaches the loop through the drain must
+    /// take the same road as one that woke the `select!` — arm the debounce — so the pass
+    /// reports `worktree`, not a rescan to run now. Two in one pass are one flag: one
+    /// deadline, re-armed from the last of them.
+    #[test]
+    fn run_drain_reports_a_worktree_event_for_the_debounce_not_for_a_rescan() {
+        use lastcall_engine::herdr::client::WorktreeChange;
+        let worktree = |change| HerdrEvent::WorktreeChanged {
+            change,
+            workspace_id: "ws".to_owned(),
+            path: "/tmp/w/alpha-feat".to_owned(),
+            branch: None,
+        };
+        let mut ui = ui();
+        let mut wires = Wires::new();
+        let (htx, hrx) = mpsc::channel(8);
+        wires.link.events = Some(hrx);
+        htx.try_send(worktree(WorktreeChange::Created)).unwrap();
+        htx.try_send(worktree(WorktreeChange::Removed)).unwrap();
+        let pass = wires.drain_into(&mut ui, (Changed::No, None));
+        assert!(pass.worktree, "the drained events ask for the debounce");
+        assert_eq!(
+            pass.changed,
+            Changed::No,
+            "a worktree event draws nothing by itself"
+        );
+        assert!(pass.effects.is_empty() && pass.stop.is_none());
+
+        // A pass with no worktree event leaves the flag down.
+        let pass = wires.drain_into(&mut ui, (Changed::No, None));
+        assert!(!pass.worktree);
+    }
+
+    /// The cap bounds one pass: a queue longer than [`DRAIN_CAP`] draws, then continues.
+    #[test]
+    fn run_drain_stops_at_the_cap() {
+        let mut ui = ui();
+        let mut wires = Wires::new();
+        for _ in 0..DRAIN_CAP + 8 {
+            wires.input_tx.send(key(KeyCode::Char('f'))).unwrap();
+        }
+        let pass = wires.drain_into(&mut ui, (Changed::No, None));
+        assert_eq!(pass.changed, Changed::Yes);
+        // Eight are still queued for the next pass.
+        let mut left = 0;
+        while wires.input_rx.try_recv().is_ok() {
+            left += 1;
+        }
+        assert_eq!(left, 8);
     }
 
     /// The §11 hardening, at the loop's level: a watcher pile carrying a seq below the one

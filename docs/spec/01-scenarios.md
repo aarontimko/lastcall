@@ -46,6 +46,8 @@ Legend for the harness column: **H** = verifiable with the git-plumbing harness 
 
 **B9 — Agent pushes.** Setup: B1 (committed, pending). Action: `git push -u origin main`. Expect: pile unchanged `[f1]`. (The old model's sticky-classification hole does not exist: baseline is content.) *(H)*
 
+**B12 — A writer that never pauses (the debounce cap).** Setup: A1 repo; the watcher at production timings (750 ms trailing edge, 3 s cap from the first event of a burst — Amendment v1.6). Action: a process appends to a file inside the root every 300 ms for 6 s (an app at debug logging into the repo). Expect: the root is scanned about 3 s after the first event and about every 3 s while the writes continue, then once more 750 ms after the last write; every scan shows the file's content at that moment; no other file in the root is starved; a `HEAD` change mid-burst scans at once and opens a fresh 3 s window; a quiet root is never moved by another root's cap. Without the cap: one scan 750 ms after the burst ends and none during it. *(E — `watcher_debounce_cap_scans_a_never_quiet_root_about_every_three_seconds`, `watcher_a_head_change_scan_mid_burst_leaves_no_redundant_capped_scan`, `watcher_debounce_cap_does_not_move_a_quiet_root`; real-time evidence in PR #6: 21 writes over 6 s → piles at 3.2 s and 6.4 s.)*
+
 ## C. Upstream: the flood shaper
 
 **C1 — Fetch only.** Action: `git fetch` (origin/main advanced by 3 commits touching 40 files). Expect: pile unchanged; no notice. *(H)*

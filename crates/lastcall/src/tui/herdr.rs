@@ -127,6 +127,10 @@ impl ToastRequest {
 pub struct ReadyDelta {
     pub opened: Vec<PathBuf>,
     pub closed: Vec<PathBuf>,
+    /// Whether the derived map differs from the one it replaced. `PaneAssociation` is
+    /// re-emitted on every resync (every 500 ms coalesce window), so without this every
+    /// window ended in a repaint of an identical screen (deliverable 6(b)).
+    pub changed: bool,
 }
 
 /// What herdr did with a `notification.show`.
@@ -276,6 +280,10 @@ impl HerdrView {
     /// Fold a re-derived association in, preserving every ack episode (deliverable 5):
     /// a `done` rollup opens one, any other rollup closes it.
     pub fn apply_roots(&mut self, derived: BTreeMap<PathBuf, RootAgents>) -> ReadyDelta {
+        // Cloned at entry, not compared at the end: the loop below **removes** each root
+        // from `self.roots` as it goes and `mem::take`s the leftovers, so by the swap there
+        // is nothing left to compare against.
+        let before = self.roots.clone();
         let mut delta = ReadyDelta::default();
         let mut next: BTreeMap<PathBuf, RootFlag> = BTreeMap::new();
         for (root, agents) in derived {
@@ -304,6 +312,7 @@ impl HerdrView {
                 delta.closed.push(root);
             }
         }
+        delta.changed = before != next;
         self.roots = next;
         delta
     }
@@ -1142,6 +1151,62 @@ mod tests {
         assert_eq!(
             view.apply_roots(BTreeMap::new()).closed,
             vec![PathBuf::from(A)]
+        );
+    }
+
+    /// Deliverable 6(b): herdr re-derives on every snapshot, most of which say exactly what
+    /// the last one said. `ReadyDelta::changed` is what separates the two, so an unchanged
+    /// re-derivation costs no frame; without it the TUI repainted on every poll.
+    #[test]
+    fn herdr_apply_roots_reports_changed_only_when_the_map_moved() {
+        let mut view = HerdrView::default();
+        let done = || BTreeMap::from([(PathBuf::from(A), agents(Attention::Done, 1, "p1", "cl"))]);
+
+        assert!(
+            !view.apply_roots(BTreeMap::new()).changed,
+            "nothing to nothing is not a change"
+        );
+        assert!(view.apply_roots(done()).changed, "the first root is one");
+        assert!(
+            !view.apply_roots(done()).changed,
+            "the same map again draws nothing"
+        );
+
+        // The ack lives in the flag, so the next identical derivation is still no change.
+        assert!(view.ack(Path::new(A)));
+        assert!(!view.apply_roots(done()).changed);
+
+        // A status change, an agent-count change, and a root arriving or leaving all move it.
+        assert!(
+            view.apply_roots(BTreeMap::from([(
+                PathBuf::from(A),
+                agents(Attention::Working, 1, "p1", "cl"),
+            )]))
+            .changed
+        );
+        assert!(
+            view.apply_roots(BTreeMap::from([(
+                PathBuf::from(A),
+                agents(Attention::Working, 2, "p1", "cl"),
+            )]))
+            .changed,
+            "a second agent on the same root is a change"
+        );
+        assert!(
+            view.apply_roots(BTreeMap::from([
+                (PathBuf::from(A), agents(Attention::Working, 2, "p1", "cl")),
+                (PathBuf::from(B), agents(Attention::Idle, 1, "p2", "cl")),
+            ]))
+            .changed,
+            "a root arriving is a change"
+        );
+        assert!(
+            view.apply_roots(BTreeMap::from([(
+                PathBuf::from(A),
+                agents(Attention::Working, 2, "p1", "cl"),
+            )]))
+            .changed,
+            "a root leaving is a change"
         );
     }
 

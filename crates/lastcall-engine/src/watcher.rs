@@ -30,6 +30,11 @@ use crate::scan::Pile;
 pub struct EngineTimings {
     /// Trailing-edge debounce for worktree events before a root scan.
     pub debounce: Duration,
+    /// Starvation cap on that trailing edge: a root's scan is never postponed past this
+    /// long after the **first** event of a burst, so a writer that never pauses for
+    /// `debounce` still gets scanned (Amendment v1.6; §10 2026-09-05 ruling 2).
+    /// Hardcoded like `debounce`, not a config key (Q6).
+    pub debounce_max: Duration,
     /// Backstop: re-inspect every git root's HEAD this often.
     pub head_poll: Duration,
     /// Backstop: re-run discovery and scan every root this often.
@@ -40,10 +45,53 @@ impl Default for EngineTimings {
     fn default() -> Self {
         Self {
             debounce: Duration::from_millis(750),
+            debounce_max: Duration::from_secs(3),
             head_poll: Duration::from_secs(10),
             rescan: Duration::from_secs(30),
         }
     }
+}
+
+/// Schedule a root's scan on the trailing edge, under the starvation cap: due `debounce`
+/// after this event, but never later than `debounce_max` after the first event of the
+/// burst. `first_seen` remembers where the burst started; [`scanned`] ends it.
+///
+/// Without the cap the deadline slides forever under a writer that never pauses 750 ms —
+/// an app appending to a log inside the repo — and that root's *other* files never reach
+/// the reviewer either, because the scan is per root (§11, 2026-09-05).
+fn schedule(
+    due: &mut BTreeMap<PathBuf, Instant>,
+    first_seen: &mut BTreeMap<PathBuf, Instant>,
+    root: PathBuf,
+    now: Instant,
+    timings: &EngineTimings,
+) {
+    let first = *first_seen.entry(root.clone()).or_insert(now);
+    due.insert(
+        root,
+        (now + timings.debounce).min(first + timings.debounce_max),
+    );
+}
+
+/// A root was scanned: the burst is over as far as the cap is concerned, so the next event
+/// opens a fresh `debounce_max` window. Paired with [`schedule`] and called from **every**
+/// path that scans a root — the `ready` drain (which is also where the rescan and
+/// watcher-error paths land, since both schedule `now`) and `inspect_root`'s HEAD-change
+/// scan. Miss one and the cap re-fires immediately on the next event of a long burst.
+fn scanned(first_seen: &mut BTreeMap<PathBuf, Instant>, root: &Path) {
+    first_seen.remove(root);
+}
+
+/// Deliverable 8's watcher probes. The loop's decisions are invisible from the outside —
+/// an event that scheduled nothing and an event that never arrived look identical on
+/// screen — so each one gets a `debug` line with stable field names.
+///
+/// `reason` is a closed vocabulary: `event` (a filesystem event under the root), `head`
+/// (HEAD moved, so `inspect_head` scanned), `rescan` (the discovery backstop, a watcher
+/// error, or a root set that changed) and `refresh` (the initial scans and the catch-up
+/// after watches install).
+fn trace_scan_due(root: &Path, reason: &'static str) {
+    tracing::debug!(root = %root.display(), reason, "scan due");
 }
 
 /// What the watcher publishes.
@@ -183,6 +231,17 @@ enum Scheduled {
     Scan(PathBuf),
     Head(PathBuf),
     Ignore,
+}
+
+impl Scheduled {
+    /// The `scheduled=` field of the `watch event` probe.
+    fn label(&self) -> &'static str {
+        match self {
+            Scheduled::Scan(_) => "scan",
+            Scheduled::Head(_) => "head",
+            Scheduled::Ignore => "ignore",
+        }
+    }
 }
 
 fn classify_path(path: &Path, roots: &[RootWatch], ignore: &globset::GlobSet) -> Scheduled {
@@ -393,13 +452,27 @@ async fn scan_all_roots(engine: &Arc<Mutex<Engine>>, tx: &mpsc::Sender<EngineEve
     true
 }
 
+/// The outcome of one head inspection: whether the consumer is still listening, and
+/// whether the inspection **scanned** the root (`inspect_head` scans only when HEAD moved).
+/// The second half is what clears the root's starvation-cap window ([`scanned`]).
+struct Inspected {
+    alive: bool,
+    scanned: bool,
+}
+
 async fn inspect_root(
     engine: &Arc<Mutex<Engine>>,
     tx: &mpsc::Sender<EngineEvent>,
     root: PathBuf,
-) -> bool {
+) -> Inspected {
     let r = root.clone();
-    match blocking(engine, move |e| e.inspect_head(&r)).await {
+    let inspected = blocking(engine, move |e| e.inspect_head(&r)).await;
+    tracing::debug!(
+        root = %root.display(),
+        changed = matches!(inspected, Ok(Some(_))),
+        "head inspect"
+    );
+    match inspected {
         Ok(Some(HeadChange {
             root,
             from,
@@ -409,7 +482,8 @@ async fn inspect_root(
             seq,
             pile,
         })) => {
-            emit(
+            trace_scan_due(&root, "head");
+            let alive = emit(
                 tx,
                 EngineEvent::Head {
                     root: root.clone(),
@@ -420,18 +494,29 @@ async fn inspect_root(
                 },
             )
             .await
-                && emit(tx, EngineEvent::Pile { root, seq, pile }).await
+                && emit(tx, EngineEvent::Pile { root, seq, pile }).await;
+            Inspected {
+                alive,
+                scanned: true,
+            }
         }
-        Ok(None) => true,
+        Ok(None) => Inspected {
+            alive: true,
+            scanned: false,
+        },
         Err(e) => {
-            emit(
+            let alive = emit(
                 tx,
                 EngineEvent::Notice {
                     root: Some(root),
                     text: format!("head inspection failed: {e}"),
                 },
             )
-            .await
+            .await;
+            Inspected {
+                alive,
+                scanned: false,
+            }
         }
     }
 }
@@ -492,6 +577,18 @@ async fn run_loop(
     }
 
     let mut due: BTreeMap<PathBuf, Instant> = BTreeMap::new();
+    // When each root's current burst of worktree events began; the starvation cap's input.
+    //
+    // It is **loop-local on purpose**, which means a scan the loop did not initiate does
+    // not end the window (verifier (a) F7): the TUI's own `watcher::blocking(|e|
+    // e.scan(root))` — `Effect::Refresh`, and the rescan an accept leaves behind — is
+    // invisible here, so a burst window opened before such a scan still fires its cap up
+    // to `debounce_max` later. The cost is bounded at one redundant scan per window, whose
+    // pile is unchanged and so is `Changed::No` at the app, and the window then resets.
+    // Accepted, same class and same bound as `inspect_root` leaving `due` in place on a
+    // HeadChange; the alternative is sharing this map across a task boundary for a scan
+    // that has already happened.
+    let mut first_seen: BTreeMap<PathBuf, Instant> = BTreeMap::new();
     let mut head_due: BTreeSet<PathBuf> = BTreeSet::new();
     let mut head_poll = tokio::time::interval(timings.head_poll);
     head_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -526,13 +623,18 @@ async fn run_loop(
                             // here.
                             for r in roots.clone() {
                                 let ok = if r.git_dir.is_some() {
-                                    inspect_root(&engine, &tx, r.path).await
+                                    let done = inspect_root(&engine, &tx, r.path.clone()).await;
+                                    if done.scanned { scanned(&mut first_seen, &r.path); }
+                                    done.alive
                                 } else {
+                                    scanned(&mut first_seen, &r.path);
+                                    trace_scan_due(&r.path, "refresh");
                                     scan_root(&engine, &tx, r.path).await
                                 };
                                 if !ok { return; }
                             }
                             rescan.reset();
+                            tracing::debug!(roots = roots.len(), "watch installed");
                             let text = format!(
                                 "watching {} ({} root{})",
                                 watched.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", "),
@@ -553,17 +655,27 @@ async fn run_loop(
                     Err(e) => {
                         if !emit(&tx, EngineEvent::Notice { root: None, text: format!("watcher error, rescanning: {e}") }).await { return; }
                         let now = Instant::now();
-                        for r in &roots { due.insert(r.path.clone(), now); }
+                        for r in &roots { trace_scan_due(&r.path, "rescan"); due.insert(r.path.clone(), now); }
                     }
                     Ok(ev) => {
                         if ev.need_rescan() {
                             let now = Instant::now();
-                            for r in &roots { due.insert(r.path.clone(), now); }
+                            for r in &roots { trace_scan_due(&r.path, "rescan"); due.insert(r.path.clone(), now); }
                         }
                         if actionable(&ev.kind) {
                             for p in &ev.paths {
-                                match classify_path(p, &roots, &ignore) {
-                                    Scheduled::Scan(root) => { due.insert(root, Instant::now() + timings.debounce); }
+                                let scheduled = classify_path(p, &roots, &ignore);
+                                tracing::debug!(
+                                    path = %p.display(),
+                                    kind = ?ev.kind,
+                                    scheduled = scheduled.label(),
+                                    "watch event"
+                                );
+                                match scheduled {
+                                    Scheduled::Scan(root) => {
+                                        trace_scan_due(&root, "event");
+                                        schedule(&mut due, &mut first_seen, root, Instant::now(), &timings);
+                                    }
                                     Scheduled::Head(root) => { head_due.insert(root); }
                                     Scheduled::Ignore => {}
                                 }
@@ -584,6 +696,7 @@ async fn run_loop(
         }
 
         if std::mem::take(&mut rescan_now) {
+            tracing::debug!("rescan backstop");
             let changed = blocking(&engine, |e| e.rescan()).await;
             match changed {
                 Ok(changed) => {
@@ -622,13 +735,20 @@ async fn run_loop(
             }
             let now = Instant::now();
             for r in &roots {
+                trace_scan_due(&r.path, "rescan");
                 due.insert(r.path.clone(), now);
             }
         }
 
-        // Drain: head inspections first (they scan too), then due scans.
+        // Drain: head inspections first (they scan too), then due scans. Both end the
+        // root's starvation-cap window, so a burst that outlives a scan starts counting
+        // its 3 s again from the next event instead of firing the cap right away.
         for root in std::mem::take(&mut head_due) {
-            if !inspect_root(&engine, &tx, root).await {
+            let done = inspect_root(&engine, &tx, root.clone()).await;
+            if done.scanned {
+                scanned(&mut first_seen, &root);
+            }
+            if !done.alive {
                 return;
             }
         }
@@ -640,6 +760,7 @@ async fn run_loop(
             .collect();
         for root in ready {
             due.remove(&root);
+            scanned(&mut first_seen, &root);
             if !scan_root(&engine, &tx, root).await {
                 return;
             }
@@ -650,6 +771,130 @@ async fn run_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Replays one root's burst against [`schedule`]/[`scanned`] on a simulated clock and
+    /// returns the millisecond offsets at which the loop would have scanned it.
+    ///
+    /// The model is the loop's own: the `select!` wakes at whichever comes first, the
+    /// event or `sleep_until(next_due)`, and the drain at the end of the pass scans every
+    /// root whose deadline has passed (the `head_change_at` hook stands in for a
+    /// HEAD-change scan arriving between events).
+    ///
+    /// **Ties are the simulator's, not the loop's** (verifier (a) F6): the real
+    /// `tokio::select!` above has no `biased;`, so when an event lands exactly on a
+    /// deadline either arm may win, and the two orders differ by nothing that matters —
+    /// timer first scans in this pass and the event opens the next window, so a
+    /// `Changed::No` scan may follow 750 ms later; event first schedules a deadline that
+    /// is already past and the same pass's drain scans it, carrying the tie event's own
+    /// content. This model resolves the tie to the timer so the expected offsets below are
+    /// a single sequence; `biased;` is deliberately *not* added to the loop for it.
+    fn replay(events_ms: &[u64], head_change_at: Option<u64>, timings: &EngineTimings) -> Vec<u64> {
+        let t0 = Instant::now();
+        let root = PathBuf::from("/w/alpha");
+        let mut due: BTreeMap<PathBuf, Instant> = BTreeMap::new();
+        let mut first_seen: BTreeMap<PathBuf, Instant> = BTreeMap::new();
+        let mut scans: Vec<u64> = Vec::new();
+        let ms = |at: Instant| (at - t0).as_millis() as u64;
+
+        let mut pending: Vec<u64> = events_ms.to_vec();
+        pending.sort_unstable();
+        let mut next = 0usize;
+        loop {
+            let next_event = pending.get(next).copied();
+            let next_due = due.get(&root).map(|d| ms(*d));
+            // The head-change scan is its own wake-up, ordered with everything else.
+            let head = head_change_at.filter(|at| scans.iter().all(|s| s != at));
+            let Some(now) = [next_due, head, next_event].into_iter().flatten().min() else {
+                break;
+            };
+            if next_due == Some(now) {
+                // The drain: the deadline passed, so the root is scanned.
+                due.remove(&root);
+                scanned(&mut first_seen, &root);
+                scans.push(now);
+                continue;
+            }
+            if head == Some(now) {
+                // `inspect_head` scanned this root; only the cap window is cleared.
+                scanned(&mut first_seen, &root);
+                scans.push(now);
+                continue;
+            }
+            next += 1;
+            schedule(
+                &mut due,
+                &mut first_seen,
+                root.clone(),
+                t0 + Duration::from_millis(now),
+                timings,
+            );
+        }
+        scans
+    }
+
+    /// B12 (Amendment v1.6): a writer that never pauses for the 750 ms trailing edge is
+    /// still scanned about every 3 s, and the burst's last state lands one trailing edge
+    /// after the writer stops. Without the cap the only scan in six seconds would be the
+    /// one 750 ms after the end — and on a real root the 30 s rescan backstop would be
+    /// the first thing to break the starvation.
+    #[test]
+    fn watcher_debounce_cap_scans_a_never_quiet_root_about_every_three_seconds() {
+        let timings = EngineTimings::default();
+        assert_eq!(timings.debounce, Duration::from_millis(750));
+        assert_eq!(timings.debounce_max, Duration::from_secs(3));
+        // Six seconds of edits, 300 ms apart: never 750 ms of quiet until the end.
+        let events: Vec<u64> = (0..=20).map(|i| i * 300).collect();
+        assert_eq!(*events.last().unwrap(), 6_000);
+
+        let scans = replay(&events, None, &timings);
+        assert_eq!(
+            scans,
+            vec![3_000, 6_000, 6_750],
+            "a scan at the cap, another a cap later, then the trailing edge after the end"
+        );
+
+        // Without the cap, the same burst produces exactly one scan, at the very end —
+        // the sponsor's "no changes until the very end" (§10 2026-09-04).
+        let uncapped = EngineTimings {
+            debounce_max: Duration::from_secs(60 * 60),
+            ..timings
+        };
+        assert_eq!(replay(&events, None, &uncapped), vec![6_750]);
+    }
+
+    /// A HEAD-change scan mid-burst ends the burst's cap window too, so the cap does not
+    /// fire again moments after the root was already scanned: the next capped scan is one
+    /// full `debounce_max` after the first event that follows the head change.
+    #[test]
+    fn watcher_a_head_change_scan_mid_burst_leaves_no_redundant_capped_scan() {
+        let timings = EngineTimings::default();
+        let events: Vec<u64> = (0..=20).map(|i| i * 300).collect();
+
+        // A commit lands at 1,000 ms; `inspect_head` scans the root.
+        let scans = replay(&events, Some(1_000), &timings);
+        assert_eq!(scans.first(), Some(&1_000), "the head-change scan");
+        assert_eq!(
+            scans.get(1),
+            Some(&4_200),
+            "the next cap is 3 s after the first event *after* the head change (1,200), \
+             not the 3,000 the original window would have fired"
+        );
+        assert!(
+            !scans.contains(&3_000),
+            "no redundant capped scan left behind: {scans:?}"
+        );
+
+        // The control: without the head change the cap fires at 3,000.
+        assert_eq!(replay(&events, None, &timings).first(), Some(&3_000));
+    }
+
+    /// The cap never *delays* a scan: a quiet writer still gets the plain trailing edge.
+    #[test]
+    fn watcher_debounce_cap_does_not_move_a_quiet_root() {
+        let timings = EngineTimings::default();
+        // Two edits two seconds apart: each is its own burst.
+        assert_eq!(replay(&[0, 2_000], None, &timings), vec![750, 2_750]);
+    }
 
     #[test]
     fn watcher_wanted_watches_are_parent_dirs_plus_external_git_dirs() {
@@ -778,6 +1023,13 @@ mod tests {
             matches!(is("/w/main/.git/worktrees/wt/HEAD"), Scheduled::Head(r) if r == Path::new("/w/wt"))
         );
         assert!(matches!(is("/elsewhere/z"), Scheduled::Ignore));
+
+        // Deliverable 8: the `scheduled=` field of the `watch event` probe is exactly this
+        // three-word vocabulary, so a log can be grepped for the events that scheduled
+        // nothing — the shape of "my edit never reached the screen".
+        assert_eq!(is("/w/a/src/x.rs").label(), "scan");
+        assert_eq!(is("/w/a/.git/HEAD").label(), "head");
+        assert_eq!(is("/w/a/vendor/x").label(), "ignore");
     }
 
     /// A main worktree and its linked worktree are both roots: the linked worktree's git
