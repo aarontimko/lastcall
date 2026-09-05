@@ -173,12 +173,12 @@ pub struct Override {
 /// The on-disk shape of an [`Override`].
 ///
 /// **`flag` and `flags` are both written, always.** `flag` is the schema-1.0 mirror of
-/// `flags[0]` (without its `hunk`, which 1.0 has no field for), `null` when there are no
-/// flags. A 1.0 reader drops unknown fields on load and `to_wire` re-stamps whatever
-/// version it read, so a 1.0 binary opening a 1.1 file — a merged `main` while this branch
-/// is open, or a second machine sharing the state dir — would erase every flag on its first
-/// write. With the mirror it keeps the first one. Losing the rest under a downgrade is a
-/// §11 residual, not a bug this shape can fix.
+/// `flags[0]` (without its `hunk`, which 1.0 has no field for), and it is written as `null`
+/// rather than omitted when there are no flags. A 1.0 reader drops unknown fields on load,
+/// so a 1.0 binary opening a 1.1 file — a merged `main` while this branch is open, or a
+/// second machine sharing the state dir — would erase every flag on its first write. With
+/// the mirror it keeps the first one. Losing the rest under a downgrade is a §11 residual,
+/// not a bug this shape can fix.
 ///
 /// Reading is the mirror image: `flags` when the field is present (even empty), otherwise
 /// `flag` lifted into a one-entry list — which is both a genuine 1.0 file and a 1.1 file a
@@ -304,7 +304,14 @@ impl Ledger {
             overrides.entry(k.clone()).or_insert_with(|| v.clone());
         }
         LedgerWire {
-            schema_version: self.schema_version.clone(),
+            // **Every write stamps the current version** (Amendment v1.7 §6.2; verifier
+            // F8). What `to_wire` produces is a 1.1 document — the `flags` list, the `flag`
+            // mirror, `flag` present as `null` rather than omitted — whatever the file we
+            // read said. Re-stamping the version we read meant a 1.0 file gained 1.1 fields
+            // while still claiming 1.0, and a 1.7 file kept a 1.7 stamp after this build had
+            // already dropped every 1.7 field it did not understand. Both are documents
+            // whose own version number is a lie about what is in them.
+            schema_version: SCHEMA_VERSION.to_string(),
             root: self.root.clone(),
             kind: self.kind,
             seen_tree: self.seen_tree.clone(),
@@ -769,10 +776,63 @@ mod tests {
             l.overrides["f2"].flags.is_empty(),
             "a null flag is no flags"
         );
-        // The rewrite keeps the version it read (1.0) but gains the `flags` list.
+        // The rewrite gains the `flags` list — and says so: what is written is a 1.1
+        // document, so it is stamped 1.1 (F8), not the 1.0 it was read as.
         let v: serde_json::Value = serde_json::from_str(&l.to_json()).unwrap();
-        assert_eq!(v["schema_version"], "1.0");
+        assert_eq!(v["schema_version"], "1.1");
         assert_eq!(v["overrides"]["f1"]["flags"][0]["note"], "look");
+        assert_eq!(
+            v["overrides"]["f1"]["flag"]["note"], "look",
+            "and the 1.0 mirror is still there"
+        );
+    }
+
+    /// A write says what it wrote (Amendment v1.7 §6.2; verifier F8).
+    ///
+    /// Before this, `to_wire` re-stamped the version it had read. A 1.0 file came back with
+    /// the 1.1 `flags` list inside it and `"schema_version":"1.0"` on the outside, so a
+    /// reader that trusted the stamp — including a future migration keyed on it — was told
+    /// the wrong thing about the bytes it was holding. The same in the other direction: a
+    /// 1.7 file kept its 1.7 stamp after this build had already dropped every field it did
+    /// not understand.
+    #[test]
+    fn ledger_write_always_stamps_the_current_schema_version() {
+        assert_eq!(SCHEMA_VERSION, "1.1");
+        let stamp = |json: &str| -> serde_json::Value {
+            let (l, _) = parse(json.as_bytes()).unwrap();
+            serde_json::from_str(&l.to_json()).unwrap()
+        };
+
+        // Older: a genuine 1.0 file, read and written back.
+        let older = stamp(
+            r#"{"schema_version":"1.0","root":"/r","kind":"git","seen_tree":null,
+            "seen_at":{"head_commit":null,"branch":null,"at":"x"},
+            "overrides":{"f1":{"flag":{"note":"look","created_at":"t"},"updated_at":"t"}}}"#,
+        );
+        assert_eq!(older["schema_version"], "1.1");
+
+        // Newer: a minor version this build does not know. It loads (deliberately), but
+        // what we write back is 1.1 and is stamped 1.1.
+        let newer = stamp(
+            r#"{"schema_version":"1.7","root":"/r","kind":"draft","seen_tree":null,
+            "seen_at":{"head_commit":null,"branch":null,"at":"x"},"overrides":{},"future":true}"#,
+        );
+        assert_eq!(newer["schema_version"], "1.1");
+        assert!(newer.get("future").is_none());
+
+        // And a ledger built in memory, never read from disk at all.
+        let fresh = Ledger::new(
+            Path::new("/r"),
+            RootKind::Git,
+            None,
+            SeenAt {
+                head_commit: None,
+                branch: None,
+                at: "x".into(),
+            },
+        );
+        let v: serde_json::Value = serde_json::from_str(&fresh.to_json()).unwrap();
+        assert_eq!(v["schema_version"], "1.1");
     }
 
     /// The dual write: `flag` mirrors `flags[0]` without its hunk, `flags` carries all of
