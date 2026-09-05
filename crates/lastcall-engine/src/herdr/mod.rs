@@ -16,6 +16,21 @@ pub mod guard;
 pub mod transport;
 pub mod wire;
 
+/// Bracketed-paste opener (`ESC [ 200 ~`).
+///
+/// A terminal application that has enabled bracketed paste treats everything between the
+/// markers as *pasted text* — it lands in the input buffer and is not submitted, however
+/// many newlines it holds. The **application** interprets them, never the tty line
+/// discipline (F7), so `cat` or a non-interactive shell will happily run each line: the
+/// staging proof needs a real interactive shell with `zle`'s `bracketed-paste` widget.
+pub const BRACKETED_PASTE_START: &str = "\u{1b}[200~";
+/// Bracketed-paste closer (`ESC [ 201 ~`).
+///
+/// The reason [`crate::flags::export`] renders every control byte in caret form: a `201~`
+/// sequence inside the payload would end the paste early and let the remainder arrive as
+/// keystrokes — which a shell would run.
+pub const BRACKETED_PASTE_END: &str = "\u{1b}[201~";
+
 pub use client::{
     Cache, Client, ClientHandle, ClientOptions, ClientTimings, HerdrEvent, ResyncTarget,
 };

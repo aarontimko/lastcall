@@ -42,6 +42,8 @@ pub mod method {
     pub const NOTIFICATION_SHOW: &str = "notification.show";
     /// Phase 5: focus the pane an agent runs in.
     pub const AGENT_FOCUS: &str = "agent.focus";
+    /// Phase 7: put text into a pane's input **without submitting it** (deliverable 6).
+    pub const PANE_SEND_TEXT: &str = "pane.send_text";
 }
 
 /// Errors from parsing wire lines.
@@ -481,6 +483,17 @@ pub struct PaneTarget {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentTarget {
     pub target: String,
+}
+
+/// `pane.send_text` params (schema `PaneSendTextParams`).
+///
+/// `text` goes to the pane's tty as bytes; herdr does not add a newline and does not
+/// interpret what it is given, which is exactly why the paste markers have to be part of
+/// `text` ([`crate::herdr::BRACKETED_PASTE_START`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneSendTextParams {
+    pub pane_id: String,
+    pub text: String,
 }
 
 /// `worktree.list` params (schema line 4373).

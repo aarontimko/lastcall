@@ -18,11 +18,12 @@ cargo run -q -p lastcall-testkit --example herdr_schema_fixture -- \
     crates/lastcall-testkit/fixtures/herdr/schema/consumed-surface.json
 ```
 
-Generated on **2026-09-04**. The generator reported:
+Generated on **2026-09-05** (Phase 7 deliverable 6 added `pane.send_text`; the pin did not
+move). The generator reported:
 
 ```
 herdr-schema-fixture: herdr 0.8.2, protocol 20, schema_version 1 -> …/consumed-surface.json
-  (50622 bytes, 10 methods, 15 events, 45 defs)
+  (51288 bytes, 11 methods, 15 events, 46 defs)
 ```
 
 `herdr api schema --json` reads no socket and starts no server, so generating this file touches
@@ -38,8 +39,8 @@ unrelated herdr feature a drift alert, and an alert nobody trusts is not a check
 | key | contents |
 |---|---|
 | `protocol`, `schema_version` | `20`, `1` — a bump in either is drift by itself |
-| `methods` | the ten methods we call: params schema, the request variant's `required`, and the `type` const of the result our code deserializes |
-| `results` | those ten result variants |
+| `methods` | the eleven methods we call: params schema, the request variant's `required`, and the `type` const of the result our code deserializes |
+| `results` | those eleven result variants |
 | `events` | the §5.4 lifecycle set (15), keyed by the dotted **subscription** name, each recording the snake_case `event` name herdr pushes and its payload schema |
 | `subscription_events` | `pane.agent_status_changed` (§5.5's second envelope shape) |
 | `pinned_enums` | `AgentStatus` and `NotificationShowSound` — the two vocabularies our code branches on |
@@ -49,8 +50,10 @@ The method → result mapping is not derivable from the schema (herdr's `Respons
 flat `oneOf` with no link back to a method), so `CONSUMED_METHODS` states it and the generator
 *verifies* each named result const exists. Each entry was read off herdr v0.8.2's own handlers:
 `agent.focus` → `agent_info` (`src/app/api/agents.rs:35-42`), `workspace.get` → `workspace_info`
-(`src/app/api/workspaces.rs:23-35`), `tab.focus` → `tab_info` (`src/app/api/tabs.rs:132-140`);
-the other seven were verified in Phase 1's §5 pass.
+(`src/app/api/workspaces.rs:23-35`), `tab.focus` → `tab_info` (`src/app/api/tabs.rs:132-140`),
+`pane.send_text` → `ok` (Phase 7 deliverable 6 — the schema's shared no-payload success const,
+confirmed present in `ResponseResult` by the generator); the other seven were verified in
+Phase 1's §5 pass.
 
 `workspace.get` and `tab.focus` are consumed by the real-server tests rather than by the client.
 They are pinned because a change to either breaks those tests.
@@ -75,6 +78,7 @@ Determinism: `serde_json::Map` is a `BTreeMap` in this workspace (no `preserve_o
 
 ## Regenerating
 
-Only when the pin moves. Bump `herdr_version` in the `justfile`, run `just
-herdr-schema-fixture`, update the tag and date above, and re-read the diff: this file is the
+When the pin moves, or when `CONSUMED_METHODS` gains a method. Bump `herdr_version` in the
+`justfile` if the pin is what moved, run `just herdr-schema-fixture`, update the tag, date and
+counts above, and re-read the diff: this file is the
 record of what we believe herdr's API is, so a diff nobody explained is a diff nobody checked.

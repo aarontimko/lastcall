@@ -3,7 +3,7 @@
 //! herdr's own schema is ~250 KB and 91 request variants wide; almost none of it is ours.
 //! Diffing the whole thing against a release would flag every unrelated feature herdr ships,
 //! and a drift check that cries wolf is a drift check nobody reads. So the fixture pins a
-//! *projection*: the ten methods we call, the §5.4 lifecycle event set plus the one per-pane
+//! *projection*: the eleven methods we call, the §5.4 lifecycle event set plus the one per-pane
 //! subscription event, every type schema those transitively reach, and the two enums whose
 //! values our code branches on.
 //!
@@ -32,12 +32,13 @@ use serde_json::{Map, Value, json};
 ///
 /// `workspace.get` and `tab.focus` are consumed by the real-server tests rather than by the
 /// client; they are in the kickoff's list because a change to either breaks those tests.
-pub const CONSUMED_METHODS: [(&str, &str); 10] = [
+pub const CONSUMED_METHODS: [(&str, &str); 11] = [
     ("agent.focus", "agent_info"),
     ("events.subscribe", "subscription_started"),
     ("notification.show", "notification_show"),
     ("pane.get", "pane_info"),
     ("pane.list", "pane_list"),
+    ("pane.send_text", "ok"),
     ("ping", "pong"),
     ("session.snapshot", "session_snapshot"),
     ("tab.focus", "tab_info"),

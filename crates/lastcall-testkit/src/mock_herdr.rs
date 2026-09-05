@@ -150,6 +150,8 @@ struct Config {
     pane_get: HashMap<String, Value>,
     known_panes: HashSet<String>,
     canned: HashMap<String, Value>,
+    /// Per method, an error response `(code, message)` instead of a result.
+    canned_errors: HashMap<String, (String, String)>,
     /// Per method, results served in order; the last one repeats once the list runs out.
     canned_seq: HashMap<String, Vec<Value>>,
     lifecycle_script: Vec<ScriptedEvent>,
@@ -212,6 +214,7 @@ impl MockHerdrBuilder {
                 pane_get: HashMap::new(),
                 known_panes: HashSet::new(),
                 canned: HashMap::new(),
+                canned_errors: HashMap::new(),
                 canned_seq: HashMap::new(),
                 lifecycle_script: Vec::new(),
                 status_scripts: HashMap::new(),
@@ -261,6 +264,15 @@ impl MockHerdrBuilder {
     /// A canned `result` for any other method.
     pub fn canned(mut self, method: &str, result: Value) -> Self {
         self.config.canned.insert(method.to_string(), result);
+        self
+    }
+
+    /// `method` answers with an error line instead of a result — how a test reaches the
+    /// `pane_not_found` branch of a caller without a real server.
+    pub fn error(mut self, method: &str, code: &str, message: &str) -> Self {
+        self.config
+            .canned_errors
+            .insert(method.to_string(), (code.to_string(), message.to_string()));
         self
     }
 
@@ -852,9 +864,10 @@ impl Core {
                         )),
                     }
                 }
-                false => match config.canned.get(other) {
-                    Some(result) => Reply::Line(result_line(id, result.clone())),
-                    None => Reply::Line(error_line(
+                false => match (config.canned_errors.get(other), config.canned.get(other)) {
+                    (Some((code, message)), _) => Reply::Line(error_line(id, code, message)),
+                    (None, Some(result)) => Reply::Line(result_line(id, result.clone())),
+                    (None, None) => Reply::Line(error_line(
                         id,
                         "invalid_params",
                         &format!("unknown method `{other}`"),

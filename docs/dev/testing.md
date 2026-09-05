@@ -230,7 +230,7 @@ cache is proven to have re-bootstrapped by `Cache.resyncs` going `1 -> 2`, not b
 `herdr api schema --json` is 255 KB of JSON-Schema, 91 request and 58 result variants, almost
 none of it ours — diffing all of it would flag every unrelated herdr feature, and an alert
 nobody trusts is not a check. `lastcall_testkit::herdr_schema` projects it onto the surface
-this repo actually consumes: the ten methods we call with their params and result schemas,
+this repo actually consumes: the eleven methods we call with their params and result schemas,
 the fifteen §5.4 lifecycle events plus `pane.agent_status_changed`, the transitive type
 closure, and the `AgentStatus` and `NotificationShowSound` vocabularies the code branches on.
 About 50 KB, key-sorted (`serde_json`'s maps are `BTreeMap`s here — no `preserve_order`), one

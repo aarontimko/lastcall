@@ -26,7 +26,9 @@ use lastcall_engine::herdr::transport::{SocketTransport, Transport, socket_answe
 use lastcall_engine::herdr::wire::{
     self, AgentStatus, AgentTarget, NotificationShowParams, NotificationShowResult,
 };
-use lastcall_engine::herdr::{Compat, HerdrEvent, guard};
+use lastcall_engine::herdr::{
+    BRACKETED_PASTE_END, BRACKETED_PASTE_START, Compat, HerdrEvent, guard,
+};
 use lastcall_engine::roots::Badge;
 use tokio::sync::mpsc;
 
@@ -566,6 +568,102 @@ pub async fn focus<T: Transport>(transport: &T, pane_id: &str) -> Result<(), Str
         .map_err(|e| e.to_string())
 }
 
+/// `pane.send_text` on `pane_id`, wrapped in bracketed-paste markers (deliverable 6).
+///
+/// **Staged, not sent.** The markers make an interactive shell or agent CLI treat the whole
+/// payload as pasted text: it lands in the input buffer, however many newlines it holds, and
+/// waits for the human to press Enter. That is the whole point of the gesture — lastcall
+/// hands the agent the note, the human decides when to submit it. No trailing newline: one
+/// would be a keystroke after the paste ended, which is the submit we are avoiding.
+///
+/// The markers are part of `text` because herdr sends the bytes through verbatim, and the
+/// *application* on the far side interprets them — the tty line discipline never does (F7).
+pub async fn stage<T: Transport>(transport: &T, pane_id: &str, text: &str) -> Result<(), String> {
+    let params = serde_json::to_value(wire::PaneSendTextParams {
+        pane_id: pane_id.to_owned(),
+        text: format!("{BRACKETED_PASTE_START}{text}{BRACKETED_PASTE_END}"),
+    })
+    .map_err(|e| e.to_string())?;
+    transport
+        .request(wire::method::PANE_SEND_TEXT, params)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// One agent the export could be staged to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentCandidate {
+    /// herdr's own public pane id — the `pane.send_text` target.
+    pub pane_id: String,
+    /// The agent's display label, falling back to the pane's label and then its id.
+    pub label: String,
+    pub status: Attention,
+    /// The workspace the pane lives in, by label (its id when it has none). Shown on the
+    /// picker row: candidates come from **every** workspace, so the row has to say which.
+    pub workspace_label: String,
+}
+
+/// Every agent-bearing pane associated with `root`, most-wanting-attention first.
+///
+/// The same association walk as [`derive`] — `foreground_cwd` (fallback `cwd`) up to the
+/// deepest known root — but it keeps *every* pane rather than the one that wins the rollup,
+/// because the picker's question is "which agent?" and `derive`'s is "how is this root
+/// doing?".
+///
+/// Across every workspace by default (F15: "exactly one candidate, stage without asking"
+/// has to mean one candidate *overall*, or a second agent in another workspace would be
+/// silently skipped). `workspace` narrows it to one workspace id, which is what the reducer
+/// passes while the `w` scope is on, so the picker covers the same ground the nav does.
+///
+/// Sorted by attention descending, then label, then pane id: a stable order, and the agent
+/// that is blocked on a question is the one at the top.
+pub fn agents_for(
+    cache: &Cache,
+    roots: &[RootMeta],
+    root: &Path,
+    workspace: Option<&str>,
+) -> Vec<AgentCandidate> {
+    let mut out: Vec<AgentCandidate> = Vec::new();
+    for pane in cache.panes.values() {
+        let info = &pane.info;
+        if !info.is_agent_bearing() {
+            continue;
+        }
+        if workspace.is_some_and(|w| info.workspace_id != w) {
+            continue;
+        }
+        let Some(cwd) = info.foreground_cwd.as_deref().or(info.cwd.as_deref()) else {
+            continue;
+        };
+        if deepest_root(roots, Path::new(cwd)) != Some(root) {
+            continue;
+        }
+        out.push(AgentCandidate {
+            pane_id: info.pane_id.clone(),
+            label: info
+                .agent_label()
+                .or(info.label.as_deref())
+                .unwrap_or(&info.pane_id)
+                .to_owned(),
+            status: Attention::of(pane.status.as_ref().unwrap_or(&info.agent_status)),
+            workspace_label: cache
+                .workspaces
+                .get(&info.workspace_id)
+                .map(|w| w.label.clone())
+                .filter(|l| !l.is_empty())
+                .unwrap_or_else(|| info.workspace_id.clone()),
+        });
+    }
+    out.sort_by(|a, b| {
+        b.status
+            .cmp(&a.status)
+            .then_with(|| a.label.cmp(&b.label))
+            .then_with(|| a.pane_id.cmp(&b.pane_id))
+    });
+    out
+}
+
 /// The coalescing window: herdr's own default `delay_seconds` (1 s) plus the `Finished`
 /// lifetime (5 s) plus a second of margin. Raising herdr's `delay_seconds` beyond ≈ 6 s
 /// makes our toast lose the race to herdr's own — one retry, no more.
@@ -1012,6 +1110,114 @@ mod tests {
             vec![&PathBuf::from(NESTED)]
         );
         assert_eq!(derived[Path::new(NESTED)].status, Attention::Done);
+    }
+
+    // --- staging (deliverable 6) ---------------------------------------------------------
+
+    /// The exact request. The markers have to be inside `text` — herdr passes the bytes
+    /// through and the *application* on the far side is what interprets them (F7) — and
+    /// there is no trailing newline: one would be the Enter we are deliberately not pressing.
+    #[tokio::test]
+    async fn herdr_stage_wraps_the_export_in_bracketed_paste_markers() {
+        let mock = InMemoryHerdr::builder()
+            .canned(wire::method::PANE_SEND_TEXT, json!({"type": "ok"}))
+            .in_memory();
+        let control = mock.control();
+        stage(&mock, "p1", "echo ONE\necho TWO").await.unwrap();
+        let req = control.requests().pop().expect("one request");
+        assert_eq!(req.method, "pane.send_text");
+        assert_eq!(
+            req.params,
+            json!({
+                "pane_id": "p1",
+                "text": "\u{1b}[200~echo ONE\necho TWO\u{1b}[201~",
+            })
+        );
+        let text = req.params["text"].as_str().unwrap();
+        assert!(!text.ends_with('\n'), "a newline would submit it");
+    }
+
+    /// `pane_not_found` reaches the caller as the reason the status line prints; the flag is
+    /// already on disk, so a failed send loses nothing.
+    #[tokio::test]
+    async fn herdr_stage_reports_a_pane_that_is_gone() {
+        let mock = InMemoryHerdr::builder()
+            .error(
+                wire::method::PANE_SEND_TEXT,
+                "pane_not_found",
+                "no such pane",
+            )
+            .in_memory();
+        let err = stage(&mock, "gone", "x").await.unwrap_err();
+        assert!(err.contains("pane_not_found"), "{err}");
+    }
+
+    // --- the picker's candidates (deliverable 6) -----------------------------------------
+
+    /// Every agent-bearing pane under the root, not just the one that wins the rollup, and
+    /// across workspaces (F15) — sorted by attention, then label.
+    #[test]
+    fn herdr_agents_for_lists_every_pane_under_the_root_sorted_by_attention() {
+        let mut cache = cache(vec![
+            pane("p1", "w1", A, Some("claude"), "idle"),
+            pane("p2", "w2", A, Some("zed"), "blocked"),
+            pane("p3", "w1", A, Some("codex"), "idle"),
+            // Not candidates: another root, a nested root, and a pane with no agent.
+            pane("p4", "w1", B, Some("claude"), "blocked"),
+            pane("p5", "w1", NESTED, Some("claude"), "blocked"),
+            pane("p6", "w1", A, None, "blocked"),
+        ]);
+        cache
+            .workspaces
+            .insert("w1".to_owned(), workspace("w1", "alpha", None));
+        cache
+            .workspaces
+            .insert("w2".to_owned(), workspace("w2", "review", None));
+        let got = agents_for(&cache, &roots(), Path::new(A), None);
+        assert_eq!(
+            got.iter()
+                .map(|c| (c.pane_id.as_str(), c.label.as_str(), c.status))
+                .collect::<Vec<_>>(),
+            vec![
+                ("p2", "zed", Attention::Blocked),
+                ("p1", "claude", Attention::Idle),
+                ("p3", "codex", Attention::Idle),
+            ],
+            "blocked first, then by label"
+        );
+        assert_eq!(got[0].workspace_label, "review");
+        assert_eq!(got[1].workspace_label, "alpha");
+        // Scoped to one workspace, the way the nav narrows under `w`.
+        let scoped = agents_for(&cache, &roots(), Path::new(A), Some("w1"));
+        assert_eq!(
+            scoped
+                .iter()
+                .map(|c| c.pane_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["p1", "p3"]
+        );
+        // The nested root's own pane is its own candidate, never the parent's.
+        assert_eq!(
+            agents_for(&cache, &roots(), Path::new(NESTED), None)
+                .iter()
+                .map(|c| c.pane_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["p5"]
+        );
+    }
+
+    /// `foreground_cwd` beats `cwd` here too, and the status stream beats the snapshot —
+    /// the walk is `derive`'s, only the keep rule differs.
+    #[test]
+    fn herdr_agents_for_uses_the_same_walk_as_derive() {
+        let cache = cache(vec![foregrounded(
+            streaming(pane("p1", "w1", B, Some("claude"), "working"), "blocked"),
+            A,
+        )]);
+        assert!(agents_for(&cache, &roots(), Path::new(B), None).is_empty());
+        let got = agents_for(&cache, &roots(), Path::new(A), None);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].status, Attention::Blocked);
     }
 
     /// Ruling 1: provenance first. The workspace's `checkout_path` anchors the scope and
