@@ -119,6 +119,10 @@ pub enum Refused {
     /// The path is in a merge conflict (`ls-files -u`): restoring it would write over one
     /// side of a merge git is still holding open (gate item 4; C4).
     Conflicted { path: Vec<u8> },
+    /// The hunk list handed to `restore_hunk` does not reassemble the rendered content, so
+    /// "everything but hunk k" would silently drop whatever is missing from it (verifier
+    /// F3). The one refusal that is about the *caller's* view rather than the file.
+    Incomplete { path: Vec<u8> },
 }
 
 impl Refused {
@@ -158,6 +162,12 @@ impl Refused {
             Refused::NoSuchHunk { path, index } => format!("{}: no hunk {index}", lossy(path)),
             Refused::Conflicted { path } => {
                 format!("{}: unresolved merge conflict; not {verb}", lossy(path))
+            }
+            Refused::Incomplete { path } => {
+                format!(
+                    "{}: only part of the diff is loaded; not {verb}",
+                    lossy(path)
+                )
             }
         }
     }
@@ -883,11 +893,29 @@ impl Ops<'_> {
             Baseline::Present { oid, .. } => self.store.cat_blob(oid)?,
             Baseline::Absent | Baseline::Empty => Vec::new(),
         };
-        let keep: Vec<usize> = hunks
+        // The hunk CAS has to cover the *hunks*, not only the file (verifier F3).
+        //
+        // "Restore hunk k" is `baseline ⊕ every content hunk but k`, and that identity holds
+        // only while the list the caller passed is the complete one. `hunks::expand`
+        // truncates at a line cap, so an expanded collapsed row can hand over a partial list
+        // — and both CASes still pass, because the *file* has not moved. The write would
+        // then be `baseline ⊕ a fragment`, silently discarding every edit the cap dropped.
+        // The store's blobs are canonical, so reassembling the whole list and hashing it is
+        // an exact test: it equals the current oid precisely when nothing is missing.
+        let all: Vec<usize> = hunks
             .iter()
-            .filter(|h| !h.is_mode_change() && h.index != hunk_index)
+            .filter(|h| !h.is_mode_change())
             .map(|h| h.index)
             .collect();
+        let whole = hunks::apply_hunks(&base_bytes, hunks, &all);
+        // `cas_live` above proved the row has a current oid and that it is this one.
+        let current = rendered.oid.as_ref().expect("cas_live passed");
+        if self.store.hash_bytes(&whole)? != *current {
+            return refuse(Refused::Incomplete {
+                path: rendered.path.clone(),
+            });
+        }
+        let keep: Vec<usize> = all.iter().copied().filter(|i| *i != hunk_index).collect();
         let content = hunks::apply_hunks(&base_bytes, hunks, &keep);
         let bytes = self.restore_bytes(&rendered.path, &content)?;
         // A content hunk leaves the mode where the live file has it: only the mode hunk
@@ -1763,6 +1791,61 @@ mod tests {
             other => panic!("expected a filter refusal, got {other:?}"),
         }
         assert_eq!(std::fs::read(repo.path().join("f1")).unwrap(), b"edited\n");
+    }
+
+    /// A truncated hunk list is refused rather than written (verifier F3).
+    ///
+    /// The probe: a 3,000-line file whose first line and last 2,000 lines are edited. The
+    /// row collapses on size, `hunks::expand` truncates at `EXPAND_LINE_CAP`, and the list
+    /// that comes back describes only the first change. Both CASes pass — the file has not
+    /// moved — so "restore hunk 0" used to write `baseline ⊕ nothing` and take all 2,000
+    /// edits with it.
+    #[test]
+    fn ops_restore_hunk_refuses_a_truncated_hunk_list() {
+        let mut repo = FixtureRepo::new("ops-restore-truncated").unwrap();
+        let baseline: String = (0..3_000).map(|i| format!("line {i}\n")).collect();
+        repo.write("big.txt", &baseline);
+        repo.commit("big").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+
+        let mut lines: Vec<String> = (0..3_000).map(|i| format!("line {i}\n")).collect();
+        lines[0] = "EDIT 0\n".to_string();
+        for line in lines.iter_mut().take(3_000).skip(1_000) {
+            *line = line.replace("line", "EDIT");
+        }
+        let edited: String = lines.concat();
+        repo.write("big.txt", &edited);
+
+        let r = rendered(&h, b"big.txt");
+        let expanded = crate::hunks::expand(baseline.as_bytes(), edited.as_bytes());
+        assert!(
+            expanded.omitted_lines > 0,
+            "the fixture must actually overrun the cap"
+        );
+
+        let out = h
+            .ops()
+            .restore_hunk(&r, &expanded.hunks, 0, &NoFault)
+            .unwrap();
+        match out.refused.first() {
+            Some(rf @ Refused::Incomplete { .. }) => assert_eq!(
+                rf.message("restored"),
+                "big.txt: only part of the diff is loaded; not restored"
+            ),
+            other => panic!("expected an incompleteness refusal, got {other:?}"),
+        }
+
+        let after = std::fs::read(repo.path().join("big.txt")).unwrap();
+        assert_eq!(after, edited.as_bytes(), "the file is untouched");
+        assert_eq!(
+            after
+                .split(|b| *b == b'\n')
+                .filter(|l| l.starts_with(b"EDIT"))
+                .count(),
+            2_001,
+            "every edited line survives"
+        );
     }
 
     /// The round-trip guard (F2) refuses only the genuinely lossy case. A plain LF file
