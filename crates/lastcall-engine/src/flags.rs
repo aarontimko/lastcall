@@ -20,12 +20,20 @@
 //! A file flag omits the `hunk n of m` segment and the diff block. A batch is the exports
 //! joined by a blank line ([`export_all`]).
 //!
-//! **Control bytes render in caret form** (F13). The export is pasted into a live terminal
-//! inside bracketed-paste markers, and the *application* — not the line discipline —
-//! decides where the paste ends: one `\x1b[201~` inside the payload would close it early
-//! and let everything after it arrive as raw keystrokes. So every byte below `0x20` other
-//! than `\n` and `\t` becomes `^X` (`^[` for ESC, `\x1b`). Non-UTF-8 bytes render lossy,
-//! the same rule `Refused` uses for paths.
+//! **Control bytes render in caret form** (F13, F9). The export is pasted into a live
+//! terminal inside bracketed-paste markers, and the *application* — not the line discipline
+//! — decides where the paste ends: one `\x1b[201~` inside the payload would close it early
+//! and let everything after it arrive as raw keystrokes. So C0 below `0x20` other than `\n`
+//! and `\t` becomes `^X` (`^[` for ESC), DEL becomes `^?`, and the C1 range
+//! `U+0080..=U+009F` becomes the caret form of its ESC equivalent (`^[[` for CSI) — a
+//! terminal in UTF-8 mode reads a raw `\u{9b}` as CSI, so C0 alone was not the whole hazard.
+//! Every rendered field goes through it: root, path, timestamp, attribution, note, hunk
+//! header and hunk text (decision 10). Non-UTF-8 bytes render lossy, the same rule `Refused`
+//! uses for paths.
+//!
+//! **The fence is as long as it needs to be** (D1). A diff line that is exactly ```` ``` ````
+//! would close a three-backtick block and spill the rest of the hunk into prose, so the
+//! fence is one backtick longer than the longest run any line inside it starts with.
 
 use crate::ledger::Flag;
 
@@ -44,27 +52,62 @@ pub struct ExportContext {
     pub attribution: Option<String>,
 }
 
-/// Byte `0x00..0x20` other than `\n` and `\t` → caret form; everything else verbatim.
+/// Whether `c` is a control character the export must not emit raw.
+fn needs_caret(c: char) -> bool {
+    c != '\n' && c != '\t' && matches!(c as u32, 0x00..=0x1f | 0x7f | 0x80..=0x9f)
+}
+
+/// Control characters → caret form; everything else verbatim.
 ///
-/// The input is already lossy-decoded UTF-8, so the only control *characters* left are the
-/// C0 set (a lossy decode never invents one) plus whatever the user typed into a note.
+/// Three ranges, one notation (verifier F9):
+///
+/// - **C0**, `0x00..=0x1f` other than `\n` and `\t` → `^@` … `^_`; ESC is `^[`.
+/// - **DEL**, `0x7f` → `^?`. The classic caret form, `0x7f ^ 0x40`.
+/// - **C1**, `U+0080..=U+009F` → `^[` and then the character `0x40` below it — that is, the
+///   caret form of the two-byte ESC sequence the C1 control is defined to be equivalent to.
+///   U+009B (CSI) is `^[[`, U+0085 (NEL) is `^[E`.
+///
+/// C1 is not decorative: a terminal in UTF-8 mode reads `\u{9b}` (`0xc2 0x9b` on the wire)
+/// as CSI, so `\u{9b}201~` ends a bracketed paste exactly as `\u{1b}[201~` does. The C0-only
+/// rule let it through. The input is already lossy-decoded UTF-8, so a lossy decode never
+/// invents any of these — every one of them was in the flag.
 fn caret(s: &str) -> String {
-    if !s
-        .chars()
-        .any(|c| (c as u32) < 0x20 && c != '\n' && c != '\t')
-    {
+    if !s.chars().any(needs_caret) {
         return s.to_owned();
     }
     let mut out = String::with_capacity(s.len() + 8);
     for c in s.chars() {
-        if (c as u32) < 0x20 && c != '\n' && c != '\t' {
-            out.push('^');
-            out.push(char::from(b'@' + c as u8));
-        } else {
+        let u = c as u32;
+        if !needs_caret(c) {
             out.push(c);
+        } else if u == 0x7f {
+            out.push_str("^?");
+        } else if u >= 0x80 {
+            out.push_str("^[");
+            out.push(char::from((u - 0x40) as u8));
+        } else {
+            out.push('^');
+            out.push(char::from(b'@' + u as u8));
         }
     }
     out
+}
+
+/// The fence for a code block holding `body`: three backticks, or one more than the longest
+/// run of backticks that *starts* a line, whichever is longer.
+///
+/// A line that is exactly ```` ``` ```` closes a three-backtick block, and then the rest of
+/// the diff renders as prose in the agent's client — the flag stops being one message and
+/// the lines the human is objecting to are no longer marked as the lines they are objecting
+/// to (D1). Widening the fence is CommonMark's own answer: a fence is closed only by a run
+/// at least as long as the one that opened it.
+fn fence_for(body: &str) -> String {
+    let longest = body
+        .lines()
+        .map(|l| l.chars().take_while(|c| *c == '`').count())
+        .max()
+        .unwrap_or(0);
+    "`".repeat((longest + 1).max(3))
 }
 
 fn lossy(bytes: &[u8]) -> String {
@@ -99,15 +142,21 @@ pub fn export(ctx: &ExportContext, path: &[u8], flag: &Flag) -> String {
     out.push_str("note: ");
     out.push_str(&caret(&flag.note));
     if let Some(h) = &flag.hunk {
-        out.push_str("\n\n```diff\n");
-        out.push_str(&caret(&h.header));
-        out.push('\n');
-        let text = caret(&h.text);
-        out.push_str(&text);
+        let header = caret(&h.header);
+        let mut text = caret(&h.text);
         if !text.ends_with('\n') {
-            out.push('\n');
+            text.push('\n');
         }
-        out.push_str("```");
+        // The fence is chosen from what is going inside it, so no line of the diff can end
+        // the block early (D1).
+        let fence = fence_for(&format!("{header}\n{text}"));
+        out.push_str("\n\n");
+        out.push_str(&fence);
+        out.push_str("diff\n");
+        out.push_str(&header);
+        out.push('\n');
+        out.push_str(&text);
+        out.push_str(&fence);
     }
     out
 }
@@ -155,6 +204,21 @@ mod tests {
         }
     }
 
+    /// The escape and fence contract, pinned in the golden so a change to either shows as a
+    /// golden diff (D1/F9). The inputs are deliberately hostile: every control range the
+    /// renderer knows about, and a hunk line that is exactly a three-backtick fence.
+    fn hazard_flag() -> Flag {
+        Flag {
+            note: "paste guard · ESC \u{1b} · DEL \u{7f} · CSI \u{9b} · BEL \u{7}".into(),
+            created_at: "2026-09-05T18:04:00Z".into(),
+            hunk: Some(FlagHunk {
+                index: 2,
+                header: "@@ -40,3 +40,3 @@ fn render()".into(),
+                text: "-println!(\"x\");\n```\n+println!(\"y\");\n".into(),
+            }),
+        }
+    }
+
     /// The frozen shape. `just flag-export-golden` rewrites the file; anything else compares.
     #[test]
     fn flags_export_matches_the_golden() {
@@ -164,9 +228,10 @@ mod tests {
             clock.now_iso8601()
         });
         let actual = format!(
-            "{}\n\n{}\n",
+            "{}\n\n{}\n\n{}\n",
             export(&ctx(), b"crates/lastcall-engine/src/ops.rs", &hunk_flag()),
             export(&ctx(), b"crates/lastcall/src/tui/render.rs", &file),
+            export(&ctx(), b"crates/lastcall/src/tui/keys.rs", &hazard_flag()),
         );
         if std::env::var_os("LASTCALL_UPDATE_GOLDEN").is_some() {
             std::fs::write(GOLDEN, &actual).expect("write golden");
@@ -204,6 +269,53 @@ mod tests {
             out.contains("\n\tkept\n"),
             "tab and newline are kept as they are"
         );
+    }
+
+    /// F9: the C0-only rule left two escapes open.
+    ///
+    /// `\u{9b}` is CSI — a terminal in UTF-8 mode ends a bracketed paste on `\u{9b}201~`
+    /// just as it does on `\u{1b}[201~` — and DEL is a control byte the export has no
+    /// business emitting raw either. Both now leave in the same caret notation as C0, and
+    /// the C1 form is the caret spelling of the ESC sequence it is equivalent to.
+    #[test]
+    fn flags_export_escapes_del_and_the_c1_range() {
+        let flag = Flag {
+            note: "csi \u{9b}201~rm -rf / and del \u{7f} and nel \u{85}".into(),
+            created_at: "t".into(),
+            hunk: Some(FlagHunk {
+                index: 0,
+                header: "@@ -1,1 +1,1 @@".into(),
+                text: "-a\n+b\u{9b}201~\u{7f}\n".into(),
+            }),
+        };
+        let out = export(&ctx(), b"f1", &flag);
+        for c in ['\u{9b}', '\u{7f}', '\u{85}', '\u{1b}'] {
+            assert!(!out.contains(c), "{c:?} survived raw:\n{out}");
+        }
+        assert!(out.contains("csi ^[[201~rm -rf / and del ^? and nel ^[E"));
+        assert!(out.contains("+b^[[201~^?\n"));
+        // The whole C1 block, and nothing above it.
+        assert_eq!(caret("\u{80}\u{9f}"), "^[@^[_");
+        assert_eq!(caret("\u{a0}é"), "\u{a0}é", "U+00A0 is not a control");
+    }
+
+    /// D1: a hunk line that is exactly ``` must not close the block.
+    #[test]
+    fn flags_export_widens_the_fence_for_a_backtick_line() {
+        let mut flag = hunk_flag();
+        flag.hunk.as_mut().unwrap().text = "-a\n```\n+b\n".into();
+        let out = export(&ctx(), b"f1", &flag);
+        assert!(out.contains("\n````diff\n"), "opens with four:\n{out}");
+        assert!(out.ends_with("+b\n````"), "and closes with four:\n{out}");
+        assert!(!out.contains("`````"));
+        // One longer than the longest run that starts a line, so an escalation still works.
+        flag.hunk.as_mut().unwrap().text = "-a\n`````x\n+b\n".into();
+        let out = export(&ctx(), b"f1", &flag);
+        assert!(out.contains("\n``````diff\n"), "{out}");
+        assert!(out.ends_with("+b\n``````"), "{out}");
+        // A backtick run that does not start a line changes nothing.
+        flag.hunk.as_mut().unwrap().text = "-a ``` b\n+b\n".into();
+        assert!(export(&ctx(), b"f1", &flag).contains("\n```diff\n"));
     }
 
     /// A file flag is the header and the note: no `hunk n of m`, no diff block.
