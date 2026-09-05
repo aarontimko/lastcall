@@ -37,6 +37,8 @@ use lastcall_testkit::tmp::TempDir;
 const NOT_A_TERMINAL: &str = "lastcall: not a terminal; try `lastcall status`";
 /// `render::TOO_SMALL`.
 const TOO_SMALL: &str = "too small: 40×10 min";
+/// `commands/tui.rs::DISCOVERING` (deliverable 7), kept in sync by `wait_first_piles`.
+const DISCOVERING: &str = "lastcall: discovering roots under ";
 
 /// The engine's debounce plus one second: the §8 Phase 3 gate's live-update budget.
 const LIVE_UPDATE_BUDGET: Duration = Duration::from_millis(1750);
@@ -315,9 +317,25 @@ fn wait_first_piles(pty: &mut PtyTui) -> Duration {
             .is_some_and(|i| i < first_row),
         "the first frame is the empty state"
     );
+    let alt_on = find(&raw, ALT_SCREEN_ON).expect("alternate screen on");
+    assert!(find(&raw, MOUSE_ON).is_some(), "mouse capture is on");
+    // Phase 6 deliverable 7: discovery can take seconds over a large tree, and a terminal
+    // that prints nothing reads as a hang. `commands/tui.rs` writes one stderr line before
+    // `Engine::open`, so it lands in the transcript **before** the alternate screen is
+    // taken, and the first frame - drawn after - replaces it.
+    let discovering = find(&raw, DISCOVERING.as_bytes()).unwrap_or_else(|| {
+        panic!(
+            "the discovering line: {:?}",
+            String::from_utf8_lossy(&raw[..raw.len().min(400)])
+        )
+    });
     assert!(
-        find(&raw, ALT_SCREEN_ON).is_some() && find(&raw, MOUSE_ON).is_some(),
-        "alternate screen and mouse capture are on"
+        discovering < alt_on,
+        "the discovering line ({discovering}) precedes alternate-screen-on ({alt_on})"
+    );
+    assert!(
+        alt_on < scanning,
+        "the first frame ({scanning}) comes after it ({alt_on})"
     );
     assert!(pty.screen(|s| s.alternate_screen()));
     assert!(pty.screen(|s| s.mouse_protocol_mode() != vt100::MouseProtocolMode::None));
