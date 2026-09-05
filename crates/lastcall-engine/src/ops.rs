@@ -617,6 +617,10 @@ impl Ops<'_> {
                 path: path.to_vec(),
                 reason,
             },
+            crate::restore::WriteError::Moved => Refused::Moved {
+                path: path.to_vec(),
+                live: None,
+            },
             crate::restore::WriteError::Io { source, .. } => Refused::Unhashable {
                 path: path.to_vec(),
                 reason: source.to_string(),
@@ -756,6 +760,10 @@ impl Ops<'_> {
                 path: self.store.root().join(OsStr::from_bytes(path)),
                 source: std::io::Error::other(reason),
             }),
+            Err(crate::restore::WriteError::Moved) => Err(OpsError::Io {
+                path: self.store.root().join(OsStr::from_bytes(path)),
+                source: std::io::Error::other("moved"),
+            }),
             Err(crate::restore::WriteError::Io { path, source }) => OpsError::io(path, source),
         }
     }
@@ -815,7 +823,7 @@ impl Ops<'_> {
             }),
             // The second CAS is the only refusal this deep, and it is `Moved` — the same
             // answer the entry CAS gives, so the TUI has one case to render.
-            Err(WriteError::Refuse(_)) => Ok(Outcome {
+            Err(WriteError::Refuse(_) | WriteError::Moved) => Ok(Outcome {
                 refused: vec![Refused::Moved {
                     path: path.to_vec(),
                     live: None,
@@ -878,6 +886,11 @@ impl Ops<'_> {
             return match crate::restore::set_mode(self.store, &rendered.path, mode) {
                 Ok(()) => Ok(Outcome::default()),
                 Err(crate::restore::WriteError::Io { path, source }) => OpsError::io(path, source),
+                // The leaf is a symlink now, so it is not the row that was rendered (F6).
+                Err(crate::restore::WriteError::Moved) => refuse(Refused::Moved {
+                    path: rendered.path.clone(),
+                    live: None,
+                }),
                 Err(crate::restore::WriteError::Refuse(reason)) => refuse(Refused::Unhashable {
                     path: rendered.path.clone(),
                     reason,
@@ -1039,6 +1052,10 @@ impl Ops<'_> {
                 crate::restore::WriteError::Refuse(reason) => refuse(Refused::Unhashable {
                     path: rendered.path.clone(),
                     reason,
+                }),
+                crate::restore::WriteError::Moved => refuse(Refused::Moved {
+                    path: rendered.path.clone(),
+                    live: None,
                 }),
                 crate::restore::WriteError::Io { path, source } => OpsError::io(path, source),
             };

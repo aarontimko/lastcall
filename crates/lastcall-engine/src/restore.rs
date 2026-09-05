@@ -73,6 +73,10 @@ pub enum WriteError {
         source: std::io::Error,
     },
     Refuse(String),
+    /// The thing at the path is not the thing that was rendered: the leaf itself is now a
+    /// symlink. The caller turns this into [`crate::ops::Refused::Moved`] — the same answer
+    /// the compare-and-swap gives, because it is the same fact.
+    Moved,
 }
 
 impl WriteError {
@@ -435,8 +439,26 @@ pub fn set_mode(store: &Store, rel: &[u8], mode: Option<Mode>) -> Result<(), Wri
     }
     let full = store.root().join(OsStr::from_bytes(rel));
     let bits = perm_bits(&full, mode, true);
-    std::fs::set_permissions(&full, std::fs::Permissions::from_mode(bits))
-        .map_err(|e| WriteError::io(&full, e))
+    // `chmod(2)` follows symlinks, and so does `std::fs::set_permissions` (verifier F6). A
+    // leaf swapped for a link to `~/.ssh/authorized_keys` between the render and the
+    // keystroke would have had that file chmod'd — the one write in the whole path that
+    // could land outside the worktree, and it slipped past `check_parent_chain` because
+    // that walk deliberately stops before the leaf.
+    //
+    // So open the leaf itself with `O_NOFOLLOW` and `fchmod` the descriptor. `ELOOP` is the
+    // kernel saying "that is a symlink", which is `Moved`; and once the open succeeds the
+    // descriptor names the file, so nothing swapped in afterwards can be the one we chmod.
+    let fd = match nix::fcntl::open(
+        &full,
+        nix::fcntl::OFlag::O_RDONLY | nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(nix::errno::Errno::ELOOP) => return Err(WriteError::Moved),
+        Err(e) => return Err(WriteError::io(&full, std::io::Error::from(e))),
+    };
+    nix::sys::stat::fchmod(&fd, nix::sys::stat::Mode::from_bits_truncate(bits as _))
+        .map_err(|e| WriteError::io(&full, std::io::Error::from(e)))
 }
 
 #[cfg(test)]
@@ -523,6 +545,53 @@ mod tests {
         assert!(
             collision(root, nfd.as_bytes(), true).is_some(),
             "an NFD name that resolves onto the NFC file is a collision"
+        );
+    }
+
+    /// `chmod` follows symlinks; the mode-hunk restore must not (verifier F6).
+    ///
+    /// The shape that matters: an agent replaces the leaf with a link pointing *outside* the
+    /// root between the render and the keystroke. The old `set_permissions` call would have
+    /// chmod'd the pointee — a write that escaped the worktree entirely.
+    #[test]
+    fn restore_set_mode_refuses_a_symlink_leaf() {
+        use crate::store::tests::fixture_env;
+        use lastcall_testkit::fixture_repo::FixtureRepo;
+
+        let repo = FixtureRepo::new("setmode").unwrap();
+        let state = TempDir::new("lc-setmode");
+        let env = fixture_env(&repo, &state);
+        let paths = crate::paths::RepoPaths::under(state.join("repo"));
+        let rg = crate::git::RepoGit::new(&env, repo.path());
+        let config = rg.config_list().unwrap();
+        let facts = crate::store::RepoFacts::read(&rg, &config).unwrap();
+        let (store, notices) =
+            Store::open(&env, repo.path(), RootKind::Git, &paths, Some(&facts)).unwrap();
+        assert!(notices.is_empty(), "{notices:?}");
+        assert!(store.filemode(), "the fixture must honour the exec bit");
+
+        // The happy path first, so the refusal below is not passing for want of a chmod.
+        set_mode(&store, b"f1", Some(Mode::Executable)).unwrap();
+        let bits = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(bits(&repo.path().join("f1")) & 0o111, 0o111);
+        set_mode(&store, b"f1", Some(Mode::Regular)).unwrap();
+        assert_eq!(bits(&repo.path().join("f1")) & 0o111, 0);
+
+        // Now the swap: `f1` becomes a link to a file outside the root.
+        let outside = state.path().join("outside.txt");
+        std::fs::write(&outside, b"secret").unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::remove_file(repo.path().join("f1")).unwrap();
+        std::os::unix::fs::symlink(&outside, repo.path().join("f1")).unwrap();
+
+        match set_mode(&store, b"f1", Some(Mode::Executable)) {
+            Err(WriteError::Moved) => {}
+            other => panic!("expected Moved, got {other:?}"),
+        }
+        assert_eq!(
+            bits(&outside),
+            0o600,
+            "the outside pointee's mode must be untouched"
         );
     }
 
