@@ -40,6 +40,8 @@ pub mod method {
     pub const EVENTS_SUBSCRIBE: &str = "events.subscribe";
     /// Phase 5.
     pub const NOTIFICATION_SHOW: &str = "notification.show";
+    /// Phase 5: focus the pane an agent runs in.
+    pub const AGENT_FOCUS: &str = "agent.focus";
 }
 
 /// Errors from parsing wire lines.
@@ -263,6 +265,25 @@ impl PaneInfo {
     pub fn is_agent_bearing(&self) -> bool {
         self.agent.is_some()
     }
+
+    /// Does `newer` differ from `self` only in fields nothing downstream reads (§11)?
+    ///
+    /// A terminal writes its title on every prompt, and `revision`, `scroll` and `tokens`
+    /// move with the cursor; none of them changes a root's rollup, its scope or its dot. The
+    /// comparison is by exclusion — every *other* field is compared, so a field added to
+    /// `PaneInfo` later counts as a real change until someone lists it here on purpose.
+    pub fn differs_only_cosmetically(&self, newer: &PaneInfo) -> bool {
+        let mut probe = newer.clone();
+        probe.title.clone_from(&self.title);
+        probe.terminal_title.clone_from(&self.terminal_title);
+        probe
+            .terminal_title_stripped
+            .clone_from(&self.terminal_title_stripped);
+        probe.revision = self.revision;
+        probe.scroll.clone_from(&self.scroll);
+        probe.tokens.clone_from(&self.tokens);
+        probe == *self
+    }
 }
 
 /// `WorkspaceInfo` (schema line 1071). `number` is a positional index that renumbers on
@@ -407,7 +428,11 @@ pub struct SnapshotResult {
     pub snapshot: SessionSnapshot,
 }
 
-/// `pane.get` → `{"type":"pane","pane":{...}}`.
+/// `pane.get` → `{"type":"pane_info","pane":{...}}`.
+///
+/// (The tag was written `"pane"` here through Phase 4; the pinned schema fixture says
+/// `pane_info`, and so does the real server. Nothing read the tag, so only the comment was
+/// ever wrong.)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PaneResult {
     pub pane: PaneInfo,
@@ -446,6 +471,16 @@ pub struct NotificationShowResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneTarget {
     pub pane_id: String,
+}
+
+/// `agent.focus` params (schema `AgentTarget`).
+///
+/// `target` is herdr's own public pane id, never a display name: the server
+/// resolves it against the session, and a name would silently focus the wrong
+/// pane (or nothing) when two panes share one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTarget {
+    pub target: String,
 }
 
 /// `worktree.list` params (schema line 4373).

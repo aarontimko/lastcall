@@ -258,14 +258,12 @@ pub fn toplevel(env: &Env, dir: &Path) -> Option<PathBuf> {
 /// The main worktree's path when `root` is a linked worktree (`--git-dir` ≠
 /// `--git-common-dir`), from the first `worktree list --porcelain` entry.
 pub fn main_worktree_if_linked(rg: &RepoGit) -> Option<PathBuf> {
-    let dir = rg
-        .run(&["rev-parse", "--path-format=absolute", "--git-dir"])
+    // Both flags are infallible, so one batched call answers both (deliverable 1c).
+    let lines = rg
+        .rev_parse_batch(&["--git-dir", "--git-common-dir"], 2)
         .ok()?;
-    let common = rg
-        .run(&["rev-parse", "--path-format=absolute", "--git-common-dir"])
-        .ok()?;
-    let dir = std::fs::canonicalize(String::from_utf8_lossy(&dir).trim()).ok()?;
-    let common = std::fs::canonicalize(String::from_utf8_lossy(&common).trim()).ok()?;
+    let dir = std::fs::canonicalize(&lines[0]).ok()?;
+    let common = std::fs::canonicalize(&lines[1]).ok()?;
     if dir == common {
         return None;
     }

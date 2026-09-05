@@ -130,6 +130,59 @@ test-integration-herdr:
     bin="$(just herdr-fetch | tail -n 1)"
     LASTCALL_TEST_HERDR_BIN="$bin" just test-integration
 
+# Regenerate the consumed-surface schema fixture from the **pinned** release (kickoff 11a).
+# Never from master and never by hand: the provenance file records the tag and this command.
+herdr-schema-fixture:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    bin="$(just herdr-fetch | tail -n 1)"
+    out="$PWD/crates/lastcall-testkit/fixtures/herdr/schema/consumed-surface.json"
+    cargo run -q -p lastcall-testkit --example herdr_schema_fixture -- "$bin" "$out"
+    echo "herdr-schema-fixture: wrote $out"
+
+# Download the **latest** herdr release (not the pinned tag) into target/herdr/<tag>/herdr,
+# for the weekly compat check. Prints the absolute path as the last line, like herdr-fetch.
+herdr-fetch-latest:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    version="$(gh release view -R herdrdev/herdr --json tagName --jq .tagName)"
+    if [ -z "$version" ]; then
+        echo "herdr-fetch-latest: could not resolve the latest tag" >&2
+        exit 1
+    fi
+    dest="target/herdr/$version/herdr"
+    expected="herdr ${version#v}"
+    case "$(uname -s)-$(uname -m)" in
+        Darwin-arm64)  asset="herdr-macos-aarch64" ;;
+        Darwin-x86_64) asset="herdr-macos-x86_64" ;;
+        Linux-x86_64)  asset="herdr-linux-x86_64" ;;
+        Linux-aarch64|Linux-arm64) asset="herdr-linux-aarch64" ;;
+        *) echo "herdr-fetch-latest: unsupported host $(uname -s)-$(uname -m)" >&2; exit 1 ;;
+    esac
+    echo "herdr-fetch-latest: latest release is $version" >&2
+    if [ ! -x "$dest" ] || [ "$("$dest" --version 2>/dev/null || true)" != "$expected" ]; then
+        mkdir -p "$(dirname "$dest")"
+        gh release download "$version" -R herdrdev/herdr -p "$asset" -O "$dest" --clobber
+        chmod +x "$dest"
+    fi
+    actual="$("$dest" --version)"
+    # The version check is against the tag gh reported, not against herdr_version.
+    if [ "$actual" != "$expected" ]; then
+        echo "herdr-fetch-latest: expected '$expected', got '$actual'" >&2
+        exit 1
+    fi
+    echo "herdr-fetch-latest: verified $actual" >&2
+    echo "$PWD/$dest"
+
+# The real-server subset against the **latest** herdr, for the compat job. A protocol-guard
+# refusal, a schema-projection mismatch or any herdr_real_* failure all count as drift.
+test-integration-herdr-latest:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    bin="$(just herdr-fetch-latest | tail -n 1)"
+    LASTCALL_TEST_HERDR_BIN="$bin" \
+        cargo test -p lastcall-engine --test test_integration_herdr_real -- --nocapture --test-threads=1
+
 # Re-record the herdr fixtures from the real pinned binary (deliverable 6 provenance rule)
 # into crates/lastcall-testkit/fixtures/herdr/recorded/ (committed; see the provenance files).
 herdr-record:

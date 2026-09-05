@@ -830,7 +830,7 @@ pub(crate) mod fixture_tests {
     use crate::ops::Ops;
     use crate::paths::RepoPaths;
     use crate::store::tests::fixture_env;
-    use crate::store::{RootKind, TreeWrite};
+    use crate::store::{RepoFacts, RootKind, TreeWrite};
     use lastcall_testkit::fixture_repo::FixtureRepo;
     use lastcall_testkit::tmp::TempDir;
 
@@ -859,6 +859,7 @@ pub(crate) mod fixture_tests {
                 clock: &self.clock,
                 compaction_threshold: self.compaction_threshold,
                 staged: std::collections::BTreeMap::new(),
+                lock: crate::ops::DEFAULT_LOCK,
             }
         }
 
@@ -866,8 +867,10 @@ pub(crate) mod fixture_tests {
             let env = fixture_env(repo, state);
             let paths = RepoPaths::under(state.join("repo"));
             let repo_git = RepoGit::new(&env, repo.path());
+            let config = repo_git.config_list().unwrap();
+            let facts = RepoFacts::read(&repo_git, &config).unwrap();
             let (store, _) =
-                Store::open(&env, repo.path(), RootKind::Git, &paths, Some(&repo_git)).unwrap();
+                Store::open(&env, repo.path(), RootKind::Git, &paths, Some(&facts)).unwrap();
             let exclude = repo_git.git_path("info/exclude").unwrap();
             let index =
                 PrivateIndex::new(store.git().clone(), &paths, RootKind::Git, Some(exclude));

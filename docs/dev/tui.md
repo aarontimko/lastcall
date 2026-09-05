@@ -182,6 +182,9 @@ Defaults (`input::DEFAULT_KEYMAP`, in help-overlay order):
 | `accept` | `a` | on a file row: the one hunk under the diff cursor (a hunkless row — binary, collapsed, deleted, unreadable — whole); on a group: the group; on a root: every row of it (asks above 10 files) | the same hunk |
 | `accept_file` | `shift-a` | accept the selected file whole — the only key that does | |
 | `accept_all` | `ctrl-a` | accept everything listed, every root (asks above 10 files) | |
+| `ack` | `d` | ack the selected root's herdr ready flag ("herdr in the UI" below) | |
+| `jump` | `g` | focus the selected root's agent in herdr | |
+| `scope` | `w` | workspace scope on/off | |
 | `refresh` | `r` | rescan every root now (ignored while one is running) | |
 | `help` | `?` | the help overlay (any key closes it) | |
 | `quit` | `q` `ctrl-c` | exit 0 | |
@@ -236,6 +239,143 @@ mode) and by `lastcall config` (exit 2, so a bad table is visible headlessly):
 The effective table is what the hint line and the help overlay show (`App.keymap`), so a
 user sees their own bindings, not the defaults.
 
+## herdr in the UI (Phase 5)
+
+lastcall runs standalone; launched inside a herdr pane it also shows what the agents are
+doing. **The socket never reaches the reducer.** A dedicated task owns the client and folds
+`HerdrUpdate` values into `App` through `tui/herdr.rs`, which is the whole socket-free
+vocabulary the reducer may see; `app.rs` and `render.rs` never name
+`lastcall_engine::herdr`, so no `Cache`, `PaneInfo` or client handle can be reached from the
+reducer (§6.6, and the gate grep below).
+
+### The dot on a repo row
+
+Each root's nav row can carry one glyph before its bold name, with the agent count between
+the two when the root has more than one agent (`⚑3 alpha`).
+
+| dot | glyph | style | when |
+|---|---|---|---|
+| ready | `⚑` U+2691 | bold unacked, dim once acked | a **ready episode** stands (see below) |
+| blocked | `●` U+25CF | red | rollup `blocked`, no ready episode |
+| working | `●` U+25CF | yellow | rollup `working` |
+| unknown | `·` U+00B7 | dim | herdr reports a status word we do not know |
+| *(none)* | | | rollup `idle`, or `done` with no ready episode |
+
+The status shown is a **rollup**: `max` over every agent associated with the root, in the
+order `blocked > done > working > idle > unknown` (`Attention` derives `Ord`, so the enum
+order *is* the rule). Every dot disappears while the link is not live — a `Reconnecting` or
+`standalone` lastcall claims nothing about agents rather than showing stale dots.
+
+A **ready episode** opens the first time the rollup says `done` and closes on any non-`done`
+rollup (or when the root loses its agents entirely). Inside one episode there is exactly one
+alert, and an ack survives every re-derivation; a fresh `done` after the episode closed
+alerts again. The ack is **local to this process** (§10, 2026-09-04): a second lastcall over
+the same session derives the same flag and keeps its own ack.
+
+A root with no pending files is still listed while it has a ready episode or a blocked
+agent (`RootFlag::attention`); `working` / `idle` / `unknown` only annotate a root that is
+listed for its own reasons. Such a flag-only root shows `nothing pending · agent <status>`
+in both panes, so `enter` has somewhere to land — and in a nav too narrow for that line the
+half that survives is `agent <status>`, because the branch line above it already says
+`0 files`.
+
+### Keys
+
+| key | action | what it does |
+|---|---|---|
+| `d` | `ack` | ack the selected root's ready flag: the `⚑` dims, and the root drops out of a pending toast window. Nothing on a blocked root — there is no episode to ack — so the hint is not offered there either. |
+| `g` | `jump` | `agent.focus` on the max-attention agent's pane, then `focused <agent> in herdr` in the status line. Offered for a ready **or** a blocked root: both have a pane. |
+| `w` | `scope` | workspace scope on/off. Only does something when a scope was derived. |
+
+They are ordinary `[keys]` names (`ack`, `jump`, `scope`) and rebind like any other. Both
+`d` and `g` act on the **selected** root — the root of whatever the selection names.
+Clicking the dot itself selects that root and acks it in one gesture (`Target::RootDot`,
+the same reducer path as the key). The hint line offers `d ack` and `g jump` at tier 1 (only
+while the selected root actually carries the matching flag) and `w scope` at tier 2.
+
+### The header badge
+
+| state | badge |
+|---|---|
+| connected | `herdr <version>`, dim |
+| reconnecting | `herdr ⟳` |
+| `mode = "off"`, or no link asked for | `standalone`, dim |
+| `mode = "on"` and the link failed | `standalone: <reason>` |
+
+A click on the badge (`Target::HeaderHerdr`) puts the full text in the status line, which is
+how a truncated reason is read.
+
+### Workspace scope
+
+When the pane's workspace can be identified (`HERDR_WORKSPACE_ID`, read through the engine's
+injected `Env` and not `std::env`), `[herdr] scope = "workspace"` hides roots outside it and
+the mandatory notice says so:
+
+```text
+scope: <workspace label> · 3 repos hidden (w shows all)
+```
+
+`w` toggles it for the session; `scope = "all"` starts with it off. A hidden root is still
+watched — the scope is a view, not a filter on the engine.
+
+### Configuration
+
+lastcall's own `config.toml`:
+
+```toml
+[herdr]
+mode = "auto"      # auto | on | off — `on` makes a failed link visible in the badge
+session = "work"   # optional named-session pin
+toast = true       # ask herdr for a desktop notification when a repo first goes ready
+scope = "workspace" # workspace | all
+```
+
+Those four are the whole table (`HerdrConfig` is `deny_unknown_fields`, so a typo is an
+error, not a silent default).
+
+**Toasts need herdr's own setting too.** In `~/.config/herdr/config.toml`:
+
+```toml
+[ui.toast]
+delivery = "herdr"
+```
+
+herdr's default is `delivery = "off"`, which answers every `notification.show` with
+`disabled` — so with `[herdr] toast = true` and herdr left at its default, nothing is shown
+and nothing is retried. The window is deliberate rather than immediate: herdr shows its own
+completion toast when an agent goes `done`, and answers `busy` while any toast is on screen,
+so a call at that instant would always be refused. `TOAST_DELAY` is **7 s** — herdr's default
+`[ui.toast] delay_seconds` (1 s) plus its `Finished` toast lifetime (5 s) plus a second of
+margin — and one `notification.show` names every root that went ready in that window and is
+still unacked (`lastcall: alpha ready for review`, or `lastcall: 3 repos ready for review`
+with the names in the body; two roots sharing a basename are qualified by their parent
+directory). A `busy` or `rate_limited` verdict earns exactly **one** retry 5 s later; every
+other reason is dropped to the debug log. Never a third request. Raising herdr's
+`delay_seconds` beyond about six seconds makes our toast lose that race for good.
+
+### The demo (Gate 5's sponsor item)
+
+herdr derives `done` **only for a completion in a tab the user is not viewing** (§5.7), and
+focusing that tab silently flips `done → idle` with no event. So the layout matters, and a
+side-by-side pane in the same tab is documented as *never flags — you watched it happen*.
+The recipe below is the sponsor's real layout: the agent in a repo workspace, lastcall in the
+parent-dir workspace.
+
+1. In herdr, open a workspace on the **parent directory** of your repos and run lastcall in
+   a pane there. The badge should read `herdr <version>`.
+2. In a **different herdr workspace** (its own tab), open one of those repos and start an
+   agent in it.
+3. Switch back to the lastcall tab and leave it focused while the agent works. The repo's
+   row shows a yellow `●` while it runs.
+4. When the agent finishes — with the lastcall tab still the one you are looking at — the row
+   flips to a bold `⚑`, the repo is listed even if it has nothing pending, and (with
+   `[ui.toast] delivery = "herdr"` in herdr's config) a toast follows about seven seconds
+   later.
+5. `g` jumps to the agent's pane; `d` dims the flag without leaving the review.
+
+If the flag never appears, check the tab: a completion in the tab you are *watching* is one
+herdr never calls `done`.
+
 ## Hit-testing
 
 `render` returns a `HitMap`: the nav and main inner rectangles (`pane_at`, for the wheel)
@@ -247,7 +387,7 @@ The loop keeps the `HitMap` of the *last drawn* frame — not `App` — and drop
 stale (`run_press_resolves_through_the_hit_map_and_resize_invalidates_it`). A press becomes
 `Action::Press(col, row)`; the loop resolves it to a `Target` (`NavRoot`, `NavRow`,
 `NavGroup`, `DiffHunk(i)`, `DiffBody`, `Divider`, `HeaderAcceptAll`, `FileAccept`,
-`HunkAccept(i)`) and calls `App::hit`, which is the same reducer path the equivalent key
+`HunkAccept(i)`, `RootDot`, `HeaderHerdr`) and calls `App::hit`, which is the same reducer path the equivalent key
 takes (`app_hunk_click_equals_hunk_key`, `app_accept_hunk_by_keys_equals_hunk_accept_click`).
 While the confirm modal is open `hit` ignores every target, and `Ui::event` drops every
 mouse event — press, drag, release, wheel — before it reaches the app at all (the wheel over
@@ -363,11 +503,12 @@ exactly, so `accepted f1` cannot pass for `accepted f1 · 1 hunk left`.
 
 ```sh
 rg -n 'Command::new\("git"\)' crates                       # engine git.rs, plus the testkit's fixture builder; nothing under tui/
-rg -n 'std::env::var|home_dir\(' crates/lastcall/src        # only the LASTCALL_LOG* reads in tui/term.rs
+rg -n 'std::env::var|home_dir\(' crates/lastcall/src        # the two LASTCALL_LOG* reads in tui/term.rs, plus LASTCALL_PARALLELISM in commands/mod.rs (test-only override, never under tui/)
 rg -n 'lock\(' crates/lastcall/src/tui                      # nothing
 rg -n 'Rendered::of' crates/lastcall/src                    # only tui/app.rs (requests come from the held rows)
 rg -n 'last_pile|scan_all\(|\.scan\(' crates/lastcall/src/tui/app.rs   # nothing (the reducer never scans)
 rg -n 'println!|eprintln!|print!' crates/lastcall/src/tui   # nothing (the messages are in commands/)
 rg -n 'thread::sleep|tokio::time::sleep' crates/lastcall/src/tui   # nothing
+rg -n 'lastcall_engine::herdr' crates/lastcall/src/tui     # only tui/herdr.rs and tui/run.rs (the task side); never app.rs or render.rs
 cargo tree -e normal -p lastcall -p lastcall-engine | grep -c testkit   # 0
 ```

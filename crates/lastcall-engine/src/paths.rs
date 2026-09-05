@@ -7,11 +7,13 @@
 //!
 //! ```text
 //! <state>/roots/<parent-hash>/meta.json
-//! <state>/roots/<parent-hash>/repos/<repo-hash>/{ledger.json, store/, index, index.tree, index.tmp, lock}
+//! <state>/roots/<parent-hash>/repos/<repo-hash>/{ledger.json, store/, index, index.tree, index.<pid>.tmp, lock}
 //! ```
 //!
-//! `index.tree`, `index.tmp` and `lock` are additive files under the frozen layout (reported
-//! as a proposed §6.1 editorial addition).
+//! `index.tree`, `index.<pid>.tmp` and `lock` are additive files under the frozen layout
+//! (reported as a proposed §6.1 editorial addition). The scan's temp index carries the
+//! process id because several lastcall processes share one state dir (Phase 5 deliverable 2a,
+//! the §11 entry): one `index.tmp` between them is two `read-tree`s into the same file.
 
 use std::path::{Path, PathBuf};
 
@@ -64,6 +66,30 @@ impl std::fmt::Display for RootId {
     }
 }
 
+/// The scan's temp index for one process: `index.<pid>.tmp`.
+///
+/// Every lastcall process over one state dir gets its own, so that two concurrent scans of
+/// one root cannot `read-tree` into the same file. [`TEMP_INDEX_PREFIX`] and
+/// [`TEMP_INDEX_SUFFIX`] are what the stale sweep at `Store::open` matches on.
+pub const TEMP_INDEX_PREFIX: &str = "index.";
+pub const TEMP_INDEX_SUFFIX: &str = ".tmp";
+
+pub fn temp_index_name(pid: u32) -> String {
+    format!("{TEMP_INDEX_PREFIX}{pid}{TEMP_INDEX_SUFFIX}")
+}
+
+/// Whether `name` is some process's temp index — `index.<digits>.tmp` and nothing else, so
+/// that the sweep can never take `index`, `index.tree` or a file a future version adds.
+pub fn is_temp_index_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(TEMP_INDEX_PREFIX) else {
+        return false;
+    };
+    let Some(pid) = rest.strip_suffix(TEMP_INDEX_SUFFIX) else {
+        return false;
+    };
+    !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// Every file a root owns under the state dir.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoPaths {
@@ -83,7 +109,7 @@ impl RepoPaths {
             store: repo_dir.join("store"),
             index: repo_dir.join("index"),
             index_tree: repo_dir.join("index.tree"),
-            index_tmp: repo_dir.join("index.tmp"),
+            index_tmp: repo_dir.join(temp_index_name(std::process::id())),
             lock: repo_dir.join("lock"),
             repo_dir,
         }
@@ -182,8 +208,26 @@ mod tests {
         assert_eq!(repo.store, PathBuf::from(format!("{base}/store")));
         assert_eq!(repo.index, PathBuf::from(format!("{base}/index")));
         assert_eq!(repo.index_tree, PathBuf::from(format!("{base}/index.tree")));
-        assert_eq!(repo.index_tmp, PathBuf::from(format!("{base}/index.tmp")));
+        assert_eq!(
+            repo.index_tmp,
+            PathBuf::from(format!("{base}/index.{}.tmp", std::process::id()))
+        );
         assert_eq!(repo.lock, PathBuf::from(format!("{base}/lock")));
+    }
+
+    #[test]
+    fn paths_temp_index_name_is_matched_only_for_a_numeric_pid() {
+        assert_eq!(temp_index_name(4321), "index.4321.tmp");
+        assert!(is_temp_index_name(&temp_index_name(std::process::id())));
+        assert!(is_temp_index_name("index.1.tmp"));
+        // Never the persistent index, its tree stamp, or anything else the repo dir holds.
+        assert!(!is_temp_index_name("index"));
+        assert!(!is_temp_index_name("index.tree"));
+        assert!(!is_temp_index_name("index.tmp"));
+        assert!(!is_temp_index_name("index..tmp"));
+        assert!(!is_temp_index_name("index.4321.tmp.bak"));
+        assert!(!is_temp_index_name("index.a12.tmp"));
+        assert!(!is_temp_index_name("ledger.json"));
     }
 
     #[test]

@@ -28,8 +28,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::env::Env;
-use crate::git::{self, BatchCheck, GitError, Mode, Oid, RepoGit, StoreGit};
-use crate::paths::RepoPaths;
+use crate::git::{self, BatchCheck, ConfigList, GitError, Mode, Oid, RepoGit, StoreGit};
+use crate::paths::{self, RepoPaths};
 
 /// `git | draft`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -99,74 +99,149 @@ pub struct Store {
     filemode: bool,
 }
 
+/// Everything about the user's repository the store needs, read **once** by the caller.
+///
+/// Phase 5 deliverable 1c: before this, `Store::open` spawned seven `git` children of its
+/// own per root (`config --get core.excludesfile`, four `COPIED_CONFIG_KEYS` reads, and
+/// two `rev-parse --git-path`). All of it now comes from one `config --list -z` and one
+/// batched `rev-parse` the caller already ran for its head inspection.
+#[derive(Debug, Clone)]
+pub struct RepoFacts<'a> {
+    /// One `config --list -z` of the user's repository.
+    pub config: &'a ConfigList,
+    /// `rev-parse --git-path objects` — the object dir the alternate points at (the
+    /// common dir's for a linked worktree, D10).
+    pub objects_dir: PathBuf,
+    /// `rev-parse --git-path info/attributes`.
+    pub info_attributes: PathBuf,
+}
+
+impl<'a> RepoFacts<'a> {
+    /// Read the two git paths with a `--git-path` call each. The engine's `open_root`
+    /// folds them into the head inspection's batched `rev-parse` instead and builds the
+    /// struct literally; this is for callers with no inspection to fold them into.
+    pub fn read(git: &RepoGit, config: &'a ConfigList) -> Result<Self, GitError> {
+        Ok(Self {
+            config,
+            objects_dir: git.git_path("objects")?,
+            info_attributes: git.git_path("info/attributes")?,
+        })
+    }
+}
+
+/// How long another process's temp index must have gone untouched before the sweep takes it.
+const STALE_TEMP_INDEX: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Remove this process's own temp index and any *stale* one left by a process that died
+/// (Phase 5 deliverable 2a).
+///
+/// Ours goes unconditionally - a leftover from our own crashed fold, which `read-tree` would
+/// replace anyway. Another process's goes only when it has not been modified for an hour,
+/// because there is no liveness probe here: a pid on this machine says nothing (it may have
+/// been reused, and the file may belong to a container's pid namespace), and adding a probe
+/// would mean a new dependency for a file that costs nothing to leave lying. On Windows
+/// nothing but ours is ever removed. A failure at any step is silence: a temp index we could
+/// not delete is litter, never a reason to fail an open.
+fn sweep_temp_indexes(repo_dir: &Path, ours: &Path) {
+    let _ = std::fs::remove_file(ours);
+    if cfg!(windows) {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(repo_dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !paths::is_temp_index_name(name) {
+            continue;
+        }
+        let path = entry.path();
+        if path == ours {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .and_then(|m| now.duration_since(m).map_err(std::io::Error::other))
+            .is_ok_and(|age| age >= STALE_TEMP_INDEX);
+        if stale {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
 impl Store {
-    /// Open (initializing when absent) the store for `root`. `repo_git` is `Some` for git
+    /// Open (initializing when absent) the store for `root`. `repo` is `Some` for git
     /// roots. Returns the store and any notices (a failed key copy is a notice, never fatal).
     pub fn open(
         env: &Env,
         root: &Path,
         kind: RootKind,
         paths: &RepoPaths,
-        repo_git: Option<&RepoGit>,
+        repo: Option<&RepoFacts<'_>>,
     ) -> Result<(Self, Vec<String>), StoreError> {
         let mut notices = Vec::new();
         std::fs::create_dir_all(&paths.repo_dir).map_err(|e| io_err(&paths.repo_dir, e))?;
         if !paths.store.join("HEAD").is_file() {
             StoreGit::init_bare(env, &paths.store)?;
         }
-        // A stale temp index from a crashed fold; read-tree would replace it anyway.
-        let _ = std::fs::remove_file(&paths.index_tmp);
+        sweep_temp_indexes(&paths.repo_dir, &paths.index_tmp);
 
-        let excludes_file = match repo_git {
-            Some(rg) => match rg.config_get("core.excludesfile") {
-                Ok(v) => v.map(PathBuf::from),
-                Err(e) => {
-                    notices.push(format!("cannot read core.excludesfile: {e}"));
-                    None
-                }
-            },
-            None => None,
-        };
+        let excludes_file = repo
+            .and_then(|r| r.config.get("core.excludesfile"))
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from);
         let git =
             StoreGit::new(env, root, &paths.store, &paths.index).with_excludes_file(excludes_file);
+        // What the store's own config file already holds, in one spawn: every write below
+        // is skipped when the value already matches.
+        let store_config = git.config_list_local();
         // The store's own config pins the monitor/cache keys as well (a `git` run by hand
         // against the store must not start a daemon either). A failure is a notice: the
         // `-c` on every command still holds.
         for (key, value) in git::NEUTRALIZED_CONFIG {
+            if store_config.get(key) == Some(*value) {
+                continue;
+            }
             if let Err(e) = git.run(&["config", key, value]) {
                 notices.push(format!("cannot set {key} in the store: {e}"));
             }
         }
 
-        if let Some(rg) = repo_git {
+        if let Some(r) = repo {
             // Alternates → the user's object dir (the common dir for a linked worktree).
-            let objects = rg.git_path("objects")?;
             let info = paths.store.join("objects").join("info");
             std::fs::create_dir_all(&info).map_err(|e| io_err(&info, e))?;
             let alternates = info.join("alternates");
-            let mut line = objects.as_os_str().as_bytes().to_vec();
+            let mut line = r.objects_dir.as_os_str().as_bytes().to_vec();
             line.push(b'\n');
             std::fs::write(&alternates, line).map_err(|e| io_err(&alternates, e))?;
             // Normalization keys, at every open (the user may change them).
             for key in COPIED_CONFIG_KEYS {
-                match rg.config_get(key) {
-                    Ok(Some(v)) => {
-                        if let Err(e) = git.run(&["config", key, &v]) {
+                match r.config.get(key) {
+                    Some(v) => {
+                        if store_config.get(key) == Some(v) {
+                            continue;
+                        }
+                        if let Err(e) = git.run(&["config", key, v]) {
                             notices.push(format!("cannot copy {key} into the store: {e}"));
                         }
                     }
-                    Ok(None) => {
+                    None => {
                         // Unset in the user's config: unset ours (exit 5 = was not set).
-                        let _ = git.run_raw(None, &["config", "--unset", key], None);
+                        if store_config.get(key).is_some() {
+                            let _ = git.run_raw(None, &["config", "--unset", key], None);
+                        }
                     }
-                    Err(e) => notices.push(format!("cannot read {key}: {e}")),
                 }
             }
             // info/attributes: invisible to the store otherwise; a `* text=auto` living only
             // there would make every CRLF file churn.
-            let theirs = rg.git_path("info/attributes")?;
+            let theirs = &r.info_attributes;
             let ours = paths.store.join("info").join("attributes");
-            match std::fs::read(&theirs) {
+            match std::fs::read(theirs) {
                 Ok(bytes) => {
                     if let Some(parent) = ours.parent() {
                         std::fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
@@ -579,13 +654,131 @@ pub(crate) mod tests {
     }
 
     fn open_git(repo: &FixtureRepo, state: &TempDir) -> (Store, RepoGit) {
+        open_git_at(repo, state, &RepoPaths::under(state.join("repo")))
+    }
+
+    fn open_git_at(repo: &FixtureRepo, state: &TempDir, paths: &RepoPaths) -> (Store, RepoGit) {
         let env = fixture_env(repo, state);
-        let paths = RepoPaths::under(state.join("repo"));
         let rg = RepoGit::new(&env, repo.path());
+        let config = rg.config_list().unwrap();
+        let facts = RepoFacts::read(&rg, &config).unwrap();
         let (store, notices) =
-            Store::open(&env, repo.path(), RootKind::Git, &paths, Some(&rg)).unwrap();
+            Store::open(&env, repo.path(), RootKind::Git, paths, Some(&facts)).unwrap();
         assert!(notices.is_empty(), "{notices:?}");
         (store, rg)
+    }
+
+    /// Set `path`'s mtime `secs` into the past, so a sweep sees an aged file without a sleep.
+    fn age(path: &Path, secs: u64) {
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(secs);
+        let f = std::fs::File::options().write(true).open(path).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(when))
+            .unwrap();
+    }
+
+    /// The sweep takes our own temp index and a *dead* process's aged one, and nothing else:
+    /// not a temp index another live lastcall touched a minute ago, and not the persistent
+    /// index or its tree stamp, which share the `index` stem (deliverable 2a).
+    #[test]
+    fn store_sweeps_only_our_temp_index_and_an_hour_old_orphan() {
+        let dir = TempDir::new("lc-sweep");
+        let repo_dir = dir.mkdir("repo");
+        let paths = RepoPaths::under(repo_dir.clone());
+        // A pid that is not ours; the sweep never probes liveness, only the mtime.
+        let dead = repo_dir.join(paths::temp_index_name(999_999));
+        let live = repo_dir.join(paths::temp_index_name(std::process::id() + 1));
+        for f in [
+            &paths.index_tmp,
+            &dead,
+            &live,
+            &paths.index,
+            &paths.index_tree,
+        ] {
+            std::fs::write(f, b"x").unwrap();
+        }
+        age(&dead, 60 * 60 + 5);
+        age(&live, 60);
+        // The persistent index is old too: age alone must not be enough to take a file.
+        age(&paths.index, 60 * 60 * 24);
+
+        sweep_temp_indexes(&repo_dir, &paths.index_tmp);
+
+        assert!(!paths.index_tmp.exists(), "ours goes unconditionally");
+        assert!(!dead.exists(), "an hour-old orphan goes");
+        assert!(live.exists(), "a temp index touched a minute ago stays");
+        assert!(paths.index.exists(), "the persistent index is never swept");
+        assert!(paths.index_tree.exists(), "nor its tree stamp");
+    }
+
+    /// And `Store::open` is where it runs.
+    #[test]
+    fn store_open_sweeps_a_stale_temp_index_left_by_a_dead_process() {
+        let repo = FixtureRepo::new("sweep").unwrap();
+        let state = TempDir::new("lc-sweep-open");
+        let repo_dir = state.mkdir("repo");
+        let paths = RepoPaths::under(repo_dir.clone());
+        let dead = repo_dir.join(paths::temp_index_name(999_998));
+        std::fs::write(&dead, b"x").unwrap();
+        age(&dead, 60 * 60 + 5);
+
+        let (store, _) = open_git_at(&repo, &state, &paths);
+
+        assert!(!dead.exists(), "the stale temp index is gone after open");
+        assert!(
+            store
+                .index_tmp
+                .ends_with(paths::temp_index_name(std::process::id())),
+            "the store scans through its own process's temp index: {}",
+            store.index_tmp.display()
+        );
+    }
+
+    /// The one batched read must answer **exactly** what the seven `config --get` calls it
+    /// replaced answered, for every key the open consumes — against real git, with values
+    /// that contain the two bytes a naive `key=value` split would break on.
+    #[test]
+    fn store_config_list_agrees_with_config_get_for_every_key_the_open_reads() {
+        let repo = FixtureRepo::new("cfg").unwrap();
+        let state = TempDir::new("lc-cfg");
+        let env = fixture_env(&repo, &state);
+        let rg = RepoGit::new(&env, repo.path());
+        // A URL with `=` in its query, an excludesfile whose name contains `=`, a
+        // multi-valued key (last wins), and a key left unset.
+        repo.git(&["config", "remote.origin.url", "https://h.invalid/r?a=1&b=2"])
+            .unwrap();
+        repo.git(&["config", "core.excludesfile", "/tmp/ex=cludes"])
+            .unwrap();
+        repo.git(&["config", "user.email", "a@b.invalid"]).unwrap();
+        repo.git(&["config", "core.autocrlf", "input"]).unwrap();
+        repo.git(&["config", "--add", "core.ignorecase", "false"])
+            .unwrap();
+        repo.git(&["config", "--add", "core.ignorecase", "true"])
+            .unwrap();
+
+        let mut keys: Vec<&str> = vec![
+            "core.excludesfile",
+            "user.email",
+            "remote.origin.url",
+            "core.eol",
+        ];
+        keys.extend_from_slice(COPIED_CONFIG_KEYS);
+        let list = rg.config_list().unwrap();
+        for key in keys {
+            let want = rg.config_get(key).unwrap();
+            // `--get` on an unset key exits 1 (`None`); a key set to the empty string is
+            // `Some("")`. The map must make the same distinction.
+            assert_eq!(
+                list.get(key).map(str::to_owned),
+                want,
+                "config --list -z disagrees with config --get {key}"
+            );
+        }
+        assert_eq!(
+            list.get("core.ignorecase"),
+            Some("true"),
+            "the last value of a multi-valued key, like --get"
+        );
+        assert_eq!(list.get("no.such.key"), None);
     }
 
     #[test]

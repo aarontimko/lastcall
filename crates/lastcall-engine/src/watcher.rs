@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use notify::{RecursiveMode, Watcher as _};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
@@ -77,12 +77,30 @@ pub struct Watcher {
     pub engine: Arc<Mutex<Engine>>,
     pub handle: JoinHandle<()>,
     stop: watch::Sender<bool>,
+    rescan: Arc<Notify>,
 }
 
 impl Watcher {
     /// Ask the loop to finish; `handle` completes shortly after.
     pub fn stop(&self) {
         let _ = self.stop.send(true);
+    }
+
+    /// Run the discovery rescan now instead of at the next backstop tick.
+    ///
+    /// Exactly what the `rescan` interval does: `Engine::rescan`, then — if the root set
+    /// changed — reinstalled watches, an `EngineEvent::RootsChanged`, and every root marked
+    /// due for a scan. `Engine::rescan` opens new roots but does not scan or watch them, so
+    /// this loop is the only thing that turns a new directory into a visible root, and the
+    /// backstop is minutes wide.
+    ///
+    /// The caller is whoever learns about a new root sooner than the backstop would: herdr's
+    /// `WorktreeChanged`, after its own debounce (Phase 5 deliverable 7). This is a
+    /// *trigger*, not an instruction — `roots::discover` still decides, so a `Removed` path
+    /// that is still on disk stays a root. Calls coalesce: several before the loop wakes run
+    /// one rescan, and one arriving mid-rescan runs another after it.
+    pub fn request_rescan(&self) {
+        self.rescan.notify_one();
     }
 
     pub async fn join(self) {
@@ -103,12 +121,20 @@ impl Engine {
         let engine = Arc::new(Mutex::new(self));
         let (tx, events) = mpsc::channel(256);
         let (stop, stop_rx) = watch::channel(false);
-        let handle = tokio::spawn(run_loop(engine.clone(), timings, tx, stop_rx));
+        let rescan = Arc::new(Notify::new());
+        let handle = tokio::spawn(run_loop(
+            engine.clone(),
+            timings,
+            tx,
+            stop_rx,
+            rescan.clone(),
+        ));
         Watcher {
             events,
             engine,
             handle,
             stop,
+            rescan,
         }
     }
 }
@@ -342,6 +368,31 @@ async fn scan_root(
     }
 }
 
+/// Scan every root in one engine call — the bounded pool — and emit the piles in path
+/// order. One lock for the whole set instead of one per root.
+async fn scan_all_roots(engine: &Arc<Mutex<Engine>>, tx: &mpsc::Sender<EngineEvent>) -> bool {
+    let results = blocking(engine, |e| e.scan_all()).await;
+    for (root, seq, result) in results {
+        let ok = match result {
+            Ok(pile) => emit(tx, EngineEvent::Pile { root, seq, pile }).await,
+            Err(e) => {
+                emit(
+                    tx,
+                    EngineEvent::Notice {
+                        root: Some(root),
+                        text: format!("scan failed: {e}"),
+                    },
+                )
+                .await
+            }
+        };
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
 async fn inspect_root(
     engine: &Arc<Mutex<Engine>>,
     tx: &mpsc::Sender<EngineEvent>,
@@ -390,6 +441,8 @@ async fn run_loop(
     timings: EngineTimings,
     tx: mpsc::Sender<EngineEvent>,
     mut stop: watch::Receiver<bool>,
+    // `Watcher::request_rescan`: the discovery rescan on demand, not only on the tick.
+    requested_rescan: Arc<Notify>,
 ) {
     let (fs_tx, mut fs_rx) = mpsc::unbounded_channel::<Result<notify::Event, notify::Error>>();
     let mut watcher = match notify::recommended_watcher(move |res| {
@@ -424,11 +477,18 @@ async fn run_loop(
         roots.clone(),
     ));
     let mut reinstall = false;
-    // Initial scans.
-    for r in roots.iter().map(|r| r.path.clone()).collect::<Vec<_>>() {
-        if !scan_root(&engine, &tx, r).await {
-            return;
-        }
+    // Initial scans. The first root is scanned on its own so the first pile reaches the
+    // screen as early as it ever did; the rest go through one `scan_all`, which runs them
+    // on the engine's bounded pool instead of one at a time behind the engine mutex
+    // (Phase 5 deliverable 1b — this loop was the whole gap between `first_pile_ms` and
+    // `first_frame_ms` on the 100-root bench).
+    if let Some(first) = roots.first().map(|r| r.path.clone())
+        && !scan_root(&engine, &tx, first).await
+    {
+        return;
+    }
+    if roots.len() > 1 && !scan_all_roots(&engine, &tx).await {
+        return;
     }
 
     let mut due: BTreeMap<PathBuf, Instant> = BTreeMap::new();
@@ -440,6 +500,7 @@ async fn run_loop(
     rescan.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     rescan.tick().await;
 
+    let mut rescan_now = false;
     loop {
         let next_due = due.values().min().copied();
         let sleep = tokio::time::sleep_until(
@@ -516,28 +577,53 @@ async fn run_loop(
                     if r.git_dir.is_some() { head_due.insert(r.path.clone()); }
                 }
             }
-            _ = rescan.tick() => {
-                let changed = blocking(&engine, |e| e.rescan()).await;
-                match changed {
-                    Ok(changed) => {
-                        if !changed.is_empty() {
-                            roots = { let g = lock(&engine); root_watches(&g) };
-                            if install.is_some() {
-                                reinstall = true;
-                            } else {
-                                install = Some(spawn_install(watcher.take(), std::mem::take(&mut watched), roots.clone()));
-                            }
-                            if !emit(&tx, EngineEvent::RootsChanged(changed)).await { return; }
+            _ = rescan.tick() => { rescan_now = true; }
+            // The same work, asked for rather than waited for (deliverable 7's seam).
+            _ = requested_rescan.notified() => { rescan_now = true; }
+            _ = sleep, if next_due.is_some() => {}
+        }
+
+        if std::mem::take(&mut rescan_now) {
+            let changed = blocking(&engine, |e| e.rescan()).await;
+            match changed {
+                Ok(changed) => {
+                    if !changed.is_empty() {
+                        roots = {
+                            let g = lock(&engine);
+                            root_watches(&g)
+                        };
+                        if install.is_some() {
+                            reinstall = true;
+                        } else {
+                            install = Some(spawn_install(
+                                watcher.take(),
+                                std::mem::take(&mut watched),
+                                roots.clone(),
+                            ));
+                        }
+                        if !emit(&tx, EngineEvent::RootsChanged(changed)).await {
+                            return;
                         }
                     }
-                    Err(e) => {
-                        if !emit(&tx, EngineEvent::Notice { root: None, text: format!("rescan failed: {e}") }).await { return; }
+                }
+                Err(e) => {
+                    if !emit(
+                        &tx,
+                        EngineEvent::Notice {
+                            root: None,
+                            text: format!("rescan failed: {e}"),
+                        },
+                    )
+                    .await
+                    {
+                        return;
                     }
                 }
-                let now = Instant::now();
-                for r in &roots { due.insert(r.path.clone(), now); }
             }
-            _ = sleep, if next_due.is_some() => {}
+            let now = Instant::now();
+            for r in &roots {
+                due.insert(r.path.clone(), now);
+            }
         }
 
         // Drain: head inspections first (they scan too), then due scans.

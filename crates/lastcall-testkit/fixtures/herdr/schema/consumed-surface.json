@@ -1,0 +1,2439 @@
+{
+  "defs": {
+    "event/AgentSessionInfo": {
+      "properties": {
+        "agent": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/defs/event/AgentSessionRefKind"
+        },
+        "source": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "source",
+        "agent",
+        "kind",
+        "value"
+      ],
+      "type": "object"
+    },
+    "event/AgentSessionRefKind": {
+      "enum": [
+        "id",
+        "path"
+      ],
+      "type": "string"
+    },
+    "event/AgentStatus": {
+      "enum": [
+        "idle",
+        "working",
+        "blocked",
+        "done",
+        "unknown"
+      ],
+      "type": "string"
+    },
+    "event/PaneInfo": {
+      "properties": {
+        "agent": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agent_session": {
+          "anyOf": [
+            {
+              "$ref": "#/defs/event/AgentSessionInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "agent_status": {
+          "$ref": "#/defs/event/AgentStatus"
+        },
+        "cwd": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "display_agent": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "focused": {
+          "type": "boolean"
+        },
+        "foreground_cwd": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pane_id": {
+          "type": "string"
+        },
+        "revision": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "scroll": {
+          "anyOf": [
+            {
+              "$ref": "#/defs/event/PaneScrollInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "state_labels": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "tab_id": {
+          "type": "string"
+        },
+        "terminal_id": {
+          "type": "string"
+        },
+        "terminal_title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "terminal_title_stripped": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tokens": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "maxProperties": 32,
+          "propertyNames": {
+            "pattern": "^[A-Za-z0-9_-]{1,32}$"
+          },
+          "type": "object"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "pane_id",
+        "terminal_id",
+        "workspace_id",
+        "tab_id",
+        "focused",
+        "agent_status",
+        "revision"
+      ],
+      "type": "object"
+    },
+    "event/PaneScrollInfo": {
+      "properties": {
+        "max_offset_from_bottom": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "offset_from_bottom": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "viewport_rows": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "offset_from_bottom",
+        "max_offset_from_bottom",
+        "viewport_rows"
+      ],
+      "type": "object"
+    },
+    "event/TabInfo": {
+      "properties": {
+        "agent_status": {
+          "$ref": "#/defs/event/AgentStatus"
+        },
+        "focused": {
+          "type": "boolean"
+        },
+        "label": {
+          "type": "string"
+        },
+        "number": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pane_count": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tab_id": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tab_id",
+        "workspace_id",
+        "number",
+        "label",
+        "focused",
+        "pane_count",
+        "agent_status"
+      ],
+      "type": "object"
+    },
+    "event/WorkspaceInfo": {
+      "properties": {
+        "active_tab_id": {
+          "type": "string"
+        },
+        "agent_status": {
+          "$ref": "#/defs/event/AgentStatus"
+        },
+        "focused": {
+          "type": "boolean"
+        },
+        "label": {
+          "type": "string"
+        },
+        "number": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pane_count": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tab_count": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tokens": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "maxProperties": 32,
+          "propertyNames": {
+            "pattern": "^[A-Za-z0-9_-]{1,32}$"
+          },
+          "type": "object"
+        },
+        "workspace_id": {
+          "type": "string"
+        },
+        "worktree": {
+          "anyOf": [
+            {
+              "$ref": "#/defs/event/WorkspaceWorktreeInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "workspace_id",
+        "number",
+        "label",
+        "focused",
+        "pane_count",
+        "tab_count",
+        "active_tab_id",
+        "agent_status"
+      ],
+      "type": "object"
+    },
+    "event/WorkspaceWorktreeInfo": {
+      "properties": {
+        "checkout_path": {
+          "type": "string"
+        },
+        "is_linked_worktree": {
+          "type": "boolean"
+        },
+        "repo_key": {
+          "type": "string"
+        },
+        "repo_name": {
+          "type": "string"
+        },
+        "repo_root": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "repo_key",
+        "repo_name",
+        "repo_root",
+        "checkout_path",
+        "is_linked_worktree"
+      ],
+      "type": "object"
+    },
+    "event/WorktreeInfo": {
+      "properties": {
+        "branch": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "is_bare": {
+          "type": "boolean"
+        },
+        "is_detached": {
+          "type": "boolean"
+        },
+        "is_linked_worktree": {
+          "type": "boolean"
+        },
+        "is_prunable": {
+          "type": "boolean"
+        },
+        "label": {
+          "type": "string"
+        },
+        "open_workspace_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "is_bare",
+        "is_detached",
+        "is_prunable",
+        "is_linked_worktree",
+        "label"
+      ],
+      "type": "object"
+    },
+    "request/AgentStatus": {
+      "enum": [
+        "idle",
+        "working",
+        "blocked",
+        "done",
+        "unknown"
+      ],
+      "type": "string"
+    },
+    "request/AgentTarget": {
+      "properties": {
+        "target": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "target"
+      ],
+      "type": "object"
+    },
+    "request/EmptyParams": {
+      "type": "object"
+    },
+    "request/EventsSubscribeParams": {
+      "properties": {
+        "subscriptions": {
+          "items": {
+            "$ref": "#/defs/request/Subscription"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "subscriptions"
+      ],
+      "type": "object"
+    },
+    "request/NotificationShowParams": {
+      "properties": {
+        "body": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "position": {
+          "anyOf": [
+            {
+              "$ref": "#/defs/request/ToastHerdrPosition"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sound": {
+          "$ref": "#/defs/request/NotificationShowSound"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "title"
+      ],
+      "type": "object"
+    },
+    "request/NotificationShowSound": {
+      "enum": [
+        "none",
+        "done",
+        "request"
+      ],
+      "type": "string"
+    },
+    "request/OutputMatch": {
+      "oneOf": [
+        {
+          "properties": {
+            "type": {
+              "const": "substring",
+              "type": "string"
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "value"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "regex",
+              "type": "string"
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "value"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "request/PaneListParams": {
+      "properties": {
+        "workspace_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "request/PaneTarget": {
+      "properties": {
+        "pane_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "pane_id"
+      ],
+      "type": "object"
+    },
+    "request/PingParams": {
+      "type": "object"
+    },
+    "request/ReadSource": {
+      "enum": [
+        "visible",
+        "recent",
+        "recent_unwrapped",
+        "detection"
+      ],
+      "type": "string"
+    },
+    "request/Subscription": {
+      "oneOf": [
+        {
+          "properties": {
+            "type": {
+              "const": "workspace.created",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "workspace.updated",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "workspace.metadata_updated",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "workspace.renamed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "workspace.moved",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "workspace.reordered",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "workspace.closed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "workspace.focused",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "worktree.created",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "worktree.opened",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "worktree.removed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "tab.created",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "tab.closed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "tab.focused",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "tab.renamed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "tab.moved",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "pane.created",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "pane.closed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "pane.updated",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "pane.focused",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "pane.moved",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "pane.exited",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "pane.agent_detected",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "lines": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "match": {
+              "$ref": "#/defs/request/OutputMatch"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "source": {
+              "$ref": "#/defs/request/ReadSource"
+            },
+            "strip_ansi": {
+              "default": true,
+              "type": "boolean"
+            },
+            "type": {
+              "const": "pane.output_matched",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "pane_id",
+            "source",
+            "match"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "agent_status": {
+              "anyOf": [
+                {
+                  "$ref": "#/defs/request/AgentStatus"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "pane.agent_status_changed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "pane_id"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "pane_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "pane.scroll_changed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "pane_id"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "layout.updated",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "request/TabTarget": {
+      "properties": {
+        "tab_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tab_id"
+      ],
+      "type": "object"
+    },
+    "request/ToastHerdrPosition": {
+      "enum": [
+        "top-left",
+        "top-right",
+        "bottom-left",
+        "bottom-right"
+      ],
+      "type": "string"
+    },
+    "request/WorkspaceTarget": {
+      "properties": {
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id"
+      ],
+      "type": "object"
+    },
+    "request/WorktreeListParams": {
+      "properties": {
+        "cwd": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspace_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "subscription_event/AgentStatus": {
+      "enum": [
+        "idle",
+        "working",
+        "blocked",
+        "done",
+        "unknown"
+      ],
+      "type": "string"
+    },
+    "success_response/AgentInfo": {
+      "properties": {
+        "agent": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agent_session": {
+          "anyOf": [
+            {
+              "$ref": "#/defs/success_response/AgentSessionInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "agent_status": {
+          "$ref": "#/defs/success_response/AgentStatus"
+        },
+        "cwd": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "display_agent": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "focused": {
+          "type": "boolean"
+        },
+        "foreground_cwd": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "interactive_ready": {
+          "type": "boolean"
+        },
+        "launch_pending": {
+          "type": "boolean"
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pane_id": {
+          "type": "string"
+        },
+        "revision": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "screen_detection_skipped": {
+          "type": "boolean"
+        },
+        "state_change_seq": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "state_labels": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "tab_id": {
+          "type": "string"
+        },
+        "terminal_id": {
+          "type": "string"
+        },
+        "terminal_title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "terminal_title_stripped": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tokens": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "maxProperties": 32,
+          "propertyNames": {
+            "pattern": "^[A-Za-z0-9_-]{1,32}$"
+          },
+          "type": "object"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "terminal_id",
+        "agent_status",
+        "workspace_id",
+        "tab_id",
+        "pane_id",
+        "focused",
+        "revision"
+      ],
+      "type": "object"
+    },
+    "success_response/AgentSessionInfo": {
+      "properties": {
+        "agent": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/defs/success_response/AgentSessionRefKind"
+        },
+        "source": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "source",
+        "agent",
+        "kind",
+        "value"
+      ],
+      "type": "object"
+    },
+    "success_response/AgentSessionRefKind": {
+      "enum": [
+        "id",
+        "path"
+      ],
+      "type": "string"
+    },
+    "success_response/AgentStatus": {
+      "enum": [
+        "idle",
+        "working",
+        "blocked",
+        "done",
+        "unknown"
+      ],
+      "type": "string"
+    },
+    "success_response/NotificationShowReason": {
+      "enum": [
+        "shown",
+        "disabled",
+        "rate_limited",
+        "no_foreground_client",
+        "busy"
+      ],
+      "type": "string"
+    },
+    "success_response/PaneInfo": {
+      "properties": {
+        "agent": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agent_session": {
+          "anyOf": [
+            {
+              "$ref": "#/defs/success_response/AgentSessionInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "agent_status": {
+          "$ref": "#/defs/success_response/AgentStatus"
+        },
+        "cwd": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "display_agent": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "focused": {
+          "type": "boolean"
+        },
+        "foreground_cwd": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pane_id": {
+          "type": "string"
+        },
+        "revision": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "scroll": {
+          "anyOf": [
+            {
+              "$ref": "#/defs/success_response/PaneScrollInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "state_labels": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "tab_id": {
+          "type": "string"
+        },
+        "terminal_id": {
+          "type": "string"
+        },
+        "terminal_title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "terminal_title_stripped": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tokens": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "maxProperties": 32,
+          "propertyNames": {
+            "pattern": "^[A-Za-z0-9_-]{1,32}$"
+          },
+          "type": "object"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "pane_id",
+        "terminal_id",
+        "workspace_id",
+        "tab_id",
+        "focused",
+        "agent_status",
+        "revision"
+      ],
+      "type": "object"
+    },
+    "success_response/PaneLayoutPane": {
+      "properties": {
+        "focused": {
+          "type": "boolean"
+        },
+        "pane_id": {
+          "type": "string"
+        },
+        "rect": {
+          "$ref": "#/defs/success_response/PaneLayoutRect"
+        }
+      },
+      "required": [
+        "pane_id",
+        "focused",
+        "rect"
+      ],
+      "type": "object"
+    },
+    "success_response/PaneLayoutRect": {
+      "properties": {
+        "height": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "width": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "x": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "y": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "x",
+        "y",
+        "width",
+        "height"
+      ],
+      "type": "object"
+    },
+    "success_response/PaneLayoutSnapshot": {
+      "properties": {
+        "area": {
+          "$ref": "#/defs/success_response/PaneLayoutRect"
+        },
+        "focused_pane_id": {
+          "type": "string"
+        },
+        "panes": {
+          "items": {
+            "$ref": "#/defs/success_response/PaneLayoutPane"
+          },
+          "type": "array"
+        },
+        "splits": {
+          "items": {
+            "$ref": "#/defs/success_response/PaneLayoutSplit"
+          },
+          "type": "array"
+        },
+        "tab_id": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string"
+        },
+        "zoomed": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "tab_id",
+        "zoomed",
+        "area",
+        "focused_pane_id",
+        "panes",
+        "splits"
+      ],
+      "type": "object"
+    },
+    "success_response/PaneLayoutSplit": {
+      "properties": {
+        "direction": {
+          "$ref": "#/defs/success_response/SplitDirection"
+        },
+        "id": {
+          "type": "string"
+        },
+        "ratio": {
+          "format": "float",
+          "type": "number"
+        },
+        "rect": {
+          "$ref": "#/defs/success_response/PaneLayoutRect"
+        }
+      },
+      "required": [
+        "id",
+        "direction",
+        "ratio",
+        "rect"
+      ],
+      "type": "object"
+    },
+    "success_response/PaneScrollInfo": {
+      "properties": {
+        "max_offset_from_bottom": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "offset_from_bottom": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "viewport_rows": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "offset_from_bottom",
+        "max_offset_from_bottom",
+        "viewport_rows"
+      ],
+      "type": "object"
+    },
+    "success_response/ServerCapabilities": {
+      "properties": {
+        "detached_server_daemon": {
+          "default": false,
+          "type": "boolean"
+        },
+        "live_handoff": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "live_handoff"
+      ],
+      "type": "object"
+    },
+    "success_response/SessionSnapshot": {
+      "properties": {
+        "agents": {
+          "items": {
+            "$ref": "#/defs/success_response/AgentInfo"
+          },
+          "type": "array"
+        },
+        "focused_pane_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "focused_tab_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "focused_workspace_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "layouts": {
+          "items": {
+            "$ref": "#/defs/success_response/PaneLayoutSnapshot"
+          },
+          "type": "array"
+        },
+        "panes": {
+          "items": {
+            "$ref": "#/defs/success_response/PaneInfo"
+          },
+          "type": "array"
+        },
+        "protocol": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tabs": {
+          "items": {
+            "$ref": "#/defs/success_response/TabInfo"
+          },
+          "type": "array"
+        },
+        "version": {
+          "type": "string"
+        },
+        "workspaces": {
+          "items": {
+            "$ref": "#/defs/success_response/WorkspaceInfo"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "version",
+        "protocol",
+        "workspaces",
+        "tabs",
+        "panes",
+        "layouts",
+        "agents"
+      ],
+      "type": "object"
+    },
+    "success_response/SplitDirection": {
+      "enum": [
+        "right",
+        "down"
+      ],
+      "type": "string"
+    },
+    "success_response/TabInfo": {
+      "properties": {
+        "agent_status": {
+          "$ref": "#/defs/success_response/AgentStatus"
+        },
+        "focused": {
+          "type": "boolean"
+        },
+        "label": {
+          "type": "string"
+        },
+        "number": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pane_count": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tab_id": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tab_id",
+        "workspace_id",
+        "number",
+        "label",
+        "focused",
+        "pane_count",
+        "agent_status"
+      ],
+      "type": "object"
+    },
+    "success_response/WorkspaceInfo": {
+      "properties": {
+        "active_tab_id": {
+          "type": "string"
+        },
+        "agent_status": {
+          "$ref": "#/defs/success_response/AgentStatus"
+        },
+        "focused": {
+          "type": "boolean"
+        },
+        "label": {
+          "type": "string"
+        },
+        "number": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pane_count": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tab_count": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tokens": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "maxProperties": 32,
+          "propertyNames": {
+            "pattern": "^[A-Za-z0-9_-]{1,32}$"
+          },
+          "type": "object"
+        },
+        "workspace_id": {
+          "type": "string"
+        },
+        "worktree": {
+          "anyOf": [
+            {
+              "$ref": "#/defs/success_response/WorkspaceWorktreeInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "workspace_id",
+        "number",
+        "label",
+        "focused",
+        "pane_count",
+        "tab_count",
+        "active_tab_id",
+        "agent_status"
+      ],
+      "type": "object"
+    },
+    "success_response/WorkspaceWorktreeInfo": {
+      "properties": {
+        "checkout_path": {
+          "type": "string"
+        },
+        "is_linked_worktree": {
+          "type": "boolean"
+        },
+        "repo_key": {
+          "type": "string"
+        },
+        "repo_name": {
+          "type": "string"
+        },
+        "repo_root": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "repo_key",
+        "repo_name",
+        "repo_root",
+        "checkout_path",
+        "is_linked_worktree"
+      ],
+      "type": "object"
+    },
+    "success_response/WorktreeInfo": {
+      "properties": {
+        "branch": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "is_bare": {
+          "type": "boolean"
+        },
+        "is_detached": {
+          "type": "boolean"
+        },
+        "is_linked_worktree": {
+          "type": "boolean"
+        },
+        "is_prunable": {
+          "type": "boolean"
+        },
+        "label": {
+          "type": "string"
+        },
+        "open_workspace_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "is_bare",
+        "is_detached",
+        "is_prunable",
+        "is_linked_worktree",
+        "label"
+      ],
+      "type": "object"
+    },
+    "success_response/WorktreeSourceInfo": {
+      "properties": {
+        "repo_key": {
+          "type": "string"
+        },
+        "repo_name": {
+          "type": "string"
+        },
+        "repo_root": {
+          "type": "string"
+        },
+        "source_checkout_path": {
+          "type": "string"
+        },
+        "source_workspace_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "repo_key",
+        "repo_name",
+        "repo_root",
+        "source_checkout_path"
+      ],
+      "type": "object"
+    }
+  },
+  "events": {
+    "pane.agent_detected": {
+      "data": {
+        "properties": {
+          "agent": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "final_status": {
+            "anyOf": [
+              {
+                "$ref": "#/defs/event/AgentStatus"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "pane_id": {
+            "type": "string"
+          },
+          "released": {
+            "type": "boolean"
+          },
+          "type": {
+            "const": "pane_agent_detected",
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "pane_id",
+          "workspace_id"
+        ],
+        "type": "object"
+      },
+      "event": "pane_agent_detected"
+    },
+    "pane.closed": {
+      "data": {
+        "properties": {
+          "pane_id": {
+            "type": "string"
+          },
+          "type": {
+            "const": "pane_closed",
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "pane_id",
+          "workspace_id"
+        ],
+        "type": "object"
+      },
+      "event": "pane_closed"
+    },
+    "pane.created": {
+      "data": {
+        "properties": {
+          "pane": {
+            "$ref": "#/defs/event/PaneInfo"
+          },
+          "type": {
+            "const": "pane_created",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "pane"
+        ],
+        "type": "object"
+      },
+      "event": "pane_created"
+    },
+    "pane.exited": {
+      "data": {
+        "properties": {
+          "pane_id": {
+            "type": "string"
+          },
+          "type": {
+            "const": "pane_exited",
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "pane_id",
+          "workspace_id"
+        ],
+        "type": "object"
+      },
+      "event": "pane_exited"
+    },
+    "pane.focused": {
+      "data": {
+        "properties": {
+          "pane_id": {
+            "type": "string"
+          },
+          "type": {
+            "const": "pane_focused",
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "pane_id",
+          "workspace_id"
+        ],
+        "type": "object"
+      },
+      "event": "pane_focused"
+    },
+    "pane.moved": {
+      "data": {
+        "properties": {
+          "closed_tab_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "closed_workspace_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_tab": {
+            "anyOf": [
+              {
+                "$ref": "#/defs/event/TabInfo"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "created_workspace": {
+            "anyOf": [
+              {
+                "$ref": "#/defs/event/WorkspaceInfo"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "pane": {
+            "$ref": "#/defs/event/PaneInfo"
+          },
+          "previous_pane_id": {
+            "type": "string"
+          },
+          "previous_tab_id": {
+            "type": "string"
+          },
+          "previous_workspace_id": {
+            "type": "string"
+          },
+          "type": {
+            "const": "pane_moved",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "previous_pane_id",
+          "previous_workspace_id",
+          "previous_tab_id",
+          "pane"
+        ],
+        "type": "object"
+      },
+      "event": "pane_moved"
+    },
+    "pane.updated": {
+      "data": {
+        "properties": {
+          "pane": {
+            "$ref": "#/defs/event/PaneInfo"
+          },
+          "type": {
+            "const": "pane_updated",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "pane"
+        ],
+        "type": "object"
+      },
+      "event": "pane_updated"
+    },
+    "tab.focused": {
+      "data": {
+        "properties": {
+          "tab_id": {
+            "type": "string"
+          },
+          "type": {
+            "const": "tab_focused",
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "tab_id",
+          "workspace_id"
+        ],
+        "type": "object"
+      },
+      "event": "tab_focused"
+    },
+    "workspace.closed": {
+      "data": {
+        "properties": {
+          "type": {
+            "const": "workspace_closed",
+            "type": "string"
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "$ref": "#/defs/event/WorkspaceInfo"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "workspace_id"
+        ],
+        "type": "object"
+      },
+      "event": "workspace_closed"
+    },
+    "workspace.created": {
+      "data": {
+        "properties": {
+          "type": {
+            "const": "workspace_created",
+            "type": "string"
+          },
+          "workspace": {
+            "$ref": "#/defs/event/WorkspaceInfo"
+          }
+        },
+        "required": [
+          "type",
+          "workspace"
+        ],
+        "type": "object"
+      },
+      "event": "workspace_created"
+    },
+    "workspace.focused": {
+      "data": {
+        "properties": {
+          "type": {
+            "const": "workspace_focused",
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "workspace_id"
+        ],
+        "type": "object"
+      },
+      "event": "workspace_focused"
+    },
+    "workspace.updated": {
+      "data": {
+        "properties": {
+          "type": {
+            "const": "workspace_updated",
+            "type": "string"
+          },
+          "workspace": {
+            "$ref": "#/defs/event/WorkspaceInfo"
+          }
+        },
+        "required": [
+          "type",
+          "workspace"
+        ],
+        "type": "object"
+      },
+      "event": "workspace_updated"
+    },
+    "worktree.created": {
+      "data": {
+        "properties": {
+          "type": {
+            "const": "worktree_created",
+            "type": "string"
+          },
+          "workspace": {
+            "$ref": "#/defs/event/WorkspaceInfo"
+          },
+          "worktree": {
+            "$ref": "#/defs/event/WorktreeInfo"
+          }
+        },
+        "required": [
+          "type",
+          "workspace",
+          "worktree"
+        ],
+        "type": "object"
+      },
+      "event": "worktree_created"
+    },
+    "worktree.opened": {
+      "data": {
+        "properties": {
+          "already_open": {
+            "type": "boolean"
+          },
+          "type": {
+            "const": "worktree_opened",
+            "type": "string"
+          },
+          "workspace": {
+            "$ref": "#/defs/event/WorkspaceInfo"
+          },
+          "worktree": {
+            "$ref": "#/defs/event/WorktreeInfo"
+          }
+        },
+        "required": [
+          "type",
+          "workspace",
+          "worktree",
+          "already_open"
+        ],
+        "type": "object"
+      },
+      "event": "worktree_opened"
+    },
+    "worktree.removed": {
+      "data": {
+        "properties": {
+          "forced": {
+            "type": "boolean"
+          },
+          "type": {
+            "const": "worktree_removed",
+            "type": "string"
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "$ref": "#/defs/event/WorkspaceInfo"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "workspace_id": {
+            "type": "string"
+          },
+          "worktree": {
+            "$ref": "#/defs/event/WorktreeInfo"
+          }
+        },
+        "required": [
+          "type",
+          "workspace_id",
+          "worktree",
+          "forced"
+        ],
+        "type": "object"
+      },
+      "event": "worktree_removed"
+    }
+  },
+  "methods": {
+    "agent.focus": {
+      "params": {
+        "$ref": "#/defs/request/AgentTarget"
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "result": "agent_info"
+    },
+    "events.subscribe": {
+      "params": {
+        "$ref": "#/defs/request/EventsSubscribeParams"
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "result": "subscription_started"
+    },
+    "notification.show": {
+      "params": {
+        "$ref": "#/defs/request/NotificationShowParams"
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "result": "notification_show"
+    },
+    "pane.get": {
+      "params": {
+        "$ref": "#/defs/request/PaneTarget"
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "result": "pane_info"
+    },
+    "pane.list": {
+      "params": {
+        "$ref": "#/defs/request/PaneListParams"
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "result": "pane_list"
+    },
+    "ping": {
+      "params": {
+        "$ref": "#/defs/request/PingParams"
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "result": "pong"
+    },
+    "session.snapshot": {
+      "params": {
+        "$ref": "#/defs/request/EmptyParams"
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "result": "session_snapshot"
+    },
+    "tab.focus": {
+      "params": {
+        "$ref": "#/defs/request/TabTarget"
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "result": "tab_info"
+    },
+    "workspace.get": {
+      "params": {
+        "$ref": "#/defs/request/WorkspaceTarget"
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "result": "workspace_info"
+    },
+    "worktree.list": {
+      "params": {
+        "$ref": "#/defs/request/WorktreeListParams"
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "result": "worktree_list"
+    }
+  },
+  "pinned_enums": {
+    "AgentStatus": [
+      "idle",
+      "working",
+      "blocked",
+      "done",
+      "unknown"
+    ],
+    "NotificationShowSound": [
+      "none",
+      "done",
+      "request"
+    ]
+  },
+  "protocol": 20,
+  "results": {
+    "agent_info": {
+      "properties": {
+        "agent": {
+          "$ref": "#/defs/success_response/AgentInfo"
+        },
+        "type": {
+          "const": "agent_info",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "agent"
+      ],
+      "type": "object"
+    },
+    "notification_show": {
+      "properties": {
+        "reason": {
+          "$ref": "#/defs/success_response/NotificationShowReason"
+        },
+        "shown": {
+          "type": "boolean"
+        },
+        "type": {
+          "const": "notification_show",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "shown",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "pane_info": {
+      "properties": {
+        "pane": {
+          "$ref": "#/defs/success_response/PaneInfo"
+        },
+        "type": {
+          "const": "pane_info",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "pane"
+      ],
+      "type": "object"
+    },
+    "pane_list": {
+      "properties": {
+        "panes": {
+          "items": {
+            "$ref": "#/defs/success_response/PaneInfo"
+          },
+          "type": "array"
+        },
+        "type": {
+          "const": "pane_list",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "panes"
+      ],
+      "type": "object"
+    },
+    "pong": {
+      "properties": {
+        "capabilities": {
+          "anyOf": [
+            {
+              "$ref": "#/defs/success_response/ServerCapabilities"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "protocol": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "type": {
+          "const": "pong",
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "version",
+        "protocol"
+      ],
+      "type": "object"
+    },
+    "session_snapshot": {
+      "properties": {
+        "snapshot": {
+          "$ref": "#/defs/success_response/SessionSnapshot"
+        },
+        "type": {
+          "const": "session_snapshot",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "snapshot"
+      ],
+      "type": "object"
+    },
+    "subscription_started": {
+      "properties": {
+        "type": {
+          "const": "subscription_started",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    "tab_info": {
+      "properties": {
+        "tab": {
+          "$ref": "#/defs/success_response/TabInfo"
+        },
+        "type": {
+          "const": "tab_info",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "tab"
+      ],
+      "type": "object"
+    },
+    "workspace_info": {
+      "properties": {
+        "type": {
+          "const": "workspace_info",
+          "type": "string"
+        },
+        "workspace": {
+          "$ref": "#/defs/success_response/WorkspaceInfo"
+        }
+      },
+      "required": [
+        "type",
+        "workspace"
+      ],
+      "type": "object"
+    },
+    "worktree_list": {
+      "properties": {
+        "source": {
+          "$ref": "#/defs/success_response/WorktreeSourceInfo"
+        },
+        "type": {
+          "const": "worktree_list",
+          "type": "string"
+        },
+        "worktrees": {
+          "items": {
+            "$ref": "#/defs/success_response/WorktreeInfo"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "type",
+        "source",
+        "worktrees"
+      ],
+      "type": "object"
+    }
+  },
+  "schema_version": 1,
+  "subscription_events": {
+    "pane.agent_status_changed": {
+      "data": {
+        "properties": {
+          "agent": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "agent_status": {
+            "$ref": "#/defs/subscription_event/AgentStatus"
+          },
+          "display_agent": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pane_id": {
+            "type": "string"
+          },
+          "state_labels": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "pane_id",
+          "workspace_id",
+          "agent_status"
+        ],
+        "type": "object"
+      },
+      "event": "pane.agent_status_changed"
+    }
+  }
+}

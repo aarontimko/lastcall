@@ -26,6 +26,9 @@ unicode-width = "0.2"
 [dev-dependencies]
 insta = "1.48"
 lastcall-testkit.workspace = true
+# `test-util` for `tokio::time::pause()`: the toast timing tests advance a virtual clock
+# instead of sleeping (unit tier: no sleep over 50 ms).
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

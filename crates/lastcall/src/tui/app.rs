@@ -14,16 +14,18 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use lastcall_engine::count::with_thousands;
-use lastcall_engine::engine::{AcceptRequest, Accepted, RootState};
+use lastcall_engine::engine::{AcceptRequest, Accepted, EngineError, RootState};
 use lastcall_engine::git::Oid;
 use lastcall_engine::headstate::InProgress;
 use lastcall_engine::hunks::Hunk;
-use lastcall_engine::ops::Rendered;
+use lastcall_engine::ledger::LedgerError;
+use lastcall_engine::ops::{OpsError, Rendered};
 use lastcall_engine::roots::Badge;
 use lastcall_engine::scan::{Annotation, Change, Group, Pile, Row};
 use lastcall_engine::store::RootKind;
 use lastcall_engine::watcher::EngineEvent;
 
+use super::herdr::{HerdrUpdate, HerdrView, Link, ToastRequest};
 use super::input::{Action, Keymap};
 
 pub const NAV_WIDTH_DEFAULT: u16 = 28;
@@ -175,6 +177,10 @@ pub enum Target {
     FileAccept,
     /// The `[a accept]` hint on hunk `i`'s header line.
     HunkAccept(usize),
+    /// A root row's herdr dot: a click there acks the flag (deliverable 5).
+    RootDot(PathBuf),
+    /// The header's herdr badge: a click shows the full standalone reason.
+    HeaderHerdr,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,7 +211,7 @@ pub enum Changed {
 }
 
 impl Changed {
-    fn or(self, other: Changed) -> Changed {
+    pub fn or(self, other: Changed) -> Changed {
         if self == Changed::Yes || other == Changed::Yes {
             Changed::Yes
         } else {
@@ -226,6 +232,11 @@ pub enum Effect {
     /// the results to [`App::accepted`]. Every request is built from the held `RootView`
     /// (§6.3): `Rendered::of` on a held row, `All` on the held pile.
     Accept(Vec<(PathBuf, AcceptRequest)>),
+    /// `agent.focus` on this pane id (herdr's own public id, never a name); the result
+    /// comes back as `HerdrUpdate::Focused`.
+    Focus(String),
+    /// Tell the toast task which ready episodes opened and which ended (deliverable 6).
+    Toast(ToastRequest),
 }
 
 /// What one accept covers (§6.7): the key to the status text, the confirm modal's live
@@ -290,6 +301,33 @@ pub const NOTHING_TO_ACCEPT: &str = "nothing to accept";
 /// How long a status notice stays on the status line before the key hints return.
 pub const STATUS_TTL: Duration = Duration::from_secs(30);
 
+/// One root's accept result, as the loop hands it to the reducer.
+pub type AcceptResult = Result<Accepted, AcceptFailed>;
+
+/// Why one root's accept failed.
+///
+/// `LedgerBusy` is separate because it is a *whole-root* condition — another lastcall
+/// process is mid-write on this root's ledger — where every `Refused` carries a row path and
+/// renders against that row. It stays an `Err` off the accepted path so nothing is marked
+/// seen, and the row it was asked for is still pending when the status line appears
+/// (Phase 5 deliverable 2c).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcceptFailed {
+    LedgerBusy,
+    Other(String),
+}
+
+impl AcceptFailed {
+    /// Classify what `Engine::accept` returned. Matched on the typed error, never on the
+    /// message text.
+    pub fn of(e: &EngineError) -> Self {
+        match e {
+            EngineError::Ops(OpsError::Ledger(LedgerError::LockBusy { .. })) => Self::LedgerBusy,
+            other => Self::Other(other.to_string()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct App {
     pub roots: BTreeMap<PathBuf, RootView>,
@@ -321,6 +359,9 @@ pub struct App {
     /// `Quit` is ignored while it is (`Quit` passes as it does through the help overlay:
     /// `q` and ctrl-c quit by default, everywhere).
     pub confirm: Option<Confirm>,
+    /// Everything herdr says, and the local ack episodes (Phase 5). Socket-free: the
+    /// reducer never sees the client's own types.
+    pub herdr: HerdrView,
     /// The effective key bindings, `(action name, key specs)` in `DEFAULT_KEYMAP` order.
     /// Seeded from the defaults; worker 3b replaces it after `Keymap::from_config` so the
     /// hint line and the help overlay show the user's own bindings.
@@ -353,6 +394,7 @@ impl App {
             seq: BTreeMap::new(),
             accepting: None,
             confirm: None,
+            herdr: HerdrView::default(),
             // The canonical spellings (`shift-a` shows as `A`), as `Keymap::table` gives.
             keymap: Keymap::defaults().table(),
         }
@@ -368,11 +410,47 @@ impl App {
 
     // ---- derived views -------------------------------------------------------------------
 
+    /// Whether `view` is listed in the nav (§6.7 plus deliverable 5): it has pending rows
+    /// **or** an attention flag (a ready episode, acked or not, or a blocked agent) — and
+    /// it survives the active workspace scope (deliverable 8). `working`/`idle`/`unknown`
+    /// never list a root by themselves; they annotate one already listed.
+    pub fn is_listed(&self, view: &RootView) -> bool {
+        self.herdr.in_scope(&view.meta.path)
+            && (view.listed()
+                || self
+                    .herdr
+                    .flag(&view.meta.path)
+                    .is_some_and(|f| f.attention()))
+    }
+
+    /// Roots the active scope hides that would otherwise be listed: the `N` of the
+    /// `scope: … · N repos hidden (w shows all)` notice.
+    pub fn scoped_out(&self) -> usize {
+        if self.herdr.active_scope().is_none() {
+            return 0;
+        }
+        self.roots
+            .values()
+            .filter(|v| !self.herdr.in_scope(&v.meta.path))
+            .filter(|v| v.listed() || self.herdr.flag(&v.meta.path).is_some_and(|f| f.attention()))
+            .count()
+    }
+
+    /// The mandatory scope notice (deliverable 8), or `None` when no scope is in force.
+    pub fn scope_notice(&self) -> Option<String> {
+        let scope = self.herdr.active_scope()?;
+        Some(format!(
+            "scope: {} · {} hidden (w shows all)",
+            scope.label,
+            plural(self.scoped_out(), "repo")
+        ))
+    }
+
     /// Nav order: for each listed root by path, `[Root, rows…, groups…]`.
     pub fn nav_entries(&self) -> Vec<Selection> {
         let mut out = Vec::new();
         for (path, view) in &self.roots {
-            if !view.listed() {
+            if !self.is_listed(view) {
                 continue;
             }
             out.push(Selection::Root(path.clone()));
@@ -387,7 +465,7 @@ impl App {
     }
 
     pub fn listed_roots(&self) -> impl Iterator<Item = &RootView> {
-        self.roots.values().filter(|v| v.listed())
+        self.roots.values().filter(|v| self.is_listed(v))
     }
 
     /// The selected row, if the selection is a row that still exists.
@@ -635,8 +713,10 @@ impl App {
                 }
             }
             AcceptScope::All => {
+                // "Every listed root" is the nav's own rule (deliverable 8): a root the
+                // active scope hides is not on screen, so accept-all never touches it.
                 for (root, view) in &self.roots {
-                    if view.listed() {
+                    if view.listed() && self.is_listed(view) {
                         out.push((root.clone(), AcceptRequest::All(view.pile.clone())));
                     }
                 }
@@ -673,8 +753,12 @@ impl App {
                 }
             }
             AcceptScope::All => {
+                // The same rule as `accept_requests`, so the confirm modal's numbers and
+                // names describe exactly the roots the accept will cover.
                 for (root, view) in &self.roots {
-                    tally(root, &view.rows().iter().collect::<Vec<_>>());
+                    if self.is_listed(view) {
+                        tally(root, &view.rows().iter().collect::<Vec<_>>());
+                    }
                 }
             }
         }
@@ -742,7 +826,7 @@ impl App {
     /// path as a watcher pile (seq included), then the §6.7 advance rule runs for the
     /// selection the accept was asked from, `accepting` clears and one status line says
     /// what happened. An `Err` for one root is named in the status and undoes nothing.
-    pub fn accepted(&mut self, results: Vec<(PathBuf, Result<Accepted, String>)>) -> Changed {
+    pub fn accepted(&mut self, results: Vec<(PathBuf, AcceptResult)>) -> Changed {
         let inflight = self.accepting.take();
         let before = self.selection.clone();
         let mut changed = if inflight.is_some() {
@@ -760,7 +844,16 @@ impl App {
                     ok_roots.push(root.clone());
                     changed = changed.or(self.apply_pile(root, acc.seq, acc.pile));
                 }
-                Err(e) => errors.push(format!("{}: {e}", self.root_name(&root))),
+                // A busy ledger is a whole-root condition, not a per-row refusal: another
+                // lastcall process holds this root's lock. Say so plainly and leave the row
+                // pending — the same keystroke works a moment later (Phase 5 deliverable 2c).
+                Err(AcceptFailed::LedgerBusy) => errors.push(format!(
+                    "ledger busy in {} — try again",
+                    self.root_name(&root)
+                )),
+                Err(AcceptFailed::Other(e)) => {
+                    errors.push(format!("{}: {e}", self.root_name(&root)))
+                }
             }
         }
         let Some(Accepting { scope, files }) = inflight else {
@@ -1011,9 +1104,18 @@ impl App {
     /// Fold one user action in.
     pub fn handle(&mut self, action: Action) -> (Changed, Option<Effect>) {
         use Action::*;
-        if self.confirm.is_some() && !matches!(action, Tick | Resize(..) | Confirm | Cancel | Quit)
+        // `Herdr` passes both gates: news from the herdr task is not a keystroke, and it
+        // must never close the confirm modal or the help overlay (deliverable 5).
+        if self.confirm.is_some()
+            && !matches!(
+                action,
+                Tick | Resize(..) | Confirm | Cancel | Quit | Herdr(_)
+            )
         {
             return (Changed::No, None);
+        }
+        if let Herdr(update) = action {
+            return self.herdr_update(update);
         }
         if self.help
             && !matches!(
@@ -1046,7 +1148,13 @@ impl App {
                         .nav_entries()
                         .into_iter()
                         .find(|e| matches!(e, Selection::Row(r, _) if *r == root));
-                    self.select(first)
+                    match first {
+                        Some(row) => self.select(Some(row)),
+                        // A flag-only root has no row to open; the diff pane says
+                        // `nothing pending · agent done`, so focus it rather than
+                        // dropping the selection.
+                        None => self.set_focus(Focus::Diff),
+                    }
                 }
                 None => self.move_selection(1),
             },
@@ -1105,6 +1213,17 @@ impl App {
                     Changed::No
                 }
             }
+            Ack => return self.ack_selected(),
+            Jump => return self.jump_selected(),
+            ScopeToggle => {
+                if self.herdr.scope.is_none() {
+                    return (Changed::No, None);
+                }
+                self.herdr.scoped = !self.herdr.scoped;
+                self.reconcile_selection();
+                Changed::Yes
+            }
+            Herdr(_) => unreachable!("handled above, before the help gate"),
             Quit => return (Changed::No, Some(Effect::Quit)),
             Press(_, _) => Changed::No,
             Drag(x, _) => {
@@ -1136,6 +1255,100 @@ impl App {
         (changed, None)
     }
 
+    // ---- herdr ---------------------------------------------------------------------------
+
+    /// The root an ack or a jump applies to: the selected entry's root, whichever pane has
+    /// focus and whether a root, a row or a group is selected.
+    pub fn flagged_root(&self) -> Option<PathBuf> {
+        Some(self.selection.as_ref()?.root().to_path_buf())
+    }
+
+    /// `d`: ack the selected root's flag. Local to this process (ruling 10) and idempotent;
+    /// the dot dims and herdr is not told. The name also leaves any pending toast window.
+    fn ack_selected(&mut self) -> (Changed, Option<Effect>) {
+        let Some(root) = self.flagged_root() else {
+            return (Changed::No, None);
+        };
+        if !self.herdr.ack(&root) {
+            return (Changed::No, None);
+        }
+        self.reconcile_selection();
+        // Keyed by path, so acking `/A/proj` leaves `/B/proj` in the window (review (b) F5).
+        (
+            Changed::Yes,
+            Some(Effect::Toast(ToastRequest {
+                ready: Vec::new(),
+                dropped: vec![root],
+            })),
+        )
+    }
+
+    /// `g`: focus the selected root's agent in herdr. Nothing to do without a pane id.
+    fn jump_selected(&mut self) -> (Changed, Option<Effect>) {
+        let Some(root) = self.flagged_root() else {
+            return (Changed::No, None);
+        };
+        match self.herdr.flag(&root).and_then(|f| f.pane.clone()) {
+            Some(pane) => (Changed::No, Some(Effect::Focus(pane))),
+            None => (Changed::No, None),
+        }
+    }
+
+    /// Fold one piece of herdr news in (deliverables 4, 5, 6, 8).
+    pub fn herdr_update(&mut self, update: HerdrUpdate) -> (Changed, Option<Effect>) {
+        match update {
+            HerdrUpdate::Connected { version, .. } => {
+                self.herdr.link = Link::Connected { version };
+                (Changed::Yes, None)
+            }
+            HerdrUpdate::Reconnecting => {
+                self.herdr.link = Link::Reconnecting;
+                (Changed::Yes, None)
+            }
+            HerdrUpdate::Standalone { reason } => {
+                self.herdr.link = Link::Standalone { reason };
+                (Changed::Yes, None)
+            }
+            HerdrUpdate::Roots(derived) => {
+                let delta = self.herdr.apply_roots(derived);
+                self.reconcile_selection();
+                let request = ToastRequest {
+                    ready: delta
+                        .opened
+                        .iter()
+                        .map(|r| (r.clone(), self.root_name(r)))
+                        .collect(),
+                    dropped: delta.closed.clone(),
+                };
+                let effect =
+                    (self.herdr.toast && !request.is_empty()).then_some(Effect::Toast(request));
+                (Changed::Yes, effect)
+            }
+            HerdrUpdate::Scope(scope) => {
+                if self.herdr.scope == scope {
+                    return (Changed::No, None);
+                }
+                self.herdr.scope = scope;
+                self.reconcile_selection();
+                (Changed::Yes, None)
+            }
+            HerdrUpdate::Toast(Ok(shown)) if shown.shown => {
+                self.set_status("toast shown");
+                (Changed::Yes, None)
+            }
+            // A refusal or a transport error is a debug log in the task, not a banner.
+            HerdrUpdate::Toast(_) => (Changed::No, None),
+            HerdrUpdate::Focused(Ok(agent)) => {
+                self.set_status(format!("focused {agent} in herdr"));
+                (Changed::Yes, None)
+            }
+            HerdrUpdate::Focused(Err(reason)) => {
+                self.set_status(format!("jump failed: {reason}"));
+                (Changed::Yes, None)
+            }
+        }
+    }
+
     /// Fold a resolved mouse target in (the loop maps `Press(x, y)` through the `HitMap`).
     pub fn hit(&mut self, target: Target) -> (Changed, Option<Effect>) {
         if self.confirm.is_some() {
@@ -1147,6 +1360,26 @@ impl App {
         }
         let changed = match target {
             Target::HeaderAcceptAll => return self.handle(Action::AcceptAll),
+            Target::RootDot(root) => {
+                // The click selects the root exactly as a click on its name does, then
+                // acks — key and mouse land on one `App` (the parity test).
+                self.select(Some(Selection::Root(root)));
+                self.set_focus(Focus::Nav);
+                return self.handle(Action::Ack);
+            }
+            Target::HeaderHerdr => match &self.herdr.link {
+                Link::Standalone { reason } if !reason.is_empty() => {
+                    let reason = reason.clone();
+                    self.set_status(format!("standalone: {reason}"));
+                    Changed::Yes
+                }
+                Link::Connected { version } => {
+                    let version = version.clone();
+                    self.set_status(format!("herdr {version}"));
+                    Changed::Yes
+                }
+                _ => Changed::No,
+            },
             Target::FileAccept => return self.handle(Action::AcceptFile),
             Target::HunkAccept(i) => {
                 // The cursor first lands on hunk `i` exactly as a click on its header
@@ -1357,7 +1590,7 @@ pub(crate) mod testfix {
     }
 
     /// An engine answer for `root`: a clean outcome, `seq`, and `pile` as the rescan.
-    pub fn accepted_ok(name: &str, seq: u64, pile: Pile) -> (PathBuf, Result<Accepted, String>) {
+    pub fn accepted_ok(name: &str, seq: u64, pile: Pile) -> (PathBuf, AcceptResult) {
         (
             root(name),
             Ok(Accepted {
@@ -1900,7 +2133,7 @@ mod tests {
             Action::Back,
         ] {
             assert_eq!(
-                app.handle(action),
+                app.handle(action.clone()),
                 (Changed::No, None),
                 "{action:?} ignored"
             );
@@ -2090,13 +2323,56 @@ mod tests {
         assert_eq!(status(&app), "accepted f1 (deleted)");
     }
 
+    /// A second lastcall process held the root's ledger lock (Phase 5 deliverable 2c). The
+    /// status line says so in the root's own words, the row is *not* marked seen, and it is
+    /// still there to try again — this is deliberately not a `Refused`, which would render
+    /// against the row and read like the file changed underneath.
+    #[test]
+    fn app_accept_refused_by_a_busy_ledger_says_try_again_and_leaves_the_row_pending() {
+        let mut app = three_roots();
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Accept);
+        let changed = app.accepted(vec![(root("alpha"), Err(AcceptFailed::LedgerBusy))]);
+        assert_eq!(changed, Changed::Yes);
+        assert_eq!(status(&app), "ledger busy in alpha — try again");
+        assert!(
+            app.roots[&root("alpha")].listed(),
+            "alpha's pile is untouched, so the row is still pending"
+        );
+        assert_eq!(
+            app.selection,
+            Some(row("alpha", "f1")),
+            "the cursor did not move on"
+        );
+        assert_eq!(
+            app.accepting, None,
+            "the request is over; the key works again"
+        );
+    }
+
+    /// The classification is on the typed error, not on the message text.
+    #[test]
+    fn app_accept_failed_classifies_lock_busy_and_nothing_else() {
+        use lastcall_engine::paths::RepoPaths;
+        let busy = EngineError::Ops(OpsError::Ledger(LedgerError::LockBusy {
+            path: RepoPaths::under("/state/repo".into()).lock,
+            retries: 40,
+        }));
+        assert_eq!(AcceptFailed::of(&busy), AcceptFailed::LedgerBusy);
+        let other = EngineError::NoSuchRoot("/gone".into());
+        assert_eq!(
+            AcceptFailed::of(&other),
+            AcceptFailed::Other("no such root: /gone".into())
+        );
+    }
+
     #[test]
     fn app_multi_root_accepted_with_one_err_applies_others_and_names_failed_root() {
         let mut app = three_roots();
         app.select(Some(row("beta", "u1")));
         app.handle(Action::AcceptAll);
         let changed = app.accepted(vec![
-            (root("alpha"), Err("boom".into())),
+            (root("alpha"), Err(AcceptFailed::Other("boom".into()))),
             accepted_ok("beta", 2, Pile::default()),
             accepted_ok("notes", 2, Pile::default()),
         ]);
@@ -2650,5 +2926,392 @@ mod tests {
         );
         assert_eq!(hunk_block(&[mode.clone(), row.hunks[0].clone()], 0), 2);
         assert_eq!(hunk_block(&[mode.clone()], 0), 1, "the last hunk has none");
+    }
+
+    // --- herdr (deliverables 5 and 8) ----------------------------------------------------
+
+    use super::super::herdr::testfix as hfix;
+    use super::super::herdr::{Attention, Dot, Ready, RootAgents, Scope, ToastShown};
+
+    /// `three_roots` with alpha emptied, herdr connected, and `derived` folded in.
+    fn with_herdr(derived: BTreeMap<PathBuf, RootAgents>) -> App {
+        let mut app = three_roots();
+        assert_eq!(
+            app.apply(pile_event_seq(
+                "alpha",
+                1,
+                without(pile("alpha"), &["f1", "f2"])
+            ))
+            .0,
+            Changed::Yes,
+            "alpha now has nothing pending"
+        );
+        app.handle(Action::Herdr(HerdrUpdate::Connected {
+            version: "0.8.2".to_owned(),
+            protocol: 21,
+        }));
+        app.handle(Action::Herdr(HerdrUpdate::Roots(derived)));
+        app
+    }
+
+    fn one(name: &str, status: Attention) -> BTreeMap<PathBuf, RootAgents> {
+        BTreeMap::from([(root(name), hfix::agents(status, 1, "w1:p1", "claude"))])
+    }
+
+    /// Ruling 4 + ruling 9: a repo with nothing pending is listed because its agent is
+    /// done, and the nav row says so instead of showing a pile.
+    #[test]
+    fn app_herdr_done_lists_a_root_with_nothing_pending() {
+        let app = with_herdr(one("alpha", Attention::Done));
+        assert!(
+            app.listed_roots().any(|v| v.meta.path == root("alpha")),
+            "a done agent lists its repo"
+        );
+        assert_eq!(
+            app.herdr.dot(&root("alpha")),
+            Some(Dot::Ready { acked: false })
+        );
+        assert!(app.nav_entries().contains(&Selection::Root(root("alpha"))));
+    }
+
+    /// Ruling 4: `working` and `idle` only annotate. A repo with nothing pending and a
+    /// working agent stays off the list; `blocked` puts it back on.
+    #[test]
+    fn app_herdr_working_annotates_but_blocked_lists() {
+        let app = with_herdr(one("alpha", Attention::Working));
+        assert!(
+            !app.listed_roots().any(|v| v.meta.path == root("alpha")),
+            "a working agent is not a reason to list an empty repo"
+        );
+        assert_eq!(app.herdr.dot(&root("alpha")), Some(Dot::Working));
+
+        let app = with_herdr(one("alpha", Attention::Blocked));
+        assert!(app.listed_roots().any(|v| v.meta.path == root("alpha")));
+        assert_eq!(app.herdr.dot(&root("alpha")), Some(Dot::Blocked));
+
+        let app = with_herdr(one("alpha", Attention::Idle));
+        assert!(!app.listed_roots().any(|v| v.meta.path == root("alpha")));
+        assert_eq!(app.herdr.dot(&root("alpha")), None);
+    }
+
+    /// Ruling 10: `d` is local and idempotent — the dot dims, herdr is never told, and the
+    /// repo stays listed. The name also leaves any pending toast window.
+    #[test]
+    fn app_herdr_ack_dims_the_flag_and_withdraws_the_toast() {
+        let mut app = with_herdr(one("alpha", Attention::Done));
+        app.select(Some(Selection::Root(root("alpha"))));
+        let (changed, effect) = app.handle(Action::Ack);
+        assert_eq!(changed, Changed::Yes);
+        assert_eq!(
+            effect,
+            Some(Effect::Toast(ToastRequest {
+                ready: Vec::new(),
+                dropped: vec![root("alpha")],
+            }))
+        );
+        assert_eq!(
+            app.herdr.dot(&root("alpha")),
+            Some(Dot::Ready { acked: true })
+        );
+        assert!(
+            app.listed_roots().any(|v| v.meta.path == root("alpha")),
+            "an acked flag still lists the repo; it only stops shouting"
+        );
+        assert_eq!(
+            app.handle(Action::Ack),
+            (Changed::No, None),
+            "acking twice is not news"
+        );
+        // Nothing about the ack reaches herdr: the only effect it can produce is the toast
+        // withdrawal, and the flag herdr sees is still `done`.
+        assert_eq!(
+            app.herdr.flag(&root("alpha")).unwrap().status,
+            Attention::Done
+        );
+    }
+
+    /// Deliverable 6: the reducer asks for a toast on the episodes that just opened, and
+    /// only while `[herdr] toast` is on.
+    #[test]
+    fn app_herdr_toast_effect_names_only_the_opened_episodes() {
+        let mut app = with_herdr(BTreeMap::new());
+        app.herdr.toast = true;
+        let (_, effect) = app.handle(Action::Herdr(HerdrUpdate::Roots(one(
+            "alpha",
+            Attention::Done,
+        ))));
+        assert_eq!(
+            effect,
+            Some(Effect::Toast(ToastRequest {
+                ready: vec![(root("alpha"), "alpha".to_owned())],
+                dropped: Vec::new(),
+            }))
+        );
+        // The same derivation again is the same episode: nothing to send.
+        let (_, effect) = app.handle(Action::Herdr(HerdrUpdate::Roots(one(
+            "alpha",
+            Attention::Done,
+        ))));
+        assert_eq!(effect, None);
+        // The agent went back to work: the episode closed, so the pending name is withdrawn.
+        let (_, effect) = app.handle(Action::Herdr(HerdrUpdate::Roots(one(
+            "alpha",
+            Attention::Working,
+        ))));
+        assert_eq!(
+            effect,
+            Some(Effect::Toast(ToastRequest {
+                ready: Vec::new(),
+                dropped: vec![root("alpha")],
+            }))
+        );
+
+        app.herdr.toast = false;
+        let (changed, effect) = app.handle(Action::Herdr(HerdrUpdate::Roots(one(
+            "alpha",
+            Attention::Done,
+        ))));
+        assert_eq!(changed, Changed::Yes, "the flag still lights");
+        assert_eq!(effect, None, "[herdr] toast = false sends nothing");
+    }
+
+    /// `g` hands the loop the winning agent's **pane id** — herdr's own public id, never a
+    /// display name — and the answer names the agent in the status line.
+    #[test]
+    fn app_herdr_jump_carries_the_pane_id_and_the_answer_is_a_status() {
+        let mut app = with_herdr(one("alpha", Attention::Done));
+        app.select(Some(Selection::Root(root("alpha"))));
+        assert_eq!(
+            app.handle(Action::Jump),
+            (Changed::No, Some(Effect::Focus("w1:p1".to_owned())))
+        );
+        app.handle(Action::Herdr(HerdrUpdate::Focused(Ok("claude".to_owned()))));
+        assert_eq!(status(&app), "focused claude in herdr");
+        app.handle(Action::Herdr(HerdrUpdate::Focused(Err(
+            "pane_not_found".to_owned()
+        ))));
+        assert_eq!(status(&app), "jump failed: pane_not_found");
+
+        // A root herdr says nothing about has nothing to jump to.
+        app.select(Some(Selection::Root(root("beta"))));
+        assert_eq!(app.handle(Action::Jump), (Changed::No, None));
+        assert_eq!(app.handle(Action::Ack), (Changed::No, None));
+    }
+
+    /// Deliverable 8: the scope hides the roots outside it, the notice counts exactly what
+    /// it hid, and `w` shows all. Without a derived scope `w` does nothing at all.
+    #[test]
+    fn app_herdr_scope_hides_roots_and_w_shows_all() {
+        let mut app = three_roots();
+        app.herdr.scoped = true;
+        assert_eq!(app.scope_notice(), None, "no scope, no notice");
+        assert_eq!(app.handle(Action::ScopeToggle), (Changed::No, None));
+
+        let scope = Scope {
+            label: "alpha".to_owned(),
+            roots: [root("alpha")].into_iter().collect(),
+        };
+        assert_eq!(
+            app.handle(Action::Herdr(HerdrUpdate::Scope(Some(scope.clone()))))
+                .0,
+            Changed::Yes
+        );
+        assert_eq!(
+            app.listed_roots()
+                .map(|v| v.meta.name.clone())
+                .collect::<Vec<_>>(),
+            vec!["alpha".to_owned()]
+        );
+        assert_eq!(app.scoped_out(), 2);
+        assert_eq!(
+            app.scope_notice().as_deref(),
+            Some("scope: alpha · 2 repos hidden (w shows all)"),
+            "the notice is mandatory whenever the scope hides anything"
+        );
+
+        assert_eq!(app.handle(Action::ScopeToggle).0, Changed::Yes);
+        assert_eq!(app.listed_roots().count(), 3, "w shows all");
+        assert_eq!(app.scope_notice(), None);
+        assert_eq!(
+            app.handle(Action::Herdr(HerdrUpdate::Scope(Some(scope)))),
+            (Changed::No, None),
+            "re-deriving the same scope while it is off is not a redraw"
+        );
+    }
+
+    /// Deliverable 8: "accept-all under scope covers listed roots only". `^A` folds every
+    /// **listed** root, and the scope is what decides listing — a hidden root's rows are
+    /// neither accepted nor named in the confirm modal.
+    #[test]
+    fn app_herdr_accept_all_under_scope_covers_listed_roots_only() {
+        let mut app = three_roots();
+        app.herdr.scoped = true;
+        app.handle(Action::Herdr(HerdrUpdate::Scope(Some(Scope {
+            label: "alpha".to_owned(),
+            roots: [root("alpha")].into_iter().collect(),
+        }))));
+        assert_eq!(app.listed_roots().count(), 1, "beta and notes are hidden");
+
+        // The requests the reducer would hand the engine name alpha and nothing else.
+        assert_eq!(
+            app.accept_requests(&AcceptScope::All)
+                .into_iter()
+                .map(|(r, _)| r)
+                .collect::<Vec<_>>(),
+            vec![root("alpha")],
+            "a hidden root is not accepted behind the user's back"
+        );
+        // And so do the confirm modal's numbers: alpha's two rows, alpha's name.
+        let counts = app.counts_of(&AcceptScope::All);
+        assert_eq!(counts.roots, vec!["alpha".to_owned()]);
+        assert_eq!(
+            counts.files, 2,
+            "beta's two and notes' one are out of scope"
+        );
+
+        // Above the threshold the modal shows that same tally, and `y` accepts that set.
+        app.apply(pile_event_seq("alpha", 1, rows_n(11, 0, 0)));
+        assert_eq!(app.handle(Action::AcceptAll).1, None, "eleven files ask");
+        let counts = app.confirm_counts().expect("the modal is open");
+        assert_eq!(counts.roots, vec!["alpha".to_owned()]);
+        assert_eq!(counts.files, 11);
+        let (_, effect) = app.handle(Action::Confirm);
+        let Some(Effect::Accept(reqs)) = effect else {
+            panic!("y starts the accept: {effect:?}")
+        };
+        assert_eq!(
+            reqs.into_iter().map(|(r, _)| r).collect::<Vec<_>>(),
+            vec![root("alpha")]
+        );
+
+        // `w` shows all three again, and then accept-all covers all three.
+        app.accepting = None;
+        app.handle(Action::ScopeToggle);
+        assert_eq!(app.counts_of(&AcceptScope::All).roots.len(), 3);
+        assert_eq!(app.accept_requests(&AcceptScope::All).len(), 3);
+    }
+
+    /// The confirm modal and the help overlay are the user's own state: herdr news folds
+    /// in underneath them and never closes either.
+    #[test]
+    fn app_herdr_update_never_closes_the_modal_or_the_help() {
+        let mut app = three_roots();
+        app.apply(pile_event_seq("alpha", 1, rows_n(11, 0, 0)));
+        app.handle(Action::AcceptAll);
+        assert!(app.confirm.is_some(), "eleven files ask");
+        assert_eq!(
+            app.handle(Action::Herdr(HerdrUpdate::Roots(one(
+                "beta",
+                Attention::Done
+            ))))
+            .0,
+            Changed::Yes
+        );
+        assert!(app.confirm.is_some(), "the modal survives herdr news");
+        assert!(app.herdr.flag(&root("beta")).unwrap().ready.is_some());
+        app.handle(Action::Cancel);
+
+        app.handle(Action::Help);
+        assert!(app.help);
+        app.handle(Action::Herdr(HerdrUpdate::Reconnecting));
+        assert!(app.help, "the help overlay survives herdr news");
+        assert_eq!(app.herdr.link, Link::Reconnecting);
+    }
+
+    /// herdr can answer before the first scan does. A derivation naming a root the app has
+    /// not adopted yet is kept, and lights the moment `sync_roots` learns the root.
+    #[test]
+    fn app_herdr_update_before_sync_roots_is_kept() {
+        let mut app = App::new();
+        app.handle(Action::Herdr(HerdrUpdate::Connected {
+            version: "0.8.2".to_owned(),
+            protocol: 21,
+        }));
+        app.handle(Action::Herdr(HerdrUpdate::Roots(one(
+            "alpha",
+            Attention::Done,
+        ))));
+        assert!(
+            app.herdr.flag(&root("alpha")).is_some(),
+            "the flag is not dropped on the floor for want of a root"
+        );
+        assert_eq!(app.listed_roots().count(), 0, "no roots to list yet");
+
+        assert_eq!(app.sync_roots(vec![meta("alpha")]), Changed::Yes);
+        assert!(
+            app.listed_roots().any(|v| v.meta.path == root("alpha")),
+            "the moment the root exists, the flag lists it"
+        );
+        assert_eq!(
+            app.herdr.dot(&root("alpha")),
+            Some(Dot::Ready { acked: false })
+        );
+    }
+
+    /// A link that drops takes every dot with it (§6.6 degradation) but not the ack
+    /// episodes: reconnecting re-derives, and an ack the user already made still stands.
+    #[test]
+    fn app_herdr_reconnect_neutralises_the_dots_and_keeps_the_acks() {
+        let mut app = with_herdr(one("alpha", Attention::Done));
+        app.select(Some(Selection::Root(root("alpha"))));
+        app.handle(Action::Ack);
+        app.handle(Action::Herdr(HerdrUpdate::Reconnecting));
+        assert_eq!(app.herdr.dot(&root("alpha")), None);
+        assert_eq!(
+            app.herdr.flag(&root("alpha")).unwrap().ready,
+            Some(Ready { acked: true })
+        );
+        app.handle(Action::Herdr(HerdrUpdate::Connected {
+            version: "0.8.2".to_owned(),
+            protocol: 21,
+        }));
+        assert_eq!(
+            app.herdr.dot(&root("alpha")),
+            Some(Dot::Ready { acked: true })
+        );
+    }
+
+    /// A shown toast says so; a refusal is the task's debug log, not a banner.
+    #[test]
+    fn app_herdr_toast_verdict_only_speaks_when_it_was_shown() {
+        let mut app = three_roots();
+        app.handle(Action::Herdr(HerdrUpdate::Toast(Ok(ToastShown {
+            shown: false,
+            reason: "busy".to_owned(),
+        }))));
+        assert_eq!(status(&app), "");
+        assert_eq!(
+            app.handle(Action::Herdr(HerdrUpdate::Toast(Err("eof".to_owned())))),
+            (Changed::No, None)
+        );
+        app.handle(Action::Herdr(HerdrUpdate::Toast(Ok(ToastShown {
+            shown: true,
+            reason: String::new(),
+        }))));
+        assert_eq!(status(&app), "toast shown");
+    }
+
+    /// Clicking the header badge says what the link is doing, and says why when `mode = on`
+    /// made a failure visible.
+    #[test]
+    fn app_herdr_header_badge_click_names_the_link() {
+        let mut app = three_roots();
+        app.handle(Action::Herdr(HerdrUpdate::Connected {
+            version: "0.8.2".to_owned(),
+            protocol: 21,
+        }));
+        assert_eq!(app.hit(Target::HeaderHerdr).0, Changed::Yes);
+        assert_eq!(status(&app), "herdr 0.8.2");
+        app.handle(Action::Herdr(HerdrUpdate::Standalone {
+            reason: "no socket at /run/herdr.sock".to_owned(),
+        }));
+        app.hit(Target::HeaderHerdr);
+        assert_eq!(status(&app), "standalone: no socket at /run/herdr.sock");
+        // A silent standalone (the default `auto`) has nothing to say.
+        app.handle(Action::Herdr(HerdrUpdate::Standalone {
+            reason: String::new(),
+        }));
+        app.status = None;
+        assert_eq!(app.hit(Target::HeaderHerdr), (Changed::No, None));
     }
 }

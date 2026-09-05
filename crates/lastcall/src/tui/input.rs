@@ -18,13 +18,17 @@ use crossterm::event::{
 };
 use lastcall_engine::config::KeySpecs;
 
+use super::herdr::HerdrUpdate;
+
 /// Diff lines one wheel notch scrolls.
 pub const WHEEL_LINES: u16 = 3;
 
 /// Everything the app can be asked to do. Keys, mouse gestures and the tick all become one
 /// of these before they touch [`super::app::App`], so the keyboard and mouse paths are
 /// provably equivalent (the parity tests) and the reducer never sees a crossterm type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Not `Copy`: `Herdr` carries the derived association (deliverable 4), which owns strings.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// Nav focus: previous entry. Diff focus: scroll up one line.
     NavUp,
@@ -74,6 +78,14 @@ pub enum Action {
     Confirm,
     /// Dismiss the confirm modal (`n` / `Esc`); nothing outside it.
     Cancel,
+    /// Ack the selected root's herdr flag (deliverable 5). Local to this process.
+    Ack,
+    /// Focus the selected root's agent in herdr (`Effect::Focus`).
+    Jump,
+    /// Toggle the herdr workspace scope for this session (deliverable 8).
+    ScopeToggle,
+    /// News from the herdr task. Never key-bound; the loop's fourth `select!` arm makes it.
+    Herdr(HerdrUpdate),
 }
 
 /// Action name (the `[keys]` config key) → default key specs, in help-overlay order.
@@ -92,6 +104,9 @@ pub const DEFAULT_KEYMAP: &[(&str, &[&str])] = &[
     ("accept", &["a"]),
     ("accept_file", &["shift-a"]),
     ("accept_all", &["ctrl-a"]),
+    ("ack", &["d"]),
+    ("jump", &["g"]),
+    ("scope", &["w"]),
     ("refresh", &["r"]),
     ("help", &["?"]),
     ("quit", &["q", "ctrl-c"]),
@@ -140,6 +155,9 @@ impl Action {
             "accept" => Action::Accept,
             "accept_file" => Action::AcceptFile,
             "accept_all" => Action::AcceptAll,
+            "ack" => Action::Ack,
+            "jump" => Action::Jump,
+            "scope" => Action::ScopeToggle,
             "refresh" => Action::Refresh,
             "help" => Action::Help,
             "quit" => Action::Quit,
@@ -164,6 +182,9 @@ impl Action {
             "accept" => "accept the hunk or the selected entry",
             "accept_file" => "accept the whole file",
             "accept_all" => "accept everything listed",
+            "ack" => "ack the agent flag",
+            "jump" => "jump to the agent in herdr",
+            "scope" => "workspace scope on/off",
             "refresh" => "rescan now",
             "help" => "this help",
             "quit" => "quit",
@@ -461,7 +482,7 @@ impl Keymap {
                     continue; // the same key listed twice for one action is harmless
                 }
                 owners.push((key, name.clone()));
-                bindings.push((key, action));
+                bindings.push((key, action.clone()));
             }
         }
         Ok(Keymap { table, bindings })
@@ -482,7 +503,7 @@ impl Keymap {
         self.bindings
             .iter()
             .find(|(k, _)| *k == key)
-            .map(|(_, a)| *a)
+            .map(|(_, a)| a.clone())
     }
 }
 
@@ -530,6 +551,7 @@ mod tests {
     use lastcall_engine::engine::AcceptRequest;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use std::collections::BTreeMap;
 
     fn key(c: char) -> Event {
         Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
@@ -1192,6 +1214,9 @@ mod tests {
             (Action::Accept, "key"),
             (Action::AcceptFile, "key"),
             (Action::AcceptAll, "key"),
+            (Action::Ack, "key"),
+            (Action::Jump, "key"),
+            (Action::ScopeToggle, "key"),
             (Action::Confirm, "modal"),
             (Action::Cancel, "modal"),
             (Action::Press(1, 1), "mouse"),
@@ -1199,6 +1224,7 @@ mod tests {
             (Action::Release, "mouse"),
             (Action::Resize(80, 24), "terminal"),
             (Action::Tick, "timer"),
+            (Action::Herdr(HerdrUpdate::Reconnecting), "herdr"),
         ];
         let by_modal: Vec<Action> = MODAL_KEYS
             .iter()
@@ -1242,9 +1268,13 @@ mod tests {
             | Action::AcceptFile
             | Action::AcceptAll
             | Action::Confirm
-            | Action::Cancel => 26,
+            | Action::Cancel
+            | Action::Ack
+            | Action::Jump
+            | Action::ScopeToggle
+            | Action::Herdr(_) => 30,
         };
-        assert_eq!(table.len(), 26);
+        assert_eq!(table.len(), 30);
     }
 
     #[test]
@@ -1365,6 +1395,52 @@ mod tests {
             matches!(reqs[0].1, AcceptRequest::File(_)),
             "{:?}",
             reqs[0].1
+        );
+    }
+
+    /// `d` vs a click on the nav dot: both select the root and ack it, and land on one
+    /// `App`. Ruling 10's ack is local, so the only effect either produces is the toast
+    /// withdrawal.
+    #[test]
+    fn input_parity_ack() {
+        let km = Keymap::defaults();
+        let mut base = three_roots();
+        base.handle(Action::Resize(100, 30));
+        // alpha has nothing pending; herdr says its agent is done, so it is listed anyway.
+        base.apply(pile_event_seq(
+            "alpha",
+            1,
+            without(pile("alpha"), &["f1", "f2"]),
+        ));
+        base.handle(Action::Herdr(HerdrUpdate::Connected {
+            version: "0.8.2".to_owned(),
+            protocol: 21,
+        }));
+        base.handle(Action::Herdr(HerdrUpdate::Roots(BTreeMap::from([(
+            root("alpha"),
+            crate::tui::herdr::testfix::agents(
+                crate::tui::herdr::Attention::Done,
+                1,
+                "w1:p1",
+                "claude",
+            ),
+        )]))));
+        let (_, hits) = frame(&base);
+        let mut by_key = base.clone();
+        let mut by_mouse = base.clone();
+
+        // The key path selects the root first, exactly as the click does.
+        by_key.select(Some(Selection::Root(root("alpha"))));
+        let by_key_effect = press_key(&mut by_key, &km, key('d'));
+        let by_mouse_effect = click(&mut by_mouse, &km, &hits, &Target::RootDot(root("alpha")));
+
+        assert_eq!(by_key, by_mouse);
+        assert_eq!(by_key_effect, by_mouse_effect);
+        assert_eq!(frame(&by_key).0, frame(&by_mouse).0);
+        assert_eq!(
+            by_key.herdr.dot(&root("alpha")),
+            Some(crate::tui::herdr::Dot::Ready { acked: true }),
+            "both paths dim the flag"
         );
     }
 

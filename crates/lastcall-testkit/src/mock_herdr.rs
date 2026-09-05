@@ -76,6 +76,9 @@ pub struct RecordedRequest {
     pub id: Option<String>,
     pub method: String,
     pub params: Value,
+    /// How long after the mock was built the request arrived, on the **tokio** clock — so a
+    /// test under `tokio::time::pause()` sees the virtual gap it advanced, not zero.
+    pub at: Duration,
 }
 
 /// One scripted event line, emitted `after` the previous scripted line on that stream.
@@ -147,6 +150,8 @@ struct Config {
     pane_get: HashMap<String, Value>,
     known_panes: HashSet<String>,
     canned: HashMap<String, Value>,
+    /// Per method, results served in order; the last one repeats once the list runs out.
+    canned_seq: HashMap<String, Vec<Value>>,
     lifecycle_script: Vec<ScriptedEvent>,
     status_scripts: HashMap<String, Vec<ScriptedEvent>>,
     faults: Faults,
@@ -168,6 +173,10 @@ struct Counters {
 
 struct Core {
     config: Mutex<Config>,
+    /// The tokio-clock instant the mock was built; `RecordedRequest::at` is measured from it.
+    started: tokio::time::Instant,
+    /// How many results of each `canned_seq` have been served.
+    seq_served: Mutex<HashMap<String, usize>>,
     requests: Mutex<Vec<RecordedRequest>>,
     subscriptions: Mutex<Vec<Vec<Subscription>>>,
     lifecycle_live: Mutex<Vec<mpsc::UnboundedSender<String>>>,
@@ -203,6 +212,7 @@ impl MockHerdrBuilder {
                 pane_get: HashMap::new(),
                 known_panes: HashSet::new(),
                 canned: HashMap::new(),
+                canned_seq: HashMap::new(),
                 lifecycle_script: Vec::new(),
                 status_scripts: HashMap::new(),
                 faults: Faults {
@@ -251,6 +261,16 @@ impl MockHerdrBuilder {
     /// A canned `result` for any other method.
     pub fn canned(mut self, method: &str, result: Value) -> Self {
         self.config.canned.insert(method.to_string(), result);
+        self
+    }
+
+    /// Canned results for `method` served **in order**, the last one repeating for every
+    /// further call: how a test scripts "`busy` first, then `shown`". Takes precedence over
+    /// [`canned`](Self::canned) for the same method; an empty list is ignored.
+    pub fn canned_seq(mut self, method: &str, results: Vec<Value>) -> Self {
+        if !results.is_empty() {
+            self.config.canned_seq.insert(method.to_string(), results);
+        }
         self
     }
 
@@ -311,6 +331,8 @@ impl MockHerdrBuilder {
     fn core(self) -> Arc<Core> {
         Arc::new(Core {
             config: Mutex::new(self.config),
+            started: tokio::time::Instant::now(),
+            seq_served: Mutex::new(HashMap::new()),
             requests: Mutex::new(Vec::new()),
             subscriptions: Mutex::new(Vec::new()),
             lifecycle_live: Mutex::new(Vec::new()),
@@ -597,7 +619,20 @@ impl Core {
             id: Some(req.id.clone()),
             method: req.method.clone(),
             params: req.params.clone(),
+            at: self.started.elapsed(),
         });
+    }
+
+    /// The next `canned_seq` result for `method`, if one is scripted: entry `n` for the
+    /// `n`-th call, the last entry from then on.
+    fn next_seq(&self, method: &str) -> Option<Value> {
+        let config = self.config.lock().unwrap();
+        let seq = config.canned_seq.get(method)?;
+        let mut served = self.seq_served.lock().unwrap();
+        let n = served.entry(method.to_string()).or_insert(0);
+        let value = seq.get(*n).or_else(|| seq.last())?.clone();
+        *n += 1;
+        Some(value)
     }
 
     async fn dispatch_line(&self, raw_line: &str) -> Reply {
@@ -645,6 +680,7 @@ impl Core {
                 id: id.clone(),
                 method: method.to_string(),
                 params: Value::Null,
+                at: self.started.elapsed(),
             });
             return Reply::Line(error_line(
                 id.as_deref(),
@@ -801,13 +837,29 @@ impl Core {
                     close_after: config.faults.close_lifecycle_after,
                 })
             }
-            other => match config.canned.get(other) {
-                Some(result) => Reply::Line(result_line(id, result.clone())),
-                None => Reply::Line(error_line(
-                    id,
-                    "invalid_params",
-                    &format!("unknown method `{other}`"),
-                )),
+            other => match config.canned_seq.contains_key(other) {
+                // `next_seq` takes both locks itself, so the borrow of `config` ends first.
+                true => {
+                    let method = other.to_string();
+                    let id = id.map(str::to_string);
+                    drop(config);
+                    match self.next_seq(&method) {
+                        Some(result) => Reply::Line(result_line(id.as_deref(), result)),
+                        None => Reply::Line(error_line(
+                            id.as_deref(),
+                            "invalid_params",
+                            &format!("unknown method `{method}`"),
+                        )),
+                    }
+                }
+                false => match config.canned.get(other) {
+                    Some(result) => Reply::Line(result_line(id, result.clone())),
+                    None => Reply::Line(error_line(
+                        id,
+                        "invalid_params",
+                        &format!("unknown method `{other}`"),
+                    )),
+                },
             },
         }
     }
@@ -1233,6 +1285,44 @@ mod tests {
             mock.methods(),
             vec!["ping", "session.snapshot", "pane.get", "pane.get"]
         );
+    }
+
+    /// The Phase 5 seams: `canned_seq` answers in order with the last one repeating, and
+    /// every request records the **tokio**-clock gap since the mock was built, so a test
+    /// under `tokio::time::pause()` can assert a retry waited exactly its delay.
+    #[tokio::test(start_paused = true)]
+    async fn mock_canned_seq_serves_in_order_and_records_the_virtual_arrival() {
+        let mock = InMemoryHerdr::builder()
+            .canned_seq(
+                "notification.show",
+                vec![
+                    json!({"shown": false, "reason": "busy"}),
+                    json!({"shown": true, "reason": ""}),
+                ],
+            )
+            .canned("notification.show", json!({"shown": false, "reason": "no"}))
+            .in_memory();
+        let first = mock.request("notification.show", json!({})).await.unwrap();
+        assert_eq!(first["reason"], "busy", "the sequence beats `canned`");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let second = mock.request("notification.show", json!({})).await.unwrap();
+        assert_eq!(second["shown"], true);
+        let third = mock.request("notification.show", json!({})).await.unwrap();
+        assert_eq!(third["shown"], true, "the last result repeats");
+
+        let at: Vec<Duration> = mock
+            .control()
+            .requests()
+            .into_iter()
+            .map(|r| r.at)
+            .collect();
+        assert_eq!(at[0], Duration::ZERO);
+        assert_eq!(
+            at[1] - at[0],
+            Duration::from_secs(5),
+            "virtual time, not zero"
+        );
+        assert_eq!(at[2], at[1]);
     }
 
     #[tokio::test(start_paused = true)]

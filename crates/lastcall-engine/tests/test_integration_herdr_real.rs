@@ -13,15 +13,22 @@
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use lastcall_engine::herdr::client::{Client, ClientOptions, ClientTimings, HerdrEvent};
 use lastcall_engine::herdr::guard;
-use lastcall_engine::herdr::transport::{SocketTransport, Transport, TransportError};
+use lastcall_engine::herdr::transport::{EventStream, SocketTransport, Transport, TransportError};
 use lastcall_engine::herdr::wire::{self, AgentStatus, Event, Subscription};
-use lastcall_testkit::herdr_spawn::{SpawnedHerdr, herdr_bin_from_env, write_skip_notice};
+use lastcall_testkit::herdr_schema;
+use lastcall_testkit::herdr_spawn::{
+    HerdrIsolation, SpawnedHerdr, herdr_bin_from_env, write_skip_notice,
+};
 use lastcall_testkit::json_lines;
 use serde_json::{Value, json};
+use tokio::io::AsyncWriteExt;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -67,6 +74,22 @@ fn raw_snapshot(sock: &Path, id: &str) -> String {
     )
     .expect("raw snapshot")
     .expect("raw snapshot line")
+}
+
+/// `<bin> --version` → `herdr 0.8.2`; the last token is what `ping` answers as `version`.
+/// Read from the binary, never pinned as a literal, so `just test-integration-herdr-latest`
+/// measures drift against a newer release instead of failing on the version string
+/// (verifier (c) F1).
+fn version_of(bin: &Path) -> String {
+    let out = std::process::Command::new(bin)
+        .arg("--version")
+        .output()
+        .expect("herdr --version");
+    let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    line.split_whitespace()
+        .last()
+        .unwrap_or_else(|| panic!("`herdr --version` printed nothing: {line:?}"))
+        .to_string()
 }
 
 fn say(msg: &str) {
@@ -139,18 +162,16 @@ async fn herdr_real_ping_bootstrap_events_and_done_derivation() {
     assert!(sock.as_os_str().len() < 100, "socket path under 100 bytes");
     let t = SocketTransport::new(&sock, TIMEOUT);
 
-    // 1. ping: version 0.8.2 and a supported protocol. The published v0.8.2 asset answers
-    //    protocol 20 (the spec's 21 is herdr master post-release; see guard::SUPPORTED_PROTOCOLS).
+    // 1. ping: the binary's own version and a supported protocol. The published v0.8.2 asset
+    //    answers protocol 20 (the spec's 21 is herdr master post-release); any member of
+    //    guard::SUPPORTED_PROTOCOLS is accepted so the same test runs against the latest release.
+    let expected_version = version_of(herdr.bin());
     let pong = guard::ping(&t).await.expect("ping");
-    assert_eq!(pong.version, "0.8.2", "{pong:?}");
+    assert_eq!(pong.version, expected_version, "{pong:?}");
     assert!(
         guard::SUPPORTED_PROTOCOLS.contains(&pong.protocol),
         "{pong:?} not in {:?}",
         guard::SUPPORTED_PROTOCOLS
-    );
-    assert_eq!(
-        pong.protocol, 20,
-        "the pinned v0.8.2 release asset answers protocol 20: {pong:?}"
     );
     assert!(guard::compare(&pong).is_ok());
     say(&format!(
@@ -224,7 +245,7 @@ async fn herdr_real_ping_bootstrap_events_and_done_derivation() {
     })
     .await
     .expect("Connected within the deadline");
-    assert_eq!(connected, ("0.8.2".to_string(), pong.protocol));
+    assert_eq!(connected, (expected_version.clone(), pong.protocol));
     let cache = handle.snapshot().expect("snapshot installed");
     assert!(
         !cache.workspaces.is_empty(),
@@ -490,4 +511,733 @@ async fn herdr_real_ping_bootstrap_events_and_done_derivation() {
         "the spawned herdr's dir is removed on drop"
     );
     say("done");
+}
+
+// ---------------------------------------------------------------------------------------
+// Phase 5 deliverable 10 — G3 and G6 against the pinned real server
+// ---------------------------------------------------------------------------------------
+
+/// The lines [`FilteringTransport`] swallows.
+///
+/// Lifecycle events arrive snake_case (§5.5); the per-pane status event arrives dotted.
+/// Between them these four are every route by which the client could hear about a focus
+/// change or a status change *as an event*, so what is left is the fallback resync, and only
+/// the fallback resync.
+const FILTERED_EVENTS: [&str; 4] = [
+    "tab_focused",
+    "pane_focused",
+    "workspace_focused",
+    wire::PANE_AGENT_STATUS_CHANGED,
+];
+
+/// What the filter did, for the assertions.
+#[derive(Debug, Default)]
+struct FilterStats {
+    /// Subscriptions carrying the §5.4 lifecycle set: a second one means a reconnect.
+    lifecycle_subscribes: AtomicUsize,
+    /// Event names dropped, in arrival order.
+    dropped: Mutex<Vec<String>>,
+    /// Event names forwarded, in arrival order — named, not just counted, so a heal that was
+    /// really driven by some *other* event cannot pass as a fallback resync.
+    forwarded: Mutex<Vec<String>>,
+}
+
+impl FilterStats {
+    fn dropped_names(&self) -> Vec<String> {
+        self.dropped
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn forwarded_names(&self) -> Vec<String> {
+        self.forwarded
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+}
+
+/// The name of a pushed event line, either envelope shape.
+fn event_name(line: &str) -> Option<String> {
+    serde_json::from_str::<Value>(line)
+        .ok()?
+        .get("event")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// A [`Transport`] that deprives the client of the focus and per-pane status lines.
+///
+/// Requests pass straight through (the client still resyncs over the real socket); only the
+/// **event streams** are censored. Every subscription is relayed to herdr exactly as asked —
+/// the server never sees a difference — and the acknowledged stream is re-served through an
+/// in-process pipe with [`FILTERED_EVENTS`] removed.
+///
+/// This is what makes G3 a real test: without it the `done` → `idle` flip is announced by
+/// `tab_focused`, and a reconnect would re-bootstrap from `session.snapshot` and show idle
+/// trivially. With it, the only thing that can heal the cache is the periodic resync.
+#[derive(Clone)]
+struct FilteringTransport<T: Transport + Clone> {
+    inner: T,
+    stats: Arc<FilterStats>,
+}
+
+impl<T: Transport + Clone> FilteringTransport<T> {
+    fn new(inner: T) -> Self {
+        Self {
+            inner,
+            stats: Arc::new(FilterStats::default()),
+        }
+    }
+}
+
+impl<T: Transport + Clone> Transport for FilteringTransport<T> {
+    async fn request(&self, method: &str, params: Value) -> Result<Value, TransportError> {
+        self.inner.request(method, params).await
+    }
+
+    async fn subscribe(
+        &self,
+        subscriptions: Vec<Subscription>,
+    ) -> Result<EventStream, TransportError> {
+        if subscriptions.iter().any(|s| s.kind == "tab.focused") {
+            self.stats
+                .lifecycle_subscribes
+                .fetch_add(1, Ordering::SeqCst);
+        }
+        let mut inner = self.inner.subscribe(subscriptions).await?;
+        let (ours, mut theirs) = tokio::io::duplex(64 * 1024);
+        let stats = Arc::clone(&self.stats);
+        tokio::spawn(async move {
+            while let Ok(Some(line)) = inner.next_line(None).await {
+                let name = event_name(&line);
+                match &name {
+                    Some(name) if FILTERED_EVENTS.contains(&name.as_str()) => {
+                        stats
+                            .dropped
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(name.clone());
+                        continue;
+                    }
+                    _ => {}
+                }
+                stats
+                    .forwarded
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(name.unwrap_or_else(|| "(no event field)".to_string()));
+                if theirs.write_all(line.as_bytes()).await.is_err()
+                    || theirs.write_all(b"\n").await.is_err()
+                {
+                    break;
+                }
+            }
+            // Dropping `theirs` is the EOF the consumer sees: a real close stays a close.
+        });
+        Ok(EventStream::new(Box::new(ours)))
+    }
+
+    fn describe(&self) -> String {
+        format!("filtered({})", self.inner.describe())
+    }
+}
+
+/// Drive the root pane of a fresh workspace to `done`, the way section 4 of the Phase 1 test
+/// does: a second tab takes focus, so the completion happens in a tab the user is not
+/// viewing and herdr derives `done` (§5.7). Returns `(workspace_id, root_pane, first_tab)`.
+async fn drive_pane_to_done<T: Transport>(t: &T, cwd: &Path) -> (String, String, String) {
+    let created = t
+        .request(
+            "workspace.create",
+            json!({ "cwd": cwd.to_string_lossy(), "focus": true }),
+        )
+        .await
+        .expect("workspace.create");
+    let workspace_id = created["workspace"]["workspace_id"]
+        .as_str()
+        .expect("workspace_id")
+        .to_string();
+    let root_pane = created["root_pane"]["pane_id"]
+        .as_str()
+        .expect("root_pane.pane_id")
+        .to_string();
+    let first_tab = created["root_pane"]["tab_id"]
+        .as_str()
+        .expect("root_pane.tab_id")
+        .to_string();
+    t.request(
+        "tab.create",
+        json!({ "workspace_id": workspace_id, "focus": true }),
+    )
+    .await
+    .expect("tab.create takes focus away from the agent's tab");
+    for state in ["working", "idle"] {
+        let ok = t
+            .request(
+                "pane.report_agent",
+                json!({ "pane_id": root_pane, "source": "lastcall-test", "agent": "demo", "state": state }),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("pane.report_agent {state}: {e}"));
+        assert_eq!(ok["type"], "ok");
+        if state == "working" {
+            // Let herdr observe `working` before the completion transition.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    }
+    // Poll the authority rather than sleeping on hope.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let pane = t
+            .request("pane.get", json!({ "pane_id": root_pane }))
+            .await
+            .expect("pane.get");
+        if pane["pane"]["agent_status"] == "done" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "herdr never derived `done` for {root_pane}: {pane}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    (workspace_id, root_pane, first_tab)
+}
+
+/// **G3** (`01-scenarios.md` §G). The silent `done` → `idle` flip (§5.7) heals through the
+/// periodic resync alone.
+///
+/// The client runs on a [`FilteringTransport`], so the `tab_focused` line that would have
+/// driven a focus resync — and every per-pane `agent_status_changed` line — never reaches
+/// it. The cache is stale from the moment the tab is focused until the next `fallback`
+/// resync, and the test asserts it heals inside `fallback + 1 s` **without a reconnect**
+/// (exactly one `Connected`, exactly one lifecycle subscription): a reconnect re-bootstraps
+/// from `session.snapshot` and would show idle trivially.
+#[tokio::test]
+async fn herdr_real_done_flip_heals_within_fallback() {
+    let Some(bin) = herdr_bin_from_env() else {
+        write_skip_notice();
+        return;
+    };
+    let mut herdr = SpawnedHerdr::spawn(&bin).expect("spawn herdr in a PTY");
+    herdr
+        .wait_for_socket(Duration::from_secs(5))
+        .expect("socket appears within 5 s");
+    let sock = herdr.socket_path().to_path_buf();
+    say(&format!(
+        "G3: spawned pid {:?} at {}",
+        herdr.pid(),
+        sock.display()
+    ));
+    let raw = SocketTransport::new(&sock, TIMEOUT);
+
+    // 1. A pane herdr calls `done`, before the client ever connects: the bootstrap snapshot
+    //    is the only thing that tells the client so.
+    let (_ws, root_pane, first_tab) = drive_pane_to_done(&raw, &herdr.isolation().base).await;
+    say(&format!("G3: {root_pane} is done in tab {first_tab}"));
+
+    // 2. Connect through the filter, with a 3 s fallback resync.
+    const FALLBACK: Duration = Duration::from_secs(3);
+    let filtered = FilteringTransport::new(raw.clone());
+    let stats = Arc::clone(&filtered.stats);
+    let (handle, mut rx) = Client::spawn(
+        filtered,
+        ClientTimings {
+            coalesce: Duration::from_millis(200),
+            fallback: FALLBACK,
+            request_timeout: TIMEOUT,
+            reconnect_initial: Duration::from_millis(200),
+            reconnect_max: Duration::from_secs(1),
+        },
+        // Reconnect stays ON: a reconnect is the failure this test must be able to see.
+        ClientOptions { reconnect: true },
+    );
+    let mut trace: Vec<String> = Vec::new();
+    let mut connects = 0usize;
+    tokio::time::timeout(TIMEOUT, async {
+        loop {
+            match rx.recv().await {
+                Some(HerdrEvent::Connected { version, protocol }) => {
+                    connects += 1;
+                    trace.push(format!("Connected {version} protocol {protocol}"));
+                    break;
+                }
+                Some(HerdrEvent::Standalone { notice }) => panic!("standalone: {notice}"),
+                Some(other) => trace.push(format!("{other:?}")),
+                None => panic!("client ended before Connected"),
+            }
+        }
+    })
+    .await
+    .expect("Connected within the deadline");
+    let cache = handle.snapshot().expect("bootstrap cache");
+    assert_eq!(
+        cache.status_of(&root_pane),
+        Some(&AgentStatus::Done),
+        "the bootstrap snapshot must show the pane as done"
+    );
+
+    // 3. Focus the agent's tab. herdr clears its seen flag and the pane becomes idle with no
+    //    global event for the flip itself; the one line that *would* have driven a resync
+    //    (`tab_focused`) is eaten by the filter.
+    // Let the scene settle first. herdr announces the second tab's pane asynchronously, well
+    // after `tab.create` has returned, so a `pane_created` can still be in flight here — and
+    // any lifecycle event schedules a coalesced resync, which would heal the cache in ~200 ms
+    // and make the fallback window irrelevant. Wait for the push stream to go quiet (shorter
+    // than one fallback window, so this cannot silently consume the heal itself).
+    let settle_deadline = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < settle_deadline {
+        match tokio::time::timeout(Duration::from_millis(800), rx.recv()).await {
+            Err(_) => break, // quiet
+            Ok(Some(event)) => {
+                if matches!(event, HerdrEvent::Connected { .. }) {
+                    connects += 1;
+                }
+                trace.push(format!("settle: {event:?}"));
+            }
+            Ok(None) => panic!("client ended while settling"),
+        }
+    }
+    assert_eq!(
+        handle
+            .snapshot()
+            .and_then(|c| c.status_of(&root_pane).cloned()),
+        Some(AgentStatus::Done),
+        "the pane must still read done when the tab is focused, or there is nothing to heal"
+    );
+    let forwarded_before_focus = stats.forwarded_names().len();
+    let focus_at = Instant::now();
+    let focused = raw
+        .request("tab.focus", json!({ "tab_id": first_tab }))
+        .await
+        .expect("tab.focus");
+    assert!(focused.get("type").is_some(), "{focused}");
+
+    // 4. The heal must arrive within one fallback window plus a second of slack.
+    let budget = FALLBACK + Duration::from_secs(1);
+    let healed = tokio::time::timeout(budget, async {
+        loop {
+            match rx.recv().await {
+                Some(HerdrEvent::Connected { .. }) => {
+                    connects += 1;
+                    trace.push("Connected (RECONNECT)".into());
+                }
+                Some(HerdrEvent::AgentStatusChanged {
+                    pane_id, from, to, ..
+                }) if pane_id == root_pane && to == AgentStatus::Idle => {
+                    trace.push(format!("AgentStatusChanged {pane_id} {from:?} -> idle"));
+                    break true;
+                }
+                Some(HerdrEvent::Resync(target)) => trace.push(format!("Resync({target:?})")),
+                Some(HerdrEvent::Disconnected { reason }) => {
+                    trace.push(format!("Disconnected {reason}"));
+                }
+                Some(other) => trace.push(format!("{other:?}")),
+                None => break false,
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "no idle within {budget:?}; trace:\n  {}",
+            trace.join("\n  ")
+        )
+    });
+    let elapsed = focus_at.elapsed();
+    say(&format!("G3 trace ({elapsed:?} after tab.focus):"));
+    for line in &trace {
+        say(&format!("  {line}"));
+    }
+    assert!(healed, "the client channel ended before the heal");
+    assert!(
+        elapsed <= budget,
+        "heal took {elapsed:?}, over the {budget:?} budget"
+    );
+
+    // 5. It healed *through the resync*, not through an event the filter was meant to eat.
+    let dropped = stats.dropped_names();
+    say(&format!("G3 dropped {} lines: {dropped:?}", dropped.len()));
+    assert!(
+        dropped.iter().any(|n| n == "tab_focused"),
+        "the filter must have eaten the tab_focused announcing the flip; dropped {dropped:?}"
+    );
+    assert!(
+        trace.iter().any(|l| l == "Resync(Snapshot)"),
+        "the heal must come through the fallback's full resync — a `Resync(PaneGet(..))` \
+         would mean a status stream closed and healed it in ~200 ms instead; trace: {trace:?}"
+    );
+
+    // 6. And it healed without a reconnect: one Connected, one lifecycle subscription.
+    assert_eq!(
+        connects, 1,
+        "a reconnect would make this test vacuous; trace: {trace:?}"
+    );
+    assert_eq!(
+        stats.lifecycle_subscribes.load(Ordering::SeqCst),
+        1,
+        "exactly one lifecycle stream was ever opened"
+    );
+    assert!(
+        !trace.iter().any(|l| l.contains("Disconnected")),
+        "no disconnect, before or after the focus; trace: {trace:?}"
+    );
+    let forwarded = stats.forwarded_names();
+    assert!(
+        !forwarded.is_empty(),
+        "the filter must still have forwarded the lines it does not censor"
+    );
+    let after_focus = &forwarded[forwarded_before_focus.min(forwarded.len())..];
+    say(&format!(
+        "G3 forwarded {} lines ({} after tab.focus: {after_focus:?})",
+        forwarded.len(),
+        after_focus.len()
+    ));
+    assert!(
+        after_focus.is_empty(),
+        "the heal must be the fallback resync and nothing else, but herdr pushed \
+         {after_focus:?} between the focus and the heal — either the filter list in the \
+         kickoff is incomplete or herdr announces the flip another way (report it)"
+    );
+
+    // 7. The cache agrees with the server.
+    assert_eq!(
+        handle
+            .snapshot()
+            .and_then(|c| c.status_of(&root_pane).cloned()),
+        Some(AgentStatus::Idle)
+    );
+    let pane = raw
+        .request("pane.get", json!({ "pane_id": root_pane }))
+        .await
+        .expect("pane.get after focus");
+    assert_eq!(pane["pane"]["agent_status"], "idle", "{pane}");
+    handle.shutdown().await;
+    say("G3 done");
+}
+
+/// **G6** (`01-scenarios.md` §G). A real server restart converges: the client reconnects to
+/// the **same socket** and its cache equals a fresh `session.snapshot` from the new process.
+///
+/// The first server is stopped with `herdr server stop` over its own isolated socket, not a
+/// signal, so the socket file is gone deterministically (a stale socket would make the
+/// client see a connect refusal rather than a clean disconnect).
+#[tokio::test]
+async fn herdr_real_disconnect_reconnect_converges() {
+    let Some(bin) = herdr_bin_from_env() else {
+        write_skip_notice();
+        return;
+    };
+    let mut herdr = SpawnedHerdr::spawn(&bin).expect("spawn herdr in a PTY");
+    herdr
+        .wait_for_socket(Duration::from_secs(5))
+        .expect("socket appears within 5 s");
+    let sock = herdr.socket_path().to_path_buf();
+    let isolation: HerdrIsolation = herdr.isolation().clone();
+    isolation
+        .assert_isolated()
+        .expect("the isolation is private before anything is stopped");
+    say(&format!(
+        "G6: spawned pid {:?} at {}",
+        herdr.pid(),
+        sock.display()
+    ));
+    let t = SocketTransport::new(&sock, TIMEOUT);
+    // Some state to converge on, so an empty cache cannot pass for a converged one.
+    let (_ws, root_pane, _tab) = drive_pane_to_done(&t, &isolation.base).await;
+
+    let (handle, mut rx) = Client::spawn(
+        t.clone(),
+        ClientTimings {
+            coalesce: Duration::from_millis(200),
+            // Parked far past the test: every resync counted below is a bootstrap.
+            fallback: Duration::from_secs(300),
+            request_timeout: TIMEOUT,
+            reconnect_initial: Duration::from_millis(200),
+            reconnect_max: Duration::from_secs(1),
+        },
+        ClientOptions { reconnect: true },
+    );
+    let mut trace: Vec<String> = Vec::new();
+    let first_connect = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            match rx.recv().await {
+                Some(HerdrEvent::Connected { version, protocol }) => break (version, protocol),
+                Some(HerdrEvent::Standalone { notice }) => panic!("standalone: {notice}"),
+                Some(other) => trace.push(format!("{other:?}")),
+                None => panic!("client ended before Connected"),
+            }
+        }
+    })
+    .await
+    .expect("Connected within the deadline");
+    trace.push(format!(
+        "Connected {} protocol {}",
+        first_connect.0, first_connect.1
+    ));
+    let before = handle.snapshot().expect("first cache");
+    assert_eq!(before.resyncs, 1, "bootstrap is the first resync");
+    assert!(before.panes.contains_key(&root_pane));
+
+    // 1. Stop it the way a user does. `herdr server stop` waits for the socket to go away.
+    let stop_at = Instant::now();
+    herdr
+        .stop_server(Duration::from_secs(10))
+        .expect("`herdr server stop` over the isolated socket");
+    assert!(
+        !sock.exists(),
+        "the socket file must be gone after `server stop`"
+    );
+    say(&format!("G6: stopped in {:?}", stop_at.elapsed()));
+
+    // 2. The client notices.
+    let reason = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match rx.recv().await {
+                Some(HerdrEvent::Disconnected { reason }) => break Some(reason),
+                Some(other) => trace.push(format!("{other:?}")),
+                None => break None,
+            }
+        }
+    })
+    .await
+    .expect("a Disconnected within 10 s")
+    .expect("the channel stays open across a disconnect");
+    trace.push(format!("Disconnected {reason}"));
+    say(&format!("G6: disconnected: {reason}"));
+
+    // 3. Same socket path, same config dir — anything else would not be a reconnect.
+    herdr
+        .respawn(&isolation)
+        .expect("respawn on the same socket");
+    herdr
+        .wait_for_socket(Duration::from_secs(10))
+        .expect("the new server's socket appears");
+    assert_eq!(herdr.socket_path(), sock.as_path());
+    say(&format!("G6: respawned pid {:?}", herdr.pid()));
+
+    // 4. Full bootstrap again.
+    let second_connect = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            match rx.recv().await {
+                Some(HerdrEvent::Connected { version, protocol }) => break (version, protocol),
+                Some(HerdrEvent::Standalone { notice }) => panic!("standalone: {notice}"),
+                Some(other) => trace.push(format!("{other:?}")),
+                None => panic!("client ended before it reconnected"),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no reconnect; trace:\n  {}", trace.join("\n  ")));
+    trace.push(format!(
+        "Connected {} protocol {}",
+        second_connect.0, second_connect.1
+    ));
+    assert_eq!(second_connect, first_connect, "same herdr identity");
+
+    // 5. `Cache.resyncs` + 1, and the cache equals a fresh snapshot from the NEW server.
+    let fresh: Value =
+        serde_json::from_str(&raw_snapshot(&sock, "g6-fresh")).expect("raw snapshot parses");
+    let fresh = &fresh["result"]["snapshot"];
+    let fresh_panes: BTreeSet<String> = fresh["panes"]
+        .as_array()
+        .expect("panes[]")
+        .iter()
+        .map(|p| p["pane_id"].as_str().expect("pane_id").to_string())
+        .collect();
+    let fresh_workspaces: BTreeSet<String> = fresh["workspaces"]
+        .as_array()
+        .expect("workspaces[]")
+        .iter()
+        .map(|w| {
+            w["workspace_id"]
+                .as_str()
+                .expect("workspace_id")
+                .to_string()
+        })
+        .collect();
+    let after = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(c) = handle.snapshot()
+                && c.resyncs > before.resyncs
+                && c.panes.keys().cloned().collect::<BTreeSet<_>>() == fresh_panes
+            {
+                break c;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "cache never converged on the new server's snapshot ({fresh_panes:?}); trace:\n  {}",
+            trace.join("\n  ")
+        )
+    });
+    assert_eq!(
+        after.resyncs,
+        before.resyncs + 1,
+        "one more resync: the reconnect's bootstrap"
+    );
+    assert_eq!(
+        after.workspaces.keys().cloned().collect::<BTreeSet<_>>(),
+        fresh_workspaces
+    );
+    assert_eq!(after.version, first_connect.0);
+    assert_eq!(after.protocol, first_connect.1);
+    // herdr restores the session on respawn, so the pane and workspace id sets alone cannot
+    // tell the stale cache from the new server's snapshot (verifier (c) F2). The root pane's
+    // agent status can: it was driven to `done` before the stop, and the new server reports
+    // whatever it restored (`unknown` with v0.8.2). The cache takes a pane's status from
+    // `panes[].agent_status`, so compare against that field of the fresh snapshot.
+    let fresh_root_status: Option<AgentStatus> = fresh["panes"]
+        .as_array()
+        .expect("panes[]")
+        .iter()
+        .find(|p| p["pane_id"].as_str() == Some(root_pane.as_str()))
+        .map(|p| AgentStatus::parse(p["agent_status"].as_str().expect("agent_status")));
+    assert_eq!(
+        after.status_of(&root_pane).cloned(),
+        fresh_root_status,
+        "the cache must carry the new server's status for the root pane"
+    );
+    assert_ne!(
+        after.status_of(&root_pane),
+        before.status_of(&root_pane),
+        "the status must have changed across the restart ({:?} before), or this assertion \
+         proves nothing about convergence",
+        before.status_of(&root_pane)
+    );
+    assert_eq!(
+        after.focused_workspace_id.as_deref(),
+        fresh["focused_workspace_id"].as_str()
+    );
+    say("G6 trace:");
+    for line in &trace {
+        say(&format!("  {line}"));
+    }
+    say(&format!(
+        "G6: converged, resyncs {} -> {}, {} panes, {} workspaces",
+        before.resyncs,
+        after.resyncs,
+        after.panes.len(),
+        after.workspaces.len()
+    ));
+    handle.shutdown().await;
+    say("G6 done");
+}
+
+// ---------------------------------------------------------------------------------------
+// Phase 5 deliverable 11b — the consumed-surface drift check
+// ---------------------------------------------------------------------------------------
+
+/// The committed projection of the pinned release's API surface.
+const CONSUMED_SURFACE: &str =
+    include_str!("../../lastcall-testkit/fixtures/herdr/schema/consumed-surface.json");
+
+/// **Deliverable 11b.** `<bin> api schema --json`, projected onto what we consume, must equal
+/// `consumed-surface.json`.
+///
+/// Against the pinned binary this is a tautology that guards the *generator* (a projection that
+/// silently stopped following `$ref`s would still round-trip, so the fixture's own counts are
+/// asserted too). Its real job is `just test-integration-herdr-latest` in the weekly compat
+/// workflow, where the binary is herdr's **latest** release: there, a diff is the drift alert.
+///
+/// `api schema --json` starts no server and reads no socket, so this test spawns nothing.
+#[test]
+fn herdr_real_schema_consumed_surface_unchanged() {
+    let Some(bin) = herdr_bin_from_env() else {
+        write_skip_notice();
+        return;
+    };
+    let version = std::process::Command::new(&bin)
+        .arg("--version")
+        .output()
+        .expect("herdr --version");
+    let version = String::from_utf8_lossy(&version.stdout).trim().to_string();
+
+    let out = std::process::Command::new(&bin)
+        .args(["api", "schema", "--json"])
+        .output()
+        .expect("herdr api schema --json");
+    assert!(
+        out.status.success(),
+        "`herdr api schema --json` exited {:?}: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    let schema: Value = serde_json::from_slice(&out.stdout).expect("schema is JSON");
+
+    let actual = herdr_schema::project(&schema).unwrap_or_else(|e| {
+        panic!(
+            "{version} does not answer the surface we consume: {e}\n\
+             (that is itself the drift report — a method, event or type we call is gone)"
+        )
+    });
+    let expected: Value = serde_json::from_str(CONSUMED_SURFACE).expect("fixture is JSON");
+
+    say(&format!(
+        "schema: {version} protocol {} schema_version {}, {} methods / {} events / {} defs",
+        actual["protocol"],
+        actual["schema_version"],
+        actual["methods"]
+            .as_object()
+            .map_or(0, serde_json::Map::len),
+        actual["events"].as_object().map_or(0, serde_json::Map::len),
+        actual["defs"].as_object().map_or(0, serde_json::Map::len),
+    ));
+
+    let differences = herdr_schema::diff(&expected, &actual);
+    assert!(
+        differences.is_empty(),
+        "herdr compat drift: {version} differs from the pinned consumed surface \
+         (crates/lastcall-testkit/fixtures/herdr/schema/consumed-surface.json) in {} place(s):\n  {}\n\
+         \nIf this is a herdr upgrade we are adopting, re-pin with `just herdr-schema-fixture` \
+         and update the provenance file. If it is the weekly compat job, it is telling you a \
+         future herdr will break lastcall.",
+        differences.len(),
+        differences.join("\n  ")
+    );
+
+    // The fixture must actually contain the surface, not an empty husk that always matches.
+    let methods = expected["methods"].as_object().expect("methods object");
+    assert_eq!(
+        methods.len(),
+        herdr_schema::CONSUMED_METHODS.len(),
+        "every consumed method is pinned"
+    );
+    for (method, result) in herdr_schema::CONSUMED_METHODS {
+        assert_eq!(
+            methods[method]["result"], result,
+            "`{method}` still answers `{result}`"
+        );
+        assert!(
+            expected["results"].get(result).is_some(),
+            "the `{result}` result schema is pinned"
+        );
+    }
+    assert_eq!(
+        expected["events"]
+            .as_object()
+            .map_or(0, serde_json::Map::len),
+        wire::LIFECYCLE_SUBSCRIPTIONS.len(),
+        "all 15 §5.4 lifecycle events are pinned"
+    );
+    assert_eq!(
+        expected["pinned_enums"]["AgentStatus"],
+        json!(["idle", "working", "blocked", "done", "unknown"]),
+        "the status vocabulary every dot and rollup depends on"
+    );
+    assert_eq!(
+        expected["pinned_enums"]["NotificationShowSound"],
+        json!(["none", "done", "request"]),
+        "our toast sends `done`; the engine type stays lenient, the fixture is what notices"
+    );
+    assert!(
+        expected["defs"].as_object().is_some_and(|d| d.len() > 20),
+        "the transitive type closure is pinned, not just the entry points"
+    );
+    say("schema: consumed surface unchanged");
 }

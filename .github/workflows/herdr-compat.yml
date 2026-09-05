@@ -1,0 +1,126 @@
+# Weekly early warning that a **future** herdr release will break lastcall
+# (docs/spec/00-spec.md §7.5; docs/spec/94-phase5-kickoff.md deliverable 11c).
+#
+# `ci.yml` pins herdr to the tag in the justfile and must stay green on its own. This job does
+# the opposite: it fetches herdr's *latest* release and runs the real-server subset plus the
+# consumed-surface schema check against it. A failure here is information, never a blocker —
+# it files one issue and stops.
+name: herdr-compat
+
+on:
+  schedule:
+    # Mondays, 06:00 UTC.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/herdr-compat.yml
+      - crates/lastcall-testkit/fixtures/herdr/schema/**
+      - justfile
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  compat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read the toolchain pin
+        id: pin
+        run: echo "channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.pin.outputs.channel }}
+      - uses: extractions/setup-just@v4
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Fetch the latest herdr release
+        id: herdr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="$(gh release view -R herdrdev/herdr --json tagName --jq .tagName)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          just herdr-fetch-latest
+
+      # The real-server subset against that binary. The protocol guard refusing an unsupported
+      # protocol, a consumed-surface diff and any herdr_real_* failure all count as drift.
+      - name: Real-server subset against the latest herdr
+        id: subset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: just test-integration-herdr-latest
+
+      - name: File one issue for the drift
+        # Never from a pull_request run: a red PR would file `drift: <pinned>` while latest ==
+        # pinned, and that one open issue would then suppress the real Monday alert.
+        if: failure() && steps.subset.outcome == 'failure' && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.herdr.outputs.version }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title="herdr compat drift: ${VERSION}"
+          # `gh issue list --label` and `gh issue create --label` both need the label to exist;
+          # the first run of this workflow is the one that creates it. `--force` makes a repeat
+          # run a no-op rather than an error.
+          gh label create herdr-compat --force \
+            --description "A newer herdr release fails the weekly compatibility check" \
+            --color D93F0B >/dev/null
+          # Never spam. One open herdr-compat issue at a time, full stop: this job runs every
+          # week and drift persists until someone adopts the release, so a second issue would
+          # only ever be the same news again.
+          open_issues="$(gh issue list --state open --label herdr-compat \
+            --json number,title --jq '.[] | "#\(.number) \(.title)"')"
+          if [ -n "$open_issues" ]; then
+            echo "herdr-compat: already open, not filing another:" >&2
+            echo "$open_issues" >&2
+            exit 0
+          fi
+          # Belt and braces: the search index catches a same-titled issue the label query
+          # somehow missed (a closed-then-reopened one, a label removed by hand).
+          same_title="$(gh issue list --state open --search "$title in:title" \
+            --json number,title --jq "map(select(.title == \"$title\")) | .[0].number // empty")"
+          if [ -n "$same_title" ]; then
+            echo "herdr-compat: issue #$same_title already says this; not filing another." >&2
+            exit 0
+          fi
+          # The body goes through a file: a `$(cat <<EOF …)` here would be mis-lexed by
+          # bash, which scans for the closing paren before it processes the heredoc and
+          # trips over an apostrophe in the prose.
+          body="${RUNNER_TEMP:-.}/herdr-compat-body.md"
+          cat > "$body" <<EOF
+          The weekly herdr compatibility check failed against herdr \`${VERSION}\`, which is
+          newer than the pinned release this repo builds and tests against
+          (\`herdr_version\` in the \`justfile\`).
+
+          **This is a warning, not a break.** \`ci.yml\` is unaffected and stays green: it uses
+          the pinned tag. What it means is that adopting \`${VERSION}\` will need work first.
+
+          Job log: ${RUN_URL}
+
+          What failed is one of:
+
+          - \`herdr_real_schema_consumed_surface_unchanged\` — the consumed API surface moved.
+            The failure message lists every path that differs against
+            \`crates/lastcall-testkit/fixtures/herdr/schema/consumed-surface.json\`.
+          - the protocol guard refusing \`${VERSION}\`'s protocol number
+            (\`lastcall_engine::herdr::guard::SUPPORTED_PROTOCOLS\`).
+          - one of the \`herdr_real_*\` behaviour tests — herdr still answers the same shapes
+            but behaves differently.
+
+          To adopt the new release: bump \`herdr_version\` in the \`justfile\`, run
+          \`just herdr-schema-fixture\`, read the fixture diff and update
+          \`consumed-surface.json.provenance.md\`, then \`just test-integration-herdr\`.
+
+          Filed automatically by \`.github/workflows/herdr-compat.yml\`.
+          EOF
+          gh issue create --label herdr-compat --title "$title" \
+            --body-file "$body"

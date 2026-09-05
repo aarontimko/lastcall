@@ -16,7 +16,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use lastcall::tui::app::{App, Effect, RootMeta, Selection};
+use lastcall::tui::app::{AcceptFailed, App, Effect, RootMeta, Selection};
+use lastcall::tui::herdr::{Attention, Dot, HerdrUpdate, RootAgents, Scope};
 use lastcall::tui::input::Action;
 use lastcall::tui::render::{render, styles};
 use lastcall_engine::engine::{Engine, EngineOptions};
@@ -468,7 +469,7 @@ fn run_accept(app: &mut App, engine: &mut Engine, effect: Option<Effect>) {
     let results = reqs
         .into_iter()
         .map(|(root, req)| {
-            let result = engine.accept(&root, req).map_err(|e| e.to_string());
+            let result = engine.accept(&root, req).map_err(|e| AcceptFailed::of(&e));
             (root, result)
         })
         .collect();
@@ -752,4 +753,208 @@ fn tui_row_cap_notice() {
         "{frame}"
     );
     snapshot("tui_row_cap_notice", &app, W, H);
+}
+
+// --- herdr overlay (kickoff deliverables 5 and 8) ---------------------------------------
+
+/// Fold a derived association in the way the loop's fourth `select!` arm does.
+fn herdr_roots(app: &mut App, derived: &[(&Path, Attention, &str)]) {
+    let map: BTreeMap<PathBuf, RootAgents> = derived
+        .iter()
+        .map(|(root, status, agent)| {
+            (
+                root.to_path_buf(),
+                RootAgents {
+                    status: *status,
+                    agents: 1,
+                    pane: Some(format!("w1:{agent}")),
+                    agent: Some((*agent).to_owned()),
+                },
+            )
+        })
+        .collect();
+    app.handle(Action::Herdr(HerdrUpdate::Roots(map)));
+}
+
+fn herdr_connected(app: &mut App) {
+    app.handle(Action::Herdr(HerdrUpdate::Connected {
+        version: "0.8.2".to_owned(),
+        protocol: 21,
+    }));
+}
+
+/// A dot per state: alpha's agent is done (bright flag), beta's is blocked (red), notes'
+/// is working (yellow). The count follows the name when a root has more than one agent.
+#[test]
+fn tui_herdr_status_dots() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    let (alpha, beta, notes) = (
+        root_named(&engine, "alpha"),
+        root_named(&engine, "beta"),
+        root_named(&engine, "notes"),
+    );
+    herdr_connected(&mut app);
+    herdr_roots(
+        &mut app,
+        &[
+            (&alpha, Attention::Done, "claude"),
+            (&beta, Attention::Blocked, "codex"),
+            (&notes, Attention::Working, "claude"),
+        ],
+    );
+    assert_eq!(app.herdr.dot(&alpha), Some(Dot::Ready { acked: false }));
+    assert_eq!(app.herdr.dot(&beta), Some(Dot::Blocked));
+    assert_eq!(app.herdr.dot(&notes), Some(Dot::Working));
+    snapshot("tui_herdr_status_dots", &app, W, H);
+}
+
+/// Ruling 10: `d` dims alpha's flag and nothing else moves — herdr still says `done`, the
+/// repo stays listed, and beta's blocked dot is untouched.
+#[test]
+fn tui_herdr_ready_ack_dims() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    let (alpha, beta) = (root_named(&engine, "alpha"), root_named(&engine, "beta"));
+    herdr_connected(&mut app);
+    herdr_roots(
+        &mut app,
+        &[
+            (&alpha, Attention::Done, "claude"),
+            (&beta, Attention::Blocked, "codex"),
+        ],
+    );
+    app.select(Some(Selection::Root(alpha.clone())));
+    let (changed, effect) = app.handle(Action::Ack);
+    assert_eq!(changed, lastcall::tui::app::Changed::Yes);
+    assert!(matches!(effect, Some(Effect::Toast(_))), "{effect:?}");
+    assert_eq!(app.herdr.dot(&alpha), Some(Dot::Ready { acked: true }));
+    assert_eq!(app.herdr.dot(&beta), Some(Dot::Blocked));
+    snapshot("tui_herdr_ready_ack_dims", &app, W, H);
+}
+
+/// Ruling 4: alpha has nothing pending, and herdr's `done` lists it anyway with a line
+/// that says why. beta's `working` is not a reason to list it, so it stays off.
+#[test]
+fn tui_herdr_flag_only_root_listed() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let (alpha, beta) = (root_named(&engine, "alpha"), root_named(&engine, "beta"));
+    mark_seen(&mut engine, &alpha);
+    mark_seen(&mut engine, &beta);
+    let mut app = app_of(&mut engine);
+    assert!(
+        !app.listed_roots().any(|v| v.meta.path == alpha),
+        "nothing pending, nothing listed"
+    );
+    herdr_connected(&mut app);
+    herdr_roots(
+        &mut app,
+        &[
+            (&alpha, Attention::Done, "claude"),
+            (&beta, Attention::Working, "codex"),
+        ],
+    );
+    assert!(app.listed_roots().any(|v| v.meta.path == alpha));
+    assert!(
+        !app.listed_roots().any(|v| v.meta.path == beta),
+        "working only annotates (ruling 4)"
+    );
+    app.select(Some(Selection::Root(alpha)));
+    let (frame, _) = draw(&app, W, H);
+    assert!(
+        frame.contains(&lastcall::tui::render::nothing_pending("done")),
+        "{frame}"
+    );
+    snapshot("tui_herdr_flag_only_root_listed", &app, W, H);
+}
+
+/// The four header badges, each pinned as the header line it produces: connected names
+/// the version, reconnecting is undimmed so it is visible, and a standalone that the user
+/// asked for (`mode = "on"`) says why while the default one stays quiet.
+#[test]
+fn tui_herdr_header_states() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let base = app_of(&mut engine);
+    let states: Vec<(&str, HerdrUpdate)> = vec![
+        (
+            "connected",
+            HerdrUpdate::Connected {
+                version: "0.8.2".to_owned(),
+                protocol: 21,
+            },
+        ),
+        ("reconnecting", HerdrUpdate::Reconnecting),
+        (
+            "standalone (auto)",
+            HerdrUpdate::Standalone {
+                reason: String::new(),
+            },
+        ),
+        (
+            "standalone (on)",
+            HerdrUpdate::Standalone {
+                reason: "no herdr socket".to_owned(),
+            },
+        ),
+    ];
+    let mut lines = String::new();
+    for (name, update) in states {
+        let mut app = base.clone();
+        app.handle(Action::Herdr(update));
+        let (frame, _) = draw(&app, W, H);
+        let header = frame.lines().next().expect("a header").trim_end();
+        lines.push_str(&format!("{name:<18} |{header}|\n"));
+    }
+    insta::assert_snapshot!("tui_herdr_header_states", lines);
+}
+
+/// Deliverable 8: the scope hides what is not in this workspace, and the notice that says
+/// so is mandatory — it is right-aligned beside the hint line, naming the count and the
+/// key that shows everything again.
+#[test]
+fn tui_herdr_scope_notice() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    let alpha = root_named(&engine, "alpha");
+    herdr_connected(&mut app);
+    app.handle(Action::Herdr(HerdrUpdate::Scope(Some(Scope {
+        label: "alpha".to_owned(),
+        roots: [alpha.clone()].into_iter().collect(),
+    }))));
+    app.herdr.scoped = true;
+    assert_eq!(app.listed_roots().count(), 1);
+    assert_eq!(
+        app.scope_notice().as_deref(),
+        Some("scope: alpha · 2 repos hidden (w shows all)")
+    );
+    snapshot("tui_herdr_scope_notice", &app, W, H);
+}
+
+/// Review (b) F2: the notice is mandatory while the scope is active, and a transient
+/// status owns the status row most of the time (one is set at startup, after every accept,
+/// on a HEAD change and on a focus verdict, for 30 s each). The two share the row — status
+/// left with its age, notice right — instead of the notice disappearing under the status.
+#[test]
+fn tui_herdr_scope_notice_with_status() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    let alpha = root_named(&engine, "alpha");
+    herdr_connected(&mut app);
+    app.handle(Action::Herdr(HerdrUpdate::Scope(Some(Scope {
+        label: "alpha".to_owned(),
+        roots: [alpha].into_iter().collect(),
+    }))));
+    app.herdr.scoped = true;
+    app.set_status("accepted f1 in alpha");
+    let (frame, _) = draw(&app, W, H);
+    let row = frame.lines().last().expect("a status row");
+    assert!(row.contains("repos hidden"), "{row}");
+    assert!(row.contains("accepted f1 in alpha"), "{row}");
+    snapshot("tui_herdr_scope_notice_with_status", &app, W, H);
 }

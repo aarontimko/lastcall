@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use lastcall_engine::config;
-use lastcall_engine::engine::{Engine, EngineOptions};
+use lastcall_engine::engine::Engine;
 use lastcall_engine::env::Env;
 use lastcall_engine::status::{RowStatus, row_line};
 use lastcall_engine::watcher::EngineEvent;
@@ -20,7 +20,7 @@ pub fn run(
     let env = Env::from_process();
     let loaded = config::load(&env)?;
     let resolved = loaded.resolve(env.cwd());
-    let engine = match Engine::open(&loaded, &resolved, &env, EngineOptions::default()) {
+    let engine = match Engine::open(&loaded, &resolved, &env, crate::commands::engine_options()) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("lastcall: {e}");

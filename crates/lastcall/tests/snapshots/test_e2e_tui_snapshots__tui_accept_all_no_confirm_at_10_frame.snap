@@ -2,7 +2,7 @@
 source: crates/lastcall/tests/test_e2e_tui_snapshots.rs
 expression: frame
 ---
-"lastcall  0 repos · 0 files · 0 hunks  [Accept All]                                       watching W"
+"lastcall  0 repos · 0 files · 0 hunks  standalone  [Accept All]                           watching W"
 "┌──────────────────────────┬───────────────────────────────────────────────────────────────────────┐"
 "│                          │nothing pending across 3 roots                                         │"
 "│                          │  alpha  main                                                          │"

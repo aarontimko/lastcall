@@ -2,7 +2,7 @@
 source: crates/lastcall/tests/test_e2e_tui_snapshots.rs
 expression: frame
 ---
-"lastcall  3 repos · 15 files · 15 hunks  [Accept All]                                     watching W"
+"lastcall  3 repos · 15 files · 15 hunks  standalone  [Accept All]                         watching W"
 "┌──────────────────────────┬───────────────────────────────────────────────────────────────────────┐"
 "│alpha                     │beta  main · 12 files                                                  │"
 "│  main · 2 files          │  A g01  +1 −0                                                         │"

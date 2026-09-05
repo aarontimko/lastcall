@@ -30,9 +30,15 @@ use crate::store::RootKind;
 
 pub const SCHEMA_VERSION: &str = "1.0";
 
-/// Lock retry policy: 20 × 50 ms, then the operation errors — never write unlocked.
-const LOCK_RETRIES: u32 = 20;
-const LOCK_BACKOFF: Duration = Duration::from_millis(50);
+/// Lock retry policy: 40 × 50 ms = 2 s, then the operation errors — never write unlocked.
+///
+/// Doubled from 20 in Phase 5 (deliverable 2b): workspace scoping makes one lastcall process
+/// per pane the normal setup, so a second process holding this root's lock through a
+/// `read → merge → write tmp → rename` is routine rather than a collision, and 1 s was thin
+/// for that on a cold state dir. Above 2 s an accept stops feeling like a keystroke, so the
+/// budget stops there and `LockBusy` becomes the `ledger busy in <root> — try again` line.
+pub const LOCK_RETRIES: u32 = 40;
+pub const LOCK_BACKOFF: Duration = Duration::from_millis(50);
 
 // ---------------------------------------------------------------------------------------
 // Clock
@@ -412,7 +418,8 @@ pub struct LedgerLock {
 }
 
 impl LedgerLock {
-    /// Bounded retry (20 × 50 ms); after that the operation errors — never write unlocked.
+    /// Bounded retry (40 × 50 ms = 2 s); after that the operation errors — never write
+    /// unlocked. See [`LOCK_RETRIES`] for why the budget is what it is.
     pub fn acquire(paths: &RepoPaths) -> Result<Self, LedgerError> {
         Self::acquire_with(paths, LOCK_RETRIES, LOCK_BACKOFF)
     }
@@ -739,11 +746,14 @@ mod tests {
         let dir = TempDir::new("lc-lock");
         let paths = RepoPaths::under(dir.join("repo"));
         let held = LedgerLock::acquire(&paths).unwrap();
-        let err = LedgerLock::acquire_with(&paths, 2, Duration::from_millis(1)).unwrap_err();
+        let err = LedgerLock::acquire_with(&paths, 2, Duration::from_millis(10)).unwrap_err();
         assert!(
             matches!(err, LedgerError::LockBusy { retries: 2, .. }),
             "{err}"
         );
+        // The shipping budget (Phase 5 deliverable 2b): 2 s, not the 1 s of Phase 4.
+        assert_eq!(LOCK_RETRIES, 40);
+        assert_eq!(LOCK_BACKOFF * LOCK_RETRIES, Duration::from_secs(2));
         drop(held);
         // Bounded retry, not a single attempt: a sibling test may be between fork and
         // exec of a git child at this instant, and the child still shares the flock'd

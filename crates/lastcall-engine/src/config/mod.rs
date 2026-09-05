@@ -139,7 +139,9 @@ pub enum DraftInitial {
 }
 
 /// The `[herdr]` table.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+///
+/// No `derive(Default)`: `toast` defaults to `true`, which a derive cannot express.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)] // required on config types; see `Config`
 pub struct HerdrConfig {
     /// `auto | on | off`, default `auto`.
@@ -147,6 +149,21 @@ pub struct HerdrConfig {
     /// Optional named-session pin (§6.6).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
+    /// Ask herdr to show a desktop notification when a repo first goes ready. Default `true`.
+    pub toast: bool,
+    /// Which repos the herdr overlay covers, `workspace | all`. Default `workspace`.
+    pub scope: HerdrScope,
+}
+
+impl Default for HerdrConfig {
+    fn default() -> Self {
+        Self {
+            mode: HerdrMode::default(),
+            session: None,
+            toast: true,
+            scope: HerdrScope::default(),
+        }
+    }
 }
 
 /// `herdr.mode`.
@@ -157,6 +174,17 @@ pub enum HerdrMode {
     Auto,
     On,
     Off,
+}
+
+/// `herdr.scope`: which repos the overlay covers when a workspace can be identified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum HerdrScope {
+    /// Only the repos of the herdr workspace this pane belongs to.
+    #[default]
+    Workspace,
+    /// Every watched repo, whatever workspace it belongs to.
+    All,
 }
 
 /// Where the effective config came from.
@@ -543,6 +571,29 @@ nav_down = ["down", "j", "ctrl-n"]
             "{err}"
         );
         assert!(err.to_string().contains("socket"), "{err}");
+    }
+
+    /// Phase 5 rulings 1 and 5: the two new keys are optional, and their defaults are the
+    /// ones the rulings name — a `[herdr]` table that mentions neither still toasts and
+    /// still starts scoped to the workspace.
+    #[test]
+    fn config_herdr_toast_and_scope_default_on_and_parse() {
+        let dir = TempDir::new("lc-config");
+        let (env, _) = env_with_config(&dir, "[herdr]\nmode = \"on\"\n");
+        let herdr = load(&env).unwrap().config.herdr;
+        assert!(herdr.toast, "toast defaults on (ruling 5)");
+        assert_eq!(herdr.scope, HerdrScope::Workspace, "ruling 1");
+
+        let (env, _) = env_with_config(&dir, "[herdr]\ntoast = false\nscope = \"all\"\n");
+        let herdr = load(&env).unwrap().config.herdr;
+        assert!(!herdr.toast);
+        assert_eq!(herdr.scope, HerdrScope::All);
+
+        let (env, _) = env_with_config(&dir, "[herdr]\nscope = \"workspaces\"\n");
+        assert!(
+            matches!(load(&env).unwrap_err(), ConfigError::Parse { .. }),
+            "a near-miss spelling is an error, not a silent default"
+        );
     }
 
     #[test]

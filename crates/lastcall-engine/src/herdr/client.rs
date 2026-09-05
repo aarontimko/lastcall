@@ -99,7 +99,8 @@ pub enum HerdrEvent {
     Disconnected { reason: String },
     /// Protocol mismatch or no server: running standalone.
     Standalone { notice: String },
-    /// Every lifecycle event, verbatim (for `hello-herdr`; never truth).
+    /// Every lifecycle event, verbatim (for `hello-herdr`; never truth) — except a
+    /// title-only `pane_updated`, which is dropped at the client (§11).
     Lifecycle(Box<Event>),
     /// A resync ran against the named authority.
     Resync(ResyncTarget),
@@ -989,6 +990,32 @@ impl<T: Transport> Actor<T> {
     /// Rule 2: events schedule work; they do not mutate cached truth. Returns false if the
     /// consumer is gone.
     async fn handle_lifecycle(&mut self, event: Event) -> bool {
+        // §11: a `pane_updated` that only renamed the pane is churn — a shell writes its title
+        // on every prompt, and both a resync and a relayed event per keystroke would keep a
+        // whole session busy for nothing. The new titles are folded into the cache so a reader
+        // is never looking at a stale one, and the event stops here — ahead of the verbatim
+        // relay, so it costs one map write. `agent_status` is not among the copied fields, so
+        // rule 2 and §5.6 are untouched: any real delta falls through to the match below.
+        let event = match event {
+            Event::PaneUpdated { pane }
+                if self
+                    .cache
+                    .as_ref()
+                    .and_then(|c| c.panes.get(&pane.pane_id))
+                    .is_some_and(|r| !r.provisional && r.info.differs_only_cosmetically(&pane)) =>
+            {
+                if let Some(record) = self
+                    .cache
+                    .as_mut()
+                    .and_then(|c| c.panes.get_mut(&pane.pane_id))
+                {
+                    record.info = pane;
+                }
+                self.publish();
+                return true;
+            }
+            other => other,
+        };
         if !self
             .emit(HerdrEvent::Lifecycle(Box::new(event.clone())))
             .await
@@ -1110,9 +1137,13 @@ impl<T: Transport> Actor<T> {
                 }
                 self.schedule_snapshot();
             }
-            // `pane_updated` never writes the cache: its agent_status can be older than a
-            // completed resync (§5.6). A dotted status event on the *lifecycle* stream is not a
-            // per-pane stream event either; both are just hints.
+            // §11: a `pane_updated` that only renamed the pane is churn — a shell writes its
+            // title on every prompt, and a resync each time would keep a whole session busy.
+            // The titles are folded into the cache so a later reader is not looking at a stale
+            // one; `agent_status` is not among the fields copied, so §5.6 still holds.
+            // A `pane_updated` that got this far never writes the cache: its agent_status can
+            // be older than a completed resync (§5.6). A dotted status event on the *lifecycle*
+            // stream is not a per-pane stream event either; both are just hints.
             Event::PaneUpdated { .. }
             | Event::PaneMoved { .. }
             | Event::WorkspaceCreated { .. }
@@ -2235,6 +2266,76 @@ mod tests {
             handle.snapshot().unwrap().panes[P1].info.revision,
             fixture_revision,
             "snapshot's PaneInfo, not the event's"
+        );
+        handle.shutdown().await;
+    }
+
+    /// §11: a terminal renaming its own pane must not cost a snapshot. The new titles land
+    /// in the cache; nothing reaches the consumer and nothing is scheduled. A real delta
+    /// beside the title (here the cwd) still resyncs, so the exemption cannot swallow an
+    /// agent moving between repos.
+    #[tokio::test(start_paused = true)]
+    async fn client_ignores_title_only_pane_updated() {
+        let mock = builder().in_memory();
+        let (handle, mut rx, _) = boot(&mock).await;
+        let cached = handle.snapshot().unwrap().panes[P1].info.clone();
+        let snapshots = || {
+            mock.requests()
+                .iter()
+                .filter(|r| r.method == wire::method::SESSION_SNAPSHOT)
+                .count()
+        };
+        let snapshots_before = snapshots();
+
+        for (n, title) in ["~/dev/git/lastcall — zsh", "~/dev/git/lastcall — vim"]
+            .into_iter()
+            .enumerate()
+        {
+            let mut pane = serde_json::to_value(&cached).unwrap();
+            pane["title"] = json!(title);
+            pane["terminal_title"] = json!(title);
+            pane["revision"] = json!(cached.revision + 1 + n as u64);
+            mock.push_lifecycle(
+                json!({"event": "pane_updated", "data": {"type": "pane_updated", "pane": pane}})
+                    .to_string(),
+            );
+        }
+        settle().await;
+        advance(timings().coalesce * 2).await;
+        let events = drain(&mut rx);
+        assert!(events.is_empty(), "a rename is not news: {events:?}");
+        assert_eq!(
+            snapshots(),
+            snapshots_before,
+            "two title-only events, zero snapshots"
+        );
+        let after = handle.snapshot().unwrap();
+        assert_eq!(
+            after.panes[P1].info.title.as_deref(),
+            Some("~/dev/git/lastcall — vim"),
+            "the cache carries the latest title"
+        );
+        assert_eq!(after.panes[P1].info.revision, cached.revision + 2);
+        assert_eq!(after.status_of(P1), Some(&AgentStatus::Working));
+
+        // The same payload with one more field changed is an ordinary `pane_updated` again.
+        let mut moved = serde_json::to_value(&cached).unwrap();
+        moved["title"] = json!("~/dev/git/other — zsh");
+        moved["cwd"] = json!("/Users/demo/dev/git/other");
+        mock.push_lifecycle(
+            json!({"event": "pane_updated", "data": {"type": "pane_updated", "pane": moved}})
+                .to_string(),
+        );
+        settle().await;
+        advance(timings().coalesce).await;
+        let events = drain(&mut rx);
+        assert_eq!(lifecycle_names(&events), vec!["pane_updated".to_string()]);
+        assert_eq!(resyncs(&events), vec![ResyncTarget::Snapshot]);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, HerdrEvent::PaneAssociation { pane_id, .. } if pane_id == P1)),
+            "{events:?}"
         );
         handle.shutdown().await;
     }

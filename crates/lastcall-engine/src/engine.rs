@@ -18,7 +18,7 @@ use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 
 use crate::config::{Config, DraftInitial, Loaded, Resolved};
 use crate::env::Env;
-use crate::git::{self, GitError, Oid, RepoGit};
+use crate::git::{self, ConfigList, GitError, Oid, RepoGit};
 use crate::headstate::{self, HeadState, TransitionFacts};
 use crate::hunks::Hunk;
 use crate::index::{IndexError, PrivateIndex};
@@ -29,7 +29,7 @@ use crate::ops::{FaultInjector, NoFault, Ops, OpsError, Outcome, Rendered};
 use crate::paths::{Layout, ParentId, ParentMeta, RepoPaths, RootId};
 use crate::roots::{self, Badge, DiscoverInputs, Discovery, RootsChanged};
 use crate::scan::{self, Pile, ScanError, ScanInputs};
-use crate::store::{RootKind, Store, StoreError};
+use crate::store::{RepoFacts, RootKind, Store, StoreError};
 use crate::upstream::{self, Classifier};
 
 /// The oldest git the engine accepts (`--path-format=absolute`, `ls-files --others -z`
@@ -75,6 +75,21 @@ fn io_err(path: &Path, source: std::io::Error) -> EngineError {
 /// paths (kickoff ruling; not a config key).
 pub const DEFAULT_ROW_CAP: usize = 10_000;
 
+/// The ceiling on [`EngineOptions::parallelism`]. Every root's work is a git subprocess,
+/// so the useful width is the machine's, and past a handful of concurrent `git` children
+/// the disk, not the CPU, is the limit. There is deliberately no config key for it
+/// (Phase 5 ruling): the binary's `LASTCALL_PARALLELISM` override exists for the golden
+/// test, not for users.
+pub const MAX_PARALLELISM: usize = 8;
+
+/// `min(available_parallelism(), MAX_PARALLELISM)`, floor 1.
+pub fn default_parallelism() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .clamp(1, MAX_PARALLELISM)
+}
+
 /// Injectable knobs.
 #[derive(Clone)]
 pub struct EngineOptions {
@@ -84,6 +99,10 @@ pub struct EngineOptions {
     /// Rows materialised per scan beyond the priority set (override paths); further
     /// changed paths are counted in [`Pile::omitted`] with a notice, never hashed.
     pub row_cap: usize,
+    /// How many roots are opened, and scanned, at once. 1 runs everything inline on the
+    /// calling thread — no thread is spawned at all — and the resulting state must be
+    /// identical at every value (`engine_parallel_open_and_scan_match_the_sequential_run_exactly`).
+    pub parallelism: usize,
 }
 
 impl Default for EngineOptions {
@@ -92,6 +111,7 @@ impl Default for EngineOptions {
             compaction_threshold: 500,
             clock: Arc::new(SystemClock),
             row_cap: DEFAULT_ROW_CAP,
+            parallelism: default_parallelism(),
         }
     }
 }
@@ -101,8 +121,63 @@ impl std::fmt::Debug for EngineOptions {
         f.debug_struct("EngineOptions")
             .field("compaction_threshold", &self.compaction_threshold)
             .field("row_cap", &self.row_cap)
+            .field("parallelism", &self.parallelism)
             .finish_non_exhaustive()
     }
+}
+
+/// Run `job` over `items` on at most `width` threads and return the results **in the order
+/// of `items`** — never in completion order, so nothing downstream can depend on which
+/// worker finished first.
+///
+/// `width <= 1` (or a single item) runs inline on the calling thread with no thread spawned
+/// at all: the sequential path is then literally the same code, which is what makes
+/// "identical state at parallelism 1 and 8" a claim about the *work*, not about two
+/// implementations that have to be kept in step.
+///
+/// The only shared state is the work queue and the result slots; each item is handed to
+/// exactly one worker, which owns it for the whole call, so `job` needs no lock of its own
+/// and none is held across it.
+fn parallel_map<I, T, F>(items: Vec<I>, width: usize, job: F) -> Vec<T>
+where
+    I: Send,
+    T: Send,
+    F: Fn(I) -> T + Sync,
+{
+    let n = items.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let width = width.clamp(1, MAX_PARALLELISM).min(n);
+    if width == 1 {
+        return items.into_iter().map(job).collect();
+    }
+    // Reversed so `pop` hands out index 0 first: a run that is *effectively* sequential
+    // (one slow root, the rest trivial) still starts in path order.
+    let queue: Vec<(usize, I)> = items.into_iter().enumerate().rev().collect();
+    let queue = std::sync::Mutex::new(queue);
+    let slots: std::sync::Mutex<Vec<Option<T>>> =
+        std::sync::Mutex::new((0..n).map(|_| None).collect());
+    let job = &job;
+    let queue = &queue;
+    let slots = &slots;
+    std::thread::scope(|scope| {
+        for _ in 0..width {
+            scope.spawn(move || {
+                loop {
+                    let next = queue.lock().unwrap_or_else(|e| e.into_inner()).pop();
+                    let Some((i, item)) = next else { break };
+                    let value = job(item);
+                    slots.lock().unwrap_or_else(|e| e.into_inner())[i] = Some(value);
+                }
+            });
+        }
+    });
+    let slots = std::mem::take(&mut *slots.lock().unwrap_or_else(|e| e.into_inner()));
+    slots
+        .into_iter()
+        .map(|s| s.expect("every index is filled before the scope ends"))
+        .collect()
 }
 
 /// Everything the engine holds for one root.
@@ -248,6 +323,20 @@ pub struct Engine {
     scan_seq: u64,
 }
 
+/// Take this process's temp index in every root it opened (Phase 5 deliverable 2a).
+///
+/// Each scan already unlinks it the moment it is done with it, so this only matters when a
+/// scan died between the `read-tree` and the `write-tree` - but a long-lived TUI over many
+/// roots would otherwise leave one such file per root behind until the hour-old sweep at the
+/// next open, and the sweep is the fallback for a *killed* process, not for a clean quit.
+impl Drop for Engine {
+    fn drop(&mut self) {
+        for state in self.roots.values() {
+            let _ = std::fs::remove_file(&state.paths.index_tmp);
+        }
+    }
+}
+
 impl Engine {
     /// Open the engine: check git, prepare the state dir, discover roots, open ledgers.
     pub fn open(
@@ -389,8 +478,29 @@ impl Engine {
             .filter(|r| !self.roots.contains_key(&r.path))
             .cloned()
             .collect();
-        for d in to_open {
-            match self.open_root(&d) {
+        // Each parent's `meta.json` is written **before** the pool starts: it is the one
+        // piece of shared state an open touches, so writing it serially is what keeps the
+        // pool free of any lock of its own (deliverable 1a).
+        // A root whose parent `meta.json` cannot be written is not opened at all — one
+        // "cannot open" notice, and the root stays out of `roots` (as `open_root` did
+        // before the pool existed), rather than a notice for a root that is then open.
+        let mut to_open = to_open;
+        to_open.retain(|d| match self.ensure_parent_meta(&d.parent) {
+            Ok(()) => true,
+            Err(e) => {
+                self.notices
+                    .push(format!("{}: cannot open: {e}", d.path.display()));
+                false
+            }
+        });
+        // Opened on up to `parallelism` threads; applied here, serially, in path order, so
+        // the resulting state does not depend on which root finished first.
+        let ctx = self.open_ctx();
+        let opened = parallel_map(to_open.iter().collect(), self.options.parallelism, |d| {
+            open_root_with(&ctx, d)
+        });
+        for (d, state) in to_open.iter().zip(opened) {
+            match state {
                 Ok(state) => {
                     self.roots.insert(d.path.clone(), state);
                 }
@@ -414,242 +524,326 @@ impl Engine {
         Ok(changed)
     }
 
-    fn open_root(&self, d: &roots::DiscoveredRoot) -> Result<RootState, EngineError> {
-        let parent_id = ParentId::of(&d.parent);
-        let root_id = RootId::of(&d.path);
-        let paths = self.layout.repo_paths(&parent_id, &root_id);
-        std::fs::create_dir_all(&paths.repo_dir).map_err(|e| io_err(&paths.repo_dir, e))?;
-        let meta = self.layout.meta_path(&parent_id);
-        if !meta.exists() {
-            let m = ParentMeta {
-                schema_version: ledger::SCHEMA_VERSION.to_string(),
-                parent: d.parent.to_string_lossy().into_owned(),
-                created_at: self.options.clock.now_iso8601(),
-            };
-            let text = serde_json::to_string_pretty(&m).unwrap_or_default();
-            std::fs::write(&meta, text).map_err(|e| io_err(&meta, e))?;
+    /// Write `<parent>/meta.json` if it is not there yet. Serial, before the open pool.
+    fn ensure_parent_meta(&self, parent: &Path) -> Result<(), EngineError> {
+        let meta = self.layout.meta_path(&ParentId::of(parent));
+        if meta.exists() {
+            return Ok(());
         }
-        let repo = (d.kind == RootKind::Git).then(|| RepoGit::new(&self.env, &d.path));
-        let (store, mut notices) = Store::open(&self.env, &d.path, d.kind, &paths, repo.as_ref())?;
-        let exclude_from = repo
-            .as_ref()
-            .and_then(|rg| rg.git_path("info/exclude").ok());
-        let index = PrivateIndex::new(store.git().clone(), &paths, d.kind, exclude_from);
-        let head = match &repo {
-            Some(rg) => headstate::inspect(rg)?,
-            None => HeadState::none(),
+        // The parent's directory used to be created as a side effect of the first root's
+        // `repo_dir`; the meta write now runs before any of that (deliverable 1a).
+        if let Some(dir) = meta.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| io_err(dir, e))?;
+        }
+        let m = ParentMeta {
+            schema_version: ledger::SCHEMA_VERSION.to_string(),
+            parent: parent.to_string_lossy().into_owned(),
+            created_at: self.options.clock.now_iso8601(),
         };
-        let user_email = repo
-            .as_ref()
-            .and_then(|rg| rg.config_get("user.email").ok().flatten())
-            .filter(|e| !e.is_empty());
-        // `config --get` is allowlisted; `remote get-url origin` (§6.7) is not, and the two
-        // differ only under `url.<base>.insteadOf` rewriting.
-        let remote = repo
-            .as_ref()
-            .and_then(|rg| rg.config_get("remote.origin.url").ok().flatten())
-            .and_then(|url| remote_slug(&url));
+        let text = serde_json::to_string_pretty(&m).unwrap_or_default();
+        std::fs::write(&meta, text).map_err(|e| io_err(&meta, e))
+    }
 
-        // A `ledger.json.tmp` left by a crash between write and rename (E1) is garbage:
-        // the rename never happened, so `ledger.json` is still the previous version. A
-        // live writer holds the lock between its write and rename, so the tmp is judged
-        // under the lock: once we hold it, any tmp still there is stale.
-        let stale_tmp = paths.ledger.with_extension("json.tmp");
+    fn open_ctx(&self) -> OpenCtx<'_> {
+        OpenCtx {
+            env: &self.env,
+            layout: &self.layout,
+            clock: self.options.clock.as_ref(),
+            draft_initial: self.config.draft_initial,
+        }
+    }
+
+    /// Open one root on the calling thread — what the pool does per item, without the
+    /// pool. The budget test measures this.
+    #[cfg(test)]
+    fn open_root(&self, d: &roots::DiscoveredRoot) -> Result<RootState, EngineError> {
+        self.ensure_parent_meta(&d.parent)?;
+        open_root_with(&self.open_ctx(), d)
+    }
+}
+
+/// Everything opening one root reads from the engine. `&OpenCtx` is what crosses into the
+/// pool — never `&Engine`, whose `roots` map the apply step mutates.
+struct OpenCtx<'a> {
+    env: &'a Env,
+    layout: &'a Layout,
+    clock: &'a (dyn Clock + Send + Sync),
+    draft_initial: DraftInitial,
+}
+
+fn open_root_with(ctx: &OpenCtx<'_>, d: &roots::DiscoveredRoot) -> Result<RootState, EngineError> {
+    let parent_id = ParentId::of(&d.parent);
+    let root_id = RootId::of(&d.path);
+    let paths = ctx.layout.repo_paths(&parent_id, &root_id);
+    std::fs::create_dir_all(&paths.repo_dir).map_err(|e| io_err(&paths.repo_dir, e))?;
+    let repo = (d.kind == RootKind::Git).then(|| RepoGit::new(ctx.env, &d.path));
+    // Two spawns of the user's repo answer everything this open needs from it
+    // (deliverable 1c): one `config --list -z`, and the head inspection's batched
+    // `rev-parse` with the three git paths folded in. A config that cannot be read is
+    // a notice and an empty reading — the same fail-open the per-key reads had.
+    let mut notices = Vec::new();
+    let repo_config = match &repo {
+        Some(rg) => match rg.config_list() {
+            Ok(c) => c,
+            Err(e) => {
+                notices.push(format!("cannot read the repository config: {e}"));
+                ConfigList::default()
+            }
+        },
+        None => ConfigList::default(),
+    };
+    const GIT_PATHS: [&str; 3] = ["objects", "info/attributes", "info/exclude"];
+    let (head, git_paths) = match &repo {
+        Some(rg) => headstate::inspect_with_paths(rg, &GIT_PATHS)?,
+        None => (HeadState::none(), Vec::new()),
+    };
+    let facts = repo.as_ref().map(|_| RepoFacts {
+        config: &repo_config,
+        objects_dir: git_paths[0].clone(),
+        info_attributes: git_paths[1].clone(),
+    });
+    let (store, store_notices) = Store::open(ctx.env, &d.path, d.kind, &paths, facts.as_ref())?;
+    notices.extend(store_notices);
+    let exclude_from = git_paths.get(2).cloned();
+    let index = PrivateIndex::new(store.git().clone(), &paths, d.kind, exclude_from);
+    let user_email = repo_config
+        .get("user.email")
+        .filter(|e| !e.is_empty())
+        .map(str::to_owned);
+    // `config --list` resolves exactly what `config --get` would; `remote get-url
+    // origin` (§6.7) is not allowlisted, and the two differ only under
+    // `url.<base>.insteadOf` rewriting.
+    let remote = repo_config
+        .get("remote.origin.url")
+        .filter(|u| !u.is_empty())
+        .and_then(remote_slug);
+
+    // A `ledger.json.tmp` left by a crash between write and rename (E1) is garbage:
+    // the rename never happened, so `ledger.json` is still the previous version. A
+    // live writer holds the lock between its write and rename, so the tmp is judged
+    // under the lock: once we hold it, any tmp still there is stale.
+    let stale_tmp = paths.ledger.with_extension("json.tmp");
+    if stale_tmp.exists() {
+        let _lock = LedgerLock::acquire(&paths)?;
         if stale_tmp.exists() {
-            let _lock = LedgerLock::acquire(&paths)?;
-            if stale_tmp.exists() {
-                let _ = std::fs::remove_file(&stale_tmp);
-                notices
-                    .push("removed a stale ledger.json.tmp from an interrupted write".to_owned());
+            let _ = std::fs::remove_file(&stale_tmp);
+            notices.push("removed a stale ledger.json.tmp from an interrupted write".to_owned());
+        }
+    }
+    let clock: &dyn Clock = ctx.clock;
+    let expected_root = d.path.to_string_lossy();
+    let first = match ledger::load(&paths, clock)? {
+        LoadResult::Loaded { ledger, .. } if ledger.root != expected_root => {
+            // A ledger recorded for another path is another root's state, however it
+            // got here (kickoff deliverable 2): exactly an unreadable ledger.
+            let moved_to = ledger::move_aside_ledger(&paths, clock)?;
+            LoadResult::Unreadable {
+                moved_to,
+                reason: format!("recorded root {} is not {expected_root}", ledger.root),
             }
         }
-        let clock: &dyn Clock = self.options.clock.as_ref();
-        let expected_root = d.path.to_string_lossy();
-        let first = match ledger::load(&paths, clock)? {
-            LoadResult::Loaded { ledger, .. } if ledger.root != expected_root => {
-                // A ledger recorded for another path is another root's state, however it
-                // got here (kickoff deliverable 2): exactly an unreadable ledger.
-                let moved_to = ledger::move_aside_ledger(&paths, clock)?;
-                LoadResult::Unreadable {
-                    moved_to,
-                    reason: format!("recorded root {} is not {expected_root}", ledger.root),
+        other => other,
+    };
+    let mut ledger = match first {
+        LoadResult::Loaded { ledger, notices: n } => {
+            notices.extend(n);
+            ledger
+        }
+        first => {
+            // Nothing usable on disk. Whatever is written now is written under the
+            // lock after a second look, so two processes opening the same never-seen
+            // root cannot clobber each other's first sight (or an accept in between),
+            // and a corrupt ledger moved aside by one of them is never mistaken for
+            // "never seen" by the other: a moved-aside sibling with no ledger beside
+            // it can only mean that, and it opens with nothing seen (over-shows).
+            let _lock = LedgerLock::acquire(&paths)?;
+            match ledger::load(&paths, clock)? {
+                LoadResult::Loaded { ledger, notices: n } => {
+                    notices.extend(n);
+                    notices.push("ledger written by another process while opening".to_owned());
+                    ledger
                 }
-            }
-            other => other,
-        };
-        let mut ledger = match first {
-            LoadResult::Loaded { ledger, notices: n } => {
-                notices.extend(n);
-                ledger
-            }
-            first => {
-                // Nothing usable on disk. Whatever is written now is written under the
-                // lock after a second look, so two processes opening the same never-seen
-                // root cannot clobber each other's first sight (or an accept in between),
-                // and a corrupt ledger moved aside by one of them is never mistaken for
-                // "never seen" by the other: a moved-aside sibling with no ledger beside
-                // it can only mean that, and it opens with nothing seen (over-shows).
-                let _lock = LedgerLock::acquire(&paths)?;
-                match ledger::load(&paths, clock)? {
-                    LoadResult::Loaded { ledger, notices: n } => {
-                        notices.extend(n);
-                        notices.push("ledger written by another process while opening".to_owned());
-                        ledger
-                    }
-                    second => {
-                        let unreadable = match (first, second) {
-                            (LoadResult::Unreadable { moved_to, reason }, _)
-                            | (_, LoadResult::Unreadable { moved_to, reason }) => {
-                                Some((moved_to, reason))
-                            }
-                            _ => ledger::moved_aside_sibling(&paths)
-                                .map(|p| (p, "moved aside by another process".to_owned())),
-                        };
-                        match unreadable {
-                            Some((moved_to, reason)) => {
+                second => {
+                    let unreadable = match (first, second) {
+                        (LoadResult::Unreadable { moved_to, reason }, _)
+                        | (_, LoadResult::Unreadable { moved_to, reason }) => {
+                            Some((moved_to, reason))
+                        }
+                        _ => ledger::moved_aside_sibling(&paths)
+                            .map(|p| (p, "moved aside by another process".to_owned())),
+                    };
+                    match unreadable {
+                        Some((moved_to, reason)) => {
+                            notices.push(format!(
+                                "ledger unreadable ({reason}); moved to {} and reopened with nothing seen",
+                                moved_to.display()
+                            ));
+                            // Persisted at once, with no `seen_at`: the next open must
+                            // find *this* ledger, not fall to first sight at the current
+                            // HEAD (which would hide everything committed since the old
+                            // ledger was last good).
+                            let l = Ledger::new(
+                                &d.path,
+                                d.kind,
+                                None,
+                                SeenAt {
+                                    head_commit: None,
+                                    branch: None,
+                                    at: clock.now_iso8601(),
+                                },
+                            );
+                            ledger::save(&paths, &l)?;
+                            l
+                        }
+                        None => {
+                            // E4: a sibling ledger whose root no longer exists is
+                            // probably this root under its old name. First-sight rules
+                            // apply; say where the old state is.
+                            for (old_root, dir) in
+                                orphaned_ledgers(&ctx.layout.repos_dir(&parent_id))
+                            {
                                 notices.push(format!(
-                                    "ledger unreadable ({reason}); moved to {} and reopened with nothing seen",
-                                    moved_to.display()
+                                    "first sight; previous state for {old_root} (no longer on disk) is kept at {}",
+                                    dir.display()
                                 ));
-                                // Persisted at once, with no `seen_at`: the next open must
-                                // find *this* ledger, not fall to first sight at the current
-                                // HEAD (which would hide everything committed since the old
-                                // ledger was last good).
-                                let l = Ledger::new(
-                                    &d.path,
-                                    d.kind,
-                                    None,
-                                    SeenAt {
-                                        head_commit: None,
-                                        branch: None,
-                                        at: clock.now_iso8601(),
-                                    },
-                                );
-                                ledger::save(&paths, &l)?;
-                                l
                             }
-                            None => {
-                                // E4: a sibling ledger whose root no longer exists is
-                                // probably this root under its old name. First-sight rules
-                                // apply; say where the old state is.
-                                for (old_root, dir) in
-                                    orphaned_ledgers(&self.layout.repos_dir(&parent_id))
-                                {
-                                    notices.push(format!(
-                                        "first sight; previous state for {old_root} (no longer on disk) is kept at {}",
-                                        dir.display()
-                                    ));
-                                }
-                                let l = first_sight(
-                                    &d.path,
-                                    d.kind,
-                                    &store,
-                                    &head,
-                                    self.config.draft_initial,
-                                    clock,
-                                )?;
-                                ledger::save(&paths, &l)?;
-                                l
-                            }
+                            let l = first_sight(
+                                &d.path,
+                                d.kind,
+                                &store,
+                                &head,
+                                ctx.draft_initial,
+                                clock,
+                            )?;
+                            ledger::save(&paths, &l)?;
+                            l
                         }
                     }
                 }
             }
-        };
-        if let Some(t) = ledger.seen_tree.clone()
-            && !store.exists(&t)
-        {
-            notices.push(format!(
-                "seen tree {t} no longer exists in the object store (git gc?); treating everything as unseen"
-            ));
-            ledger.seen_tree = None;
         }
-        let tree = match &ledger.seen_tree {
-            Some(t) => store.ls_tree(t)?,
-            None => TreeEntries::new(),
+    };
+    if let Some(t) = ledger.seen_tree.clone()
+        && !store.exists(&t)
+    {
+        notices.push(format!(
+            "seen tree {t} no longer exists in the object store (git gc?); treating everything as unseen"
+        ));
+        ledger.seen_tree = None;
+    }
+    let tree = match &ledger.seen_tree {
+        Some(t) => store.ls_tree(t)?,
+        None => TreeEntries::new(),
+    };
+    let ledger_stamp = ledger::stamp(&paths);
+    Ok(RootState {
+        path: d.path.clone(),
+        kind: d.kind,
+        parent: d.parent.clone(),
+        badge: d.badge.clone(),
+        case_insensitive: scan::probe_case_insensitive(&d.path),
+        paths,
+        store,
+        index,
+        repo,
+        ledger,
+        tree,
+        head,
+        classifier: Classifier::default(),
+        excluded_dirs: Vec::new(),
+        notices,
+        last_pile: None,
+        nested_repos: Vec::new(),
+        nested_changed: false,
+        user_email,
+        remote,
+        ledger_stamp,
+    })
+}
+
+/// What one root's scan needs from the engine that is not in its own [`RootState`]. Shared
+/// by reference across the scan pool; nothing in it is mutated there.
+struct ScanCtx {
+    collapsed: GlobSet,
+    collapse_size_bytes: u64,
+    row_cap: usize,
+}
+
+/// Scan one root, start to finish, mutating **only** that root's state: its nested-repo
+/// list, its classifier cache and its `last_pile`. This is the pool's unit of work
+/// (deliverable 1b).
+///
+/// `scan_seq` is deliberately *not* touched here. It is the engine's ordering of scans, and
+/// assigning it inside the pool would make it depend on which worker finished first; the
+/// serial apply step in [`Engine::scan_all`] hands it out in path order instead.
+fn scan_root(state: &mut RootState, ctx: &ScanCtx) -> Result<Pile, EngineError> {
+    state.reload_ledger_if_changed();
+    let out = scan::scan(&ScanInputs {
+        store: &state.store,
+        index: &state.index,
+        repo: state.repo.as_ref(),
+        ledger: &state.ledger,
+        seen_tree: state.ledger.seen_tree.as_ref(),
+        tree: &state.tree,
+        case_insensitive: state.case_insensitive,
+        collapsed_globs: &ctx.collapsed,
+        collapse_size_bytes: ctx.collapse_size_bytes,
+        excluded_dirs: &state.excluded_dirs,
+        index_tmp: &state.paths.index_tmp,
+        row_cap: ctx.row_cap,
+    })?;
+    let mut pile = out.pile;
+    if out.nested_repos != state.nested_repos {
+        state.nested_repos = out.nested_repos;
+        state.nested_changed = true;
+    }
+    if let Some(rg) = &state.repo {
+        // Classify against the *live* HEAD, not the last inspected one: a pull or
+        // rebase changes files before (or without) a git-dir event reaching
+        // `inspect_head`, and the pile must never depend on that ordering.
+        // `state.head` stays the last *reported* state so the transition notice
+        // is still emitted exactly once by `inspect_head`.
+        // Annotation is a label layer: none of its inputs failing may drop a row.
+        let seen_head = state.ledger.seen_at.head_commit.clone();
+        let skipped = match headstate::inspect(rg) {
+            Err(e) => Some(format!("head inspection skipped: {e}")),
+            Ok(live) => match state.classifier.get(
+                rg,
+                seen_head.as_ref(),
+                &live,
+                state.user_email.as_deref(),
+            ) {
+                Err(e) => Some(format!("upstream classification skipped: {e}")),
+                Ok(class) => upstream::annotate(&mut pile, class, rg)
+                    .err()
+                    .map(|e| format!("upstream annotation skipped: {e}")),
+            },
         };
-        let ledger_stamp = ledger::stamp(&paths);
-        Ok(RootState {
-            path: d.path.clone(),
-            kind: d.kind,
-            parent: d.parent.clone(),
-            badge: d.badge.clone(),
-            case_insensitive: scan::probe_case_insensitive(&d.path),
-            paths,
-            store,
-            index,
-            repo,
-            ledger,
-            tree,
-            head,
-            classifier: Classifier::default(),
-            excluded_dirs: Vec::new(),
-            notices,
-            last_pile: None,
-            nested_repos: Vec::new(),
-            nested_changed: false,
-            user_email,
-            remote,
-            ledger_stamp,
-        })
+        if let Some(n) = skipped {
+            pile.notices.push(n);
+        }
+    }
+    state.last_pile = Some(pile.clone());
+    Ok(pile)
+}
+
+impl Engine {
+    fn scan_ctx(&self) -> ScanCtx {
+        ScanCtx {
+            collapsed: self.collapsed.clone(),
+            collapse_size_bytes: self.config.collapse_size_bytes,
+            row_cap: self.options.row_cap,
+        }
     }
 
     /// Scan one root: candidates → rows → annotation.
     pub fn scan(&mut self, root: &Path) -> Result<Pile, EngineError> {
-        let collapsed = self.collapsed.clone();
-        let collapse_size = self.config.collapse_size_bytes;
-        let row_cap = self.options.row_cap;
+        let ctx = self.scan_ctx();
         let state = self
             .roots
             .get_mut(root)
             .ok_or_else(|| EngineError::NoSuchRoot(root.to_path_buf()))?;
-        state.reload_ledger_if_changed();
-        let out = scan::scan(&ScanInputs {
-            store: &state.store,
-            index: &state.index,
-            repo: state.repo.as_ref(),
-            ledger: &state.ledger,
-            seen_tree: state.ledger.seen_tree.as_ref(),
-            tree: &state.tree,
-            case_insensitive: state.case_insensitive,
-            collapsed_globs: &collapsed,
-            collapse_size_bytes: collapse_size,
-            excluded_dirs: &state.excluded_dirs,
-            index_tmp: &state.paths.index_tmp,
-            row_cap,
-        })?;
-        let mut pile = out.pile;
-        if out.nested_repos != state.nested_repos {
-            state.nested_repos = out.nested_repos;
-            state.nested_changed = true;
-        }
-        if let Some(rg) = &state.repo {
-            // Classify against the *live* HEAD, not the last inspected one: a pull or
-            // rebase changes files before (or without) a git-dir event reaching
-            // `inspect_head`, and the pile must never depend on that ordering.
-            // `state.head` stays the last *reported* state so the transition notice
-            // is still emitted exactly once by `inspect_head`.
-            // Annotation is a label layer: none of its inputs failing may drop a row.
-            let seen_head = state.ledger.seen_at.head_commit.clone();
-            let skipped = match headstate::inspect(rg) {
-                Err(e) => Some(format!("head inspection skipped: {e}")),
-                Ok(live) => match state.classifier.get(
-                    rg,
-                    seen_head.as_ref(),
-                    &live,
-                    state.user_email.as_deref(),
-                ) {
-                    Err(e) => Some(format!("upstream classification skipped: {e}")),
-                    Ok(class) => upstream::annotate(&mut pile, class, rg)
-                        .err()
-                        .map(|e| format!("upstream annotation skipped: {e}")),
-                },
-            };
-            if let Some(n) = skipped {
-                pile.notices.push(n);
-            }
-        }
-        state.last_pile = Some(pile.clone());
+        let pile = scan_root(state, &ctx)?;
         self.scan_seq += 1;
         Ok(pile)
     }
@@ -668,9 +862,31 @@ impl Engine {
             if todo.is_empty() {
                 break;
             }
-            for p in todo {
-                let r = self.scan(&p);
+            // Scanned on up to `parallelism` threads, each worker owning one root's state
+            // outright; then applied here, serially, in path order. `scan_seq` is handed
+            // out only in this serial step, so the numbering is the path order and never
+            // the order the workers happened to finish in.
+            let ctx = self.scan_ctx();
+            let width = self.options.parallelism;
+            let mut states: Vec<(PathBuf, &mut RootState)> = self
+                .roots
+                .iter_mut()
+                .filter(|(p, _)| todo.contains(p))
+                .map(|(p, s)| (p.clone(), s))
+                .collect();
+            states.sort_by(|a, b| a.0.as_os_str().cmp(b.0.as_os_str()));
+            let scanned = parallel_map(states, width, |(p, state)| (p, scan_root(state, &ctx)));
+            for (p, r) in scanned {
+                self.scan_seq += 1;
                 results.insert(p, (self.scan_seq, r));
+            }
+            // A root that is in `todo` but no longer in `roots` cannot happen (both come
+            // from the same map), but a missing one must still be recorded so the retry
+            // loop terminates.
+            for p in todo {
+                results
+                    .entry(p.clone())
+                    .or_insert_with(|| (self.scan_seq, Err(EngineError::NoSuchRoot(p.clone()))));
             }
             // Discovery re-runs only when a scan saw the set of nested repos change (a
             // new `dir/` in `ls-files --others`), not on every call while one exists.
@@ -804,6 +1020,7 @@ impl Engine {
             clock,
             compaction_threshold: threshold,
             staged: BTreeMap::new(),
+            lock: crate::ops::DEFAULT_LOCK,
         })
     }
 }
@@ -983,6 +1200,255 @@ pub(crate) mod tests {
         roots[0].path.clone()
     }
 
+    /// Six roots in one parent dir, so a pool has something to spread.
+    fn six_roots(state: &TempDir) -> (PathBuf, Env, Vec<FixtureRepo>, TempDir) {
+        let parent = TempDir::new("lc-many");
+        let parent_path = parent.path().to_path_buf();
+        let repos: Vec<FixtureRepo> = (0..6)
+            .map(|i| FixtureRepo::new_in(TempDir::adopt(&parent_path), &format!("r{i}")).unwrap())
+            .collect();
+        // Each root gets a different amount of unseen work, so the workers finish out of
+        // path order and a result that depended on completion order would show.
+        for (i, r) in repos.iter().enumerate() {
+            for f in 0..=i {
+                r.write(
+                    &format!("f{f}.txt"),
+                    format!("root {i} file {f}\nsecond line\n"),
+                );
+            }
+        }
+        let home = parent_path.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let env = Env::empty(&parent_path)
+            .with_home(home)
+            .with_var("GIT_CONFIG_GLOBAL", "/dev/null")
+            .with_var("GIT_CONFIG_SYSTEM", "/dev/null")
+            .with_var("GIT_CONFIG_NOSYSTEM", "1")
+            .with_var("LASTCALL_STATE_DIR", state.path().to_string_lossy());
+        // The TempDir goes back to the caller: the fixtures live under it, and dropping
+        // it at the end of the test removes all six roots in one go.
+        (
+            std::fs::canonicalize(&parent_path).unwrap(),
+            env,
+            repos,
+            parent,
+        )
+    }
+
+    fn many_root_engine(parent: &Path, env: &Env, state: &TempDir, width: usize) -> Engine {
+        let loaded = Loaded {
+            config: Config {
+                parent_dirs: vec![parent.to_path_buf()],
+                ..Config::default()
+            },
+            source: ConfigSource::Defaults { searched: vec![] },
+            state_dir: state.path().to_path_buf(),
+        };
+        let resolved = Resolved {
+            parent_dirs: vec![parent.to_path_buf()],
+            notices: vec![],
+        };
+        let options = EngineOptions {
+            parallelism: width,
+            ..EngineOptions::default()
+        };
+        Engine::open(&loaded, &resolved, env, options).unwrap()
+    }
+
+    /// Deliverable 1a/1b: the pool is a performance change and nothing else. Opening and
+    /// scanning six roots at width 1 and at width 4 must produce byte-identical state —
+    /// the same roots in the same order, the same ledgers, the same piles, and the same
+    /// `scan_seq` per root, which is only true because the serial apply step hands
+    /// `scan_seq` out in path order rather than in completion order.
+    #[test]
+    fn engine_parallel_open_and_scan_match_the_sequential_run_exactly() {
+        let state1 = TempDir::new("lc-par1");
+        let (parent, env, _repos, _dir) = six_roots(&state1);
+
+        let describe = |engine: &mut Engine| -> Vec<String> {
+            engine
+                .scan_all()
+                .into_iter()
+                .map(|(p, seq, r)| {
+                    let root = engine.root(&p).expect("scanned root is open");
+                    let rows: Vec<String> = r
+                        .as_ref()
+                        .map(|pile| {
+                            pile.rows
+                                .iter()
+                                .map(|row| {
+                                    format!(
+                                        "{} {:?}",
+                                        String::from_utf8_lossy(&row.path),
+                                        row.change
+                                    )
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_else(|e| vec![format!("ERR {e}")]);
+                    format!(
+                        "{} seq={seq} tree={:?} seen={:?} rows={rows:?}",
+                        p.file_name().unwrap().to_string_lossy(),
+                        root.ledger.seen_tree.as_ref().map(Oid::as_str),
+                        root.ledger.seen_at.head_commit.as_ref().map(Oid::as_str),
+                    )
+                })
+                .collect()
+        };
+
+        let mut serial = many_root_engine(&parent, &env, &state1, 1);
+        assert_eq!(serial.roots().len(), 6, "{:?}", serial.root_paths());
+        let a = describe(&mut serial);
+        drop(serial);
+
+        // A *fresh* state dir, so the parallel run does its own first sight too.
+        let state2 = TempDir::new("lc-par4");
+        let env2 = {
+            let mut e = env.clone();
+            e = e.with_var("LASTCALL_STATE_DIR", state2.path().to_string_lossy());
+            e
+        };
+        let mut parallel = many_root_engine(&parent, &env2, &state2, 4);
+        let b = describe(&mut parallel);
+        assert_eq!(a, b, "width 1 and width 4 disagree");
+        assert_eq!(a.len(), 6);
+        // `scan_seq` is 1..=6 in path order in both runs.
+        for (i, line) in a.iter().enumerate() {
+            assert!(line.contains(&format!("seq={}", i + 1)), "{line}");
+        }
+    }
+
+    /// A root the pool cannot open must not take the others down with it: it becomes a
+    /// notice, the rest open, and the engine is usable.
+    #[test]
+    fn engine_parallel_open_reports_an_unopenable_root_as_a_notice() {
+        let state = TempDir::new("lc-badroot");
+        let (parent, env, repos, _dir) = six_roots(&state);
+        // Make one root's state dir unusable by putting a *file* where its repo dir goes.
+        // Discovery still finds the root; only its open fails.
+        let engine = many_root_engine(&parent, &env, &state, 4);
+        let victim = repos[2].path().to_path_buf();
+        let victim = std::fs::canonicalize(&victim).unwrap();
+        let repo_dir = engine.root(&victim).unwrap().paths.repo_dir.clone();
+        drop(engine);
+        let state2 = TempDir::new("lc-badroot2");
+        let env2 = env.with_var("LASTCALL_STATE_DIR", state2.path().to_string_lossy());
+        let rel = repo_dir.strip_prefix(state.path()).unwrap().to_path_buf();
+        let blocked = state2.path().join(&rel);
+        std::fs::create_dir_all(blocked.parent().unwrap()).unwrap();
+        std::fs::write(&blocked, b"not a directory").unwrap();
+
+        let engine = many_root_engine(&parent, &env2, &state2, 4);
+        assert_eq!(engine.roots().len(), 5, "{:?}", engine.root_paths());
+        assert!(engine.root(&victim).is_none());
+        assert!(
+            engine
+                .notices()
+                .iter()
+                .any(|n| n.contains(&victim.display().to_string()) && n.contains("cannot open")),
+            "{:?}",
+            engine.notices()
+        );
+    }
+
+    /// A parent whose `meta.json` cannot be written is reported once per root and none of
+    /// its roots is opened — not a "cannot open" notice for a root that is then open, and
+    /// not two notices for one root (verifier (a) F2).
+    #[test]
+    fn engine_open_with_an_unwritable_parent_meta_opens_nothing_and_notices_once_per_root() {
+        let state = TempDir::new("lc-badmeta");
+        let (parent, env, repos, _dir) = six_roots(&state);
+        let engine = many_root_engine(&parent, &env, &state, 4);
+        let meta = {
+            let root = std::fs::canonicalize(repos[0].path()).unwrap();
+            let repo_dir = engine.root(&root).unwrap().paths.repo_dir.clone();
+            // `<parent>/repos/<id>` → the parent's dir is two levels up.
+            repo_dir.parent().unwrap().parent().unwrap().to_path_buf()
+        };
+        drop(engine);
+        let state2 = TempDir::new("lc-badmeta2");
+        let env2 = env.with_var("LASTCALL_STATE_DIR", state2.path().to_string_lossy());
+        let rel = meta.strip_prefix(state.path()).unwrap().to_path_buf();
+        let blocked = state2.path().join(&rel);
+        std::fs::create_dir_all(blocked.parent().unwrap()).unwrap();
+        std::fs::write(&blocked, b"not a directory").unwrap();
+
+        let engine = many_root_engine(&parent, &env2, &state2, 4);
+        assert!(engine.roots().is_empty(), "{:?}", engine.root_paths());
+        for repo in &repos {
+            let root = std::fs::canonicalize(repo.path()).unwrap();
+            let n = engine
+                .notices()
+                .iter()
+                .filter(|n| n.contains(&root.display().to_string()) && n.contains("cannot open"))
+                .count();
+            assert_eq!(n, 1, "{}: {:?}", root.display(), engine.notices());
+        }
+    }
+
+    /// The per-root git process budget (Phase 5 deliverable 1c). Both figures are measured
+    /// on the calling thread — `thread_spawn_count` rather than the process-wide counter,
+    /// which is a race in a test binary that runs tests in parallel.
+    ///
+    /// The budget is the point of the deliverable: if a later change reintroduces a
+    /// per-key `config --get` or a per-path `rev-parse`, these numbers move and this fails.
+    #[test]
+    fn engine_open_and_scan_stay_inside_the_per_root_git_budget() {
+        let repo = FixtureRepo::new("budget").unwrap();
+        let state = TempDir::new("lc-budget");
+        let (loaded, resolved) = loaded_for(&repo, &state, Config::default());
+        let env = fixture_env(&repo, &state);
+
+        // Discovery, then one root opened on this thread: the per-root open cost.
+        let engine = Engine::open(&loaded, &resolved, &env, EngineOptions::default()).unwrap();
+        let root = only_root(&engine);
+        let d = roots::DiscoveredRoot {
+            path: root.clone(),
+            kind: RootKind::Git,
+            parent: std::fs::canonicalize(repo.parent_dir()).unwrap(),
+            badge: None,
+        };
+        drop(engine);
+        let engine = Engine::open(&loaded, &resolved, &env, EngineOptions::default()).unwrap();
+        let before = crate::git::thread_spawn_count();
+        let opened = engine.open_root(&d).unwrap();
+        let open_spawns = crate::git::thread_spawn_count() - before;
+        drop(opened);
+        eprintln!("BUDGET open_spawns_per_root={open_spawns}");
+        assert!(
+            open_spawns <= 10,
+            "opening one root costs {open_spawns} git processes, budget 10"
+        );
+
+        // One scan of one root, on this thread, in the bench's pile shape: an edit, an
+        // add and a delete together, so rename detection runs through `index.<pid>.tmp`
+        // — the most expensive scan shape, and the one S1/S1h measure (17 per root).
+        // An add alone costs 12, an edit alone 13; the ceiling guards the worst shape.
+        let mut engine = engine;
+        engine.scan(&root).unwrap();
+        repo.write("f1", "a1\nchanged\na3\na4\na5\na6\na7\na8\na9\na10\n");
+        repo.write("budget.txt", "one\ntwo\nthree\n");
+        repo.remove("f3");
+        let before = crate::git::thread_spawn_count();
+        let pile = engine.scan(&root).unwrap();
+        let scan_spawns = crate::git::thread_spawn_count() - before;
+        eprintln!(
+            "BUDGET scan_spawns_per_root={scan_spawns} rows={}",
+            pile.rows.len()
+        );
+        assert_eq!(pile.rows.len(), 3, "edit, add and delete are three rows");
+        // Measured, not aspirational. This shape is 17 today (read-tree seeding aside:
+        // one `update-index --refresh`, `diff-files`, three `ls-files`, the four-spawn
+        // head inspection, two `for-each-ref refs/remotes`, `hash-object --stdin-paths`,
+        // `cat-file --batch`, and rename detection's passes over the temp index). 1c
+        // reduces the *open*; the scan pipeline is not batchable without a redesign
+        // (see docs/dev/bench.md). The ceiling catches a regression.
+        assert!(
+            scan_spawns <= 18,
+            "scanning one root costs {scan_spawns} git processes, budget 18"
+        );
+    }
+
     #[test]
     fn engine_open_first_sight_scan_and_stable_status() {
         let repo = FixtureRepo::new("eng").unwrap();
@@ -1115,6 +1581,182 @@ pub(crate) mod tests {
             acc.pile,
             "the returned pile is the rescan"
         );
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Several lastcall processes over one state dir (Phase 5 deliverable 2)
+    // -----------------------------------------------------------------------------------
+
+    /// Two engines over one root — two lastcall processes, as workspace scoping makes
+    /// normal — accept a different file each, neither having seen the other's write. Both
+    /// accepts must survive: `Ops::commit` re-reads the ledger under the lock and replays
+    /// its staged change onto it, so the second write is a merge and not a clobber.
+    #[test]
+    fn engine_two_engines_over_one_root_keep_both_accepts() {
+        let repo = FixtureRepo::new("eng-two").unwrap();
+        let state = TempDir::new("lc-eng-two");
+        repo.write("f1", "one edited\n");
+        repo.write("f2", "two edited\n");
+        let mut a = open_engine(&repo, &state, Config::default());
+        let mut b = open_engine(&repo, &state, Config::default());
+        let root = only_root(&a);
+        assert_eq!(only_root(&b), root, "the same root, the same state dir");
+
+        // Both scan first, so each holds the *pre-accept* ledger in memory: a commit that
+        // wrote its own in-memory copy would drop whichever accept landed first.
+        let (r1, _) = rendered_row(&mut a, &root, b"f1");
+        let (r2, _) = rendered_row(&mut b, &root, b"f2");
+        assert!(
+            a.accept(&root, AcceptRequest::File(r1))
+                .unwrap()
+                .outcome
+                .ok()
+        );
+        let acc = b.accept(&root, AcceptRequest::File(r2)).unwrap();
+        assert!(acc.outcome.ok());
+
+        // On disk, and after a third process opens the root cold.
+        let c = open_engine(&repo, &state, Config::default());
+        let overrides = &c.root(&root).unwrap().ledger.overrides;
+        assert!(
+            overrides.contains_key("f1"),
+            "engine A's accept survived: {overrides:?}"
+        );
+        assert!(
+            overrides.contains_key("f2"),
+            "engine B's accept survived: {overrides:?}"
+        );
+        assert!(
+            acc.pile.row(b"f1").is_none() && acc.pile.row(b"f2").is_none(),
+            "neither is pending any more: {:?}",
+            acc.pile.rows
+        );
+    }
+
+    /// A lock the test holds makes an accept fail with `LockBusy` — an `Err` off the
+    /// `Local::Accepted` path, never a `Refused` (a `Refused` carries a row path and renders
+    /// per row; this is a whole-root condition and belongs on the status line). Short
+    /// budget, so the test waits 20 ms rather than the shipping 2 s.
+    #[test]
+    fn engine_accept_under_a_held_ledger_lock_is_lock_busy_not_a_refusal() {
+        let repo = FixtureRepo::new("eng-busy").unwrap();
+        let state = TempDir::new("lc-eng-busy");
+        repo.write("f1", "edited\n");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let root = only_root(&engine);
+        let (rendered, _) = rendered_row(&mut engine, &root, b"f1");
+        let paths = engine.root(&root).unwrap().paths.clone();
+        let held = ledger::LedgerLock::acquire(&paths).unwrap();
+
+        let err = {
+            let mut ops = engine.ops(&root).unwrap();
+            ops.lock = (2, Duration::from_millis(10));
+            ops.accept_file(&rendered, &NoFault).unwrap_err()
+        };
+        assert!(
+            matches!(
+                &err,
+                OpsError::Ledger(ledger::LedgerError::LockBusy { retries: 2, path })
+                    if *path == paths.lock
+            ),
+            "{err:?}"
+        );
+        // The shipping budget is the doubled one, and the accept path really uses it.
+        assert_eq!(ledger::LOCK_RETRIES, 40);
+        assert_eq!(crate::ops::DEFAULT_LOCK, (40, Duration::from_millis(50)));
+        // What the engine hands the TUI is an `Err` carrying the lock path, and the TUI
+        // turns it into the `ledger busy in <root> — try again` status line.
+        let surfaced = EngineError::from(err);
+        assert!(
+            matches!(
+                surfaced,
+                EngineError::Ops(OpsError::Ledger(ledger::LedgerError::LockBusy { .. }))
+            ),
+            "{surfaced:?}"
+        );
+        assert_eq!(
+            surfaced.to_string(),
+            format!("could not take {} after 2 tries", paths.lock.display())
+        );
+
+        // Nothing reached the disk: the lock is taken before the merge and the tmp write.
+        let on_disk =
+            String::from_utf8_lossy(&std::fs::read(&paths.ledger).unwrap_or_default()).into_owned();
+        assert!(
+            !on_disk.contains("\"f1\""),
+            "nothing written unlocked: {on_disk}"
+        );
+        // The engine's own copy *is* dirty — the op staged the override before it tried to
+        // commit — and `Engine::accept_with` is what repairs it after an `Err`, by dropping
+        // the stamp and re-reading the ledger the disk still has. Same two lines here.
+        drop(held);
+        let state = engine.roots.get_mut(&root).unwrap();
+        state.ledger_stamp = None;
+        state.reload_ledger_if_changed();
+        assert!(
+            state.ledger.overrides.is_empty(),
+            "the staged accept is gone: {:?}",
+            state.ledger.overrides
+        );
+        assert!(
+            engine.scan(&root).unwrap().row(b"f1").is_some(),
+            "still pending"
+        );
+    }
+
+    /// Two engines scan one root at the same time. They share the persistent private index
+    /// (`<store>/index`, `index.tree`) on purpose — deliverable 2d keeps it shared — so this
+    /// is the test that the sharing holds: `PrivateIndex::refresh`'s retry absorbs git's own
+    /// `index.lock` and the two piles agree. A scan is read-only about the ledger, so
+    /// agreement is the whole assertion. Both engines live in this one process, so they
+    /// share `index.<pid>.tmp` too (it is per process, not per engine); the fixture is
+    /// adds only, so rename detection never touches the temp index here and the shared
+    /// path is not contended — two *processes* are what production has, and each gets
+    /// its own temp index by pid.
+    #[test]
+    fn engine_two_engines_scan_one_root_concurrently_and_agree() {
+        let repo = FixtureRepo::new("eng-conc").unwrap();
+        let state = TempDir::new("lc-eng-conc");
+        for i in 0..12 {
+            repo.write(&format!("c{i}.txt"), format!("edited {i}\nsecond\n"));
+        }
+        let mut a = open_engine(&repo, &state, Config::default());
+        let mut b = open_engine(&repo, &state, Config::default());
+        let root = only_root(&a);
+        assert_ne!(
+            a.root(&root).unwrap().paths.index_tmp,
+            PathBuf::from("index.tmp"),
+            "the temp index is per-process"
+        );
+
+        let (pa, pb) = std::thread::scope(|s| {
+            let root_a = root.clone();
+            let root_b = root.clone();
+            let ha = s.spawn(move || {
+                let mut out = Vec::new();
+                for _ in 0..4 {
+                    out.push(a.scan(&root_a).unwrap());
+                }
+                out
+            });
+            let hb = s.spawn(move || {
+                let mut out = Vec::new();
+                for _ in 0..4 {
+                    out.push(b.scan(&root_b).unwrap());
+                }
+                out
+            });
+            (ha.join().unwrap(), hb.join().unwrap())
+        });
+
+        // Every scan on both sides saw the same 12 rows: no retry exhaustion, no half-index.
+        for (i, pile) in pa.iter().chain(pb.iter()).enumerate() {
+            assert_eq!(pile.rows.len(), 12, "scan {i}: {:?}", pile.rows);
+            assert_eq!(
+                pile.rows, pa[0].rows,
+                "scan {i} disagrees with the first scan"
+            );
+        }
     }
 
     #[test]

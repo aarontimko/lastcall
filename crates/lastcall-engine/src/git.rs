@@ -20,6 +20,7 @@
 //! or an agent shell that exports them can never redirect the store or the inspection.
 //! Paths are bytes end to end; every path-producing command runs with `-z`.
 
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -63,9 +64,21 @@ pub const NEUTRALIZED_CONFIG: &[(&str, &str)] = &[
 /// and `tests/test_perf_scan.rs`; never a product input).
 static SPAWNS: AtomicU64 = AtomicU64::new(0);
 
+thread_local! {
+    /// The same count for *this thread only*. The process-wide figure is a race in any
+    /// test binary that runs tests in parallel, and one root's open or scan happens on one
+    /// thread (including inside the bounded pool), so this is the per-root budget probe.
+    static THREAD_SPAWNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// How many git processes this process has spawned so far.
 pub fn spawn_count() -> u64 {
     SPAWNS.load(Ordering::Relaxed)
+}
+
+/// How many git processes the **calling thread** has spawned so far.
+pub fn thread_spawn_count() -> u64 {
+    THREAD_SPAWNS.with(std::cell::Cell::get)
 }
 
 /// The minimum git version every plumbing flag we use exists in (`--path-format=absolute`
@@ -240,6 +253,7 @@ fn run_command(
 ) -> Result<GitOutput, GitError> {
     use std::io::Write;
     SPAWNS.fetch_add(1, Ordering::Relaxed);
+    THREAD_SPAWNS.with(|c| c.set(c.get() + 1));
     let cwd = cmd
         .get_current_dir()
         .map(Path::to_path_buf)
@@ -458,6 +472,20 @@ impl StoreGit {
         run_command(self.command(index.unwrap_or(&self.index)), &argv, stdin)
     }
 
+    /// One `config --list -z --local` of the store's own config file.
+    ///
+    /// `--local` and not plain `--list`: [`base_command`] pins [`NEUTRALIZED_CONFIG`] with
+    /// `-c` on every child, and a plain `--list` would report those command-line values as
+    /// present and make the store's config writes look unnecessary — the store's file must
+    /// carry them so that a `git` run by hand against it is neutralised too.
+    pub fn config_list_local(&self) -> ConfigList {
+        match self.run_raw(None, &["config", "--list", "-z", "--local"], None) {
+            // Exit 1 with no output is "the file has no entries", not a failure.
+            Ok(out) => ConfigList::parse(&out.stdout),
+            Err(_) => ConfigList::default(),
+        }
+    }
+
     /// `git init -q --bare` at `store` (an associated function: there is no store yet).
     pub fn init_bare(env: &Env, store: &Path) -> Result<(), GitError> {
         let cwd = store
@@ -474,6 +502,88 @@ impl StoreGit {
         ];
         let out = run_command(base_command(env, &cwd), &args, None)?;
         require_success(out, &args, &cwd).map(|_| ())
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// config --list -z
+// ---------------------------------------------------------------------------------------
+
+/// One `git config --list -z` reading: every effective key, resolved by git itself.
+///
+/// The `-z` framing is `key\nvalue\0` per record, and `key\0` (no `\n` at all) for a
+/// valueless key — the `[section] key` form, which `--get` answers with an empty line. A
+/// value may therefore contain `=` **and** newlines, so records are split on NUL and the
+/// key ends at the *first* `\n`, never at an `=`. A repeated key is multi-valued and the
+/// **last** occurrence wins, exactly as `config --get` reports it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConfigList {
+    entries: BTreeMap<String, String>,
+}
+
+impl ConfigList {
+    /// Parse `--list -z` output. Records whose key is not UTF-8 are skipped (no key we
+    /// consume can be non-UTF-8; a value that is not UTF-8 is kept lossily, as `--get`
+    /// would reach us through `stdout_trimmed`).
+    pub fn parse(bytes: &[u8]) -> Self {
+        let mut entries = BTreeMap::new();
+        for rec in split_nul(bytes) {
+            let (key, value) = match rec.iter().position(|b| *b == b'\n') {
+                Some(nl) => (&rec[..nl], &rec[nl + 1..]),
+                // A valueless key: `--get` prints an empty line for it, so it reads back
+                // as the empty string rather than as absent.
+                None => (rec, &b""[..]),
+            };
+            let Ok(key) = std::str::from_utf8(key) else {
+                continue;
+            };
+            // Last wins, like `--get` over a multi-valued key.
+            entries.insert(
+                normalize_config_key(key),
+                String::from_utf8_lossy(value).into_owned(),
+            );
+        }
+        Self { entries }
+    }
+
+    /// The value `config --get <key>` would print, trimmed the same way.
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.entries
+            .get(&normalize_config_key(key))
+            .map(|v| v.trim())
+    }
+
+    /// The value with no trimming (the parser's own view; tests and `=`/newline cases).
+    pub fn raw(&self, key: &str) -> Option<&str> {
+        self.entries
+            .get(&normalize_config_key(key))
+            .map(String::as_str)
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// git's own key comparison: the **section** and the **variable** are case-insensitive, the
+/// subsection between them is case-sensitive. `--list` prints keys with section and
+/// variable already lowercased, so a lookup for `core.untrackedCache` — the spelling the
+/// code and `NEUTRALIZED_CONFIG` use — must be folded the same way or it silently misses
+/// and the caller rewrites a key that is already set.
+fn normalize_config_key(key: &str) -> String {
+    match (key.find('.'), key.rfind('.')) {
+        // section.subsection…​.variable
+        (Some(first), Some(last)) if first < last => {
+            let mut s = key[..first].to_ascii_lowercase();
+            s.push_str(&key[first..=last]);
+            s.push_str(&key[last + 1..].to_ascii_lowercase());
+            s
+        }
+        _ => key.to_ascii_lowercase(),
     }
 }
 
@@ -502,9 +612,10 @@ impl RepoGit {
 
     /// The closed allowlist. `args[0]` must be the subcommand (no global options), and the
     /// stateful forms of otherwise-read-only commands are refused:
-    /// `ls-files` only with `-v`, `-u` or `--stage`/`-s`; `config` only `--get`;
-    /// `symbolic-ref` with exactly one ref (the two-ref form writes); `log` only with a
-    /// `--format`; `worktree` only `list --porcelain`.
+    /// `ls-files` only with `-v`, `-u` or `--stage`/`-s`; `config` only `--get` or exactly
+    /// `--list -z` (Phase 5 ruling 6: one shape, so one `config` spawn per root replaces
+    /// seven `--get`s); `symbolic-ref` with exactly one ref (the two-ref form writes);
+    /// `log` only with a `--format`; `worktree` only `list --porcelain`.
     pub fn allowed<S: AsRef<OsStr>>(args: &[S]) -> bool {
         let strs: Vec<String> = args
             .iter()
@@ -527,7 +638,7 @@ impl RepoGit {
                 rest.iter().filter(|a| !a.starts_with('-')).count() == 1
                     && !rest.iter().any(|a| a == "-d" || a == "--delete")
             }
-            "config" => rest.first().is_some_and(|a| a == "--get"),
+            "config" => rest.first().is_some_and(|a| a == "--get") || rest == ["--list", "-z"],
             "ls-files" => rest
                 .iter()
                 .any(|a| a == "-v" || a == "-u" || a == "--stage" || a == "-s"),
@@ -589,6 +700,44 @@ impl RepoGit {
     pub fn git_path(&self, name: &str) -> Result<PathBuf, GitError> {
         let out = self.run(&["rev-parse", "--path-format=absolute", "--git-path", name])?;
         Ok(PathBuf::from(String::from_utf8_lossy(&out).trim()))
+    }
+
+    /// One `rev-parse --path-format=absolute <flags…>`, whose outputs pair by position:
+    /// one line per *output-producing* flag, in argument order. `expected_lines` is that
+    /// count (`--git-path <name>` is two argv words but one line), and a mismatch is a
+    /// parse error rather than a silently shifted answer.
+    ///
+    /// **Only infallible flags belong here.** `rev-parse` exits non-zero as a whole if any
+    /// one flag fails, so `-q --verify <ref>` — whose exit code *is* the answer — must stay
+    /// in its own call.
+    pub fn rev_parse_batch(
+        &self,
+        flags: &[&str],
+        expected_lines: usize,
+    ) -> Result<Vec<String>, GitError> {
+        let mut argv: Vec<&str> = Vec::with_capacity(flags.len() + 2);
+        argv.push("rev-parse");
+        argv.push("--path-format=absolute");
+        argv.extend_from_slice(flags);
+        let out = self.run(&argv)?;
+        let lines: Vec<String> = String::from_utf8_lossy(&out)
+            .lines()
+            .map(|l| l.trim_end_matches('\r').to_owned())
+            .collect();
+        if lines.len() != expected_lines {
+            return Err(GitError::Parse {
+                argv: argv.iter().map(|s| s.to_string()).collect(),
+                message: format!("expected {expected_lines} lines, got {}", lines.len()),
+            });
+        }
+        Ok(lines)
+    }
+
+    /// One `config --list -z` of the user's repository: every effective key in one spawn,
+    /// with the same resolution `--get` performs (`include`/`includeIf` are resolved by git
+    /// in the same process with the same cwd, so this is not a file read).
+    pub fn config_list(&self) -> Result<ConfigList, GitError> {
+        Ok(ConfigList::parse(&self.run(&["config", "--list", "-z"])?))
     }
 
     /// `config --get <key>` → `None` when unset (exit 1).
@@ -836,6 +985,7 @@ mod tests {
             ],
             vec!["symbolic-ref", "-q", "--short", "HEAD"],
             vec!["config", "--get", "user.email"],
+            vec!["config", "--list", "-z"],
             vec!["ls-files", "-v", "-z"],
             vec!["ls-files", "-u", "-z"],
             vec!["ls-files", "--stage", "-z"],
@@ -875,6 +1025,11 @@ mod tests {
             vec!["ls-files", "--others", "-z"],
             vec!["config", "user.email", "x@y"],
             vec!["config", "--unset", "user.email"],
+            // Only the exact `--list -z` shape widens the allowlist (ruling 6).
+            vec!["config", "--list"],
+            vec!["config", "--list", "-z", "--local"],
+            vec!["config", "--list", "-z", "--file", "/elsewhere/x"],
+            vec!["config", "--list", "--edit"],
             vec!["symbolic-ref", "HEAD", "refs/heads/x"],
             vec!["symbolic-ref", "--delete", "refs/heads/x"],
             vec!["symbolic-ref", "-d", "refs/heads/x"],
@@ -1101,5 +1256,71 @@ mod tests {
         assert_eq!(split_nul(b"a\0b\0"), vec![&b"a"[..], &b"b"[..]]);
         assert_eq!(split_nul(b"a\0\0b\0"), vec![&b"a"[..], &b""[..], &b"b"[..]]);
         assert!(split_nul(b"").is_empty());
+    }
+
+    /// The four shapes real `config --list -z` output takes. The record separator is NUL,
+    /// the key ends at the *first* newline, and neither an `=` nor a newline inside a value
+    /// may be mistaken for that boundary.
+    #[test]
+    fn git_config_list_parses_the_z_framing_not_the_equals_form() {
+        let bytes: &[u8] = b"core.bare\nfalse\0\
+core.excludesfile\n\0\
+remote.origin.url\nhttps://example.invalid/r?a=1&b=2\0\
+alias.lg\nlog --oneline\n  --graph\0\
+user.name\0";
+        let c = ConfigList::parse(bytes);
+        assert_eq!(c.len(), 5);
+        assert_eq!(c.get("core.bare"), Some("false"));
+        // Present-but-empty is `Some("")`, exactly what `--get` prints for it — never None.
+        assert_eq!(c.get("core.excludesfile"), Some(""));
+        assert_eq!(
+            c.raw("remote.origin.url"),
+            Some("https://example.invalid/r?a=1&b=2"),
+            "the key ends at the newline; an `=` inside the value is just a byte"
+        );
+        assert_eq!(
+            c.raw("alias.lg"),
+            Some("log --oneline\n  --graph"),
+            "a value may contain newlines; only NUL ends the record"
+        );
+        // A valueless key (`[section] key`) exists and reads back as the empty string.
+        assert_eq!(c.get("user.name"), Some(""));
+        assert_eq!(c.get("no.such.key"), None);
+    }
+
+    #[test]
+    fn git_config_list_takes_the_last_value_of_a_multi_valued_key() {
+        // `--get` on a multi-valued key prints the last one; the map must agree, or the one
+        // batched read would disagree with the seven `--get` calls it replaces.
+        let bytes: &[u8] = b"core.excludesfile\n/first\0core.excludesfile\n/second\0";
+        let c = ConfigList::parse(bytes);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c.get("core.excludesfile"), Some("/second"));
+    }
+
+    /// git prints `core.untrackedCache` as `core.untrackedcache`, so a lookup by the
+    /// camel-case spelling the code uses must still hit — otherwise `Store::open` decides
+    /// the key is unset and rewrites it on every single open (two wasted spawns per root).
+    /// A subsection keeps its case, and a URL in a subsection is not folded.
+    #[test]
+    fn git_config_list_folds_section_and_variable_case_but_not_the_subsection() {
+        let bytes: &[u8] = b"core.untrackedcache\nfalse\0\
+remote.Origin.url\nhttps://X.invalid/R\0\
+includeif.gitdir:/Work/.path\n/w/cfg\0";
+        let c = ConfigList::parse(bytes);
+        assert_eq!(c.get("core.untrackedCache"), Some("false"));
+        assert_eq!(c.get("CORE.UntrackedCache"), Some("false"));
+        // Subsection case is significant: `remote.origin.url` is a *different* key.
+        assert_eq!(c.get("remote.Origin.URL"), Some("https://X.invalid/R"));
+        assert_eq!(c.get("remote.origin.url"), None);
+        assert_eq!(c.get("includeIf.gitdir:/Work/.PATH"), Some("/w/cfg"));
+    }
+
+    #[test]
+    fn git_config_list_of_empty_output_is_empty_not_a_phantom_key() {
+        let c = ConfigList::parse(b"");
+        assert!(c.is_empty());
+        assert_eq!(c.get("user.email"), None);
+        assert_eq!(ConfigList::default(), c);
     }
 }

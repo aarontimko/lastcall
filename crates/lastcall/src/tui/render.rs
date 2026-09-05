@@ -25,10 +25,25 @@ use super::app::{
     AcceptScope, App, Focus, MIN_SIZE, NAV_MIN_COLS, RootView, Selection, Target, annotation_name,
     diff_len, hunk_offsets, plural,
 };
+use super::herdr::{Dot, Link};
 use super::input::{Action, MODAL_KEYS};
 
 pub const TOO_SMALL: &str = "too small: 40×10 min";
 pub const NO_SELECTION: &str = "select a file (↑↓ or click) · ? for help";
+/// What a flag-only root (no pending rows) shows instead of a file list, in the nav and
+/// in the diff pane, so `Enter` has somewhere to land. `<status>` is herdr's own word.
+pub fn nothing_pending(status: &str) -> String {
+    format!("nothing pending · agent {status}")
+}
+
+/// The same line for a nav column too narrow for it: the `nothing pending · ` half is
+/// already implied by the branch line's `0 files` above it, while the status word is the
+/// only thing on screen that says *why* the root is listed — so that half is what
+/// survives a truncation rather than what gets cut (review (b) F9).
+pub fn nothing_pending_short(status: &str) -> String {
+    format!("agent {status}")
+}
+
 /// The help overlay's mouse note (ruling 3): `term::enter` turns mouse capture on, so the
 /// terminal's own text selection needs the shift override. The stopgap until the Phase 8
 /// select-to-copy item lands.
@@ -157,11 +172,15 @@ pub fn render(app: &App, frame: &mut Frame<'_>) -> HitMap {
     hits
 }
 
-/// `lastcall  <repos> · <files> · <hunks>  [Accept All]` … `watching <parents>`. The file
-/// count carries `+` when any listed root's pile stopped at the row cap; the control is
-/// dim when nothing is listed and is the `HeaderAcceptAll` target either way. When the
-/// control and the notice do not both fit (60 columns), the control goes and the notice
-/// stays: `^A` duplicates the control, nothing else says what is being watched.
+/// `lastcall  <repos> · <files> · <hunks>  <herdr badge>  [Accept All]` …
+/// `watching <parents>`. The file count carries `+` when any listed root's pile stopped at
+/// the row cap; the control is dim when nothing is listed and is the `HeaderAcceptAll`
+/// target either way; the badge is the `HeaderHerdr` target.
+///
+/// Priority when the line is short: the counts, then the notice, then the badge, then the
+/// control — `^A` duplicates the control, nothing else says what is being watched or
+/// whether herdr is answering. A line with no room for the notice keeps the badge and the
+/// control instead of leaving the right half empty.
 fn render_header(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
     let listed: Vec<&RootView> = app.listed_roots().collect();
     let files: usize = listed.iter().map(|v| v.rows().len()).sum();
@@ -177,7 +196,7 @@ fn render_header(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
         plural(hunks, "hunk")
     );
     let control = "[Accept All]";
-    let control_x = area.x + (left.width() + 2) as u16;
+    let (badge, badge_style) = herdr_badge(app);
     let parents: BTreeSet<String> = app
         .roots
         .values()
@@ -192,16 +211,39 @@ fn render_header(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
         )
     };
     let width = area.width as usize;
-    let with_control = left.width() + 2 + control.width();
-    // Priority when the line is short: the counts, then the notice, then the control.
-    let both_fit = with_control + 2 + right.width() <= width;
-    let notice_fits_alone = left.width() + 2 + right.width() <= width;
-    let show_control = both_fit || !notice_fits_alone;
-    let show_notice = both_fit || notice_fits_alone;
+    let cost = |badge_on: bool, control_on: bool, notice_on: bool| {
+        left.width()
+            + if badge_on { 2 + badge.width() } else { 0 }
+            + if control_on { 2 + control.width() } else { 0 }
+            + if notice_on { 2 + right.width() } else { 0 }
+    };
+    // Preference order, first that fits (the last is the unconditional fallback).
+    let (show_badge, show_control, show_notice) = [
+        (true, true, true),
+        (true, false, true),
+        (false, false, true),
+        (true, true, false),
+        (true, false, false),
+        (false, false, false),
+    ]
+    .into_iter()
+    .find(|(b, c, n)| cost(*b, *c, *n) <= width)
+    .unwrap_or((false, false, false));
+
     let mut used = left.width();
     let mut spans = vec![Span::styled(left, bold())];
+    let mut badge_x = None;
+    if show_badge {
+        spans.push(Span::raw("  "));
+        badge_x = Some(area.x + (used + 2) as u16);
+        used += 2 + badge.width();
+        spans.push(Span::styled(badge.clone(), badge_style));
+    }
+    let mut control_x = None;
     if show_control {
         spans.push(Span::raw("  "));
+        control_x = Some(area.x + (used + 2) as u16);
+        used += 2 + control.width();
         spans.push(Span::styled(
             control,
             if listed.is_empty() {
@@ -210,18 +252,36 @@ fn render_header(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
                 Style::new()
             },
         ));
-        used = with_control;
     }
     if show_notice {
         let pad = width.saturating_sub(used + right.width());
         spans.push(Span::raw(format!("{}{right}", " ".repeat(pad))));
     }
     buf.set_line(area.x, area.y, &Line::from(spans), area.width);
-    if show_control && with_control <= width {
+    if let Some(x) = badge_x {
         hits.targets.push((
-            Rect::new(control_x, area.y, control.width() as u16, 1),
+            Rect::new(x, area.y, badge.width() as u16, 1),
+            Target::HeaderHerdr,
+        ));
+    }
+    if let Some(x) = control_x {
+        hits.targets.push((
+            Rect::new(x, area.y, control.width() as u16, 1),
             Target::HeaderAcceptAll,
         ));
+    }
+}
+
+/// The header's herdr badge and its style (deliverable 5): `herdr <version>` dim when
+/// connected, `herdr ⟳` while reconnecting, `standalone` dim when off or absent, and
+/// `standalone: <reason>` when `mode = "on"` made the failure visible.
+fn herdr_badge(app: &App) -> (String, Style) {
+    match &app.herdr.link {
+        Link::Connected { version } => (format!("herdr {version}"), dim()),
+        Link::Reconnecting => ("herdr ⟳".to_owned(), Style::new()),
+        Link::Off => ("standalone".to_owned(), dim()),
+        Link::Standalone { reason } if reason.is_empty() => ("standalone".to_owned(), dim()),
+        Link::Standalone { reason } => (format!("standalone: {reason}"), Style::new()),
     }
 }
 
@@ -235,13 +295,54 @@ fn count_plus(n: usize, plus: bool, noun: &str) -> String {
     }
 }
 
+/// The status line: a transient status with its age, else the hint line — with the
+/// mandatory scope notice (deliverable 8) right-aligned beside whichever of the two is
+/// showing, and alone when neither pairing fits.
+///
+/// The notice is mandatory *while a scope is active* (ruling 1, and the "Scope hiding
+/// pending work silently" trap), so a transient status — set at startup, after every
+/// accept, on a HEAD change, on a focus verdict — yields the room rather than hiding it:
+/// the status text is truncated first and the notice keeps its right-hand column.
 fn render_status(app: &App, buf: &mut Buffer, area: Rect) {
+    let width = area.width as usize;
+    let notice = app.scope_notice();
+    // The notice needs its own column plus a gap; below that it takes the line alone.
+    let notice_room = notice.as_ref().filter(|n| n.width() + 4 <= width);
     let line = match (&app.status, app.status_age()) {
-        (Some(s), Some(age)) => Line::from(vec![
-            Span::raw(s.text.clone()),
-            Span::styled(format!(" · {age}"), dim()),
-        ]),
-        _ => Line::from(Span::styled(hints(app, area.width), dim())),
+        (Some(s), Some(age)) => {
+            let age = format!(" · {age}");
+            match (notice_room, &notice) {
+                (Some(notice), _) => {
+                    let room = (width - notice.width() - 2).saturating_sub(age.width());
+                    let text = ellipsize(&s.text, room);
+                    let pad = width.saturating_sub(text.width() + age.width() + notice.width());
+                    Line::from(vec![
+                        Span::raw(text),
+                        Span::styled(age, dim()),
+                        Span::raw(" ".repeat(pad)),
+                        Span::styled(notice.clone(), dim()),
+                    ])
+                }
+                (None, Some(notice)) => Line::from(Span::styled(notice.clone(), dim())),
+                (None, None) => {
+                    Line::from(vec![Span::raw(s.text.clone()), Span::styled(age, dim())])
+                }
+            }
+        }
+        _ => match (notice_room, &notice) {
+            (None, None) => Line::from(Span::styled(hints(app, area.width), dim())),
+            (None, Some(notice)) => Line::from(Span::styled(notice.clone(), dim())),
+            (Some(notice), _) => {
+                let room = width - notice.width() - 2;
+                let hints = hints(app, room as u16);
+                let pad = width.saturating_sub(hints.width() + notice.width());
+                Line::from(vec![
+                    Span::styled(hints, dim()),
+                    Span::raw(" ".repeat(pad)),
+                    Span::styled(notice.clone(), dim()),
+                ])
+            }
+        },
     };
     buf.set_line(area.x, area.y, &line, area.width);
 }
@@ -303,6 +404,28 @@ pub fn hints(app: &App, width: u16) -> String {
     };
     // (hint, tier): when the line must shrink, tier 2 goes first (`focus`, `refresh`;
     // always below `NAV_MIN_COLS`), then tier 1 (the file and global accept hints).
+    // The herdr hints are conditional: `d`/`g` only while the selected root carries a
+    // flag, `w` only while a scope is active (deliverable 5's hint ladder).
+    // `d` acks a **ready episode** and nothing else, so a blocked root — which is listed,
+    // and does carry a dot — must not be offered `d ack`, where the key would do nothing
+    // (review (b) F7). `g` is offered for either, because both have a pane to jump to.
+    let flag = app.flagged_root().and_then(|r| app.herdr.flag(&r).cloned());
+    let ack = flag
+        .as_ref()
+        .is_some_and(|f| f.ready.is_some())
+        .then(|| first("ack").map(|k| format!("{k} ack")))
+        .flatten();
+    let jump = flag
+        .as_ref()
+        .is_some_and(|f| f.attention())
+        .then(|| first("jump").map(|k| format!("{k} jump")))
+        .flatten();
+    let scope = app
+        .herdr
+        .scope
+        .is_some()
+        .then(|| first("scope").map(|k| format!("{k} scope")))
+        .flatten();
     let items = [
         (pair("nav_up", "nav_down").map(|k| format!("{k} select")), 0),
         (first("open").map(|k| format!("{k} open")), 0),
@@ -313,6 +436,9 @@ pub fn hints(app: &App, width: u16) -> String {
         (context, 0),
         (file, 1),
         (first("accept_all").map(|k| format!("{k} accept all")), 1),
+        (ack, 1),
+        (jump, 1),
+        (scope, 2),
         (first("focus_toggle").map(|k| format!("{k} focus")), 2),
         (first("refresh").map(|k| format!("{k} refresh")), 2),
         (first("help").map(|k| format!("{k} help")), 0),
@@ -358,9 +484,12 @@ fn render_nav(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
     let width = area.width as usize;
     let mut lines: Vec<NavLine> = Vec::new();
     let mut selected_at: Option<usize> = None;
+    // (line index, dot width, root): the dot's own hit rect, pushed once the line's final
+    // screen row is known (below).
+    let mut dots: Vec<(usize, u16, std::path::PathBuf)> = Vec::new();
     let mut first = true;
     for (path, view) in &app.roots {
-        if !view.listed() {
+        if !app.is_listed(view) {
             continue;
         }
         if !first {
@@ -373,7 +502,19 @@ fn render_nav(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
         first = false;
         let sel = Some(Selection::Root(path.clone()));
         let is_sel = app.selection == sel;
-        let mut spans = vec![Span::styled(view.meta.name.clone(), bold())];
+        let mut spans = Vec::new();
+        // The dot sits before the bold name, with the agent count when there is more than
+        // one; clicking it acks (`RootDot`), clicking the name selects as it always did.
+        if let Some(dot) = app.herdr.dot(path) {
+            let agents = app.herdr.flag(path).map(|f| f.agents).unwrap_or(1);
+            let text = match agents {
+                0 | 1 => format!("{} ", dot_glyph(dot)),
+                n => format!("{}{n} ", dot_glyph(dot)),
+            };
+            dots.push((lines.len(), text.width() as u16, path.clone()));
+            spans.push(Span::styled(text, dot_style(dot)));
+        }
+        spans.push(Span::styled(view.meta.name.clone(), bold()));
         let remote = view.meta.remote.as_deref().filter(|_| app.show_remote);
         if let Some(remote) = remote {
             let budget = width.saturating_sub(view.meta.name.width() + 2);
@@ -405,6 +546,26 @@ fn render_nav(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
             target: None,
             selected: false,
         });
+        if view.rows().is_empty() {
+            // A flag-only root (deliverable 5): listed on its agent alone, so it needs a
+            // line under the branch for `Enter` to have somewhere to land.
+            let status = app
+                .herdr
+                .flag(path)
+                .map(|f| f.status.as_str())
+                .unwrap_or("done");
+            let full = format!("  {}", nothing_pending(status));
+            let text = if full.width() <= width {
+                full
+            } else {
+                format!("  {}", nothing_pending_short(status))
+            };
+            lines.push(NavLine {
+                line: Line::from(Span::styled(text, dim())),
+                target: Some(Target::NavRoot(path.clone())),
+                selected: false,
+            });
+        }
         for row in view.rows() {
             let sel = Selection::Row(path.clone(), row.path.clone());
             let is_sel = app.selection.as_ref() == Some(&sel);
@@ -450,6 +611,32 @@ fn render_nav(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
         if let Some(t) = &entry.target {
             hits.targets.push((row_rect, t.clone()));
         }
+        // The dot wins over the row it sits on (`at` scans last-to-first).
+        if let Some((_, w, root)) = dots.iter().find(|(line, _, _)| *line == i) {
+            hits.targets
+                .push((Rect::new(area.x, y, *w, 1), Target::RootDot(root.clone())));
+        }
+    }
+}
+
+/// The glyph for a dot (deliverable 5).
+fn dot_glyph(dot: Dot) -> char {
+    match dot {
+        Dot::Ready { .. } => '\u{2691}',
+        Dot::Blocked | Dot::Working => '\u{25cf}',
+        Dot::Unknown => '\u{b7}',
+    }
+}
+
+/// Bright while the flag is unacked, dim once acked (herdr still says `done`, so the flag
+/// stays — only its weight changes); red blocked, yellow working, dim unknown.
+fn dot_style(dot: Dot) -> Style {
+    match dot {
+        Dot::Ready { acked: false } => bold(),
+        Dot::Ready { acked: true } => dim(),
+        Dot::Blocked => red(),
+        Dot::Working => Style::new().fg(Color::Yellow),
+        Dot::Unknown => dim(),
     }
 }
 
@@ -556,6 +743,14 @@ fn render_main(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
                 }
                 lines.push(Line::from(spans));
                 push_notices(&mut lines, view.notices());
+                if view.rows().is_empty() {
+                    let status = app
+                        .herdr
+                        .flag(root)
+                        .map(|f| f.status.as_str())
+                        .unwrap_or("done");
+                    lines.push(Line::from(Span::styled(nothing_pending(status), dim())));
+                }
                 for row in view.rows() {
                     lines.push(nav_row_line(row, true, usize::MAX));
                 }
@@ -1438,7 +1633,7 @@ mod tests {
     #[test]
     fn render_empty_app_shows_empty_state_and_hints() {
         let app = App::new();
-        let (frame, styles) = frame_of(&app, 80, 12);
+        let (frame, styles) = frame_of(&app, 100, 12);
         assert!(frame.contains("nothing pending across 0 roots"), "{frame}");
         assert!(
             frame.contains("lastcall  0 repos · 0 files · 0 hunks"),
@@ -1447,9 +1642,171 @@ mod tests {
         assert!(frame.contains("watching nothing"), "{frame}");
         assert!(frame.contains("↑↓ select"), "{frame}");
         assert!(styles.contains("0 0..37 Reset Reset BOLD"), "{styles}");
+        // counts, then the dim `standalone` badge, then the control.
         assert!(
-            styles.contains("0 39..51 Reset Reset DIM"),
+            styles.contains("0 39..49 Reset Reset DIM"),
+            "the herdr badge is dim while standalone: {styles}"
+        );
+        assert!(
+            styles.contains("0 51..63 Reset Reset DIM"),
             "Accept All is dim with nothing listed: {styles}"
+        );
+    }
+
+    /// The header's four segments do not fit at 80 columns, and the ladder is
+    /// counts → notice → badge → control: `^A` and the hint line duplicate the control,
+    /// nothing else says what is watched or whether herdr is answering.
+    #[test]
+    fn render_header_drops_the_accept_control_before_the_herdr_badge() {
+        let app = App::new();
+        let (frame, _) = frame_of(&app, 80, 12);
+        assert!(frame.contains("standalone"), "{frame}");
+        assert!(frame.contains("watching nothing"), "{frame}");
+        assert!(!frame.contains("[Accept All]"), "{frame}");
+        // Nothing under the width of the counts alone survives but the counts.
+        let (narrow, _) = frame_of(&app, 40, 12);
+        assert!(narrow.contains("lastcall  0 repos"), "{narrow}");
+    }
+
+    /// Deliverable 8 / ruling 1: the scope notice is mandatory *while the scope is
+    /// active*, not merely while the status line happens to be free. A transient status —
+    /// one is set at startup, after every accept, on a HEAD change and on a focus verdict,
+    /// and lives 30 s — shares the row with it: status left, notice right, the status text
+    /// truncated first. Below the notice's own width the notice takes the row alone.
+    #[test]
+    fn render_scope_notice_survives_a_transient_status() {
+        use crate::tui::herdr::{HerdrUpdate, Scope};
+        let mut app = three_roots();
+        app.herdr.scoped = true;
+        app.handle(Action::Herdr(HerdrUpdate::Scope(Some(Scope {
+            label: "alpha".to_owned(),
+            roots: [root("alpha")].into_iter().collect(),
+        }))));
+        let notice = app.scope_notice().expect("a scope is active");
+        assert_eq!(notice, "scope: alpha · 2 repos hidden (w shows all)");
+
+        // With no status the notice sits beside the hints (the pre-existing layout).
+        let (frame, _) = frame_of(&app, 100, 12);
+        assert!(frame.contains("repos hidden"), "{frame}");
+
+        // With one set it is still there — this is what the old code dropped.
+        app.set_status("accepted f1 in alpha");
+        let last = |frame: &str| frame.lines().last().unwrap().trim_matches('"').to_owned();
+        let (frame, _) = frame_of(&app, 100, 12);
+        let row = last(&frame);
+        assert!(row.contains("repos hidden"), "{row}");
+        assert!(row.starts_with("accepted f1 in alpha · 0s"), "{row}");
+        assert!(row.trim_end().ends_with(&notice), "{row}");
+
+        // A long status yields the room rather than pushing the notice off the row.
+        app.set_status("x".repeat(200));
+        let row = last(&frame_of(&app, 100, 12).0);
+        assert!(row.trim_end().ends_with(&notice), "{row}");
+        assert!(row.contains('…'), "the status is what truncates: {row}");
+
+        // Too narrow for both: the notice keeps the row, the status yields entirely.
+        let row = last(&frame_of(&app, 46, 12).0);
+        assert_eq!(row.trim_end(), notice);
+    }
+
+    /// Review (b) F7: `d` acks a ready episode; on a blocked root it does nothing, so the
+    /// hint ladder must not offer it. `g jump` is offered for either — both have a pane.
+    #[test]
+    fn render_ack_hint_only_where_d_would_do_something() {
+        use crate::tui::herdr::{Attention, HerdrUpdate, RootAgents};
+        let flagged = |status: Attention| {
+            let mut app = three_roots();
+            app.handle(Action::Herdr(HerdrUpdate::Connected {
+                version: "0.8.2".to_owned(),
+                protocol: 21,
+            }));
+            app.handle(Action::Herdr(HerdrUpdate::Roots(
+                [(
+                    root("alpha"),
+                    RootAgents {
+                        status,
+                        agents: 1,
+                        pane: Some("w1:p1".to_owned()),
+                        agent: Some("claude".to_owned()),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            )));
+            app.select(Some(Selection::Root(root("alpha"))));
+            app
+        };
+
+        let blocked = flagged(Attention::Blocked);
+        assert!(blocked.herdr.flag(&root("alpha")).unwrap().attention());
+        assert_eq!(
+            blocked.clone().handle(Action::Ack),
+            (Changed::No, None),
+            "`d` on a blocked root does nothing"
+        );
+        let line = hints(&blocked, 200);
+        assert!(!line.contains("d ack"), "{line}");
+        assert!(line.contains("g jump"), "{line}");
+
+        // A ready episode is what `d` is for — offered before and after the ack, because
+        // the flag stays on screen and the key stays the way to explain it.
+        let mut done = flagged(Attention::Done);
+        assert!(hints(&done, 200).contains("d ack"), "{}", hints(&done, 200));
+        assert_eq!(done.handle(Action::Ack).0, Changed::Yes);
+        let line = hints(&done, 200);
+        assert!(line.contains("d ack"), "{line}");
+        assert!(line.contains("g jump"), "{line}");
+    }
+
+    /// Review (b) F9: at the nav's real width the flag-only line truncated to
+    /// `nothing pending · agent`, losing herdr's status word — the only thing on screen
+    /// saying why the root is listed. Narrow rows drop the leading half instead.
+    #[test]
+    fn render_flag_only_row_keeps_the_status_word_when_it_cannot_fit() {
+        use crate::tui::herdr::{Attention, HerdrUpdate, RootAgents};
+        let mut app = three_roots();
+        app.apply(pile_event_seq(
+            "alpha",
+            1,
+            without(pile("alpha"), &["f1", "f2"]),
+        ));
+        app.handle(Action::Herdr(HerdrUpdate::Connected {
+            version: "0.8.2".to_owned(),
+            protocol: 21,
+        }));
+        app.handle(Action::Herdr(HerdrUpdate::Roots(
+            [(
+                root("alpha"),
+                RootAgents {
+                    status: Attention::Done,
+                    agents: 1,
+                    pane: Some("w1:p1".to_owned()),
+                    agent: Some("claude".to_owned()),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        )));
+        app.select(Some(Selection::Root(root("alpha"))));
+        // The nav column at 100×30 is 26 wide: `  nothing pending · agent done` is 30.
+        let (frame, _) = frame_of(&app, 100, 30);
+        assert!(
+            frame.lines().any(|l| l.starts_with("\"│  agent done")),
+            "the nav keeps herdr's word: {frame}"
+        );
+        assert!(
+            !frame.contains("│  nothing pending · agent"),
+            "never the half that says nothing: {frame}"
+        );
+        // The diff pane is wide enough for the full sentence, and still shows it.
+        assert!(frame.contains(&nothing_pending("done")), "{frame}");
+
+        // A nav column dragged wide enough keeps the full line.
+        app.nav_width = 40;
+        let (wide, _) = frame_of(&app, 100, 30);
+        assert!(
+            wide.contains(&format!("│  {}", nothing_pending("done"))),
+            "{wide}"
         );
     }
 
