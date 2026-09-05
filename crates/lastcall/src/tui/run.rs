@@ -77,7 +77,9 @@ pub enum Local {
     /// A herdr request the loop made off the UI task came back (`agent.focus`, a toast).
     Herdr(HerdrUpdate),
     /// An `Effect::Expand` finished: one collapsed row's on-demand hunks (deliverable 4).
-    Expanded(PathBuf, Vec<u8>, Expanded),
+    /// The row `hunks_of` was given travels back with the answer, so the app can tell an
+    /// answer for the oids on screen from one for oids a pile has since replaced.
+    Expanded(PathBuf, Box<Row>, Expanded),
 }
 
 /// The terminal-free core of the loop: the app, the keymap, and the hit map of the last
@@ -176,7 +178,7 @@ impl Ui {
                 (Changed::No, Some(Effect::Quit))
             }
             Local::Herdr(update) => self.app.handle(Action::Herdr(update)),
-            Local::Expanded(root, path, view) => (self.app.set_expanded(root, path, view), None),
+            Local::Expanded(root, row, view) => (self.app.set_expanded(root, &row, view), None),
         }
     }
 
@@ -192,9 +194,10 @@ impl Ui {
     }
 }
 
-/// Events one pass folds in beyond the one the `select!` woke on. A pass that keeps folding
-/// forever is a pass that never draws, so the drain stops here whatever is still queued —
-/// the next iteration picks the rest up (deliverable 6).
+/// Round-robin **rounds** one pass drains beyond the event the `select!` woke on; a round
+/// polls each of the four sources once, so a pass folds at most four times this many
+/// events. A pass that keeps folding forever is a pass that never draws, so the drain stops
+/// here whatever is still queued — the next iteration picks the rest up (deliverable 6).
 pub const DRAIN_CAP: usize = 256;
 
 /// Why a pass ended the loop.
@@ -216,8 +219,11 @@ pub struct Pass {
     pub cause: Option<&'static str>,
     pub effects: Vec<Effect>,
     pub stop: Option<Stop>,
-    /// A herdr event in this pass asked for a discovery rescan (`worktree.*`).
-    pub rescan: bool,
+    /// A herdr `worktree.*` event was drained in this pass. The loop **arms** the
+    /// `WORKTREE_DEBOUNCE` timer for it exactly as the `select!` arm does for the event it
+    /// woke on — never a rescan on the spot, which would bypass the Phase 5 debounce and
+    /// cancel a timer an earlier event of the same burst had armed (verifier (b) F2).
+    pub worktree: bool,
     /// A mouse press the drain refused to fold because the pass already has something to
     /// draw. It is folded at the top of the next iteration, **after** the frame, so a press
     /// always resolves against the hit map of a frame the user actually saw.
@@ -314,7 +320,7 @@ pub(crate) fn drain(ui: &mut Ui, sources: &mut Sources<'_>, link: &mut Herdr, pa
             && let Ok(event) = rx.try_recv()
         {
             any = true;
-            pass.rescan |= herdr::triggers_rescan(&event);
+            pass.worktree |= herdr::triggers_rescan(&event);
             if let Some(update) = herdr::update_of(&event) {
                 pass.fold("herdr", ui.app.handle(Action::Herdr(update)));
             }
@@ -506,15 +512,15 @@ fn spawn_expand(
         let task = tokio::spawn(async move {
             blocking(&engine, move |e| {
                 let view = e.hunks_of(&root, &row);
-                (root, row.path.clone(), view)
+                (root, row, view)
             })
             .await
         });
-        let Some((root, path, view)) = joined(task, &tx, "expand").await else {
+        let Some((root, row, view)) = joined(task, &tx, "expand").await else {
             return;
         };
         let local = match view {
-            Ok(view) => Local::Expanded(root, path, view),
+            Ok(view) => Local::Expanded(root, row, view),
             Err(e) => Local::Notice(Some(root), format!("expand failed: {e}")),
         };
         let _ = tx.send(local);
@@ -872,12 +878,17 @@ pub fn run(
                     drain(&mut ui, &mut sources, &mut link, &mut pass);
                 }
                 held = pass.held.take();
-                rescan |= pass.rescan;
                 if rescan {
                     // Deliverable 7: the event is only a trigger — `roots::discover` decides
                     // what is a root, and `RootsChanged` + the new pile take the usual path.
                     worktree_due = None;
                     watcher.request_rescan();
+                }
+                if pass.worktree {
+                    // A drained `worktree.*` event (re)arms the debounce, after the timer
+                    // check above so an event that shares a pass with the timer firing
+                    // opens the next window rather than being folded into the old one.
+                    worktree_due = Some(tokio::time::Instant::now() + WORKTREE_DEBOUNCE);
                 }
                 let mut stop = pass.stop;
                 for effect in pass.effects {
@@ -1241,6 +1252,39 @@ mod tests {
                 "the pile behind the fatal was never folded"
             );
         }
+    }
+
+    /// Verifier (b) F2: a `worktree.*` event that reaches the loop through the drain must
+    /// take the same road as one that woke the `select!` — arm the debounce — so the pass
+    /// reports `worktree`, not a rescan to run now. Two in one pass are one flag: one
+    /// deadline, re-armed from the last of them.
+    #[test]
+    fn run_drain_reports_a_worktree_event_for_the_debounce_not_for_a_rescan() {
+        use lastcall_engine::herdr::client::WorktreeChange;
+        let worktree = |change| HerdrEvent::WorktreeChanged {
+            change,
+            workspace_id: "ws".to_owned(),
+            path: "/tmp/w/alpha-feat".to_owned(),
+            branch: None,
+        };
+        let mut ui = ui();
+        let mut wires = Wires::new();
+        let (htx, hrx) = mpsc::channel(8);
+        wires.link.events = Some(hrx);
+        htx.try_send(worktree(WorktreeChange::Created)).unwrap();
+        htx.try_send(worktree(WorktreeChange::Removed)).unwrap();
+        let pass = wires.drain_into(&mut ui, (Changed::No, None));
+        assert!(pass.worktree, "the drained events ask for the debounce");
+        assert_eq!(
+            pass.changed,
+            Changed::No,
+            "a worktree event draws nothing by itself"
+        );
+        assert!(pass.effects.is_empty() && pass.stop.is_none());
+
+        // A pass with no worktree event leaves the flag down.
+        let pass = wires.drain_into(&mut ui, (Changed::No, None));
+        assert!(!pass.worktree);
     }
 
     /// The cap bounds one pass: a queue longer than [`DRAIN_CAP`] draws, then continues.

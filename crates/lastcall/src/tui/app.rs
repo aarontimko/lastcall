@@ -570,27 +570,30 @@ impl App {
         )
     }
 
-    /// An `Effect::Expand` came back. It is dropped unless the row is still selected and
-    /// still carries the oids it was computed from — a pile that landed meanwhile makes the
-    /// answer a diff of something the screen is no longer showing.
-    pub fn set_expanded(&mut self, root: PathBuf, path: Vec<u8>, view: Expanded) -> Changed {
+    /// An `Effect::Expand` came back for `asked`, the row `hunks_of` was given. It is
+    /// dropped unless that row is still selected **and** still carries the oids the answer
+    /// was computed from: a pile that landed between the request and the answer makes it a
+    /// diff of something the screen is no longer showing, and storing it under the row's
+    /// new oids would keep it there for as long as those oids last (verifier (b) F1).
+    pub fn set_expanded(&mut self, root: PathBuf, asked: &Row, view: Expanded) -> Changed {
+        let path = asked.path.clone();
         let matches_selection = matches!(
             &self.selection,
             Some(Selection::Row(r, p)) if *r == root && *p == path
         );
-        let Some(row) = self
+        let same_oids = self
             .roots
             .get(&root)
             .and_then(|v| v.row(&path))
-            .filter(|_| matches_selection)
-        else {
+            .is_some_and(|row| row.baseline == asked.baseline && row.current == asked.current);
+        if !matches_selection || !same_oids {
             return Changed::No;
-        };
+        }
         let next = Expansion {
             root,
             path,
-            baseline: row.baseline.clone(),
-            current: row.current.clone(),
+            baseline: asked.baseline.clone(),
+            current: asked.current.clone(),
             view,
         };
         if self.expanded.as_ref() == Some(&next) {
@@ -1897,7 +1900,7 @@ mod tests {
 
             let view = expansion_of(3, 0);
             assert_eq!(
-                app.set_expanded(root("alpha"), b"f1".to_vec(), view.clone()),
+                app.set_expanded(root("alpha"), &asked_row, view.clone()),
                 Changed::Yes
             );
             assert_eq!(app.view_hunks().len(), 3, "the diff pane shows the hunks");
@@ -1925,8 +1928,9 @@ mod tests {
         let collapsed = alpha_collapsed(Collapsed::Glob);
         let expand = |app: &mut App| {
             app.select(Some(row("alpha", "f1")));
+            let asked = app.selected_row().unwrap().clone();
             assert_eq!(
-                app.set_expanded(root("alpha"), b"f1".to_vec(), expansion_of(2, 0)),
+                app.set_expanded(root("alpha"), &asked, expansion_of(2, 0)),
                 Changed::Yes
             );
         };
@@ -1965,12 +1969,62 @@ mod tests {
         let mut app = three_roots();
         app.handle(Action::Resize(100, 30));
         app.apply(pile_event_seq("alpha", 1, alpha_collapsed(Collapsed::Glob)));
+        let asked = app.roots[&root("alpha")].row(b"f1").unwrap().clone();
         app.select(Some(row("alpha", "f2")));
         assert_eq!(
-            app.set_expanded(root("alpha"), b"f1".to_vec(), expansion_of(2, 0)),
+            app.set_expanded(root("alpha"), &asked, expansion_of(2, 0)),
             Changed::No
         );
         assert!(app.expanded.is_none());
+    }
+
+    /// Verifier (b) F1: an answer computed for the oids `e` was pressed on is dropped when a
+    /// pile has moved the row's oids meanwhile — the row is still selected, but the hunks
+    /// describe a delta the counts on screen no longer do. Storing it under the row's new
+    /// oids would have kept it through every later identical pile.
+    #[test]
+    fn app_expansion_answer_for_moved_oids_is_dropped() {
+        let collapsed = alpha_collapsed(Collapsed::Glob);
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.apply(pile_event_seq("alpha", 1, collapsed.clone()));
+        app.select(Some(row("alpha", "f1")));
+        let (_, effect) = app.handle(Action::Expand);
+        let Some(Effect::Expand(_, asked)) = effect else {
+            panic!("an expand effect: {effect:?}");
+        };
+
+        // The file is rewritten again before `hunks_of` answers.
+        let mut moved = collapsed;
+        moved.rows[0].current.as_mut().unwrap().oid =
+            Oid::parse(&"c".repeat(40)).expect("a well-formed oid");
+        app.apply(pile_event_seq("alpha", 2, moved));
+        assert_eq!(app.selection, Some(row("alpha", "f1")), "still selected");
+
+        assert_eq!(
+            app.set_expanded(root("alpha"), &asked, expansion_of(2, 0)),
+            Changed::No,
+            "a diff of oids the screen no longer shows"
+        );
+        assert!(app.expanded.is_none());
+        assert!(
+            app.view_hunks().is_empty(),
+            "the collapsed placeholder stays"
+        );
+
+        // A fresh request answers against the new oids and is shown.
+        let (_, effect) = app.handle(Action::Expand);
+        let Some(Effect::Expand(_, again)) = effect else {
+            panic!("an expand effect: {effect:?}");
+        };
+        assert_ne!(
+            again.current, asked.current,
+            "the new request carries the new oids"
+        );
+        assert_eq!(
+            app.set_expanded(root("alpha"), &again, expansion_of(2, 0)),
+            Changed::Yes
+        );
     }
 
     fn status(app: &App) -> &str {

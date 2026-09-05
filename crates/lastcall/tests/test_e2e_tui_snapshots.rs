@@ -523,10 +523,7 @@ fn tui_diff_view_collapsed_expanded() {
     };
     let view = engine.hunks_of(&root, &asked).expect("the expansion");
     assert!(view.omitted_lines > 0, "a whole-file rewrite hits the cap");
-    assert_eq!(
-        app.set_expanded(root, asked.path.clone(), view),
-        Changed::Yes
-    );
+    assert_eq!(app.set_expanded(root, &asked, view), Changed::Yes);
     app.handle(Action::Open);
     snapshot("tui_diff_view_collapsed_expanded", &app, W, H);
 }

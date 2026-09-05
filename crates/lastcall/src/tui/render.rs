@@ -916,9 +916,17 @@ fn render_row_body(
             } else {
                 ""
             };
+            // A mode-only change on a collapsed row has no content hunks to count, so the
+            // header is where the change is named (verifier (a) F5 / (b) F5).
+            let mode = match (&row.baseline, &row.current) {
+                (Some(b), Some(c)) if b.mode != c.mode => {
+                    format!(" · mode {} → {}", b.mode.as_str(), c.mode.as_str())
+                }
+                _ => String::new(),
+            };
             let mut line = single(
                 format!(
-                    "collapsed ({name}) · +{} −{}{tail}",
+                    "collapsed ({name}) · +{} −{}{tail}{mode}",
                     with_thousands(row.added),
                     with_thousands(row.deleted)
                 ),
@@ -1480,7 +1488,8 @@ mod tests {
             "nothing is expanded yet: {before}"
         );
 
-        app.set_expanded(root("alpha"), b"f1".to_vec(), expansion_of(2, 1_234));
+        let asked = app.selected_row().unwrap().clone();
+        app.set_expanded(root("alpha"), &asked, expansion_of(2, 1_234));
         let (after, _) = frame_of(&app, 100, 30);
         assert!(
             after.contains("collapsed (glob)"),
@@ -1493,9 +1502,24 @@ mod tests {
         );
 
         // A whole answer has no footer.
-        app.set_expanded(root("alpha"), b"f1".to_vec(), expansion_of(2, 0));
+        app.set_expanded(root("alpha"), &asked, expansion_of(2, 0));
         let (whole, _) = frame_of(&app, 100, 30);
         assert!(!whole.contains("lines omitted"), "{whole}");
+    }
+
+    /// A collapsed row whose modes differ names the change in its header: a mode-only
+    /// change has no content hunks, so `+0 −0` alone would read as "nothing happened".
+    #[test]
+    fn render_collapsed_header_names_a_mode_change() {
+        use lastcall_engine::git::Mode;
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        let mut pile = alpha_collapsed(lastcall_engine::scan::Collapsed::Glob);
+        pile.rows[0].current.as_mut().unwrap().mode = Mode::Executable;
+        app.apply(pile_event_seq("alpha", 1, pile));
+        app.select(Some(row("alpha", "f1")));
+        let (frame, _) = frame_of(&app, 100, 30);
+        assert!(frame.contains("mode 100644 → 100755"), "{frame}");
     }
 
     /// A binary row says why there is nothing to expand and draws no control.
