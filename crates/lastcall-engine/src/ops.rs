@@ -916,6 +916,17 @@ impl Ops<'_> {
             });
         }
         let keep: Vec<usize> = all.iter().copied().filter(|i| *i != hunk_index).collect();
+        // An added file's only content hunk *is* the file (verifier F4; the F16 shape for
+        // additions). "Everything but hunk 0" is nothing at all, and writing a zero-byte
+        // file where the user's added file was left a truncated file and a still-pending
+        // row — recoverable only by pressing restore a second time. Take the removal path
+        // `restore_file` takes for exactly this row.
+        let baseline_absent = matches!(&baseline, Baseline::Absent)
+            || matches!(&baseline, Baseline::Empty if self.empty_baseline_means_absent());
+        if baseline_absent && keep.is_empty() {
+            let mut before = Self::second_cas(rendered, self.store, fault);
+            return self.restore_write(&rendered.path, None, None, &mut before);
+        }
         let content = hunks::apply_hunks(&base_bytes, hunks, &keep);
         let bytes = self.restore_bytes(&rendered.path, &content)?;
         // A content hunk leaves the mode where the live file has it: only the mode hunk
@@ -2020,6 +2031,50 @@ mod tests {
             "a file that did not exist at the baseline is removed, not truncated"
         );
         assert!(h.scan().pile.is_empty());
+    }
+
+    /// The hunk route reaches the same place the file route does for an added file
+    /// (verifier F4). It used to write a zero-byte file and leave the row pending.
+    #[test]
+    fn ops_restore_hunk_on_an_added_file_removes_it() {
+        let repo = FixtureRepo::new("ops-restore-added-hunk").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        repo.write("added", "new\n");
+        let row = h.scan().pile.row(b"added").unwrap().clone();
+        assert_eq!(row.change, Change::Added);
+        assert_eq!(
+            row.hunks.len(),
+            1,
+            "the addition renders as one content hunk"
+        );
+        let r = Rendered::of(&row);
+        let out = h.ops().restore_hunk(&r, &row.hunks, 0, &NoFault).unwrap();
+        assert!(out.ok(), "{out:?}");
+        assert!(
+            !repo.path().join("added").exists(),
+            "the row's only content hunk is the file: restoring it removes the file"
+        );
+        assert!(h.scan().pile.is_empty(), "and the row is gone");
+    }
+
+    /// The neighbouring case that must NOT remove: a first-sight root, where every row is
+    /// "added" but nothing has a baseline to go back to (F17).
+    #[test]
+    fn ops_restore_hunk_at_first_sight_does_not_remove() {
+        let repo = FixtureRepo::new("ops-restore-added-hunk-fs").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        h.ledger.seen_tree = None;
+        repo.write("added", "new\n");
+        let row = h.scan().pile.row(b"added").unwrap().clone();
+        let r = Rendered::of(&row);
+        let out = h.ops().restore_hunk(&r, &row.hunks, 0, &NoFault).unwrap();
+        assert!(out.ok(), "{out:?}");
+        assert!(
+            repo.path().join("added").exists(),
+            "with no seen tree there is no baseline to go back to; the draft survives"
+        );
     }
 
     #[test]
