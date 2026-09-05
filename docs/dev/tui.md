@@ -792,10 +792,13 @@ The two Phase 4 scenes drive the accept loop through the same binary:
   with `nothing pending across 3 roots` and no file row ever drawn (the agent's commit
   moved HEAD, not a baseline); one more edit shows `M f2  +1 −0` and `1 repo · 1 file · 1
   hunk`.
-- `pty_accept_refused_when_file_moves` — `f1`'s diff open, the agent appends a line, `A`
-  goes out before the 750 ms debounce has rescanned: the status reads `f1: changed since
-  rendered; not accepted`, the row stays, the ledger has no override; once the rescan
-  shows `M f1  +2 −1`, `A` accepts.
+- `pty_accept_refused_when_file_moves` — the `watching …` status is on (the watch is live,
+  so the append below is the debounce's to find), `f1`'s diff open, the agent appends a
+  line, `A` goes out before the 750 ms debounce has rescanned: the status reads `f1:
+  changed since rendered; not accepted`, the row stays, the ledger has no override; once
+  the rescan shows `M f1  +2 −1`, `A` accepts. Without that first wait a loaded runner
+  let the FSEvents install land after `A`: its gap-closing rescan found the append and its
+  `watching` notice replaced the refusal on the status row (CI macos-latest 2026-09-05).
 
 Both print `PTY accept …` timing lines. The status bar is asserted as `<text> · <age>`
 exactly, so `accepted f1` cannot pass for `accepted f1 · 1 hunk left`.

@@ -300,6 +300,20 @@ fn rows_listed(s: &vt100::Screen) -> bool {
 /// Wait for the first piles; returns how long they took. Also proves the first frame was
 /// the empty state with the `scanning` status: in the raw transcript that text precedes
 /// the first file row.
+/// The status row reads `watching <parent> (3 roots)`: the FSEvents watch is installed and
+/// its gap-closing rescans are done, so from here a file change is found by the live watch
+/// and its debounce rather than by a startup rescan. The temp path is long, so only the
+/// head of the line is asserted.
+fn wait_watching(pty: &mut PtyTui) {
+    pty.wait_for(LONG, |s| {
+        let (_, cols) = s.size();
+        s.rows(0, cols)
+            .last()
+            .is_some_and(|r| r.starts_with("watching "))
+    })
+    .unwrap_or_else(|e| panic!("the watch is live: {e}"));
+}
+
 fn wait_first_piles(pty: &mut PtyTui) -> Duration {
     let took = pty
         .wait_for(LONG, rows_listed)
@@ -874,13 +888,7 @@ fn pty_accept_loop_and_restart() {
         return;
     };
     let t = Instant::now();
-    pty.wait_for(LONG, |s| {
-        let (_, cols) = s.size();
-        s.rows(0, cols)
-            .last()
-            .is_some_and(|r| r.starts_with("watching "))
-    })
-    .unwrap_or_else(|e| panic!("relaunch scanned: {e}"));
+    wait_watching(&mut pty);
     assert!(
         find_words(&pty.raw(), &["scanning", "3", "roots…"]).is_some(),
         "the relaunch scanned first"
@@ -1060,6 +1068,13 @@ fn pty_accept_refused_when_file_moves() {
         return;
     };
     wait_first_piles(&mut pty);
+    // The race under test is against the 750 ms debounce of a *live* watch, so the watch
+    // has to be live first. The `watching …` notice arrives only after the FSEvents install
+    // and its gap-closing rescan of every root; on a loaded runner that landed after `A`,
+    // replacing the refusal on the status row and rescanning the append (CI macos-latest
+    // 2026-09-05). Before the watch is live the append would be found by that rescan, not
+    // by the debounce.
+    wait_watching(&mut pty);
     pty.send(b"jj\r").expect("keys");
     pty.wait_for_text("f1  M  +1 −1", Duration::from_secs(5))
         .unwrap_or_else(|e| panic!("f1 open: {e}"));

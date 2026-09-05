@@ -7,7 +7,13 @@
 //! runs both lines — so a mock, or a pane running anything but an interactive shell, would
 //! prove the opposite of what we need. The pane here runs `zsh -f -i`, whose `zle`
 //! `bracketed-paste` widget is on by default and holds a pasted multi-line payload in the
-//! editing buffer until the human presses Enter.
+//! editing buffer until the human presses Enter — or, where there is no zsh on the host,
+//! `bash --norc --noprofile -i` with readline's `enable-bracketed-paste` switched on (bash
+//! 5.1+ has it on by default; the `bind` makes the premise explicit). GitHub's
+//! `ubuntu-latest` image ships no zsh, and its `/bin/sh` is dash, which exits when an
+//! `exec` fails — so the pane's shell was gone by the second `send_text` and herdr
+//! answered `pane_not_found` (CI 2026-09-05). The shell is chosen by looking for `zsh` on
+//! this process's `PATH`; the pane runs on the same host.
 //!
 //! The mock-transport unit test (`herdr_stage_wraps_the_export_in_bracketed_paste_markers`)
 //! pins the exact request; this pins what the request *does*.
@@ -79,6 +85,22 @@ async fn send_raw<T: Transport>(t: &T, pane_id: &str, text: &str) {
     .expect("pane.send_text");
 }
 
+/// The interactive shell for the pane: the `exec` line that replaces the pane's `/bin/sh`,
+/// then the lines that make its prompt recognisable and its paste handling explicit.
+fn interactive_shell() -> (&'static str, Vec<String>) {
+    let prompt = format!("PS1='{PROMPT} '\r");
+    let has_zsh = std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join("zsh").is_file()));
+    if has_zsh {
+        ("exec zsh -f -i\r", vec![prompt])
+    } else {
+        (
+            "exec bash --norc --noprofile -i\r",
+            vec!["bind 'set enable-bracketed-paste on'\r".to_owned(), prompt],
+        )
+    }
+}
+
 /// Lines that are exactly `word` — command *output*, as opposed to `echo ONE` sitting on a
 /// prompt as pending input.
 fn output_lines(screen: &str, word: &str) -> usize {
@@ -112,17 +134,21 @@ async fn herdr_real_send_text_lands_unsubmitted() {
         .to_string();
     say(&format!("hosting pane {pane}"));
 
-    // An interactive zsh with no rc files, then a prompt we can recognise. `exec` replaces
+    // An interactive shell with no rc files, then a prompt we can recognise. `exec` replaces
     // the pane's own shell so nothing underneath can answer instead.
-    send_raw(&t, &pane, "exec zsh -f -i\r").await;
-    send_raw(&t, &pane, &format!("PROMPT='{PROMPT} '\r")).await;
-    // The prompt itself starts a line; the echoed command that set it carries a quote.
-    wait_for(&t, &pane, "the zsh prompt", |s| {
+    let (exec_line, setup) = interactive_shell();
+    say(&format!("shell: {}", exec_line.trim_end()));
+    send_raw(&t, &pane, exec_line).await;
+    for line in &setup {
+        send_raw(&t, &pane, line).await;
+    }
+    // The prompt itself starts a line; the echoed commands that set things up carry quotes.
+    wait_for(&t, &pane, "the shell prompt", |s| {
         s.lines()
             .any(|l| l.starts_with(PROMPT) && !l.contains('\''))
     })
     .await;
-    say("interactive zsh is up");
+    say("interactive shell is up");
 
     // The gesture under test.
     stage(&t, &pane, "echo ONE\necho TWO").await.expect("stage");
