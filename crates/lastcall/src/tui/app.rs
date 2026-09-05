@@ -361,6 +361,14 @@ pub struct App {
     pub diff: DiffCursor,
     /// Outer width of the nav pane (its right border is the divider), 16..=60.
     pub nav_width: u16,
+    /// The nav's scroll offset in **nav lines** — the vector `render_nav` builds and
+    /// windows, not `nav_entries()`, because separators, branch lines and the
+    /// nothing-pending line are lines the reader scrolls past but can never select.
+    ///
+    /// Written back from `HitMap::nav_top` after each frame that drew the nav (deliverable
+    /// 9), so scrolling survives the next pile: the reducers never touch it, and the
+    /// clamp in `render_nav` handles a list that shrank underneath it.
+    pub nav_top: usize,
     pub dragging: bool,
     pub full_paths: bool,
     pub show_remote: bool,
@@ -410,6 +418,7 @@ impl App {
             focus: Focus::Nav,
             diff: DiffCursor::default(),
             nav_width: NAV_WIDTH_DEFAULT,
+            nav_top: 0,
             dragging: false,
             full_paths: false,
             show_remote: false,
@@ -3321,6 +3330,22 @@ mod tests {
             app.herdr.flag(&root("alpha")).unwrap().status,
             Attention::Done
         );
+    }
+
+    /// Deliverable 9: the nav offset belongs to the frame, not to the reducers. `sync_roots`
+    /// and `apply` must leave it alone — a list that shrank under it is `render_nav`'s clamp
+    /// to fix, and a reducer that "helpfully" reset it would undo the reader's scroll on
+    /// every pile.
+    #[test]
+    fn app_reducers_never_move_the_nav_offset() {
+        let mut app = three_roots();
+        app.nav_top = 7;
+        app.sync_roots(vec![meta("alpha"), meta("beta")]);
+        app.apply(pile_event_seq("alpha", 9, rows_n(3, 0, 0)));
+        app.select(Some(row("alpha", "p01")));
+        app.handle(Action::Resize(80, 24));
+        app.handle(Action::NavPageDown);
+        assert_eq!(app.nav_top, 7, "only a drawn frame moves it");
     }
 
     /// Phase 6 deliverable 6: herdr re-derives on every snapshot it receives, and most say

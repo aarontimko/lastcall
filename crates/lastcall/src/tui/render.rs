@@ -63,6 +63,12 @@ pub struct HitMap {
     pub nav: Option<Rect>,
     pub main: Option<Rect>,
     pub targets: Vec<(Rect, Target)>,
+    /// The nav offset this frame used, in **nav lines** (deliverable 9), written back into
+    /// [`App::nav_top`] by [`crate::tui::run::Ui::rendered`] so the next frame starts where
+    /// this one left off. `None` when the nav was not drawn at all — below
+    /// [`NAV_MIN_COLS`], or in a frame with no nav pane — so a narrow window does not reset
+    /// an offset the user will see again when it widens.
+    pub nav_top: Option<usize>,
 }
 
 impl HitMap {
@@ -596,11 +602,24 @@ fn render_nav(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
         }
     }
 
+    // Deliverable 9: the offset persists across frames. Before, it was derived from the
+    // selection alone, so every frame with the selection in view snapped back to line 0 and
+    // a mouse-only reader could never see past the first screenful of a long nav.
+    //
+    // The rules, in order: clamp what the last frame left (the list may have shrunk under
+    // it), then scroll the minimum that brings the selected line back into
+    // `[top, top + rows)` — above, the line becomes the top; below, the bottom.
     let rows = area.height as usize;
-    let offset = match selected_at {
-        Some(i) if i >= rows => i + 1 - rows,
-        _ => 0,
-    };
+    let max_top = lines.len().saturating_sub(rows);
+    let mut offset = app.nav_top.min(max_top);
+    if let Some(i) = selected_at {
+        if i < offset {
+            offset = i;
+        } else if i >= offset + rows {
+            offset = i + 1 - rows;
+        }
+    }
+    hits.nav_top = Some(offset);
     for (i, entry) in lines.iter().enumerate().skip(offset).take(rows) {
         let y = area.y + (i - offset) as u16;
         let row_rect = Rect::new(area.x, y, area.width, 1);
@@ -1344,6 +1363,100 @@ mod tests {
             .unwrap();
         let buf = terminal.backend().buffer().clone();
         (terminal.backend().to_string(), styles(&buf))
+    }
+
+    /// One root with `n` rows `p00`..`pNN`, so the nav's lines are exactly the root name
+    /// (line 0), its branch line (line 1) and one line per row from line 2.
+    fn one_root(n: usize) -> App {
+        let mut app = App::new();
+        app.sync_roots(vec![meta("alpha")]);
+        app.apply(pile_event("alpha", rows_n(n, 0, 0)));
+        app.handle(Action::Resize(100, 30));
+        app
+    }
+
+    /// Draw just the nav into a `rows`-high pane and report the offset it used and where
+    /// each drawn line landed.
+    fn nav_only(app: &mut App, rows: u16) -> HitMap {
+        let area = Rect::new(0, 0, 40, rows);
+        let mut buf = Buffer::empty(area);
+        let mut hits = HitMap::default();
+        render_nav(app, &mut buf, area, &mut hits);
+        if let Some(top) = hits.nav_top {
+            app.nav_top = top;
+        }
+        hits
+    }
+
+    /// Deliverable 9: the nav offset persists between frames and moves the **minimum** that
+    /// brings the selection back on screen. Before, it was recomputed from the selection
+    /// every frame, so a nav longer than the pane snapped back to the top the moment the
+    /// selection was visible.
+    #[test]
+    fn render_nav_offset_scrolls_the_minimum_to_reach_the_selection() {
+        // 38 rows -> 40 nav lines: the root, its branch line, then one per row.
+        let mut app = one_root(38);
+        assert_eq!(app.nav_top, 0);
+
+        // Line 25 (row p23) in a 20-row pane: the bottom of the window lands on it.
+        app.select(Some(row("alpha", "p23")));
+        assert_eq!(nav_only(&mut app, 20).nav_top, Some(6), "25 + 1 − 20");
+
+        // Line 20 is inside [6, 26): a selection already on screen scrolls nothing.
+        app.select(Some(row("alpha", "p18")));
+        assert_eq!(nav_only(&mut app, 20).nav_top, Some(6));
+
+        // Line 5 is above the window: it becomes the top, not the bottom.
+        app.select(Some(row("alpha", "p03")));
+        assert_eq!(nav_only(&mut app, 20).nav_top, Some(5));
+
+        // The last line can never leave the pane less than full.
+        app.select(Some(row("alpha", "p37")));
+        assert_eq!(nav_only(&mut app, 20).nav_top, Some(20), "40 − 20");
+    }
+
+    /// A click selects the line under the pointer and the view does not jump: the reader
+    /// clicked what they could see, so there is nothing to scroll to.
+    #[test]
+    fn render_nav_offset_is_unchanged_by_a_click_on_a_visible_row() {
+        let mut app = one_root(38);
+        app.select(Some(row("alpha", "p23")));
+        let hits = nav_only(&mut app, 20);
+        assert_eq!(app.nav_top, 6);
+
+        // The pane's third screen row is nav line 8 — row p06.
+        let target = hits.at(0, 2).expect("a nav target").clone();
+        assert_eq!(target, Target::NavRow(root("alpha"), b"p06".to_vec()));
+        app.hit(target);
+        assert_eq!(app.selection, Some(row("alpha", "p06")));
+        assert_eq!(
+            nav_only(&mut app, 20).nav_top,
+            Some(6),
+            "the clicked line was already on screen"
+        );
+    }
+
+    /// A pile that empties most of a root leaves an offset past the end of the list; the
+    /// clamp pulls it back so the pane is full rather than blank.
+    #[test]
+    fn render_nav_offset_clamps_when_the_list_shrinks() {
+        let mut app = one_root(38);
+        app.select(Some(row("alpha", "p37")));
+        assert_eq!(nav_only(&mut app, 20).nav_top, Some(20));
+
+        // 8 rows -> 10 lines, which is shorter than the pane: the only valid offset is 0.
+        app.apply(pile_event_seq("alpha", 2, rows_n(8, 0, 0)));
+        assert_eq!(
+            app.nav_top, 20,
+            "the reducers leave the offset alone; the clamp is render's job"
+        );
+        assert_eq!(nav_only(&mut app, 20).nav_top, Some(0));
+
+        // 30 rows -> 32 lines: the deepest a 20-row pane can start is line 12.
+        app.apply(pile_event_seq("alpha", 3, rows_n(30, 0, 0)));
+        app.nav_top = 25;
+        app.selection = None;
+        assert_eq!(nav_only(&mut app, 20).nav_top, Some(12));
     }
 
     /// Phase 6 deliverable 4: the collapsed row's header offers `[e expand]`, the answer

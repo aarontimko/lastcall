@@ -182,6 +182,12 @@ impl Ui {
 
     /// Record the hit map a render produced.
     pub fn rendered(&mut self, hits: HitMap) {
+        // Deliverable 9: only a frame that actually drew the nav has an offset to report.
+        // A `None` means the nav was not on screen (below `NAV_MIN_COLS`), and the app keeps
+        // the offset it had, so widening the window returns the reader where they were.
+        if let Some(top) = hits.nav_top {
+            self.app.nav_top = top;
+        }
         self.hits = Some(hits);
     }
 }
@@ -1054,6 +1060,47 @@ mod tests {
             drain(ui, &mut sources, &mut self.link, &mut pass);
             pass
         }
+    }
+
+    /// Deliverable 9: `Ui::rendered` is where the frame's nav offset becomes the app's, and
+    /// it writes back **only** what a frame that drew the nav reported. Below
+    /// `NAV_MIN_COLS` there is no nav pane and therefore no offset, so a narrow window must
+    /// not reset one the reader will see again when it widens.
+    #[test]
+    fn run_nav_offset_is_written_back_only_by_a_frame_that_drew_the_nav() {
+        fn draw_at(ui: &mut Ui, w: u16, h: u16) -> Option<usize> {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            let mut hits = HitMap::default();
+            term.draw(|f| hits = render(&ui.app, f)).unwrap();
+            let reported = hits.nav_top;
+            ui.rendered(hits);
+            reported
+        }
+
+        let mut app = App::new();
+        app.sync_roots(vec![meta("alpha")]);
+        app.apply(pile_event("alpha", rows_n(60, 0, 0)));
+        app.handle(Action::Resize(100, 30));
+        let mut ui = Ui::new(app, Keymap::defaults());
+
+        // A selection deep in the list scrolls the nav and the offset lands on the app.
+        ui.app.select(Some(row("alpha", "p50")));
+        assert!(draw_at(&mut ui, 100, 30).is_some());
+        let scrolled = ui.app.nav_top;
+        assert!(scrolled > 0, "the nav scrolled to reach p50");
+
+        // 60 columns is under `NAV_MIN_COLS`: no nav, nothing to report, nothing written.
+        ui.app.handle(Action::Resize(60, 30));
+        assert_eq!(draw_at(&mut ui, 60, 30), None, "no nav pane, no offset");
+        assert_eq!(
+            ui.app.nav_top, scrolled,
+            "the offset survived the narrow frame"
+        );
+
+        // Wide again, and the reader is where they were.
+        ui.app.handle(Action::Resize(100, 30));
+        assert_eq!(draw_at(&mut ui, 100, 30), Some(scrolled));
+        assert_eq!(ui.app.nav_top, scrolled);
     }
 
     /// Deliverable 6(a): a burst of piles is **one** pass and therefore one frame. Before
