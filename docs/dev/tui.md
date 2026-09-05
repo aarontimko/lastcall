@@ -68,7 +68,8 @@ gate greps at the end of this page are how that is enforced).
   every other key.
 - **`run.rs` — the loop.** One tokio `select!` over the watcher's events, the terminal
   reader thread's events, the loop's own finished engine work (`Local`), a 1 s tick, Ctrl-C
-  (a key event under raw mode; the signal branch is for `kill -INT`) and SIGTERM. Every
+  (a key event under raw mode; the signal branch is for `kill -INT`) and SIGTERM. One
+  **pass** per iteration, not one per event: see "One draw per pass" below. Every
   engine call goes through `watcher::blocking` on a spawned task; the UI task never holds the
   engine mutex (`rg -n 'lock\(' crates/lastcall/src/tui` finds nothing). `Effect::Accept`
   runs as **one** `blocking` closure over every root it covers (`spawn_accept`): each root's
@@ -82,12 +83,63 @@ gate greps at the end of this page are how that is enforced).
   the panic hook, `TerminalGuard::drop` and the quit path, so a crash never leaves the shell
   in raw mode.
 
+### One draw per pass (Phase 6)
+
+The `select!` wakes on one event; `run::drain` then polls the other three receivers
+round-robin — input, engine, local, herdr — and folds everything already queued into the
+same **`Pass`** before the frame is drawn. Ten piles landing together are one draw, not
+ten, and a herdr resync that re-derives an identical root map is now no draw at all
+(`ReadyDelta.changed`, `herdr_apply_roots_reports_changed_only_when_the_map_moved`, and
+`app_herdr_roots_draw_nothing_when_the_derivation_is_identical`).
+
+- **`Pass { changed, cause, effects, stop, rescan, held }`.** `changed` is the `Changed`
+  fold over every event in the pass; `cause` is the **first** source that made it
+  `Changed::Yes` (`"input"`, `"engine"`, `"local"`, `"herdr"`, `"timer"`, `"tick"`) and is
+  the `cause=` field of the `draw` probe; `effects` are the non-quit effects, run in order
+  after the drain. A quit — from `Pass::of`'s own seed or from any folded event — becomes
+  `Pass::stop`, never an entry in `effects`: the dispatch loop must not `break` out of a
+  `for` and drop the rest of the pass's work, and the seeded case is asserted
+  (`run_drain_stops_at_quit_and_at_a_fatal`). `Local::Fatal` becomes `Stop::Fatal` the same
+  way.
+- **`DRAIN_CAP` = 256** events per pass. Past it the drain returns with the rest still
+  queued, so a pathological producer cannot starve the frame
+  (`run_drain_stops_at_the_cap`).
+- **Press pushback.** A left `Press` that arrives once the pass is already
+  `Changed::Yes` is **held**, not folded: it would be hit-tested against a `HitMap` from a
+  frame the user never saw. It is replayed as the first event of the next pass, against the
+  frame it was aimed at (`run_drain_holds_a_press_behind_an_undrawn_change`). Wheel and
+  release events have no such hazard and fold freely.
+
+`run_drain_folds_a_burst_of_piles_into_one_pass` is the shape test: 17 piles pushed into
+two different receivers, one pass, 17 hunks on the row, and an empty `Pass` on the next
+drain.
+
+### The nav keeps its scroll offset (Phase 6)
+
+`App.nav_top` is the nav's offset in **nav lines** — the vector `render_nav` builds and
+windows, not `nav_entries()`. No reducer ever writes it
+(`app_reducers_never_move_the_nav_offset`): `render_nav` clamps the stored offset to the
+current list, scrolls it the *minimum* needed to bring the selection into view, and reports
+where it landed as
+`HitMap::nav_top`, which `Ui::rendered` writes back. `HitMap::nav_top` is `None` whenever
+the nav was not drawn (below `NAV_MIN_COLS`), and then the offset survives untouched —
+`run_nav_offset_is_written_back_only_by_a_frame_that_drew_the_nav`. The visible
+consequence: clicking a row that is already on screen no longer scrolls the list, and a
+selection that moves one line moves the window one line.
+
 ### Startup and the first frame
 
 `commands/tui.rs` fails loudly *before* the terminal is touched: stdout not a TTY → the
 one permitted message `lastcall: not a terminal; try \`lastcall status\`` on stderr, exit 2
 (never draws into a pipe); a `[keys]` table that does not parse → `lastcall: [keys] …`, exit
-2; an engine that cannot open → exit 1 like `status`. Then `run::run` builds the runtime as
+2; an engine that cannot open → exit 1 like `status`. Discovery itself can take seconds on a
+large parent dir (S1's hundred roots: about 3.7 s), and it happens *before* there is a
+screen to draw into, so `commands/tui.rs` prints one line to **stderr** first —
+`lastcall: discovering roots under <dir>[, <dir>]…` (`commands::tui::DISCOVERING`) — after
+`term::init_tracing()` and before `Engine::open`. It is the only thing on stderr in the
+happy path, it scrolls away with the shell's scrollback when the alternate screen opens,
+and the PTY harness pins the order: the line, then `\x1b[?1049h`, then `scanning N roots…`
+(`wait_first_piles`). Then `run::run` builds the runtime as
 `watch` does, enters the terminal, seeds the app with the engine's roots (`sync_roots`) and
 the status `scanning N roots…`, and draws the empty state — the first piles arrive through
 the watcher a moment later (about 1.6 s on the fixture under the PTY harness). `--poll N`
@@ -182,6 +234,7 @@ Defaults (`input::DEFAULT_KEYMAP`, in help-overlay order):
 | `accept` | `a` | on a file row: the one hunk under the diff cursor (a hunkless row — binary, collapsed, deleted, unreadable — whole); on a group: the group; on a root: every row of it (asks above 10 files) | the same hunk |
 | `accept_file` | `shift-a` | accept the selected file whole — the only key that does | |
 | `accept_all` | `ctrl-a` | accept everything listed, every root (asks above 10 files) | |
+| `expand` | `e` | expand the selected collapsed row into hunks ("Collapsed rows" below) | |
 | `ack` | `d` | ack the selected root's herdr ready flag ("herdr in the UI" below) | |
 | `jump` | `g` | focus the selected root's agent in herdr | |
 | `scope` | `w` | workspace scope on/off | |
@@ -214,6 +267,44 @@ terminal's. Hold **shift** while dragging to select and copy with the terminal's
 selection (every terminal we target honours the shift override). The help overlay says so
 in its last line (`render::SELECT_NOTE`); it is the stopgap until the Phase 8 select-to-copy
 item lands.
+
+### Collapsed rows and `e` (Phase 6)
+
+A lockfile, a binary or a file over `collapse_size_bytes` is a **collapsed** row: `⊟` in the
+nav, and in the main pane one dimmed line instead of a diff —
+`collapsed (glob|binary|size) · +a −d` — with `[e expand]` right-aligned on it. The accept
+story is unchanged and deliberately whole-row: `a` on a collapsed row takes the file (there
+is no hunk to point at) and `A` does the same, which is why an expansion draws **no
+per-hunk `[a accept]` control** — the row header's `[A accept file]` is the only accept on
+that screen.
+
+- `e` (or a click on `[e expand]`) emits `Effect::Expand(root, Box<Row>)`; the loop runs
+  `Engine::hunks_of` off the UI task and hands the result back as `Local::Expanded`. The
+  boxed row is not ceremony: `hunks_of` diffs *that row's* oids, so the expansion always
+  matches the counts on screen.
+- `App.expanded: Option<Expansion>` holds `{ root, path, baseline, current, view }` — one
+  at a time, and `App::expansion()` returns it only while the selection still points at
+  that row. A newer pile whose oids differ clears it, so a stale expansion cannot outlive
+  the delta it was computed from.
+- **Binary is never expandable.** The line reads `collapsed (binary) · +a −d · not
+  expandable`, no control is drawn and no hit target is registered, and `e` on such a row
+  is a silent no-op — no effect, no redraw. `e` is equally silent on a row that is not
+  collapsed and on one already expanded (`app_expand_is_a_no_op_off_a_collapsed_row`), and
+  the key and the click go down the same path (`input_parity_expand`, whose second half
+  asserts a binary row offers no expand target).
+- The expansion is capped at `hunks::EXPAND_LINE_CAP` = 2,000 body lines. When it truncates,
+  the **last line of the pane** is `… N lines omitted (cap 2,000)` — the footer owns that
+  line, so a truncated expansion can never scroll its own warning off the screen.
+
+**Design-pass input** (§10 2026-09-05 ruling 3: Phases 6–8 add no new layout concept
+without a note here naming it). Phase 6 adds two: the **collapsed-row body** — a dimmed
+status line carrying a right-aligned `[e expand]` control, with hunks and a cap footer
+under it — and the **retained nav offset**, which changes when the list scrolls rather than
+what it looks like. The snapshots `tui_draft_root_hunks`, `tui_nav_collapsed_lockfile`,
+`tui_nav_collapsed_binary_and_size` and `tui_diff_view_collapsed_expanded` are those
+frames, and they join `tui_accept_controls`, `tui_herdr_scope_notice` and `tui_herdr_scope_notice_with_status` as
+the pass's input at the Phase 9 kickoff. Nothing in the status line, the header ladder or
+the scope notice moved.
 
 ### The `[keys]` table (`config.toml`)
 
@@ -498,6 +589,43 @@ exactly, so `accepted f1` cannot pass for `accepted f1 · 1 hunk left`.
   `LASTCALL_LOG` (an `EnvFilter` directive, default `info`). Unset, there is no subscriber at
   all. These two reads are the only environment access under `tui/`; everything else comes
   through the engine's `Env`.
+
+### What `debug` says (Phase 6 deliverable 8)
+
+```sh
+LASTCALL_LOG=debug LASTCALL_LOG_FILE=/tmp/lc.log lastcall tui
+```
+
+Answering "why is it slow / why did nothing happen" without a debugger. Seven messages, and
+the **field names are the interface** — greps and the capture test
+(`crates/lastcall-engine/tests/test_integration_tracing.rs`) depend on them, so rename one
+and fix both:
+
+| message | fields | where |
+|---|---|---|
+| `open done` | `roots`, `ms` | `Engine::open`, once per process |
+| `scan done` | `root`, `ms`, `rows`, `seq` | every scan, `Engine::scan` and each root of `scan_all` |
+| `watch event` | `path`, `kind`, `scheduled` | one per actionable filesystem event |
+| `scan due` | `root`, `reason` | a root's scan was scheduled |
+| `head inspect` | `root`, `changed` | every HEAD inspection, poll or event |
+| `fold` | `source`, `changed` | one per event folded into a `Pass` |
+| `draw` | `cause`, `ms` | one per frame actually drawn |
+
+Two closed vocabularies:
+
+- `scheduled=` is what the watcher routed the event to: `scan` (a worktree path), `head` (a
+  git-dir path on the allowlist), `ignore` (filtered out) — `Scheduled::label`.
+- `reason=` is why a scan became due: `event` (a filesystem event), `head` (HEAD moved and
+  the inspection scanned), `rescan` (the backstop, a watcher error, or the root set
+  changing), `refresh` (the initial pass and the post-install catch-up).
+
+`fold`'s `source=` and `draw`'s `cause=` share one vocabulary — `input`, `engine`, `local`,
+`herdr`, `timer`, `tick` — so `rg 'draw' /tmp/lc.log` counts frames and says what caused
+each, and the `fold` lines between two `draw` lines are exactly what that pass coalesced.
+`watch installed` (with `roots`) and `rescan backstop` mark the two lifecycle moments.
+There is no `set_global_default` anywhere in the tree, in tests included: the capture test
+is its own integration binary because `tracing` caches callsite interest **globally**, so a
+sibling lib test scanning on a subscriber-free thread would poison it.
 
 ## Gate greps
 

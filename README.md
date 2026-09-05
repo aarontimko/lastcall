@@ -24,7 +24,9 @@ sees; see [`docs/dev/hello-herdr.md`](docs/dev/hello-herdr.md)). Phase 2 adds th
 review engine behind `lastcall status` and `lastcall watch`. Phase 3 adds the terminal UI:
 bare `lastcall` (or `lastcall tui`) shows every root's pile and updates it live. Phase 4
 adds accepting — hunk, file, group, repo, everything — which is what shrinks the pile and
-survives a restart.
+survives a restart. Phase 5 adds the herdr overlay (below). Phase 6 adds draft dirs (a directory that is not a git repo, reviewed as
+a root of its own) and collapsed rows: a lockfile, a binary or a very large file is one
+accept, not a wall of hunks, and `e` expands one on demand when you do want to read it.
 
 ## Try it
 
@@ -47,10 +49,13 @@ accepts the selected file whole, `ctrl-a` (or a click on `[Accept All]`) accepts
 listed across every repo — above ten files a modal asks first (`y`/`enter` confirm,
 `n`/`esc` cancel). An accept is compare-and-swap against what was on screen: if the file
 changed underneath, the status says `changed since rendered; not accepted` and the row
-stays. The pile shrinks to `nothing pending`, and a relaunch on the same state dir starts
+stays. A generated file — a lockfile, a binary, anything over `collapse_size_bytes` — is a
+single `⊟` row instead of a diff: `a` or `A` accepts it whole, and `e` expands the
+lockfile/large-file kind into real hunks (up to 2,000 lines; a binary is never expandable).
+The pile shrinks to `nothing pending`, and a relaunch on the same state dir starts
 from there, whatever the agent committed in between (an agent's commit moves HEAD, never
-your baseline). Not yet: flagging with a note and restoring (Phase 7), draft dirs and
-single-row lockfile/binary accepts (Phase 6), editing in place (Phase 8). `lastcall tui --poll 2` polls every 2 s if filesystem events are late or
+your baseline). Not yet: flagging with a note and restoring (Phase 7), editing in place
+(Phase 8). `lastcall tui --poll 2` polls every 2 s if filesystem events are late or
 missing.
 Keys are rebindable in `config.toml`, one spec or a list per action (the full grammar and
 table: [`docs/dev/tui.md`](docs/dev/tui.md)):
@@ -76,6 +81,28 @@ scope = "workspace" # workspace | all — which repos the overlay covers
 
 The toast also needs herdr's own `[ui.toast] delivery = "herdr"`, which is `"off"` by
 default; the details and the demo recipe are in [`docs/dev/tui.md`](docs/dev/tui.md).
+
+### `config.toml`
+
+`~/.config/lastcall/config.toml` (`XDG_CONFIG_HOME` honoured; `lastcall config` prints the
+effective values and any notices). Every key is optional and an unknown key is an error:
+
+| key | default | what it does |
+|---|---|---|
+| `parent_dirs` | `[]` (the launch cwd) | absolute paths whose git repos are watched |
+| `draft_dirs` | `[]` | globs relative to a parent dir (`"_drafts/**"`, `"notes"`) or absolute paths: directories that are **not** git repos, reviewed as roots of their own |
+| `draft_initial` | `"seen"` | what a draft root's first sight means — `seen` (start from zero, review only what changes after it) or `pending` (everything already there is pending) |
+| `collapsed_globs` | the nine common lockfiles | paths shown as one collapsed row instead of hunks: `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `Cargo.lock`, `poetry.lock`, `uv.lock`, `Gemfile.lock`, `go.sum`, `composer.lock` |
+| `collapse_size_bytes` | `524288` (512 KiB) | files **larger** than this collapse too; must be > 0. A file with a NUL byte in its first 8,000 is binary and collapses whatever this says |
+| `ignore_globs` | `.git/**`, `node_modules/**`, `target/**`, `vendor/**`, `.venv/**` | scope the filesystem watcher only — an ignored path never wakes a scan, but the next scan still shows a tracked edit under it |
+
+```toml
+parent_dirs = ["/Users/me/src"]
+draft_dirs = ["_drafts/**", "notes"]
+draft_initial = "seen"
+collapsed_globs = ["package-lock.json", "Cargo.lock", "*.min.js"]
+collapse_size_bytes = 524288
+```
 
 The headless commands:
 

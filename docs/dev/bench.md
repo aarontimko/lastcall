@@ -30,7 +30,7 @@ lines, copied. A debug build prints a SKIP line and measures nothing.
   new dependency.
 - The TUI runs with `--poll 1` in S1, S2 and S4 (and in S3's first half), so head polling
   and the full rescan both tick every second; the `S3_events` half runs with the defaults
-  (debounce 750 ms, head poll 10 s, rescan 30 s) so that the number is the watcher's, not
+  (debounce 750 ms with a 3 s cap, head poll 10 s, rescan 30 s) so that the number is the watcher's, not
   the rescan backstop's. If the watcher never delivered the burst within 25 s the harness
   prints a SKIP line instead of a number.
 
@@ -101,15 +101,16 @@ open_ms` is the same file under the default config: `jj`+`enter` from the collap
 
 The scan runs Myers twice per row — once for `counts` (the `+n −m` in the nav) and once
 for `diff` (the hunks) — so the 100,000-line file is diffed twice in the 270 ms. A Phase 9
-target candidate, noted here, not acted on.
+target candidate, noted here, not acted on. `scan_spawns` is **16** as of Phase 6 (run D
+below); this row is the Phase 4 number.
 
 ### S3 — 1,000 files dropped into a clean root under watch
 
 One first-sighted repo with the TUI showing `nothing pending across 1 root` and the status
 line at `watching …`; then 1,000 files (`d00`–`d09`, 100 per dir) written as fast as the
 harness can. `settle_ms` runs from the last write to `1 repo · 1,000 files` in the header.
-`S3` is `tui --poll 1`; `S3_events` is `tui` with the default timings (debounce 750 ms, the
-30 s rescan backstop), so its number is the watcher's own.
+`S3` is `tui --poll 1`; `S3_events` is `tui` with the default timings (debounce 750 ms under
+its 3 s cap, the 30 s rescan backstop), so its number is the watcher's own.
 
 | metric | `S3` (`--poll 1`) | `S3_events` (defaults) |
 |---|---|---|
@@ -142,7 +143,8 @@ The in-process `scan_ms` is one `Engine::scan` of the same root after the TUI ha
 | `omitted` | 40000 |
 
 `rows_shown == DEFAULT_ROW_CAP` and `omitted == 50,000 − cap` are asserted by the
-harness, not just printed.
+harness, not just printed. `scan_spawns` is **15** as of Phase 6 (run D below); this row is
+the Phase 4 number.
 
 ## Variance (run B, and a third run)
 
@@ -231,6 +233,9 @@ cargo test --release -p lastcall --test test_bench -- --ignored --nocapture --te
 | `first_pile_ms` | 33623 | 13851 | 4803 |
 | `first_frame_ms` | 56568 | 35947 | 8762 |
 | `peak_rss_kb` | 31936 | 28288 | 28736 |
+
+`scan_all_spawns` is **1600** as of Phase 6 (run D below); this table's 1700 is the Phase 5
+number and the "before" that run D is measured against.
 
 ### S1h — 50 clones, 80 edited files each (4,000 rows)
 
@@ -338,6 +343,91 @@ so the gap between the first pile and the full frame stayed at ~22 s until that 
 one `scan_all` (S1's first pile is still streamed on its own, so `first_pile_ms` is
 unaffected). `peak_rss_kb` moves by less than the sampler's noise: eight concurrent roots
 cost about 0.4 MB over one on S1, and nothing near a per-root allocation.
+
+## Phase 6 (run D): one remote-ref listing per scan
+
+`docs/spec/95-phase6-kickoff.md` deliverable 5. Classification used to run
+`for-each-ref refs/remotes` to build its memo key and then `classify` ran the listing
+again; now the listing that builds the key is the listing `classify` is given, so a scan
+issues **one** `for-each-ref`, not two. Nothing else in this phase touches the scan's git
+usage (`hunks_of` is on-demand, off every scan by construction).
+
+Machine block: unchanged from above except the date (2026-09-05) and the commit (this
+branch's tip). Command: `just bench` (all five scenarios, `--test-threads=1`), one run.
+
+### The spawn rows
+
+| scenario | metric | before | after | per root per scan |
+|---|---|---|---|---|
+| S1 | `open_spawns` | 1102 | 1102 | 11 → 11 (open lists no remote refs) |
+| S1 | `scan_all_spawns` | 1700 | **1600** | 17 → **16** |
+| S2 | `scan_spawns` | 19 | **16** | one root, one scan |
+| S4 | `scan_spawns` | 18 | **15** | one root, one scan |
+
+S1 is the clean comparison: its "before" is the Phase 5 measurement in the table above, on
+the same fixture, so the whole −100 is this phase — exactly one fewer git process per root
+per scan, across 100 roots. S2's and S4's "before" columns are the **Phase 4** run-A
+numbers (neither scenario was re-run in Phase 5), so their −3 carries Phase 5's batched
+head inspection as well as this phase's −1; the Phase 5 paragraph's "19 per scan became 17"
+is the missing middle. No count moved that was not a spawn: `rows`, `hunks`, `rows_shown`
+and `omitted` are identical to run A.
+
+Wall times are lower across the board against run A, but run A predates the bounded pool
+and the batched reads and is not a like-for-like: read them against the Phase 5 table
+instead (S1 `open_ms` 4291 → 3682, `scan_all_ms` 4464 → 3853, `first_frame_ms` 8803 →
+7533 — the spawn the scan no longer makes, times 100 roots, plus run-to-run noise).
+
+### The raw `BENCH` lines
+
+```text
+BENCH S1 open_ms=3682
+BENCH S1 open_spawns=1102
+BENCH S1 roots=100
+BENCH S1 rows=4000
+BENCH S1 scan_all_ms=3853
+BENCH S1 scan_all_spawns=1600
+BENCH S1 first_pile_ms=4370
+BENCH S1 first_frame_ms=7533
+BENCH S1 peak_rss_kb=21728
+BENCH S1h open_ms=2093
+BENCH S1h open_spawns=552
+BENCH S1h roots=50
+BENCH S1h rows=4000
+BENCH S1h scan_all_ms=2999
+BENCH S1h scan_all_spawns=800
+BENCH S1h first_pile_ms=2226
+BENCH S1h first_frame_ms=3994
+BENCH S1h peak_rss_kb=21280
+BENCH S2 file_bytes=1100001
+BENCH S2 hunks=2
+BENCH S2 scan_ms=206
+BENCH S2 scan_spawns=16
+BENCH S2 open_ms=13
+BENCH S2 hunk_next_ms=13
+BENCH S2 page_down_ms=14
+BENCH S2 peak_rss_kb=53680
+BENCH S2_default_config open_ms=15
+BENCH S3 files=1000
+BENCH S3 settle_ms=1539
+BENCH S3 peak_rss_kb=9792
+BENCH S3_events files=1000
+BENCH S3_events settle_ms=1528
+BENCH S3_events peak_rss_kb=9632
+BENCH S4 capped_count_ms=3485
+BENCH S4 settle_ms=5123
+BENCH S4 peak_rss_kb=78608
+BENCH S4 scan_ms=1540
+BENCH S4 scan_spawns=15
+BENCH S4 rows_shown=10000
+BENCH S4 omitted=40000
+```
+
+S2's screen half (`open_ms` and below) is from a second invocation of `bench_s2` alone: the
+first `just bench` failed there on an assertion that predates this phase. `bench_s2` waited
+for the nav to read `M big.txt`, but `+99,989 −99,989` with thousands separators (`cd045b2`,
+Phase 4 ruling 2) leaves the 28-column nav no room for the extension, so the row renders
+`M big.…`. The scenario's own numbers were never wrong — the wait was — and the assertion
+is now `M big`. S1, S3 and S4 were unaffected and their lines are from the single full run.
 
 ## What the first run found
 

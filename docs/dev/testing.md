@@ -32,7 +32,11 @@ focus arrows and the shift-drag note: 106 binary lib = 317; the deletion-row hun
 (sponsor-found, `a4e353c`): 185 engine = 318, the Phase 5 floor; Phase 5 engine and TUI work
 (5a/5b): 205 engine + 24 testkit + 146 binary lib + 5 binary main = 380; Phase 5 real-server
 and schema work (5c, the `herdr_schema` projection's own tests and the isolation-collision
-test): 34 testkit = **390**, the Phase 6 floor).
+test): 34 testkit = 390, the Phase 6 floor; Phase 6 engine work (draft roots, collapsed
+classes, `hunks_of`, the debounce cap, one remote-ref listing): 215 engine + 34 testkit +
+146 binary lib + 5 binary main = 400; Phase 6 TUI work (the expand key, the drain pass, the
+nav offset, the discovering line, the debug probes): 218 engine + 34 testkit + 164 binary
+lib + 6 binary main = **422**, the Phase 7 floor).
 The suite never shrinks across commits. One recorded exception: at the Phase 2 code review
 the three filesystem-live watcher tests (up to 30 s waits, real FSEvents) left the unit tier
 for `crates/lastcall-engine/tests/test_integration_watcher.rs` because they contradicted the
@@ -88,14 +92,19 @@ and commit the file.
 
 Both files live in `crates/lastcall/tests/`; `docs/dev/tui.md` has the how-to.
 
-`test_e2e_tui_snapshots.rs` renders twenty-nine scenes (the sixteen Phase 3 ones; the
+`test_e2e_tui_snapshots.rs` renders thirty-three scenes (the sixteen Phase 3 ones; the
 seven Phase 4 accept scenes, which drive the real `Engine::accept` from the reducer's own
 `Effect::Accept` and feed `App::accepted`, and where `tui_accept_all_confirm` pins a second
 `_live` frame; and the six Phase 5 herdr scenes — `tui_herdr_status_dots`,
 `tui_herdr_ready_ack_dims`, `tui_herdr_flag_only_root_listed`, `tui_herdr_header_states`,
 `tui_herdr_scope_notice`, `tui_herdr_scope_notice_with_status`, fed by a `HerdrView` built
 in-process, with no socket anywhere; `tui_herdr_header_states` pins one snapshot rather than
-two, being a list of badge lines and not a frame) through `ratatui::backend::TestBackend`
+two, being a list of badge lines and not a frame; and the four Phase 6 ones —
+`tui_draft_root_hunks`, whose fixture adds the opt-in fourth root `W/alpha/_drafts` through
+`fixture_parent::add_draft_root` and so is the **only** scene that is not three roots,
+`tui_nav_collapsed_lockfile`, `tui_nav_collapsed_binary_and_size` and
+`tui_diff_view_collapsed_expanded`, which presses `e` and pins the expansion under the
+collapsed line) through `ratatui::backend::TestBackend`
 from an `App` fed by a real engine over the shared `fixture_parent` (each scene builds its
 own fixture and state dir under a temp dir) and pins each as two `insta` snapshots under
 `crates/lastcall/tests/snapshots/`: `<scene>_frame` (the symbols, exactly as a 100×30 — or
@@ -128,7 +137,12 @@ link live), `pty_herdr_a_stalled_socket_does_not_hold_the_keys` (a socket that a
 never answers: `q` still exits inside the quit budget while the 5 s guard timeout runs), and
 `pty_herdr_worktree_created_reaches_the_nav_through_the_loop` (a checkout made after startup,
 with the discovery backstop parked at `--poll 300`, so only the loop's `worktree_due` arm can
-bring it in). The scenes are serialized (one mutex); the whole file is about 30 s. Timing lines go to `stderr().write_all` so they survive libtest's
+bring it in). The Phase 6 scene `pty_draft_root_hunk_accept_and_restart` runs the binary
+over `draft_config_toml`'s four roots — it must, or the child would discover only three —
+and accepts a hunk in the gitignored `_drafts/` root, then relaunches on the same state dir
+to show it stayed accepted; `wait_first_piles` additionally pins the startup order
+(`lastcall: discovering roots under …` on stderr, then the alternate-screen sequence, then
+`scanning N roots…`). The scenes are serialized (one mutex); the whole file is about 30 s. Timing lines go to `stderr().write_all` so they survive libtest's
 capture — run it with `-- --nocapture` to see them. If the live-update assertion fails on a
 loaded host, report the measured numbers; do not loosen the budget.
 
@@ -167,6 +181,13 @@ loaded host, report the measured numbers; do not loosen the budget.
 - A test that guards against a hang (`engine_scan_returns_under_a_global_fsmonitor_config`)
   runs the engine on a thread and bounds it with `recv_timeout` (5 s) — the bound is a
   failure, never a wait the passing path takes.
+- **Nothing calls `tracing::subscriber::set_global_default`**, in any tier. `tracing` caches
+  a callsite's `Interest` process-wide — the first thread to reach it decides for every
+  other — so a `with_default` scope in a lib test can be silently disabled by a sibling test
+  that reached the same callsite on a subscriber-free thread. The probe-field test
+  (`crates/lastcall-engine/tests/test_integration_tracing.rs`, Phase 6 deliverable 8) is
+  therefore its **own integration binary**: one process, one subscriber scope, no siblings
+  to race. Any future test that captures `tracing` output belongs in that binary.
 
 ## The real-herdr subset (`test_integration_herdr_real.rs`)
 

@@ -217,6 +217,54 @@ ledger busy in <root> — try again
 
 Pressing the same key a moment later is the entire fix.
 
+## Draft roots and collapsed classes (Phase 6)
+
+**A draft root is a directory, not a repo.** `draft_dirs` (globs relative to a parent dir,
+or absolute paths) makes a non-git directory a root of its own: discovery lists it beside
+the repos, and it gets the same store, ledger and seen tree as a repo does — the store is a
+bare object database with **no alternates and no key copy**, since there is no repository
+to borrow objects from and no user config to inherit, and `RootKind::Draft` is what tells
+the pile apart. First sight follows
+`draft_initial`: `seen` (the default) records everything already there as the baseline, so
+the root opens at zero and only later edits are pending; `pending` records nothing, so
+everything present is a row on the first scan. There is no HEAD, so head inspection,
+upstream classification and annotation (pipeline step 9) never run — `scan_root` gates the
+whole block on `state.repo`, skipped rather than faked — and neither does the conflict read
+of step 8, which needs the user's index. Rename pairing does run: its temp index is our own
+store's, not the user's. A
+draft root nested inside a repo (a gitignored `_drafts/`) is the interesting case: the repo
+scan drops `others` entries under it (pipeline step 3) so one edit is one row, in the draft
+root, once.
+
+**A collapsed row is one accept, not a diff.** `render_content` (step 7) runs a ladder and
+returns *before* hunks are computed: `collapsed_globs` (the nine common lockfiles by
+default) → binary (a NUL byte in the first 8,000 of either side) → size (either side
+**strictly larger** than `collapse_size_bytes`, default 512 KiB). The row carries its
+`+added −removed` counts and a `Collapsed` tag, no `Hunk`s, and a mode-only change never
+synthesises one on a collapsed row (the early return is above that synthesis). Accepting is
+whole-row by construction: there is no hunk to point `a` at.
+
+**`Engine::hunks_of(root, row)` is the opt-in escape hatch** — the `e` key's engine half,
+never part of a scan, because the point of a collapsed class is that a lockfile rewrite
+does not pay a second Myers pass on every rescan. It diffs **the row's own** baseline and
+current oids (not a fresh resolution, so the expansion shows exactly the delta the counts
+were rendered from even if the file has moved since) and truncates at
+`hunks::EXPAND_LINE_CAP` = 2,000 body lines, reporting the remainder as
+`Expanded::omitted_lines`. A side the row does not have is legitimately empty; a side it
+*does* have whose oid the store cannot produce is `EngineError::MissingBlob`, never an
+empty side — reading a missing current blob as empty would draw the live file as one
+enormous deletion, hiding exactly what the reviewer pressed `e` to read. The result is a
+view: it is never written back onto the `Row`, so `accept_file` and `accept_all` stay
+whole-row for a collapsed path.
+
+**One remote-ref listing per scan.** Upstream classification (step 9) is memoized on a
+`ClassifyKey` of (seen head, head state, the `for-each-ref refs/remotes` listing). The
+listing that *builds* the key is the listing `classify` is given, so a scan runs
+`for-each-ref` exactly once and reuses it for every row —
+`engine_classification_lists_remote_refs_once_per_scan` counts the argv. The measured
+effect is one fewer git process per root per scan (17 → 16 on S1; `docs/dev/bench.md`
+run D).
+
 ## The fail-open ladder
 
 Every rung shows *more* than the truth, never less, and says why in a notice:
@@ -363,7 +411,17 @@ subdirectory of the main worktree's (`<main>/.git/worktrees/<name>`), and at equ
 root's own git dir beats another root's common dir — then filtered to an allowlist (`HEAD`,
 `index`, `ORIG_HEAD`, `MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`, `refs/`,
 `rebase-merge/`, `rebase-apply/`, `logs/`), worktree events are debounced on the trailing
-edge (750 ms), and two polling backstops remain (HEAD every 10 s, root discovery every 30 s).
+edge (750 ms **with a 3 s starvation cap**), and two polling backstops remain (HEAD every
+10 s, root discovery every 30 s). The cap is Amendment v1.6: the trailing edge alone
+postpones a root's scan for as long as a writer keeps writing, so a scan is scheduled
+`debounce` after the latest event **but never later than `debounce_max` after the first
+event of the burst** (`watcher::schedule`; a `min` of the two deadlines). Both are per
+root, both are hardcoded — `--poll N` moves the two backstops and nothing else
+(`poll_timings_none_keeps_defaults_and_zero_clamps_to_one_second` asserts the debounce pair
+survives it), and neither has a config key (Q6). A scan the loop ran ends the burst window
+and the next event opens a fresh one; a scan the loop did **not** initiate (the TUI's own
+`Effect::Refresh`, or the rescan an accept leaves behind) does not, which costs at most one
+redundant scan per window.
 `scan_all` re-runs discovery only when a scan saw a root's set of nested repositories change,
 not on every tick while one exists. Events only *schedule* work: every scan, head inspection and rescan runs on
 `spawn_blocking` under the engine's mutex, and the result is published as an `EngineEvent`
