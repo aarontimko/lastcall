@@ -62,6 +62,12 @@ pub enum EngineError {
     Ops(#[from] OpsError),
     #[error("no such root: {}", .0.display())]
     NoSuchRoot(PathBuf),
+    /// An on-demand expansion ([`Engine::hunks_of`]) wanted a blob the store cannot
+    /// produce. Reading it as an empty side would render the live file as deleted, which
+    /// hides the content the reviewer asked to see (invariant 2 is over-show, never hide),
+    /// so the expansion refuses instead and the caller says "refresh".
+    #[error("blob {oid} is missing from the store for {}", root.display())]
+    MissingBlob { root: PathBuf, oid: String },
 }
 
 fn io_err(path: &Path, source: std::io::Error) -> EngineError {
@@ -918,8 +924,16 @@ impl Engine {
     ///
     /// The diff is computed from **the row's own** `baseline`/`current` oids, not from a
     /// fresh resolution, so the expansion shows exactly the delta the row's counts were
-    /// rendered from even if the file has moved since. An oid the store cannot produce
-    /// reads as an empty side (invariant 2: over-show, never hide).
+    /// rendered from even if the file has moved since.
+    ///
+    /// A side the row does not have (an added or a deleted file) is legitimately empty.
+    /// A side the row *does* have whose oid the store cannot produce is
+    /// [`EngineError::MissingBlob`], never an empty side: reading a missing **current**
+    /// blob as empty would draw the live file as one enormous deletion, hiding exactly
+    /// what the reviewer pressed `e` to read (invariant 2 is over-show, never hide, and
+    /// the scan's own `render_content` pushes a notice for the same condition). The only
+    /// way to reach it is a state dir replaced between the scan that produced the row and
+    /// the expansion — the caller's answer is "refresh", not "trust this diff".
     ///
     /// The result is a view. It is never written back onto the [`Row`]: `accept_file` and
     /// `accept_all` must stay whole-row for a collapsed path (§6.3 "single accept").
@@ -936,12 +950,21 @@ impl Engine {
         wanted.sort();
         wanted.dedup();
         let blobs = state.store.cat_blobs(&wanted)?;
-        let side = |e: &Option<crate::scan::Entry>| -> Vec<u8> {
-            e.as_ref()
-                .and_then(|entry| blobs.get(&entry.oid).cloned())
-                .unwrap_or_default()
+        let side = |e: &Option<crate::scan::Entry>| -> Result<Vec<u8>, EngineError> {
+            match e {
+                None => Ok(Vec::new()),
+                Some(entry) => {
+                    blobs
+                        .get(&entry.oid)
+                        .cloned()
+                        .ok_or_else(|| EngineError::MissingBlob {
+                            root: root.to_path_buf(),
+                            oid: entry.oid.as_str().to_owned(),
+                        })
+                }
+            }
         };
-        Ok(hunks::expand(&side(&row.baseline), &side(&row.current)))
+        Ok(hunks::expand(&side(&row.baseline)?, &side(&row.current)?))
     }
 
     /// Re-inspect HEAD; when it moved (or an operation finished), scan and describe it.
@@ -2362,6 +2385,55 @@ pub(crate) mod tests {
             .hunks_of(Path::new("/nope/not/a/root"), &row)
             .unwrap_err();
         assert!(matches!(err, EngineError::NoSuchRoot(_)), "{err:?}");
+    }
+
+    /// Verifier (a) F1: a wanted oid the store cannot produce is an error on **either**
+    /// side, never an empty one. An empty current side would draw the live file as a whole
+    /// deletion — hiding what `e` was pressed to read — and an empty baseline would claim
+    /// the whole file is new; both are worse than saying so.
+    #[test]
+    fn engine_hunks_of_refuses_a_row_whose_blob_the_store_lost() {
+        let mut repo = FixtureRepo::new("eng-expand-lost").unwrap();
+        let before: String = (0..40)
+            .map(|i| format!("  \"pkg-{i}\": \"1.0.0\",\n"))
+            .collect();
+        repo.commit_files(&[("package-lock.json", before.as_str())], "lock")
+            .unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let root = only_root(&engine);
+        repo.write(
+            "package-lock.json",
+            format!("{before}  \"pkg-40\": \"1.0.0\",\n"),
+        );
+        let pile = engine.scan(&root).unwrap();
+        let row = pile.row(b"package-lock.json").unwrap().clone();
+        assert_eq!(row.collapsed, Some(crate::scan::Collapsed::Glob));
+        // The real row expands.
+        assert!(!engine.hunks_of(&root, &row).unwrap().hunks.is_empty());
+
+        let ghost = Oid::parse(&"f".repeat(40)).expect("a well-formed but absent oid");
+        let with = |side: fn(&mut Row, crate::scan::Entry)| {
+            let mut row = row.clone();
+            let mode = row.current.as_ref().expect("a modified row").mode;
+            side(
+                &mut row,
+                crate::scan::Entry {
+                    oid: ghost.clone(),
+                    mode,
+                },
+            );
+            engine.hunks_of(&root, &row).unwrap_err()
+        };
+        for err in [
+            with(|r, e| r.baseline = Some(e)),
+            with(|r, e| r.current = Some(e)),
+        ] {
+            match err {
+                EngineError::MissingBlob { oid, .. } => assert_eq!(oid, ghost.as_str()),
+                other => panic!("expected MissingBlob, got {other:?}"),
+            }
+        }
     }
 
     /// Phase 6 deliverable 5 (§11 "`for-each-ref refs/remotes` twice per scan"): the
