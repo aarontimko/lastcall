@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crossterm::event::Event;
+use crossterm::event::{Event, MouseButton, MouseEvent, MouseEventKind};
 use lastcall_engine::engine::{AcceptRequest, Engine};
 use lastcall_engine::env::Env;
 use lastcall_engine::herdr::HerdrEvent;
@@ -184,6 +184,142 @@ impl Ui {
     pub fn rendered(&mut self, hits: HitMap) {
         self.hits = Some(hits);
     }
+}
+
+/// Events one pass folds in beyond the one the `select!` woke on. A pass that keeps folding
+/// forever is a pass that never draws, so the drain stops here whatever is still queued —
+/// the next iteration picks the rest up (deliverable 6).
+pub const DRAIN_CAP: usize = 256;
+
+/// Why a pass ended the loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Stop {
+    /// `Effect::Quit`: the user asked to leave.
+    Quit,
+    /// `Local::Fatal`: an engine task died; the panic hook already restored the terminal.
+    Fatal(String),
+}
+
+/// One turn of the loop: everything folded since the last frame, and what it asks for.
+/// The loop runs `effects` in order, breaks on `stop`, and draws **once** when
+/// `changed == Yes` — not once per event (deliverable 6).
+#[derive(Debug, Default, PartialEq)]
+pub struct Pass {
+    pub changed: Changed,
+    pub effects: Vec<Effect>,
+    pub stop: Option<Stop>,
+    /// A herdr event in this pass asked for a discovery rescan (`worktree.*`).
+    pub rescan: bool,
+    /// A mouse press the drain refused to fold because the pass already has something to
+    /// draw. It is folded at the top of the next iteration, **after** the frame, so a press
+    /// always resolves against the hit map of a frame the user actually saw.
+    pub held: Option<Event>,
+}
+
+impl Pass {
+    /// A pass seeded with what the `select!` arm folded. It goes through [`Pass::fold`] so
+    /// the seed obeys every rule the drained events do — in particular a `q` that arrives as
+    /// the pass's *first* event is a `Stop::Quit`, not an effect for the dispatch loop.
+    fn of(changed: Changed, effect: Option<Effect>) -> Self {
+        let mut pass = Self::default();
+        pass.fold((changed, effect));
+        pass
+    }
+
+    fn fold(&mut self, (changed, effect): (Changed, Option<Effect>)) {
+        self.changed = self.changed.or(changed);
+        match effect {
+            Some(Effect::Quit) => self.stop = Some(Stop::Quit),
+            Some(other) => self.effects.push(other),
+            None => {}
+        }
+    }
+}
+
+/// The loop's event queues, by mutable reference so a test can build them with
+/// `mpsc::unbounded_channel` / `mpsc::channel` and drive [`drain`] without a `Watcher`,
+/// a terminal or a runtime.
+pub(crate) struct Sources<'a> {
+    pub engine: &'a mut mpsc::Receiver<EngineEvent>,
+    pub input: &'a mut mpsc::UnboundedReceiver<Event>,
+    pub local: &'a mut mpsc::UnboundedReceiver<Local>,
+}
+
+/// Fold every event already queued into `pass`, up to [`DRAIN_CAP`], so a burst of piles or
+/// a wheel spin costs one frame instead of one frame each.
+///
+/// The rules, in the order they matter:
+///
+/// - `Effect::Quit` and `Local::Fatal` end the drain at once; whatever is still queued is
+///   never folded, because the loop is leaving.
+/// - A mouse `Press` ends the drain **once the pass has something to draw**, and is handed
+///   back in `Pass::held` rather than folded: a press resolves through the hit map of the
+///   last drawn frame, so folding it behind an undrawn change would resolve it against a
+///   frame nobody saw. Every other input event — keys, the wheel, resizes — folds freely.
+/// - Sources are polled round-robin and the drain ends when a whole round is empty.
+pub(crate) fn drain(ui: &mut Ui, sources: &mut Sources<'_>, link: &mut Herdr, pass: &mut Pass) {
+    for _ in 0..DRAIN_CAP {
+        if pass.stop.is_some() || pass.held.is_some() {
+            return;
+        }
+        let mut any = false;
+        if let Ok(event) = sources.input.try_recv() {
+            any = true;
+            if is_press(&event) && pass.changed == Changed::Yes {
+                pass.held = Some(event);
+                return;
+            }
+            pass.fold(ui.event(&event));
+        }
+        if pass.stop.is_none()
+            && let Ok(event) = sources.engine.try_recv()
+        {
+            any = true;
+            pass.fold(ui.engine(event));
+        }
+        if pass.stop.is_none()
+            && let Ok(local) = sources.local.try_recv()
+        {
+            any = true;
+            match local {
+                Local::Fatal(text) => {
+                    pass.stop = Some(Stop::Fatal(text));
+                    return;
+                }
+                Local::Roots(metas) => {
+                    pass.fold(ui.local(Local::Roots(metas)));
+                    pass.fold(herdr_rederive(ui, link));
+                }
+                other => pass.fold(ui.local(other)),
+            }
+        }
+        if pass.stop.is_none()
+            && let Some(rx) = link.events.as_mut()
+            && let Ok(event) = rx.try_recv()
+        {
+            any = true;
+            pass.rescan |= herdr::triggers_rescan(&event);
+            if let Some(update) = herdr::update_of(&event) {
+                pass.fold(ui.app.handle(Action::Herdr(update)));
+            }
+            if herdr::rederives(&event) {
+                pass.fold(herdr_rederive(ui, link));
+            }
+        }
+        if !any {
+            return;
+        }
+    }
+}
+
+fn is_press(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            ..
+        })
+    )
 }
 
 /// The quit sequence's three steps, in the only safe order (see [`shut_down`]).
@@ -400,7 +536,7 @@ async fn joined<T>(
 /// The loop's half of the herdr link: what it needs to derive, to request, and to stop.
 /// The reducer sees none of this (§6.6).
 #[derive(Default)]
-struct Herdr {
+pub(crate) struct Herdr {
     handle: Option<ClientHandle>,
     transport: Option<SocketTransport>,
     events: Option<mpsc::Receiver<HerdrEvent>>,
@@ -619,11 +755,16 @@ pub fn run(
             let mut fatal: Option<String> = None;
             // Set by a `worktree.*` event, fired once the burst has been quiet this long.
             let mut worktree_due: Option<tokio::time::Instant> = None;
+            // A press the previous pass refused to fold (see [`drain`]): folded here,
+            // after that pass drew, so it resolves against the frame the user saw.
+            let mut held: Option<Event> = None;
             loop {
                 // Copied out so the timer future borrows nothing a handler assigns to.
                 let due = worktree_due;
                 let mut rescan = false;
-                let (changed, effect) = tokio::select! {
+                let (changed, effect) = match held.take() {
+                    Some(event) => ui.event(&event),
+                    None => tokio::select! {
                     _ = signals.recv() => break,
                     event = watcher.events.recv() => match event {
                         Some(event) => ui.engine(event),
@@ -701,47 +842,74 @@ pub fn run(
                         (Changed::No, None)
                     }
                     _ = tick.tick() => ui.app.handle(Action::Tick),
+                    },
                 };
+                // Everything else already queued joins this pass, so a burst of piles or a
+                // wheel spin costs one frame rather than one frame each (deliverable 6).
+                let mut pass = Pass::of(changed, effect);
+                {
+                    let mut sources = Sources {
+                        engine: &mut watcher.events,
+                        input: &mut input_rx,
+                        local: &mut local_rx,
+                    };
+                    drain(&mut ui, &mut sources, &mut link, &mut pass);
+                }
+                held = pass.held.take();
+                rescan |= pass.rescan;
                 if rescan {
                     // Deliverable 7: the event is only a trigger — `roots::discover` decides
                     // what is a root, and `RootsChanged` + the new pile take the usual path.
                     worktree_due = None;
                     watcher.request_rescan();
                 }
-                match effect {
-                    Some(Effect::Quit) => break,
-                    Some(Effect::Refresh) => spawn_refresh(&watcher.engine, local_tx.clone()),
-                    Some(Effect::SyncRoots) => spawn_sync_roots(&watcher.engine, local_tx.clone()),
-                    Some(Effect::Accept(reqs)) => {
-                        spawn_accept(&watcher.engine, local_tx.clone(), reqs)
-                    }
-                    Some(Effect::Expand(root, row)) => {
-                        spawn_expand(&watcher.engine, local_tx.clone(), root, row)
-                    }
-                    Some(Effect::Focus(pane)) => {
-                        let label = ui
-                            .app
-                            .herdr
-                            .roots
-                            .values()
-                            .find(|f| f.pane.as_deref() == Some(pane.as_str()))
-                            .map(|f| f.agent_label())
-                            .unwrap_or_else(|| pane.clone());
-                        spawn_focus(link.transport.clone(), local_tx.clone(), pane, label);
-                    }
-                    Some(Effect::Toast(request)) => {
-                        if let Some(tx) = &link.toast {
-                            for (root, name) in request.ready {
-                                let _ = tx.send(ToastMsg::Ready { root, name });
-                            }
-                            for root in request.dropped {
-                                let _ = tx.send(ToastMsg::Drop(root));
+                let mut stop = pass.stop;
+                for effect in pass.effects {
+                    match effect {
+                        // `Pass::of` and `Pass::fold` both route a quit into `Pass::stop`, so
+                        // this arm is belt and braces — and never a `break`, which would only
+                        // leave this `for` and drop the rest of the pass's effects.
+                        Effect::Quit => stop = Some(Stop::Quit),
+                        Effect::Refresh => spawn_refresh(&watcher.engine, local_tx.clone()),
+                        Effect::SyncRoots => spawn_sync_roots(&watcher.engine, local_tx.clone()),
+                        Effect::Accept(reqs) => {
+                            spawn_accept(&watcher.engine, local_tx.clone(), reqs)
+                        }
+                        Effect::Expand(root, row) => {
+                            spawn_expand(&watcher.engine, local_tx.clone(), root, row)
+                        }
+                        Effect::Focus(pane) => {
+                            let label = ui
+                                .app
+                                .herdr
+                                .roots
+                                .values()
+                                .find(|f| f.pane.as_deref() == Some(pane.as_str()))
+                                .map(|f| f.agent_label())
+                                .unwrap_or_else(|| pane.clone());
+                            spawn_focus(link.transport.clone(), local_tx.clone(), pane, label);
+                        }
+                        Effect::Toast(request) => {
+                            if let Some(tx) = &link.toast {
+                                for (root, name) in request.ready {
+                                    let _ = tx.send(ToastMsg::Ready { root, name });
+                                }
+                                for root in request.dropped {
+                                    let _ = tx.send(ToastMsg::Drop(root));
+                                }
                             }
                         }
                     }
+                }
+                match stop {
+                    Some(Stop::Quit) => break,
+                    Some(Stop::Fatal(text)) => {
+                        fatal = Some(text);
+                        break;
+                    }
                     None => {}
                 }
-                if changed == Changed::Yes {
+                if pass.changed == Changed::Yes {
                     draw(&mut terminal, &mut ui)?;
                 }
             }
@@ -827,6 +995,199 @@ mod tests {
         })
         .unwrap();
         term.backend().to_string()
+    }
+
+    /// Channels a `drain` test drives: the three loop queues plus the herdr link, none of
+    /// which needs a `Watcher`, a terminal or a runtime.
+    struct Wires {
+        engine_tx: mpsc::Sender<EngineEvent>,
+        engine_rx: mpsc::Receiver<EngineEvent>,
+        input_tx: mpsc::UnboundedSender<Event>,
+        input_rx: mpsc::UnboundedReceiver<Event>,
+        local_tx: mpsc::UnboundedSender<Local>,
+        local_rx: mpsc::UnboundedReceiver<Local>,
+        link: Herdr,
+    }
+
+    impl Wires {
+        fn new() -> Self {
+            let (engine_tx, engine_rx) = mpsc::channel(512);
+            let (input_tx, input_rx) = mpsc::unbounded_channel();
+            let (local_tx, local_rx) = mpsc::unbounded_channel();
+            Self {
+                engine_tx,
+                engine_rx,
+                input_tx,
+                input_rx,
+                local_tx,
+                local_rx,
+                link: Herdr::default(),
+            }
+        }
+
+        fn drain_into(&mut self, ui: &mut Ui, seed: (Changed, Option<Effect>)) -> Pass {
+            let mut pass = Pass::of(seed.0, seed.1);
+            let mut sources = Sources {
+                engine: &mut self.engine_rx,
+                input: &mut self.input_rx,
+                local: &mut self.local_rx,
+            };
+            drain(ui, &mut sources, &mut self.link, &mut pass);
+            pass
+        }
+    }
+
+    /// Deliverable 6(a): a burst of piles is **one** pass and therefore one frame. Before
+    /// the drain the loop drew once per `Changed::Yes`, so a rescan of many roots repainted
+    /// the screen once per root.
+    #[test]
+    fn run_drain_folds_a_burst_of_piles_into_one_pass() {
+        let mut ui = ui();
+        let mut wires = Wires::new();
+        // Both pile sources at once: the drain is round-robin, and the highest `seq` wins
+        // whichever queue it arrived on.
+        for seq in 1..=17u64 {
+            let pile = alpha_hunks(seq as usize);
+            if seq % 2 == 0 {
+                wires
+                    .engine_tx
+                    .try_send(EngineEvent::Pile {
+                        root: root("alpha"),
+                        seq,
+                        pile,
+                    })
+                    .unwrap();
+            } else {
+                wires
+                    .local_tx
+                    .send(Local::Pile(root("alpha"), seq, pile))
+                    .unwrap();
+            }
+        }
+        let pass = wires.drain_into(&mut ui, (Changed::No, None));
+        assert_eq!(pass.changed, Changed::Yes);
+        assert!(pass.stop.is_none() && pass.held.is_none());
+        assert!(pass.effects.is_empty(), "{:?}", pass.effects);
+        // The last pile won, and one render serves all seventeen.
+        assert_eq!(ui.app.roots[&root("alpha")].pile.rows[0].hunks.len(), 17);
+        render_into(&mut ui);
+        // Nothing is left queued: the whole burst was folded.
+        let after = wires.drain_into(&mut ui, (Changed::No, None));
+        assert_eq!(after, Pass::default());
+    }
+
+    /// A press must resolve against a frame the user saw. The key ahead of it in the queue
+    /// moves the page, so folding the press in the same pass would resolve it through the
+    /// hit map of the **old** frame; the drain hands it back instead, and the loop folds it
+    /// after drawing. The click then lands where the drawn frame says it does.
+    #[test]
+    fn run_drain_holds_a_press_behind_an_undrawn_change() {
+        let mut ui = ui();
+        render_into(&mut ui);
+        ui.app.select(Some(row("alpha", "f1")));
+        render_into(&mut ui);
+        let (x, y) = target_center(&ui, &Target::NavRow(root("beta"), b"u1".to_vec()));
+
+        let mut wires = Wires::new();
+        wires.input_tx.send(key(KeyCode::PageDown)).unwrap();
+        wires
+            .input_tx
+            .send(mouse(MouseEventKind::Down(MouseButton::Left), x, y))
+            .unwrap();
+        let pass = wires.drain_into(&mut ui, (Changed::No, None));
+        assert_eq!(pass.changed, Changed::Yes, "the page key moved something");
+        let held = pass.held.expect("the press stayed queued");
+        assert!(is_press(&held));
+        assert_ne!(
+            ui.app.selection,
+            Some(row("beta", "u1")),
+            "the press has not been folded yet"
+        );
+
+        // The loop draws, then folds the held press against that frame.
+        render_into(&mut ui);
+        ui.event(&held);
+        assert_eq!(ui.app.selection, Some(row("beta", "u1")));
+
+        // A wheel event behind the same change folds freely: it needs no hit map.
+        wires.input_tx.send(key(KeyCode::PageUp)).unwrap();
+        wires
+            .input_tx
+            .send(mouse(MouseEventKind::ScrollDown, x, y))
+            .unwrap();
+        let pass = wires.drain_into(&mut ui, (Changed::No, None));
+        assert!(pass.held.is_none(), "the wheel is not a press");
+    }
+
+    /// `Quit` and `Local::Fatal` end the drain where they are: whatever is behind them is
+    /// never folded, because the loop is leaving.
+    #[test]
+    fn run_drain_stops_at_quit_and_at_a_fatal() {
+        // The seed obeys the same rule: a `q` pressed with an empty queue never reaches the
+        // effect dispatch, it *is* the stop.
+        let seeded = Pass::of(Changed::No, Some(Effect::Quit));
+        assert_eq!(seeded.stop, Some(Stop::Quit));
+        assert!(seeded.effects.is_empty());
+        {
+            let mut ui = ui();
+            let mut wires = Wires::new();
+            wires.input_tx.send(key(KeyCode::Char('r'))).unwrap();
+            wires.input_tx.send(key(KeyCode::Char('q'))).unwrap();
+            for seq in 1..=5 {
+                wires
+                    .local_tx
+                    .send(Local::Pile(root("alpha"), seq, alpha_hunks(seq as usize)))
+                    .unwrap();
+            }
+            let pass = wires.drain_into(&mut ui, (Changed::No, None));
+            assert_eq!(pass.stop, Some(Stop::Quit));
+            assert!(
+                matches!(pass.effects.as_slice(), [Effect::Refresh]),
+                "the refresh ahead of the quit still runs: {:?}",
+                pass.effects
+            );
+        }
+        {
+            let mut ui = ui();
+            let mut wires = Wires::new();
+            wires.local_tx.send(Local::RefreshDone).unwrap();
+            wires
+                .local_tx
+                .send(Local::Fatal("accept failed: panic".to_owned()))
+                .unwrap();
+            wires
+                .local_tx
+                .send(Local::Pile(root("alpha"), 9, alpha_hunks(3)))
+                .unwrap();
+            let pass = wires.drain_into(&mut ui, (Changed::No, None));
+            assert_eq!(
+                pass.stop,
+                Some(Stop::Fatal("accept failed: panic".to_owned()))
+            );
+            assert_eq!(
+                ui.app.roots[&root("alpha")].pile.rows[0].hunks.len(),
+                1,
+                "the pile behind the fatal was never folded"
+            );
+        }
+    }
+
+    /// The cap bounds one pass: a queue longer than [`DRAIN_CAP`] draws, then continues.
+    #[test]
+    fn run_drain_stops_at_the_cap() {
+        let mut ui = ui();
+        let mut wires = Wires::new();
+        for _ in 0..DRAIN_CAP + 8 {
+            wires.input_tx.send(key(KeyCode::Char('f'))).unwrap();
+        }
+        let pass = wires.drain_into(&mut ui, (Changed::No, None));
+        assert_eq!(pass.changed, Changed::Yes);
+        // Eight are still queued for the next pass.
+        let mut left = 0;
+        while wires.input_rx.try_recv().is_ok() {
+            left += 1;
+        }
+        assert_eq!(left, 8);
     }
 
     /// The §11 hardening, at the loop's level: a watcher pile carrying a seq below the one

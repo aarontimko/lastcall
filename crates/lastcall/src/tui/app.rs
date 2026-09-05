@@ -207,9 +207,11 @@ pub struct StatusLine {
 }
 
 /// Whether a reducer step changed anything a frame could show.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Changed {
     Yes,
+    /// The default: a pass that folded nothing has nothing to draw.
+    #[default]
     No,
 }
 
@@ -1461,7 +1463,12 @@ impl App {
                 };
                 let effect =
                     (self.herdr.toast && !request.is_empty()).then_some(Effect::Toast(request));
-                (Changed::Yes, effect)
+                let changed = if delta.changed {
+                    Changed::Yes
+                } else {
+                    Changed::No
+                };
+                (changed, effect)
             }
             HerdrUpdate::Scope(scope) => {
                 if self.herdr.scope == scope {
@@ -3313,6 +3320,30 @@ mod tests {
         assert_eq!(
             app.herdr.flag(&root("alpha")).unwrap().status,
             Attention::Done
+        );
+    }
+
+    /// Phase 6 deliverable 6: herdr re-derives on every snapshot it receives, and most say
+    /// what the last one said. The reducer answers `Changed::No` for those, so the loop
+    /// does not repaint on a poll that moved nothing.
+    #[test]
+    fn app_herdr_roots_draw_nothing_when_the_derivation_is_identical() {
+        let mut app = with_herdr(BTreeMap::new());
+        let done = || Action::Herdr(HerdrUpdate::Roots(one("alpha", Attention::Done)));
+        assert_eq!(app.handle(done()).0, Changed::Yes, "the first flag lights");
+        assert_eq!(
+            app.handle(done()).0,
+            Changed::No,
+            "the same derivation again is the same frame"
+        );
+        assert_eq!(
+            app.handle(Action::Herdr(HerdrUpdate::Roots(one(
+                "alpha",
+                Attention::Working
+            ))))
+            .0,
+            Changed::Yes,
+            "a status change moves the dot"
         );
     }
 
