@@ -331,12 +331,28 @@ pub struct Restored {
     pub pile: Pile,
 }
 
+/// A hunk flag as the **caller rendered it**: the record the ledger takes, plus the total
+/// the export's `hunk n of m` names.
+///
+/// `of` is caller-side on purpose (verifier F5). Deriving it from the pile the flag's own
+/// rescan produced meant the header and text came from the screen while the total came from
+/// the file as it is *now*: an agent that rewrote the file between the render and the
+/// keystroke produced `hunk 2 of 1`, a shape that never existed. The caller has the number
+/// that was true when the user looked, and that is the only one the export may name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedHunk {
+    pub hunk: FlagHunk,
+    /// **Content** hunks in the row as it was on screen. The synthetic mode hunk is not one
+    /// of them: a `chmod` on a two-hunk file is `of 2`, not `of 3`.
+    pub of: usize,
+}
+
 /// What [`Engine::flag`] and [`Engine::unflag`] produced.
 ///
 /// `export` is the paste-ready message for the flag that was just written
 /// ([`crate::flags::export`]) — computed here rather than in the UI because only the engine
-/// has both the flag's `created_at` and the rescanned row the `hunk n of m` count comes
-/// from. An `unflag`, or a refusal, leaves it empty.
+/// has the flag's `created_at`. The `hunk n of m` count comes from the caller's
+/// [`RenderedHunk`]. An `unflag`, or a refusal, leaves it empty.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Flagged {
     pub outcome: Outcome,
@@ -1229,7 +1245,7 @@ impl Engine {
         root: &Path,
         path: &[u8],
         note: &str,
-        hunk: Option<FlagHunk>,
+        hunk: Option<RenderedHunk>,
     ) -> Result<Flagged, EngineError> {
         self.flag_with(root, path, note, hunk, &NoFault)
     }
@@ -1240,10 +1256,13 @@ impl Engine {
         root: &Path,
         path: &[u8],
         note: &str,
-        hunk: Option<FlagHunk>,
+        hunk: Option<RenderedHunk>,
         fault: &dyn FaultInjector,
     ) -> Result<Flagged, EngineError> {
-        let had_hunk = hunk.is_some();
+        // The total the export will name, taken now, from what the caller rendered — not
+        // from the pile the rescan below produces (F5).
+        let of = hunk.as_ref().map(|h| h.of);
+        let hunk = hunk.map(|h| h.hunk);
         let (outcome, written) = {
             let mut ops = self.ops(root)?;
             match ops.flag(path, note, hunk, fault) {
@@ -1268,23 +1287,18 @@ impl Engine {
         };
         let pile = self.scan(root)?;
         let export = match written {
-            Some(flag) => {
-                let of = had_hunk
-                    .then(|| pile.row(path).map(|r| r.hunks.len()))
-                    .flatten();
-                crate::flags::export(
-                    &crate::flags::ExportContext {
-                        root: root
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| root.to_string_lossy().into_owned()),
-                        of,
-                        attribution: None,
-                    },
-                    path,
-                    &flag,
-                )
-            }
+            Some(flag) => crate::flags::export(
+                &crate::flags::ExportContext {
+                    root: root
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| root.to_string_lossy().into_owned()),
+                    of,
+                    attribution: None,
+                },
+                path,
+                &flag,
+            ),
             None => String::new(),
         };
         Ok(Flagged {
@@ -1872,7 +1886,7 @@ pub(crate) mod tests {
 
     /// Deliverable 5: the seam the TUI reducer calls. The export is built from the flag the
     /// ledger just took (its `created_at`, which the UI cannot reproduce) and the `of` count
-    /// from the rescanned row — and the flag is on disk whatever happens to the send.
+    /// the caller rendered — and the flag is on disk whatever happens to the send.
     #[test]
     fn engine_flag_returns_the_export_for_the_flag_it_just_wrote() {
         let repo = FixtureRepo::new("eng-flag").unwrap();
@@ -1882,10 +1896,13 @@ pub(crate) mod tests {
         repo.write("f1", F1_TWO_HUNKS);
         let (_, row) = rendered_row(&mut engine, &root, b"f1");
         assert_eq!(row.hunks.len(), 2);
-        let hunk = FlagHunk {
-            index: 1,
-            header: "@@ -9,2 +9,2 @@".into(),
-            text: "-a10\n+A10\n".into(),
+        let hunk = RenderedHunk {
+            hunk: FlagHunk {
+                index: 1,
+                header: "@@ -9,2 +9,2 @@".into(),
+                text: "-a10\n+A10\n".into(),
+            },
+            of: row.hunks.len(),
         };
         let out = engine
             .flag(&root, b"f1", "why is this changed?", Some(hunk))
@@ -1923,6 +1940,59 @@ pub(crate) mod tests {
                 .ledger
                 .overrides
                 .contains_key("f1")
+        );
+    }
+
+    /// The export names the total the **user saw**, not the one the file has by the time
+    /// the flag lands (verifier F5).
+    ///
+    /// The probe: render a two-hunk file, let an agent rewrite it to one hunk before the
+    /// keystroke, then flag hunk index 1. Taking `of` from the post-op rescan printed
+    /// `hunk 2 of 1` — a shape that never existed, in a message being pasted to the agent
+    /// as a description of what the human was looking at.
+    #[test]
+    fn engine_flag_export_names_the_rendered_hunk_total() {
+        let repo = FixtureRepo::new("eng-flag-of").unwrap();
+        let state = TempDir::new("lc-eng-flag-of");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let root = only_root(&engine);
+        repo.write("f1", F1_TWO_HUNKS);
+        let (_, row) = rendered_row(&mut engine, &root, b"f1");
+        assert_eq!(row.hunks.len(), 2, "two hunks on screen");
+        let rendered_total = row.hunks.iter().filter(|h| !h.is_mode_change()).count();
+
+        // The agent rewrites the file between the render and the keystroke: one hunk now.
+        repo.write("f1", "A1\na2\na3\na4\na5\na6\na7\na8\na9\na10\n");
+        assert_eq!(
+            engine.scan(&root).unwrap().row(b"f1").unwrap().hunks.len(),
+            1,
+            "the file really did move to one hunk"
+        );
+
+        let out = engine
+            .flag(
+                &root,
+                b"f1",
+                "why is this changed?",
+                Some(RenderedHunk {
+                    hunk: FlagHunk {
+                        index: 1,
+                        header: "@@ -9,2 +9,2 @@".into(),
+                        text: "-a10\n+A10\n".into(),
+                    },
+                    of: rendered_total,
+                }),
+            )
+            .unwrap();
+        assert!(out.outcome.ok() && out.outcome.written);
+        assert!(
+            out.export.contains("· hunk 2 of 2 ·"),
+            "the export names the rendered total, not the live one: {}",
+            out.export.lines().next().unwrap_or_default()
+        );
+        assert!(
+            !out.export.contains("of 1"),
+            "and never a total the row never had"
         );
     }
 
