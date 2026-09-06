@@ -59,17 +59,20 @@ test-integration:
 test-e2e:
     cargo test --workspace --test 'test_e2e_*'
 
-# What the pre-push hook runs (`just hooks-install`): the integration tier, then the
-# store-backed proptests in ops::tests::proptests at 64 cases — the unit tier runs them
-# at 8 so every commit stays fast. Run it by hand before a push from a machine without
-# the hook. Each step says what it is doing; the first failure stops the push.
+# What the pre-push hook runs (`just hooks-install`): the integration tier, then every
+# proptest at 64 cases — the store-backed ones in ops::tests::proptests and the text
+# buffer's round trip in tui::textbuf (Phase 8). The unit tier runs them at 8 so every
+# commit stays fast. Run it by hand before a push from a machine without the hook. Each
+# step says what it is doing; the first failure stops the push.
 test-prepush:
     #!/usr/bin/env bash
     set -euo pipefail
-    echo "--- test-prepush 1/2: just test-integration ---"
+    echo "--- test-prepush 1/3: just test-integration ---"
     just test-integration
-    echo "--- test-prepush 2/2: PROPTEST_CASES=64 cargo test -p lastcall-engine --lib proptests ---"
+    echo "--- test-prepush 2/3: PROPTEST_CASES=64 cargo test -p lastcall-engine --lib proptests ---"
     PROPTEST_CASES=64 cargo test -p lastcall-engine --lib proptests
+    echo "--- test-prepush 3/3: PROPTEST_CASES=64 cargo test -p lastcall --lib proptests ---"
+    PROPTEST_CASES=64 cargo test -p lastcall --lib proptests
     echo "--- test-prepush: green ---"
 
 # All three tiers, in order.

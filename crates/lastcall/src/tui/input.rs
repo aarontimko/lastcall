@@ -124,6 +124,77 @@ pub enum NoteKey {
     Cancel,
 }
 
+/// One edit inside a text buffer ([`super::textbuf::TextBuf`]), for the two places that
+/// hold one: the note modal (deliverable 5) and the inline editor (deliverable 8).
+///
+/// Deliberately *only* the buffer's own vocabulary. `Send`, `Cancel`, `Save` and a paste's
+/// destination are the caller's business — the note modal sends a flag where the editor
+/// writes a file — so they stay out of here and the same mapping serves both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditKey {
+    /// Text to put in verbatim. A `String`, not a `char`, because a bracketed paste arrives
+    /// as one `Event::Paste` and must land as one edit, whatever it contains.
+    Insert(String),
+    Newline,
+    Backspace,
+    Delete,
+    Left,
+    Right,
+    Up,
+    Down,
+    WordLeft,
+    WordRight,
+    WordBackspace,
+    Home,
+    End,
+    /// `Ctrl-K`: from the cursor to the end of the line.
+    KillToEnd,
+    PageUp,
+    PageDown,
+}
+
+/// The buffer edit one key event asks for, or nothing (Phase 8 deliverable 4).
+///
+/// Everything a terminal reports for the motions people expect in a text field, and nothing
+/// else: `Enter` and `Esc` are **not** here, because what they mean depends on who is
+/// holding the buffer — the note modal sends and cancels, the inline editor saves and
+/// closes. The caller checks those first and asks this second.
+///
+/// `Shift-Enter` is a newline only when the terminal can tell it apart from `Enter`, which
+/// is why `enhanced` is a parameter: with no keyboard-enhancement flags the two are the
+/// same byte, and promising a key that silently sends the note instead is worse than not
+/// promising it (deliverable 5). `Ctrl-J` is the binding that always works.
+pub fn edit_key(key: &Key, enhanced: bool) -> Option<EditKey> {
+    let alt_or_ctrl = key.alt || key.ctrl;
+    Some(match key.code {
+        KeyCode::Enter if key.alt => EditKey::Newline,
+        KeyCode::Enter if key.shift && enhanced => EditKey::Newline,
+        KeyCode::Char('j') if key.ctrl => EditKey::Newline,
+        KeyCode::Backspace if key.alt || key.ctrl => EditKey::WordBackspace,
+        KeyCode::Char('w') if key.ctrl => EditKey::WordBackspace,
+        KeyCode::Backspace => EditKey::Backspace,
+        KeyCode::Delete => EditKey::Delete,
+        KeyCode::Left if alt_or_ctrl => EditKey::WordLeft,
+        KeyCode::Right if alt_or_ctrl => EditKey::WordRight,
+        KeyCode::Left => EditKey::Left,
+        KeyCode::Right => EditKey::Right,
+        KeyCode::Up => EditKey::Up,
+        KeyCode::Down => EditKey::Down,
+        KeyCode::Home => EditKey::Home,
+        KeyCode::End => EditKey::End,
+        KeyCode::Char('a') if key.ctrl => EditKey::Home,
+        KeyCode::Char('e') if key.ctrl => EditKey::End,
+        KeyCode::Char('k') if key.ctrl => EditKey::KillToEnd,
+        KeyCode::PageUp => EditKey::PageUp,
+        KeyCode::PageDown => EditKey::PageDown,
+        KeyCode::Tab if !alt_or_ctrl => EditKey::Insert("\t".to_owned()),
+        // A printable is text. That is what keeps a keymap letter — `q`, `a`, `i` — from
+        // being swallowed by the buffer while a modal is open: it types itself.
+        KeyCode::Char(c) if !alt_or_ctrl => EditKey::Insert(c.to_string()),
+        _ => return None,
+    })
+}
+
 /// What one keystroke does in the agent picker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickKey {

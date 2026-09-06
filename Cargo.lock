@@ -858,6 +858,7 @@ dependencies = [
  "insta",
  "lastcall-engine",
  "lastcall-testkit",
+ "proptest",
  "ratatui",
  "serde_json",
  "tokio",

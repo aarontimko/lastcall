@@ -6,6 +6,7 @@
 //! - `editor` — pure `$VISUAL`/`$EDITOR` resolution and the per-editor "open at line" argv.
 //! - `input`  — the `Action` vocabulary and `DEFAULT_KEYMAP`, `to_action(Event, &Keymap)`
 //!   and `Keymap::from_config` (the `[keys]` table).
+//! - `textbuf` — the editable text buffer the note modal and the inline editor share.
 //! - `render` — `render(&App, frame) -> HitMap`, plus `styles(&Buffer)` for the snapshot tier.
 //! - `herdr`  — the socket-free boundary to the herdr client: `HerdrUpdate`, `HerdrView`,
 //!   the pure `derive`, and the one task that talks to the socket (Phase 5).
@@ -22,3 +23,4 @@ pub mod input;
 pub mod render;
 pub mod run;
 pub mod term;
+pub mod textbuf;
