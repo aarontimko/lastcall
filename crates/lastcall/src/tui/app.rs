@@ -394,6 +394,10 @@ pub struct EditOpen {
     /// Zero-based `(first, last)` of the hunk the editor opened at — the band. `None` for a
     /// row with no content hunk at all (a mode-only change opens at line 1 with no band).
     pub band: Option<(usize, usize)>,
+    /// Which open this is: [`App::edit_gen`] at the moment `i` was pressed. It travels to
+    /// the read and back so [`App::edit_read`] can tell the answer it is waiting for from
+    /// an answer to an open that is no longer the live one (verifier (b) F2).
+    pub generation: u64,
 }
 
 /// The inline editor, if open (deliverable 8; ruling P3).
@@ -919,6 +923,18 @@ pub struct App {
     /// and swallows every key the confirm modal above it does not take — `q` included, so
     /// a keymap letter types itself (F16).
     pub editor: Option<Editor>,
+    /// The generation of the last [`Effect::EditInline`] issued, and whether its answer is
+    /// still the one to honour (verifier (b) F2).
+    ///
+    /// The read runs off the UI task, so `i` pressed twice in one burst — key repeat, a
+    /// pasted `ii`, a second press while a slow disk answers the first — used to produce
+    /// two reads whose answers both opened an editor, the second one throwing away
+    /// whatever the reader had typed into the first. `edit_pending` is `Some(gen)` from the
+    /// press until its answer lands: a press while it is set asks for nothing, and an
+    /// answer whose `generation` is not the pending one is dropped.
+    pub edit_pending: Option<u64>,
+    /// Monotonic counter behind [`App::edit_pending`]; every open gets its own number.
+    pub edit_gen: u64,
     /// The confirm modal, if open: every action but `Tick`/`Resize`/`Confirm`/`Cancel`/
     /// `Quit` is ignored while it is (`Quit` passes as it does through the help overlay:
     /// `q` and ctrl-c quit by default, everywhere).
@@ -976,6 +992,8 @@ impl App {
             note: None,
             picker: None,
             editor: None,
+            edit_pending: None,
+            edit_gen: 0,
             confirm: None,
             herdr: HerdrView::default(),
             expanded: None,
@@ -1829,8 +1847,17 @@ impl App {
     /// Nothing is drawn on the way out — the read is one `lstat` and one file read off the
     /// UI task — and the marks and the band are computed **here**, from the pile that is on
     /// screen, so the editor that opens describes the file the reader was looking at.
+    ///
+    /// One open at a time (verifier (b) F2). An editor that is already up swallows `i` as
+    /// text, so the first arm is defence for a caller that is not the keymap; the second is
+    /// the one that fires — a second press while the first read is still in flight asks for
+    /// nothing, because the editor it would open is the editor about to open. Neither says
+    /// anything: the reader is looking at the buffer they asked for either way.
     fn edit_inline(&mut self) -> (Changed, Option<Effect>) {
         if !matches!(self.selection, Some(Selection::Row(..))) {
+            return (Changed::No, None);
+        }
+        if self.editor.is_some() || self.edit_pending.is_some() {
             return (Changed::No, None);
         }
         let Some((root, rendered, line)) = self.edit_target() else {
@@ -1849,6 +1876,8 @@ impl App {
             .edit_hunk()
             .filter(|h| !h.new_range.is_empty())
             .map(|h| (h.new_range.start, h.new_range.end - 1));
+        self.edit_gen += 1;
+        self.edit_pending = Some(self.edit_gen);
         (
             Changed::No,
             Some(Effect::EditInline(EditOpen {
@@ -1857,6 +1886,7 @@ impl App {
                 line,
                 marks,
                 band,
+                generation: self.edit_gen,
             })),
         )
     }
@@ -1868,11 +1898,19 @@ impl App {
     /// the file anyway — `use shift-i: binary` — because "no" is only half an answer when
     /// there is a second way in. Every other refusal is the CAS speaking, and says so in
     /// the vocabulary every other refused op uses.
+    ///
+    /// An answer to an open that is no longer the pending one is dropped without a word
+    /// (verifier (b) F2): it would open an editor over the one the reader is typing in, or
+    /// print the refusal of a file they have stopped asking about.
     pub fn edit_read(
         &mut self,
         open: EditOpen,
         result: Result<Vec<u8>, Refused>,
     ) -> (Changed, Option<Effect>) {
+        if self.edit_pending != Some(open.generation) {
+            return (Changed::No, None);
+        }
+        self.edit_pending = None;
         let text = match result {
             Ok(bytes) => match String::from_utf8(bytes) {
                 Ok(text) => text,
@@ -6278,6 +6316,65 @@ mod tests {
             open.line,
             from_nav.edit_target().expect("openable").2,
             "`i` and `shift-i` ask for the same line"
+        );
+    }
+
+    /// Verifier (b) F2: two `i` in one burst used to open two editors, the second read's
+    /// answer replacing the buffer the reader had already typed into. Now the second press
+    /// asks for nothing while the first read is in flight, and an answer to an open that is
+    /// no longer pending — a duplicate, or a read that was already superseded — is dropped.
+    #[test]
+    fn app_edit_does_not_replace_a_dirty_editor() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.select(Some(row("alpha", "f1")));
+
+        let open = edit_open(&mut app);
+        assert_eq!(
+            app.edit_pending,
+            Some(open.generation),
+            "the read is in flight"
+        );
+        assert_eq!(
+            app.handle(Action::Edit),
+            (Changed::No, None),
+            "a second `i` while the first read is out asks for nothing"
+        );
+        assert_eq!(
+            app.edit_pending,
+            Some(open.generation),
+            "and does not move the open the answer will be matched against"
+        );
+
+        assert_eq!(
+            app.edit_read(open.clone(), Ok(lines_of(10).into_bytes())),
+            (Changed::Yes, None)
+        );
+        assert_eq!(app.edit_pending, None, "the open is answered");
+        app.handle(Action::Editor(EditorKey::Edit(EditKey::Insert(
+            "mine ".to_owned(),
+        ))));
+        let typed = app.editor.as_ref().expect("open").buf.text();
+        assert!(typed.starts_with("mine l0"), "the reader typed: {typed:?}");
+        assert!(app.editor.as_ref().expect("open").buf.dirty());
+
+        // The second read's answer — the same file, a fresh copy off the disk — lands.
+        assert_eq!(
+            app.edit_read(open, Ok(lines_of(10).into_bytes())),
+            (Changed::No, None),
+            "an answer nobody is waiting for is dropped"
+        );
+        let ed = app.editor.as_ref().expect("still open");
+        assert_eq!(ed.buf.text(), typed, "the typed text survives");
+        assert!(ed.buf.dirty(), "and the buffer is still dirty");
+
+        // Belt to that braces: `i` with an editor up (no keymap path reaches it — the
+        // editor eats the key as text) opens nothing over the buffer either.
+        assert_eq!(app.handle(Action::Edit), (Changed::No, None));
+        assert_eq!(
+            app.editor.as_ref().expect("still open").buf.text(),
+            typed,
+            "the buffer is untouched"
         );
     }
 
