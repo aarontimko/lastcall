@@ -1358,7 +1358,9 @@ impl App {
     ///   of every non-waiting editor (`code` without `--wait`), whose later save arrives as
     ///   an ordinary pending row;
     /// - **gone**, **a symlink**, or **unhashable** on return — there is no content to
-    ///   bless, and the row stays pending with the reason on the status line.
+    ///   bless, and the row stays pending with the reason on the status line;
+    /// - **another modal is already open** (a confirm, the note, the agent picker) — the
+    ///   question would replace one the user is reading, so it is not asked at all.
     pub fn editor_returned(
         &mut self,
         root: PathBuf,
@@ -1393,6 +1395,15 @@ impl App {
         };
         if rendered.oid.as_ref() == Some(&oid) && rendered.mode == Some(mode) {
             self.set_status("no change");
+            return (Changed::Yes, None);
+        }
+        // Another question is already on screen. The return arrives on a channel, so a
+        // confirm the user opened between the resume and the reply (or a note, or the agent
+        // picker) would be silently replaced and the next `y` would answer *this* question
+        // instead of the one they read — verifier (a) F1. The row keeps the editor's delta,
+        // so the edit is not lost: it is reviewed as an ordinary pending row.
+        if self.confirm.is_some() || self.note.is_some() || self.picker.is_some() {
+            self.set_status(format!("{path}: changed on return; left pending"));
             return (Changed::Yes, None);
         }
         let live_rendered = Rendered {
@@ -3492,6 +3503,74 @@ mod tests {
                 "the row is untouched"
             );
         }
+    }
+
+    /// Verifier (a) F1: the return arrives on a channel, so a question can already be on
+    /// screen when it lands. Replacing it would mean the next `y` answers a question the
+    /// user never read — so the blessing is not asked at all and the row stays pending with
+    /// the editor's delta on it.
+    #[test]
+    fn app_editor_return_leaves_the_row_pending_when_a_modal_is_open() {
+        // A confirm: accept-all over twelve files, waiting for its answer.
+        let mut app = three_roots();
+        app.apply(pile_event("alpha", rows_n(12, 0, 0)));
+        app.select(Some(Selection::Root(root("alpha"))));
+        app.handle(Action::Accept);
+        let asked = app.confirm.clone();
+        assert!(asked.is_some(), "the accept-all question is up");
+
+        let rendered = Rendered::of(app.roots[&root("alpha")].row(b"p00").expect("p00"));
+        let live = Current::Present {
+            oid: Oid::parse(&"e".repeat(40)).expect("a well-formed oid"),
+            mode: rendered.mode.expect("not a deletion"),
+        };
+        let (changed, effect) = app.editor_returned(root("alpha"), rendered.clone(), live.clone());
+        assert_eq!(changed, Changed::Yes, "only the status moved");
+        assert_eq!(effect, None);
+        assert_eq!(app.confirm, asked, "the accept-all question is untouched");
+        assert_eq!(app.confirm_bless(), None, "and it is not a blessing");
+        assert_eq!(status(&app), "p00: changed on return; left pending");
+        assert!(
+            app.roots[&root("alpha")].row(b"p00").is_some(),
+            "the row is still there to review the ordinary way"
+        );
+
+        // The note modal: the same answer.
+        let mut app = note_open();
+        let rendered = Rendered::of(app.roots[&root("alpha")].row(b"f1").expect("f1"));
+        let live = Current::Present {
+            oid: Oid::parse(&"e".repeat(40)).expect("a well-formed oid"),
+            mode: rendered.mode.expect("not a deletion"),
+        };
+        app.editor_returned(root("alpha"), rendered.clone(), live.clone());
+        assert!(app.note.is_some(), "the note is still being typed");
+        assert!(app.confirm.is_none(), "nothing was asked over it");
+        assert_eq!(status(&app), "f1: changed on return; left pending");
+
+        // The agent picker: likewise.
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.handle(agents_of(
+            "alpha",
+            vec![
+                agent("w1:p1", "claude", "lastcall"),
+                agent("w2:p3", "codex", "spike"),
+            ],
+        ));
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Flag);
+        type_note(&mut app, "look at this");
+        app.handle(Action::Note(NoteKey::Send));
+        app.flagged(
+            root("alpha"),
+            flag_of("f1"),
+            flagged_ok("EXPORT", 1, pile("alpha")),
+        );
+        assert!(app.picker.is_some(), "the picker is up");
+        app.editor_returned(root("alpha"), rendered, live);
+        assert!(app.picker.is_some(), "and it stays up");
+        assert!(app.confirm.is_none());
+        assert_eq!(status(&app), "f1: changed on return; left pending");
     }
 
     #[test]
