@@ -124,6 +124,12 @@ pub enum Refused {
     /// The path is in a merge conflict (`ls-files -u`): restoring it would write over one
     /// side of a merge git is still holding open (gate item 4; C4).
     Conflicted { path: Vec<u8> },
+    /// The row cannot be edited at all: it is a deletion, a symlink, or (deliverable 8)
+    /// content the inline editor will not hold — binary, or over the collapse cap.
+    ///
+    /// `why` is a short noun phrase the UI can also render on its own (`use shift-i:
+    /// <why>`), so it never repeats the path.
+    NotEditable { path: Vec<u8>, why: String },
     /// The hunk list handed to `restore_hunk` does not reassemble the rendered content, so
     /// "everything but hunk k" would silently drop whatever is missing from it (verifier
     /// F3). The one refusal that is about the *caller's* view rather than the file.
@@ -170,6 +176,9 @@ impl Refused {
             Refused::NonUtf8Path { path } => {
                 format!("{}: non-UTF-8 path; accept unsupported in v1", lossy(path))
             }
+            // The one refusal whose verb is fixed: editing is the only operation that can
+            // raise it, so `Display` (which passes `"accepted"`) still reads correctly.
+            Refused::NotEditable { path, why } => format!("{}: {why}; not saved", lossy(path)),
             Refused::NoSuchHunk { path, index } => format!("{}: no hunk {index}", lossy(path)),
             Refused::Conflicted { path } => {
                 format!("{}: unresolved merge conflict; not {verb}", lossy(path))
@@ -610,6 +619,9 @@ impl Ops<'_> {
     // twice: once at entry, and once more immediately before the `rename` (§6.3). The
     // remaining window between the second hash and the rename is the §11 residual; the
     // rescan every restore ends with is its mitigation.
+    //
+    // [`Ops::save_file`] below is the same shape for the same reason, with one addition
+    // the restore does not have: it writes the ledger too, *after* the file.
 
     /// Everything both restore routes check before anything is computed, in the order the
     /// checks have to happen: a UTF-8 path, no unresolved conflict, no symlink in the
@@ -1114,6 +1126,95 @@ impl Ops<'_> {
                 self.restore_write(&rendered.path, Some(&bytes), Some(*mode), &mut before)
             }
         }
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Save — the second operation that writes the user's working tree (Phase 8)
+    // -----------------------------------------------------------------------------------
+
+    /// Write `bytes` at `rendered.path` under compare-and-swap and set the path's override
+    /// to what was written (§6.3 "editor save"; invariant 8).
+    ///
+    /// **Do not harmonise this with `accept_hunk`.** Accept-hunk has no live CAS on
+    /// purpose (Amendment A3): it computes a blob from the baseline and the hunk the user
+    /// saw and never touches the working tree, so a file that moved underneath cannot
+    /// smuggle anything into the ledger. A save is the opposite case — it *writes* the
+    /// working tree — so the live CAS is the entire guard, and, exactly as in a restore, it
+    /// runs twice: once here at entry and once more inside `before_rename`.
+    ///
+    /// The order below is the one rule that is easy to get wrong. The oid is computed from
+    /// the buffer's bytes **before anything is written** (design review F1) with
+    /// [`Store::hash_bytes_as`], not read back from the file afterwards: `write_bytes`'s
+    /// `before_rename` hook takes no arguments and cannot reach the temp file, and a fresh
+    /// read after the rename would hash whatever an agent wrote in the
+    /// rename-to-ledger window and bless it. Recording the oid of the bytes we wrote means
+    /// such a write shows up as **pending** at the rescan, which is invariant 2's
+    /// direction.
+    ///
+    /// The bytes go down verbatim — the caller read the worktree file, CRLF and all, so
+    /// what comes back is what the user saw — with the **live** mode, so the executable
+    /// bit survives and the override's mode matches what the next scan will `lstat`.
+    /// The baseline is never touched.
+    ///
+    /// §11 residuals inherited from the restore verbatim: the hash-then-rename window
+    /// (mitigated, as there, by the rescan every save ends with) and the orphaned open
+    /// descriptor.
+    pub fn save_file(
+        &mut self,
+        rendered: &Rendered,
+        bytes: &[u8],
+        fault: &dyn FaultInjector,
+    ) -> Result<Outcome, OpsError> {
+        let refuse = |r: Refused| {
+            Ok(Outcome {
+                refused: vec![r],
+                ..Default::default()
+            })
+        };
+        let not_editable = |why: &str| Refused::NotEditable {
+            path: rendered.path.clone(),
+            why: why.to_owned(),
+        };
+        // A deletion row has no file to save into, and a symlink's "content" is its target:
+        // writing bytes at it would either follow the link or replace it, and neither is an
+        // edit of the row the user was looking at.
+        if rendered.oid.is_none() {
+            return refuse(not_editable("the file is gone"));
+        }
+        if rendered.mode == Some(Mode::Symlink) {
+            return refuse(not_editable("not a regular file"));
+        }
+        if let Err(r) = self.restore_preflight(&rendered.path) {
+            return refuse(r);
+        }
+        let live = match self.cas_live(rendered) {
+            Ok(live) => live,
+            Err(r) => return refuse(r),
+        };
+        // Before any write. A hashing failure is an error, not a refusal, and leaves the
+        // working tree untouched.
+        let oid = self.store.hash_bytes_as(&rendered.path, bytes)?;
+        let mut before = Self::second_cas(rendered, self.store, fault);
+        let written = self.restore_write(&rendered.path, Some(bytes), Some(live.mode), &mut before);
+        match written {
+            Ok(out) if !out.ok() => return Ok(out),
+            Ok(_) => {}
+            Err(e) => return Err(e),
+        }
+        // The file is on disk; only now does the ledger learn about it. A crash in this
+        // window leaves the new bytes and the old ledger — the edit is pending, which is
+        // the fail-open direction, and nothing the user typed is lost.
+        let key = match Self::key(&rendered.path) {
+            Ok(k) => k,
+            Err(r) => return refuse(r),
+        };
+        self.set_override(&key, Some(oid), Some(live.mode));
+        let compacted = self.commit(fault)?;
+        Ok(Outcome {
+            refused: Vec::new(),
+            compacted,
+            written: true,
+        })
     }
 
     /// Accept everything in `snapshot` at its rendered content (A5), stamp `seen_at`
@@ -2240,6 +2341,287 @@ mod tests {
         assert!(h.scan().pile.is_empty());
     }
 
+    // -----------------------------------------------------------------------------------
+    // Save (Phase 8 deliverable 1)
+    // -----------------------------------------------------------------------------------
+
+    /// Gate item 1 at the engine: an editor save produces zero new pending for the saved
+    /// content, and the override the ledger records is the file's real post-write hash.
+    #[test]
+    fn ops_save_file_is_cas_and_the_rescan_shows_zero_pending() {
+        let repo = FixtureRepo::new("ops-save").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        repo.write("f1", "one\ntwo\n");
+        let r = rendered(&h, b"f1");
+        let out = h
+            .ops()
+            .save_file(&r, b"one\nTWO\nthree\n", &NoFault)
+            .unwrap();
+        assert!(out.ok(), "{out:?}");
+        assert!(out.written, "a save writes the ledger, unlike a restore");
+        assert_eq!(
+            std::fs::read(repo.path().join("f1")).unwrap(),
+            b"one\nTWO\nthree\n",
+            "the buffer's bytes land verbatim"
+        );
+        assert!(
+            h.scan().pile.is_empty(),
+            "invariant 8: the user never reviews their own just-typed change"
+        );
+        let live = match h.store.hash_path(b"f1") {
+            Current::Present { oid, .. } => oid,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            h.ledger.overrides["f1"].blob,
+            Some(Some(live)),
+            "the override is the hash of what is on disk"
+        );
+        assert!(temp_ghosts(repo.path()).is_empty());
+    }
+
+    /// The CAS refuses and — the half that matters — writes nothing at all.
+    #[test]
+    fn ops_save_file_refuses_when_the_file_moved_and_leaves_it_untouched() {
+        let repo = FixtureRepo::new("ops-save-moved").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        repo.write("f1", "rendered\n");
+        let r = rendered(&h, b"f1");
+        // The agent writes between the buffer being read and Ctrl-S.
+        repo.write("f1", "the agent got there first\n");
+        let out = h.ops().save_file(&r, b"my edit\n", &NoFault).unwrap();
+        assert!(
+            matches!(out.refused.first(), Some(Refused::Moved { .. })),
+            "{out:?}"
+        );
+        assert!(!out.written, "a refused save never touches the ledger");
+        assert_eq!(
+            std::fs::read(repo.path().join("f1")).unwrap(),
+            b"the agent got there first\n",
+            "a refused save leaves the working file byte for byte as it was"
+        );
+        assert!(!h.ledger.overrides.contains_key("f1"));
+        assert!(temp_ghosts(repo.path()).is_empty());
+    }
+
+    /// The mode goes down with the bytes, and the proof is the *rescan*: the scan compares
+    /// `(oid, mode)`, so an override whose mode disagreed with the file would leave the row
+    /// pending even though the content matched.
+    #[test]
+    fn ops_save_file_keeps_the_executable_bit() {
+        let mut repo = FixtureRepo::new("ops-save-exec").unwrap();
+        repo.write("s.sh", "#!/bin/sh\necho one\n");
+        repo.chmod_x("s.sh", true);
+        repo.commit("script").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        if !h.store.filemode() {
+            return; // a root that ignores the executable bit has nothing to prove
+        }
+        repo.write("s.sh", "#!/bin/sh\necho two\n");
+        repo.chmod_x("s.sh", true);
+        let r = rendered(&h, b"s.sh");
+        assert_eq!(r.mode, Some(Mode::Executable));
+        let out = h
+            .ops()
+            .save_file(&r, b"#!/bin/sh\necho three\n", &NoFault)
+            .unwrap();
+        assert!(out.ok(), "{out:?}");
+        use std::os::unix::fs::PermissionsExt;
+        let bits = std::fs::metadata(repo.path().join("s.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert!(bits & 0o111 != 0, "still executable: {bits:o}");
+        assert!(
+            h.scan().pile.is_empty(),
+            "the rescan agrees on content and mode"
+        );
+    }
+
+    /// D3 through a save: a CRLF file under `* text=auto` goes back with its CRLFs intact,
+    /// the override is the *filtered* oid git will compute for it, and nothing pends.
+    #[test]
+    fn scenario_d3_save_of_a_crlf_text_auto_file_round_trips() {
+        let mut repo = FixtureRepo::new("ops-save-crlf").unwrap();
+        repo.write(".gitattributes", "* text=auto\n");
+        repo.write("crlf.txt", "a\r\nb\r\nc\r\n");
+        repo.commit("crlf").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        repo.write("crlf.txt", "a\r\nB\r\nc\r\n");
+        let r = rendered(&h, b"crlf.txt");
+        let edited: &[u8] = b"a\r\nB\r\nC\r\n";
+        let out = h.ops().save_file(&r, edited, &NoFault).unwrap();
+        assert!(out.ok(), "{out:?}");
+        assert_eq!(
+            std::fs::read(repo.path().join("crlf.txt")).unwrap(),
+            edited,
+            "the CRLFs the user saw are the CRLFs that go back"
+        );
+        assert_eq!(
+            h.ledger.overrides["crlf.txt"].blob,
+            Some(Some(h.store.hash_bytes(b"a\nB\nC\n").unwrap())),
+            "the override is the LF-normalised blob git stores, not the raw bytes"
+        );
+        assert!(h.scan().pile.is_empty());
+    }
+
+    /// Neither a deletion row nor a symlink is an editable file, and the refusal says so
+    /// without pretending the CAS failed.
+    #[test]
+    fn ops_save_file_refuses_a_symlink_and_a_deletion() {
+        let mut repo = FixtureRepo::new("ops-save-noteditable").unwrap();
+        repo.symlink("f1", "link");
+        repo.commit("link").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        repo.remove("f2");
+        repo.remove("link");
+        repo.symlink("f3", "link");
+        let gone = rendered(&h, b"f2");
+        assert!(gone.oid.is_none());
+        let out = h.ops().save_file(&gone, b"resurrect\n", &NoFault).unwrap();
+        match out.refused.first() {
+            Some(Refused::NotEditable { why, .. }) => assert_eq!(why, "the file is gone"),
+            other => panic!("{other:?}"),
+        }
+        assert!(!repo.path().join("f2").exists(), "nothing was recreated");
+
+        let link = rendered(&h, b"link");
+        assert_eq!(link.mode, Some(Mode::Symlink));
+        let out = h.ops().save_file(&link, b"bytes\n", &NoFault).unwrap();
+        match out.refused.first() {
+            Some(Refused::NotEditable { why, .. }) => assert_eq!(why, "not a regular file"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_link(repo.path().join("link")).unwrap(),
+            std::path::Path::new("f3"),
+            "the link is untouched and nothing was written through it"
+        );
+        assert_eq!(
+            Refused::NotEditable {
+                path: b"link".to_vec(),
+                why: "not a regular file".into(),
+            }
+            .to_string(),
+            "link: not a regular file; not saved"
+        );
+    }
+
+    /// F3 — a draft (non-git) root behaves exactly as a git root does.
+    #[test]
+    fn scenario_f3_save_on_a_draft_root() {
+        let mut d = proptests::Draft::new("lc-save-draft");
+        let mut files = BTreeMap::new();
+        files.insert("n.md".to_owned(), b"one\ntwo\n".to_vec());
+        d.reset(&files);
+        d.write("n.md", b"one\nTWO\n");
+        let pile = d.scan();
+        let r = Rendered::of(pile.row(b"n.md").expect("pending"));
+        let out = d
+            .ops()
+            .save_file(&r, b"one\nTWO\nthree\n", &NoFault)
+            .unwrap();
+        assert!(out.ok(), "{out:?}");
+        assert_eq!(
+            std::fs::read(d.root.join("n.md")).unwrap(),
+            b"one\nTWO\nthree\n"
+        );
+        assert!(d.scan().is_empty(), "zero pending on a draft root too");
+    }
+
+    /// Drops `ledger.json.tmp` at [`FaultPoint::AfterLedgerTmpWrite`], leaving exactly the
+    /// on-disk state a crash before the rename would (the `engine.rs` `DropTmp` twin).
+    struct DropLedgerTmp(std::path::PathBuf);
+
+    impl FaultInjector for DropLedgerTmp {
+        fn at(&self, point: FaultPoint) {
+            if point == FaultPoint::AfterLedgerTmpWrite {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+    }
+
+    /// F10: the file is written and the process dies before the ledger lands. Nothing the
+    /// user typed is lost — it is on disk — and the edit is simply **pending**, which is
+    /// the fail-open direction invariant 2 asks for.
+    #[test]
+    fn ops_save_file_that_dies_before_the_ledger_shows_the_edit_pending() {
+        let repo = FixtureRepo::new("ops-save-e1").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        // One clean save first, so there is a real ledger on disk to compare against.
+        repo.write("f2", "kept\n");
+        let r2 = rendered(&h, b"f2");
+        assert!(h.ops().save_file(&r2, b"kept\n", &NoFault).unwrap().ok());
+        repo.write("f1", "one\n");
+        let r = rendered(&h, b"f1");
+        let tmp = h.paths.ledger.with_extension("json.tmp");
+        let err = h
+            .ops()
+            .save_file(&r, b"my edit\n", &DropLedgerTmp(tmp))
+            .expect_err("the ledger rename fails");
+        assert!(matches!(err, OpsError::Ledger(_)), "{err}");
+        assert_eq!(
+            std::fs::read(repo.path().join("f1")).unwrap(),
+            b"my edit\n",
+            "the buffer is safely on disk"
+        );
+        // The in-memory ledger still holds the staged override; the engine seam drops it.
+        // What the *next* engine sees is the on-disk ledger, which never learned anything.
+        let disk = match ledger::load(&h.paths, &h.clock).unwrap() {
+            LoadResult::Loaded { ledger, .. } => ledger,
+            other => panic!("{other:?}"),
+        };
+        assert!(
+            !disk.overrides.contains_key("f1"),
+            "the ledger on disk never learned about the save"
+        );
+        assert!(
+            disk.overrides.contains_key("f2"),
+            "and the earlier save is still there"
+        );
+        h.ledger = disk;
+        assert_eq!(
+            pile_lines(&h.scan().pile),
+            vec!["f1"],
+            "the edit shows as pending rather than being lost"
+        );
+        assert!(temp_ghosts(repo.path()).is_empty());
+    }
+
+    /// F10, the other fault point: a failure while the temp file is on disk leaves neither
+    /// a changed file nor a ghost.
+    #[test]
+    fn ops_save_file_that_fails_before_the_rename_leaves_no_trace() {
+        let repo = FixtureRepo::new("ops-save-temp-fault").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        repo.write("f1", "one\n");
+        let r = rendered(&h, b"f1");
+        let out = h
+            .ops()
+            .save_file(&r, b"my edit\n", &FailAt(FaultPoint::AfterTempWrite))
+            .unwrap();
+        assert!(!out.ok(), "the fault aborts the save: {out:?}");
+        assert!(!out.written);
+        assert_eq!(
+            std::fs::read(repo.path().join("f1")).unwrap(),
+            b"one\n",
+            "the rename never happened"
+        );
+        assert!(temp_ghosts(repo.path()).is_empty());
+        assert!(!h.ledger.overrides.contains_key("f1"));
+        // The same save without the fault lands, so the failure was the fault.
+        let out = h.ops().save_file(&r, b"my edit\n", &NoFault).unwrap();
+        assert!(out.ok(), "{out:?}");
+        assert!(h.scan().pile.is_empty());
+    }
+
     /// Kickoff deliverable 8 (ii)/(iii): property tests over one draft root per test — a
     /// private store on a temp dir, no user repo, the `RootKind::Draft` plumbing exactly as
     /// the engine opens one. Each case rewrites the file set and resets the ledger to first
@@ -2263,9 +2645,9 @@ mod tests {
         use crate::ledger::FixedClock;
         use crate::scan::{Change, ScanInputs};
 
-        struct Draft {
+        pub(super) struct Draft {
             _dir: TempDir,
-            root: PathBuf,
+            pub(super) root: PathBuf,
             store: Store,
             index: PrivateIndex,
             ledger: Ledger,
@@ -2276,7 +2658,7 @@ mod tests {
         }
 
         impl Draft {
-            fn new(name: &str) -> Self {
+            pub(super) fn new(name: &str) -> Self {
                 let dir = TempDir::new(name);
                 let root = dir.mkdir("draft");
                 let state = dir.mkdir("state");
@@ -2314,7 +2696,7 @@ mod tests {
             }
 
             /// Make `files` the whole worktree and the ledger a first sight of it.
-            fn reset(&mut self, files: &BTreeMap<String, Vec<u8>>) {
+            pub(super) fn reset(&mut self, files: &BTreeMap<String, Vec<u8>>) {
                 for entry in std::fs::read_dir(&self.root).unwrap() {
                     std::fs::remove_file(entry.unwrap().path()).unwrap();
                 }
@@ -2327,7 +2709,7 @@ mod tests {
                 ledger::save(&self.paths, &self.ledger).unwrap();
             }
 
-            fn write(&self, name: &str, bytes: &[u8]) {
+            pub(super) fn write(&self, name: &str, bytes: &[u8]) {
                 std::fs::write(self.root.join(name), bytes).unwrap();
             }
 
@@ -2348,7 +2730,7 @@ mod tests {
                     .collect()
             }
 
-            fn scan(&self) -> Pile {
+            pub(super) fn scan(&self) -> Pile {
                 crate::scan::scan(&ScanInputs {
                     store: &self.store,
                     index: &self.index,
@@ -2367,7 +2749,7 @@ mod tests {
                 .pile
             }
 
-            fn ops(&mut self) -> Ops<'_> {
+            pub(super) fn ops(&mut self) -> Ops<'_> {
                 Ops {
                     store: &self.store,
                     index: &self.index,
@@ -2840,6 +3222,60 @@ mod tests {
                     Ok(())
                 },
             );
+            if let Err(e) = result {
+                panic!("{e}");
+            }
+        }
+
+        /// Arbitrary editor-buffer bytes: CRLF, a lone CR, no trailing newline, tabs, NUL
+        /// (a NUL-bearing buffer is *binary* to git and must still pend nothing).
+        fn save_bytes() -> impl Strategy<Value = Vec<u8>> {
+            let piece = prop_oneof![
+                Just(&b"a\n"[..]),
+                Just(&b"b\r\n"[..]),
+                Just(&b"\r"[..]),
+                Just(&b"\n"[..]),
+                Just(&b"\tt\n"[..]),
+                Just(&b"tail"[..]),
+                Just(&b"\0\n"[..]),
+                Just(&b"\xc3\xa9\r\n"[..]),
+            ];
+            prop::collection::vec(piece, 0..8).prop_map(|v| v.concat())
+        }
+
+        /// Gate item 1 as a property (64 cases in prepush): whatever the buffer holds, a
+        /// save puts exactly those bytes on disk and the rescan that follows pends nothing.
+        #[test]
+        fn ops_save_then_scan_pends_nothing_for_any_bytes() {
+            let d = RefCell::new(Draft::new("lc-prop-save"));
+            let mut runner = TestRunner::new(config());
+            let result = runner.run(&(content(), save_bytes()), |(seed, bytes)| {
+                let mut d = d.borrow_mut();
+                let mut files = BTreeMap::new();
+                files.insert("n".to_owned(), seed.clone());
+                d.reset(&files);
+                // Something has to be pending for there to be a row to save into.
+                let mut edited = seed.clone();
+                edited.extend_from_slice(b"pending\n");
+                d.write("n", &edited);
+                let pile = d.scan();
+                let row = pile.row(b"n").expect("the edit is pending").clone();
+                let rendered = Rendered::of(&row);
+                let out = d.ops().save_file(&rendered, &bytes, &NoFault).unwrap();
+                prop_assert!(out.ok(), "{:?}", out);
+                prop_assert_eq!(
+                    std::fs::read(d.root.join("n")).unwrap(),
+                    bytes.clone(),
+                    "the buffer's bytes land verbatim"
+                );
+                let after = d.scan();
+                prop_assert!(
+                    after.row(b"n").is_none(),
+                    "the saved row is still pending: {:?}",
+                    crate::scan::pile_lines(&after)
+                );
+                Ok(())
+            });
             if let Err(e) = result {
                 panic!("{e}");
             }

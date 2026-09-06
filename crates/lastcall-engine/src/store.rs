@@ -22,7 +22,7 @@
 //! missing, which surfaces as [`Current::Unhashable`]). Informational deferral.
 
 use std::collections::{BTreeMap, HashMap};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -436,6 +436,37 @@ impl Store {
             .run_stdin(None, &["hash-object", "-w", "--stdin"], bytes)?;
         Oid::parse(String::from_utf8_lossy(&out).trim())
             .ok_or_else(|| StoreError::Other("hash-object --stdin printed no oid".into()))
+    }
+
+    /// `hash-object -w --path=<rel> --stdin`: the oid a **scan** will compute for `bytes`
+    /// once they are the content of `rel` (Phase 8 deliverable 1).
+    ///
+    /// The same runner and environment as [`Store::hash_path`] — `GIT_DIR=<store>`,
+    /// `GIT_WORK_TREE=<root>`, cwd = root — so `rel`'s attributes (`text=auto`, `eol`, a
+    /// clean filter) act exactly as they do on a scanned file. That is the whole point:
+    /// a save must know the post-write oid **before** it writes anything (design review
+    /// F1), because `restore::write_bytes`'s `before_rename` hook takes no arguments and
+    /// cannot reach the temp file, and a fresh read after the rename would hash whatever
+    /// an agent put there in the meantime. `--path` is what separates this from
+    /// [`Store::hash_bytes`], which deliberately passes no path because its input is
+    /// already-canonical blob content.
+    ///
+    /// A draft root has no `.gitattributes`, so the two calls agree there trivially.
+    pub fn hash_bytes_as(&self, rel: &[u8], bytes: &[u8]) -> Result<Oid, StoreError> {
+        let mut path_arg = OsString::from("--path=");
+        path_arg.push(OsStr::from_bytes(rel));
+        let out = self.git.run_stdin(
+            None,
+            &[
+                OsString::from("hash-object"),
+                OsString::from("-w"),
+                path_arg,
+                OsString::from("--stdin"),
+            ],
+            bytes,
+        )?;
+        Oid::parse(String::from_utf8_lossy(&out).trim())
+            .ok_or_else(|| StoreError::Other("hash-object --path --stdin printed no oid".into()))
     }
 
     /// `cat-file blob <oid>`.
@@ -969,5 +1000,64 @@ pub(crate) mod tests {
         assert_eq!(paths, vec![&b"a.md"[..], &b"l"[..], &b"sub/b.md"[..]]);
         assert_eq!(entries[&b"l"[..]].0, Mode::Symlink);
         assert!(store.exists(&entries[&b"a.md"[..]].1), "blobs were written");
+    }
+
+    /// The contract deliverable 1 rests on: the oid a save records **before** it writes is
+    /// the oid the next scan computes **after** it wrote (design review F1).
+    ///
+    /// Checked where the two could diverge — under `text=auto` and under an explicit
+    /// `eol=crlf`, both of which make git store something other than the bytes on disk —
+    /// and on a draft root, which has no attributes at all.
+    #[test]
+    fn store_hash_bytes_as_equals_hash_path_after_write() {
+        let mut repo = FixtureRepo::new("hash-as").unwrap();
+        repo.write(".gitattributes", "* text=auto\ncrlf.txt eol=crlf\n");
+        repo.commit("attrs").unwrap();
+        let state = TempDir::new("lc-store");
+        let (store, _) = open_git(&repo, &state);
+        let cases: [(&[u8], &[u8]); 4] = [
+            (b"plain.txt", b"a\nb\nc\n"),
+            (b"auto.txt", b"a\r\nb\r\nc\r\n"),
+            (b"crlf.txt", b"x\r\ny\r\n"),
+            (b"noeol.txt", b"no trailing newline"),
+        ];
+        for (rel, bytes) in cases {
+            let before = store.hash_bytes_as(rel, bytes).unwrap();
+            crate::restore::write_bytes(&store, rel, bytes, Some(Mode::Regular), &mut || Ok(()))
+                .unwrap();
+            assert_eq!(
+                std::fs::read(repo.path().join(OsStr::from_bytes(rel))).unwrap(),
+                bytes,
+                "{}: the bytes go down verbatim",
+                String::from_utf8_lossy(rel)
+            );
+            match store.hash_path(rel) {
+                Current::Present { oid, .. } => assert_eq!(
+                    oid,
+                    before,
+                    "{}: the pre-write oid is the post-write scan's oid",
+                    String::from_utf8_lossy(rel)
+                ),
+                other => panic!("{other:?}"),
+            }
+        }
+
+        // A draft root: no `.gitattributes` anywhere, so `--path` changes nothing — the
+        // save path still goes through the same call and must still agree.
+        let dir = TempDir::new("lc-draft-hash");
+        let root = dir.mkdir("notes");
+        let dstate = dir.mkdir("state");
+        let env = Env::empty(dir.path()).with_home(dir.mkdir("home"));
+        let dpaths = RepoPaths::under(dstate.join("repo"));
+        let (draft, _) = Store::open(&env, &root, RootKind::Draft, &dpaths, None).unwrap();
+        let bytes = b"one\r\ntwo\n";
+        let before = draft.hash_bytes_as(b"n.md", bytes).unwrap();
+        crate::restore::write_bytes(&draft, b"n.md", bytes, Some(Mode::Regular), &mut || Ok(()))
+            .unwrap();
+        assert_eq!(std::fs::read(root.join("n.md")).unwrap(), bytes);
+        match draft.hash_path(b"n.md") {
+            Current::Present { oid, .. } => assert_eq!(oid, before),
+            other => panic!("{other:?}"),
+        }
     }
 }

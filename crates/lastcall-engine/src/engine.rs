@@ -331,6 +331,27 @@ pub struct Restored {
     pub pile: Pile,
 }
 
+/// One editor save as a UI asks for it (§6.3 "editor save"; Phase 8 deliverable 1).
+///
+/// `rendered` is what the buffer was read from — the CAS target — and `bytes` is the
+/// buffer verbatim, line endings and a missing trailing newline included.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaveRequest {
+    pub rendered: Rendered,
+    pub bytes: Vec<u8>,
+}
+
+/// What [`Engine::save`] produced. Like [`Restored`] plus the ledger: a save writes the
+/// working tree *and* the override, so `outcome.written` is `true` on success, and `pile`
+/// is the rescan that should show the saved row gone (invariant 8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Saved {
+    pub outcome: Outcome,
+    /// [`Engine::scan_seq`] of `pile`.
+    pub seq: u64,
+    pub pile: Pile,
+}
+
 /// A hunk flag as the **caller rendered it**: the record the ledger takes, plus the total
 /// the export's `hunk n of m` names.
 ///
@@ -1226,6 +1247,50 @@ impl Engine {
         };
         let pile = self.scan(root)?;
         Ok(Restored {
+            outcome,
+            seq: self.scan_seq,
+            pile,
+        })
+    }
+
+    /// Write an editor buffer back to the working tree and advance the path's baseline to
+    /// it (§6.3 "editor save"; invariant 8 — the user is never asked to review their own
+    /// just-typed change).
+    ///
+    /// The same op-then-rescan critical section as [`Engine::accept_with`], and for the
+    /// extra reason that a save has: `pile` is what proves the invariant, because a clean
+    /// save must leave the row *gone*. The rescan is also the §11 mitigation for the
+    /// hash-then-rename window, exactly as it is for a restore.
+    pub fn save(&mut self, root: &Path, req: SaveRequest) -> Result<Saved, EngineError> {
+        self.save_with(root, req, &NoFault)
+    }
+
+    /// [`Engine::save`] with a fault injector.
+    pub fn save_with(
+        &mut self,
+        root: &Path,
+        req: SaveRequest,
+        fault: &dyn FaultInjector,
+    ) -> Result<Saved, EngineError> {
+        let result = {
+            let mut ops = self.ops(root)?;
+            ops.save_file(&req.rendered, &req.bytes, fault)
+        };
+        let outcome = match result {
+            Ok(o) => o,
+            Err(e) => {
+                // The file may well be on disk — the failure is the ledger's — so the
+                // staged override is dropped and the on-disk ledger re-read. The next scan
+                // then shows the saved bytes as *pending*, which is the honest answer.
+                if let Some(state) = self.roots.get_mut(root) {
+                    state.ledger_stamp = None;
+                    state.reload_ledger_if_changed();
+                }
+                return Err(EngineError::Ops(e));
+            }
+        };
+        let pile = self.scan(root)?;
+        Ok(Saved {
             outcome,
             seq: self.scan_seq,
             pile,
