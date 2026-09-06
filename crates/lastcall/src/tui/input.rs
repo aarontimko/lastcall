@@ -105,6 +105,19 @@ pub enum Action {
     /// [`editor_action`] resolves everything while `App::editor` is open, so a keymap
     /// letter — `q` included — types itself (F16).
     Editor(EditorKey),
+    /// Start a line selection in the diff at the cursor line, or extend the one that is
+    /// already running (deliverable 9). Whole lines only: the unit the reader is reviewing
+    /// in is a diff line, and a half-line copied out of a `-` and a `+` is not a thing
+    /// anyone means to paste.
+    Select,
+    /// Copy the selection — or, with none, the hunk under the cursor — to the system
+    /// clipboard through OSC 52 (`Effect::Copy`), and clear the selection.
+    Copy,
+    /// Extend a **mouse** selection to diff line `n` (absolute, not a screen row). Built by
+    /// the loop from a `Drag`, which is the only place the pane's rectangle is known; the
+    /// reducer ignores it unless a press landed in the diff body first, which is how a
+    /// divider drag stays a divider drag (design review F13).
+    SelectTo(usize),
     /// One move inside the agent picker. Never key-bound, for the same reason.
     Pick(PickKey),
     /// Answer the confirm modal (`y` / `Enter`); nothing outside it.
@@ -370,6 +383,8 @@ pub const DEFAULT_KEYMAP: &[(&str, &[&str])] = &[
     ("restore_file", &["shift-u"]),
     ("flag", &["m"]),
     ("unflag", &["shift-m"]),
+    ("select", &["v"]),
+    ("copy", &["y"]),
     ("edit", &["i"]),
     ("edit_external", &["shift-i"]),
     ("ack", &["d"]),
@@ -428,6 +443,8 @@ impl Action {
             "restore_file" => Action::RestoreFile,
             "flag" => Action::Flag,
             "unflag" => Action::Unflag,
+            "select" => Action::Select,
+            "copy" => Action::Copy,
             "edit" => Action::Edit,
             "edit_external" => Action::EditExternal,
             "ack" => Action::Ack,
@@ -468,6 +485,8 @@ impl Action {
             // help overlay at 100×30 falls back to one clipped column the moment the two
             // widest rows plus 7 exceed the width. The overlay is the only place a reader
             // ever sees a description, so the short form is the one that survives.
+            "select" => "select lines",
+            "copy" => "copy selection",
             "edit" => "edit in place",
             "edit_external" => "$EDITOR at the hunk",
             "ack" => "ack the agent flag",
@@ -1033,7 +1052,9 @@ mod tests {
 
     #[test]
     fn input_override_replaces_defaults_rather_than_appending() {
-        let km = Keymap::from_config(&keys(&[("quit", &["x"]), ("scroll_up", &["v"])])).unwrap();
+        // `z`, not `v`: `v` is `select`'s default since deliverable 9, and binding it to a
+        // second action is the `Duplicate` this test is not about.
+        let km = Keymap::from_config(&keys(&[("quit", &["x"]), ("scroll_up", &["z"])])).unwrap();
         assert_eq!(to_action(&key('x'), &km), Some(Action::Quit));
         assert_eq!(to_action(&key('q'), &km), None, "q no longer quits");
         assert_eq!(
@@ -1041,7 +1062,7 @@ mod tests {
             None,
             "ctrl-c no longer quits either: the entry replaced both defaults"
         );
-        assert_eq!(to_action(&key('v'), &km), Some(Action::ScrollUp(1)));
+        assert_eq!(to_action(&key('z'), &km), Some(Action::ScrollUp(1)));
         let table = km.table();
         let quit = table.iter().position(|(n, _)| n == "quit").unwrap();
         assert_eq!(table[quit].1, vec!["x".to_owned()]);
@@ -1052,7 +1073,7 @@ mod tests {
         );
         assert_eq!(
             table.last().unwrap(),
-            &("scroll_up".to_owned(), vec!["v".to_owned()]),
+            &("scroll_up".to_owned(), vec!["z".to_owned()]),
             "a newly bound action is appended"
         );
         let untouched = table.iter().find(|(n, _)| n == "nav_up").unwrap();
@@ -1509,6 +1530,9 @@ mod tests {
             (Action::RestoreFile, "key"),
             (Action::Flag, "key"),
             (Action::Unflag, "key"),
+            (Action::Select, "key"),
+            (Action::Copy, "key"),
+            (Action::SelectTo(0), "mouse"),
             (Action::Edit, "key"),
             (Action::EditExternal, "key"),
             (Action::Note(NoteKey::Send), "modal-note"),
@@ -1572,6 +1596,9 @@ mod tests {
             | Action::RestoreFile
             | Action::Flag
             | Action::Unflag
+            | Action::Select
+            | Action::Copy
+            | Action::SelectTo(_)
             | Action::Edit
             | Action::EditExternal
             | Action::Note(_)
@@ -1582,9 +1609,9 @@ mod tests {
             | Action::Ack
             | Action::Jump
             | Action::ScopeToggle
-            | Action::Herdr(_) => 40,
+            | Action::Herdr(_) => 43,
         };
-        assert_eq!(table.len(), 40);
+        assert_eq!(table.len(), 43);
     }
 
     #[test]
@@ -1601,7 +1628,10 @@ mod tests {
         assert_eq!(modal_action(Key::parse("a").unwrap()), None);
         // Outside the modal the same keys keep their keymap meaning (or none).
         assert_eq!(to_action(&key('n'), &km), Some(Action::HunkNext));
-        assert_eq!(to_action(&key('y'), &km), None);
+        // `y` is the confirm key *inside* the modal and the copy key outside it
+        // (deliverable 9): the two never collide, because `modal_action` is consulted only
+        // while `App::confirm` is open and the keymap only when it is not.
+        assert_eq!(to_action(&key('y'), &km), Some(Action::Copy));
         assert!(
             km.bindings()
                 .iter()

@@ -349,6 +349,10 @@ pub enum Effect {
         rendered: Rendered,
         bytes: Vec<u8>,
     },
+    /// Put `bytes` on the user's clipboard with an OSC 52 write (deliverable 9). The
+    /// payload is already capped ([`super::clipboard::CAP`]) and already the text the diff
+    /// pane showed: the loop's only job is to encode it and hand it to the terminal.
+    Copy(Vec<u8>),
     /// `Engine::hunks_of` for one collapsed row, off the UI task; the answer comes back as
     /// `Local::Expanded`. The **row** travels, not just its path: the expansion is computed
     /// from the oids the row was rendered from, so it shows exactly the delta the counts
@@ -754,6 +758,20 @@ pub const RESTORE_IN_PROGRESS: &str = "restore in progress";
 pub const NOTHING_TO_RESTORE: &str = "nothing to restore";
 /// What `shift-i` says on a row there is no file to open (deliverable 7).
 pub const NOT_EDITABLE: &str = "not editable";
+
+/// The copy cue's text, and how long it stays up. Two seconds is long enough to read and
+/// short enough that a reader who copied twice sees the second one arrive.
+pub const COPIED: &str = "copied to clipboard";
+pub const CUE_SECS: u64 = 2;
+
+/// A selection the terminal would not take whole. It names the size because the only thing
+/// the reader can do about it is select less, and they need to know by how much.
+pub fn too_large_text(bytes: usize) -> String {
+    format!(
+        "selection too large to copy ({} KiB; the terminal would drop it)",
+        bytes.div_ceil(1024)
+    )
+}
 /// What the status says when the engine will not hand the inline editor the file's bytes
 /// (deliverable 8): the reason, and the key that *can* open it anyway.
 pub fn use_shift_i(why: &str) -> String {
@@ -808,6 +826,37 @@ impl AcceptFailed {
     }
 }
 
+/// A live line selection in the diff pane (deliverable 9): both ends are **absolute diff
+/// line indices** into [`App::view_hunks`], and either may be the larger.
+///
+/// The anchor is where the selection started — the `v` keypress, or the mouse press — and
+/// the cursor is where it has been dragged or scrolled to. Keeping them unordered is what
+/// lets a reader select upwards and then back down through the anchor without the range
+/// jumping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sel {
+    pub anchor: usize,
+    pub cursor: usize,
+}
+
+impl Sel {
+    /// `(first, last)`, inclusive and in screen order.
+    pub fn range(&self) -> (usize, usize) {
+        (self.anchor.min(self.cursor), self.anchor.max(self.cursor))
+    }
+}
+
+/// A short-lived message over the diff pane, independent of the status line (deliverable
+/// 9). The status line is the record of what the *engine* did; a copy is a thing the
+/// terminal did, and overwriting an accept's or a refusal's status with it would lose the
+/// more important of the two.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cue {
+    pub text: String,
+    /// Cleared by the first `Tick` at or after this instant.
+    pub until: Instant,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct App {
     pub roots: BTreeMap<PathBuf, RootView>,
@@ -825,6 +874,21 @@ pub struct App {
     /// clamp in `render_nav` handles a list that shrank underneath it.
     pub nav_top: usize,
     pub dragging: bool,
+    /// The live line selection in the diff pane, if any (deliverable 9). Cleared by `Esc`,
+    /// by a copy, and by anything that changes which row the diff is showing.
+    pub sel: Option<Sel>,
+    /// The diff line a **mouse press** landed on, while the button is still down: the
+    /// anchor a `Drag` would extend from, and the answer to "where did this drag start?"
+    /// that keeps a divider drag a divider drag (design review F13). `None` for a press
+    /// anywhere else, which is why a drag over the nav selects nothing.
+    pub press_line: Option<usize>,
+    /// Whether a `Drag` has reached a different line since that press. A press and a
+    /// release with nothing in between is a click, not a zero-length copy — including when
+    /// the two arrive in one drained pass, because this is state and not a comparison of
+    /// timestamps.
+    pub drag_moved: bool,
+    /// The copy cue, if one is up.
+    pub cue: Option<Cue>,
     pub full_paths: bool,
     pub show_remote: bool,
     pub help: bool,
@@ -894,6 +958,10 @@ impl App {
             nav_width: NAV_WIDTH_DEFAULT,
             nav_top: 0,
             dragging: false,
+            sel: None,
+            press_line: None,
+            drag_moved: false,
+            cue: None,
             full_paths: false,
             show_remote: false,
             help: false,
@@ -2546,6 +2614,9 @@ impl App {
         }
         self.selection = next;
         self.diff = DiffCursor::default();
+        // A selection is a range of *this* row's diff lines; the moment the row changes the
+        // range means nothing, so it goes rather than pointing at another file's text.
+        self.sel = None;
         self.drop_stale_expansion();
         Changed::Yes
     }
@@ -2628,6 +2699,36 @@ impl App {
         Changed::Yes
     }
 
+    /// Move a live selection's far end `delta` lines and scroll only as far as it takes to
+    /// keep that end on screen.
+    ///
+    /// This is what `nav_up`/`nav_down`/`page` do while a selection is running, in place of
+    /// [`Self::scroll_by`]. The diff pane has no per-line cursor of its own — its cursor
+    /// *is* the first visible line — and moving that as the selection grew would push the
+    /// lines being selected off the top of the pane, one per keystroke. So while `v` is
+    /// live the selection's own end is the cursor, and `v j j y` copies the three lines the
+    /// reader can see.
+    fn move_sel_cursor(&mut self, delta: isize) -> Changed {
+        let (Some(sel), rows) = (self.sel, self.page_rows()) else {
+            return Changed::No;
+        };
+        let max = diff_lines(self.view_hunks()).saturating_sub(1) as isize;
+        let next = (sel.cursor as isize + delta).clamp(0, max) as usize;
+        if next == sel.cursor {
+            return Changed::No;
+        }
+        self.sel = Some(Sel {
+            cursor: next,
+            ..sel
+        });
+        self.diff.scroll = self
+            .diff
+            .scroll
+            .min(next)
+            .max(next.saturating_sub(rows.saturating_sub(1)));
+        Changed::Yes
+    }
+
     /// Move the hunk cursor and scroll so its header is the first visible line.
     fn move_hunk(&mut self, delta: isize) -> Changed {
         let (len, offsets) = {
@@ -2645,7 +2746,84 @@ impl App {
         }
         self.diff.hunk = next;
         self.diff.scroll = scroll;
+        self.follow_selection();
         Changed::Yes
+    }
+
+    // ---- select to copy (deliverable 9) ---------------------------------------------------
+
+    /// Drag a live selection's moving end along with the diff cursor. Called by everything
+    /// that moves the cursor — the nav keys, a page, `hunk_next`, the wheel over the diff —
+    /// because the cursor *is* the selection's far end, whatever moved it. A selection that
+    /// began with the mouse is taken over by the keyboard here rather than being dropped:
+    /// the anchor is still where the reader put it.
+    fn follow_selection(&mut self) {
+        if let Some(sel) = &mut self.sel {
+            sel.cursor = self.diff.scroll;
+        }
+    }
+
+    /// `v`: anchor a selection at the diff cursor, or, with one already running, pull its
+    /// moving end to the cursor. There is no per-line cursor in the diff pane — the cursor
+    /// *is* [`DiffCursor::scroll`], the first visible line — so `v j j y` copies three
+    /// lines, which is the sequence the kickoff names.
+    fn start_selection(&mut self) -> Changed {
+        if self.selected_row().is_none() || self.view_hunks().is_empty() {
+            return Changed::No;
+        }
+        let at = self.diff.scroll;
+        let next = Sel {
+            anchor: self.sel.map_or(at, |s| s.anchor),
+            cursor: at,
+        };
+        if self.sel == Some(next) {
+            return Changed::No;
+        }
+        self.sel = Some(next);
+        Changed::Yes
+    }
+
+    /// The bytes `y` would put on the clipboard: the selection's lines, or — with no
+    /// selection — the hunk under the cursor whole, header included.
+    pub fn copy_payload(&self) -> Option<Vec<u8>> {
+        let hunks = self.view_hunks();
+        if hunks.is_empty() {
+            return None;
+        }
+        let Some(sel) = self.sel else {
+            let hunk = hunks.get(self.diff.hunk.min(hunks.len() - 1))?;
+            return Some(format!("{}\n{}", hunk_header(hunk), hunk_body(hunk)).into_bytes());
+        };
+        let last = diff_lines(hunks).checked_sub(1)?;
+        let (a, b) = sel.range();
+        let mut out = String::new();
+        for i in a.min(last)..=b.min(last) {
+            out.push_str(&diff_line_text(hunks, i)?);
+            out.push('\n');
+        }
+        Some(out.into_bytes())
+    }
+
+    /// `y`, and the mouse release that ends a drag: copy, clear the selection, raise the
+    /// cue. Over the cap nothing is written and the selection **stays**, because the only
+    /// thing the reader can do about it is select less and they need the range to shrink.
+    fn copy_selection(&mut self) -> (Changed, Option<Effect>) {
+        let Some(bytes) = self.copy_payload() else {
+            return (Changed::No, None);
+        };
+        if bytes.len() > super::clipboard::CAP {
+            self.set_status(too_large_text(bytes.len()));
+            return (Changed::Yes, None);
+        }
+        self.sel = None;
+        // The status line is the record of what the engine did; a copy is a thing the
+        // terminal did, so it gets its own cue and leaves an accept's or a refusal's
+        // sentence on screen.
+        self.cue = Some(Cue {
+            text: COPIED.to_owned(),
+            until: self.now + Duration::from_secs(CUE_SECS),
+        });
+        (Changed::Yes, Some(Effect::Copy(bytes)))
     }
 
     // ---- user actions --------------------------------------------------------------------
@@ -2693,6 +2871,14 @@ impl App {
             NavDown if nav => self.move_selection(1),
             NavPageUp if nav => self.move_selection(-page),
             NavPageDown if nav => self.move_selection(page),
+            // In the diff with a selection running, these keys move its far end
+            // (deliverable 9); with none, they scroll the pane as they always have.
+            NavUp if self.sel.is_some() => self.move_sel_cursor(-1),
+            NavDown if self.sel.is_some() => self.move_sel_cursor(1),
+            NavPageUp if self.sel.is_some() => self.move_sel_cursor(-page),
+            NavPageDown if self.sel.is_some() => self.move_sel_cursor(page),
+            ScrollUp(n) if self.sel.is_some() => self.move_sel_cursor(-(n as isize)),
+            ScrollDown(n) if self.sel.is_some() => self.move_sel_cursor(n as isize),
             NavUp => self.scroll_by(-1),
             NavDown => self.scroll_by(1),
             NavPageUp => self.scroll_by(-page),
@@ -2718,7 +2904,40 @@ impl App {
                 }
                 None => self.move_selection(1),
             },
+            // Esc peels one layer: a live selection first (cleared, never copied), and only
+            // then the focus. A reader who selected by mistake gets out of it without
+            // losing the pane they were reading.
+            Back if self.sel.is_some() => {
+                self.sel = None;
+                Changed::Yes
+            }
             Back => self.set_focus(Focus::Nav),
+            Select if self.effective_focus() == Focus::Diff => self.start_selection(),
+            Select => Changed::No,
+            Copy if self.effective_focus() == Focus::Diff => return self.copy_selection(),
+            Copy => Changed::No,
+            // Only a drag whose press landed in the diff body selects; `press_line` is set
+            // by the loop from the last frame's rectangle, so a drag that began on the
+            // divider is still a divider drag (design review F13).
+            SelectTo(line) => match self.press_line {
+                Some(anchor) => {
+                    let last = diff_lines(self.view_hunks()).saturating_sub(1);
+                    let cursor = line.min(last);
+                    let next = Sel {
+                        anchor: anchor.min(last),
+                        cursor,
+                    };
+                    if cursor != next.anchor {
+                        self.drag_moved = true;
+                    }
+                    if self.sel == Some(next) {
+                        return (Changed::No, None);
+                    }
+                    self.sel = Some(next);
+                    Changed::Yes
+                }
+                None => Changed::No,
+            },
             FocusToggle => match self.focus {
                 Focus::Nav => self.set_focus(Focus::Diff),
                 Focus::Diff => self.set_focus(Focus::Nav),
@@ -2837,6 +3056,14 @@ impl App {
             }
             Release => {
                 self.dragging = false;
+                let anchor = self.press_line.take();
+                let dragged = std::mem::take(&mut self.drag_moved);
+                // A press and a release with nothing in between is a click, not a
+                // zero-length copy — and this is state, not a comparison of timestamps, so
+                // it holds when both arrive in one drained pass.
+                if dragged && anchor.is_some() && self.sel.is_some() {
+                    return self.copy_selection();
+                }
                 Changed::No
             }
             Resize(w, h) => {
@@ -2848,14 +3075,24 @@ impl App {
             }
             Tick => {
                 self.now += Duration::from_secs(1);
-                match &self.status {
+                // The cue is on its own clock, so it goes when its two seconds are up
+                // whatever the status line is doing.
+                let cue_went = match &self.cue {
+                    Some(c) if self.now >= c.until => {
+                        self.cue = None;
+                        true
+                    }
+                    _ => false,
+                };
+                let status = match &self.status {
                     Some(s) if self.now.duration_since(s.at) >= STATUS_TTL => {
                         self.status = None; // the hints come back
                         Changed::Yes
                     }
                     Some(_) => Changed::Yes,
                     None => Changed::No,
-                }
+                };
+                if cue_went { Changed::Yes } else { status }
             }
         };
         (changed, None)
@@ -3195,6 +3432,35 @@ pub fn hunk_offsets(hunks: &[Hunk]) -> Vec<usize> {
 /// Total diff lines of a hunk list, counting the blank separator lines.
 pub fn diff_lines(hunks: &[Hunk]) -> usize {
     (0..hunks.len()).map(|i| hunk_block(hunks, i)).sum()
+}
+
+/// Diff line `i` of `hunks` exactly as the pane shows it, or `None` past the end: the
+/// header for a hunk's first line, `+`/`-`/space and the line's own text for its body, and
+/// the empty string for the blank separator between two hunks.
+///
+/// This is what a copy puts on the clipboard, and it is the same text
+/// [`hunk_header`]/[`hunk_body`] give a flag export — tabs stay tabs, because the paste
+/// target wants the file's own bytes; only the *screen* expands them.
+pub fn diff_line_text(hunks: &[Hunk], i: usize) -> Option<String> {
+    let offsets = hunk_offsets(hunks);
+    let h = offsets.partition_point(|&o| o <= i).checked_sub(1)?;
+    let within = i - offsets[h];
+    let hunk = &hunks[h];
+    if within == 0 {
+        return Some(hunk_header(hunk));
+    }
+    if within >= hunk_height(hunk) {
+        // The blank separator line: on screen it spaces two hunks apart, and in a copy it
+        // does the same.
+        return (within < hunk_block(hunks, h)).then(String::new);
+    }
+    let (tag, bytes) = &hunk.lines[within - 1];
+    let prefix = match tag {
+        Tag::Context => ' ',
+        Tag::Insert => '+',
+        Tag::Delete => '-',
+    };
+    Some(format!("{prefix}{}", hunk_line_text(bytes)))
 }
 
 /// Total diff lines of a row's own hunks. The diff pane may be showing an expansion
@@ -7268,5 +7534,218 @@ mod tests {
         assert_eq!(note_action(&ctrl_c, &km, false), Some(Action::Quit));
         let (_, effect) = app.handle(Action::Quit);
         assert_eq!(effect, Some(Effect::Quit), "quitting writes no flag");
+    }
+
+    // ---- deliverable 9: select to copy ---------------------------------------------------
+
+    /// alpha with `f1` given two identical hunks, focused in the diff at line 0.
+    ///
+    /// Each hunk is the fixture's own: header `@@ -1,4 +1,4 @@` then `-a1`, `+A1`, ` a2`,
+    /// ` a3`, ` a4` — six diff lines, a blank separator, six more.
+    fn diff_at_f1() -> App {
+        let mut app = three_roots();
+        app.apply(pile_event("alpha", alpha_two_hunks()));
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Open);
+        assert_eq!(app.effective_focus(), Focus::Diff);
+        assert_eq!(diff_lines(app.view_hunks()), 13);
+        app
+    }
+
+    fn copied(effect: Option<Effect>) -> String {
+        match effect {
+            Some(Effect::Copy(bytes)) => String::from_utf8(bytes).expect("utf-8 payload"),
+            other => panic!("expected a copy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn app_select_extends_with_the_cursor_and_y_copies_the_range() {
+        let mut app = diff_at_f1();
+        // There is no per-line cursor in the diff pane: the cursor *is* the first visible
+        // line, so `v j j y` copies three lines counted from where the reader was.
+        assert_eq!(app.diff.scroll, 0);
+        assert_eq!(app.handle(Action::Select), (Changed::Yes, None));
+        assert_eq!(
+            app.sel,
+            Some(Sel {
+                anchor: 0,
+                cursor: 0
+            })
+        );
+        for _ in 0..2 {
+            app.handle(Action::NavDown);
+        }
+        // The pane does *not* scroll under the selection: the far end moved, and the three
+        // selected lines are the three the reader can see.
+        assert_eq!(app.diff.scroll, 0);
+        assert_eq!(
+            app.sel,
+            Some(Sel {
+                anchor: 0,
+                cursor: 2
+            })
+        );
+        let (changed, effect) = app.handle(Action::Copy);
+        assert_eq!(changed, Changed::Yes);
+        assert_eq!(copied(effect), "@@ -1,4 +1,4 @@\n-a1\n+A1\n");
+        assert_eq!(app.sel, None, "a copy clears the selection");
+        assert_eq!(app.cue.as_ref().map(|c| c.text.as_str()), Some(COPIED));
+
+        // Upwards from the middle: the range is whichever way round the two ends are, and
+        // the pane scrolls only as far as it takes to keep the far end on screen.
+        for _ in 0..3 {
+            app.handle(Action::NavDown);
+        }
+        assert_eq!(
+            app.diff.scroll, 3,
+            "with no selection the keys still scroll"
+        );
+        app.handle(Action::Select);
+        app.handle(Action::NavUp);
+        app.handle(Action::NavUp);
+        assert_eq!(
+            app.sel,
+            Some(Sel {
+                anchor: 3,
+                cursor: 1
+            })
+        );
+        assert_eq!(app.diff.scroll, 1, "the far end pulled the pane up with it");
+        assert_eq!(copied(app.handle(Action::Copy).1), "-a1\n+A1\n a2\n");
+
+        // Esc clears without copying, and leaves the pane where it was.
+        app.handle(Action::Select);
+        assert_eq!(app.handle(Action::Back), (Changed::Yes, None));
+        assert_eq!(app.sel, None);
+        assert_eq!(app.effective_focus(), Focus::Diff, "Esc peeled one layer");
+        assert_eq!(app.handle(Action::Back), (Changed::Yes, None));
+        assert_eq!(app.effective_focus(), Focus::Nav, "the second one focuses");
+        // And with the nav focused neither key does anything.
+        assert_eq!(app.handle(Action::Select), (Changed::No, None));
+        assert_eq!(app.handle(Action::Copy), (Changed::No, None));
+    }
+
+    #[test]
+    fn app_y_without_a_selection_copies_the_hunk() {
+        let mut app = diff_at_f1();
+        let whole = "@@ -1,4 +1,4 @@\n-a1\n+A1\n a2\n a3\n a4\n";
+        assert_eq!(copied(app.handle(Action::Copy).1), whole);
+        assert_eq!(app.sel, None);
+        // The *hunk under the cursor*, not the first: `n` moves the cursor and `y` follows.
+        app.handle(Action::HunkNext);
+        assert_eq!(app.diff.hunk, 1);
+        assert_eq!(copied(app.handle(Action::Copy).1), whole);
+        // A selection that spans the separator carries it, exactly as the pane shows it.
+        app.handle(Action::HunkPrev);
+        app.handle(Action::Select);
+        for _ in 0..8 {
+            app.handle(Action::NavDown);
+        }
+        assert_eq!(
+            copied(app.handle(Action::Copy).1),
+            "@@ -1,4 +1,4 @@\n-a1\n+A1\n a2\n a3\n a4\n\n@@ -1,4 +1,4 @@\n-a1\n"
+        );
+        // Nothing selected and nothing to select: a row with no hunks copies nothing.
+        let mut empty = three_roots();
+        empty.select(Some(row("alpha", "f1")));
+        empty.apply(pile_event("alpha", alpha_collapsed(Collapsed::Glob)));
+        empty.handle(Action::Open);
+        assert_eq!(empty.handle(Action::Copy), (Changed::No, None));
+    }
+
+    #[test]
+    fn app_copy_cue_lasts_two_seconds_and_leaves_the_status_alone() {
+        let mut app = diff_at_f1();
+        app.set_status("saved f1");
+        app.handle(Action::Copy);
+        assert_eq!(app.cue.as_ref().map(|c| c.text.as_str()), Some(COPIED));
+        assert_eq!(
+            app.status.as_ref().map(|s| s.text.as_str()),
+            Some("saved f1"),
+            "a copy is a thing the terminal did; the status is the engine's record"
+        );
+        // One second in, the cue is still up; the second tick reaches `until` and clears it.
+        assert_eq!(app.handle(Action::Tick).0, Changed::Yes);
+        assert!(app.cue.is_some(), "one second is not two");
+        assert_eq!(app.handle(Action::Tick).0, Changed::Yes);
+        assert_eq!(app.cue, None);
+        assert_eq!(
+            app.status.as_ref().map(|s| s.text.as_str()),
+            Some("saved f1"),
+            "and the status outlives it"
+        );
+    }
+
+    #[test]
+    fn app_mouse_drag_selects_rows_and_release_copies() {
+        let mut app = diff_at_f1();
+        // A press with no drag after it is a click, not a zero-length copy — the loop
+        // clears `sel` on the press and nothing here puts one back.
+        app.press_line = Some(1);
+        assert_eq!(app.handle(Action::Release), (Changed::No, None));
+        assert_eq!(app.sel, None);
+        assert_eq!(app.press_line, None, "the release ends the gesture");
+
+        // A drag from line 1 to line 4, then the release that copies it.
+        app.press_line = Some(1);
+        assert_eq!(app.handle(Action::SelectTo(2)).0, Changed::Yes);
+        assert!(app.drag_moved);
+        assert_eq!(app.handle(Action::SelectTo(4)).0, Changed::Yes);
+        assert_eq!(
+            app.sel,
+            Some(Sel {
+                anchor: 1,
+                cursor: 4
+            })
+        );
+        assert_eq!(app.handle(Action::SelectTo(4)).0, Changed::No, "no repaint");
+        let (changed, effect) = app.handle(Action::Release);
+        assert_eq!(changed, Changed::Yes);
+        assert_eq!(copied(effect), "-a1\n+A1\n a2\n a3\n");
+        assert_eq!(app.sel, None);
+        assert!(!app.drag_moved);
+
+        // A drag whose press did not land in the diff body — the divider's, or the nav's —
+        // selects nothing at all (design review F13).
+        assert_eq!(app.press_line, None);
+        assert_eq!(app.handle(Action::SelectTo(3)), (Changed::No, None));
+        assert_eq!(app.sel, None);
+        // And a drag past the last diff line stops at it rather than copying blanks.
+        app.press_line = Some(11);
+        app.handle(Action::SelectTo(999));
+        assert_eq!(
+            app.sel,
+            Some(Sel {
+                anchor: 11,
+                cursor: 12
+            })
+        );
+    }
+
+    #[test]
+    fn app_copy_over_the_cap_writes_nothing() {
+        let mut app = three_roots();
+        let mut big = pile("alpha");
+        big.rows[0].hunks[0].lines = vec![(Tag::Insert, vec![b'x'; 40 * 1024])];
+        app.apply(pile_event("alpha", big));
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Open);
+        let payload = app.copy_payload().expect("a payload to refuse");
+        assert!(payload.len() > super::super::clipboard::CAP);
+        let (changed, effect) = app.handle(Action::Copy);
+        assert_eq!(changed, Changed::Yes);
+        assert_eq!(effect, None, "nothing is written over the cap");
+        assert_eq!(app.cue, None, "and no cue claims otherwise");
+        assert_eq!(
+            app.status.as_ref().map(|s| s.text.as_str()),
+            Some("selection too large to copy (41 KiB; the terminal would drop it)")
+        );
+        // The selection stays: the only thing the reader can do is select less.
+        app.handle(Action::Select);
+        app.handle(Action::NavDown);
+        let sel = app.sel;
+        app.handle(Action::Copy);
+        assert_eq!(app.sel, sel, "still there to shrink");
     }
 }

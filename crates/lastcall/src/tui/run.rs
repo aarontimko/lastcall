@@ -62,6 +62,7 @@ use super::app::{
     AcceptFailed, AcceptResult, App, Changed, EditOpen, Effect, FlagKind, FlagResult,
     RestoreResult, RootMeta, SaveResult,
 };
+use super::clipboard::Osc52;
 use super::editor::EditorCommand;
 use super::herdr::{self, HerdrLink, HerdrPlan, HerdrUpdate, Link, ToastMsg};
 use super::input::{
@@ -286,8 +287,26 @@ impl Ui {
                 self.hits = None;
                 self.app.handle(action)
             }
-            Action::Press(x, y) => match self.hits.as_ref().and_then(|h| h.at(x, y)).cloned() {
-                Some(target) => self.app.hit(target),
+            Action::Press(x, y) => {
+                // Deliverable 9: the anchor is taken from the frame the user pressed on,
+                // **before** `hit` runs — a press on a hunk header moves the diff cursor,
+                // and an anchor read after that would be the header's new scroll rather
+                // than the line under the pointer. A press anywhere but the diff body
+                // (the nav, the divider, the header) leaves it `None`, which is what keeps
+                // a divider drag a divider drag.
+                self.app.press_line = self.diff_line_at(x, y);
+                self.app.drag_moved = false;
+                self.app.sel = None;
+                match self.hits.as_ref().and_then(|h| h.at(x, y)).cloned() {
+                    Some(target) => self.app.hit(target),
+                    None => (Changed::No, None),
+                }
+            }
+            // A drag with the divider held is the divider's (`App::handle` owns it); any
+            // other drag is a selection, and the reducer ignores it unless the press landed
+            // in the diff body (design review F13).
+            Action::Drag(x, y) if !self.app.dragging => match self.diff_line_at(x, y) {
+                Some(line) => self.app.handle(Action::SelectTo(line)),
                 None => (Changed::No, None),
             },
             Action::ScrollUp(_) | Action::ScrollDown(_) if !self.app.help => {
@@ -311,6 +330,15 @@ impl Ui {
     /// Where `(x, y)` lands in the editor's **text** area, as a `(row, column)` offset
     /// inside it — the gutter and the borders already subtracted. `None` when the last
     /// frame drew no editor, or when the point is outside it.
+    /// The **absolute diff line** `(x, y)` sits on, or `None` when the point is outside the
+    /// last frame's diff body. Absolute, not a screen row: the pane is drawn from
+    /// `App::diff.scroll`, and a selection outlives the scrolling that follows it.
+    fn diff_line_at(&self, x: u16, y: u16) -> Option<usize> {
+        let rect = self.hits.as_ref()?.diff_body?;
+        rect.contains(ratatui::layout::Position::new(x, y))
+            .then(|| self.app.diff.scroll + (y - rect.y) as usize)
+    }
+
     fn editor_text_at(&self, x: u16, y: u16) -> Option<(u16, u16)> {
         let rect = self.hits.as_ref()?.editor?;
         rect.contains(ratatui::layout::Position::new(x, y))
@@ -1529,6 +1557,14 @@ pub fn run(
                             rendered,
                             bytes,
                         } => spawn_save(&watcher.engine, local_tx.clone(), root, rendered, bytes),
+                        // Deliverable 9. OSC 52 is write-only: the terminal never answers,
+                        // so there is nothing to check and a write that fails is not worth
+                        // ending the loop on — the reducer has already raised the cue, and
+                        // a terminal that does not implement the sequence simply drops it
+                        // (`docs/dev/tui.md` says which do).
+                        Effect::Copy(bytes) => {
+                            let _ = crossterm::execute!(io::stdout(), Osc52(bytes));
+                        }
                         Effect::Flag {
                             root,
                             path,
@@ -2268,6 +2304,75 @@ mod tests {
         let (x, y) = target_center(&ui, &Target::NavRoot(root("alpha")));
         ui.event(&mouse(MouseEventKind::Down(MouseButton::Left), x, y));
         assert_eq!(ui.app.selection, Some(Selection::Root(root("alpha"))));
+    }
+
+    /// Deliverable 9's mouse half, where it actually lives: the press anchor comes from the
+    /// last frame's rectangle, a drag becomes `SelectTo`, the release copies — and the
+    /// divider drag is untouched (design review F13).
+    #[test]
+    fn run_mouse_drag_in_the_diff_selects_and_the_divider_drag_still_resizes() {
+        let mut ui = ui();
+        ui.app.apply(pile_event("alpha", alpha_two_hunks()));
+        ui.app.select(Some(row("alpha", "f1")));
+        ui.app.handle(Action::Open);
+        render_into(&mut ui);
+        let body = ui.hits.as_ref().unwrap().diff_body.expect("the hunk lines");
+
+        // Press on the second body row, drag two rows down, release.
+        let press = mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            body.x + 2,
+            body.y + 1,
+        );
+        ui.event(&press);
+        assert_eq!(ui.app.press_line, Some(1), "absolute, not a screen row");
+        assert!(ui.app.sel.is_none(), "a press alone selects nothing");
+        ui.event(&mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            body.x + 2,
+            body.y + 3,
+        ));
+        assert_eq!(ui.app.sel.map(|s| s.range()), Some((1, 3)));
+        let (changed, effect) = ui.event(&mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            body.x + 2,
+            body.y + 3,
+        ));
+        assert_eq!(changed, Changed::Yes);
+        assert_eq!(
+            effect,
+            Some(Effect::Copy(b"-a1\n+A1\n a2\n".to_vec())),
+            "the release copies the rows the drag covered"
+        );
+        assert!(ui.app.sel.is_none());
+
+        // A press and a release with no drag between them is a click: it moves the cursor
+        // to the hunk it landed on and copies nothing.
+        render_into(&mut ui);
+        let before = ui.app.diff;
+        ui.event(&press);
+        let (changed, effect) = ui.event(&mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            body.x + 2,
+            body.y + 1,
+        ));
+        assert_eq!((changed, effect), (Changed::No, None));
+        assert_eq!(ui.app.diff, before);
+        assert!(ui.app.sel.is_none());
+
+        // The divider drag is a divider drag: the press is outside the diff body, so no
+        // anchor is taken and the drag resizes the nav as it always has.
+        render_into(&mut ui);
+        let (dx, dy) = target_center(&ui, &Target::Divider);
+        ui.event(&mouse(MouseEventKind::Down(MouseButton::Left), dx, dy));
+        assert_eq!(ui.app.press_line, None);
+        assert!(ui.app.dragging);
+        let width = ui.app.nav_width;
+        ui.event(&mouse(MouseEventKind::Drag(MouseButton::Left), dx + 4, dy));
+        assert_eq!(ui.app.nav_width, width + 4);
+        assert!(ui.app.sel.is_none(), "and it selects nothing");
+        ui.event(&mouse(MouseEventKind::Up(MouseButton::Left), dx + 4, dy));
+        assert!(!ui.app.dragging);
     }
 
     #[test]

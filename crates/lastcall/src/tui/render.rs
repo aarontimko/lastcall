@@ -68,9 +68,11 @@ pub fn nothing_pending_short(status: &str) -> String {
 }
 
 /// The help overlay's mouse note (ruling 3): `term::enter` turns mouse capture on, so the
-/// terminal's own text selection needs the shift override. The stopgap until the Phase 8
-/// select-to-copy item lands.
-pub const SELECT_NOTE: &str = "shift+drag selects text (mouse capture is on)";
+/// terminal's own text selection needs the shift override. It stays now that deliverable 9
+/// has landed — shift+drag is still the terminal-native path, and the one that works where
+/// OSC 52 does not — with `v`/`y` named beside it. 62 columns, so the note fits inside the
+/// overlay at 80 (design review F19).
+pub const SELECT_NOTE: &str = "shift+drag selects text (mouse capture is on) · v/y copies";
 
 /// The inline editor's line-number gutter: four columns of number and one for the `▎` that
 /// marks a line inside a pending hunk (deliverable 8). `App::EDITOR_GUTTER` is the same
@@ -131,6 +133,12 @@ pub struct HitMap {
     /// drew one: what turns a click into a caret position (deliverable 8). Not a `Target`,
     /// because a target says *what* was clicked and this has to answer *where*.
     pub editor: Option<Rect>,
+    /// The rectangle the **hunk lines** were drawn into, when this frame drew any
+    /// (deliverable 9): what turns a mouse press or drag into a diff line. Like
+    /// [`HitMap::editor`] it is a *where*, not a *what*, so it is not a `Target` — and it
+    /// is narrower than `Target::DiffBody`, which covers the whole pane including the
+    /// expansion header and the empty states.
+    pub diff_body: Option<Rect>,
 }
 
 impl HitMap {
@@ -249,6 +257,11 @@ pub fn render(app: &App, frame: &mut Frame<'_>) -> HitMap {
             .push((Rect::new(x, body.y, 1, body.height), Target::Divider));
     }
 
+    // Deliverable 9: the copy cue sits over the diff pane, under every modal — a copy is
+    // not a question, and it must never hide the one being asked.
+    if let Some(cue) = &app.cue {
+        render_cue(&cue.text, buf, main_inner);
+    }
     if app.help {
         render_help(app, buf, area);
     }
@@ -522,6 +535,13 @@ pub fn hints(app: &App, width: u16) -> String {
         .is_some_and(|f| f.attention())
         .then(|| first("jump").map(|k| format!("{k} jump")))
         .flatten();
+    let diff = app.effective_focus() == Focus::Diff;
+    let select_hint = diff
+        .then(|| first("select").map(|k| format!("{k} select")))
+        .flatten();
+    let copy_hint = diff
+        .then(|| first("copy").map(|k| format!("{k} copy")))
+        .flatten();
     let scope = app
         .herdr
         .scope
@@ -543,6 +563,12 @@ pub fn hints(app: &App, width: u16) -> String {
         (scope, 2),
         (first("focus_toggle").map(|k| format!("{k} focus")), 2),
         (first("refresh").map(|k| format!("{k} refresh")), 2),
+        // Deliverable 9: the diff pane's own two keys, on the widest line only. Their own
+        // tier, dropped before anything that was on the line before them, so no narrower
+        // frame loses a hint it used to have — and the help overlay and its mouse note name
+        // them at every width.
+        (select_hint, 3),
+        (copy_hint, 3),
         (first("help").map(|k| format!("{k} help")), 0),
         (first("quit").map(|k| format!("{k} quit")), 0),
     ];
@@ -555,9 +581,11 @@ pub fn hints(app: &App, width: u16) -> String {
             .join("  ")
     };
     let fits = |s: &str| s.width() <= width as usize;
-    let full = join(2);
-    if width >= NAV_MIN_COLS && fits(&full) {
-        return full;
+    for tier in [3, 2] {
+        let line = join(tier);
+        if width >= NAV_MIN_COLS && fits(&line) {
+            return line;
+        }
     }
     let mid = join(1);
     if fits(&mid) { mid } else { join(0) }
@@ -1260,6 +1288,10 @@ fn render_hunks(
     let offsets = hunk_offsets(hunks);
     let scroll = app.diff.scroll.min(total.saturating_sub(1));
     let current = app.diff.hunk.min(hunks.len() - 1);
+    // Deliverable 9: where a mouse press or drag turns into a diff line, and the inclusive
+    // line range a live selection covers.
+    hits.diff_body = Some(area);
+    let selected = app.sel.map(|s| s.range());
     // The hunk containing `scroll`, and the line within it.
     let mut h = offsets.partition_point(|&o| o <= scroll).saturating_sub(1);
     let mut within = scroll - offsets[h];
@@ -1320,6 +1352,18 @@ fn render_hunks(
                 if h == current {
                     band(&mut line, area.width, style);
                 }
+            }
+            // Last, and over the hunk band: a selection is the reader's own mark, and it
+            // reads as one run across the pane whatever is underneath it.
+            if selected.is_some_and(|(a, b)| {
+                let at = offsets[h] + within;
+                at >= a && at <= b
+            }) {
+                band(
+                    &mut line,
+                    area.width,
+                    Style::new().add_modifier(Modifier::REVERSED),
+                );
             }
             buf.set_line(area.x, area.y + y, &line, area.width);
             within += 1;
@@ -1823,6 +1867,26 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     )
 }
 
+/// The copy cue: one centred, `Clear`-backed line over the diff pane (deliverable 9). It is
+/// deliberately not the status line — the status is the record of what the *engine* did,
+/// and a copy must not overwrite an accept's or a refusal's sentence.
+fn render_cue(text: &str, buf: &mut Buffer, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let rect = centered(area, text.width() as u16 + 2, 1);
+    Clear.render(rect, buf);
+    buf.set_line(
+        rect.x,
+        rect.y,
+        &Line::from(Span::styled(
+            format!(" {text} "),
+            Style::new().add_modifier(Modifier::REVERSED),
+        )),
+        rect.width,
+    );
+}
+
 /// Clear `rect`, draw the focused border with `title`, and hand back the inside.
 fn modal_block<'a>(title: impl Into<Line<'a>>, rect: Rect, buf: &mut Buffer) -> Rect {
     Clear.render(rect, buf);
@@ -2193,6 +2257,31 @@ mod tests {
         assert!(frame.contains(SELECT_NOTE), "{frame}");
     }
 
+    /// Deliverable 11 (design review F15): the four keys Phase 8 added are all on screen at
+    /// 100×30, which holds only while their descriptions stay short enough for the overlay
+    /// to keep two columns — `help_columns` falls back to one clipped column the moment the
+    /// two widest rows plus 7 exceed the width.
+    #[test]
+    fn render_help_shows_the_phase8_keys_at_100x30() {
+        let mut app = three_roots();
+        app.help = true;
+        let (frame, _) = frame_of(&app, 100, 30);
+        for (key, action) in [
+            ("i", "edit"),
+            ("I", "edit_external"),
+            ("v", "select"),
+            ("y", "copy"),
+        ] {
+            let row = format!("{key:<15}{}", Action::describe(action));
+            assert!(frame.contains(&row), "no {row:?} row:\n{frame}");
+            assert!(
+                Action::describe(action).width() <= 30,
+                "{action} would cost the overlay its second column"
+            );
+        }
+        assert!(frame.contains(SELECT_NOTE), "{frame}");
+    }
+
     /// Ruling P9 in the one place a reviewer looks a key up: the overlay names `⇧⏎` only
     /// on a terminal that reports the enhancement, and names the key that always works
     /// everywhere else. Which terminals report it is `docs/dev/tui.md`'s answer, not a row.
@@ -2370,6 +2459,20 @@ mod tests {
         );
         app.handle(Action::Open);
         assert_eq!(hints(&app, 120), nav_line, "the diff pane says the same");
+        // Deliverable 9: `v select  y copy` are the diff pane's own keys, and they are
+        // tier 2 — a line with room for `Tab focus` has room for them, and one without
+        // keeps the accept hints instead.
+        assert_eq!(
+            hints(&app, 140),
+            "↑↓ select  ⏎ open  n/p hunk  a accept hunk  A accept file  ^A accept all  Tab focus  r refresh  v select  y copy  ? help  q quit"
+        );
+        assert!(!nav_line.contains("y copy"), "the nav has no copy key");
+        app.handle(Action::Back);
+        assert!(
+            !hints(&app, 140).contains("y copy"),
+            "and the nav still has none at any width"
+        );
+        app.handle(Action::Open);
         app.select(Some(Selection::Root(root("alpha"))));
         assert!(
             hints(&app, 100).contains("n/p hunk  a accept all in alpha  ^A accept all"),
@@ -2540,6 +2643,66 @@ mod tests {
         assert!(
             !buf[(main.x, second)].modifier.contains(Modifier::REVERSED),
             "only the selected header is a band"
+        );
+    }
+
+    /// Deliverable 9: the selected lines are one reverse-video run across the pane, the
+    /// hunk lines' rectangle is reported for the mouse, and the cue sits over the diff.
+    #[test]
+    fn render_selection_is_reverse_video_and_the_cue_sits_over_the_diff() {
+        let mut app = three_roots();
+        app.apply(pile_event("alpha", alpha_two_hunks()));
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Open);
+        app.handle(Action::Resize(100, 30));
+        // Lines 1..=3 of the diff: `-a1`, `+A1`, ` a2` — not the header, so the run cannot
+        // be mistaken for the selected-hunk band.
+        app.handle(Action::NavDown);
+        app.handle(Action::Select);
+        app.handle(Action::NavDown);
+        app.handle(Action::NavDown);
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut hits = None;
+        terminal.draw(|f| hits = Some(render(&app, f))).unwrap();
+        let hits = hits.unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let body = hits.diff_body.expect("the hunk lines' rectangle");
+        let main = hits.main.expect("the diff pane");
+        assert!(main.union(body) == main, "the body is inside the pane");
+        // The first `j` scrolled (no selection yet), the two after it only moved the
+        // selection's far end — so line 1 is the top row and the selection is the three
+        // rows from there.
+        assert_eq!(app.diff.scroll, 1);
+        assert_eq!(app.sel.map(|s| s.range()), Some((1, 3)));
+        // Every cell of every selected row, edge to edge — the underlying `+`/`-` colours
+        // stay, so the run is one *modifier* across the pane rather than one style span.
+        let styled = styles(&buf);
+        for y in body.y..body.y + 3 {
+            for x in body.x..body.right() {
+                assert!(
+                    buf[(x, y)].modifier.contains(Modifier::REVERSED),
+                    "({x}, {y}) is not selected:\n{styled}"
+                );
+            }
+        }
+        assert!(
+            !buf[(body.x, body.y + 3)]
+                .modifier
+                .contains(Modifier::REVERSED),
+            "and the line after it is not selected"
+        );
+
+        // The cue is centred over the diff pane and says so.
+        app.handle(Action::Copy);
+        let (frame, _) = frame_of(&app, 100, 30);
+        let cue = frame
+            .lines()
+            .find(|l| l.contains(super::super::app::COPIED))
+            .expect(&frame);
+        let at = cue.find(super::super::app::COPIED).unwrap() as u16;
+        assert!(
+            at > main.x && at < main.right(),
+            "the cue is over the diff pane, not the nav: {cue:?}"
         );
     }
 

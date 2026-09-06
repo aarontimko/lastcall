@@ -17,6 +17,7 @@
 //! ledger or git, and it holds no review state of its own.
 
 pub mod app;
+pub mod clipboard;
 pub mod editor;
 pub mod herdr;
 pub mod input;

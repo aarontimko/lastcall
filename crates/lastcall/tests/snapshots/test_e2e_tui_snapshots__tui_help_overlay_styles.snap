@@ -12,10 +12,9 @@ expression: style
 2 35..37 Green Reset -
 2 38..40 Red Reset -
 2 67..99 Reset Reset DIM
-3 0..1 Cyan Reset -
-3 27..28 Cyan Reset -
-3 28..99 Reset Reset REVERSED
-4 0..100 Cyan Reset -
+3 0..100 Cyan Reset -
+4 0..1 Cyan Reset -
+4 99..100 Cyan Reset -
 5 0..1 Cyan Reset -
 5 99..100 Cyan Reset -
 6 0..1 Cyan Reset -

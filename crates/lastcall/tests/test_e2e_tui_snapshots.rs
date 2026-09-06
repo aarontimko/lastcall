@@ -1542,6 +1542,68 @@ fn tui_editor_open() {
     snapshot("tui_editor_open", &app, W, H);
 }
 
+// ---- deliverable 9: select to copy -------------------------------------------------------
+
+/// Three selected lines of `src/parse.rs`'s middle hunk in reverse video, the rest of the
+/// pane untouched: what `v j j` looks like before the `y`.
+#[test]
+fn tui_diff_selection() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    let alpha = root_named(&engine, "alpha");
+    at_parse_rs_middle_hunk(&mut app, &engine, &alpha);
+    app.handle(Action::Select);
+    app.handle(Action::NavDown);
+    app.handle(Action::NavDown);
+    let sel = app.sel.expect("a selection");
+    assert_eq!(sel.range().1 - sel.range().0, 2, "three lines");
+    assert!(app.copy_payload().is_some());
+    snapshot("tui_diff_selection", &app, W, H);
+}
+
+/// The cue after the copy: a centred box over the diff pane, and the status line still
+/// saying what the engine last did.
+#[test]
+fn tui_copy_cue() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    let alpha = root_named(&engine, "alpha");
+    at_parse_rs_middle_hunk(&mut app, &engine, &alpha);
+    app.set_status("saved src/parse.rs");
+    let (_, effect) = app.handle(Action::Copy);
+    let Some(Effect::Copy(bytes)) = effect else {
+        panic!("a copy effect, got {effect:?}");
+    };
+    assert!(
+        String::from_utf8_lossy(&bytes).starts_with("@@ -"),
+        "the hunk under the cursor, header first"
+    );
+    assert!(app.cue.is_some());
+    let (frame, _) = draw(&app, W, H);
+    assert!(frame.contains("copied to clipboard"), "{frame}");
+    assert!(frame.contains("saved src/parse.rs"), "{frame}");
+    snapshot("tui_copy_cue", &app, W, H);
+}
+
+/// The hint line with the diff focused on a wide frame: `v select` and `y copy` are the
+/// last two hints on it, and the first to go when the line has to shrink.
+#[test]
+fn tui_hint_diff_focus() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    let alpha = root_named(&engine, "alpha");
+    at_parse_rs_middle_hunk(&mut app, &engine, &alpha);
+    app.handle(Action::Resize(140, 20));
+    let (frame, _) = draw(&app, 140, 20);
+    assert!(frame.contains("v select  y copy"), "{frame}");
+    let (narrow, _) = draw(&app, W, H);
+    assert!(!narrow.contains("y copy"), "{narrow}");
+    snapshot("tui_hint_diff_focus", &app, 140, 20);
+}
+
 /// Esc on a buffer that has been typed in asks before throwing the text away, and the
 /// question names the file.
 #[test]

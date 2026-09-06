@@ -2479,3 +2479,80 @@ fn pty_edit_inline_save_refused_when_the_file_moved() {
     assert_eq!(status.exit_code(), 0, "{status:?}");
     assert_clean_exit(&pty, since);
 }
+
+/// Deliverable 9 end to end: `v j j` selects three diff lines, `y` copies them, and the one
+/// thing lastcall can actually prove about a clipboard over ssh is on the wire — a single
+/// OSC 52 write whose base64 is the three lines as the pane drew them.
+///
+/// OSC 52 is write-only: no terminal answers it, so "the clipboard now holds this" is not
+/// a claim any test can make. The sponsor's own check at the PR is the other half (design
+/// review F14).
+#[test]
+fn pty_copy_writes_osc52_with_the_selected_lines() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let Some(mut pty) = fx.spawn_tui(&bin()) else {
+        return;
+    };
+    wait_first_piles(&mut pty);
+    wait_watching(&mut pty);
+    open_parse_rs_hunk_2(&mut pty);
+
+    // The three lines the pane is about to hand over: the hunk header `n` scrolled to the
+    // top, and the two under it.
+    let top = hunk_headers(&pty)
+        .first()
+        .map(|(row, _)| *row)
+        .expect("hunk 2's header at the top of the pane");
+    let rows = pty.rows();
+    let pane = col_of(&rows[top as usize], "@@ -").expect("the diff pane's left edge");
+    let on_screen: Vec<String> = (top..top + 3)
+        .map(|r| {
+            let text: String = rows[r as usize].chars().skip(pane as usize).collect();
+            // The pane's right border is part of the screen row, not of the diff line.
+            text.trim_end().trim_end_matches('│').trim_end().to_owned()
+        })
+        .collect();
+
+    let before = pty.raw().len();
+    pty.send(b"vjjy").expect("v j j y");
+    pty.wait_for_text("copied to clipboard", Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("the cue says the copy happened: {e}"));
+
+    // Exactly one OSC 52 write, and it is this copy's.
+    let raw = pty.raw();
+    let osc: Vec<usize> = (0..raw.len())
+        .filter(|i| raw[*i..].starts_with(b"\x1b]52;c;"))
+        .collect();
+    assert_eq!(osc.len(), 1, "one OSC 52 write, at {osc:?}");
+    assert!(osc[0] >= before, "and it is the one this scene asked for");
+    let payload = &raw[osc[0] + b"\x1b]52;c;".len()..];
+    let end = payload.iter().position(|b| *b == 0x07).expect("the BEL");
+    let encoded = String::from_utf8(payload[..end].to_vec()).expect("base64 is ascii");
+
+    // The first line is the header the screen shows; the two after it are the pane's own
+    // lines, `+`/`-`/space and all. Compared through the encoder, so the assertion is about
+    // the bytes on the wire rather than about a decoder written to match it.
+    let header = header_text(&rows[top as usize]);
+    assert!(
+        on_screen[0].starts_with(&header) && on_screen[0].ends_with("[m flag]"),
+        "the header row carries its controls, and they are not part of the line: {:?}",
+        on_screen[0]
+    );
+    let expected = format!("{header}\n{}\n{}\n", on_screen[1], on_screen[2]);
+    assert_eq!(
+        encoded,
+        lastcall::tui::clipboard::base64(expected.as_bytes()),
+        "the payload is {expected:?}"
+    );
+    assert!(
+        expected.len() <= lastcall::tui::clipboard::CAP,
+        "well under the 32 KiB cap"
+    );
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}
