@@ -419,7 +419,9 @@ pub fn hints(app: &App, width: u16) -> String {
         Some(AcceptScope::Root(root)) => accept
             .as_ref()
             .map(|k| format!("{k} accept all in {}", app.root_name(root))),
-        Some(AcceptScope::All) | None => None,
+        // `Bless` is never what the *selection* covers — it is built by the editor-return
+        // path and lives only inside a confirm — so the hint line has nothing to say for it.
+        Some(AcceptScope::All) | Some(AcceptScope::Bless { .. }) | None => None,
     };
     let file = match &scope {
         Some(AcceptScope::Hunk { .. }) => accept_file.map(|k| format!("{k} accept file")),
@@ -1418,15 +1420,24 @@ fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
     }
 }
 
-/// The confirm modal (§6.7), centered like the help overlay. One box, two operations: the
-/// title is ` accept ` or ` restore ` and the first row comes from the scope.
+/// The confirm modal (§6.7), centered like the help overlay. One box, three operations: the
+/// title is ` accept `, ` restore ` or ` review `, and the first row comes from the scope.
 ///
 /// An accept's numbers come from `App::confirm_counts`, i.e. the held piles as they are at
 /// this frame: `Accept all <N> files in <root>?` (one root) or `across <R> repos?`, then
 /// `<g> grouped upstream · <c> collapsed` only when either is non-zero. A restore covers one
-/// row, so it has one question row and nothing to tally (F11).
+/// row, so it has one question row and nothing to tally (F11). So does the post-`$EDITOR`
+/// blessing (Phase 8 deliverable 3), whose question names the path and nothing else: the
+/// user is being asked about their own editor session, not about a count.
 fn render_confirm(app: &App, buf: &mut Buffer, area: Rect) {
-    let (title, mut rows) = match app.confirm_restore() {
+    if let Some(path) = app.confirm_bless() {
+        let question = format!(
+            "{} changed while your editor was open — mark as reviewed?",
+            String::from_utf8_lossy(path)
+        );
+        return confirm_box(" review ", vec![question], buf, area);
+    }
+    let (title, rows) = match app.confirm_restore() {
         Some(scope) => (" restore ", vec![restore_question(scope)]),
         None => {
             let Some(counts) = app.confirm_counts() else {
@@ -1449,6 +1460,11 @@ fn render_confirm(app: &App, buf: &mut Buffer, area: Rect) {
             (" accept ", rows)
         }
     };
+    confirm_box(title, rows, buf, area);
+}
+
+/// The box every confirm shares: the question rows, a blank line, then the modal keys.
+fn confirm_box(title: &str, mut rows: Vec<String>, buf: &mut Buffer, area: Rect) {
     rows.push(String::new());
     rows.push(
         MODAL_KEYS

@@ -38,7 +38,9 @@ use lastcall_engine::herdr::HerdrEvent;
 use lastcall_engine::herdr::client::{Cache, ClientHandle};
 use lastcall_engine::herdr::transport::SocketTransport;
 use lastcall_engine::hunks::Expanded;
+use lastcall_engine::ops::Rendered;
 use lastcall_engine::scan::{Pile, Row};
+use lastcall_engine::store::Current;
 use lastcall_engine::watcher::{EngineEvent, EngineTimings, Watcher, blocking};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -109,6 +111,14 @@ pub enum Local {
     Fatal(String),
     /// A herdr request the loop made off the UI task came back (`agent.focus`, a toast).
     Herdr(HerdrUpdate),
+    /// An `Effect::EditorReturned` finished: what the work tree holds at the path the
+    /// `$EDITOR` session had open (Phase 8 deliverable 3). The row the editor was opened on
+    /// travels back with the answer so the reducer compares against what the user saw.
+    EditorReturned {
+        root: PathBuf,
+        rendered: Rendered,
+        live: Current,
+    },
     /// An `Effect::Expand` finished: one collapsed row's on-demand hunks (deliverable 4).
     /// The row `hunks_of` was given travels back with the answer, so the app can tell an
     /// answer for the oids on screen from one for oids a pile has since replaced.
@@ -248,6 +258,11 @@ impl Ui {
                 (Changed::No, Some(Effect::Quit))
             }
             Local::Herdr(update) => self.app.handle(Action::Herdr(update)),
+            Local::EditorReturned {
+                root,
+                rendered,
+                live,
+            } => self.app.editor_returned(root, rendered, live),
             Local::Expanded(root, row, view) => (self.app.set_expanded(root, &row, view), None),
         }
     }
@@ -767,6 +782,38 @@ fn spawn_expand(
     });
 }
 
+/// `Effect::EditorReturned`: one `Engine::current` off the UI task (deliverable 3).
+///
+/// An `Err` — only `NoSuchRoot`, since `current` does no ledger work — is handed to the
+/// reducer as [`Current::Unhashable`] rather than as a notice, so the editor-return path has
+/// exactly one shape and one sentence: the file is left pending and the reason is named.
+fn spawn_editor_return(
+    engine: &Arc<Mutex<Engine>>,
+    tx: mpsc::UnboundedSender<Local>,
+    root: PathBuf,
+    rendered: Rendered,
+) {
+    let engine = engine.clone();
+    tokio::spawn(async move {
+        let path = rendered.path.clone();
+        let task = tokio::spawn(async move {
+            blocking(&engine, move |e| {
+                let live = e.current(&root, &path);
+                (root, live)
+            })
+            .await
+        });
+        let Some((root, live)) = joined(task, &tx, "editor return").await else {
+            return;
+        };
+        let _ = tx.send(Local::EditorReturned {
+            root,
+            rendered,
+            live: live.unwrap_or_else(|e| Current::Unhashable(e.to_string())),
+        });
+    });
+}
+
 /// `Effect::SyncRoots`: re-read every root's metadata off the UI task.
 fn spawn_sync_roots(engine: &Arc<Mutex<Engine>>, tx: mpsc::UnboundedSender<Local>) {
     let engine = engine.clone();
@@ -1224,6 +1271,12 @@ pub fn run(
                             root,
                             label,
                             export,
+                        ),
+                        Effect::EditorReturned { root, rendered } => spawn_editor_return(
+                            &watcher.engine,
+                            local_tx.clone(),
+                            root,
+                            rendered,
                         ),
                         Effect::Expand(root, row) => {
                             spawn_expand(&watcher.engine, local_tx.clone(), root, row)

@@ -18,14 +18,14 @@ use lastcall_engine::engine::{
     AcceptRequest, Accepted, EngineError, Flagged, RenderedHunk, RestoreRequest, Restored,
     RootState,
 };
-use lastcall_engine::git::Oid;
+use lastcall_engine::git::{Mode, Oid};
 use lastcall_engine::headstate::InProgress;
 use lastcall_engine::hunks::{Expanded, Hunk, Tag};
 use lastcall_engine::ledger::{FlagHunk, LedgerError};
 use lastcall_engine::ops::{OpsError, Rendered};
 use lastcall_engine::roots::Badge;
 use lastcall_engine::scan::{Annotation, Change, Collapsed, Entry, Group, Pile, Row};
-use lastcall_engine::store::RootKind;
+use lastcall_engine::store::{Current, RootKind};
 use lastcall_engine::watcher::EngineEvent;
 
 use super::herdr::{AgentCandidate, HerdrUpdate, HerdrView, Link, ToastRequest};
@@ -292,6 +292,15 @@ pub enum Effect {
     Focus(String),
     /// Tell the toast task which ready episodes opened and which ended (deliverable 6).
     Toast(ToastRequest),
+    /// The `$EDITOR` child exited: rehash this path off the UI task (`Engine::current`)
+    /// and bring the answer back as [`Local::EditorReturned`](super::run::Local), which
+    /// [`App::editor_returned`] folds (Phase 8 deliverable 3). The `rendered` row is the
+    /// one the editor was opened on, so the comparison is against what the user saw and
+    /// not against a pile the watcher may have applied while the editor had the terminal.
+    EditorReturned {
+        root: PathBuf,
+        rendered: Rendered,
+    },
     /// `Engine::hunks_of` for one collapsed row, off the UI task; the answer comes back as
     /// `Local::Expanded`. The **row** travels, not just its path: the expansion is computed
     /// from the oids the row was rendered from, so it shows exactly the delta the counts
@@ -338,6 +347,20 @@ pub enum AcceptScope {
     Root(PathBuf),
     /// Every row of every listed root.
     All,
+    /// The post-`$EDITOR` blessing (deliverable 3, ruling P1): accept **the bytes the
+    /// editor left on disk**, not the ones the row was rendered from.
+    ///
+    /// The only scope that carries its own [`Rendered`]. Every other variant is resolved
+    /// against the held `RootView` at [`App::accept_requests`] time, which is exactly what
+    /// a blessing must not do: the live oid was read by `Engine::current` after the editor
+    /// exited, and the view still holds the pre-edit row (the watcher's pile for the save
+    /// may not have arrived, and if it has, the row's oid is the same live one anyway).
+    Bless {
+        root: PathBuf,
+        path: Vec<u8>,
+        /// The pre-edit row with `oid`/`mode` replaced by what is on disk now.
+        rendered: Box<Rendered>,
+    },
 }
 
 /// An accept the loop is running: its scope and the rows each request covered, so the
@@ -1174,6 +1197,9 @@ impl App {
                     out.push((root.clone(), AcceptRequest::All(view.pile.clone())));
                 }
             }
+            AcceptScope::Bless { root, rendered, .. } => {
+                out.push((root.clone(), AcceptRequest::File((**rendered).clone())));
+            }
             AcceptScope::All => {
                 // "Every listed root" is the nav's own rule (deliverable 8): a root the
                 // active scope hides is not on screen, so accept-all never touches it.
@@ -1203,7 +1229,9 @@ impl App {
             counts.roots.push(self.root_name(root));
         };
         match scope {
-            AcceptScope::Hunk { root, path, .. } | AcceptScope::File { root, path, .. } => {
+            AcceptScope::Hunk { root, path, .. }
+            | AcceptScope::File { root, path, .. }
+            | AcceptScope::Bless { root, path, .. } => {
                 if let Some(row) = self.roots.get(root).and_then(|v| v.row(path)) {
                     tally(root, &[row]);
                 }
@@ -1243,6 +1271,82 @@ impl App {
             ConfirmScope::Restore(ref scope) => Some(scope),
             ConfirmScope::Accept(_) => None,
         }
+    }
+
+    /// The blessing the confirm modal is asking about, if it is asking about one: the path
+    /// the `$EDITOR` session changed. Kept beside [`App::confirm_restore`] so `render_confirm`
+    /// asks one question per shape and never matches the scope enum itself.
+    pub fn confirm_bless(&self) -> Option<&[u8]> {
+        match self.confirm.as_ref()?.scope {
+            ConfirmScope::Accept(AcceptScope::Bless { ref path, .. }) => Some(path),
+            _ => None,
+        }
+    }
+
+    /// The `$EDITOR` child exited and the path was rehashed: decide what the session meant
+    /// (deliverable 3; ruling P1 = Amendment v1.8).
+    ///
+    /// lastcall cannot tell who wrote the bytes — the user's editor, or an agent that wrote
+    /// while the editor had the terminal — so a *changed* file is never blessed silently:
+    /// it opens the confirm, and the user, who knows whether they saved, answers it. That
+    /// confirm is what makes the blessing an admissible exception to invariant 3 ("accept is
+    /// metadata-only and never a fresh read"): the answer, not the read, is the review.
+    ///
+    /// Everything else writes nothing:
+    /// - **unchanged** (the same oid *and* mode) — the usual outcome of a look-and-quit, and
+    ///   of every non-waiting editor (`code` without `--wait`), whose later save arrives as
+    ///   an ordinary pending row;
+    /// - **gone**, **a symlink**, or **unhashable** on return — there is no content to
+    ///   bless, and the row stays pending with the reason on the status line.
+    pub fn editor_returned(
+        &mut self,
+        root: PathBuf,
+        rendered: Rendered,
+        live: Current,
+    ) -> (Changed, Option<Effect>) {
+        let path = String::from_utf8_lossy(&rendered.path).into_owned();
+        let (oid, mode) = match live {
+            Current::Absent => {
+                self.set_status(format!("{path}: deleted on return; left pending"));
+                return (Changed::Yes, None);
+            }
+            // `hash_path` phrases these: `not a regular file` for a fifo or socket,
+            // `typechange: a directory where a file was`, an `EACCES` message. Each is a
+            // reason a reader can act on, so it is passed through rather than flattened.
+            Current::Unhashable(why) => {
+                self.set_status(format!("{path}: {why} on return; left pending"));
+                return (Changed::Yes, None);
+            }
+            // A symlink hashes fine — it is its target's bytes — but it is not a file the
+            // editor edited in place, so it takes the same sentence a fifo does.
+            Current::Present {
+                mode: Mode::Symlink,
+                ..
+            } => {
+                self.set_status(format!(
+                    "{path}: not a regular file on return; left pending"
+                ));
+                return (Changed::Yes, None);
+            }
+            Current::Present { oid, mode } => (oid, mode),
+        };
+        if rendered.oid.as_ref() == Some(&oid) && rendered.mode == Some(mode) {
+            self.set_status("no change");
+            return (Changed::Yes, None);
+        }
+        let live_rendered = Rendered {
+            oid: Some(oid),
+            mode: Some(mode),
+            ..rendered
+        };
+        self.confirm = Some(Confirm {
+            scope: ConfirmScope::Accept(AcceptScope::Bless {
+                root,
+                path: live_rendered.path.clone(),
+                rendered: Box::new(live_rendered),
+            }),
+        });
+        (Changed::Yes, None)
     }
 
     fn group_rows(&self, root: &Path, kind: Annotation) -> Vec<&Row> {
@@ -1757,6 +1861,10 @@ impl App {
                 let suffix = if *deleted { " (deleted)" } else { "" };
                 format!("accepted {}{suffix}", lossy(path))
             }
+            // The blessing says `reviewed`, not `accepted`: what was marked seen is the
+            // content the user's own editor session left, which is the whole point of the
+            // confirm they just answered (ruling P1).
+            AcceptScope::Bless { path, .. } => format!("reviewed {}", lossy(path)),
             AcceptScope::Group { kind, .. } => format!(
                 "accepted {} · {}",
                 annotation_name(*kind),
@@ -2109,7 +2217,17 @@ impl App {
                 None => Changed::No,
             },
             Cancel => {
+                // A declined blessing is worth a sentence: the user has just been asked a
+                // question about a file, and silence would leave them guessing whether the
+                // `n` landed. The row itself stays, showing the editor's delta like any
+                // other pending change.
+                let declined = self
+                    .confirm_bless()
+                    .map(|p| String::from_utf8_lossy(p).into_owned());
                 if self.confirm.take().is_some() {
+                    if let Some(path) = declined {
+                        self.set_status(format!("{path} left pending"));
+                    }
                     Changed::Yes
                 } else {
                     Changed::No
@@ -3175,6 +3293,147 @@ mod tests {
             Some(row("beta", "u2")),
             "a vanished group advances to the root's first remaining row"
         );
+    }
+
+    // ---- the post-$EDITOR blessing (Phase 8 deliverable 3) -----------------------------
+
+    /// The row `f1` was rendered from, and the same row with the editor's bytes on it.
+    fn editor_pair(app: &App) -> (Rendered, Current) {
+        let rendered = Rendered::of(app.roots[&root("alpha")].row(b"f1").expect("f1"));
+        let live = Current::Present {
+            oid: Oid::parse(&"e".repeat(40)).expect("a well-formed oid"),
+            mode: rendered.mode.expect("f1 is not a deletion"),
+        };
+        (rendered, live)
+    }
+
+    /// Deliverable 3 / ruling P1: a file the editor session changed is never blessed
+    /// silently. `Enter` sends the accept **with the live oid** — not the one on the held
+    /// row — and `Esc` sends nothing and says the row is still pending.
+    #[test]
+    fn app_editor_return_asks_before_blessing_a_changed_file() {
+        let mut app = three_roots();
+        app.select(Some(row("alpha", "f1")));
+        let (rendered, live) = editor_pair(&app);
+        let Current::Present { oid: live_oid, .. } = live.clone() else {
+            unreachable!("built as Present");
+        };
+
+        // The return itself writes nothing: it opens the question.
+        let (changed, effect) = app.editor_returned(root("alpha"), rendered.clone(), live.clone());
+        assert_eq!(changed, Changed::Yes);
+        assert_eq!(effect, None, "the confirm is the only thing that happens");
+        assert_eq!(
+            app.confirm_bless(),
+            Some(&b"f1"[..]),
+            "the confirm names the path the editor had open"
+        );
+        assert!(app.accepting.is_none(), "nothing is in flight yet");
+
+        // `y` / Enter: the request carries what is on disk now, and the held row's own oid
+        // is nowhere in it — that is the whole of the blessing.
+        let (changed, effect) = app.handle(Action::Confirm);
+        assert_eq!(changed, Changed::Yes);
+        assert!(app.confirm.is_none());
+        let reqs = requests(effect);
+        assert_eq!(
+            reqs,
+            vec![(
+                root("alpha"),
+                AcceptRequest::File(Rendered {
+                    oid: Some(live_oid.clone()),
+                    ..rendered.clone()
+                })
+            )]
+        );
+        assert_ne!(rendered.oid, Some(live_oid), "the live oid is a new one");
+        assert_eq!(status(&app), "accepting…");
+
+        // The answer names the session, not an accept: `reviewed`, and the row is gone.
+        app.accepted(vec![accepted_ok(
+            "alpha",
+            4,
+            without(pile("alpha"), &["f1"]),
+        )]);
+        assert_eq!(status(&app), "reviewed f1");
+        assert!(app.roots[&root("alpha")].row(b"f1").is_none());
+
+        // Esc: no effect at all, and the row is still there to review the ordinary way.
+        let mut app = three_roots();
+        app.select(Some(row("alpha", "f1")));
+        let (rendered, live) = editor_pair(&app);
+        app.editor_returned(root("alpha"), rendered, live);
+        let (changed, effect) = app.handle(Action::Cancel);
+        assert_eq!(changed, Changed::Yes);
+        assert_eq!(effect, None, "a declined blessing writes nothing");
+        assert!(app.confirm.is_none());
+        assert!(app.accepting.is_none());
+        assert_eq!(status(&app), "f1 left pending");
+        assert!(app.roots[&root("alpha")].row(b"f1").is_some());
+    }
+
+    /// A look-and-quit — and every non-waiting editor, which returns before the user has
+    /// saved — leaves the file byte-identical: no question, no write, one word.
+    #[test]
+    fn app_editor_return_skips_an_unchanged_file() {
+        let mut app = three_roots();
+        app.select(Some(row("alpha", "f1")));
+        let rendered = Rendered::of(app.roots[&root("alpha")].row(b"f1").expect("f1"));
+        let live = Current::Present {
+            oid: rendered.oid.clone().expect("f1 is not a deletion"),
+            mode: rendered.mode.expect("f1 is not a deletion"),
+        };
+        let (changed, effect) = app.editor_returned(root("alpha"), rendered.clone(), live);
+        assert_eq!(changed, Changed::Yes);
+        assert_eq!(effect, None);
+        assert!(app.confirm.is_none(), "nothing to ask about");
+        assert_eq!(status(&app), "no change");
+
+        // The mode alone is enough to make it a change: `chmod +x` inside the editor is a
+        // delta the ledger has to record, so it asks.
+        let live = Current::Present {
+            oid: rendered.oid.clone().expect("f1 is not a deletion"),
+            mode: Mode::Executable,
+        };
+        app.editor_returned(root("alpha"), rendered, live);
+        assert_eq!(app.confirm_bless(), Some(&b"f1"[..]));
+    }
+
+    /// Nothing on disk to bless: the file is gone, or it is not a regular file. Each says
+    /// which, and each leaves the row exactly as it was.
+    #[test]
+    fn app_editor_return_leaves_a_deleted_file_pending() {
+        let mut app = three_roots();
+        app.select(Some(row("alpha", "f1")));
+        let rendered = Rendered::of(app.roots[&root("alpha")].row(b"f1").expect("f1"));
+        let held = app.clone();
+
+        for (live, expect) in [
+            (Current::Absent, "f1: deleted on return; left pending"),
+            (
+                Current::Present {
+                    oid: Oid::parse(&"e".repeat(40)).expect("a well-formed oid"),
+                    mode: Mode::Symlink,
+                },
+                "f1: not a regular file on return; left pending",
+            ),
+            (
+                Current::Unhashable("typechange: a directory where a file was".into()),
+                "f1: typechange: a directory where a file was on return; left pending",
+            ),
+        ] {
+            let (changed, effect) = app.editor_returned(root("alpha"), rendered.clone(), live);
+            assert_eq!(changed, Changed::Yes);
+            assert_eq!(effect, None, "nothing is written");
+            assert!(app.confirm.is_none(), "and nothing is asked");
+            assert_eq!(status(&app), expect);
+            assert!(app.accepting.is_none());
+            assert_eq!(
+                app.roots[&root("alpha")].row(b"f1"),
+                held.roots[&root("alpha")].row(b"f1"),
+                "the row is untouched"
+            );
+        }
     }
 
     #[test]

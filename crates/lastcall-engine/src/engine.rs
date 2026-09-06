@@ -30,7 +30,7 @@ use crate::ops::{FaultInjector, NoFault, Ops, OpsError, Outcome, Rendered};
 use crate::paths::{Layout, ParentId, ParentMeta, RepoPaths, RootId};
 use crate::roots::{self, Badge, DiscoverInputs, Discovery, RootsChanged};
 use crate::scan::{self, Pile, Row, ScanError, ScanInputs};
-use crate::store::{RepoFacts, RootKind, Store, StoreError};
+use crate::store::{Current, RepoFacts, RootKind, Store, StoreError};
 use crate::upstream::{self, Classifier};
 
 /// The oldest git the engine accepts (`--path-format=absolute`, `ls-files --others -z`
@@ -1251,6 +1251,26 @@ impl Engine {
             seq: self.scan_seq,
             pile,
         })
+    }
+
+    /// What the work tree holds at `path` **right now** — one `lstat` plus, for a file,
+    /// one `hash-object -w` (Phase 8 deliverable 3).
+    ///
+    /// The read the post-`$EDITOR` blessing is built on: the TUI has a [`Rendered`] row
+    /// from before the editor ran and needs to know what the editor left behind. It is a
+    /// plain read — no ledger, no override, no scan — so it stays cheap enough to run on
+    /// the one path the user just edited, and it is the same `hash_path` a scan would use,
+    /// which is what makes the oid it returns comparable with a row's.
+    ///
+    /// A blessing built on this answer is the **one** deliberate exception to invariant 3
+    /// (accept is never a fresh read), and it is guarded by a confirm the user answers:
+    /// §6.3's editor-save row and §11's residual both say so (Amendment v1.8, ruling P1).
+    pub fn current(&self, root: &Path, path: &[u8]) -> Result<Current, EngineError> {
+        let state = self
+            .roots
+            .get(root)
+            .ok_or_else(|| EngineError::NoSuchRoot(root.to_path_buf()))?;
+        Ok(state.store.hash_path(path))
     }
 
     /// Write an editor buffer back to the working tree and advance the path's baseline to

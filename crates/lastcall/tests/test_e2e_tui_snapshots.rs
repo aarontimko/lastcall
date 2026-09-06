@@ -899,6 +899,71 @@ fn tui_accept_all_confirm() {
     assert!(engine.scan(&beta).expect("scan").is_empty());
 }
 
+/// Phase 8 deliverable 3 / ruling P1: the `$EDITOR` session ended and `f1` on disk is not
+/// what the row was rendered from, so the blessing asks before it writes. `y` accepts the
+/// bytes the editor left — the row goes, and the ledger holds the *live* oid, not the one
+/// the screen was showing when the editor opened.
+#[test]
+fn tui_editor_return_confirm() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let alpha = root_named(&engine, "alpha");
+    let mut app = app_of(&mut engine);
+    select_row(&mut app, &alpha, "f1");
+    let rendered = lastcall_engine::ops::Rendered::of(app.roots[&alpha].row(b"f1").expect("f1"));
+
+    // What the editor did: it wrote the file while lastcall was suspended. The row on
+    // screen is still the pre-edit one — no pile has arrived — which is exactly the state
+    // the return path has to handle.
+    scene
+        .repo("alpha")
+        .write("f1", "the line the editor left behind\n");
+    let live = engine.current(&alpha, b"f1").expect("a watched root");
+    let lastcall_engine::store::Current::Present { oid: live_oid, .. } = live.clone() else {
+        panic!("f1 is a regular file: {live:?}");
+    };
+    assert_ne!(
+        Some(&live_oid),
+        rendered.oid.as_ref(),
+        "the editor changed it"
+    );
+
+    let (changed, effect) = app.editor_returned(alpha.clone(), rendered, live);
+    assert_eq!(changed, Changed::Yes);
+    assert_eq!(effect, None, "the question comes first");
+    let (frame, _) = draw(&app, W, H);
+    assert!(
+        frame.contains("f1 changed while your editor was open — mark as reviewed?"),
+        "{frame}"
+    );
+    assert!(frame.contains("y / ⏎ confirm    n / Esc cancel"), "{frame}");
+    snapshot("tui_editor_return_confirm", &app, W, H);
+
+    // `y`: the accept carries the live oid, so the row is gone and nothing was re-read.
+    let (_, effect) = app.handle(Action::Confirm);
+    let Some(Effect::Accept(ref reqs)) = effect else {
+        panic!("an accept effect, got {effect:?}");
+    };
+    assert_eq!(reqs.len(), 1);
+    run_accept(&mut app, &mut engine, effect);
+    assert_eq!(status_text(&app), "reviewed f1");
+    assert!(app.roots[&alpha].row(b"f1").is_none());
+    assert!(
+        engine
+            .scan(&alpha)
+            .expect("scan")
+            .rows
+            .iter()
+            .all(|r| r.path != b"f1"),
+        "the blessed content is the baseline: nothing pending for f1"
+    );
+    assert_eq!(
+        std::fs::read_to_string(scene.repo("alpha").path().join("f1")).unwrap(),
+        "the line the editor left behind\n",
+        "the blessing is metadata: the file the editor wrote is untouched"
+    );
+}
+
 /// G0 Q5: exactly 10 files accept without asking. Only alpha is pending (beta and notes
 /// marked seen), with `f1`, `f2` and eight generated files; `ctrl-a` folds it at once.
 #[test]
