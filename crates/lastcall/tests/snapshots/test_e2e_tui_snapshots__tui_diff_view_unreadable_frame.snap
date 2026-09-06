@@ -2,12 +2,13 @@
 source: crates/lastcall/tests/test_e2e_tui_snapshots.rs
 expression: frame
 ---
-"lastcall  3 repos · 5 files · 4 hunks  standalone  [Accept All]                           watching W"
+"lastcall  3 repos · 6 files · 7 hunks  standalone  [Accept All]                           watching W"
 "┌──────────────────────────┬───────────────────────────────────────────────────────────────────────┐"
 "│alpha                     │f2  T  +0 −0                           [A accept file] [U restore file]│"
-"│  main · 2 files          │f2: cannot hash (typechange: a directory where a file was); shown pendi│"
+"│  main · 3 files          │f2: cannot hash (typechange: a directory where a file was); shown pendi│"
 "│  M f1  +1 −1             │                                                                       │"
 "│  T f2  +0 −0             │                                                                       │"
+"│  M parse.rs  +10 −2      │                                                                       │"
 "│──────────────────────────│                                                                       │"
 "│beta                      │                                                                       │"
 "│  main · 2 files          │                                                                       │"
@@ -18,7 +19,6 @@ expression: frame
 "│notes                     │                                                                       │"
 "│  draft · 1 file          │                                                                       │"
 "│  M n2.md  +2 −0          │                                                                       │"
-"│                          │                                                                       │"
 "│                          │                                                                       │"
 "│                          │                                                                       │"
 "│                          │                                                                       │"

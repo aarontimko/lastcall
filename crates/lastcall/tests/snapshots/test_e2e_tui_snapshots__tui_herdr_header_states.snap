@@ -2,7 +2,7 @@
 source: crates/lastcall/tests/test_e2e_tui_snapshots.rs
 expression: lines
 ---
-connected          |"lastcall  3 repos · 5 files · 5 hunks  herdr 0.8.2  [Accept All]                          watching W"|
-reconnecting       |"lastcall  3 repos · 5 files · 5 hunks  herdr ⟳  [Accept All]                              watching W"|
-standalone (auto)  |"lastcall  3 repos · 5 files · 5 hunks  standalone  [Accept All]                           watching W"|
-standalone (on)    |"lastcall  3 repos · 5 files · 5 hunks  standalone: no herdr socket  [Accept All]          watching W"|
+connected          |"lastcall  3 repos · 6 files · 8 hunks  herdr 0.8.2  [Accept All]                          watching W"|
+reconnecting       |"lastcall  3 repos · 6 files · 8 hunks  herdr ⟳  [Accept All]                              watching W"|
+standalone (auto)  |"lastcall  3 repos · 6 files · 8 hunks  standalone  [Accept All]                           watching W"|
+standalone (on)    |"lastcall  3 repos · 6 files · 8 hunks  standalone: no herdr socket  [Accept All]          watching W"|

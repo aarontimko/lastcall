@@ -484,8 +484,9 @@ fn pty_live_update_hunk_nav_click_and_quit() {
             "edit-to-screen min of two tries {best:?} exceeds {LIVE_UPDATE_BUDGET:?} (try1 {try1:?}, try2 {try2:?})"
         );
     }
-    // The header's totals are live too: 3 repos, 5 files, 6 hunks (f1 now has two).
-    pty.wait_for_text("3 repos · 5 files · 6 hunks", Duration::from_secs(5))
+    // The header's totals are live too: 3 repos, 6 files, 9 hunks (f1 now has two, and
+    // alpha's `src/parse.rs` carries the fixture's three separated hunks).
+    pty.wait_for_text("3 repos · 6 files · 9 hunks", Duration::from_secs(5))
         .unwrap_or_else(|e| panic!("header totals: {e}"));
 
     // (3) select f1 (↓ to alpha, ↓ to f1), open it, then `n`: the second hunk header is
@@ -719,7 +720,7 @@ const F1_TWO_HUNKS: &str = "A1\na2\na3\na4\na5\na6\na7\na8\na9\nA10\n";
 const F2_EDIT: &str = "b\nagent edit\nmore\n";
 const F2_EDIT_AGAIN: &str = "b\nagent edit\nmore\nagain\n";
 const F3_EDIT: &str = "c changed\n";
-/// Added files so that after the hunk and file accepts `ctrl-a` still covers eleven files
+/// Added files so that after the hunk and file accepts `ctrl-a` still covers twelve files
 /// (> `CONFIRM_ABOVE`), which drives the confirm modal through the real terminal.
 const ADDED: [&str; 6] = ["g01", "g02", "g03", "g04", "g05", "g06"];
 
@@ -756,11 +757,11 @@ fn pty_accept_loop_and_restart() {
     let first = wait_first_piles(&mut pty);
     pty.wait_for(LONG, |s| {
         let t = s.contents();
-        t.contains("M f3") && t.contains("A g06") && t.contains("3 repos · 12 files")
+        t.contains("M f3") && t.contains("A g06") && t.contains("3 repos · 13 files")
     })
-    .unwrap_or_else(|e| panic!("all twelve rows: {e}"));
+    .unwrap_or_else(|e| panic!("all thirteen rows: {e}"));
     note(&format!(
-        "PTY accept loop: 12 files on screen after {first:.3?}"
+        "PTY accept loop: 13 files on screen after {first:.3?}"
     ));
 
     // (1) open f1: two hunks; `a` accepts the first, the row shrinks to the second.
@@ -794,19 +795,19 @@ fn pty_accept_loop_and_restart() {
         t.elapsed()
     ));
 
-    // (3) `ctrl-a`: eleven files across three roots is above the confirm threshold; the
+    // (3) `ctrl-a`: twelve files across three roots is above the confirm threshold; the
     // modal counts u1 as the one grouped upstream row; `y` folds all three ledgers.
     pty.send(b"\x01").expect("ctrl-a");
     pty.wait_for(Duration::from_secs(5), |s| {
         let text = s.contents();
-        text.contains("Accept all 11 files across 3 repos?")
+        text.contains("Accept all 12 files across 3 repos?")
             && text.contains("1 grouped upstream · 0 collapsed")
     })
     .unwrap_or_else(|e| panic!("confirm modal: {e}"));
     let t = Instant::now();
     pty.send(b"y").expect("y");
     pty.wait_for(OVERLOADED, |s| {
-        status_is(s, "accepted 11 files in 3 repos")
+        status_is(s, "accepted 12 files in 3 repos")
             && s.contents().contains("nothing pending across 3 roots")
     })
     .unwrap_or_else(|e| panic!("accept all: {e}"));
@@ -832,7 +833,7 @@ fn pty_accept_loop_and_restart() {
     // The seen tree itself, listed from the root's store: one entry per path of alpha's
     // working tree as accepted and nothing else — f1 and f2 at the blobs the agent left
     // (hashed here from the same files: f1 is the whole edit, hunk then file), f3 as the
-    // agent's commit has it, the six added files.
+    // agent's commit has it, the six added files, and the fixture's `src/parse.rs`.
     let store = alpha_state.join("store");
     let seen_tree = after["seen_tree"].as_str().expect("seen_tree is an oid");
     let listing = alpha
@@ -856,6 +857,7 @@ fn pty_accept_loop_and_restart() {
         .collect();
     let mut expected = vec!["f1", "f2", "f3"];
     expected.extend(ADDED);
+    expected.push(fixture_parent::PARSE_RS);
     assert_eq!(
         entries.keys().copied().collect::<Vec<_>>(),
         expected,

@@ -776,8 +776,10 @@ fn tui_accept_last_hunk_advances() {
     snapshot("tui_accept_last_hunk_advances", &app, W, H);
 }
 
-/// §6.7: accepting a repo's last file collapses the repo out of the nav. alpha's `f1`
-/// then `f2` accepted whole; alpha unlists and the selection moves to beta's first row.
+/// §6.7: accepting a repo's last file collapses the repo out of the nav. alpha's `f1`,
+/// `f2` then `src/parse.rs` accepted whole; alpha unlists and the selection moves to
+/// beta's first row. (`src/parse.rs` is deliverable 10's addition: alpha has three
+/// pending files, and it sorts last, so it is the last file here.)
 #[test]
 fn tui_accept_last_file_collapses_repo() {
     let scene = Scene::build();
@@ -798,6 +800,22 @@ fn tui_accept_last_file_collapses_repo() {
     let (_, effect) = app.handle(Action::AcceptFile);
     run_accept(&mut app, &mut engine, effect);
     assert_eq!(status_text(&app), "accepted f2");
+    assert!(
+        app.roots[&alpha].listed(),
+        "alpha still has src/parse.rs pending"
+    );
+    assert_eq!(
+        app.selection,
+        Some(Selection::Row(
+            alpha.clone(),
+            fixture_parent::PARSE_RS.as_bytes().to_vec()
+        )),
+        "the next row in alpha"
+    );
+
+    let (_, effect) = app.handle(Action::AcceptFile);
+    run_accept(&mut app, &mut engine, effect);
+    assert_eq!(status_text(&app), "accepted src/parse.rs");
     assert!(
         !app.roots[&alpha].listed(),
         "alpha collapsed out of the nav"
@@ -965,12 +983,14 @@ fn tui_editor_return_confirm() {
 }
 
 /// G0 Q5: exactly 10 files accept without asking. Only alpha is pending (beta and notes
-/// marked seen), with `f1`, `f2` and eight generated files; `ctrl-a` folds it at once.
+/// marked seen), with `f1`, `f2`, deliverable 10's `src/parse.rs` and seven generated
+/// files; `ctrl-a` folds it at once. The generated count is what keeps the pile at
+/// exactly ten — the threshold is the subject here, not alpha's shape.
 #[test]
 fn tui_accept_all_no_confirm_at_10() {
     let scene = Scene::build();
     let alpha_repo = scene.repo("alpha");
-    for i in 1..=8 {
+    for i in 1..=7 {
         alpha_repo.write(&format!("g{i:02}"), format!("generated {i}\n"));
     }
     let mut engine = scene.engine();
@@ -997,12 +1017,14 @@ fn tui_accept_all_no_confirm_at_10() {
 
 /// Ruling 1: an engine capped at 3 rows over alpha with 5 pending files shows the first
 /// three by path, `3+ files` in the nav and header, and the notice under the root's
-/// main-view header.
+/// main-view header. The five are `f1`, `f2`, deliverable 10's `src/parse.rs` (which
+/// sorts last, so it is one of the omitted two) and two generated files — the cap and
+/// the omitted count are the subject here, not alpha's shape.
 #[test]
 fn tui_row_cap_notice() {
     let scene = Scene::build();
     let alpha_repo = scene.repo("alpha");
-    for i in 1..=3 {
+    for i in 1..=2 {
         alpha_repo.write(&format!("g{i}"), format!("generated {i}\n"));
     }
     let mut engine = scene.engine_with(EngineOptions {
