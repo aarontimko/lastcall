@@ -621,7 +621,8 @@ Then `run::Suspend::run`. **Every step is load-bearing and the order is the whol
 4. **`Signals::resume`** before anything is drawn: that same `^C` was delivered to lastcall
    too, and the loop must not read it as "quit" the moment it runs again. For
    `EDITOR_SETTLE` = 50 ms after the resume an interrupt is ignored — a real `ctrl-c` a
-   moment later still quits (`pty_editor_ctrl_c_does_not_quit_lastcall`).
+   moment later still quits (`pty_editor_ctrl_c_does_not_quit_lastcall`, which now **ends**
+   with that second `^C` 300 ms after the resume rather than with a `q` — verifier (b) F3).
    **Residual (verifier (b) F5):** `Signals::register` also
    registers `SIGQUIT` and drops the stream on the spot, and tokio's handler stays installed
    for the life of the process — so `kill -QUIT <lastcall>` from another terminal does
@@ -1182,8 +1183,9 @@ The Phase 8 scenes are the ones that need a **child process** and a real termina
 which is exactly what neither a reducer test nor a snapshot can reach:
 `pty_editor_save_pends_nothing` (`shift-i`, the probe editor rewrites the file, the return
 confirm, `y`, and the row is gone), `pty_editor_ctrl_c_does_not_quit_lastcall` (a `^C` typed
-while the editor owns the terminal kills the *editor*; lastcall is still up on resume, and a
-`^C` a moment later still quits), `pty_edit_inline_save_pends_nothing` and
+while the editor owns the terminal kills the *editor*; lastcall is still up on resume, and
+the scene then exits on a second `^C` 300 ms later — past `EDITOR_SETTLE`, so the drain
+swallowed the editor's interrupt and not this one), `pty_edit_inline_save_pends_nothing` and
 `pty_edit_inline_save_refused_when_the_file_moved` (`i`, type, `^S`, against a file an agent
 rewrites underneath), `pty_copy_writes_osc52_with_the_selected_lines` (`vjjy`, then the raw
 transcript is searched for exactly one `\x1b]52;c;` and its base64 decoded — by the test's own

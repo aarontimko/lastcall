@@ -2284,10 +2284,18 @@ fn pty_editor_ctrl_c_does_not_quit_lastcall() {
         pty.screen_text()
     );
 
-    // …and the keyboard still reaches it.
+    // …and the keyboard still reaches it — with a **second `^C`**, which is the half of the
+    // claim the scene used to leave to a `q` (verifier (b) F3). It proves two things at
+    // once: `Signals::resume`'s drain swallowed the editor's interrupt and not this one,
+    // and the resumed terminal is back in raw mode, where `\x03` is a key event the keymap
+    // quits on rather than a signal. It goes out well past `EDITOR_SETTLE` (50 ms), which
+    // is the window the docs promise a `ctrl-c` has to be repeated in.
+    std::thread::sleep(Duration::from_millis(300));
     let since = pty.raw().len();
-    pty.send(b"q").expect("q");
-    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    pty.send(b"\x03").expect("^C after the resume");
+    let status = pty
+        .wait_exit(QUIT_BUDGET)
+        .expect("a real ^C a moment after the resume quits");
     assert_eq!(status.exit_code(), 0, "{status:?}");
     assert_clean_exit(&pty, since);
 }
