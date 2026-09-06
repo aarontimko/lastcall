@@ -635,9 +635,10 @@ Then `run::Suspend::run`. **Every step is load-bearing and the order is the whol
    fatal here. `resize` clears the screen and resets the back buffer and asks the terminal
    nothing.
 
-A spawn that never started (`<program>: not found`) is a status line and nothing else. A
-child that ran — whatever its exit status; an editor that quits with an error still wrote, or
-did not — produces `Effect::EditorReturned`, and the answer table is in
+A spawn that never started (`editor not found: <program>`, the verb first because the status
+row ellipsizes from the tail and `$EDITOR` is often an absolute path) is a status line and
+nothing else. A child that ran — whatever its exit status; an editor that quits with an error
+still wrote, or did not — produces `Effect::EditorReturned`, and the answer table is in
 [`engine.md`](engine.md) under "The blessing on `$EDITOR` return": `no change`, one of the
 four `left pending` sentences, or the confirm
 `<path> changed while your editor was open — mark as reviewed?` (`y`/`Enter` → an accept of

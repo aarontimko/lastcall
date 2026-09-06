@@ -1028,7 +1028,7 @@ impl Suspend<'_> {
     ///
     /// `Ok(None)` means the child ran (whatever its exit status: an editor that quits with an
     /// error still wrote, or did not, and the return path is what decides). `Ok(Some(status))`
-    /// means it never started — `<program>: not found` — and there is nothing to bless. `Err`
+    /// means it never started — `editor not found: <program>` — and there is nothing to bless. `Err`
     /// is a failure to take the terminal *back*, which is fatal: there is no screen to report
     /// it on.
     async fn run(
@@ -1076,11 +1076,22 @@ impl Suspend<'_> {
                 tracing::debug!(program = %cmd.program, ?status, "editor exited");
                 None
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                Some(format!("{}: not found", cmd.program))
-            }
-            Err(e) => Some(format!("{}: {e}", cmd.program)),
+            Err(e) => Some(spawn_failure(&cmd.program, &e)),
         })
+    }
+}
+
+/// Why the `$EDITOR` child never started, as a status line (verifier (b) F4).
+///
+/// The **verb leads**: `render_status` ellipsizes from the tail, and `$EDITOR` is often an
+/// absolute path (`/opt/homebrew/Cellar/…/bin/nvim`), so `<program>: not found` used to
+/// leave a status row that was all path and no answer — the reader saw their editor's name
+/// and no reason at all. Whatever gets cut off now is the tail of a path they typed.
+fn spawn_failure(program: &str, e: &io::Error) -> String {
+    if e.kind() == io::ErrorKind::NotFound {
+        format!("editor not found: {program}")
+    } else {
+        format!("editor failed: {e}: {program}")
     }
 }
 
@@ -2601,6 +2612,30 @@ mod tests {
             notice: Some("committed on main (1 commit)".into()),
         });
         assert_eq!((changed, effect), (Changed::Yes, Some(Effect::SyncRoots)));
+    }
+
+    /// Verifier (b) F4: `$EDITOR` is often an absolute path, `render_status` ellipsizes from
+    /// the tail, and the old `<program>: not found` therefore drew a status row of pure path
+    /// with the answer cut off. The verb leads now, so a 120-character program name loses
+    /// its own tail and nothing else.
+    #[test]
+    fn run_editor_spawn_failure_leads_with_the_verb() {
+        let long = format!("/var/folders/{}/bin/vi", "x".repeat(100));
+        assert!(long.len() > 100, "wider than the status row");
+        let missing = spawn_failure(&long, &io::Error::from(io::ErrorKind::NotFound));
+        assert!(missing.starts_with("editor not found: "), "{missing}");
+        assert!(
+            spawn_failure(&long, &io::Error::from(io::ErrorKind::PermissionDenied))
+                .starts_with("editor failed: "),
+        );
+
+        let mut ui = ui();
+        ui.app.set_status(missing);
+        let frame = frame_of(&ui);
+        assert!(
+            frame.contains("editor not found"),
+            "the verb survives the truncation:\n{frame}"
+        );
     }
 
     #[test]
