@@ -20,6 +20,7 @@
 //! release binary, printing the final screen and the exit code.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -196,7 +197,19 @@ impl Fixture {
     /// `lastcall tui --poll 1` in a 100×30 PTY; `None` only when this host has no PTY
     /// (written as a visible SKIP).
     fn spawn_tui(&self, bin: &Path) -> Option<PtyTui> {
-        match self.command(bin).args(["tui", "--poll", "1"]).spawn() {
+        self.spawn_tui_env(bin, &[])
+    }
+
+    /// [`Fixture::spawn_tui`] with extra environment for the child. Only the Phase 8 editor
+    /// scenes use it, to point `$EDITOR` at their own probe script: `isolated_lastcall`
+    /// removes `$VISUAL` and `$EDITOR` from every child, so a scene that says nothing here
+    /// cannot reach an editor at all.
+    fn spawn_tui_env(&self, bin: &Path, env: &[(&str, OsString)]) -> Option<PtyTui> {
+        let mut cmd = self.command(bin).args(["tui", "--poll", "1"]);
+        for (key, value) in env {
+            cmd = cmd.env(key, value);
+        }
+        match cmd.spawn() {
             Ok(p) => Some(p),
             Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
                 note(&format!("SKIP: this host cannot open a pty: {e}"));
@@ -2023,5 +2036,258 @@ fn pty_keyboard_enhancement_probe_is_answered_and_swallowed() {
         find(&pty.raw()[since..], b"\x1b[<1u").is_some(),
         "the pushed flags are popped before the alternate screen is left"
     );
+    assert_clean_exit(&pty, since);
+}
+
+// ---- Phase 8 deliverable 7: `$EDITOR` -----------------------------------------------------
+
+/// The probe editor (`tests/probe/editor.sh`) as a symlink named `vim` inside `dir`, plus
+/// the log it appends to. The **symlink's** name is what `editor.rs`'s basename table keys
+/// off, so a scene reaching this gets `+<line> <file>` argv; the absolute path is what
+/// `$EDITOR` is set to, so nothing goes on `PATH` and no editor of the developer's is
+/// reachable (`isolated_lastcall` removed `$VISUAL` and `$EDITOR` outright).
+fn probe_vim(dir: &Path) -> (PathBuf, PathBuf) {
+    let bindir = dir.join("probe-bin");
+    std::fs::create_dir_all(&bindir).expect("the probe bin dir");
+    let vim = bindir.join("vim");
+    if !vim.exists() {
+        std::os::unix::fs::symlink(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/probe/editor.sh"),
+            &vim,
+        )
+        .expect("the `vim` symlink");
+    }
+    (vim, dir.join("editor.log"))
+}
+
+/// What the probe editor "saves": `PARSE_RS_EDITED` with one more line **inside the middle
+/// hunk**, right under the line `shift-i` puts the cursor on. That placement is the point:
+/// the blessing has to cover the whole live file, not just the hunk the editor was opened
+/// at, and a line somewhere else would not tell those two apart from the row alone.
+fn parse_rs_saved() -> String {
+    let mut out = String::new();
+    for line in fixture_parent::PARSE_RS_EDITED.lines() {
+        out.push_str(line);
+        out.push('\n');
+        if line == fixture_parent::PARSE_RS_EDIT2 {
+            out.push_str("            // typed in $EDITOR\n");
+        }
+    }
+    assert!(
+        out.len() > fixture_parent::PARSE_RS_EDITED.len(),
+        "the marker line is in the edited text"
+    );
+    out
+}
+
+/// Move the nav selection to `parse.rs`, open it, and step to its **second** hunk — the one
+/// with real leading context (design review F5, F9). `jjjj` walks alpha's nav
+/// (root, f1, f2, src/parse.rs); `⏎` focuses the diff, which is where `shift-i` reads the
+/// hunk under the cursor from.
+fn open_parse_rs_hunk_2(pty: &mut PtyTui) {
+    pty.wait_for_text("M parse.rs  +10 −2", LONG)
+        .unwrap_or_else(|e| panic!("the parse.rs row: {e}"));
+    pty.send(b"jjjj\r").expect("keys");
+    pty.wait_for_text("parse.rs  M  +10 −2", LONG)
+        .unwrap_or_else(|e| panic!("parse.rs opens in the diff pane: {e}"));
+    let first = hunk_headers(pty)
+        .first()
+        .map(|(_, r)| header_text(r))
+        .expect("a hunk header on screen");
+    assert!(
+        first.starts_with("@@ -1,"),
+        "hunk 1 is the module doc at the top of the file, not {first}"
+    );
+    pty.send(b"n").expect("n");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        let (_, cols) = s.size();
+        s.rows(0, cols)
+            .find(|r| r.contains("@@ -"))
+            .is_some_and(|r| !header_text(&r).starts_with("@@ -1,"))
+    })
+    .unwrap_or_else(|e| panic!("`n` scrolls hunk 2's header to the top: {e}"));
+}
+
+/// Gate item 2 end to end: an `$EDITOR` session that **saves** leaves nothing pending — the
+/// user is asked whether they meant it, and `Enter` blesses the whole live file.
+///
+/// Both halves of ruling P1 are here, in one process because that is the only way to show
+/// they are the same question answered differently:
+///
+/// * `Enter` on `alpha/src/parse.rs` — the row goes away entirely (invariant 8 for the
+///   session: what the editor left behind *is* the reviewed content, not just the hunk that
+///   was open), and the file on disk holds the line the editor wrote;
+/// * `Esc` on `alpha/f1`, whose row the same probe editor also rewrites — the row **stays**,
+///   with the editor's own change pending on it like any agent's.
+///
+/// The second half is on a different file for a plain reason: after the first one is blessed
+/// there is no `parse.rs` row left to press `shift-i` on.
+#[test]
+fn pty_editor_save_pends_nothing() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let (vim, log) = probe_vim(&fx.state);
+    let saved = parse_rs_saved();
+    let Some(mut pty) = fx.spawn_tui_env(
+        &bin(),
+        &[
+            ("EDITOR", vim.into_os_string()),
+            ("LASTCALL_PROBE_EDITOR_LOG", log.clone().into_os_string()),
+            ("LASTCALL_PROBE_EDITOR_WRITE", saved.clone().into()),
+        ],
+    ) else {
+        return;
+    };
+    wait_first_piles(&mut pty);
+    // Before `shift-i`, not for the timing: the watcher emits its `watching <parent>
+    // (3 roots)` notice once, and a notice is a **status**, so one that arrived while the
+    // editor had the terminal would drain over the return path's own status the moment the
+    // loop ran again. Waiting for it here is the scene saying which status it is reading.
+    wait_watching(&mut pty);
+
+    // (1) `shift-i` on parse.rs hunk 2; the probe rewrites the file and exits.
+    open_parse_rs_hunk_2(&mut pty);
+    let t = Instant::now();
+    pty.send(b"I").expect("shift-i");
+    pty.wait_for_text("mark as reviewed?", LONG)
+        .unwrap_or_else(|e| panic!("the blessing confirm after the editor exits: {e}"));
+    note(&format!(
+        "PTY editor: save to confirm in {:.3?}",
+        t.elapsed()
+    ));
+    assert_eq!(
+        std::fs::read_to_string(fx.parent.join("alpha").join(fixture_parent::PARSE_RS))
+            .expect("parse.rs"),
+        saved,
+        "the editor's save is on disk before the question is answered"
+    );
+
+    // `Enter` = yes: the whole live file is accepted, so the row is gone.
+    pty.send(b"\r").expect("enter");
+    pty.wait_for(OVERLOADED, |s| {
+        status_is(s, "reviewed src/parse.rs") && !s.contents().contains("M parse.rs")
+    })
+    .unwrap_or_else(|e| panic!("Enter blesses the session's content: {e}"));
+    assert_eq!(
+        std::fs::read_to_string(fx.parent.join("alpha").join(fixture_parent::PARSE_RS))
+            .expect("parse.rs"),
+        saved,
+        "blessing is metadata: the bytes the editor wrote are untouched"
+    );
+
+    // (2) the same editor on `f1`, answered `Esc`: the row stays, pending the editor's own
+    // change. Nothing is written by lastcall either way — this is the half that shows the
+    // confirm is a real question and not a formality.
+    select_until(&mut pty, "f1  M");
+    pty.send(b"\r").expect("open f1");
+    pty.wait_for_text("@@ -", Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("f1's diff: {e}"));
+    pty.send(b"I").expect("shift-i");
+    pty.wait_for_text("f1 changed while your editor was open", LONG)
+        .unwrap_or_else(|e| panic!("the blessing confirm for f1: {e}"));
+    pty.send(b"\x1b").expect("esc");
+    pty.wait_for(OVERLOADED, |s| {
+        status_is(s, "f1 left pending") && s.contents().contains("M f1")
+    })
+    .unwrap_or_else(|e| panic!("Esc leaves the row pending: {e}"));
+    assert_eq!(
+        std::fs::read_to_string(fx.parent.join("alpha/f1")).expect("f1"),
+        saved,
+        "declining changes nothing on disk either"
+    );
+
+    // The probe ran twice, and both times through the `vim` symlink at an absolute path.
+    let logged = std::fs::read_to_string(&log).expect("the probe log");
+    assert_eq!(
+        logged.lines().filter(|l| l.starts_with("argv: +")).count(),
+        2,
+        "two editor sessions with a `+<line>` argv:\n{logged}"
+    );
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}
+
+/// Design review F4: a `^C` typed while `$EDITOR` owns the terminal must not quit lastcall.
+///
+/// During the suspend the tty is back in cooked mode, so the `\x03` is not a key event —
+/// the line discipline turns it into a `SIGINT` for the whole foreground process group,
+/// which is the editor **and** lastcall. The editor dies from it (that is what a user
+/// pressing `^C` in `vim` expects); lastcall's tokio handler latches it, and `Signals::
+/// resume` is what stops the loop reading that latch as "quit" the moment it runs again.
+///
+/// Nothing here can be proved from a reducer: the signal never reaches the reducer, and the
+/// only observable is that the frame comes back instead of the process ending.
+#[test]
+fn pty_editor_ctrl_c_does_not_quit_lastcall() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let (vim, log) = probe_vim(&fx.state);
+    let Some(mut pty) = fx.spawn_tui_env(
+        &bin(),
+        &[
+            ("EDITOR", vim.into_os_string()),
+            ("LASTCALL_PROBE_EDITOR_LOG", log.clone().into_os_string()),
+            // Long enough that the `^C` lands while the script is still running, short
+            // enough that a `^C` that never arrives does not hang the scene.
+            ("LASTCALL_PROBE_EDITOR_SLEEP", "1".into()),
+        ],
+    ) else {
+        return;
+    };
+    wait_first_piles(&mut pty);
+    // The watcher's one-shot `watching …` notice, before the suspend rather than during it
+    // (see `pty_editor_save_pends_nothing`).
+    wait_watching(&mut pty);
+    open_parse_rs_hunk_2(&mut pty);
+
+    pty.send(b"I").expect("shift-i");
+    // The probe writes its log line before it sleeps, so this is "the editor has the
+    // terminal now" — no fixed sleep on our side.
+    let start = Instant::now();
+    loop {
+        if std::fs::read_to_string(&log).is_ok_and(|t| t.contains("cwd: ")) {
+            break;
+        }
+        assert!(
+            start.elapsed() < LONG,
+            "the probe editor never started:\n{}",
+            pty.screen_text()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    pty.send(b"\x03").expect("^C at the editor");
+
+    // The script wrote nothing, so the return path's answer is `no change` — and its being
+    // on screen at all is the assertion: lastcall is alive, back on the alternate screen,
+    // with the row it left.
+    pty.wait_for(LONG, |s| status_is(s, "no change"))
+        .unwrap_or_else(|e| panic!("the TUI is back after the ^C: {e}"));
+    let back = start.elapsed();
+    note(&format!("PTY editor ^C: frame back after {back:.3?}"));
+    // The probe was told to sleep a second. Coming back sooner is the proof that the `^C`
+    // reached the *child* — a sleep that simply finished would look the same on screen.
+    assert!(
+        back < Duration::from_secs(1),
+        "the ^C interrupted the editor rather than the sleep running out ({back:?})"
+    );
+    assert!(
+        pty.screen(|s| s.alternate_screen()),
+        "back on the alternate screen"
+    );
+    assert!(
+        pty.screen_text().contains("parse.rs  M  +10 −2"),
+        "the same row is still open:\n{}",
+        pty.screen_text()
+    );
+
+    // …and the keyboard still reaches it.
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
     assert_clean_exit(&pty, since);
 }

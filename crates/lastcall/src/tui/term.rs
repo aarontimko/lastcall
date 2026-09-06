@@ -7,8 +7,10 @@
 //!
 //! Logging never goes to stdout or stderr while the alternate screen is up: `init_tracing`
 //! writes only to `LASTCALL_LOG_FILE` (filtered by `LASTCALL_LOG`, default `info`), and is a
-//! no-op when that variable is unset. These reads and [`KEYBOARD_ENV`] are the only
-//! environment access in the TUI; everything else comes through the engine's `Env`.
+//! no-op when that variable is unset. These reads, [`KEYBOARD_ENV`] and `$VISUAL`/`$EDITOR`
+//! (read in `run.rs` when `shift-i` opens an external editor — Phase 8 deliverable 7, and
+//! `editor.rs` itself takes a lookup closure so it stays pure) are the only environment
+//! access in the TUI; everything else comes through the engine's `Env`.
 //!
 //! **Keyboard enhancement** (Phase 8 deliverable 5, ruling P9). `enter()` asks the terminal
 //! once per process whether it speaks the kitty keyboard protocol and, when it does, pushes

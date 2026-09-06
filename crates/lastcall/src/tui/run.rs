@@ -16,14 +16,24 @@
 //! `restore()` first — the shell is sane even if shutdown hangs — then a bounded
 //! `watcher.join()`, then a bounded runtime shutdown ([`shut_down`]).
 //!
-//! The reader thread is never joined: `crossterm::event::read()` blocks in `mio::Poll` on
-//! the tty and nothing in the restore sequence wakes it, so it polls with a 50 ms timeout
-//! under a stop flag and exits on its own shortly after the loop ends.
+//! The reader thread is never joined **on the quit path**: `crossterm::event::read()` blocks
+//! in `mio::Poll` on the tty and nothing in the restore sequence wakes it, so it polls with a
+//! 50 ms timeout under a stop flag and exits on its own shortly after the loop ends. The
+//! `$EDITOR` suspend *does* join it ([`Suspend::run`]), because there the thread must be gone
+//! rather than merely told to stop: two processes reading the same tty would split the
+//! user's keystrokes between the editor and a dead TUI (design review F8).
+//!
+//! **While `$EDITOR` owns the terminal the `select!` does not run at all.** The handover is
+//! synchronous inside the effect dispatch, so watcher piles, herdr events and ticks queue on
+//! their channels and are drained in the pass that follows the resume. One of those piles may
+//! be the watcher's own notice of the editor's save, so the frame right after a resume can
+//! show the edit pending for an instant before the blessing question replaces it — documented
+//! in `docs/dev/tui.md`, not a defect.
 
 use std::collections::BTreeMap;
 use std::io;
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -45,11 +55,13 @@ use lastcall_engine::store::Current;
 use lastcall_engine::watcher::{EngineEvent, EngineTimings, Watcher, blocking};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Rect;
 use tokio::sync::mpsc;
 
 use super::app::{
     AcceptFailed, AcceptResult, App, Changed, Effect, FlagKind, FlagResult, RestoreResult, RootMeta,
 };
+use super::editor::EditorCommand;
 use super::herdr::{self, HerdrLink, HerdrPlan, HerdrUpdate, Link, ToastMsg};
 use super::input::{
     Action, Key, Keymap, modal_action, note_action, pick_action, pointer, to_action,
@@ -59,8 +71,13 @@ use super::term;
 
 /// How long the quit path waits for the watcher, and then for the runtime.
 pub const SHUTDOWN_BUDGET: Duration = Duration::from_millis(500);
-/// The reader thread's poll timeout: how long after the loop ends it can linger.
+/// The reader thread's poll timeout: how long after the loop ends it can linger, and how
+/// long the `$EDITOR` suspend's join can take.
 pub const INPUT_POLL: Duration = Duration::from_millis(50);
+/// How long the resume from an `$EDITOR` suspend spends swallowing interrupts (F4). See
+/// [`Signals::resume`]: a `^C` typed at the editor is delivered to lastcall too, and without
+/// this window it would quit the loop the moment the loop starts running again.
+pub const EDITOR_SETTLE: Duration = Duration::from_millis(50);
 /// Status-line ages advance this often.
 pub const TICK: Duration = Duration::from_secs(1);
 /// How long a burst of `worktree.*` events is coalesced before one discovery rescan
@@ -505,12 +522,19 @@ fn block_bounded<F: Future>(
     rt.block_on(async { tokio::time::timeout(budget, fut).await.ok() })
 }
 
-/// The detached reader thread: `poll(INPUT_POLL)` + `read()` under a stop flag, forwarding
-/// every event. Returns the flag; the thread is never joined (module docs).
-fn spawn_input(tx: mpsc::UnboundedSender<Event>) -> io::Result<Arc<AtomicBool>> {
+/// The reader thread: `poll(INPUT_POLL)` + `read()` under a stop flag, forwarding every
+/// event.
+///
+/// Returns the flag **and the handle**. The quit path only raises the flag and lets the
+/// thread end on its own (module docs); the `$EDITOR` suspend joins it, which is why the
+/// handle is returned at all (design review F8). The join is bounded by one [`INPUT_POLL`]
+/// because the thread is never blocked in `read()` for longer than that.
+fn spawn_input(
+    tx: mpsc::UnboundedSender<Event>,
+) -> io::Result<(Arc<AtomicBool>, std::thread::JoinHandle<()>)> {
     let stop = Arc::new(AtomicBool::new(false));
     let flag = stop.clone();
-    std::thread::Builder::new()
+    let handle = std::thread::Builder::new()
         .name("lastcall-input".to_owned())
         .spawn(move || {
             while !flag.load(Ordering::Relaxed) {
@@ -528,7 +552,7 @@ fn spawn_input(tx: mpsc::UnboundedSender<Event>) -> io::Result<Arc<AtomicBool>> 
                 }
             }
         })?;
-    Ok(stop)
+    Ok((stop, handle))
 }
 
 fn root_metas(engine: &mut Engine) -> Vec<RootMeta> {
@@ -796,36 +820,125 @@ fn spawn_expand(
     });
 }
 
-/// `Effect::EditorReturned`: one `Engine::current` off the UI task (deliverable 3).
+/// One `Engine::current` off the UI task, awaited in place.
 ///
-/// An `Err` — only `NoSuchRoot`, since `current` does no ledger work — is handed to the
-/// reducer as [`Current::Unhashable`] rather than as a notice, so the editor-return path has
-/// exactly one shape and one sentence: the file is left pending and the reason is named.
-fn spawn_editor_return(
-    engine: &Arc<Mutex<Engine>>,
-    tx: mpsc::UnboundedSender<Local>,
-    root: PathBuf,
-    rendered: Rendered,
-) {
+/// Every failure becomes a [`Current::Unhashable`] with its own words rather than a notice or
+/// a panic: an `Err` from `current` (only `NoSuchRoot` — it does no ledger work) and a
+/// panicking engine task alike. The editor path then has exactly one shape and one sentence
+/// for "there is nothing to bless": the file is left pending and the reason is named.
+async fn editor_current(engine: &Arc<Mutex<Engine>>, root: PathBuf, path: Vec<u8>) -> Current {
     let engine = engine.clone();
-    tokio::spawn(async move {
-        let path = rendered.path.clone();
-        let task = tokio::spawn(async move {
-            blocking(&engine, move |e| {
-                let live = e.current(&root, &path);
-                (root, live)
-            })
-            .await
-        });
-        let Some((root, live)) = joined(task, &tx, "editor return").await else {
-            return;
-        };
-        let _ = tx.send(Local::EditorReturned {
-            root,
-            rendered,
-            live: live.unwrap_or_else(|e| Current::Unhashable(e.to_string())),
-        });
-    });
+    let task =
+        tokio::spawn(async move { blocking(&engine, move |e| e.current(&root, &path)).await });
+    match task.await {
+        Ok(Ok(live)) => live,
+        Ok(Err(e)) => Current::Unhashable(e.to_string()),
+        Err(e) => Current::Unhashable(format!("engine task failed: {e}")),
+    }
+}
+
+/// Everything the `$EDITOR` handover takes apart and puts back (deliverable 7).
+///
+/// Grouped into one borrow because the sequence is ordered and every step of it is state the
+/// reducer cannot see: the terminal, the guard that owns its mode, the reader thread and the
+/// channel it feeds, and the signal streams.
+struct Suspend<'a> {
+    ui: &'a mut Ui,
+    terminal: &'a mut Screen,
+    guard: &'a mut term::TerminalGuard,
+    stop: &'a mut Arc<AtomicBool>,
+    reader: &'a mut Option<std::thread::JoinHandle<()>>,
+    input: &'a mut mpsc::UnboundedReceiver<Event>,
+    signals: &'a mut Signals,
+}
+
+impl Suspend<'_> {
+    /// Give the terminal to `cmd`, wait for it, and take the terminal back. **Every step is
+    /// load-bearing and the order is the whole point** (kickoff deliverable 7; design review
+    /// F4 and F8):
+    ///
+    /// 1. **Stop and join the reader thread.** Told-to-stop is not enough: a thread still
+    ///    inside `crossterm::event::read()` competes with the editor for the same tty and
+    ///    splits the user's keystrokes between the two. It polls at [`INPUT_POLL`], so the
+    ///    join costs at most that.
+    /// 2. **`term::restore()`** — which pops the keyboard-enhancement flags *before* leaving
+    ///    the alternate screen, so the editor starts on a terminal reporting keys the way its
+    ///    own reader expects (`term.rs`).
+    /// 3. **Spawn the child** with the three standard descriptors inherited and `cwd` at the
+    ///    root, and wait for it. Its signal dispositions are the shell's own: `exec` resets
+    ///    every *handler* to `SIG_DFL`, and lastcall installs handlers (tokio's) rather than
+    ///    `SIG_IGN`, so nothing this process did is inherited and a `^C` at the editor
+    ///    interrupts the editor.
+    /// 4. **[`Signals::resume`]** before anything is drawn: the same `^C` was delivered to
+    ///    lastcall too, and the loop must not read it as "quit" the moment it runs again.
+    /// 5. **`term::enter()`**, then **replace the guard without dropping it**. The old guard's
+    ///    `Drop` calls `restore()`, which would now undo the *live* terminal it never owned,
+    ///    so it is forgotten rather than dropped.
+    /// 6. **A fresh channel and a fresh reader thread.** The old channel can still hold the
+    ///    key release of `shift-i` or a `Resize` the editor caused, neither of which means
+    ///    anything to the resumed TUI.
+    /// 7. **Clear and a synthetic `Resize`** to the size the terminal has *now*: the
+    ///    editor may have been resized, and ratatui's back buffer describes a screen the
+    ///    editor has since painted over. Through `Terminal::resize` rather than
+    ///    `Terminal::clear`, which would ask the terminal for its cursor position and wait
+    ///    two seconds for an answer that may never come.
+    ///
+    /// `Ok(None)` means the child ran (whatever its exit status: an editor that quits with an
+    /// error still wrote, or did not, and the return path is what decides). `Ok(Some(status))`
+    /// means it never started — `<program>: not found` — and there is nothing to bless. `Err`
+    /// is a failure to take the terminal *back*, which is fatal: there is no screen to report
+    /// it on.
+    async fn run(
+        &mut self,
+        cmd: &EditorCommand,
+        file: &Path,
+        line: usize,
+        cwd: &Path,
+    ) -> io::Result<Option<String>> {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.reader.take() {
+            let _ = handle.join();
+        }
+        term::restore();
+
+        let spawned = std::process::Command::new(&cmd.program)
+            .args(cmd.argv(file, line))
+            .current_dir(cwd)
+            .status();
+
+        self.signals.resume().await;
+
+        let fresh = term::enter()?;
+        std::mem::forget(std::mem::replace(self.guard, fresh));
+
+        let (tx, rx) = mpsc::unbounded_channel::<Event>();
+        let (stop, handle) = spawn_input(tx)?;
+        *self.stop = stop;
+        *self.reader = Some(handle);
+        *self.input = rx;
+
+        // **Not** `Terminal::clear()`, which is the obvious call and the wrong one: it
+        // snapshots the cursor with a terminal *query* (DSR), so it needs a reply — from a
+        // terminal the freshly spawned reader thread is now polling, and which a terminal
+        // that never answers turns into crossterm's two-second timeout and then an `Err`
+        // that would be fatal here. `Terminal::resize` does exactly what the resume needs
+        // and asks the terminal nothing: it clears the screen and resets the back buffer, so
+        // the next draw paints every cell of a screen the editor has painted over.
+        if let Ok((w, h)) = crossterm::terminal::size() {
+            self.terminal.resize(Rect::new(0, 0, w, h))?;
+            self.ui.app.handle(Action::Resize(w, h));
+        }
+        Ok(match spawned {
+            Ok(status) => {
+                tracing::debug!(program = %cmd.program, ?status, "editor exited");
+                None
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                Some(format!("{}: not found", cmd.program))
+            }
+            Err(e) => Some(format!("{}: {e}", cmd.program)),
+        })
+    }
 }
 
 /// `Effect::SyncRoots`: re-read every root's metadata off the UI task.
@@ -1013,10 +1126,22 @@ struct Signals {
 
 impl Signals {
     /// Needs a runtime context (`Runtime::enter`).
+    ///
+    /// `SIGQUIT` is registered and the stream is dropped on the spot. Registering installs
+    /// tokio's handler for the life of the process, which is the disposition the `$EDITOR`
+    /// suspend needs and the safe stand-in for the design review's `SIG_IGN` (F4): a `^\`
+    /// typed while the editor owns a *cooked* terminal would otherwise reach lastcall with
+    /// its default disposition and dump core behind the editor, leaving no one to restore
+    /// the screen. It costs nothing the rest of the time, because under raw mode `^\` is a
+    /// byte and not a signal. It is done this way rather than with `nix`'s `sigaction`
+    /// because that is an `unsafe fn` and this workspace is `unsafe_code = "forbid"` — see
+    /// the report's ruling note. The child is unaffected either way: `exec` resets handlers
+    /// to `SIG_DFL`, and only `SIG_IGN` would have been inherited.
     fn register() -> Signals {
         #[cfg(unix)]
         {
             use tokio::signal::unix::{SignalKind, signal};
+            let _ = signal(SignalKind::quit());
             Signals {
                 int: signal(SignalKind::interrupt()).ok(),
                 term: signal(SignalKind::terminate()).ok(),
@@ -1026,6 +1151,29 @@ impl Signals {
         {
             Signals {}
         }
+    }
+
+    /// Put the streams back after an `$EDITOR` suspend, and swallow what the suspend latched
+    /// (design review F4).
+    ///
+    /// A `^C` typed at the editor goes to the whole foreground process group, so lastcall
+    /// receives it too. Nothing was polling `recv()` at the time, but the stream **remembers**
+    /// that it fired, and the first `select!` of the resumed loop would take that as the user
+    /// asking to quit — a keystroke aimed at `vim` ending the review. Fresh streams do not
+    /// carry the old notification; the drain that follows closes the remaining window, where
+    /// the runtime's signal driver has read the signal but not yet published it. For
+    /// [`EDITOR_SETTLE`] after a resume, an interrupt is therefore ignored — a real `ctrl-c`
+    /// in that window has to be pressed again. `SIGTERM` is deliberately **not** drained: it
+    /// is not something a terminal types.
+    async fn resume(&mut self) {
+        *self = Signals::register();
+        #[cfg(unix)]
+        if let Some(int) = self.int.as_mut() {
+            let deadline = tokio::time::Instant::now() + EDITOR_SETTLE;
+            while let Ok(Some(())) = tokio::time::timeout_at(deadline, int.recv()).await {}
+        }
+        #[cfg(not(unix))]
+        tokio::time::sleep(EDITOR_SETTLE).await;
     }
 
     async fn recv(&mut self) {
@@ -1067,14 +1215,17 @@ pub fn run(
         let _ctx = runtime.enter();
         Signals::register()
     };
-    let guard = term::enter()?;
+    let mut guard = term::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut ui = Ui::new(App::new(), keymap);
     // Asked once, inside `enter`, before the input thread exists; the app reads the cached
     // answer so the note modal promises `⇧⏎` only where it works (ruling P9).
     ui.app.enhanced = term::keyboard_enhanced();
     let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Event>();
-    let stop = spawn_input(input_tx)?;
+    // Both are replaced wholesale by an `$EDITOR` suspend, which joins the thread and opens
+    // a fresh channel; `reader` is `None` only while that handover is in flight.
+    let (mut input_stop, input_thread) = spawn_input(input_tx)?;
+    let mut reader = Some(input_thread);
     let (local_tx, mut local_rx) = mpsc::unbounded_channel::<Local>();
 
     // Copied out before the engine is moved into its watcher: both are immutable for the
@@ -1234,7 +1385,12 @@ pub fn run(
                     worktree_due = Some(tokio::time::Instant::now() + WORKTREE_DEBOUNCE);
                 }
                 let mut stop = pass.stop;
-                for effect in pass.effects {
+                // A queue rather than the vector itself: the `$EDITOR` suspend finishes by
+                // asking for deliverable 3's return path, and that has to run in **this**
+                // pass, after the resume and before the frame the user sees next.
+                let mut effects: std::collections::VecDeque<Effect> = pass.effects.into();
+                let mut redraw = pass.changed;
+                while let Some(effect) = effects.pop_front() {
                     match effect {
                         // `Pass::of` and `Pass::fold` both route a quit into `Pass::stop`, so
                         // this arm is belt and braces — and never a `break`, which would only
@@ -1293,12 +1449,89 @@ pub fn run(
                             label,
                             export,
                         ),
-                        Effect::EditorReturned { root, rendered } => spawn_editor_return(
-                            &watcher.engine,
-                            local_tx.clone(),
+                        Effect::EditExternal {
                             root,
                             rendered,
-                        ),
+                            line,
+                        } => {
+                            let path = String::from_utf8_lossy(&rendered.path).into_owned();
+                            let cmd = match EditorCommand::resolve(&|n| std::env::var(n).ok()) {
+                                Ok(cmd) => cmd,
+                                Err(e) => {
+                                    ui.app.set_status(e.to_string());
+                                    redraw = Changed::Yes;
+                                    continue;
+                                }
+                            };
+                            // The CAS: the file must still be the one the row describes.
+                            // Opening an editor on bytes the user has not seen is how a
+                            // review tool talks someone into saving over an agent's newer
+                            // work — so the answer is to refuse and let the next pile
+                            // redraw the row, never to open and hope.
+                            let live = editor_current(
+                                &watcher.engine,
+                                root.clone(),
+                                rendered.path.clone(),
+                            )
+                            .await;
+                            let same = matches!(
+                                &live,
+                                Current::Present { oid, mode }
+                                    if rendered.oid.as_ref() == Some(oid)
+                                        && rendered.mode == Some(*mode)
+                            );
+                            if !same {
+                                ui.app
+                                    .set_status(format!("{path}: changed since rendered; not opened"));
+                                redraw = Changed::Yes;
+                                continue;
+                            }
+                            // `edit_target` refused a path that is not UTF-8, so this holds.
+                            let Ok(rel) = std::str::from_utf8(&rendered.path) else {
+                                ui.app.set_status(super::app::NOT_EDITABLE.to_owned());
+                                redraw = Changed::Yes;
+                                continue;
+                            };
+                            let file = root.join(rel);
+                            // Overwritten by the return path below; it is what the status
+                            // line holds while the editor owns the screen, and the only
+                            // place the "no line flag known" half of `opened_note` is said.
+                            ui.app.set_status(cmd.opened_note());
+                            let spawn_failed = Suspend {
+                                ui: &mut ui,
+                                terminal: &mut terminal,
+                                guard: &mut guard,
+                                stop: &mut input_stop,
+                                reader: &mut reader,
+                                input: &mut input_rx,
+                                signals: &mut signals,
+                            }
+                            .run(&cmd, &file, line, &root)
+                            .await?;
+                            redraw = Changed::Yes;
+                            match spawn_failed {
+                                Some(why) => ui.app.set_status(why),
+                                None => effects.push_back(Effect::EditorReturned {
+                                    root,
+                                    rendered,
+                                }),
+                            }
+                        }
+                        Effect::EditorReturned { root, rendered } => {
+                            let live = editor_current(
+                                &watcher.engine,
+                                root.clone(),
+                                rendered.path.clone(),
+                            )
+                            .await;
+                            let (changed, next) = ui.local(Local::EditorReturned {
+                                root,
+                                rendered,
+                                live,
+                            });
+                            redraw = redraw.or(changed);
+                            effects.extend(next);
+                        }
                         Effect::Expand(root, row) => {
                             spawn_expand(&watcher.engine, local_tx.clone(), root, row)
                         }
@@ -1344,7 +1577,7 @@ pub fn run(
                         crossterm::execute!(io::stdout(), DisableBracketedPaste)
                     };
                 }
-                if pass.changed == Changed::Yes {
+                if redraw == Changed::Yes {
                     // Deliverable 8: one line per repaint, saying why and how long. A
                     // `draw` per pile in a burst is the symptom deliverable 6 removed, and
                     // this is how the sponsor sees it stay removed.
@@ -1370,7 +1603,7 @@ pub fn run(
         (outcome, watcher)
     });
 
-    stop.store(true, Ordering::Relaxed);
+    input_stop.store(true, Ordering::Relaxed);
     let mut real = RealShutdown {
         terminal: Some(terminal),
         guard: Some(guard),

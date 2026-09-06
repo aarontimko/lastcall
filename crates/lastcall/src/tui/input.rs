@@ -88,6 +88,11 @@ pub enum Action {
     Flag,
     /// Clear every flag on the selected file.
     Unflag,
+    /// Suspend the TUI and open the selected file in `$VISUAL`/`$EDITOR`, at the line of
+    /// the hunk under the cursor (deliverable 7; `Effect::EditExternal`). A row with
+    /// nothing to open — a deletion, a symlink, a path that is not UTF-8 — says
+    /// `not editable` instead.
+    EditExternal,
     /// One edit inside the note modal. Never key-bound: while the modal is open every key
     /// is resolved by [`note_action`] before the keymap is consulted.
     Note(NoteKey),
@@ -300,6 +305,7 @@ pub const DEFAULT_KEYMAP: &[(&str, &[&str])] = &[
     ("restore_file", &["shift-u"]),
     ("flag", &["m"]),
     ("unflag", &["shift-m"]),
+    ("edit_external", &["shift-i"]),
     ("ack", &["d"]),
     ("jump", &["g"]),
     ("scope", &["w"]),
@@ -356,6 +362,7 @@ impl Action {
             "restore_file" => Action::RestoreFile,
             "flag" => Action::Flag,
             "unflag" => Action::Unflag,
+            "edit_external" => Action::EditExternal,
             "ack" => Action::Ack,
             "jump" => Action::Jump,
             "scope" => Action::ScopeToggle,
@@ -388,6 +395,13 @@ impl Action {
             "restore_file" => "restore the whole file",
             "flag" => "flag it with a note",
             "unflag" => "clear the file's flags",
+            // Deliverable 7 wrote this description out in full ("open the file in $EDITOR at
+            // the hunk under the cursor"); design review F15 and deliverable 11 cap every
+            // help row at 30 columns and name this one `$EDITOR at the hunk`, because the
+            // help overlay at 100×30 falls back to one clipped column the moment the two
+            // widest rows plus 7 exceed the width. The overlay is the only place a reader
+            // ever sees a description, so the short form is the one that survives.
+            "edit_external" => "$EDITOR at the hunk",
             "ack" => "ack the agent flag",
             "jump" => "jump to the agent in herdr",
             "scope" => "workspace scope on/off",
@@ -1427,6 +1441,7 @@ mod tests {
             (Action::RestoreFile, "key"),
             (Action::Flag, "key"),
             (Action::Unflag, "key"),
+            (Action::EditExternal, "key"),
             (Action::Note(NoteKey::Send), "modal-note"),
             (Action::Pick(PickKey::Send), "modal-note"),
             (Action::Ack, "key"),
@@ -1487,6 +1502,7 @@ mod tests {
             | Action::RestoreFile
             | Action::Flag
             | Action::Unflag
+            | Action::EditExternal
             | Action::Note(_)
             | Action::Pick(_)
             | Action::Confirm
@@ -1494,9 +1510,9 @@ mod tests {
             | Action::Ack
             | Action::Jump
             | Action::ScopeToggle
-            | Action::Herdr(_) => 37,
+            | Action::Herdr(_) => 38,
         };
-        assert_eq!(table.len(), 37);
+        assert_eq!(table.len(), 38);
     }
 
     #[test]

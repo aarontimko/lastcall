@@ -305,6 +305,21 @@ pub enum Effect {
     Focus(String),
     /// Tell the toast task which ready episodes opened and which ended (deliverable 6).
     Toast(ToastRequest),
+    /// Suspend the TUI and open the user's `$EDITOR` on this path, at this line
+    /// (deliverable 7; ruling P3). The loop owns the whole sequence — the CAS that proves
+    /// the row is still what the user is looking at, the terminal handover, the child, and
+    /// the resume — because every step of it is terminal or process state the reducer
+    /// cannot see. `line` is [`Hunk::editor_line`] of the hunk under the cursor: the first
+    /// line the agent actually changed, never the leading context above it (F9).
+    EditExternal {
+        root: PathBuf,
+        /// The row as it was on screen. The loop refuses to open when the working tree no
+        /// longer matches it, and the same value comes back as the `rendered` of the
+        /// [`Effect::EditorReturned`] the resume raises, so the blessing question is asked
+        /// against what the user saw.
+        rendered: Rendered,
+        line: usize,
+    },
     /// The `$EDITOR` child exited: rehash this path off the UI task (`Engine::current`)
     /// and bring the answer back as [`Local::EditorReturned`](super::run::Local), which
     /// [`App::editor_returned`] folds (Phase 8 deliverable 3). The `rendered` row is the
@@ -613,6 +628,8 @@ pub const ACCEPT_IN_PROGRESS: &str = "accept in progress";
 pub const NOTHING_TO_ACCEPT: &str = "nothing to accept";
 pub const RESTORE_IN_PROGRESS: &str = "restore in progress";
 pub const NOTHING_TO_RESTORE: &str = "nothing to restore";
+/// What `shift-i` says on a row there is no file to open (deliverable 7).
+pub const NOT_EDITABLE: &str = "not editable";
 
 /// How long a status notice stays on the status line before the key hints return.
 pub const STATUS_TTL: Duration = Duration::from_secs(30);
@@ -1535,6 +1552,76 @@ impl App {
         })
     }
 
+    /// What `shift-i` (and, in deliverable 8, `i`) would open: the selected row and the
+    /// **one-based line** an editor should land on inside it.
+    ///
+    /// The row is the one the user is looking at and the line is the one they are looking
+    /// at inside it: with the diff focused and a content hunk under the cursor, that hunk's
+    /// [`Hunk::editor_line`] — the first line the agent actually changed, never
+    /// `new_range.start + 1`, which is three lines of leading context above it (design
+    /// review F9). From the nav, and from a diff cursor parked on the synthetic mode hunk
+    /// (there is no text in it to open at), the row's **first content** hunk; a row with no
+    /// content hunk at all — a collapsed file nobody expanded, a binary row — opens at
+    /// line 1, which is the honest answer for "somewhere in this file".
+    ///
+    /// `None` on the three rows there is no file to open: a **deletion** (the path is gone
+    /// — restoring it is `u`, not an editor), a **symlink** (opening it would edit its
+    /// target, which is a different file from the one the row is about) and a path whose
+    /// bytes are **not UTF-8** (the argv handed to the editor is built from it, and a byte
+    /// string that is not text is not something to hand a process blind). The caller says
+    /// [`NOT_EDITABLE`]; deliverable 8's own refusals are the engine's, and say more.
+    pub fn edit_target(&self) -> Option<(PathBuf, Rendered, usize)> {
+        let Selection::Row(root, path) = self.selection.clone()? else {
+            return None;
+        };
+        let row = self.roots.get(&root)?.row(&path)?;
+        if row.change == Change::Deleted {
+            return None;
+        }
+        if !matches!(
+            row.current.as_ref().map(|e| e.mode),
+            Some(Mode::Regular) | Some(Mode::Executable)
+        ) {
+            return None;
+        }
+        if std::str::from_utf8(&path).is_err() {
+            return None;
+        }
+        let hunks = self.view_hunks();
+        let under_cursor = (self.effective_focus() == Focus::Diff)
+            .then(|| hunks.get(self.diff.hunk.min(hunks.len().saturating_sub(1))))
+            .flatten()
+            .filter(|h| !h.is_mode_change());
+        let line = under_cursor
+            .or_else(|| hunks.iter().find(|h| !h.is_mode_change()))
+            .map_or(1, |h| h.editor_line());
+        Some((root, Rendered::of(row), line))
+    }
+
+    /// `shift-i`: hand the loop the suspend-and-open sequence, or say why there is nothing
+    /// to open. Nothing is drawn on the way out — the next frame the user sees is either
+    /// their editor or the resumed TUI — so a row that *can* be opened returns
+    /// [`Changed::No`] and lets the loop's own status line speak on resume.
+    fn edit_external(&mut self) -> (Changed, Option<Effect>) {
+        if !matches!(self.selection, Some(Selection::Row(..))) {
+            return (Changed::No, None);
+        }
+        match self.edit_target() {
+            Some((root, rendered, line)) => (
+                Changed::No,
+                Some(Effect::EditExternal {
+                    root,
+                    rendered,
+                    line,
+                }),
+            ),
+            None => {
+                self.set_status(NOT_EDITABLE);
+                (Changed::Yes, None)
+            }
+        }
+    }
+
     /// `m`: open the note modal on what `flag_target` names.
     fn open_note(&mut self) -> (Changed, Option<Effect>) {
         let Some(target) = self.flag_target() else {
@@ -2270,6 +2357,7 @@ impl App {
             },
             Flag => return self.open_note(),
             Unflag => return self.unflag_selected(),
+            EditExternal => return self.edit_external(),
             Note(key) => return self.note_key(key),
             Pick(key) => return self.pick_key(key),
             // `Confirm` here is `Action::Confirm` (`use Action::*` above), so the modal's
@@ -5286,6 +5374,63 @@ mod tests {
         deleted(&mut by_file);
         by_file.handle(Action::RestoreFile);
         assert_eq!(by_file.confirm_restore(), Some(&scope));
+    }
+
+    /// Deliverable 7's refusals. `shift-i` opens a *file* at a *line*, so there are three
+    /// rows it has nothing to open: a deletion (no file), a symlink or any other non-regular
+    /// mode (nothing an editor edits in place, and following it would edit the target
+    /// instead), and a path that is not UTF-8 (there is no `&str` to build an argv from
+    /// without mangling it). Each answers `not editable` and produces no effect — the
+    /// keystroke must never fall through to "open something else".
+    ///
+    /// The positive case is the integration scene `editor_launch_lands_at_the_right_line`,
+    /// which is the only place the argv can actually be seen.
+    #[test]
+    fn app_edit_external_refuses_rows_with_nothing_to_open() {
+        // A row `shift-i` *does* open, so the refusals below are about the row and not
+        // about the key being unwired.
+        let mut ok = three_roots();
+        ok.handle(Action::Resize(100, 30));
+        ok.select(Some(row("alpha", "f1")));
+        let (changed, effect) = ok.handle(Action::EditExternal);
+        assert_eq!(changed, Changed::No, "the screen does not move to open one");
+        assert!(
+            matches!(effect, Some(Effect::EditExternal { .. })),
+            "{effect:?}"
+        );
+        assert!(ok.edit_target().is_some());
+
+        /// Select `path`, open it, and demand the refusal: no effect, and the status says
+        /// so rather than the key quietly doing nothing.
+        fn refuses(app: &mut App, path: &[u8], what: &str) {
+            app.handle(Action::Resize(100, 30));
+            app.select(Some(Selection::Row(root("alpha"), path.to_vec())));
+            app.handle(Action::Open);
+            assert!(app.edit_target().is_none(), "{what} has nothing to open");
+            let (changed, effect) = app.handle(Action::EditExternal);
+            assert_eq!(effect, None, "{what}: no editor is spawned");
+            assert_eq!(changed, Changed::Yes, "{what}: the status moved");
+            assert_eq!(status(app), NOT_EDITABLE, "{what}");
+        }
+
+        let mut deletion = three_roots();
+        deletion.apply(pile_event_seq("alpha", 1, alpha_as(Change::Deleted)));
+        refuses(&mut deletion, b"f1", "a deletion");
+
+        let mut symlink = three_roots();
+        let mut p = pile("alpha");
+        p.rows[0].current = p.rows[0].current.clone().map(|e| Entry {
+            mode: Mode::Symlink,
+            ..e
+        });
+        symlink.apply(pile_event_seq("alpha", 1, p));
+        refuses(&mut symlink, b"f1", "a symlink");
+
+        let mut non_utf8 = three_roots();
+        let mut p = pile("alpha");
+        p.rows[0].path = vec![0xff, 0xfe];
+        non_utf8.apply(pile_event_seq("alpha", 1, p));
+        refuses(&mut non_utf8, &[0xff, 0xfe], "a non-UTF-8 path");
     }
 
     /// `m` flags what is on screen: from the nav there is no hunk under a cursor, so the

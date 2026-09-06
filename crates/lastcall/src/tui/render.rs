@@ -1389,7 +1389,7 @@ fn help_columns(keys: &[String], area: Rect) -> Vec<String> {
 }
 
 fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
-    let keys: Vec<String> = app
+    let named: Vec<(&str, String)> = app
         .keymap
         .iter()
         .map(|(name, specs)| (name.as_str(), keys_label(specs)))
@@ -1398,8 +1398,9 @@ fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
                 .iter()
                 .map(|(name, specs)| (*name, keys_label(specs))),
         )
-        .map(|(name, keys)| format!("{keys:<14} {}", Action::describe(name)))
+        .map(|(name, keys)| (name, format!("{keys:<14} {}", Action::describe(name))))
         .collect();
+    let keys: Vec<String> = named.iter().map(|(_, row)| row.clone()).collect();
     let mut rows = help_columns(&keys, area);
     rows.push(String::new());
     rows.push(newline_note(app.enhanced).to_owned());
@@ -1432,6 +1433,17 @@ fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
         // The blank separator is *not* reserved — it is the first thing the clip spends.
         // Reserving it too costs a key row, and at 80×30 the key row it costs is `quit`.
         rows.truncate(cap.saturating_sub(3));
+        // …and `quit` is pinned to the end of what survives. The keymap grows — Phase 8
+        // alone adds four rows — and a clip that simply takes the first N pushes the last
+        // row off first, which in this keymap is the one row a reader who opened the overlay
+        // by accident most needs. `any key closes` gets them out of the overlay; this gets
+        // them out of lastcall. It costs the row above it, never the footer.
+        if let Some((_, quit)) = named.iter().find(|(name, _)| *name == "quit")
+            && !rows.iter().any(|r| r.contains(quit.as_str()))
+        {
+            rows.truncate(cap.saturating_sub(4));
+            rows.push(quit.clone());
+        }
         rows.push(newline_note(app.enhanced).to_owned());
         rows.push(SELECT_NOTE.to_owned());
         rows.truncate(cap.saturating_sub(1));

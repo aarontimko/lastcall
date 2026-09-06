@@ -127,6 +127,9 @@ impl PtyCommand {
     /// `LASTCALL_KEYBOARD=plain` skips the keyboard-enhancement probe (ruling P9): the
     /// harness answers no terminal query, so an unskipped probe would cost every scene
     /// crossterm's full 2 s timeout. A scene that wants the probe removes the variable.
+    ///
+    /// `$VISUAL` and `$EDITOR` are removed for the same kind of reason (Phase 8
+    /// deliverable 7): they name a program `shift-i` would *run*.
     pub fn isolated_lastcall(self, home: &Path, config: &Path, state_dir: &Path) -> Self {
         let mut cmd = self
             .env("HOME", home)
@@ -140,7 +143,15 @@ impl PtyCommand {
             .env_remove("XDG_CONFIG_HOME")
             .env_remove("XDG_STATE_HOME")
             .env_remove("LASTCALL_LOG_FILE")
-            .env_remove("LASTCALL_LOG");
+            .env_remove("LASTCALL_LOG")
+            // Phase 8 deliverable 7: `shift-i` spawns whatever `$VISUAL`/`$EDITOR` names.
+            // No scene may reach the developer's own editor — it would take the terminal
+            // this harness is driving and wait for a human — so the isolation removes both
+            // and the editor scenes set `EDITOR` to an absolute path inside their own temp
+            // dir. Removing them here rather than in each scene means a scene that never
+            // thought about editors cannot open one either.
+            .env_remove("VISUAL")
+            .env_remove("EDITOR");
         for (key, _) in std::env::vars_os() {
             if key.to_string_lossy().starts_with("HERDR_") {
                 cmd = cmd.env_remove(key);
