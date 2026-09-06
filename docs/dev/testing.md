@@ -106,7 +106,14 @@ just flag-export-golden      # LASTCALL_UPDATE_GOLDEN=1, then a plain run to pro
   `flags::tests::flags_export_matches_the_golden` under a `FixedClock`, and covers the
   awkward shapes on purpose: a hunk flag, a file flag with no diff block, a note full of
   control bytes in caret form, and a hunk whose own body contains a three-backtick fence, so
-  that block has to open with four.
+  that block has to open with four. Phase 8 added the **whole-file** case in both its forms
+  (Amendment v1.8's additive `Flag.summary`): a file flag that carries the counts —
+  `· whole file` on the header line and `3 hunks · +12 −4` on its own line under it — and,
+  right after it, a Phase-7-shaped file flag with **no** summary, so the golden freezes that
+  an old ledger entry still renders and that a collapsed row nobody expanded prints no
+  counts line at all (verifier (a) F2). Both are in the one file on purpose: the two shapes
+  sit adjacent in the diff, so a change that drops the summary line cannot pass as a change
+  that never wrote one.
 - `flag_export_pty.md` is written by the PTY scene
   `pty_flag_note_exports_when_standalone`, so it is the export as the **built binary**
   appends it to the fallback file — the whole path, note modal included. Two fields a run
@@ -121,7 +128,7 @@ change that moved it.
 
 Both files live in `crates/lastcall/tests/`; `docs/dev/tui.md` has the how-to.
 
-`test_e2e_tui_snapshots.rs` renders thirty-nine scenes (the sixteen Phase 3 ones; the
+`test_e2e_tui_snapshots.rs` renders forty-nine scenes (the sixteen Phase 3 ones; the
 seven Phase 4 accept scenes, which drive the real `Engine::accept` from the reducer's own
 `Effect::Accept` and feed `App::accepted`, and where `tui_accept_all_confirm` pins a second
 `_live` frame; and the six Phase 5 herdr scenes — `tui_herdr_status_dots`,
@@ -137,8 +144,13 @@ collapsed line; and the six Phase 7 ones — `tui_note_modal`, `tui_agent_picker
 `tui_restore_confirm`, `tui_diff_view_flagged_hunk`, `tui_nav_flag_counts` and
 `tui_help_overlay_tall`, where the flagging scenes drive `m`, the note a character at a
 time and Enter, then call the real `Engine::flag` with the effect's own arguments and feed
-`App::flagged` back, so the frame is of an `App` the loop could have produced) through
-`ratatui::backend::TestBackend`
+`App::flagged` back, so the frame is of an `App` the loop could have produced; and the ten
+Phase 8 ones — `tui_note_modal_scrolled` and `tui_note_modal_whole_file` for the modal's
+text area and its target title, `tui_editor_return_confirm` for the `$EDITOR` blessing,
+`tui_editor_open`, `tui_editor_dirty_confirm`, `tui_editor_save_refused` and
+`tui_editor_narrow_60x20` for the inline editor, and `tui_diff_selection`, `tui_copy_cue`
+and `tui_hint_diff_focus` — the last snapshotted at **140×20**, the only scene wide enough
+for the hint line's third tier) through `ratatui::backend::TestBackend`
 from an `App` fed by a real engine over the shared `fixture_parent` (each scene builds its
 own fixture and state dir under a temp dir) and pins each as two `insta` snapshots under
 `crates/lastcall/tests/snapshots/`: `<scene>_frame` (the symbols, exactly as a 100×30 — or
@@ -202,6 +214,46 @@ candidates proves the reducer, never the wiring. The scenes are serialized (one
 mutex); the whole file is about 45 s. Timing lines go to `stderr().write_all` so they survive libtest's
 capture — run it with `-- --nocapture` to see them. If the live-update assertion fails on a
 loaded host, report the measured numbers; do not loosen the budget.
+
+### The probe editor (`tests/probe/editor.sh`)
+
+`shift-i` spawns whatever `$VISUAL`/`$EDITOR` names. **No test may reach a real editor.** One
+would take the terminal the harness is driving and wait for a human, and the developer's own
+`$EDITOR` is not the harness's to run — so `PtyCommand::isolated_lastcall` **removes** both
+variables from every child, and each editor scene sets `EDITOR` to an **absolute path** inside
+its own temp dir. `PATH` is never touched, globally or otherwise.
+
+The program at that path is `crates/lastcall/tests/probe/editor.sh`, reached through a
+**symlink the scene creates named `vim`**, so `EditorCommand`'s basename table gives it the
+`+<line> <file>` argv shape and the scene can assert the line lastcall chose. One script
+serves every scene, driven entirely by the environment:
+
+| variable | what the "editor" does |
+|---|---|
+| `LASTCALL_PROBE_EDITOR_LOG` | append `argv: …` and `cwd: …` — this is how a scene proves the line flag and that the child's cwd is the root |
+| `LASTCALL_PROBE_EDITOR_SLEEP` | sleep first, so the scene can type at the terminal while the "editor" owns it (the `^C` scene) |
+| `LASTCALL_PROBE_EDITOR_WRITE` | rewrite the file named by the **last** argument with this content — the save a real editor would have made. Unset means look and quit, which must leave the file alone |
+
+`set -u`, and deliberately **no** `set -e`: a scene that interrupts the sleep with `^C`
+expects the script to die from the signal. The exit status is never asserted, because
+lastcall treats an editor that exits non-zero exactly like one that exits 0 — either way the
+only question is what the file holds now.
+
+`test_integration_editor.rs::editor_launch_lands_at_the_right_line` is the smallest scene
+that uses it — one `shift-i` on `alpha/src/parse.rs`'s second hunk, asserting the log's
+`argv:` is `+<line> <absolute path>` and its `cwd:` is the root — and it lives in the
+integration tier because it is the argv proof, not the terminal-handover proof; the PTY
+scenes are the latter.
+
+### `LASTCALL_KEYBOARD=plain` in the harness
+
+`isolated_lastcall` also sets `LASTCALL_KEYBOARD=plain`. The harness answers no terminal
+query, so an unskipped keyboard-enhancement probe would cost **every** scene crossterm's full
+2 s timeout at startup (ruling P9; `bench.md` "Known costs"). Exactly one scene removes the
+variable — `pty_keyboard_enhancement_probe_is_answered_and_swallowed` — and plays a
+kitty-protocol terminal, proving the query is written, the answer is believed, the flags are
+pushed and popped, and no byte of the reply ever reaches the app as a key. Any new scene that
+wants the probe must remove the variable itself and pay for it.
 
 ## Naming
 
@@ -395,6 +447,20 @@ is the odd one out — generated by `just herdr-schema-fixture` from the pinned 
 command, the date and the generator's summary line. Fixture git repositories come from
 `lastcall_testkit::fixture_repo::FixtureRepo` (deterministic identity, dates, and config; a
 local bare `origin`; `coworker_push`), proven by `test_integration_fixture_repo.rs`.
+
+**`alpha/src/parse.rs` (Phase 8 deliverable 10; sponsor direction 2026-09-02).** The three-root
+parent's `f1`/`f2`/`f3` are one-line files, which is enough to prove a pile and not enough to
+edit: an editor scene needs a file with a real middle, and a hunk whose first changed line is
+neither line 1 nor a leading-context line. `fixture_parent::build` writes a 54-line config
+parser — doc comment, struct, two functions, a `mod tests` — and **commits it before the
+first sight**, then has "the agent" edit it in three separated places (the doc comment, a
+condition in the middle, a new test at the bottom) without committing, so the row has three
+hunks with real context between them. The addition happens in `build`, after
+`FixtureRepo::new_in`, so **only alpha** gets it, no existing file's content changes, and
+every `f1`/`f2`/`f3` assertion still holds (design review F7). `PARSE_RS_EDIT2` and
+`parse_rs_edit2_line()` are exported beside it: the second hunk's text and its line number,
+computed from the fixture text **independently of `Hunk::editor_line()`**, so a test that
+asserts where an editor opened is not asserting the implementation against itself (F5, F9).
 `lastcall_testkit::engine` opens an engine over one (`open_engine`, `assert_pile!`, the
 `KillAt` fault injector); `lastcall_testkit::fixture_parent` builds the golden's three-root
 parent dir (also the `just probe-status` / `probe-watch` fixture via
