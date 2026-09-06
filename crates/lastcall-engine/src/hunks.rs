@@ -62,6 +62,37 @@ impl Hunk {
             && self.lines.iter().all(|(_, l)| l.starts_with(b"mode "))
     }
 
+    /// The **one-based line of the live file** an editor should open at for this hunk
+    /// (Phase 8 deliverable 7; design review F9).
+    ///
+    /// Not `new_range.start + 1`: `new_range` includes the leading context lines
+    /// ([`CONTEXT`] of them for any hunk that is not at the top of the file), so that would
+    /// put the cursor three lines above the change every time. The walk counts context and
+    /// inserted lines on the new side and stops at the hunk's first non-context line, so:
+    ///
+    /// - a replacement lands on its first **inserted** line (the deletes of a `Replace` come
+    ///   first in `lines`, but they occupy no new-side line, so the index is the insert's);
+    /// - a pure insertion lands on its first inserted line;
+    /// - a pure deletion lands on the line **after** the removed run — the new file has
+    ///   nothing else to point at.
+    ///
+    /// The result can be one past the last line of a file whose end was deleted. Both
+    /// callers clamp: `TextBuf::open` clamps to the buffer, and every `$EDITOR` in the
+    /// basename table clamps a `+N` past the end to the last line.
+    ///
+    /// The synthetic mode hunk ([`Hunk::mode_change`]) answers 1; it is never an editor
+    /// target, because there is no text in it to edit.
+    pub fn editor_line(&self) -> usize {
+        let mut new_index = self.new_range.start;
+        for (tag, _) in &self.lines {
+            match tag {
+                Tag::Context => new_index += 1,
+                Tag::Insert | Tag::Delete => break,
+            }
+        }
+        new_index + 1
+    }
+
     /// (added, deleted) for this hunk.
     pub fn counts(&self) -> (usize, usize) {
         let added = self.lines.iter().filter(|(t, _)| *t == Tag::Insert).count();
@@ -353,6 +384,55 @@ mod tests {
         // The narrowed header never claims lines that are not on screen.
         let h = &expanded.hunks[0];
         assert_eq!(h.old_range.len() + h.new_range.len(), EXPAND_LINE_CAP);
+    }
+
+    /// Design review F9: `new_range.start + 1` is the first **context** line, three above
+    /// the change for every hunk but one at the top of the file. `editor_line` walks past
+    /// the context to the first line the reader actually came to look at.
+    #[test]
+    fn hunk_editor_line_skips_leading_context() {
+        // Twenty lines, three separated edits: a rewrite at the top (no context above it),
+        // a replacement in the middle, a pure deletion near the end.
+        let old = lines_of("l", 1..21);
+        let new = {
+            let mut lines: Vec<String> = (1..21).map(|i| format!("l{i}\n")).collect();
+            lines[0] = "TOP\n".to_owned(); // line 1 replaced
+            lines[9] = "MIDDLE\n".to_owned(); // line 10 replaced
+            lines.remove(17); // line 18 deleted
+            lines.concat().into_bytes()
+        };
+        let hunks = diff(&old, &new);
+        assert_eq!(hunks.len(), 3, "three separated hunks: {hunks:?}");
+
+        // Hunk 1 starts at the top of the file: no leading context, so both readings agree.
+        assert_eq!(hunks[0].new_range.start, 0);
+        assert_eq!(hunks[0].editor_line(), 1);
+
+        // Hunk 2 has three context lines above it. The naive reading would say line 7.
+        assert_eq!(hunks[1].new_range.start + 1, 7, "the context line");
+        assert_eq!(hunks[1].editor_line(), 10, "the line that changed");
+        let (_, line) = &hunks[1].lines[hunks[1]
+            .lines
+            .iter()
+            .position(|(t, _)| *t == Tag::Insert)
+            .expect("a replacement inserts")];
+        assert_eq!(line, b"MIDDLE\n", "and that line is the inserted one");
+
+        // Hunk 3 is a pure deletion: the new file has nothing where line 18 was, so the
+        // editor opens on the line that now follows the removed run.
+        assert!(
+            hunks[2].lines.iter().all(|(t, _)| *t != Tag::Insert),
+            "a pure deletion: {:?}",
+            hunks[2]
+        );
+        assert_eq!(hunks[2].editor_line(), 18);
+
+        // A one-line file: the whole hunk is the change, with nothing above it.
+        let tiny = diff(b"a\n", b"b\n");
+        assert_eq!(tiny[0].editor_line(), 1);
+
+        // The synthetic mode hunk has no text to open at and answers 1 rather than panic.
+        assert_eq!(Hunk::mode_change("100644", "100755").editor_line(), 1);
     }
 
     #[test]
