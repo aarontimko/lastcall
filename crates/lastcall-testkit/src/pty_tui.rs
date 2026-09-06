@@ -47,6 +47,7 @@ pub struct PtyCommand {
     env_remove: Vec<OsString>,
     size: (u16, u16),
     sample_rss: bool,
+    answer_dsr: bool,
 }
 
 impl PtyCommand {
@@ -59,6 +60,7 @@ impl PtyCommand {
             env_remove: Vec::new(),
             size: SIZE,
             sample_rss: false,
+            answer_dsr: false,
         }
     }
 
@@ -72,6 +74,23 @@ impl PtyCommand {
     /// `RUSAGE_CHILDREN` reports the largest of every waited-for descendant, git included.
     pub fn sample_rss(mut self) -> Self {
         self.sample_rss = true;
+        self
+    }
+
+    /// Answer the child's cursor-position requests the way a real terminal does: every
+    /// `ESC [ 6 n` in its output is replied to with `ESC [ 1 ; 1 R` (verifier (b) F1).
+    ///
+    /// Off by default, and deliberately so: it puts bytes into the child's input that no
+    /// other scene expects, and the reply is written from the reader thread the moment the
+    /// query is seen, which changes what a `raw()` assertion or a `wait_for` sees next.
+    /// Turn it on only in a scene that is about what the reply *does* — lastcall writes one
+    /// after an `$EDITOR` resume to wake a tty whose pending byte kqueue never reported, and
+    /// a terminal that never answers is the residual `tui.md` records.
+    ///
+    /// The row and column are not real: nothing lastcall does reads the report back (it is
+    /// swallowed inside crossterm as an internal event), so `1;1` is as good as the truth.
+    pub fn answer_cursor_position(mut self) -> Self {
+        self.answer_dsr = true;
         self
     }
 
@@ -190,8 +209,13 @@ impl PtyCommand {
         let pid = child.process_id();
         register_spawned_pid(pid, &self.bin);
 
-        let writer = pair.master.take_writer().map_err(io::Error::other)?;
+        // One writer, shared: `portable-pty` hands it out exactly once, and the reader
+        // thread needs it too when it is answering cursor-position requests.
+        let writer: SharedWriter = Arc::new(Mutex::new(
+            pair.master.take_writer().map_err(io::Error::other)?,
+        ));
         let mut reader = pair.master.try_clone_reader().map_err(io::Error::other)?;
+        let answer = self.answer_dsr.then(|| writer.clone());
         let shared = Arc::new(Mutex::new(Shared {
             parser: vt100::Parser::new(rows, cols, 0),
             raw: Vec::new(),
@@ -202,6 +226,9 @@ impl PtyCommand {
             .name("lastcall-pty-reader".to_owned())
             .spawn(move || {
                 let mut buf = [0u8; 8192];
+                // The last few bytes of the previous read, so a query split across two
+                // reads is still one query.
+                let mut carry: Vec<u8> = Vec::new();
                 loop {
                     match reader.read(&mut buf) {
                         Ok(0) | Err(_) => {
@@ -209,9 +236,29 @@ impl PtyCommand {
                             return;
                         }
                         Ok(n) => {
-                            let mut s = lock(&feed);
-                            s.raw.extend_from_slice(&buf[..n]);
-                            s.parser.process(&buf[..n]);
+                            {
+                                let mut s = lock(&feed);
+                                s.raw.extend_from_slice(&buf[..n]);
+                                s.parser.process(&buf[..n]);
+                            }
+                            if let Some(writer) = &answer {
+                                carry.extend_from_slice(&buf[..n]);
+                                let queries = carry
+                                    .windows(DSR_QUERY.len())
+                                    .filter(|w| *w == DSR_QUERY)
+                                    .count();
+                                if queries > 0 {
+                                    let mut out = lock_writer(writer);
+                                    for _ in 0..queries {
+                                        let _ = out.write_all(DSR_REPLY);
+                                    }
+                                    let _ = out.flush();
+                                }
+                                // Keep only what a query could still be starting with, so
+                                // nothing is answered twice.
+                                let keep = carry.len().saturating_sub(DSR_QUERY.len() - 1);
+                                carry.drain(..keep);
+                            }
                         }
                     }
                 }
@@ -326,10 +373,23 @@ fn lock(shared: &Mutex<Shared>) -> std::sync::MutexGuard<'_, Shared> {
     shared.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The master's writer, shared between the test's thread and the reader thread
+/// ([`PtyCommand::answer_cursor_position`]).
+type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
+
+/// DSR: "where is the cursor?" — what lastcall writes after an `$EDITOR` resume.
+const DSR_QUERY: &[u8] = b"\x1b[6n";
+/// The report a terminal answers it with, row 1 column 1.
+const DSR_REPLY: &[u8] = b"\x1b[1;1R";
+
+fn lock_writer(writer: &SharedWriter) -> std::sync::MutexGuard<'_, Box<dyn Write + Send>> {
+    writer.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// A child running inside a PTY. Killed on drop.
 pub struct PtyTui {
     master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
+    writer: SharedWriter,
     child: Box<dyn Child + Send + Sync>,
     pid: Option<u32>,
     shared: Arc<Mutex<Shared>>,
@@ -470,8 +530,9 @@ impl PtyTui {
 
     /// Write bytes to the child's terminal (keys, mouse reports).
     pub fn send(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.writer.write_all(bytes)?;
-        self.writer.flush()
+        let mut writer = lock_writer(&self.writer);
+        writer.write_all(bytes)?;
+        writer.flush()
     }
 
     /// A left click (SGR press then release) at `(col, row)`, 0-based screen coordinates.
@@ -600,6 +661,64 @@ mod tests {
             "the raw transcript keeps the escape sequence: {raw:?}"
         );
         assert!(pty.screen(|s| !s.alternate_screen()));
+    }
+
+    /// [`PtyCommand::answer_cursor_position`], both ways round (verifier (b) F1). The
+    /// child asks where the cursor is, reads six bytes back with echo off, and writes them
+    /// out again — so a reply reaching it shows up in the transcript as bytes the *child*
+    /// wrote, and nothing else can put them there.
+    #[test]
+    fn pty_tui_answers_a_cursor_position_request_only_when_asked() {
+        let script = "stty raw -echo; printf '\\033[6n'; dd bs=1 count=6 2>/dev/null";
+        let spawn = |answer: bool| {
+            let cmd = PtyCommand::new(SH).arg("-c").arg(script).size(40, 5);
+            if answer {
+                cmd.answer_cursor_position()
+            } else {
+                cmd
+            }
+            .spawn()
+        };
+
+        let answered = match spawn(true) {
+            Ok(p) => p,
+            Err(e) if skip_if_no_pty(&e) => return,
+            Err(e) => panic!("spawn: {e}"),
+        };
+        assert!(
+            wait_raw(&answered, DSR_REPLY),
+            "the child gets the report back and writes it out: {:?}",
+            String::from_utf8_lossy(&answered.raw())
+        );
+
+        // Off by default: the child is still blocked in `dd`, and nothing was written to it.
+        let silent = spawn(false).expect("spawn");
+        assert!(
+            wait_raw(&silent, DSR_QUERY),
+            "the query is on the wire either way"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            find(&silent.raw(), DSR_REPLY).is_none(),
+            "no reply without the switch: {:?}",
+            String::from_utf8_lossy(&silent.raw())
+        );
+    }
+
+    fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    /// Poll the raw transcript for `needle` (up to 5 s), without `wait_for`'s `&mut self`.
+    fn wait_raw(pty: &PtyTui, needle: &[u8]) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if find(&pty.raw(), needle).is_some() {
+                return true;
+            }
+            std::thread::sleep(POLL);
+        }
+        false
     }
 
     #[test]

@@ -2300,6 +2300,114 @@ fn pty_editor_ctrl_c_does_not_quit_lastcall() {
     assert_clean_exit(&pty, since);
 }
 
+/// Verifier (b) F1: a key typed while `$EDITOR` owns the terminal must act on the **resume**
+/// and not wait for a second key.
+///
+/// The bug it guards is below crossterm and macOS-only. crossterm registers the tty with
+/// kqueue once per process and edge-triggered (`EV_CLEAR`); xnu's raw-mode switch moves the
+/// pending cooked line into the raw queue without waking anyone, so the byte is readable and
+/// never reported — verifier (b) watched `poll` return `Ok(false)` 134 times over 6.7 s with
+/// a `n` sitting in the queue, and the *next* key delivered both at once. `Suspend::run`
+/// therefore writes one `ESC [ 6 n` after `term::enter()`: the terminal's reply is an edge
+/// the kqueue does fire on, and the read it wakes drains the stuck byte with it.
+///
+/// So the scene needs a terminal that answers — `PtyCommand::answer_cursor_position`, which
+/// no other scene turns on. On a terminal that stays silent the byte still waits for the
+/// next key; that residual is in `tui.md`'s suspend step list, and it is why this scene
+/// cannot be written without the harness switch.
+///
+/// `n` is the key on purpose: one printable byte, so nothing here depends on how the line
+/// discipline treats `\r` or on crossterm's lone-`ESC` disambiguation.
+#[test]
+fn pty_editor_key_typed_during_the_editor_is_not_stuck() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let (vim, log) = probe_vim(&fx.state);
+    let saved = parse_rs_saved();
+    let spawned = fx
+        .command(&bin())
+        .args(["tui", "--poll", "1"])
+        .env("EDITOR", vim.into_os_string())
+        .env("LASTCALL_PROBE_EDITOR_LOG", log.clone().into_os_string())
+        // The editor saves, so the return path opens the blessing confirm — the `n` typed
+        // during the sleep is the answer to it.
+        .env("LASTCALL_PROBE_EDITOR_WRITE", saved.clone())
+        .env("LASTCALL_PROBE_EDITOR_SLEEP", "1")
+        .answer_cursor_position()
+        .spawn();
+    let mut pty = match spawned {
+        Ok(p) => p,
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+            note(&format!("SKIP: this host cannot open a pty: {e}"));
+            return;
+        }
+        Err(e) => panic!("spawn lastcall tui: {e}"),
+    };
+    wait_first_piles(&mut pty);
+    wait_watching(&mut pty);
+    open_parse_rs_hunk_2(&mut pty);
+
+    pty.send(b"I").expect("shift-i");
+    // The probe logs `cwd:` before it sleeps: the editor owns the terminal from here.
+    let start = Instant::now();
+    loop {
+        if std::fs::read_to_string(&log).is_ok_and(|t| t.contains("cwd: ")) {
+            break;
+        }
+        assert!(
+            start.elapsed() < LONG,
+            "the probe editor never started:\n{}",
+            pty.screen_text()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    pty.send(b"n").expect("n while the editor sleeps");
+
+    // …and nothing else is ever sent. Before the fix this waited forever: the confirm sat
+    // on screen unanswered until a second key arrived.
+    let answered = pty
+        .wait_for(Duration::from_secs(5), |s| {
+            status_is(s, "src/parse.rs left pending")
+        })
+        .unwrap_or_else(|e| {
+            panic!("the `n` typed during the editor answers the confirm on the resume: {e}")
+        });
+    note(&format!(
+        "PTY editor stuck key: answered {answered:.3?} after the send"
+    ));
+    let screen = pty.screen_text();
+    assert!(
+        !screen.contains("mark as reviewed?"),
+        "the confirm is gone:\n{screen}"
+    );
+    assert!(
+        screen.contains("M parse.rs"),
+        "and the row is still pending, which is what `n` means:\n{screen}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fx.parent.join("alpha").join(fixture_parent::PARSE_RS))
+            .expect("parse.rs"),
+        saved,
+        "declining wrote nothing: the editor's bytes are what is on disk"
+    );
+
+    // The mechanism, on the wire: exactly one cursor-position request, written by the
+    // resume and by nothing else (`LASTCALL_KEYBOARD=plain` skips the other query lastcall
+    // knows how to write).
+    let raw = pty.raw();
+    assert_eq!(
+        raw.windows(4).filter(|w| *w == b"\x1b[6n").count(),
+        1,
+        "one DSR nudge, from the one suspend"
+    );
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}
+
 /// The inline editor's header, as [`render::render_editor_header`] writes it for the middle
 /// hunk of `src/parse.rs` — the line number comes from the fixture text, not from the
 /// engine under test.

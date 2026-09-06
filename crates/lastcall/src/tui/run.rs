@@ -1053,6 +1053,7 @@ impl Suspend<'_> {
 
         let fresh = term::enter()?;
         std::mem::forget(std::mem::replace(self.guard, fresh));
+        nudge_the_tty();
 
         let (tx, rx) = mpsc::unbounded_channel::<Event>();
         let (stop, handle) = spawn_input(tx)?;
@@ -1079,6 +1080,32 @@ impl Suspend<'_> {
             Err(e) => Some(spawn_failure(&cmd.program, &e)),
         })
     }
+}
+
+/// Ask the terminal where its cursor is, and never read the answer (verifier (b) F1).
+///
+/// A key typed in the window between the editor exiting and `term::enter()` finishing used
+/// to sit in the tty unnoticed until the *next* key, which then delivered both at once — a
+/// `q` or a `y` that looked like it did nothing. The cause is below crossterm: its mio/kqueue
+/// event source registers the tty **once per process** with `EV_CLEAR` (edge-triggered), and
+/// xnu's `TIOCSETA` moves a pending cooked line into the raw queue without `ttwakeup`, so no
+/// knote fires for a byte that is already readable. `poll` therefore reports nothing while
+/// `read(2)` would return the byte immediately.
+///
+/// `ESC [ 6 n` (DSR) makes the terminal send something of its own. That arrival is an edge
+/// the kqueue does fire on, and the `read` it wakes drains the whole buffer — the stuck key
+/// included. The reply (`ESC [ <row> ; <col> R`) is parsed by crossterm as an internal
+/// `CursorPosition` event, which its public `read()` filter never surfaces and which cannot
+/// make `poll` return true: it costs one entry in crossterm's queue per suspend and nothing
+/// else. A terminal that does not answer is left exactly as it was — the byte still waits
+/// for the next key, which is the residual `tui.md` records.
+///
+/// Fire-and-forget by design: waiting for the answer would be `crossterm::cursor::position`,
+/// which polls through the very source this is working around.
+fn nudge_the_tty() {
+    let mut out = io::stdout();
+    let _ = out.write_all(b"\x1b[6n");
+    let _ = out.flush();
 }
 
 /// Why the `$EDITOR` child never started, as a status line (verifier (b) F4).

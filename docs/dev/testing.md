@@ -255,6 +255,24 @@ kitty-protocol terminal, proving the query is written, the answer is believed, t
 pushed and popped, and no byte of the reply ever reaches the app as a key. Any new scene that
 wants the probe must remove the variable itself and pay for it.
 
+### `PtyCommand::answer_cursor_position` (off by default)
+
+The harness is a terminal that answers **nothing** — that is the point of
+`LASTCALL_KEYBOARD=plain` above — with one opt-in exception. `answer_cursor_position()` makes
+the reader thread reply to every `ESC [ 6 n` (DSR, "where is the cursor?") in the child's
+output with `ESC [ 1 ; 1 R`, the way a real terminal would. The row and column are invented:
+nothing reads the report back, because crossterm swallows it as an internal event.
+
+It exists for one behaviour. After an `$EDITOR` suspend, `Suspend::run` writes that query to
+wake a tty whose already-readable byte kqueue never reported (verifier (b) F1; the mechanism
+is in `tui.md`'s suspend step list). Only `pty_editor_key_typed_during_the_editor_is_not_stuck`
+turns it on — take the switch out and that scene hangs on an unanswered confirm, which is
+exactly the residual on a terminal that does not answer. Every other scene leaves it off:
+a reply is bytes in the child's input that nothing else expects, written from the reader
+thread the moment the query is seen, and it would change what the next `raw()` assertion or
+`wait_for` sees. `pty_tui_answers_a_cursor_position_request_only_when_asked` (testkit unit
+tier) covers both settings with a shell child that reads the reply back out.
+
 ## Naming
 
 - Unit tests live in-module (`#[cfg(test)] mod tests`) and nowhere else: a `tests/test_unit_*.rs`

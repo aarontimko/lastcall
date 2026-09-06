@@ -632,7 +632,18 @@ Then `run::Suspend::run`. **Every step is load-bearing and the order is the whol
    both quit through the restore path.
 5. **`term::enter()`, then replace the guard without dropping it.** The old guard's `Drop`
    calls `restore()`, which would now undo the *live* terminal it never owned, so it is
-   `mem::forget`ten rather than dropped.
+   `mem::forget`ten rather than dropped. Then **one `ESC [ 6 n`**, fire-and-forget
+   (`run::nudge_the_tty`, verifier (b) F1). A key typed in this window used to sit in the tty
+   until the *next* key, which delivered both at once — a `q` or a `y` that looked like it
+   did nothing: crossterm registers the tty with kqueue once per process and edge-triggered
+   (`EV_CLEAR`), and xnu's `TIOCSETA` moves the pending cooked line into the raw queue
+   without `ttwakeup`, so nothing fires for a byte that is already readable. The terminal's
+   reply is an edge the kqueue does fire on, and the read it wakes drains the stuck byte with
+   it; the reply itself is parsed by crossterm as an internal `CursorPosition` that `read()`
+   never surfaces. **Residual:** on a terminal that does not answer DSR nothing changes —
+   the key is still delivered with the next one. `pty_editor_key_typed_during_the_editor_is_not_stuck`
+   proves the fixed path with the harness playing a terminal that answers
+   (`PtyCommand::answer_cursor_position`, `testing.md`).
 6. **A fresh channel and a fresh reader thread.** The old channel can still hold the key
    release of `shift-i`, or a `Resize` the editor caused — neither means anything to the
    resumed TUI.
@@ -1185,7 +1196,9 @@ which is exactly what neither a reducer test nor a snapshot can reach:
 confirm, `y`, and the row is gone), `pty_editor_ctrl_c_does_not_quit_lastcall` (a `^C` typed
 while the editor owns the terminal kills the *editor*; lastcall is still up on resume, and
 the scene then exits on a second `^C` 300 ms later — past `EDITOR_SETTLE`, so the drain
-swallowed the editor's interrupt and not this one), `pty_edit_inline_save_pends_nothing` and
+swallowed the editor's interrupt and not this one), `pty_editor_key_typed_during_the_editor_is_not_stuck` (an `n` typed while the probe editor
+sleeps answers the return confirm on the resume, with no second keystroke — the DSR nudge of
+step 5), `pty_edit_inline_save_pends_nothing` and
 `pty_edit_inline_save_refused_when_the_file_moved` (`i`, type, `^S`, against a file an agent
 rewrites underneath), `pty_copy_writes_osc52_with_the_selected_lines` (`vjjy`, then the raw
 transcript is searched for exactly one `\x1b]52;c;` and its base64 decoded — by the test's own
