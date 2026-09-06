@@ -290,7 +290,7 @@ The modal's key discipline (`input::note_action`):
 | key | effect |
 |---|---|
 | any printable character | inserted — the keymap is off, so `q` types a `q` |
-| `Enter` | send: `Effect::Flag`, the modal closes (an **empty** note is refused) |
+| `Enter` | send: `Effect::Flag`, the modal closes (an empty note is allowed: the flag is the message) |
 | `Ctrl-J` | newline (works in every terminal) |
 | `Alt-Enter` | newline, where the terminal reports Alt (Option-as-Meta) |
 | `Shift-Enter` | newline **only** under the kitty keyboard protocol — see below |

@@ -1545,12 +1545,6 @@ impl App {
                 (Changed::Yes, None)
             }
             NoteKey::Send => {
-                // An empty note says nothing to the agent it is about to be pasted to, so
-                // Enter on an empty buffer is not a send: the modal stays open, which is
-                // the answer. `Esc` is how a reviewer changes their mind.
-                if entry.buf.text().is_empty() {
-                    return (Changed::No, None);
-                }
                 // The target was captured when `m` was pressed and is used as it was: a
                 // pile that landed meanwhile cannot move the flag onto another hunk (F14).
                 let entry = self.note.take().expect("checked above");
@@ -5224,15 +5218,6 @@ mod tests {
         assert_eq!(target.label(), "f1 · whole file");
         assert_eq!(target.modal_title(), " flag whole file ");
 
-        // An empty note has nothing to say to the agent it is about to be pasted to, so
-        // Enter is not a send and the modal stays open.
-        assert_eq!(
-            app.handle(Action::Note(NoteKey::Send)),
-            (Changed::No, None),
-            "an empty note refuses to send"
-        );
-        assert!(app.note.is_some(), "…and the modal is still open");
-
         type_note(&mut app, "the whole rewrite needs another look");
         let row_now = app.roots[&root("alpha")]
             .row(b"f1")
@@ -5733,6 +5718,29 @@ mod tests {
         app.handle(action)
     }
 
+    /// An **empty** note sends: the flag is the message (Phase 7 kickoff deliverable 10, as
+    /// ratified). Phase 8 briefly refused it; verifier (a) decision (7) caught that as a
+    /// regression against ratified behaviour and this test pins the ratified shape so the
+    /// next reader does not re-derive the refusal from first principles.
+    #[test]
+    fn app_note_modal_empty_note_sends() {
+        let mut app = note_open();
+        assert_eq!(
+            app.note.as_ref().expect("open").text(),
+            "",
+            "nothing typed yet"
+        );
+
+        let (changed, effect) = app.handle(Action::Note(NoteKey::Send));
+        assert_eq!(changed, Changed::Yes, "the send redraws");
+        assert!(app.note.is_none(), "the modal closes on the send");
+        let Some(Effect::Flag { note, path, .. }) = effect else {
+            panic!("an empty note is still a flag: {effect:?}");
+        };
+        assert_eq!(note, "", "the flag carries the empty note verbatim");
+        assert_eq!(path, b"f1".to_vec());
+    }
+
     /// The note modal's line discipline. Enter sends; the bindings a terminal reports for a
     /// deliberate line break (`Ctrl-J` everywhere, `Alt-Enter` where Alt is reported) break
     /// the line instead; Esc closes it and writes nothing.
@@ -5770,11 +5778,6 @@ mod tests {
             note_feed(&mut app, &backspace),
             (Changed::No, None),
             "nothing to delete, nothing to draw"
-        );
-        assert_eq!(
-            note_feed(&mut app, &enter),
-            (Changed::No, None),
-            "and an empty note is not a send"
         );
         note_feed(&mut app, &note_char('y'));
         let (changed, effect) =
