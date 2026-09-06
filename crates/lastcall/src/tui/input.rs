@@ -88,6 +88,11 @@ pub enum Action {
     Flag,
     /// Clear every flag on the selected file.
     Unflag,
+    /// Open the selected file in the **inline** editor, at the line of the hunk under the
+    /// cursor (deliverable 8; `Effect::EditInline`). The same rows `EditExternal` opens,
+    /// and only when the engine will hand the bytes over: a binary or oversize file says
+    /// `use shift-i: <why>` instead.
+    Edit,
     /// Suspend the TUI and open the selected file in `$VISUAL`/`$EDITOR`, at the line of
     /// the hunk under the cursor (deliverable 7; `Effect::EditExternal`). A row with
     /// nothing to open — a deletion, a symlink, a path that is not UTF-8 — says
@@ -96,6 +101,10 @@ pub enum Action {
     /// One edit inside the note modal. Never key-bound: while the modal is open every key
     /// is resolved by [`note_action`] before the keymap is consulted.
     Note(NoteKey),
+    /// One keystroke inside the inline editor. Never key-bound, for the same reason:
+    /// [`editor_action`] resolves everything while `App::editor` is open, so a keymap
+    /// letter — `q` included — types itself (F16).
+    Editor(EditorKey),
     /// One move inside the agent picker. Never key-bound, for the same reason.
     Pick(PickKey),
     /// Answer the confirm modal (`y` / `Enter`); nothing outside it.
@@ -222,6 +231,62 @@ pub enum PickKey {
     Cancel,
 }
 
+/// What one keystroke does inside the inline editor (deliverable 8).
+///
+/// The same shape as [`NoteKey`] — the buffer's own vocabulary plus the two keys only the
+/// holder can decide — with the editor's answers instead of the modal's: `Ctrl-S` writes
+/// the file, `Esc` closes it (asking first when the buffer is dirty). The mouse is here
+/// too, because the editor is the one place a click means "put the caret there".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditorKey {
+    /// Anything the buffer does with the keystroke.
+    Edit(EditKey),
+    /// `Ctrl-S`: write the buffer back through the engine's CAS'd save.
+    Save,
+    /// `Esc`: close a clean buffer, ask about a dirty one.
+    Close,
+    /// A click at this **pane-relative** row and column of the text area (the gutter is
+    /// already subtracted): the reducer adds the buffer's own scroll.
+    Click(u16, u16),
+    /// The wheel: `+n` down, `-n` up.
+    Scroll(i32),
+}
+
+/// The inline editor's action for one key event, consulted before the keymap while
+/// `App::editor` is open (deliverable 8; F16).
+///
+/// `Esc` and `Ctrl-S` are the editor's own two keys, checked first; `Enter` is a newline,
+/// not a send, because this is a file and not a message. Everything else [`edit_key`]
+/// answers, so every keymap letter types itself — the reason `q` cannot quit from inside
+/// the editor, and the reason a **non-printable** `quit` binding (`ctrl-c` by default)
+/// still can, exactly as it does under the note modal.
+pub fn editor_action(event: &Event, keymap: &Keymap, enhanced: bool) -> Option<Action> {
+    if let Event::Paste(text) = event {
+        return Some(Action::Editor(EditorKey::Edit(EditKey::Insert(
+            text.clone(),
+        ))));
+    }
+    let Event::Key(k) = event else {
+        return None;
+    };
+    let key = Key::of(k)?;
+    if key.code == KeyCode::Esc {
+        return Some(Action::Editor(EditorKey::Close));
+    }
+    if key.code == KeyCode::Char('s') && key.ctrl && !key.alt {
+        return Some(Action::Editor(EditorKey::Save));
+    }
+    // Before `edit_key`, which only makes a newline of an `Enter` that carries a modifier:
+    // in a file every `Enter` breaks the line.
+    if key.code == KeyCode::Enter && !key.ctrl && !key.alt {
+        return Some(Action::Editor(EditorKey::Edit(EditKey::Newline)));
+    }
+    if let Some(edit) = edit_key(&key, enhanced) {
+        return Some(Action::Editor(EditorKey::Edit(edit)));
+    }
+    quit_only(keymap, key)
+}
+
 /// The note modal's action for one key event, consulted before the keymap while
 /// `App.note` is open (deliverable 10).
 ///
@@ -305,6 +370,7 @@ pub const DEFAULT_KEYMAP: &[(&str, &[&str])] = &[
     ("restore_file", &["shift-u"]),
     ("flag", &["m"]),
     ("unflag", &["shift-m"]),
+    ("edit", &["i"]),
     ("edit_external", &["shift-i"]),
     ("ack", &["d"]),
     ("jump", &["g"]),
@@ -362,6 +428,7 @@ impl Action {
             "restore_file" => Action::RestoreFile,
             "flag" => Action::Flag,
             "unflag" => Action::Unflag,
+            "edit" => Action::Edit,
             "edit_external" => Action::EditExternal,
             "ack" => Action::Ack,
             "jump" => Action::Jump,
@@ -401,6 +468,7 @@ impl Action {
             // help overlay at 100×30 falls back to one clipped column the moment the two
             // widest rows plus 7 exceed the width. The overlay is the only place a reader
             // ever sees a description, so the short form is the one that survives.
+            "edit" => "edit in place",
             "edit_external" => "$EDITOR at the hunk",
             "ack" => "ack the agent flag",
             "jump" => "jump to the agent in herdr",
@@ -1441,8 +1509,10 @@ mod tests {
             (Action::RestoreFile, "key"),
             (Action::Flag, "key"),
             (Action::Unflag, "key"),
+            (Action::Edit, "key"),
             (Action::EditExternal, "key"),
             (Action::Note(NoteKey::Send), "modal-note"),
+            (Action::Editor(EditorKey::Save), "modal-note"),
             (Action::Pick(PickKey::Send), "modal-note"),
             (Action::Ack, "key"),
             (Action::Jump, "key"),
@@ -1502,17 +1572,19 @@ mod tests {
             | Action::RestoreFile
             | Action::Flag
             | Action::Unflag
+            | Action::Edit
             | Action::EditExternal
             | Action::Note(_)
+            | Action::Editor(_)
             | Action::Pick(_)
             | Action::Confirm
             | Action::Cancel
             | Action::Ack
             | Action::Jump
             | Action::ScopeToggle
-            | Action::Herdr(_) => 38,
+            | Action::Herdr(_) => 40,
         };
-        assert_eq!(table.len(), 38);
+        assert_eq!(table.len(), 40);
     }
 
     #[test]

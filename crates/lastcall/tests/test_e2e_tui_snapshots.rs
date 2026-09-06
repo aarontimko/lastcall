@@ -18,9 +18,9 @@ use std::path::{Path, PathBuf};
 
 use lastcall::tui::app::{AcceptFailed, App, Changed, Effect, FlagKind, RootMeta, Selection};
 use lastcall::tui::herdr::{AgentCandidate, Attention, Dot, HerdrUpdate, RootAgents, Scope};
-use lastcall::tui::input::{Action, EditKey, NoteKey, PickKey};
+use lastcall::tui::input::{Action, EditKey, EditorKey, NoteKey, PickKey};
 use lastcall::tui::render::{render, styles};
-use lastcall_engine::engine::{Engine, EngineOptions};
+use lastcall_engine::engine::{Engine, EngineOptions, SaveRequest};
 use lastcall_engine::env::Env;
 use lastcall_engine::ops::NoFault;
 use lastcall_engine::scan::{Annotation, Change, Collapsed, Pile};
@@ -1471,4 +1471,180 @@ fn tui_nav_flag_counts() {
 
     app.select(Some(Selection::Root(alpha.clone())));
     snapshot("tui_nav_flag_counts", &app, W, H);
+}
+
+// ---- Phase 8 deliverable 8: the inline editor -------------------------------------------
+
+/// `i` on the selection, answered by the **real** engine — the loop's `Effect::EditInline`
+/// round trip with no editor process anywhere near it.
+fn open_editor(app: &mut App, engine: &Engine) {
+    let (changed, effect) = app.handle(Action::Edit);
+    assert_eq!(
+        changed,
+        Changed::No,
+        "nothing is drawn to ask for the bytes"
+    );
+    let Some(Effect::EditInline(open)) = effect else {
+        panic!("an inline-edit effect, got {effect:?}");
+    };
+    let bytes = engine.read_rendered(&open.root, &open.rendered);
+    assert!(bytes.is_ok(), "src/parse.rs opens: {bytes:?}");
+    assert_eq!(app.edit_read(open, bytes), (Changed::Yes, None));
+    assert!(app.editor.is_some(), "the editor is open");
+}
+
+/// Select alpha's `src/parse.rs`, open the diff and put the cursor on the **middle** hunk —
+/// the shared start of every editor scene, and the one hunk whose line number proves the
+/// editor landed somewhere the fixture chose rather than at the top of the file.
+fn at_parse_rs_middle_hunk(app: &mut App, engine: &Engine, alpha: &Path) {
+    select_row(app, alpha, fixture_parent::PARSE_RS);
+    app.handle(Action::Open);
+    app.handle(Action::HunkNext);
+    let hunks = app.view_hunks();
+    assert_eq!(hunks.len(), 3, "three separated agent hunks");
+    assert_eq!(
+        hunks[1].editor_line(),
+        fixture_parent::parse_rs_edit2_line(),
+        "the middle hunk's first changed line, from the fixture text"
+    );
+    let _ = engine;
+}
+
+/// The editor open on the middle hunk: the whole file in a buffer, the caret on the agent's
+/// first changed line, the entered hunk tinted as a band, `▎` on the lines of the other two
+/// hunks, and a header that names the file and the line.
+#[test]
+fn tui_editor_open() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    let alpha = root_named(&engine, "alpha");
+    at_parse_rs_middle_hunk(&mut app, &engine, &alpha);
+    open_editor(&mut app, &engine);
+
+    let ed = app.editor.as_ref().expect("open");
+    assert_eq!(ed.line_at_open, fixture_parent::parse_rs_edit2_line());
+    assert_eq!(
+        ed.buf.text(),
+        fixture_parent::PARSE_RS_EDITED,
+        "the buffer is the file on disk"
+    );
+    assert!(ed.band.is_some(), "the entered hunk is tinted: {ed:?}");
+    let (frame, _) = draw(&app, W, H);
+    assert!(
+        frame.contains(&format!(
+            "editing src/parse.rs · line {}",
+            fixture_parent::parse_rs_edit2_line()
+        )),
+        "{frame}"
+    );
+    assert!(frame.contains("^S save   Esc close"), "{frame}");
+    snapshot("tui_editor_open", &app, W, H);
+}
+
+/// Esc on a buffer that has been typed in asks before throwing the text away, and the
+/// question names the file.
+#[test]
+fn tui_editor_dirty_confirm() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    let alpha = root_named(&engine, "alpha");
+    at_parse_rs_middle_hunk(&mut app, &engine, &alpha);
+    open_editor(&mut app, &engine);
+
+    app.handle(Action::Editor(EditorKey::Edit(EditKey::Insert(
+        "// typed by the reviewer".to_owned(),
+    ))));
+    assert!(app.editor.as_ref().expect("open").buf.dirty());
+    app.handle(Action::Editor(EditorKey::Close));
+    assert_eq!(app.confirm_discard(), Some(&b"src/parse.rs"[..]));
+    let (frame, _) = draw(&app, W, H);
+    assert!(
+        frame.contains("Discard changes to src/parse.rs?"),
+        "{frame}"
+    );
+    snapshot("tui_editor_dirty_confirm", &app, W, H);
+}
+
+/// A save the engine refuses because an agent wrote the file while the reader was typing:
+/// the buffer is kept whole, the header goes red, and the status names the two keys that
+/// reload.
+#[test]
+fn tui_editor_save_refused() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    let alpha = root_named(&engine, "alpha");
+    at_parse_rs_middle_hunk(&mut app, &engine, &alpha);
+    open_editor(&mut app, &engine);
+    app.handle(Action::Editor(EditorKey::Edit(EditKey::Insert(
+        "// typed by the reviewer\n".to_owned(),
+    ))));
+
+    // The agent writes the file underneath the open buffer.
+    scene
+        .repo("alpha")
+        .write(fixture_parent::PARSE_RS, "the agent got there first\n");
+
+    let (_, effect) = app.handle(Action::Editor(EditorKey::Save));
+    let Some(Effect::Save {
+        root,
+        rendered,
+        bytes,
+    }) = effect
+    else {
+        panic!("a save effect, got {effect:?}");
+    };
+    let result = engine
+        .save(&root, SaveRequest { rendered, bytes })
+        .map_err(|e| AcceptFailed::of(&e));
+    let refused = result
+        .as_ref()
+        .expect("the ledger answered")
+        .outcome
+        .refused
+        .clone();
+    assert!(
+        matches!(
+            refused.first(),
+            Some(lastcall_engine::ops::Refused::Moved { .. })
+        ),
+        "the compare-and-swap saw the agent's write: {refused:?}"
+    );
+    app.saved(root, fixture_parent::PARSE_RS.as_bytes().to_vec(), result);
+
+    let ed = app.editor.as_ref().expect("the buffer is kept");
+    assert!(ed.alarm, "the header is red");
+    assert!(
+        ed.buf.text().contains("// typed by the reviewer"),
+        "every character the reviewer typed is still there"
+    );
+    let (frame, _) = draw(&app, W, H);
+    assert!(
+        frame.contains("changed since you opened it; not saved — Esc, then i to reload"),
+        "{frame}"
+    );
+    // Nothing was written: the file on disk is still the agent's.
+    let on_disk = std::fs::read_to_string(alpha.join(fixture_parent::PARSE_RS)).expect("read");
+    assert_eq!(on_disk, "the agent got there first\n");
+    snapshot("tui_editor_save_refused", &app, W, H);
+}
+
+/// The editor at 60×20: the gutter and the band survive, and long lines are cut at the
+/// right edge with `→` rather than wrapped — an editor that reflows a reader's code while
+/// they type in it is lying about the file.
+#[test]
+fn tui_editor_narrow_60x20() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    let alpha = root_named(&engine, "alpha");
+    at_parse_rs_middle_hunk(&mut app, &engine, &alpha);
+    app.handle(Action::Resize(60, 20));
+    open_editor(&mut app, &engine);
+
+    let (frame, _) = draw(&app, 60, 20);
+    assert!(frame.contains('→'), "a clipped line says so: {frame}");
+    snapshot("tui_editor_narrow_60x20", &app, 60, 20);
 }

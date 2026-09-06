@@ -18,7 +18,7 @@ use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 
 use crate::config::{Config, DraftInitial, Loaded, Resolved};
 use crate::env::Env;
-use crate::git::{self, ConfigList, GitError, Oid, RepoGit};
+use crate::git::{self, ConfigList, GitError, Mode, Oid, RepoGit};
 use crate::headstate::{self, HeadState, TransitionFacts};
 use crate::hunks::{self, Hunk};
 use crate::index::{IndexError, PrivateIndex};
@@ -26,10 +26,10 @@ use crate::ledger::{
     self, Clock, FlagHunk, FlagSummary, Ledger, LedgerError, LedgerLock, LoadResult, SeenAt,
     SystemClock, TreeEntries,
 };
-use crate::ops::{FaultInjector, NoFault, Ops, OpsError, Outcome, Rendered};
+use crate::ops::{self, FaultInjector, NoFault, Ops, OpsError, Outcome, Refused, Rendered};
 use crate::paths::{Layout, ParentId, ParentMeta, RepoPaths, RootId};
 use crate::roots::{self, Badge, DiscoverInputs, Discovery, RootsChanged};
-use crate::scan::{self, Pile, Row, ScanError, ScanInputs};
+use crate::scan::{self, Entry, Pile, Row, ScanError, ScanInputs};
 use crate::store::{Current, RepoFacts, RootKind, Store, StoreError};
 use crate::upstream::{self, Classifier};
 
@@ -1271,6 +1271,75 @@ impl Engine {
             .get(root)
             .ok_or_else(|| EngineError::NoSuchRoot(root.to_path_buf()))?;
         Ok(state.store.hash_path(path))
+    }
+
+    /// The live bytes of `rendered`, for the inline editor to open on — or the refusal that
+    /// says why the file will not go in a text buffer (Phase 8 deliverable 8; F11).
+    ///
+    /// The size cap and the binary rule are **engine** decisions, not the reducer's: the cap
+    /// is `[config] collapse_size_bytes`, which the TUI never sees, and "binary" here means
+    /// exactly what a text buffer cannot hold — bytes that are not UTF-8, or that carry a
+    /// NUL. Both come back as [`Refused::NotEditable`], whose `why` the status line prints
+    /// on its own (`use shift-i: <why>`), so the user is pointed at the key that *can* open
+    /// the file.
+    ///
+    /// The order is CAS, read, **re-hash what was read**: [`ops::cas_live`] proves the file
+    /// is still the row that was drawn, and hashing the bytes that came back closes the
+    /// window between that check and the read — an agent that rewrote the file in between
+    /// gets a [`Refused::Moved`] rather than an editor full of content the row never
+    /// described. Nothing is written and no ledger lock is taken.
+    pub fn read_rendered(&self, root: &Path, rendered: &Rendered) -> Result<Vec<u8>, Refused> {
+        let not_editable = |why: &str| Refused::NotEditable {
+            path: rendered.path.clone(),
+            why: why.to_owned(),
+        };
+        let unhashable = |reason: String| Refused::Unhashable {
+            path: rendered.path.clone(),
+            reason,
+        };
+        // The same two rows `Ops::save_file` refuses outright: a deletion has no file to
+        // open, and a symlink's content is its target — opening it would edit whatever it
+        // points at, which is not the row on screen.
+        if rendered.oid.is_none() {
+            return Err(not_editable("the file is gone"));
+        }
+        if rendered.mode == Some(Mode::Symlink) {
+            return Err(not_editable("not a regular file"));
+        }
+        let state = self
+            .roots
+            .get(root)
+            .ok_or_else(|| unhashable(format!("no such root: {}", root.display())))?;
+        let live = ops::cas_live(&state.store, rendered)?;
+        let full = state
+            .store
+            .root()
+            .join(std::ffi::OsStr::from_bytes(&rendered.path));
+        let bytes = std::fs::read(&full).map_err(|e| unhashable(e.to_string()))?;
+        // The read is a *fresh* read, so it is hashed through the store's own conversion
+        // (the same one `hash_path` applies) and compared with the row. A mismatch is the
+        // agent that wrote between the CAS and the read.
+        let oid = state
+            .store
+            .hash_bytes_as(&rendered.path, &bytes)
+            .map_err(|e| unhashable(e.to_string()))?;
+        if rendered.oid.as_ref() != Some(&oid) {
+            return Err(Refused::Moved {
+                path: rendered.path.clone(),
+                live: Some(Entry {
+                    oid,
+                    mode: live.mode,
+                }),
+            });
+        }
+        let cap = self.config.collapse_size_bytes;
+        if bytes.len() as u64 > cap {
+            return Err(not_editable(&format!("over {} KiB", cap / 1024)));
+        }
+        if bytes.contains(&0) || std::str::from_utf8(&bytes).is_err() {
+            return Err(not_editable("binary"));
+        }
+        Ok(bytes)
     }
 
     /// Write an editor buffer back to the working tree and advance the path's baseline to
@@ -2921,6 +2990,70 @@ pub(crate) mod tests {
             "the expansion says what changed: {:?}",
             expanded.hunks[0]
         );
+    }
+
+    /// Deliverable 8, F11: the inline editor's read decides binary-ness and the size cap
+    /// **here**, because `collapse_size_bytes` is engine config the reducer cannot see. The
+    /// three answers in one test, on three rows of one root: the text file opens, the PNG
+    /// and the oversize file come back as `NotEditable` with the `why` the status prints.
+    #[test]
+    fn engine_read_rendered_opens_text_and_refuses_binary_and_oversize() {
+        let mut repo = FixtureRepo::new("eng-read").unwrap();
+        repo.commit_files(
+            &[
+                ("t.txt", "one\n"),
+                ("img.png", "seed\n"),
+                ("big.txt", "seed\n"),
+            ],
+            "seed",
+        )
+        .unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let config = Config {
+            collapse_size_bytes: 4 * 1024,
+            ..Config::default()
+        };
+        let mut engine = open_engine(&repo, &state, config);
+        let root = only_root(&engine);
+        repo.write("t.txt", "one\ntwo\n");
+        let mut png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR".to_vec();
+        png.resize(1_024, b'\x42');
+        repo.write("img.png", &png);
+        repo.write("big.txt", "x".repeat(5_000));
+        let pile = engine.scan(&root).unwrap();
+        let of = |name: &[u8]| Rendered::of(pile.row(name).unwrap());
+
+        assert_eq!(
+            engine.read_rendered(&root, &of(b"t.txt")).unwrap(),
+            b"one\ntwo\n",
+            "the live bytes, verbatim"
+        );
+        match engine.read_rendered(&root, &of(b"img.png")) {
+            Err(Refused::NotEditable { why, .. }) => assert_eq!(why, "binary"),
+            other => panic!("{other:?}"),
+        }
+        match engine.read_rendered(&root, &of(b"big.txt")) {
+            Err(Refused::NotEditable { why, .. }) => assert_eq!(why, "over 4 KiB"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The CAS and the re-hash: a write between the render and the read is a `Moved`, and
+    /// the editor never opens on content the row did not describe.
+    #[test]
+    fn engine_read_rendered_refuses_a_file_that_moved_since_it_was_rendered() {
+        let repo = FixtureRepo::new("eng-read-moved").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let root = only_root(&engine);
+        repo.write("f1", "first\n");
+        let pile = engine.scan(&root).unwrap();
+        let rendered = Rendered::of(pile.row(b"f1").unwrap());
+        repo.write("f1", "an agent got here first\n");
+        match engine.read_rendered(&root, &rendered) {
+            Err(Refused::Moved { path, .. }) => assert_eq!(path, b"f1"),
+            other => panic!("{other:?}"),
+        }
     }
 
     /// An unknown root is an error, not a panic or an empty expansion.

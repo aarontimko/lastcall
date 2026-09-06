@@ -42,14 +42,14 @@ use std::time::Duration;
 use crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, Event, MouseButton, MouseEvent, MouseEventKind,
 };
-use lastcall_engine::engine::{AcceptRequest, Engine, RenderedHunk, RestoreRequest};
+use lastcall_engine::engine::{AcceptRequest, Engine, RenderedHunk, RestoreRequest, SaveRequest};
 use lastcall_engine::env::Env;
 use lastcall_engine::herdr::HerdrEvent;
 use lastcall_engine::herdr::client::{Cache, ClientHandle};
 use lastcall_engine::herdr::transport::SocketTransport;
 use lastcall_engine::hunks::Expanded;
 use lastcall_engine::ledger::FlagSummary;
-use lastcall_engine::ops::Rendered;
+use lastcall_engine::ops::{Refused, Rendered};
 use lastcall_engine::scan::{Pile, Row};
 use lastcall_engine::store::Current;
 use lastcall_engine::watcher::{EngineEvent, EngineTimings, Watcher, blocking};
@@ -59,12 +59,14 @@ use ratatui::layout::Rect;
 use tokio::sync::mpsc;
 
 use super::app::{
-    AcceptFailed, AcceptResult, App, Changed, Effect, FlagKind, FlagResult, RestoreResult, RootMeta,
+    AcceptFailed, AcceptResult, App, Changed, EditOpen, Effect, FlagKind, FlagResult,
+    RestoreResult, RootMeta, SaveResult,
 };
 use super::editor::EditorCommand;
 use super::herdr::{self, HerdrLink, HerdrPlan, HerdrUpdate, Link, ToastMsg};
 use super::input::{
-    Action, Key, Keymap, modal_action, note_action, pick_action, pointer, to_action,
+    Action, EditorKey, Key, Keymap, editor_action, modal_action, note_action, pick_action, pointer,
+    to_action,
 };
 use super::render::{HitMap, Pane, render};
 use super::term;
@@ -136,6 +138,21 @@ pub enum Local {
         root: PathBuf,
         rendered: Rendered,
         live: Current,
+    },
+    /// An `Effect::EditInline` finished: the live bytes of the row the inline editor is
+    /// opening on, or the refusal that says why it will not open (deliverable 8). The
+    /// opening context travels back with the answer, so the marks and the band belong to
+    /// the pile `i` was pressed on.
+    EditRead {
+        open: EditOpen,
+        result: Result<Vec<u8>, Refused>,
+    },
+    /// An `Effect::Save` finished. The `path` travels because the answer must be able to
+    /// name the file even when the editor was closed while the write was in flight.
+    Saved {
+        root: PathBuf,
+        path: Vec<u8>,
+        result: SaveResult,
     },
     /// An `Effect::Expand` finished: one collapsed row's on-demand hunks (deliverable 4).
     /// The row `hunks_of` was given travels back with the answer, so the app can tell an
@@ -224,6 +241,43 @@ impl Ui {
                 _ => return (Changed::No, None),
             }
         }
+        // The inline editor is a text field over the whole diff pane, so it is consulted
+        // after the three modals that can sit *above* it — the discard confirm is one of
+        // them — and before the keymap, which it swallows whole: every printable key is a
+        // character of the file, `q` included (F16). Only a non-printable `quit` binding
+        // survives, as it does under the note modal. The mouse is the editor's too: a click
+        // puts the caret where it landed and the wheel scrolls, both resolved here because
+        // the pane's rectangle is a fact about the last frame and not about the app.
+        if self.app.editor.is_some() {
+            match event {
+                Event::Key(_) | Event::Paste(_) => {
+                    return match editor_action(event, &self.keymap, self.app.enhanced) {
+                        Some(action) => self.app.handle(action),
+                        None => (Changed::No, None),
+                    };
+                }
+                Event::Mouse(_) => {
+                    return match to_action(event, &self.keymap) {
+                        Some(Action::Press(x, y)) => match self.editor_text_at(x, y) {
+                            Some((dy, dx)) => {
+                                self.app.handle(Action::Editor(EditorKey::Click(dy, dx)))
+                            }
+                            None => (Changed::No, None),
+                        },
+                        Some(Action::ScrollUp(n)) => self
+                            .app
+                            .handle(Action::Editor(EditorKey::Scroll(-(n as i32)))),
+                        Some(Action::ScrollDown(n)) => {
+                            self.app.handle(Action::Editor(EditorKey::Scroll(n as i32)))
+                        }
+                        _ => (Changed::No, None),
+                    };
+                }
+                // A resize still reaches the app below, and invalidates the hit map with it.
+                Event::Resize(..) => {}
+                _ => return (Changed::No, None),
+            }
+        }
         let Some(action) = to_action(event, &self.keymap) else {
             return (Changed::No, None);
         };
@@ -254,6 +308,15 @@ impl Ui {
         }
     }
 
+    /// Where `(x, y)` lands in the editor's **text** area, as a `(row, column)` offset
+    /// inside it — the gutter and the borders already subtracted. `None` when the last
+    /// frame drew no editor, or when the point is outside it.
+    fn editor_text_at(&self, x: u16, y: u16) -> Option<(u16, u16)> {
+        let rect = self.hits.as_ref()?.editor?;
+        rect.contains(ratatui::layout::Position::new(x, y))
+            .then(|| (y - rect.y, x - rect.x))
+    }
+
     /// Fold one watcher event in.
     pub fn engine(&mut self, event: EngineEvent) -> (Changed, Option<Effect>) {
         self.app.apply(event)
@@ -281,6 +344,8 @@ impl Ui {
                 rendered,
                 live,
             } => self.app.editor_returned(root, rendered, live),
+            Local::EditRead { open, result } => self.app.edit_read(open, result),
+            Local::Saved { root, path, result } => (self.app.saved(root, path, result), None),
             Local::Expanded(root, row, view) => (self.app.set_expanded(root, &row, view), None),
         }
     }
@@ -631,6 +696,56 @@ fn spawn_restore(
         });
         if let Some(results) = joined(restore, &tx, "restore").await {
             let _ = tx.send(Local::Restored(results));
+        }
+    });
+}
+
+/// `Effect::EditInline`: read the row's live bytes for the inline editor, off the UI task.
+///
+/// One `lstat`, one `hash-object`, one `read` and one more `hash-object` — no ledger lock
+/// and nothing written — but it is still file I/O on a path that may be on a slow disk, so
+/// it goes through `blocking` like every other engine call the loop makes.
+fn spawn_read_rendered(
+    engine: &Arc<Mutex<Engine>>,
+    tx: mpsc::UnboundedSender<Local>,
+    open: EditOpen,
+) {
+    let engine = engine.clone();
+    tokio::spawn(async move {
+        let root = open.root.clone();
+        let rendered = open.rendered.clone();
+        let read = tokio::spawn(async move {
+            blocking(&engine, move |e| e.read_rendered(&root, &rendered)).await
+        });
+        if let Some(result) = joined(read, &tx, "read_rendered").await {
+            let _ = tx.send(Local::EditRead { open, result });
+        }
+    });
+}
+
+/// `Effect::Save`: the CAS'd write and its rescan in one `blocking` closure, the same shape
+/// as `spawn_restore`. The path travels to the answer so it can name the file whatever the
+/// editor did in the meantime.
+fn spawn_save(
+    engine: &Arc<Mutex<Engine>>,
+    tx: mpsc::UnboundedSender<Local>,
+    root: PathBuf,
+    rendered: Rendered,
+    bytes: Vec<u8>,
+) {
+    let engine = engine.clone();
+    tokio::spawn(async move {
+        let path = rendered.path.clone();
+        let at = root.clone();
+        let save = tokio::spawn(async move {
+            blocking(&engine, move |e| {
+                e.save(&at, SaveRequest { rendered, bytes })
+                    .map_err(|e| AcceptFailed::of(&e))
+            })
+            .await
+        });
+        if let Some(result) = joined(save, &tx, "save").await {
+            let _ = tx.send(Local::Saved { root, path, result });
         }
     });
 }
@@ -1269,10 +1384,12 @@ pub fn run(
             // A press the previous pass refused to fold (see [`drain`]): folded here,
             // after that pass drew, so it resolves against the frame the user saw.
             let mut held: Option<Event> = None;
-            // Bracketed paste is on only while the note modal lives. It is a terminal mode,
-            // not an app mode, so it is toggled here rather than through an `Effect`: the
-            // modal can close by sending, by cancelling or by quitting, and one comparison
-            // after every pass covers all three without a variant per exit.
+            // Bracketed paste is on while the note modal **or the inline editor** lives
+            // (F12): both hold a text buffer, and a paste into either must arrive as one
+            // insert. It is a terminal mode, not an app mode, so it is toggled here rather
+            // than through an `Effect`: either can close by sending, by cancelling or by
+            // quitting, and one comparison after every pass covers all of it without a
+            // variant per exit.
             let mut paste_on = false;
             loop {
                 // Copied out so the timer future borrows nothing a handler assigns to.
@@ -1404,6 +1521,14 @@ pub fn run(
                         Effect::Restore(reqs) => {
                             spawn_restore(&watcher.engine, local_tx.clone(), reqs)
                         }
+                        Effect::EditInline(open) => {
+                            spawn_read_rendered(&watcher.engine, local_tx.clone(), open)
+                        }
+                        Effect::Save {
+                            root,
+                            rendered,
+                            bytes,
+                        } => spawn_save(&watcher.engine, local_tx.clone(), root, rendered, bytes),
                         Effect::Flag {
                             root,
                             path,
@@ -1566,8 +1691,9 @@ pub fn run(
                     }
                     None => {}
                 }
-                if ui.app.note.is_some() != paste_on {
-                    paste_on = ui.app.note.is_some();
+                let wants_paste = ui.app.note.is_some() || ui.app.editor.is_some();
+                if wants_paste != paste_on {
+                    paste_on = wants_paste;
                     // Before the draw, so the frame that first shows the modal is already
                     // able to receive a paste. A terminal that does not support the mode
                     // ignores the sequence; a write that fails is not worth ending on.

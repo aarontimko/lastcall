@@ -276,6 +276,39 @@ pub struct Ops<'a> {
     pub lock: (u32, Duration),
 }
 
+/// Compare-and-swap one path's live content against the row that was rendered (A6): `Ok`
+/// with the live entry when the working tree still holds exactly what the caller drew,
+/// and the refusal that names the difference otherwise.
+///
+/// Free rather than a method on [`Ops`] because [`crate::Engine::read_rendered`] (Phase 8
+/// deliverable 8) needs the same check without taking a root's ledger: opening the inline
+/// editor writes nothing, so paying for an `Ops` — which borrows the ledger mutably — to
+/// answer one question about the working tree would be a lock the read does not need.
+/// [`Ops::cas_live`] delegates here, so the two callers cannot drift.
+pub fn cas_live(store: &Store, rendered: &Rendered) -> Result<Entry, Refused> {
+    match store.hash_path(&rendered.path) {
+        Current::Absent => Err(Refused::Moved {
+            path: rendered.path.clone(),
+            live: None,
+        }),
+        Current::Unhashable(reason) => Err(Refused::Unhashable {
+            path: rendered.path.clone(),
+            reason,
+        }),
+        Current::Present { oid, mode } => {
+            let live = Entry { oid, mode };
+            if rendered.oid.as_ref() == Some(&live.oid) && rendered.mode == Some(live.mode) {
+                Ok(live)
+            } else {
+                Err(Refused::Moved {
+                    path: rendered.path.clone(),
+                    live: Some(live),
+                })
+            }
+        }
+    }
+}
+
 impl Ops<'_> {
     fn key(path: &[u8]) -> Result<String, Refused> {
         std::str::from_utf8(path)
@@ -390,27 +423,7 @@ impl Ops<'_> {
 
     /// CAS on the live path against the rendered oid/mode.
     fn cas_live(&self, rendered: &Rendered) -> Result<Entry, Refused> {
-        match self.store.hash_path(&rendered.path) {
-            Current::Absent => Err(Refused::Moved {
-                path: rendered.path.clone(),
-                live: None,
-            }),
-            Current::Unhashable(reason) => Err(Refused::Unhashable {
-                path: rendered.path.clone(),
-                reason,
-            }),
-            Current::Present { oid, mode } => {
-                let live = Entry { oid, mode };
-                if rendered.oid.as_ref() == Some(&live.oid) && rendered.mode == Some(live.mode) {
-                    Ok(live)
-                } else {
-                    Err(Refused::Moved {
-                        path: rendered.path.clone(),
-                        live: Some(live),
-                    })
-                }
-            }
-        }
+        cas_live(self.store, rendered)
     }
 
     /// Stage one file accept in memory (no ledger write). `Ok(())` means the override is

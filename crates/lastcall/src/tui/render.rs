@@ -23,8 +23,8 @@ use ratatui::widgets::{Block, Clear, Widget};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::app::{
-    AcceptScope, App, Focus, MIN_SIZE, NAV_MIN_COLS, RootView, Selection, Target, annotation_name,
-    diff_lines, hunk_header, hunk_offsets, plural, restore_question,
+    self, AcceptScope, App, Editor, Focus, MIN_SIZE, NAV_MIN_COLS, RootView, Selection, Target,
+    annotation_name, diff_lines, hunk_header, hunk_offsets, plural, restore_question,
 };
 use super::herdr::{Dot, Link};
 use super::input::{Action, MODAL_KEYS};
@@ -72,6 +72,23 @@ pub fn nothing_pending_short(status: &str) -> String {
 /// select-to-copy item lands.
 pub const SELECT_NOTE: &str = "shift+drag selects text (mouse capture is on)";
 
+/// The inline editor's line-number gutter: four columns of number and one for the `▎` that
+/// marks a line inside a pending hunk (deliverable 8). `App::EDITOR_GUTTER` is the same
+/// number, and the reducer clamps the horizontal scroll to the text width it leaves.
+pub const EDITOR_GUTTER: u16 = app::EDITOR_GUTTER as u16;
+/// The mark on a line inside a pending hunk.
+pub const EDITOR_MARK: &str = "▎";
+/// The tint on every line of the hunk the editor was opened at, so the reader can see the
+/// region they entered while they type around it (the sponsor's addition to ruling P3).
+pub const EDITOR_BAND_BG: Color = Color::Indexed(236);
+/// The cursor's line, over the band.
+pub const EDITOR_CURSOR_BG: Color = Color::Indexed(238);
+/// Drawn in the last column of a row whose content runs off the right edge — the editor
+/// does not soft-wrap, so this is how a reader knows there is more.
+pub const EDITOR_CLIPPED: &str = "→";
+/// The hint line while the editor is open: the two keys that are not text.
+pub const EDITOR_HINTS: &str = "^S save   Esc close";
+
 /// The help overlay's newline note where the terminal cannot tell `Shift-Enter` from
 /// `Enter` (ruling P9): the guaranteed key, and why the other one is not offered.
 pub const NEWLINE_NOTE: &str = "^J is a newline in the note (⇧⏎ needs a kitty-protocol terminal)";
@@ -110,6 +127,10 @@ pub struct HitMap {
     /// [`NAV_MIN_COLS`], or in a frame with no nav pane — so a narrow window does not reset
     /// an offset the user will see again when it widens.
     pub nav_top: Option<usize>,
+    /// The inline editor's **text** area (the gutter already subtracted), when this frame
+    /// drew one: what turns a click into a caret position (deliverable 8). Not a `Target`,
+    /// because a target says *what* was clicked and this has to answer *where*.
+    pub editor: Option<Rect>,
 }
 
 impl HitMap {
@@ -163,11 +184,20 @@ pub fn render(app: &App, frame: &mut Frame<'_>) -> HitMap {
     let header = Rect::new(area.x, area.y, area.width, 1);
     let status = Rect::new(area.x, area.bottom() - 1, area.width, 1);
     let body = Rect::new(area.x, area.y + 1, area.width, area.height - 2);
-    render_header(app, buf, header, &mut hits);
+    match &app.editor {
+        Some(ed) => render_editor_header(ed, buf, header),
+        None => render_header(app, buf, header, &mut hits),
+    }
     render_status(app, buf, status);
 
     let nav_visible = area.width >= NAV_MIN_COLS;
-    let focus = if nav_visible { app.focus } else { Focus::Diff };
+    // The editor lives in the diff pane and holds every key, so the focused border follows
+    // it there whatever `app.focus` says: the nav is not where the typing goes.
+    let focus = if nav_visible && app.editor.is_none() {
+        app.focus
+    } else {
+        Focus::Diff
+    };
     let (nav_area, main_area) = if nav_visible {
         let w = app.nav_width.min(area.width.saturating_sub(20));
         (
@@ -186,7 +216,10 @@ pub fn render(app: &App, frame: &mut Frame<'_>) -> HitMap {
     let main_inner = main_block.inner(main_area);
     main_block.render(main_area, buf);
     hits.main = Some(main_inner);
-    render_main(app, buf, main_inner, &mut hits);
+    match &app.editor {
+        Some(ed) => render_editor(ed, buf, main_inner, &mut hits),
+        None => render_main(app, buf, main_inner, &mut hits),
+    }
 
     if let Some(nav_area) = nav_area {
         let nav_block = Block::bordered().border_style(if focus == Focus::Nav {
@@ -206,6 +239,12 @@ pub fn render(app: &App, frame: &mut Frame<'_>) -> HitMap {
         );
         hits.nav = Some(nav_inner);
         render_nav(app, buf, nav_inner, &mut hits);
+        // The nav stays on screen while the editor is open — the reader keeps the list of
+        // what is left to review in front of them — but dimmed, because none of its keys
+        // work until the editor closes.
+        if app.editor.is_some() {
+            buf.set_style(nav_inner, dim());
+        }
         hits.targets
             .push((Rect::new(x, body.y, 1, body.height), Target::Divider));
     }
@@ -413,6 +452,12 @@ fn render_status(app: &App, buf: &mut Buffer, area: Rect) {
 /// exactly the keys that work there (the modal's own, fixed, and the keymap's `quit`).
 pub fn hints(app: &App, width: u16) -> String {
     let first = |action: &str| app.keys_for(action).first().map(|s| hint_label(s));
+    // The editor swallows the keymap, so naming the keymap's keys here would name keys that
+    // type themselves. Its own two live in the header as well: the hint line is where every
+    // other mode's keys are, and a reader who looks down should not find the nav's.
+    if app.editor.is_some() {
+        return EDITOR_HINTS.to_owned();
+    }
     if app.confirm.is_some() {
         let modal = |name: &str| {
             MODAL_KEYS
@@ -907,6 +952,93 @@ fn render_main(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
     }
     for (i, line) in lines.iter().take(area.height as usize).enumerate() {
         buf.set_line(area.x, area.y + i as u16, line, area.width);
+    }
+}
+
+/// `editing <path> · line <n>/<total> · ^S save   Esc close` — the header row while the
+/// inline editor is open (deliverable 8).
+///
+/// It replaces the app header wholesale rather than sitting beside it: the counts, the
+/// herdr badge and `[Accept All]` all describe a review the reader has stepped out of, and
+/// the `[Accept All]` control in particular is a click target that must not be live while
+/// a buffer is open. Red until the next key when a save was refused — the file on disk is
+/// not what is on screen, and that is worth more than one line of status.
+fn render_editor_header(ed: &Editor, buf: &mut Buffer, area: Rect) {
+    // The keys live in the hint line, where every other key hint in the TUI lives; the
+    // header is the answer to "what am I in, and where in it?" and stays short enough to
+    // survive a narrow frame without ellipsizing the line number away.
+    let text = format!(
+        "editing {} · {}{}",
+        String::from_utf8_lossy(&ed.rendered.path),
+        ed.buf.position_label(),
+        if ed.buf.dirty() { " · unsaved" } else { "" },
+    );
+    let style = if ed.alarm { red() } else { bold() };
+    buf.set_stringn(
+        area.x,
+        area.y,
+        ellipsize(&text, area.width as usize),
+        area.width as usize,
+        style,
+    );
+}
+
+/// The inline editor in the diff pane: a five-column gutter, then the file (deliverable 8).
+///
+/// The gutter carries the line number and, on every line inside a pending hunk, a `▎` — so
+/// the reader can see the rest of the agent's work while they type in one part of it. The
+/// hunk they *entered* is tinted whole, its marks bold: that band is the answer to "which
+/// change was I looking at?", and it grows as they type inside it.
+///
+/// Nothing here scrolls the buffer. `TextBuf::view` draws the window the reducer clamped
+/// after the last key ([`App::clamp_editor`]), because a renderer that moved what it draws
+/// would make the frame depend on when it was drawn.
+fn render_editor(ed: &Editor, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
+    if area.width <= EDITOR_GUTTER || area.height == 0 {
+        return;
+    }
+    let text_w = area.width - EDITOR_GUTTER;
+    let text = Rect::new(area.x + EDITOR_GUTTER, area.y, text_w, area.height);
+    hits.editor = Some(text);
+    let view = ed.buf.view(area.height as usize, text_w as usize);
+    for (i, row) in view.rows.iter().enumerate() {
+        let n = view.first_line + i;
+        let (marked, in_band) = (ed.marked(n), ed.in_band(n));
+        let mark_style = match (marked, in_band) {
+            (true, true) => bold(),
+            (true, false) => Style::new(),
+            (false, _) => dim(),
+        };
+        let mut line = Line::from(vec![
+            Span::styled(format!("{:>4}", n + 1), dim()),
+            Span::styled(
+                if marked { EDITOR_MARK } else { " " }.to_owned(),
+                mark_style,
+            ),
+            Span::raw(row.clone()),
+        ]);
+        let row_style = match (n == ed.buf.cursor.line, in_band) {
+            (true, _) => Style::new().bg(EDITOR_CURSOR_BG),
+            (false, true) => Style::new().bg(EDITOR_BAND_BG),
+            (false, false) => Style::new(),
+        };
+        band(&mut line, area.width, row_style);
+        let y = area.y + i as u16;
+        buf.set_line(area.x, y, &line, area.width);
+        // The right edge, after the line is down: a row that runs off it says so, because
+        // the editor does not wrap and the rest of the line is one `End` away.
+        if view.clipped.get(i) == Some(&true) && text_w > 0 {
+            buf[(text.right() - 1, y)]
+                .set_symbol(EDITOR_CLIPPED)
+                .set_style(row_style.patch(dim()));
+        }
+    }
+    // The caret, reversed rather than left to the terminal's own cursor: the frame is the
+    // only thing a snapshot and a PTY scene can see.
+    let (cy, cx) = view.caret;
+    if (cy as u16) < area.height && (cx as u16) < text_w {
+        let cell = &mut buf[(text.x + cx as u16, area.y + cy as u16)];
+        cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
     }
 }
 
@@ -1484,6 +1616,10 @@ fn render_confirm(app: &App, buf: &mut Buffer, area: Rect) {
             String::from_utf8_lossy(path)
         );
         return confirm_box(" review ", vec![question], buf, area);
+    }
+    if let Some(path) = app.confirm_discard() {
+        let question = format!("Discard changes to {}?", String::from_utf8_lossy(path));
+        return confirm_box(" discard ", vec![question], buf, area);
     }
     let (title, rows) = match app.confirm_restore() {
         Some(scope) => (" restore ", vec![restore_question(scope)]),

@@ -610,6 +610,29 @@ impl TextBuf {
         } else if caret_col >= self.left + width {
             self.left = caret_col + 1 - width;
         }
+        self.view(rows, width)
+    }
+
+    /// The unwrapped window **at the scroll the buffer already has** — no clamping, no
+    /// mutation (Phase 8 deliverable 8).
+    ///
+    /// [`TextBuf::viewport`] is the *reducer's* call: it scrolls to the caret, which is
+    /// buffer state and must survive to the next frame. This is the *renderer's*, which is
+    /// handed a `&App` and must not move anything it is only drawing — and which would
+    /// otherwise have to clone a whole file's worth of lines every frame to be allowed to.
+    /// The inline editor keeps the two honest by re-clamping through `viewport` after every
+    /// key and every resize, so what this returns is always a window the caret is inside;
+    /// a caret outside it anyway is reported at the nearest edge rather than underflowing.
+    pub fn view(&self, rows: usize, width: usize) -> View {
+        if rows == 0 || width == 0 {
+            return View {
+                rows: Vec::new(),
+                caret: (0, 0),
+                first_line: self.top,
+                clipped: Vec::new(),
+            };
+        }
+        let caret_col = self.caret_col();
         let mut out = Vec::new();
         let mut clipped = Vec::new();
         for line in self.lines.iter().skip(self.top).take(rows) {
@@ -618,7 +641,10 @@ impl TextBuf {
             clipped.push(cut);
         }
         View {
-            caret: (self.cursor.line - self.top, caret_col - self.left),
+            caret: (
+                self.cursor.line.saturating_sub(self.top).min(rows - 1),
+                caret_col.saturating_sub(self.left).min(width - 1),
+            ),
             rows: out,
             first_line: self.top,
             clipped,

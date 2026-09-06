@@ -20,13 +20,13 @@ expression: style
 4 9..11 Green Reset REVERSED
 4 11..12 Reset Reset REVERSED
 4 12..14 Red Reset REVERSED
-4 14..27 Reset Reset REVERSED
-4 27..28 Cyan Reset -
-4 28..31 Red Reset -
+4 14..16 Reset Reset REVERSED
+4 16..84 Cyan Reset -
 5 0..1 Cyan Reset -
 5 9..11 Green Reset -
 5 12..14 Red Reset -
-5 16..84 Cyan Reset -
+5 16..17 Cyan Reset -
+5 83..84 Cyan Reset -
 6 0..1 Cyan Reset -
 6 15..16 Green Reset -
 6 16..17 Cyan Reset -

@@ -2291,3 +2291,191 @@ fn pty_editor_ctrl_c_does_not_quit_lastcall() {
     assert_eq!(status.exit_code(), 0, "{status:?}");
     assert_clean_exit(&pty, since);
 }
+
+/// The inline editor's header, as [`render::render_editor_header`] writes it for the middle
+/// hunk of `src/parse.rs` — the line number comes from the fixture text, not from the
+/// engine under test.
+fn editing_parse_rs() -> String {
+    format!(
+        "editing src/parse.rs · line {}/",
+        fixture_parent::parse_rs_edit2_line()
+    )
+}
+
+/// Gate item 1 end to end: `i` opens the file **in** lastcall, typed and pasted text lands
+/// in the buffer, and `Ctrl-S` writes it under the same compare-and-swap an accept uses —
+/// after which the row is gone with nothing left pending, because the bytes on disk are the
+/// bytes the ledger just blessed.
+///
+/// Two files, because they are two different round trips:
+///
+/// * `alpha/src/parse.rs`, which ends in a newline: typing, a **bracketed paste** of two
+///   lines, then `^S`. Every character is on disk and the row is gone.
+/// * `notes/n2.md`, rewritten **without** a trailing newline before the child starts
+///   (design review F6): saving it back must not grow one. A buffer that quietly terminates
+///   the last line rewrites a file the reader never touched that way, and the diff the next
+///   agent sees would be lastcall's, not theirs.
+#[test]
+fn pty_edit_inline_save_pends_nothing() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    // The agent's edit to the draft note, minus the trailing newline.
+    let n2 = fx.parent.join("notes/n2.md");
+    std::fs::write(&n2, "# note 2\n\nedited").expect("the no-EOL draft");
+
+    let Some(mut pty) = fx.spawn_tui(&bin()) else {
+        return;
+    };
+    wait_first_piles(&mut pty);
+    // The watcher's one-shot `watching <parent> (3 roots)` notice is a status; waiting for
+    // it here means the `saved …` status below is the one this scene put there.
+    wait_watching(&mut pty);
+
+    // (1) parse.rs, opened at the middle hunk.
+    open_parse_rs_hunk_2(&mut pty);
+    let t = Instant::now();
+    pty.send(b"i").expect("i");
+    pty.wait_for_text(&editing_parse_rs(), LONG)
+        .unwrap_or_else(|e| panic!("the inline editor opens at the hunk's line: {e}"));
+    note(&format!("PTY inline editor: open in {:.3?}", t.elapsed()));
+
+    // Type a line, then paste two more as one bracketed paste.
+    pty.send(b"// typed inline\r").expect("typing");
+    pty.wait_for_text("// typed inline", Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("the typed line is in the buffer: {e}"));
+    pty.send(b"\x1b[200~// pasted one\n// pasted two\n\x1b[201~")
+        .expect("paste");
+    pty.wait_for_text("// pasted two", Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("the pasted block is in the buffer: {e}"));
+
+    let t = Instant::now();
+    pty.send(b"\x13").expect("ctrl-s");
+    pty.wait_for(OVERLOADED, |s| {
+        status_is(s, "saved src/parse.rs") && !s.contents().contains("M parse.rs")
+    })
+    .unwrap_or_else(|e| panic!("^S saves and the row goes away: {e}"));
+    note(&format!(
+        "PTY inline editor: ^S to saved in {:.3?}",
+        t.elapsed()
+    ));
+
+    let on_disk = std::fs::read_to_string(fx.parent.join("alpha").join(fixture_parent::PARSE_RS))
+        .expect("parse.rs");
+    for line in ["// typed inline", "// pasted one", "// pasted two"] {
+        assert!(on_disk.contains(line), "{line} is on disk:\n{on_disk}");
+    }
+    assert!(
+        on_disk.contains(fixture_parent::PARSE_RS_EDIT2),
+        "and the agent's own line survived the round trip"
+    );
+    assert!(
+        !pty.screen_text().contains("editing src/parse.rs"),
+        "a clean save closes the editor:\n{}",
+        pty.screen_text()
+    );
+
+    // (2) the draft note with no trailing newline. `Esc` first: the save left the focus in
+    // the diff pane, where `j` scrolls the diff instead of walking the nav.
+    pty.send(b"\x1b").expect("esc back to the nav");
+    select_until(&mut pty, "n2.md  M");
+    pty.send(b"\r").expect("open n2.md");
+    pty.wait_for_text("@@ -", Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("n2.md's diff: {e}"));
+    pty.send(b"i").expect("i");
+    pty.wait_for_text("editing n2.md · line", LONG)
+        .unwrap_or_else(|e| panic!("the inline editor on the draft note: {e}"));
+    pty.send(b"more ").expect("typing");
+    pty.wait_for_text("more ", Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("the typed text is in the buffer: {e}"));
+    pty.send(b"\x13").expect("ctrl-s");
+    pty.wait_for(OVERLOADED, |s| {
+        status_is(s, "saved n2.md") && !s.contents().contains("M n2.md")
+    })
+    .unwrap_or_else(|e| panic!("^S saves the draft note: {e}"));
+
+    let note_text = std::fs::read_to_string(&n2).expect("n2.md");
+    assert!(
+        note_text.contains("more "),
+        "the typed text is on disk: {note_text:?}"
+    );
+    assert!(
+        !note_text.ends_with('\n'),
+        "saving a file with no trailing newline must not grow one (F6): {note_text:?}"
+    );
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}
+
+/// The save's compare-and-swap on screen: an agent writes the file while the reader is
+/// typing in it, and `^S` refuses. Nothing is written, **every character the reader typed
+/// stays in the buffer** — throwing their work away to tell them the file moved would be
+/// the worst possible reading of "not saved" — and the status names the two keys that
+/// reload.
+#[test]
+fn pty_edit_inline_save_refused_when_the_file_moved() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let Some(mut pty) = fx.spawn_tui(&bin()) else {
+        return;
+    };
+    wait_first_piles(&mut pty);
+    wait_watching(&mut pty);
+
+    pty.send(b"jj\r").expect("keys");
+    pty.wait_for_text("f1  M  +1 −1", Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("f1 open: {e}"));
+    pty.send(b"i").expect("i");
+    pty.wait_for_text("editing f1 · line", LONG)
+        .unwrap_or_else(|e| panic!("the inline editor on f1: {e}"));
+    pty.send(b"typed but never saved ").expect("typing");
+    pty.wait_for_text("typed but never saved", Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("the typed text is in the buffer: {e}"));
+
+    // The agent writes f1 underneath the open buffer.
+    fx.append("alpha/f1", "moved while the editor was open\n");
+    let before = std::fs::read(fx.parent.join("alpha/f1")).expect("read f1");
+
+    let t = Instant::now();
+    pty.send(b"\x13").expect("ctrl-s");
+    pty.wait_for(OVERLOADED, |s| {
+        status_is(
+            s,
+            "f1: changed since you opened it; not saved — Esc, then i to reload",
+        )
+    })
+    .unwrap_or_else(|e| panic!("the refusal status: {e}"));
+    note(&format!(
+        "PTY inline save refused: status after {:.3?}",
+        t.elapsed()
+    ));
+    assert_eq!(
+        std::fs::read(fx.parent.join("alpha/f1")).expect("read f1"),
+        before,
+        "a refused save writes nothing at all"
+    );
+    let screen = pty.screen_text();
+    assert!(
+        screen.contains("editing f1 · line") && screen.contains("typed but never saved"),
+        "the buffer is kept whole:\n{screen}"
+    );
+
+    // Esc asks before throwing the text away; `y` is the only thing that does.
+    pty.send(b"\x1b").expect("esc");
+    pty.wait_for_text("Discard changes to f1?", Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("the discard question: {e}"));
+    pty.send(b"y").expect("y");
+    pty.wait_for(OVERLOADED, |s| {
+        !s.contents().contains("editing f1") && s.contents().contains("M f1")
+    })
+    .unwrap_or_else(|e| panic!("the editor closes and the row is still pending: {e}"));
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}
