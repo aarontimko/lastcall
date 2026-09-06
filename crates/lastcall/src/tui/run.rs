@@ -1291,6 +1291,12 @@ impl Signals {
     /// because that is an `unsafe fn` and this workspace is `unsafe_code = "forbid"` — see
     /// the report's ruling note. The child is unaffected either way: `exec` resets handlers
     /// to `SIG_DFL`, and only `SIG_IGN` would have been inherited.
+    ///
+    /// The residual (verifier (b) F5): the handler is installed for the **life of the
+    /// process** and nobody ever reads the stream, so `kill -QUIT <lastcall>` from another
+    /// terminal does nothing at all — not just during a suspend. Anyone reaching for
+    /// `SIGQUIT` on a lastcall they think is hung should use `TERM` or `INT`, which quit
+    /// through the restore path; `tui.md`'s suspend step 4 says so too.
     fn register() -> Signals {
         #[cfg(unix)]
         {

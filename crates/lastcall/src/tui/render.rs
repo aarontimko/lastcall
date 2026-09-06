@@ -2459,13 +2459,25 @@ mod tests {
         );
         app.handle(Action::Open);
         assert_eq!(hints(&app, 120), nav_line, "the diff pane says the same");
-        // Deliverable 9: `v select  y copy` are the diff pane's own keys, and they are
-        // tier 2 — a line with room for `Tab focus` has room for them, and one without
-        // keeps the accept hints instead.
+        // Deliverable 9: `v select  y copy` are the diff pane's own keys on their own tier
+        // (3), dropped before every hint that was on the line before them — so a frame that
+        // loses them keeps `Tab focus`/`r refresh` and everything under it.
         assert_eq!(
             hints(&app, 140),
             "↑↓ select  ⏎ open  n/p hunk  a accept hunk  A accept file  ^A accept all  Tab focus  r refresh  v select  y copy  ? help  q quit"
         );
+        // The threshold `tui.md` quotes, pinned (verifier (b) F7): the tier-3 line for a
+        // file row is exactly 128 columns wide, so 128 shows it and 127 falls back to the
+        // tier-2 line — which is the same one the nav gets.
+        assert_eq!(hints(&app, 128), hints(&app, 140));
+        assert_eq!(hints(&app, 127), nav_line, "one column short of tier 3");
+        // What the line says depends on the selection, so the threshold does too: a root
+        // row trades `a accept hunk  A accept file` for `a accept all in <root>`, which is
+        // seven columns shorter with this fixture's names.
+        let mut at_root = app.clone();
+        at_root.select(Some(Selection::Root(root("alpha"))));
+        assert!(hints(&at_root, 121).contains("y copy"));
+        assert!(!hints(&at_root, 120).contains("y copy"));
         assert!(!nav_line.contains("y copy"), "the nav has no copy key");
         app.handle(Action::Back);
         assert!(
