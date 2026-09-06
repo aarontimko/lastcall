@@ -446,8 +446,8 @@ Both editors open on the **same line**: `App::edit_hunk` picks the content hunk 
 diff cursor when the diff has focus and the row's first content hunk otherwise, and
 `Hunk::editor_line()` turns it into a one-based line past the hunk's leading context. The
 synthetic mode hunk is never it — there is no text in it — and a row with no content hunk at
-all opens at line 1. `i` and `shift-i` share the function, which is what keeps them from landing on two different
-hunks of one row; the rule is pinned once per key —
+all opens at line 1. `i` and `shift-i` share the function, which is what keeps them from
+landing on two different hunks of one row; the rule is pinned once per key —
 `app_edit_external_from_the_nav_uses_the_first_hunk_line` (nav → first hunk, diff → the hunk
 under the cursor, a collapsed row → line 1) and
 `app_edit_opens_at_the_hunk_line_and_marks_its_lines`.
@@ -639,7 +639,20 @@ A spawn that never started (`<program>: not found`) is a status line and nothing
 child that ran — whatever its exit status; an editor that quits with an error still wrote, or
 did not — produces `Effect::EditorReturned`, and the answer table is in
 [`engine.md`](engine.md) under "The blessing on `$EDITOR` return": `no change`, one of the
-four `left pending` sentences, or a confirm that blesses the file at what the editor left.
+four `left pending` sentences, or the confirm
+`<path> changed while your editor was open — mark as reviewed?` (`y`/`Enter` → an accept of
+the live row, status `reviewed <path>`; `n`/`Esc` → nothing written, the row stays pending).
+
+**What that confirm guards, and what it does not.** lastcall cannot tell who wrote the bytes
+on the disk — the editor's save and an agent's write look identical from outside — but the
+*user* knows whether they saved. So a prompt after a session in which they saved nothing is
+how an agent's write announces itself, and answering `n` costs nothing but a row that stays
+pending. The guard for the other half — an agent writing the file **while** the session is
+open — is not lastcall's at all: it is the editor's own changed-on-disk warning (vim's
+`W12 Warning: File ... has changed since editing started`, VS Code's reload prompt, Emacs's
+"has changed on disk; really edit the buffer?", Helix's `:w` refusal). lastcall relies on it
+and says so here rather than pretending to a guard it cannot hold: for the duration of the
+suspend lastcall is not running, has no terminal, and reads nothing.
 The `left pending` case that is easiest to misread is the one verifier (a) F1 added: a
 confirm, note or picker already on screen is **never** replaced by the return, because the
 return arrives on a channel and the reader's next `y` would answer a question they never saw.
