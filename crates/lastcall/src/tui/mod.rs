@@ -3,6 +3,7 @@
 //! Layering, worker by worker:
 //! - `term`   — raw mode, alternate screen, mouse capture, panic-safe restore, file-only tracing.
 //! - `app`    — the pure state (`App`) and its reducers `apply` / `handle` / `sync_roots`.
+//! - `editor` — pure `$VISUAL`/`$EDITOR` resolution and the per-editor "open at line" argv.
 //! - `input`  — the `Action` vocabulary and `DEFAULT_KEYMAP`, `to_action(Event, &Keymap)`
 //!   and `Keymap::from_config` (the `[keys]` table).
 //! - `render` — `render(&App, frame) -> HitMap`, plus `styles(&Buffer)` for the snapshot tier.
@@ -15,6 +16,7 @@
 //! ledger or git, and it holds no review state of its own.
 
 pub mod app;
+pub mod editor;
 pub mod herdr;
 pub mod input;
 pub mod render;
