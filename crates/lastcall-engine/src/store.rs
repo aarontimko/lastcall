@@ -452,6 +452,14 @@ impl Store {
     /// already-canonical blob content.
     ///
     /// A draft root has no `.gitattributes`, so the two calls agree there trivially.
+    ///
+    /// **`-w` writes the object, so a save that is then refused leaves an orphan blob in
+    /// the store** (verifier (a) F6). That is deliberate and it is the same class of orphan
+    /// a scan's `hash_path -w` leaves for content nobody ever accepts: the store is never
+    /// gc'd (§11), the object is small, and the alternative — hashing without `-w` and
+    /// writing the object after the rename — would mean a fresh read of a file an agent may
+    /// have touched in between, which is exactly the window design review F1 closed. Do not
+    /// "fix" this into a post-rename read.
     pub fn hash_bytes_as(&self, rel: &[u8], bytes: &[u8]) -> Result<Oid, StoreError> {
         let mut path_arg = OsString::from("--path=");
         path_arg.push(OsStr::from_bytes(rel));

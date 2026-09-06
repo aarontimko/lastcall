@@ -293,17 +293,26 @@ The modal's key discipline (`input::note_action`):
 | `Enter` | send: `Effect::Flag`, the modal closes (an empty note is allowed: the flag is the message) |
 | `Ctrl-J` | newline (works in every terminal) |
 | `Alt-Enter` | newline, where the terminal reports Alt (Option-as-Meta) |
+| `Ctrl-Enter` | newline, where the terminal can tell it from `Enter` — the same kitty-protocol condition as `Shift-Enter`; everywhere else those bytes *are* `Enter` and send |
 | `Shift-Enter` | newline **only** under the kitty keyboard protocol — see below |
 | `←` `→` `↑` `↓`, `Home`/`End`, `PgUp`/`PgDn` | move the caret (`TextBuf::apply`) |
 | `Ctrl-A` / `Ctrl-E` | line start / line end |
 | `Alt-←` / `Alt-→` (or `Ctrl-`) | word left / word right |
 | `Backspace`, `Delete` | delete around the caret |
+| `Ctrl-H` | Backspace: crossterm reports the byte `0x08` as ctrl-h (only `0x7f` is `Backspace`), so a terminal set to send `^H` for its Backspace key keeps the key |
 | `Alt-Backspace` / `Ctrl-W` | delete the word before the caret |
 | `Ctrl-K` | delete to the end of the line |
 | `Tab` | inserts a tab character |
 | `Esc` | cancel — nothing is written |
 | the `quit` binding, non-printable only | quit (`Ctrl-C` by default): a modal is never a trap |
 | anything else | swallowed |
+
+The buffer gets first refusal, so **a `[keys] quit` bound to `ctrl-a`, `ctrl-e`, `ctrl-h`,
+`ctrl-j`, `ctrl-k` or `ctrl-w` is typed or moved as an edit inside the buffer, not obeyed**
+(verifier (a) F7). That is the intended direction — a note is text, and losing a line to a
+rebound quit is worse than needing `Ctrl-C` — but it is the reason to keep `quit` on a key
+the buffer has no use for. `Ctrl-U` is swallowed with no edit at all.
+
 
 The modal edits a [`TextBuf`](../../crates/lastcall/src/tui/textbuf.rs), the same buffer the
 inline editor uses, so what is typed round-trips byte for byte.

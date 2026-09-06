@@ -164,14 +164,25 @@ pub enum EditKey {
 /// is why `enhanced` is a parameter: with no keyboard-enhancement flags the two are the
 /// same byte, and promising a key that silently sends the note instead is worse than not
 /// promising it (deliverable 5). `Ctrl-J` is the binding that always works.
+///
+/// `Ctrl-Enter` is a newline too (verifier (a) F5): every chat UI the reviewer came from
+/// treats it as one, and it is only ever distinguishable from `Enter` under the same kitty
+/// protocol `Shift-Enter` needs — so where it can be told apart it breaks the line, and
+/// where it cannot it is a plain `Enter` and sends, which is the honest default.
+///
+/// `Ctrl-H` is `Backspace` (verifier (a) F4): crossterm parses the byte `0x08` as
+/// `Char('h') + CONTROL` — only `0x7f` is `KeyCode::Backspace` — so a terminal configured
+/// to send `^H` for its Backspace key (xterm `backarrowKey`, some tmux and urxvt setups)
+/// would otherwise lose Backspace entirely.
 pub fn edit_key(key: &Key, enhanced: bool) -> Option<EditKey> {
     let alt_or_ctrl = key.alt || key.ctrl;
     Some(match key.code {
-        KeyCode::Enter if key.alt => EditKey::Newline,
+        KeyCode::Enter if key.alt || key.ctrl => EditKey::Newline,
         KeyCode::Enter if key.shift && enhanced => EditKey::Newline,
         KeyCode::Char('j') if key.ctrl => EditKey::Newline,
         KeyCode::Backspace if key.alt || key.ctrl => EditKey::WordBackspace,
         KeyCode::Char('w') if key.ctrl => EditKey::WordBackspace,
+        KeyCode::Char('h') if key.ctrl => EditKey::Backspace,
         KeyCode::Backspace => EditKey::Backspace,
         KeyCode::Delete => EditKey::Delete,
         KeyCode::Left if alt_or_ctrl => EditKey::WordLeft,

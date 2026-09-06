@@ -26,6 +26,14 @@
 //! **display row** and `left` stays 0. A buffer is rendered in one mode for its whole life —
 //! the modal wraps, the editor does not — so the two readings never meet on one value.
 //!
+//! **A terminated buffer's final newline is not editable** (verifier (a) F9). `from("\n")`
+//! is one line with `last_terminated = true`; the cursor cannot pass the end of the last
+//! line, so `Delete` there does nothing and a user cannot strip a file's trailing newline
+//! from inside lastcall. That is vim's `eol` semantics and it is consistent both ways —
+//! `""` plus a `Newline` is two unterminated lines that also round-trip to `"\n"`. It is
+//! irrelevant to the note modal; in the inline editor it is a documented limit, and
+//! `$EDITOR` (`shift-i`) is the way out of it.
+//!
 //! Pure: no I/O, no `Instant`, no terminal. The reducer owns a `TextBuf`; `render` reads a
 //! [`View`] out of it.
 
@@ -303,12 +311,20 @@ impl TextBuf {
     }
 
     /// Insert `text` at the cursor, splitting on `\n` — how a bracketed paste lands, as one
-    /// edit rather than a key storm. A `\r\n` in the pasted text makes a CRLF line, matching
-    /// what [`TextBuf::from`] would have done with the same bytes.
+    /// edit rather than a key storm.
+    ///
+    /// A `\r\n` in the pasted text takes the **buffer's dominant ending**, not `CrLf`
+    /// (verifier (a) F3). A clipboard is not a file: a traceback copied out of PowerShell
+    /// pastes CRLF, and giving those lines `CrLf` inside an LF buffer mixes endings into a
+    /// file the user never touched that way — and, in the note modal, writes a ledger note
+    /// whose export reads `line^M` on every pasted line. `CrLf` survives a paste only into
+    /// a buffer that already uses it. The round trip is unaffected: that is
+    /// [`TextBuf::from`], which does read a file and does keep every ending it finds.
     pub fn insert_str(&mut self, text: &str) {
         if text.is_empty() {
             return;
         }
+        let pasted_end = dominant(&self.lines);
         let at = Self::byte_of(self.cur(), self.cursor.col);
         let tail = self.lines[self.cursor.line].text.split_off(at);
         let end = self.lines[self.cursor.line].end;
@@ -316,7 +332,7 @@ impl TextBuf {
         while let Some(i) = rest.find('\n') {
             let seg = &rest[..i];
             let (body, seg_end) = match seg.strip_suffix('\r') {
-                Some(body) => (body, Ending::CrLf),
+                Some(body) => (body, pasted_end),
                 None => (seg, end),
             };
             self.lines[self.cursor.line].text.push_str(body);
@@ -387,6 +403,12 @@ impl TextBuf {
 
     /// Merge the cursor's line into the one above it, cursor at the seam. The **upper**
     /// line's ending is the one that goes — it is the terminator that just stopped existing.
+    ///
+    /// So the surviving line takes the **lower** line's ending, and in a mixed-ending file
+    /// a join can change a byte outside the join itself (`"a\nb\r\n"`, Backspace at the
+    /// start of line 2, gives `"ab\r\n"` — verifier (a) F8). That is the defensible
+    /// reading: the terminator that survives is the one that was never deleted. It is
+    /// recorded here so the inline editor's tests do not later read it as a bug.
     fn join_up(&mut self) {
         let line = self.lines.remove(self.cursor.line);
         self.cursor.line -= 1;
@@ -843,9 +865,10 @@ mod tests {
         buf.mark_saved();
         assert!(!buf.dirty());
 
-        // A paste lands as one edit and splits on newlines, CRLF included.
+        // A paste lands as one edit and splits on newlines, CRLF included — and the pasted
+        // lines take this buffer's ending, which is LF (see the dedicated test below).
         buf.insert_str("1\r\n2\n");
-        assert_eq!(buf.text(), "aX1\r\n2\nb\n");
+        assert_eq!(buf.text(), "aX1\n2\nb\n");
         assert_eq!(buf.cursor, Pos { line: 2, col: 0 });
         assert!(buf.dirty(), "a paste is a change");
 
@@ -862,6 +885,44 @@ mod tests {
         tail.insert_str("y\nz");
         assert_eq!(tail.text(), "xy\nz");
         assert!(!tail.last_terminated);
+    }
+
+    /// Verifier (a) F3. A clipboard is not a file: the CRLF in a paste says where the text
+    /// was copied from, not what this buffer's lines look like. So a pasted `\r\n` takes the
+    /// buffer's dominant ending, and `CrLf` survives only into a buffer that already uses it.
+    #[test]
+    fn textbuf_paste_of_crlf_takes_the_buffers_dominant_ending() {
+        // An LF file: the paste is flattened to LF and no `\r` reaches the text.
+        let mut lf = TextBuf::from("a\nb\n");
+        lf.cursor = Pos { line: 0, col: 1 };
+        lf.insert_str("1\r\n2");
+        assert_eq!(lf.text(), "a1\n2\nb\n");
+        assert!(
+            lf.lines.iter().all(|l| l.end == Ending::Lf),
+            "no CRLF line was seeded: {:?}",
+            lf.lines
+        );
+
+        // The note modal's buffer is empty, so it is LF by default: the ledger note (and
+        // the export line built from it) is free of `^M`.
+        let mut note = TextBuf::default();
+        note.insert_str("Traceback\r\n  line 1\r\n");
+        assert_eq!(note.text(), "Traceback\n  line 1\n");
+
+        // A CRLF file keeps CRLF: pasting into it must not seed an LF line either.
+        let mut crlf = TextBuf::from("a\r\nb\r\n");
+        crlf.cursor = Pos { line: 0, col: 1 };
+        crlf.insert_str("1\r\n2");
+        assert_eq!(crlf.text(), "a1\r\n2\r\nb\r\n");
+        assert!(
+            crlf.lines.iter().all(|l| l.end == Ending::CrLf),
+            "{:?}",
+            crlf.lines
+        );
+
+        // Reading a mixed file back is a different job and still keeps every ending it
+        // finds — the round-trip property is `From`, not `insert_str`.
+        assert_eq!(TextBuf::from("a\r\nb\n").text(), "a\r\nb\n");
     }
 
     #[test]

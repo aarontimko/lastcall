@@ -5891,6 +5891,9 @@ mod tests {
         for newline in [
             note_key_event(KeyCode::Char('j'), KeyModifiers::CONTROL),
             note_key_event(KeyCode::Enter, KeyModifiers::ALT),
+            // Verifier (a) F5: chat UIs read `Ctrl-Enter` as a line break, and where the
+            // terminal cannot tell it from `Enter` this arm is simply never reached.
+            note_key_event(KeyCode::Enter, KeyModifiers::CONTROL),
         ] {
             let mut app = note_open();
             for c in "one".chars() {
@@ -5908,7 +5911,18 @@ mod tests {
             assert_eq!(note, "one\n2", "both lines, as typed");
         }
 
-        // Backspace walks back a character at a time; Esc throws the lot away.
+        // Backspace walks back a character at a time; Esc throws the lot away. `^H` is
+        // Backspace too (verifier (a) F4): crossterm reports the byte 0x08 as ctrl-h, and a
+        // terminal set to send it for its Backspace key must not lose the key.
+        for backspace in [
+            note_key_event(KeyCode::Backspace, KeyModifiers::NONE),
+            note_key_event(KeyCode::Char('h'), KeyModifiers::CONTROL),
+        ] {
+            let mut app = note_open();
+            type_note(&mut app, "xy");
+            assert_eq!(note_feed(&mut app, &backspace), (Changed::Yes, None));
+            assert_eq!(app.note.as_ref().expect("open").text(), "x");
+        }
         let backspace = note_key_event(KeyCode::Backspace, KeyModifiers::NONE);
         let mut app = note_open();
         note_feed(&mut app, &note_char('x'));
