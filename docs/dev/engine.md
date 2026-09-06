@@ -476,7 +476,11 @@ The summary is `Flag.summary` (`FlagSummary { hunks, added, deleted }`), an **op
 same reason `of` is (F14), never from a rescan an agent may have invalidated. A flag
 written before v1.8 has none and prints no summary line — the `whole file` segment is
 unconditional, the line is not. A hunk flag never prints one: `Ops::flag` drops a summary
-offered beside a hunk rather than write a flag that claims to be both.
+offered beside a hunk rather than write a flag that claims to be both. The TUI also sends
+**no** summary for a collapsed row nobody expanded (verifier (a) F2): there are no hunks
+the scan counted, and on a `Binary` row the `+a −d` are not line counts of a diff — an
+absent line is honest where `0 hunks · +1 −1` would be a claim about the file
+(`app_flag_on_a_collapsed_row_carries_no_summary`).
 
 An `unflag`, or a refusal, leaves `export` empty.
 

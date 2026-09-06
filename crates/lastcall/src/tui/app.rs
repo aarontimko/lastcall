@@ -449,7 +449,10 @@ pub enum FlagTarget {
         /// The row's shape as it was on screen: the export prints it instead of a diff
         /// (ruling P4, Amendment v1.8), and the modal's title says `whole file` because of
         /// it.
-        summary: FlagSummary,
+        ///
+        /// `None` on a collapsed row that was never expanded: there is nothing the scan
+        /// counted, and the export then prints no summary line (verifier (a) F2).
+        summary: Option<FlagSummary>,
     },
 }
 
@@ -496,11 +499,11 @@ impl FlagTarget {
     }
 
     /// The shape a whole-file flag covers; `None` for a hunk flag, which quotes its lines
-    /// instead.
+    /// instead, and `None` for a collapsed row that was never expanded (F2).
     pub fn summary(&self) -> Option<FlagSummary> {
         match self {
             FlagTarget::Hunk { .. } => None,
-            FlagTarget::File { summary, .. } => Some(*summary),
+            FlagTarget::File { summary, .. } => *summary,
         }
     }
 
@@ -1514,14 +1517,21 @@ impl App {
         // The shape travels with a whole-file flag because the export has no diff to show
         // (ruling P4): the counts are the row's as rendered, taken now, for the same reason
         // `of` is (F14).
+        //
+        // Except on a collapsed row nobody expanded: it has no hunks to count, and on a
+        // Binary row the `+a −d` are not line counts of anything the scan diffed. A summary
+        // there would tell the agent a changed file has zero hunks, which is a claim about
+        // the file rather than about lastcall's view of it — so there is no summary and the
+        // export prints no summary line (verifier (a) F2).
+        let counted = row.collapsed.is_none() || self.expansion().is_some();
         Some(FlagTarget::File {
             root,
             path,
-            summary: FlagSummary {
+            summary: counted.then_some(FlagSummary {
                 hunks: content,
                 added: row.added,
                 deleted: row.deleted,
-            },
+            }),
         })
     }
 
@@ -5342,6 +5352,57 @@ mod tests {
             hunk_header(&app.view_hunks()[2]),
             "the header the reader was looking at"
         );
+    }
+
+    /// Verifier (a) F2: a collapsed row nobody expanded has no hunks the scan counted, so a
+    /// whole-file flag on it carries **no** summary rather than one claiming `0 hunks`. On a
+    /// Binary row the line counts are not even line counts of a diff. Expanding a Glob row
+    /// gives the counts back, because then there is something on screen to count.
+    #[test]
+    fn app_flag_on_a_collapsed_row_carries_no_summary() {
+        for kind in [Collapsed::Glob, Collapsed::Binary] {
+            let mut app = three_roots();
+            app.handle(Action::Resize(100, 30));
+            app.apply(pile_event_seq("alpha", 1, alpha_collapsed(kind)));
+            app.select(Some(row("alpha", "f1")));
+
+            app.handle(Action::Flag);
+            let target = app.note.as_ref().expect("open").target.clone();
+            assert_eq!(target.label(), "f1 · whole file", "{kind:?}");
+            assert_eq!(
+                target.summary(),
+                None,
+                "{kind:?}: nothing was diffed, so nothing is claimed"
+            );
+
+            // …and the flag the engine seam receives carries the absence too.
+            let (_, effect) = app.handle(Action::Note(NoteKey::Send));
+            let Some(Effect::Flag { summary, hunk, .. }) = effect else {
+                panic!("{kind:?}: Enter sends: {effect:?}");
+            };
+            assert_eq!(summary, None, "{kind:?}");
+            assert_eq!(hunk, None, "{kind:?}: a whole-file flag");
+        }
+
+        // Expanded, the Glob row has hunks on screen and the summary comes back.
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.apply(pile_event_seq("alpha", 1, alpha_collapsed(Collapsed::Glob)));
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Expand);
+        let asked = app.selected_row().expect("f1").clone();
+        app.set_expanded(root("alpha"), &asked, expansion_of(2, 0));
+        assert_eq!(app.view_hunks().len(), 2, "the expansion is on screen");
+
+        app.handle(Action::Flag);
+        let summary = app
+            .note
+            .as_ref()
+            .expect("open")
+            .target
+            .summary()
+            .expect("an expanded row counts");
+        assert_eq!(summary.hunks, 2, "the hunks the reader can see");
     }
 
     /// F14: the target is captured when `m` is pressed. A pile that lands while the note is
