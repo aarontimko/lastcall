@@ -1050,6 +1050,51 @@ mod tests {
         assert_eq!(to_action(&key('q'), &km), Some(Action::Refresh));
     }
 
+    /// Deliverable 11: the four keys Phase 8 added are configurable like every other one —
+    /// `[keys]` resolves them by name, the override replaces the default, and the help
+    /// overlay has a short description for each (design review F15).
+    #[test]
+    fn keys_config_accepts_the_phase8_actions() {
+        for (name, default, action) in [
+            ("edit", 'i', Action::Edit),
+            ("edit_external", 'I', Action::EditExternal),
+            ("select", 'v', Action::Select),
+            ("copy", 'y', Action::Copy),
+        ] {
+            assert_eq!(Action::from_name(name), Some(action.clone()), "{name}");
+            let described = Action::describe(name);
+            assert!(!described.is_empty(), "{name} has no help row");
+            assert!(
+                described.chars().count() <= 30,
+                "{name}: {described:?} would cost the overlay its second column"
+            );
+            // The default, then an override of it: `ctrl-t` is bound to nothing, so the
+            // only way it can resolve is through the config.
+            let km = Keymap::defaults();
+            assert_eq!(
+                to_action(&key(default), &km),
+                Some(action.clone()),
+                "{name}"
+            );
+            let km = Keymap::from_config(&keys(&[(name, &["ctrl-t"])])).unwrap();
+            assert_eq!(
+                to_action(&key_code(KeyCode::Char('t'), KeyModifiers::CONTROL), &km),
+                Some(action.clone()),
+                "{name} rebinds"
+            );
+            assert_eq!(
+                to_action(&key(default), &km),
+                None,
+                "{name}'s default is replaced, not appended"
+            );
+        }
+        // And an unknown name is still an error, so a typo is not silently a no-op.
+        assert!(matches!(
+            Keymap::from_config(&keys(&[("copy_selection", &["y"])])),
+            Err(KeymapError::UnknownAction { .. })
+        ));
+    }
+
     #[test]
     fn input_override_replaces_defaults_rather_than_appending() {
         // `z`, not `v`: `v` is `select`'s default since deliverable 9, and binding it to a

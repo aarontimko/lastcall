@@ -7536,6 +7536,107 @@ mod tests {
         assert_eq!(effect, Some(Effect::Quit), "quitting writes no flag");
     }
 
+    // ---- deliverable 11: the reducer's remaining promises -------------------------------
+
+    /// From the nav there is no diff cursor to read, so both editor keys open at the row's
+    /// **first** hunk — and a row with no hunks at all opens at line 1.
+    #[test]
+    fn app_edit_external_from_the_nav_uses_the_first_hunk_line() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        // Three hunks at known places; `f1`'s own first line is a deletion, so each hunk's
+        // editor line is its `new_range.start + 1`.
+        app.apply(pile_event_seq(
+            "alpha",
+            1,
+            alpha_ranges(&[(4, 8), (20, 24), (40, 44)]),
+        ));
+        app.select(Some(row("alpha", "f1")));
+        assert_eq!(app.effective_focus(), Focus::Nav);
+        let (_, effect) = app.handle(Action::EditExternal);
+        let Some(Effect::EditExternal { line, .. }) = effect else {
+            panic!("an external-edit effect, got {effect:?}");
+        };
+        assert_eq!(line, 5, "the first hunk's first changed line");
+
+        // In the diff the cursor decides, which is the whole reason the nav needs a rule.
+        app.handle(Action::Open);
+        app.handle(Action::HunkNext);
+        let (_, effect) = app.handle(Action::EditExternal);
+        let Some(Effect::EditExternal { line, .. }) = effect else {
+            panic!("an external-edit effect, got {effect:?}");
+        };
+        assert_eq!(line, 21, "the hunk under the cursor");
+
+        // A collapsed row carries no hunks: there is no line to name, so it opens at 1.
+        let mut collapsed = three_roots();
+        collapsed.handle(Action::Resize(100, 30));
+        collapsed.apply(pile_event_seq("alpha", 1, alpha_collapsed(Collapsed::Glob)));
+        collapsed.select(Some(row("alpha", "f1")));
+        let (_, effect) = collapsed.handle(Action::EditExternal);
+        let Some(Effect::EditExternal { line, .. }) = effect else {
+            panic!("an external-edit effect, got {effect:?}");
+        };
+        assert_eq!(line, 1);
+    }
+
+    /// Every modal owns the keyboard while it is open, and that includes the three keys
+    /// Phase 8 added: `i`, `shift-i` and `v` do nothing under the note, the picker or the
+    /// confirm, and nothing under the help overlay but close it.
+    #[test]
+    fn app_edit_and_select_are_swallowed_while_a_modal_is_open() {
+        let keys = [
+            Action::Edit,
+            Action::EditExternal,
+            Action::Select,
+            Action::Copy,
+        ];
+
+        // The confirm: a restore is waiting on an answer, and an editor opened over it
+        // would take the keys that answer it.
+        let mut confirm = diff_at_f1();
+        confirm.handle(Action::RestoreFile);
+        assert!(confirm.confirm.is_some());
+        for action in keys.clone() {
+            assert_eq!(
+                confirm.handle(action.clone()),
+                (Changed::No, None),
+                "{action:?}"
+            );
+        }
+        assert!(confirm.confirm.is_some(), "and the question is still up");
+        assert!(confirm.editor.is_none() && confirm.sel.is_none());
+
+        // The note modal, which is itself a text field: `i` and `v` are characters in it,
+        // and `Ui::event` never turns them into these actions — but the reducer refuses
+        // them too, so neither path can open an editor under a modal.
+        let mut note = diff_at_f1();
+        note.handle(Action::Flag);
+        assert!(note.note.is_some());
+        for action in keys.clone() {
+            assert_eq!(
+                note.handle(action.clone()),
+                (Changed::No, None),
+                "{action:?}"
+            );
+        }
+        assert!(note.note.is_some() && note.editor.is_none() && note.sel.is_none());
+
+        // The help overlay is not a modal but a layer: the first key closes it and is
+        // spent doing so, exactly as every other key is.
+        for action in keys {
+            let mut help = diff_at_f1();
+            help.help = true;
+            assert_eq!(
+                help.handle(action.clone()),
+                (Changed::Yes, None),
+                "{action:?}"
+            );
+            assert!(!help.help, "{action:?} closed the overlay");
+            assert!(help.editor.is_none() && help.sel.is_none(), "{action:?}");
+        }
+    }
+
     // ---- deliverable 9: select to copy ---------------------------------------------------
 
     /// alpha with `f1` given two identical hunks, focused in the diff at line 0.
