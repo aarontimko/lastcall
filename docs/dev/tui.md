@@ -1179,8 +1179,9 @@ while the editor owns the terminal kills the *editor*; lastcall is still up on r
 `^C` a moment later still quits), `pty_edit_inline_save_pends_nothing` and
 `pty_edit_inline_save_refused_when_the_file_moved` (`i`, type, `^S`, against a file an agent
 rewrites underneath), `pty_copy_writes_osc52_with_the_selected_lines` (`vjjy`, then the raw
-transcript is searched for exactly one `\x1b]52;c;` and its base64 decoded back to the three
-rows that were on screen) and `pty_keyboard_enhancement_probe_is_answered_and_swallowed`.
+transcript is searched for exactly one `\x1b]52;c;` and its base64 decoded — by the test's own
+RFC 4648 decoder, never by the encoder under test — back to the three rows that were on
+screen) and `pty_keyboard_enhancement_probe_is_answered_and_swallowed`.
 `isolated_lastcall` removes `$VISUAL` and `$EDITOR` from every child — no scene may reach the
 developer's own editor — so an editor scene points `$EDITOR` at an absolute path inside its
 own temp dir; `docs/dev/testing.md` has the probe script.

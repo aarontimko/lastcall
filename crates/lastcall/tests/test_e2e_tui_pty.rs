@@ -2480,6 +2480,35 @@ fn pty_edit_inline_save_refused_when_the_file_moved() {
     assert_clean_exit(&pty, since);
 }
 
+/// RFC 4648 base64, decoded independently of the encoder the scene is checking (verifier
+/// (b) F6). Padding is trusted to be well formed — the input is one OSC 52 payload lastcall
+/// just wrote — and any byte outside the alphabet is a failure, not a skip.
+fn base64_decode(s: &str) -> Vec<u8> {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let digits: Vec<u8> = s
+        .bytes()
+        .take_while(|b| *b != b'=')
+        .map(|b| {
+            ALPHABET
+                .iter()
+                .position(|a| *a == b)
+                .unwrap_or_else(|| panic!("{:?} is not base64", b as char)) as u8
+        })
+        .collect();
+    let mut out = Vec::with_capacity(digits.len() * 3 / 4);
+    for quad in digits.chunks(4) {
+        let n = quad
+            .iter()
+            .enumerate()
+            .fold(0u32, |acc, (i, d)| acc | (*d as u32) << (18 - 6 * i));
+        // A 4-digit group carries three bytes, a 3-digit group two, a 2-digit group one.
+        for i in 0..quad.len() - 1 {
+            out.push((n >> (16 - 8 * i)) as u8);
+        }
+    }
+    out
+}
+
 /// Deliverable 9 end to end: `v j j` selects three diff lines, `y` copies them, and the one
 /// thing lastcall can actually prove about a clipboard over ssh is on the wire — a single
 /// OSC 52 write whose base64 is the three lines as the pane drew them.
@@ -2531,8 +2560,9 @@ fn pty_copy_writes_osc52_with_the_selected_lines() {
     let encoded = String::from_utf8(payload[..end].to_vec()).expect("base64 is ascii");
 
     // The first line is the header the screen shows; the two after it are the pane's own
-    // lines, `+`/`-`/space and all. Compared through the encoder, so the assertion is about
-    // the bytes on the wire rather than about a decoder written to match it.
+    // lines, `+`/`-`/space and all. **Decoded** here rather than re-encoded (verifier (b)
+    // F6): comparing against `clipboard::base64` would be comparing the encoder under test
+    // with itself, and an encoder that is wrong the same way twice would pass.
     let header = header_text(&rows[top as usize]);
     assert!(
         on_screen[0].starts_with(&header) && on_screen[0].ends_with("[m flag]"),
@@ -2541,9 +2571,9 @@ fn pty_copy_writes_osc52_with_the_selected_lines() {
     );
     let expected = format!("{header}\n{}\n{}\n", on_screen[1], on_screen[2]);
     assert_eq!(
-        encoded,
-        lastcall::tui::clipboard::base64(expected.as_bytes()),
-        "the payload is {expected:?}"
+        String::from_utf8(base64_decode(&encoded)).expect("the payload is the pane's text"),
+        expected,
+        "the payload decodes to the rows that were on screen (encoded: {encoded})"
     );
     assert!(
         expected.len() <= lastcall::tui::clipboard::CAP,
