@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use lastcall::tui::app::{AcceptFailed, App, Changed, Effect, FlagKind, RootMeta, Selection};
 use lastcall::tui::herdr::{AgentCandidate, Attention, Dot, HerdrUpdate, RootAgents, Scope};
-use lastcall::tui::input::{Action, NoteKey, PickKey};
+use lastcall::tui::input::{Action, EditKey, NoteKey, PickKey};
 use lastcall::tui::render::{render, styles};
 use lastcall_engine::engine::{Engine, EngineOptions};
 use lastcall_engine::env::Env;
@@ -1238,6 +1238,13 @@ fn tui_herdr_scope_notice_with_status() {
 
 // --- Phase 7: restore and flag ----------------------------------------------------------
 
+/// Type into the open note modal one character at a time, as the reader does.
+fn type_note(app: &mut App, note: &str) {
+    for c in note.chars() {
+        app.handle(Action::Note(NoteKey::Edit(EditKey::Insert(c.to_string()))));
+    }
+}
+
 /// Flag whatever the cursor is on, exactly as the loop does it: `m`, the note a character
 /// at a time, Enter, then the engine call the effect asked for and its answer fed back.
 /// Nothing here reaches around the reducer — the frames are of an `App` the loop could
@@ -1248,21 +1255,22 @@ fn flag_here(app: &mut App, engine: &mut Engine, note: &str) {
         Changed::Yes,
         "the note modal opens"
     );
-    for c in note.chars() {
-        app.handle(Action::Note(NoteKey::Insert(c.to_string())));
-    }
+    type_note(app, note);
     let (_, effect) = app.handle(Action::Note(NoteKey::Send));
     let Some(Effect::Flag {
         root,
         path,
         note,
         hunk,
+        summary,
         label,
     }) = effect
     else {
         panic!("a flag effect: {effect:?}");
     };
-    let flagged = engine.flag(&root, &path, &note, hunk).expect("flag");
+    let flagged = engine
+        .flag(&root, &path, &note, hunk, summary)
+        .expect("flag");
     assert!(flagged.outcome.refused.is_empty(), "{:?}", flagged.outcome);
     app.flagged(root, FlagKind::Flag { label }, Ok(flagged));
 }
@@ -1277,8 +1285,9 @@ fn candidate(pane: &str, label: &str, workspace: &str, status: Attention) -> Age
     }
 }
 
-/// The note modal over the diff: what is being flagged, the note as typed (two lines, the
-/// caret at the end), and the keys that end it.
+/// The note modal over the diff: the **title names the hunk** being flagged, the first line
+/// repeats it with the path, the note is as typed (two lines, the caret at the end), and the
+/// key line promises `^J` alone — this terminal reports no keyboard enhancement.
 #[test]
 fn tui_note_modal() {
     let scene = Scene::build();
@@ -1288,11 +1297,69 @@ fn tui_note_modal() {
     select_row(&mut app, &alpha, "f1");
     app.handle(Action::Open);
     app.handle(Action::Flag);
-    for c in "this rewrite loses the guard\nwhy?".chars() {
-        app.handle(Action::Note(NoteKey::Insert(c.to_string())));
-    }
+    type_note(&mut app, "this rewrite loses the guard\nwhy?");
     assert!(app.note.is_some());
+    let (frame, _) = draw(&app, W, H);
+    assert!(
+        frame.contains("flag hunk 1 of"),
+        "the title names it: {frame}"
+    );
+    assert!(frame.contains("⏎ send   ^J newline"), "{frame}");
     snapshot("tui_note_modal", &app, W, H);
+}
+
+/// A note taller than the box scrolls with the caret: eight lines typed, the caret moved up
+/// to line 7, and the five visible rows are lines 3 to 7 — the window ends at the caret.
+#[test]
+fn tui_note_modal_scrolled() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    let alpha = root_named(&engine, "alpha");
+    select_row(&mut app, &alpha, "f1");
+    app.handle(Action::Open);
+    app.handle(Action::Flag);
+    let note: Vec<String> = (1..=8).map(|n| format!("note line {n}")).collect();
+    type_note(&mut app, &note.join("\n"));
+    // Up once: off line 8 and onto line 7, which is where the window now ends.
+    app.handle(Action::Note(NoteKey::Edit(EditKey::Up)));
+    assert_eq!(
+        app.note.as_ref().expect("open").buf.cursor.line,
+        6,
+        "the caret is on line 7 (0-based 6)"
+    );
+    let (frame, _) = draw(&app, W, H);
+    for n in 3..=7 {
+        assert!(
+            frame.contains(&format!("note line {n}")),
+            "line {n}: {frame}"
+        );
+    }
+    for n in [1, 2, 8] {
+        assert!(
+            !frame.contains(&format!("note line {n}")),
+            "line {n} is scrolled out: {frame}"
+        );
+    }
+    snapshot("tui_note_modal_scrolled", &app, W, H);
+}
+
+/// `m` from the nav has no hunk under a cursor, so the flag is the whole file: the title
+/// says `whole file`, the first line says `f1 · whole file`, and the export the send will
+/// build carries the row's shape instead of a diff (ruling P4).
+#[test]
+fn tui_note_modal_whole_file() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    let alpha = root_named(&engine, "alpha");
+    select_row(&mut app, &alpha, "f1");
+    app.handle(Action::Flag);
+    type_note(&mut app, "the whole rewrite needs another look");
+    let (frame, _) = draw(&app, W, H);
+    assert!(frame.contains("flag whole file"), "the title: {frame}");
+    assert!(frame.contains("f1 · whole file"), "the first line: {frame}");
+    snapshot("tui_note_modal_whole_file", &app, W, H);
 }
 
 /// Two agents under one root: the picker asks which, naming each pane's workspace and

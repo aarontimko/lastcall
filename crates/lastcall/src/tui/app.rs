@@ -21,7 +21,7 @@ use lastcall_engine::engine::{
 use lastcall_engine::git::{Mode, Oid};
 use lastcall_engine::headstate::InProgress;
 use lastcall_engine::hunks::{Expanded, Hunk, Tag};
-use lastcall_engine::ledger::{FlagHunk, LedgerError};
+use lastcall_engine::ledger::{FlagHunk, FlagSummary, LedgerError};
 use lastcall_engine::ops::{OpsError, Rendered};
 use lastcall_engine::roots::Badge;
 use lastcall_engine::scan::{Annotation, Change, Collapsed, Entry, Group, Pile, Row};
@@ -30,6 +30,7 @@ use lastcall_engine::watcher::EngineEvent;
 
 use super::herdr::{AgentCandidate, HerdrUpdate, HerdrView, Link, ToastRequest};
 use super::input::{Action, Keymap, NoteKey, PickKey};
+use super::textbuf::TextBuf;
 
 pub const NAV_WIDTH_DEFAULT: u16 = 28;
 pub const NAV_WIDTH_MIN: u16 = 16;
@@ -38,6 +39,9 @@ pub const NAV_WIDTH_MAX: u16 = 60;
 pub const NAV_MIN_COLS: u16 = 70;
 /// Below this the frame is the one-line "terminal too small" message.
 pub const MIN_SIZE: (u16, u16) = (40, 10);
+/// How far `PageUp` / `PageDown` move inside the note modal: its visible text height
+/// (`render::NOTE_ROWS`), so a page is the page the reviewer can see.
+pub const NOTE_PAGE: usize = super::render::NOTE_ROWS as usize;
 
 /// The per-root metadata the nav and the empty state show. Built from a `RootState` under
 /// the engine lock (`RootMeta::of`), then owned by the app so rendering never locks.
@@ -224,6 +228,12 @@ pub enum Changed {
     No,
 }
 
+impl From<bool> for Changed {
+    fn from(yes: bool) -> Changed {
+        if yes { Changed::Yes } else { Changed::No }
+    }
+}
+
 impl Changed {
     pub fn or(self, other: Changed) -> Changed {
         if self == Changed::Yes || other == Changed::Yes {
@@ -260,6 +270,9 @@ pub enum Effect {
         /// The hunk **as it was rendered** when `m` was pressed, with the total the export
         /// names. `None` flags the file.
         hunk: Option<RenderedHunk>,
+        /// The row's shape when `m` was pressed, for a whole-file flag; `None` beside a
+        /// `hunk` (Amendment v1.8).
+        summary: Option<FlagSummary>,
         /// What the status line calls this flag (`f1`, `f1 hunk 2`). It travels with the
         /// write so its answer can name it without `App` holding a slot (F2).
         label: String,
@@ -433,6 +446,10 @@ pub enum FlagTarget {
     File {
         root: PathBuf,
         path: Vec<u8>,
+        /// The row's shape as it was on screen: the export prints it instead of a diff
+        /// (ruling P4, Amendment v1.8), and the modal's title says `whole file` because of
+        /// it.
+        summary: FlagSummary,
     },
 }
 
@@ -450,14 +467,40 @@ impl FlagTarget {
     }
 
     /// The modal's first line, and the words the status line uses for the flag afterwards:
-    /// `f1 · hunk 2 of 3` or `f1 (file)`.
+    /// `f1 · hunk 2 of 3` or `f1 · whole file`.
+    ///
+    /// `whole file` and not `(file)`: it is the same phrase the export's header uses, so
+    /// what the reviewer saw when they raised the flag and what the agent reads are one
+    /// wording (ruling P4).
     pub fn label(&self) -> String {
         let lossy = String::from_utf8_lossy(self.path()).into_owned();
         match self {
             FlagTarget::Hunk { hunk, of, .. } => {
                 format!("{lossy} · hunk {} of {of}", hunk.index + 1)
             }
-            FlagTarget::File { .. } => format!("{lossy} (file)"),
+            FlagTarget::File { .. } => format!("{lossy} · whole file"),
+        }
+    }
+
+    /// The note modal's border title: ` flag hunk 2 of 3 ` / ` flag whole file `.
+    ///
+    /// The title names the target so the question "what am I about to flag?" is answered by
+    /// the frame of the box, not only by a line inside it that a long path can crowd.
+    pub fn modal_title(&self) -> String {
+        match self {
+            FlagTarget::Hunk { hunk, of, .. } => {
+                format!(" flag hunk {} of {of} ", hunk.index + 1)
+            }
+            FlagTarget::File { .. } => " flag whole file ".to_owned(),
+        }
+    }
+
+    /// The shape a whole-file flag covers; `None` for a hunk flag, which quotes its lines
+    /// instead.
+    pub fn summary(&self) -> Option<FlagSummary> {
+        match self {
+            FlagTarget::Hunk { .. } => None,
+            FlagTarget::File { summary, .. } => Some(*summary),
         }
     }
 
@@ -482,13 +525,23 @@ impl FlagTarget {
     }
 }
 
-/// The note modal: what is being flagged, and the note as typed so far.
+/// The note modal: what is being flagged, and the note being typed.
+///
+/// The note lives in the same [`TextBuf`] the inline editor uses (deliverable 5), so every
+/// motion the buffer knows — word jumps, `Ctrl-A`/`Ctrl-E`, `Ctrl-K`, page keys — works
+/// here without the modal implementing any of them, and a note longer than the box scrolls
+/// through the buffer's own viewport.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NoteEntry {
     pub target: FlagTarget,
-    pub text: String,
-    /// Insertion point as a **byte** offset into `text`, always on a char boundary.
-    pub cursor: usize,
+    pub buf: TextBuf,
+}
+
+impl NoteEntry {
+    /// The note as it will be written.
+    pub fn text(&self) -> String {
+        self.buf.text()
+    }
 }
 
 /// The agent picker: which pane the export goes to when more than one is a candidate. The
@@ -654,6 +707,13 @@ pub struct App {
     /// Seeded from the defaults; worker 3b replaces it after `Keymap::from_config` so the
     /// hint line and the help overlay show the user's own bindings.
     pub keymap: Vec<(String, Vec<String>)>,
+    /// Whether this terminal reports the kitty keyboard protocol, asked once by
+    /// [`super::term::enter`] and set by the loop before the first frame (ruling P9).
+    ///
+    /// It changes exactly two things: `Shift-Enter` is a newline in the note modal, and the
+    /// modal's key line says so. `false` — the default, and what every terminal that does
+    /// not answer gets — promises `Ctrl-J` alone, which always works.
+    pub enhanced: bool,
 }
 
 impl Default for App {
@@ -690,6 +750,7 @@ impl App {
             expanded: None,
             // The canonical spellings (`shift-a` shows as `A`), as `Keymap::table` gives.
             keymap: Keymap::defaults().table(),
+            enhanced: false,
         }
     }
 
@@ -1439,7 +1500,18 @@ impl App {
                 });
             }
         }
-        Some(FlagTarget::File { root, path })
+        // The shape travels with a whole-file flag because the export has no diff to show
+        // (ruling P4): the counts are the row's as rendered, taken now, for the same reason
+        // `of` is (F14).
+        Some(FlagTarget::File {
+            root,
+            path,
+            summary: FlagSummary {
+                hunks: content,
+                added: row.added,
+                deleted: row.deleted,
+            },
+        })
     }
 
     /// `m`: open the note modal on what `flag_target` names.
@@ -1449,54 +1521,45 @@ impl App {
         };
         self.note = Some(NoteEntry {
             target,
-            text: String::new(),
-            cursor: 0,
+            buf: TextBuf::from(""),
         });
         (Changed::Yes, None)
     }
 
     /// One keystroke inside the note modal. Enter is the only exit that writes.
+    ///
+    /// Every edit goes to the buffer, which owns the cursor and the scroll: the modal has
+    /// no text state of its own beyond it. A key the buffer answers "nothing moved" to is
+    /// not a frame — `Home` at the start of a line redraws nothing.
     fn note_key(&mut self, key: NoteKey) -> (Changed, Option<Effect>) {
         let Some(entry) = self.note.as_mut() else {
             return (Changed::No, None);
         };
         match key {
-            NoteKey::Insert(text) => {
-                entry.text.insert_str(entry.cursor, &text);
-                entry.cursor += text.len();
-                (Changed::Yes, None)
-            }
-            NoteKey::Newline => {
-                entry.text.insert(entry.cursor, '\n');
-                entry.cursor += 1;
-                (Changed::Yes, None)
-            }
-            NoteKey::Backspace => {
-                let cut = entry.text[..entry.cursor]
-                    .chars()
-                    .next_back()
-                    .map(char::len_utf8)
-                    .unwrap_or(0);
-                if cut == 0 {
-                    return (Changed::No, None);
-                }
-                entry.cursor -= cut;
-                entry.text.remove(entry.cursor);
-                (Changed::Yes, None)
+            NoteKey::Edit(edit) => {
+                let moved = entry.buf.apply(edit, NOTE_PAGE);
+                (Changed::from(moved), None)
             }
             NoteKey::Cancel => {
                 self.note = None;
                 (Changed::Yes, None)
             }
             NoteKey::Send => {
+                // An empty note says nothing to the agent it is about to be pasted to, so
+                // Enter on an empty buffer is not a send: the modal stays open, which is
+                // the answer. `Esc` is how a reviewer changes their mind.
+                if entry.buf.text().is_empty() {
+                    return (Changed::No, None);
+                }
                 // The target was captured when `m` was pressed and is used as it was: a
                 // pile that landed meanwhile cannot move the flag onto another hunk (F14).
                 let entry = self.note.take().expect("checked above");
                 let effect = Effect::Flag {
                     root: entry.target.root().to_path_buf(),
                     path: entry.target.path().to_vec(),
-                    note: entry.text,
+                    note: entry.text(),
                     hunk: entry.target.rendered_hunk(),
+                    summary: entry.target.summary(),
                     label: entry.target.status_label(),
                 };
                 (Changed::Yes, Some(effect))
@@ -2866,7 +2929,8 @@ pub(crate) mod testfix {
 mod tests {
     use super::testfix::*;
     use super::*;
-    use crate::tui::input::note_action;
+    use crate::tui::input::{EditKey, note_action};
+    use crate::tui::textbuf::Pos;
     use crossterm::event::{Event, KeyCode, KeyModifiers};
     use lastcall_engine::roots::RootsChanged;
     /// Phase 6 deliverable 4: `e` is silent where it has nothing to do — a binary row
@@ -5157,15 +5221,37 @@ mod tests {
         let target = app.note.as_ref().expect("open").target.clone();
         assert!(matches!(target, FlagTarget::File { .. }), "{target:?}");
         assert_eq!(target.rendered_hunk(), None, "the file, not a hunk");
-        assert_eq!(target.label(), "f1 (file)");
+        assert_eq!(target.label(), "f1 · whole file");
+        assert_eq!(target.modal_title(), " flag whole file ");
+
+        // An empty note has nothing to say to the agent it is about to be pasted to, so
+        // Enter is not a send and the modal stays open.
+        assert_eq!(
+            app.handle(Action::Note(NoteKey::Send)),
+            (Changed::No, None),
+            "an empty note refuses to send"
+        );
+        assert!(app.note.is_some(), "…and the modal is still open");
+
+        type_note(&mut app, "the whole rewrite needs another look");
+        let row_now = app.roots[&root("alpha")]
+            .row(b"f1")
+            .expect("the row")
+            .clone();
         let (_, effect) = app.handle(Action::Note(NoteKey::Send));
         assert_eq!(
             effect,
             Some(Effect::Flag {
                 root: root("alpha"),
                 path: b"f1".to_vec(),
-                note: String::new(),
+                note: "the whole rewrite needs another look".to_owned(),
                 hunk: None,
+                // Ruling P4: with no diff to quote, the export carries the row's shape.
+                summary: Some(FlagSummary {
+                    hunks: 3,
+                    added: row_now.added,
+                    deleted: row_now.deleted,
+                }),
                 label: "f1".to_owned(),
             })
         );
@@ -5178,6 +5264,12 @@ mod tests {
         app.handle(Action::Flag);
         let target = app.note.as_ref().expect("open").target.clone();
         assert_eq!(target.label(), "f1 · hunk 3 of 3");
+        assert_eq!(target.modal_title(), " flag hunk 3 of 3 ");
+        assert_eq!(
+            target.summary(),
+            None,
+            "a hunk flag quotes its lines instead"
+        );
         let rendered = target.rendered_hunk().expect("a hunk flag");
         assert_eq!(rendered.of, 3, "content hunks, as the screen counted them");
         assert_eq!(rendered.hunk.index, 2);
@@ -5213,6 +5305,7 @@ mod tests {
         );
         assert_eq!(app.view_hunks().len(), 1, "the screen did move on");
 
+        type_note(&mut app, "look at this");
         let (_, effect) = app.handle(Action::Note(NoteKey::Send));
         let Some(Effect::Flag { hunk, .. }) = effect else {
             panic!("a flag effect: {effect:?}");
@@ -5252,6 +5345,7 @@ mod tests {
 
         // …and the write carries it, so the export quotes that hunk and counts `of 3`.
         app.handle(Action::Flag);
+        type_note(&mut app, "look at this");
         let (_, effect) = app.handle(Action::Note(NoteKey::Send));
         let Some(Effect::Flag { hunk, label, .. }) = effect else {
             panic!("a flag effect: {effect:?}");
@@ -5285,7 +5379,7 @@ mod tests {
         ));
         app.select(Some(row("alpha", "f1")));
         app.handle(Action::Flag);
-        app.handle(Action::Note(NoteKey::Insert("why?".to_owned())));
+        type_note(&mut app, "why?");
         let (_, flag) = app.handle(Action::Note(NoteKey::Send));
         assert!(
             matches!(flag, Some(Effect::Flag { ref label, .. }) if label == "f1"),
@@ -5325,6 +5419,7 @@ mod tests {
         ));
         app.select(Some(row("alpha", "f1")));
         app.handle(Action::Flag);
+        type_note(&mut app, "look at this");
         app.handle(Action::Note(NoteKey::Send));
 
         let (changed, effect) = app.flagged(
@@ -5374,6 +5469,7 @@ mod tests {
         ));
         app.select(Some(row("alpha", "f1")));
         app.handle(Action::Flag);
+        type_note(&mut app, "look at this");
         app.handle(Action::Note(NoteKey::Send));
 
         let (changed, effect) = app.flagged(
@@ -5402,6 +5498,7 @@ mod tests {
 
         // A write that failed says which flag it was and why.
         app.handle(Action::Flag);
+        type_note(&mut app, "look at this");
         app.handle(Action::Note(NoteKey::Send));
         app.flagged(
             root("alpha"),
@@ -5427,6 +5524,7 @@ mod tests {
         ));
         app.select(Some(row("alpha", "f1")));
         app.handle(Action::Flag);
+        type_note(&mut app, "look at this");
         app.handle(Action::Note(NoteKey::Send));
         app.flagged(
             root("alpha"),
@@ -5447,6 +5545,7 @@ mod tests {
 
         // A send that landed adds nothing: the optimistic line is already on screen.
         app.handle(Action::Flag);
+        type_note(&mut app, "look at this");
         app.handle(Action::Note(NoteKey::Send));
         app.flagged(
             root("alpha"),
@@ -5473,6 +5572,7 @@ mod tests {
         // f1 is flagged and staged; `pane.send_text` has not answered yet.
         app.select(Some(row("alpha", "f1")));
         app.handle(Action::Flag);
+        type_note(&mut app, "look at this");
         app.handle(Action::Note(NoteKey::Send));
         let (_, effect) = app.flagged(
             root("alpha"),
@@ -5484,6 +5584,7 @@ mod tests {
         // The reviewer does not wait for the socket: f2 gets its own note.
         app.select(Some(row("alpha", "f2")));
         app.handle(Action::Flag);
+        type_note(&mut app, "look at this");
         app.handle(Action::Note(NoteKey::Send));
 
         // f1's send lands, then f2's ledger write.
@@ -5514,6 +5615,7 @@ mod tests {
         app.handle(Action::Resize(100, 30));
         app.select(Some(row("alpha", "f1")));
         app.handle(Action::Flag);
+        type_note(&mut app, "look at this");
         app.handle(Action::Note(NoteKey::Send));
         let (_, effect) = app.flagged(
             root("alpha"),
@@ -5524,6 +5626,7 @@ mod tests {
 
         app.select(Some(row("alpha", "f2")));
         app.handle(Action::Flag);
+        type_note(&mut app, "look at this");
         app.handle(Action::Note(NoteKey::Send));
 
         let out = PathBuf::from("/S/exports/alpha/2026-09-05.md");
@@ -5560,6 +5663,7 @@ mod tests {
         app.handle(Action::Resize(100, 30));
         app.select(Some(row("alpha", "f1")));
         app.handle(Action::Flag);
+        type_note(&mut app, "look at this");
         app.handle(Action::Note(NoteKey::Send));
         let (_, unflag) = app.handle(Action::Unflag);
         assert_eq!(
@@ -5606,39 +5710,49 @@ mod tests {
         note_key_event(KeyCode::Char(c), KeyModifiers::NONE)
     }
 
+    /// Type `text` into the open note modal as one insert (what a paste does).
+    fn type_note(app: &mut App, text: &str) {
+        app.handle(Action::Note(NoteKey::Edit(EditKey::Insert(
+            text.to_owned(),
+        ))));
+    }
+
+    /// Open the note modal on `alpha`'s `f1` with nothing typed yet.
+    fn note_open() -> App {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Flag);
+        app
+    }
+
+    /// One key event through the modal's own mapping and into the app.
+    fn note_feed(app: &mut App, event: &Event) -> (Changed, Option<Effect>) {
+        let action =
+            note_action(event, &Keymap::defaults(), app.enhanced).expect("the modal answers it");
+        app.handle(action)
+    }
+
     /// The note modal's line discipline. Enter sends; the bindings a terminal reports for a
-    /// deliberate line break (`Ctrl-J` everywhere, `Alt-Enter` and `Shift-Enter` where they
-    /// are reported at all) break the line instead; Esc closes it and writes nothing.
+    /// deliberate line break (`Ctrl-J` everywhere, `Alt-Enter` where Alt is reported) break
+    /// the line instead; Esc closes it and writes nothing.
     #[test]
     fn app_note_modal_enter_sends_ctrl_j_and_alt_enter_break_the_line_esc_cancels() {
-        let km = Keymap::defaults();
-        let open = || {
-            let mut app = three_roots();
-            app.handle(Action::Resize(100, 30));
-            app.select(Some(row("alpha", "f1")));
-            app.handle(Action::Flag);
-            app
-        };
-        let feed = |app: &mut App, event: &Event| {
-            let action = note_action(event, &km).expect("the modal answers it");
-            app.handle(action)
-        };
         let enter = note_key_event(KeyCode::Enter, KeyModifiers::NONE);
 
         for newline in [
             note_key_event(KeyCode::Char('j'), KeyModifiers::CONTROL),
             note_key_event(KeyCode::Enter, KeyModifiers::ALT),
-            note_key_event(KeyCode::Enter, KeyModifiers::SHIFT),
         ] {
-            let mut app = open();
+            let mut app = note_open();
             for c in "one".chars() {
-                feed(&mut app, &note_char(c));
+                note_feed(&mut app, &note_char(c));
             }
-            assert_eq!(feed(&mut app, &newline), (Changed::Yes, None));
-            feed(&mut app, &note_char('2'));
-            assert_eq!(app.note.as_ref().expect("open").text, "one\n2");
+            assert_eq!(note_feed(&mut app, &newline), (Changed::Yes, None));
+            note_feed(&mut app, &note_char('2'));
+            assert_eq!(app.note.as_ref().expect("open").text(), "one\n2");
 
-            let (_, effect) = feed(&mut app, &enter);
+            let (_, effect) = note_feed(&mut app, &enter);
             assert!(app.note.is_none(), "Enter closes it");
             let Some(Effect::Flag { note, .. }) = effect else {
                 panic!("Enter sends: {effect:?}");
@@ -5648,23 +5762,128 @@ mod tests {
 
         // Backspace walks back a character at a time; Esc throws the lot away.
         let backspace = note_key_event(KeyCode::Backspace, KeyModifiers::NONE);
-        let mut app = open();
-        feed(&mut app, &note_char('x'));
-        feed(&mut app, &backspace);
-        assert_eq!(app.note.as_ref().expect("open").text, "");
+        let mut app = note_open();
+        note_feed(&mut app, &note_char('x'));
+        note_feed(&mut app, &backspace);
+        assert_eq!(app.note.as_ref().expect("open").text(), "");
         assert_eq!(
-            feed(&mut app, &backspace),
+            note_feed(&mut app, &backspace),
             (Changed::No, None),
             "nothing to delete, nothing to draw"
         );
-        feed(&mut app, &note_char('y'));
-        let (changed, effect) = feed(&mut app, &note_key_event(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(
+            note_feed(&mut app, &enter),
+            (Changed::No, None),
+            "and an empty note is not a send"
+        );
+        note_feed(&mut app, &note_char('y'));
+        let (changed, effect) =
+            note_feed(&mut app, &note_key_event(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(
             (changed, effect),
             (Changed::Yes, None),
             "Esc writes nothing"
         );
         assert!(app.note.is_none(), "Esc closes the note and writes nothing");
+    }
+
+    /// `Shift-Enter` is a newline **only** under the kitty keyboard protocol (ruling P9).
+    ///
+    /// With no enhancement flags the terminal sends the same bytes for `Enter` and
+    /// `Shift-Enter`, so treating the reported `SHIFT` as a line break would mean the note
+    /// sometimes breaks and sometimes sends depending on which terminal happens to set the
+    /// bit — the worst of the two. Off, it sends; on, it breaks the line.
+    #[test]
+    fn app_note_modal_shift_enter_is_a_newline_only_with_enhancement() {
+        let shift_enter = note_key_event(KeyCode::Enter, KeyModifiers::SHIFT);
+
+        let mut plain = note_open();
+        assert!(!plain.enhanced, "the default is the honest one");
+        type_note(&mut plain, "one");
+        let (_, effect) = note_feed(&mut plain, &shift_enter);
+        assert!(plain.note.is_none(), "without enhancement it sends");
+        let Some(Effect::Flag { note, .. }) = effect else {
+            panic!("a flag effect: {effect:?}");
+        };
+        assert_eq!(note, "one");
+
+        let mut enhanced = note_open();
+        enhanced.enhanced = true;
+        type_note(&mut enhanced, "one");
+        assert_eq!(note_feed(&mut enhanced, &shift_enter), (Changed::Yes, None));
+        type_note(&mut enhanced, "2");
+        assert_eq!(
+            enhanced.note.as_ref().expect("open").text(),
+            "one\n2",
+            "with enhancement it breaks the line"
+        );
+
+        // The key line promises exactly what the mapping does.
+        assert!(!super::super::render::note_keys(false).contains('⇧'));
+        assert!(super::super::render::note_keys(true).contains("⇧⏎ / ^J newline"));
+    }
+
+    /// Every motion the shared buffer knows reaches the note: arrows, word jumps,
+    /// `Ctrl-A`/`Ctrl-E`, `Ctrl-K`, `Ctrl-W`, and the page keys.
+    #[test]
+    fn app_note_modal_arrow_and_word_keys_move_the_caret() {
+        let mut app = note_open();
+        type_note(&mut app, "alpha beta gamma");
+        let pos = |app: &App| app.note.as_ref().expect("open").buf.cursor;
+        assert_eq!(pos(&app), Pos { line: 0, col: 16 });
+
+        // Left, then a word jump back over `gamma`, then Home and End.
+        assert_eq!(
+            note_feed(&mut app, &note_key_event(KeyCode::Left, KeyModifiers::NONE)),
+            (Changed::Yes, None)
+        );
+        assert_eq!(pos(&app), Pos { line: 0, col: 15 });
+        note_feed(&mut app, &note_key_event(KeyCode::Left, KeyModifiers::ALT));
+        assert_eq!(pos(&app).col, 11, "the start of `gamma`");
+        note_feed(
+            &mut app,
+            &note_key_event(KeyCode::Char('a'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(pos(&app).col, 0, "Ctrl-A is the start of the line");
+        note_feed(
+            &mut app,
+            &note_key_event(KeyCode::Right, KeyModifiers::CONTROL),
+        );
+        assert_eq!(pos(&app).col, 5, "Ctrl-→ is the end of `alpha`");
+        note_feed(
+            &mut app,
+            &note_key_event(KeyCode::Char('e'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(pos(&app).col, 16, "Ctrl-E is the end of the line");
+
+        // Ctrl-W eats the word behind the caret; Ctrl-K the rest of the line.
+        note_feed(
+            &mut app,
+            &note_key_event(KeyCode::Char('w'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(app.note.as_ref().expect("open").text(), "alpha beta ");
+        note_feed(
+            &mut app,
+            &note_key_event(KeyCode::Char('a'), KeyModifiers::CONTROL),
+        );
+        note_feed(
+            &mut app,
+            &note_key_event(KeyCode::Char('k'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(app.note.as_ref().expect("open").text(), "");
+
+        // A move with nowhere to go is not a frame.
+        assert_eq!(
+            note_feed(&mut app, &note_key_event(KeyCode::Up, KeyModifiers::NONE)),
+            (Changed::No, None)
+        );
+        assert_eq!(
+            note_feed(
+                &mut app,
+                &note_key_event(KeyCode::PageDown, KeyModifiers::NONE)
+            ),
+            (Changed::No, None)
+        );
     }
 
     /// A bracketed paste is one event carrying many characters, newlines included. It is
@@ -5679,8 +5898,12 @@ mod tests {
         app.handle(Action::Flag);
 
         let pasted = "first line\nsecond line\n";
-        let action = note_action(&Event::Paste(pasted.to_owned()), &km).expect("paste is handled");
-        assert_eq!(action, Action::Note(NoteKey::Insert(pasted.to_owned())));
+        let action = note_action(&Event::Paste(pasted.to_owned()), &km, app.enhanced)
+            .expect("paste is handled");
+        assert_eq!(
+            action,
+            Action::Note(NoteKey::Edit(EditKey::Insert(pasted.to_owned())))
+        );
         let (changed, effect) = app.handle(action);
         assert_eq!(
             (changed, effect),
@@ -5688,11 +5911,15 @@ mod tests {
             "inserted, not sent"
         );
         let note = app.note.as_ref().expect("still open");
-        assert_eq!(note.text, pasted);
-        assert_eq!(note.cursor, pasted.len(), "the caret is after the paste");
+        assert_eq!(note.text(), pasted);
+        assert_eq!(
+            note.buf.cursor,
+            Pos { line: 2, col: 0 },
+            "the caret is after the paste, on the line its last newline opened"
+        );
 
         // A second paste lands after the first, and Enter is still what sends.
-        app.handle(note_action(&Event::Paste("third".to_owned()), &km).expect("handled"));
+        app.handle(note_action(&Event::Paste("third".to_owned()), &km, false).expect("handled"));
         let (_, effect) = app.handle(Action::Note(NoteKey::Send));
         let Some(Effect::Flag { note, .. }) = effect else {
             panic!("a flag effect: {effect:?}");
@@ -5713,13 +5940,13 @@ mod tests {
 
         for c in "qa?rewfo".chars() {
             assert_eq!(
-                note_action(&note_char(c), &km),
-                Some(Action::Note(NoteKey::Insert(c.to_string()))),
+                note_action(&note_char(c), &km, false),
+                Some(Action::Note(NoteKey::Edit(EditKey::Insert(c.to_string())))),
                 "{c} is text inside the modal"
             );
-            app.handle(Action::Note(NoteKey::Insert(c.to_string())));
+            app.handle(Action::Note(NoteKey::Edit(EditKey::Insert(c.to_string()))));
         }
-        assert_eq!(app.note.as_ref().expect("open").text, "qa?rewfo");
+        assert_eq!(app.note.as_ref().expect("open").text(), "qa?rewfo");
         assert!(!app.help, "no key escaped to the keymap");
         assert!(app.confirm.is_none());
 
@@ -5727,24 +5954,28 @@ mod tests {
         assert_eq!(
             note_action(
                 &note_key_event(KeyCode::Char('A'), KeyModifiers::SHIFT),
-                &km
+                &km,
+                false
             ),
-            Some(Action::Note(NoteKey::Insert("A".to_owned())))
+            Some(Action::Note(NoteKey::Edit(EditKey::Insert("A".to_owned()))))
         );
 
-        // Bindings the modal has no use for are swallowed rather than reaching the keymap.
+        // Keys the buffer has no answer for are swallowed rather than reaching the keymap.
         for event in [
-            note_key_event(KeyCode::Tab, KeyModifiers::NONE),
-            note_key_event(KeyCode::PageDown, KeyModifiers::NONE),
-            note_key_event(KeyCode::Char('a'), KeyModifiers::CONTROL),
-            note_key_event(KeyCode::Left, KeyModifiers::NONE),
+            note_key_event(KeyCode::F(1), KeyModifiers::NONE),
+            note_key_event(KeyCode::Insert, KeyModifiers::NONE),
+            note_key_event(KeyCode::Char('x'), KeyModifiers::CONTROL),
         ] {
-            assert_eq!(note_action(&event, &km), None, "{event:?} does nothing");
+            assert_eq!(
+                note_action(&event, &km, false),
+                None,
+                "{event:?} does nothing"
+            );
         }
 
         // Ctrl-C is the one binding that still fires, and it does not write the note.
         let ctrl_c = note_key_event(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert_eq!(note_action(&ctrl_c, &km), Some(Action::Quit));
+        assert_eq!(note_action(&ctrl_c, &km, false), Some(Action::Quit));
         let (_, effect) = app.handle(Action::Quit);
         assert_eq!(effect, Some(Effect::Quit), "quitting writes no flag");
     }

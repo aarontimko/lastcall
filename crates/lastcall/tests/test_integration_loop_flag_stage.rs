@@ -26,7 +26,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use lastcall::tui::app::{App, Changed, Effect, FlagKind, RootMeta, Selection};
 use lastcall::tui::herdr::STAGE_TAIL;
 use lastcall::tui::input::Keymap;
-use lastcall::tui::run::{Local, Ui, herdr_fold, spawn_flag, spawn_stage};
+use lastcall::tui::run::{FlagRequest, Local, Ui, herdr_fold, spawn_flag, spawn_stage};
 use lastcall_engine::herdr::client::{Client, ClientOptions, ClientTimings};
 use lastcall_engine::herdr::transport::SocketTransport;
 use lastcall_engine::herdr::{Compat, HerdrEvent, guard};
@@ -189,6 +189,7 @@ async fn loop_flag_with_one_agent_reaches_pane_send_text() {
         path,
         note,
         hunk,
+        summary,
         label,
     }) = effect
     else {
@@ -202,7 +203,18 @@ async fn loop_flag_with_one_agent_reaches_pane_send_text() {
 
     // The loop's dispatch for that effect, and its answer.
     let (tx, mut rx) = mpsc::unbounded_channel();
-    spawn_flag(&engine, tx.clone(), root, path, note, hunk, label);
+    spawn_flag(
+        &engine,
+        tx.clone(),
+        FlagRequest {
+            root,
+            path,
+            note,
+            hunk,
+            summary,
+            label,
+        },
+    );
     let flagged = next_local(&mut rx).await;
     assert!(
         matches!(&flagged, Local::Flagged { kind: FlagKind::Flag { label }, result: Ok(_), .. } if label == "f2"),

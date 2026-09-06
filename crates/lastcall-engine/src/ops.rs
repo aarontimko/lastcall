@@ -24,8 +24,8 @@ use crate::headstate::current_head;
 use crate::hunks::{self, Hunk};
 use crate::index::{IndexError, PrivateIndex};
 use crate::ledger::{
-    self, Baseline, BaselineResolver, Clock, Flag, FlagHunk, Ledger, LedgerError, LedgerLock,
-    LoadResult, Override, SeenAt, TreeEntries,
+    self, Baseline, BaselineResolver, Clock, Flag, FlagHunk, FlagSummary, Ledger, LedgerError,
+    LedgerLock, LoadResult, Override, SeenAt, TreeEntries,
 };
 use crate::paths::RepoPaths;
 use crate::scan::{Entry, Pile, Row};
@@ -1331,12 +1331,14 @@ impl Ops<'_> {
     ///
     /// Appends rather than replaces: a review raises several questions about one file, and
     /// the second one must not silently eat the first. `hunk` carries the rendered hunk for
-    /// a per-hunk flag and is `None` for a file flag.
+    /// a per-hunk flag and is `None` for a file flag; `summary` is the mirror image — the
+    /// row's shape for a whole-file flag, `None` for a hunk flag (Amendment v1.8).
     pub fn flag(
         &mut self,
         path: &[u8],
         note: &str,
         hunk: Option<FlagHunk>,
+        summary: Option<FlagSummary>,
         fault: &dyn FaultInjector,
     ) -> Result<Outcome, OpsError> {
         let key = match Self::key(path) {
@@ -1362,6 +1364,9 @@ impl Ops<'_> {
         entry.flags.push(Flag {
             note: note.to_owned(),
             created_at: now.clone(),
+            // A hunk flag quotes its lines; a whole-file flag carries the row's shape
+            // instead. Never both.
+            summary: if hunk.is_some() { None } else { summary },
             hunk,
         });
         entry.updated_at = now;
@@ -1449,7 +1454,12 @@ mod tests {
         assert!(a.ledger.overrides.is_empty());
         assert!(a.scan().pile.is_empty(), "f2's accept survived a's fold");
         // A flag set by one side survives an accept by the other.
-        assert!(b.ops().flag(b"f3", "look", None, &NoFault).unwrap().ok());
+        assert!(
+            b.ops()
+                .flag(b"f3", "look", None, None, &NoFault)
+                .unwrap()
+                .ok()
+        );
         repo.write("f1", "one more\n");
         let r1 = rendered(&a, b"f1");
         assert!(a.ops().accept_file(&r1, &NoFault).unwrap().ok());
@@ -1709,7 +1719,9 @@ mod tests {
         repo.write("f3", "accepted\n");
         let r3 = rendered(&h, b"f3");
         h.ops().accept_file(&r3, &NoFault).unwrap();
-        h.ops().flag(b"f3", "keep me", None, &NoFault).unwrap();
+        h.ops()
+            .flag(b"f3", "keep me", None, None, &NoFault)
+            .unwrap();
         repo.write("f1", "one\n");
         repo.remove("f2");
         repo.write("new.txt", "n\n");
@@ -1788,7 +1800,7 @@ mod tests {
         let repo = FixtureRepo::new("ops-flag").unwrap();
         let state = TempDir::new("lc-ops");
         let mut h = Harness::new(&repo, &state);
-        h.ops().flag(b"f1", "note", None, &NoFault).unwrap();
+        h.ops().flag(b"f1", "note", None, None, &NoFault).unwrap();
         let o = h.ledger.overrides.get("f1").unwrap();
         assert!(o.blob.is_none());
         assert!(h.scan().pile.is_empty(), "a flag alone is not pending");
@@ -1798,8 +1810,46 @@ mod tests {
         assert!(!h.ledger.overrides.contains_key("f1"));
         let out = h.ops().unflag(b"nope", &NoFault).unwrap();
         assert!(!out.written);
-        let out = h.ops().flag(b"bad\xff", "n", None, &NoFault).unwrap();
+        let out = h.ops().flag(b"bad\xff", "n", None, None, &NoFault).unwrap();
         assert!(matches!(out.refused[0], Refused::NonUtf8Path { .. }));
+    }
+
+    /// Amendment v1.8: a whole-file flag stores the row's shape, a hunk flag never does,
+    /// and both survive a ledger round trip.
+    #[test]
+    fn ops_flag_stores_a_summary_for_a_whole_file_flag_only() {
+        let repo = FixtureRepo::new("ops-flag-summary").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        let summary = FlagSummary {
+            hunks: 3,
+            added: 12,
+            deleted: 4,
+        };
+        h.ops()
+            .flag(b"f1", "whole", None, Some(summary), &NoFault)
+            .unwrap();
+        let hunk = FlagHunk {
+            index: 1,
+            header: "@@ -1,1 +1,1 @@".into(),
+            text: "-a\n+b\n".into(),
+        };
+        // The caller offering both is the TUI's mistake to make; the op takes the hunk and
+        // drops the summary rather than writing a flag that claims to be both.
+        h.ops()
+            .flag(b"f1", "hunk", Some(hunk), Some(summary), &NoFault)
+            .unwrap();
+
+        let ledger::LoadResult::Loaded { ledger, .. } = ledger::load(&h.paths, &h.clock).unwrap()
+        else {
+            panic!("the ledger the flags were written to");
+        };
+        let flags = &ledger.overrides.get("f1").expect("the override").flags;
+        assert_eq!(flags.len(), 2);
+        assert_eq!(flags[0].summary, Some(summary), "the whole-file flag");
+        assert!(flags[0].hunk.is_none());
+        assert_eq!(flags[1].summary, None, "the hunk flag carries none");
+        assert!(flags[1].hunk.is_some());
     }
 
     // -----------------------------------------------------------------------------------

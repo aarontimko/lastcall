@@ -17,7 +17,20 @@
 //! ```
 //! ````
 //!
-//! A file flag omits the `hunk n of m` segment and the diff block. A batch is the exports
+//! A **whole-file** flag says `whole file` where a hunk flag says `hunk n of m`, adds a
+//! summary line naming the shape of what it covers, and has no diff block (Phase 8, ruling
+//! P4; Amendment v1.8):
+//!
+//! ````text
+//! lastcall flag · alpha · src/parse.rs · whole file · 2026-09-05T18:04:00Z
+//! 3 hunks · +12 −4
+//! note: this whole rewrite needs a second look
+//! ````
+//!
+//! The counts come from [`crate::ledger::FlagSummary`], stored on the flag when it was
+//! raised. A flag written before v1.8 has none and prints no summary line — the header
+//! still says `whole file`, which is a property of the flag's shape, not of the field. A
+//! hunk flag never prints a summary line even if one is present. A batch is the exports
 //! joined by a blank line ([`export_all`]).
 //!
 //! **Control bytes render in caret form** (F13, F9). The export is pasted into a live
@@ -35,7 +48,7 @@
 //! would close a three-backtick block and spill the rest of the hunk into prose, so the
 //! fence is one backtick longer than the longest run any line inside it starts with.
 
-use crate::ledger::Flag;
+use crate::ledger::{Flag, FlagSummary};
 
 /// Everything an export needs that the flag itself does not carry.
 ///
@@ -124,15 +137,26 @@ pub fn export(ctx: &ExportContext, path: &[u8], flag: &Flag) -> String {
     out.push_str(&caret(&ctx.root));
     out.push_str(" · ");
     out.push_str(&caret(&lossy(path)));
-    if let Some(h) = &flag.hunk {
-        match ctx.of {
+    match &flag.hunk {
+        Some(h) => match ctx.of {
             Some(of) => out.push_str(&format!(" · hunk {} of {of}", h.index + 1)),
             None => out.push_str(&format!(" · hunk {}", h.index + 1)),
-        }
+        },
+        // Ruling P4: the fourth segment always says which of the two a flag is, so an
+        // agent reading a wall of them never has to infer "no hunk segment means the file".
+        None => out.push_str(" · whole file"),
     }
     out.push_str(" · ");
     out.push_str(&caret(&flag.created_at));
     out.push('\n');
+    // The shape of what a whole-file flag covers, where a hunk flag shows the lines. Only
+    // for a whole-file flag, and only when the flag carries it (a pre-v1.8 flag does not).
+    if flag.hunk.is_none()
+        && let Some(sum) = &flag.summary
+    {
+        out.push_str(&summary_line(sum));
+        out.push('\n');
+    }
     if let Some(a) = &ctx.attribution {
         out.push_str(&caret(a));
         out.push('\n');
@@ -161,6 +185,16 @@ pub fn export(ctx: &ExportContext, path: &[u8], flag: &Flag) -> String {
     out
 }
 
+/// `3 hunks · +12 −4` — the shape a whole-file flag covers.
+///
+/// The same `+a −d` the nav row shows, so the reviewer's screen and the agent's message
+/// agree. Plain digits: the TUI's thousands separator is a display nicety and the export is
+/// read by a program as often as by a person.
+fn summary_line(sum: &FlagSummary) -> String {
+    let hunks = if sum.hunks == 1 { "hunk" } else { "hunks" };
+    format!("{} {hunks} · +{} −{}", sum.hunks, sum.added, sum.deleted)
+}
+
 /// Every flag on one path, oldest first, joined by a blank line.
 pub fn export_all(ctx: &ExportContext, path: &[u8], flags: &[Flag]) -> String {
     flags
@@ -174,6 +208,14 @@ pub fn export_all(ctx: &ExportContext, path: &[u8], flags: &[Flag]) -> String {
 mod tests {
     use super::*;
     use crate::ledger::FlagHunk;
+
+    fn summary() -> FlagSummary {
+        FlagSummary {
+            hunks: 3,
+            added: 12,
+            deleted: 4,
+        }
+    }
 
     /// The golden lives beside the binary's other goldens; an engine unit test writes it so
     /// the clock is injectable (F12: the binary has no clock override).
@@ -201,6 +243,7 @@ mod tests {
                         }\n"
                 .into(),
             }),
+            summary: None,
         }
     }
 
@@ -216,6 +259,7 @@ mod tests {
                 header: "@@ -40,3 +40,3 @@ fn render()".into(),
                 text: "-println!(\"x\");\n```\n+println!(\"y\");\n".into(),
             }),
+            summary: None,
         }
     }
 
@@ -223,15 +267,26 @@ mod tests {
     #[test]
     fn flags_export_matches_the_golden() {
         let clock = crate::ledger::FixedClock::at_unix(1_788_631_440);
-        let file = Flag::file("this whole file is generated — don't hand-edit", {
+        let file = Flag::whole_file(
+            "this whole file is generated — don't hand-edit",
+            {
+                use crate::ledger::Clock;
+                clock.now_iso8601()
+            },
+            summary(),
+        );
+        // The fourth entry is a flag written before Amendment v1.8: it says `whole file`
+        // like any other, and prints no summary line because it carries no counts.
+        let pre_v18 = Flag::file("a Phase 7 flag, before the summary existed", {
             use crate::ledger::Clock;
             clock.now_iso8601()
         });
         let actual = format!(
-            "{}\n\n{}\n\n{}\n",
+            "{}\n\n{}\n\n{}\n\n{}\n",
             export(&ctx(), b"crates/lastcall-engine/src/ops.rs", &hunk_flag()),
             export(&ctx(), b"crates/lastcall/src/tui/render.rs", &file),
             export(&ctx(), b"crates/lastcall/src/tui/keys.rs", &hazard_flag()),
+            export(&ctx(), b"crates/lastcall/src/tui/term.rs", &pre_v18),
         );
         if std::env::var_os("LASTCALL_UPDATE_GOLDEN").is_some() {
             std::fs::write(GOLDEN, &actual).expect("write golden");
@@ -259,6 +314,7 @@ mod tests {
                 header: "@@ -1,1 +1,1 @@".into(),
                 text: "-a\n+b\u{1b}[201~\u{7}\u{0}\n\tkept\n".into(),
             }),
+            summary: None,
         };
         let out = export(&ctx(), b"f1", &flag);
         assert!(!out.contains('\u{1b}'), "no raw ESC survives:\n{out}");
@@ -287,6 +343,7 @@ mod tests {
                 header: "@@ -1,1 +1,1 @@".into(),
                 text: "-a\n+b\u{9b}201~\u{7f}\n".into(),
             }),
+            summary: None,
         };
         let out = export(&ctx(), b"f1", &flag);
         for c in ['\u{9b}', '\u{7f}', '\u{85}', '\u{1b}'] {
@@ -318,15 +375,60 @@ mod tests {
         assert!(export(&ctx(), b"f1", &flag).contains("\n```diff\n"));
     }
 
-    /// A file flag is the header and the note: no `hunk n of m`, no diff block.
+    /// Ruling P4: a whole-file flag says `whole file` where a hunk flag says `hunk n of m`,
+    /// prints the shape it covers on the next line, and still has no diff block.
     #[test]
-    fn flags_export_of_a_file_flag_has_no_hunk_segment_or_diff() {
-        let out = export(&ctx(), b"f1", &Flag::file("look", "2026-09-05T18:04:00Z"));
+    fn flags_export_of_a_whole_file_flag_says_so_and_summarises_it() {
+        let out = export(
+            &ctx(),
+            b"f1",
+            &Flag::whole_file("look", "2026-09-05T18:04:00Z", summary()),
+        );
         assert_eq!(
             out,
-            "lastcall flag · lastcall · f1 · 2026-09-05T18:04:00Z\nnote: look"
+            "lastcall flag · lastcall · f1 · whole file · 2026-09-05T18:04:00Z\n\
+             3 hunks · +12 −4\n\
+             note: look"
         );
-        assert!(!out.contains("```"));
+        assert!(!out.contains("```"), "no diff block: {out}");
+
+        // A flag written before Amendment v1.8 carries no counts: the header still says
+        // `whole file`, and the summary line is simply absent.
+        let old = export(&ctx(), b"f1", &Flag::file("look", "2026-09-05T18:04:00Z"));
+        assert_eq!(
+            old,
+            "lastcall flag · lastcall · f1 · whole file · 2026-09-05T18:04:00Z\nnote: look"
+        );
+
+        // One hunk is one hunk. The counts are the row's, not the diff's, so zero is a
+        // real answer (a mode change with no content lines).
+        let one = export(
+            &ctx(),
+            b"f1",
+            &Flag::whole_file(
+                "n",
+                "t",
+                FlagSummary {
+                    hunks: 1,
+                    added: 0,
+                    deleted: 0,
+                },
+            ),
+        );
+        assert!(one.contains("\n1 hunk · +0 −0\nnote: n"), "{one}");
+    }
+
+    /// A hunk flag never prints a summary, even when one is somehow on the flag: the lines
+    /// it quotes *are* the shape, and two answers to the same question is worse than one.
+    #[test]
+    fn flags_export_never_summarises_a_hunk_flag() {
+        let mut flag = hunk_flag();
+        flag.summary = Some(summary());
+        let out = export(&ctx(), b"f1", &flag);
+        assert!(out.contains(" · hunk 2 of 3 · "), "{out}");
+        assert!(!out.contains("3 hunks"), "no summary line: {out}");
+        // The ops layer will not write that combination in the first place.
+        assert_eq!(Flag::file("n", "t").summary, None);
     }
 
     /// Non-UTF-8 paths render lossy, the rule `Refused` uses; `of` absent prints the index
@@ -360,8 +462,8 @@ mod tests {
         );
         assert_eq!(
             batch,
-            "lastcall flag · r · f1 · t1\nnote: one\n\n\
-             lastcall flag · r · f1 · t2\nnote: two"
+            "lastcall flag · r · f1 · whole file · t1\nnote: one\n\n\
+             lastcall flag · r · f1 · whole file · t2\nnote: two"
         );
     }
 
@@ -376,6 +478,7 @@ mod tests {
                 header: "@@ -1,1 +1,1 @@".into(),
                 text: "-a\n+b".into(),
             }),
+            summary: None,
         };
         assert!(export(&ctx(), b"f1", &flag).ends_with("-a\n+b\n```"));
     }

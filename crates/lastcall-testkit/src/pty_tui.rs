@@ -92,14 +92,23 @@ impl PtyCommand {
         self
     }
 
+    /// Set one variable for the child. Last call wins: setting a key that an earlier
+    /// [`env_remove`](Self::env_remove) (or an earlier `env`) named replaces it, so a scene
+    /// can override what [`isolated_lastcall`](Self::isolated_lastcall) chose.
     pub fn env(mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> Self {
-        self.env
-            .push((key.as_ref().to_owned(), value.as_ref().to_owned()));
+        let key = key.as_ref().to_owned();
+        self.env_remove.retain(|k| k != &key);
+        self.env.retain(|(k, _)| k != &key);
+        self.env.push((key, value.as_ref().to_owned()));
         self
     }
 
+    /// Unset one variable for the child. Last call wins, the same way [`env`](Self::env)
+    /// does: this drops any value an earlier `env` set for the key.
     pub fn env_remove(mut self, key: impl AsRef<OsStr>) -> Self {
-        self.env_remove.push(key.as_ref().to_owned());
+        let key = key.as_ref().to_owned();
+        self.env.retain(|(k, _)| k != &key);
+        self.env_remove.push(key);
         self
     }
 
@@ -114,9 +123,14 @@ impl PtyCommand {
     /// `LASTCALL_STATE_DIR`, null global/system git config, no inherited XDG dirs, no
     /// inherited `LASTCALL_LOG*` (the transcript must carry no tracing) and no inherited
     /// `HERDR_*`; `TERM=xterm-256color` so crossterm sees a capable terminal.
+    ///
+    /// `LASTCALL_KEYBOARD=plain` skips the keyboard-enhancement probe (ruling P9): the
+    /// harness answers no terminal query, so an unskipped probe would cost every scene
+    /// crossterm's full 2 s timeout. A scene that wants the probe removes the variable.
     pub fn isolated_lastcall(self, home: &Path, config: &Path, state_dir: &Path) -> Self {
         let mut cmd = self
             .env("HOME", home)
+            .env("LASTCALL_KEYBOARD", "plain")
             .env("LASTCALL_CONFIG", config)
             .env("LASTCALL_STATE_DIR", state_dir)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")

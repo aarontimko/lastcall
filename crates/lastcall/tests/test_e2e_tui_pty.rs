@@ -356,6 +356,25 @@ fn wait_first_piles(pty: &mut PtyTui) -> Duration {
     took
 }
 
+/// Poll the raw transcript until it contains `needle`; returns how long that took. The
+/// screen is no use here: the bytes wanted are a terminal *query*, which vt100 consumes
+/// without drawing anything.
+fn wait_raw(pty: &mut PtyTui, needle: &[u8], timeout: Duration) -> Duration {
+    let start = Instant::now();
+    loop {
+        if find(&pty.raw(), needle).is_some() {
+            return start.elapsed();
+        }
+        assert!(
+            start.elapsed() < timeout,
+            "{:?} not written within {timeout:?}; transcript:\n{:?}",
+            String::from_utf8_lossy(needle),
+            String::from_utf8_lossy(&pty.raw())
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// After an exit: the transcript's tail leaves the terminal sane and carries no tracing.
 fn assert_clean_exit(pty: &PtyTui, since: usize) {
     assert!(pty.wait_eof(Duration::from_secs(2)), "reader saw EOF");
@@ -1845,13 +1864,59 @@ fn pty_flag_note_exports_when_standalone() {
     );
 
     let path = export_file(&fx.state, "alpha");
-    let actual = normalise_export(&std::fs::read_to_string(&path).expect("the export file"));
+    let hunk_export = normalise_export(&std::fs::read_to_string(&path).expect("the export file"));
     for line in NOTE.lines() {
         assert!(
-            actual.contains(line),
-            "every line of the note reaches the export:\n{actual}"
+            hunk_export.contains(line),
+            "every line of the note reaches the export:\n{hunk_export}"
         );
     }
+
+    // Amendment v1.8 / ruling P4: `m` from the **nav** flags the whole file. Esc drops the
+    // diff focus first, so the second `m` has no hunk under it. The header says `whole
+    // file` where the first one said `hunk 2 of 2`, a summary line follows it, and there is
+    // no diff block — the export below is the golden that pins all three.
+    // Two writes: `\x1b` and `m` in one would reach the reader as `alt-m`, not two keys.
+    pty.send(b"\x1b").expect("esc");
+    pty.wait_for(Duration::from_secs(5), |s| !s.contents().contains("⏎ send"))
+        .unwrap_or_else(|e| panic!("esc leaves the diff focus: {e}"));
+    pty.send(b"m").expect("m");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        let t = s.contents();
+        t.contains("f1 · whole file") && t.contains("flag whole file")
+    })
+    .unwrap_or_else(|e| panic!("the whole-file note modal: {e}"));
+
+    /// The second note, the whole-file one.
+    const WHOLE: &str = "the whole file needs another pass";
+
+    pty.send(WHOLE.as_bytes()).expect("the whole-file note");
+    pty.send(b"\r").expect("enter");
+    pty.wait_for(OVERLOADED, |s| {
+        let (_, cols) = s.size();
+        s.rows(0, cols)
+            .last()
+            .is_some_and(|r| r.contains("flagged f1 · export → "))
+    })
+    .unwrap_or_else(|e| panic!("the whole-file export status: {e}"));
+
+    let ledger = fx.ledger("alpha");
+    let flags = &ledger["overrides"]["f1"]["flags"];
+    assert_eq!(flags.as_array().map(Vec::len), Some(2), "{ledger}");
+    assert_eq!(flags[1]["note"].as_str(), Some(WHOLE), "{ledger}");
+    assert!(
+        flags[1]["hunk"].is_null(),
+        "a whole-file flag carries no hunk: {ledger}"
+    );
+    assert_eq!(flags[1]["summary"]["hunks"].as_u64(), Some(2), "{ledger}");
+    assert_eq!(flags[1]["summary"]["added"].as_u64(), Some(2), "{ledger}");
+    assert_eq!(flags[1]["summary"]["deleted"].as_u64(), Some(2), "{ledger}");
+
+    let actual = normalise_export(&std::fs::read_to_string(&path).expect("the export file"));
+    assert!(
+        actual.starts_with(&hunk_export),
+        "the whole-file export is appended after the hunk one:\n{actual}"
+    );
     if std::env::var_os("LASTCALL_UPDATE_GOLDEN").is_some() {
         std::fs::write(FLAG_EXPORT_PTY_GOLDEN, &actual).expect("write golden");
         note(&format!("golden rewritten: {FLAG_EXPORT_PTY_GOLDEN}"));
@@ -1870,5 +1935,91 @@ fn pty_flag_note_exports_when_standalone() {
     pty.send(b"q").expect("q");
     let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
     assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}
+
+/// Ruling P9, the other half: the scene that **does not** set `LASTCALL_KEYBOARD=plain`.
+///
+/// Every other PTY scene sets it (`PtyCommand::isolated_lastcall`) so none of them pays
+/// crossterm's 2 s probe timeout against a harness that answers nothing. This one removes
+/// it and plays the terminal: it waits for the query crossterm writes to `/dev/tty`
+/// (`CSI ? u`, then the `CSI c` that bounds it), answers as a kitty-protocol terminal
+/// would, and then checks the three things that can go wrong.
+///
+/// 1. the query is actually written — the probe ran;
+/// 2. the app still reaches its first frame, and the enhanced key hint proves the answer
+///    was believed and the flags were pushed (`CSI > 1 u` in the transcript);
+/// 3. no byte of the reply ever surfaces as a key — crossterm's own reader consumes it
+///    before the input thread starts, so the screen carries no `?0u` / `?62` text, no
+///    modal opened by itself, and the app is still running to be quit.
+#[test]
+fn pty_keyboard_enhancement_probe_is_answered_and_swallowed() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let spawned = fx
+        .command(&bin())
+        .env_remove("LASTCALL_KEYBOARD")
+        .args(["tui", "--poll", "1"])
+        .spawn();
+    let mut pty = match spawned {
+        Ok(p) => p,
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+            note(&format!("SKIP: this host cannot open a pty: {e}"));
+            return;
+        }
+        Err(e) => panic!("spawn lastcall tui: {e}"),
+    };
+
+    // (1) The probe writes `CSI ? u` (and the `CSI c` whose reply bounds the wait).
+    let waited = wait_raw(&mut pty, b"\x1b[?u", Duration::from_secs(5));
+    note(&format!(
+        "PTY keyboard probe: query written after {waited:.3?}"
+    ));
+    assert!(
+        find(&pty.raw(), b"\x1b[c").is_some(),
+        "the device-attributes query that bounds the wait is written too"
+    );
+
+    // Answer the way kitty, WezTerm, foot or Ghostty would: the flags report, then DA1.
+    pty.send(b"\x1b[?0u\x1b[?62;1;6c").expect("the reply");
+
+    // (2) The app still starts…
+    wait_first_piles(&mut pty);
+    assert!(
+        find(&pty.raw(), b"\x1b[>1u").is_some(),
+        "the disambiguate flag is pushed once the probe says yes"
+    );
+    // …and it believed the answer: the enhanced hint is the one the note modal draws only
+    // when `term::keyboard_enhanced()` said yes.
+    // `jj` past the root header onto `f1`, then `m` on it.
+    pty.send(b"jj").expect("jj");
+    pty.wait_for(Duration::from_secs(5), |s| s.contents().contains("f1  M "))
+        .unwrap_or_else(|e| panic!("f1 is the selected row: {e}"));
+    pty.send(b"m").expect("m");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        s.contents().contains("⇧⏎ / ^J newline")
+    })
+    .unwrap_or_else(|e| panic!("the enhanced note-modal hint: {e}"));
+
+    // (3) Nothing of the reply reached the app as input.
+    pty.send(b"\x1b").expect("esc");
+    pty.wait_for(Duration::from_secs(5), |s| !s.contents().contains("⏎ send"))
+        .unwrap_or_else(|e| panic!("esc closes the modal: {e}"));
+    let screen = pty.screen_text();
+    for stray in ["?0u", "62;1;6", "[?62"] {
+        assert!(
+            !screen.contains(stray),
+            "no reply byte was echoed as typing ({stray}):\n{screen}"
+        );
+    }
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert!(
+        find(&pty.raw()[since..], b"\x1b[<1u").is_some(),
+        "the pushed flags are popped before the alternate screen is left"
+    );
     assert_clean_exit(&pty, since);
 }

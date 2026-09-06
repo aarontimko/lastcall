@@ -38,6 +38,7 @@ use lastcall_engine::herdr::HerdrEvent;
 use lastcall_engine::herdr::client::{Cache, ClientHandle};
 use lastcall_engine::herdr::transport::SocketTransport;
 use lastcall_engine::hunks::Expanded;
+use lastcall_engine::ledger::FlagSummary;
 use lastcall_engine::ops::Rendered;
 use lastcall_engine::scan::{Pile, Row};
 use lastcall_engine::store::Current;
@@ -166,7 +167,7 @@ impl Ui {
         if self.app.note.is_some() {
             match event {
                 Event::Key(_) | Event::Paste(_) => {
-                    return match note_action(event, &self.keymap) {
+                    return match note_action(event, &self.keymap, self.app.enhanced) {
                         Some(action) => self.app.handle(action),
                         None => (Changed::No, None),
                     };
@@ -610,27 +611,40 @@ fn spawn_restore(
     });
 }
 
+/// One `Effect::Flag`'s payload, carried whole into [`spawn_flag`]. It is the effect's own
+/// fields under a name: `root`, `path`, the `note`, the rendered `hunk` (`None` for a
+/// whole-file flag), its `summary` (`Some` only for a whole-file one — Amendment v1.8) and
+/// the `label` the answer will speak with.
+pub struct FlagRequest {
+    pub root: PathBuf,
+    pub path: Vec<u8>,
+    pub note: String,
+    pub hunk: Option<RenderedHunk>,
+    pub summary: Option<FlagSummary>,
+    pub label: String,
+}
+
 /// `Effect::Flag`: the ledger write and its rescan in one `blocking` closure, the same
 /// shape as `spawn_accept`. The engine renders the export (only it has the flag's
 /// `created_at`), so the answer carries the paste-ready text the send will use.
 ///
 /// Public for the same reason [`herdr_fold`] is: `tests/test_integration_loop_flag_stage.rs`
 /// drives the loop's own dispatch rather than a hand-written stand-in for it.
-pub fn spawn_flag(
-    engine: &Arc<Mutex<Engine>>,
-    tx: mpsc::UnboundedSender<Local>,
-    root: PathBuf,
-    path: Vec<u8>,
-    note: String,
-    hunk: Option<RenderedHunk>,
-    label: String,
-) {
+pub fn spawn_flag(engine: &Arc<Mutex<Engine>>, tx: mpsc::UnboundedSender<Local>, req: FlagRequest) {
+    let FlagRequest {
+        root,
+        path,
+        note,
+        hunk,
+        summary,
+        label,
+    } = req;
     let engine = engine.clone();
     let back = root.clone();
     tokio::spawn(async move {
         let task = tokio::spawn(async move {
             blocking(&engine, move |e| {
-                e.flag(&root, &path, &note, hunk)
+                e.flag(&root, &path, &note, hunk, summary)
                     .map_err(|e| AcceptFailed::of(&e))
             })
             .await
@@ -1056,6 +1070,9 @@ pub fn run(
     let guard = term::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut ui = Ui::new(App::new(), keymap);
+    // Asked once, inside `enter`, before the input thread exists; the app reads the cached
+    // answer so the note modal promises `⇧⏎` only where it works (ruling P9).
+    ui.app.enhanced = term::keyboard_enhanced();
     let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Event>();
     let stop = spawn_input(input_tx)?;
     let (local_tx, mut local_rx) = mpsc::unbounded_channel::<Local>();
@@ -1236,15 +1253,19 @@ pub fn run(
                             path,
                             note,
                             hunk,
+                            summary,
                             label,
                         } => spawn_flag(
                             &watcher.engine,
                             local_tx.clone(),
-                            root,
-                            path,
-                            note,
-                            hunk,
-                            label,
+                            FlagRequest {
+                                root,
+                                path,
+                                note,
+                                hunk,
+                                summary,
+                                label,
+                            },
                         ),
                         Effect::Unflag { root, path } => {
                             spawn_unflag(&watcher.engine, local_tx.clone(), root, path)

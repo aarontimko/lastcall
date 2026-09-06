@@ -136,6 +136,24 @@ pub struct FlagHunk {
     pub text: String,
 }
 
+/// What a **whole-file** flag was covering when it was raised (Amendment v1.8, additive).
+///
+/// A hunk flag quotes the lines it objects to, so the export can show them. A whole-file
+/// flag has nothing to quote — and "this file" with no shape at all leaves the agent
+/// guessing how big "this file" was. These three numbers are the shape as the reviewer saw
+/// it on the row, taken at flag time and stored, because a rescan later reads a file the
+/// agent may have rewritten (the same reason [`crate::ops::RenderedHunk::of`] travels with
+/// the flag rather than coming from the rescan).
+///
+/// Additive and optional: a flag written before v1.8 has none, and prints no summary line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlagSummary {
+    /// Content hunks the row showed (mode-change hunks are not content).
+    pub hunks: usize,
+    pub added: usize,
+    pub deleted: usize,
+}
+
 /// A flag on a path; never changes the baseline. `hunk` is `None` for a file flag.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Flag {
@@ -143,15 +161,33 @@ pub struct Flag {
     pub created_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hunk: Option<FlagHunk>,
+    /// The row's shape at flag time, for a whole-file flag only (Amendment v1.8). A hunk
+    /// flag never carries one, and the export never prints one for a hunk flag even if a
+    /// future writer puts one there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<FlagSummary>,
 }
 
 impl Flag {
-    /// A file flag: a note with no hunk behind it.
+    /// A file flag: a note with no hunk behind it, and no summary (Phase 7's shape).
     pub fn file(note: impl Into<String>, created_at: impl Into<String>) -> Self {
         Self {
             note: note.into(),
             created_at: created_at.into(),
             hunk: None,
+            summary: None,
+        }
+    }
+
+    /// A whole-file flag that carries the row's shape (Amendment v1.8).
+    pub fn whole_file(
+        note: impl Into<String>,
+        created_at: impl Into<String>,
+        summary: FlagSummary,
+    ) -> Self {
+        Self {
+            summary: Some(summary),
+            ..Self::file(note, created_at)
         }
     }
 }
@@ -173,7 +209,8 @@ pub struct Override {
 /// The on-disk shape of an [`Override`].
 ///
 /// **`flag` and `flags` are both written, always.** `flag` is the schema-1.0 mirror of
-/// `flags[0]` (without its `hunk`, which 1.0 has no field for), and it is written as `null`
+/// `flags[0]` (without its `hunk` or its `summary`, which 1.0 has no field for), and it is
+/// written as `null`
 /// rather than omitted when there are no flags. A 1.0 reader drops unknown fields on load,
 /// so a 1.0 binary opening a 1.1 file — a merged `main` while this branch is open, or a
 /// second machine sharing the state dir — would erase every flag on its first write. With
@@ -209,6 +246,7 @@ impl Serialize for Override {
                 note: f.note.clone(),
                 created_at: f.created_at.clone(),
                 hunk: None,
+                summary: None,
             }),
             flags: Some(self.flags.clone()),
             updated_at: self.updated_at.clone(),
@@ -855,6 +893,7 @@ mod tests {
                         note: "first".into(),
                         created_at: "t1".into(),
                         hunk: Some(hunk.clone()),
+                        summary: None,
                     },
                     Flag::file("second", "t2"),
                 ],

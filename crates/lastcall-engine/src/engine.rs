@@ -23,8 +23,8 @@ use crate::headstate::{self, HeadState, TransitionFacts};
 use crate::hunks::{self, Hunk};
 use crate::index::{IndexError, PrivateIndex};
 use crate::ledger::{
-    self, Clock, FlagHunk, Ledger, LedgerError, LedgerLock, LoadResult, SeenAt, SystemClock,
-    TreeEntries,
+    self, Clock, FlagHunk, FlagSummary, Ledger, LedgerError, LedgerLock, LoadResult, SeenAt,
+    SystemClock, TreeEntries,
 };
 use crate::ops::{FaultInjector, NoFault, Ops, OpsError, Outcome, Rendered};
 use crate::paths::{Layout, ParentId, ParentMeta, RepoPaths, RootId};
@@ -1324,15 +1324,17 @@ impl Engine {
     /// `hunk n of **m**` total does **not** come from it — [`RenderedHunk::of`] carries the
     /// count the caller had on screen (verifier F5), because a rescan reads the file as it
     /// is now and an agent that rewrote it between the render and the keystroke would
-    /// otherwise produce a `hunk 2 of 1` that never existed.
+    /// otherwise produce a `hunk 2 of 1` that never existed. `summary` travels with a
+    /// whole-file flag for the same reason (Amendment v1.8) and is ignored for a hunk flag.
     pub fn flag(
         &mut self,
         root: &Path,
         path: &[u8],
         note: &str,
         hunk: Option<RenderedHunk>,
+        summary: Option<FlagSummary>,
     ) -> Result<Flagged, EngineError> {
-        self.flag_with(root, path, note, hunk, &NoFault)
+        self.flag_with(root, path, note, hunk, summary, &NoFault)
     }
 
     /// [`Engine::flag`] with a fault injector.
@@ -1342,6 +1344,7 @@ impl Engine {
         path: &[u8],
         note: &str,
         hunk: Option<RenderedHunk>,
+        summary: Option<FlagSummary>,
         fault: &dyn FaultInjector,
     ) -> Result<Flagged, EngineError> {
         // The total the export will name, taken now, from what the caller rendered — not
@@ -1350,7 +1353,7 @@ impl Engine {
         let hunk = hunk.map(|h| h.hunk);
         let (outcome, written) = {
             let mut ops = self.ops(root)?;
-            match ops.flag(path, note, hunk, fault) {
+            match ops.flag(path, note, hunk, summary, fault) {
                 Ok(o) => {
                     // The flag as the ledger now holds it: `created_at` is the op's clock
                     // reading, which the UI has no way to reproduce.
@@ -1990,7 +1993,7 @@ pub(crate) mod tests {
             of: row.hunks.len(),
         };
         let out = engine
-            .flag(&root, b"f1", "why is this changed?", Some(hunk))
+            .flag(&root, b"f1", "why is this changed?", Some(hunk), None)
             .unwrap();
         assert!(out.outcome.ok() && out.outcome.written);
         let base = root.file_name().unwrap().to_string_lossy().into_owned();
@@ -2009,7 +2012,9 @@ pub(crate) mod tests {
         assert_eq!(out.pile.row(b"f1").unwrap().flags.len(), 1);
 
         // A second, file-level flag: no hunk segment, no diff block, and it appends.
-        let out = engine.flag(&root, b"f1", "and this file", None).unwrap();
+        let out = engine
+            .flag(&root, b"f1", "and this file", None, None)
+            .unwrap();
         assert!(!out.export.contains("```") && !out.export.contains("hunk"));
         assert!(out.export.ends_with("note: and this file"));
         assert_eq!(out.pile.row(b"f1").unwrap().flags.len(), 2);
@@ -2067,6 +2072,7 @@ pub(crate) mod tests {
                     },
                     of: rendered_total,
                 }),
+                None,
             )
             .unwrap();
         assert!(out.outcome.ok() && out.outcome.written);
@@ -2089,7 +2095,7 @@ pub(crate) mod tests {
         let state = TempDir::new("lc-eng-flag-bad");
         let mut engine = open_engine(&repo, &state, Config::default());
         let root = only_root(&engine);
-        let out = engine.flag(&root, b"bad\xff", "n", None).unwrap();
+        let out = engine.flag(&root, b"bad\xff", "n", None, None).unwrap();
         assert!(matches!(
             out.outcome.refused[..],
             [crate::ops::Refused::NonUtf8Path { .. }]

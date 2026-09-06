@@ -28,6 +28,7 @@ use super::app::{
 };
 use super::herdr::{Dot, Link};
 use super::input::{Action, MODAL_KEYS};
+use super::textbuf::Wrap;
 
 pub const TOO_SMALL: &str = "too small: 40×10 min";
 /// The note modal's box: wide enough for a sentence, narrow enough to sit over the diff.
@@ -36,7 +37,20 @@ pub const NOTE_WIDTH: u16 = 60;
 pub const NOTE_ROWS: u16 = 5;
 /// The insertion point, drawn into the text (see `render_note`).
 pub const NOTE_CARET: &str = "▌";
+/// The note modal's key line where the terminal cannot tell `Shift-Enter` from `Enter`.
 pub const NOTE_KEYS: &str = "⏎ send   ^J newline   Esc cancel";
+/// …and where it can (the kitty keyboard protocol; ruling P9).
+pub const NOTE_KEYS_ENHANCED: &str = "⏎ send   ⇧⏎ / ^J newline   Esc cancel";
+
+/// The key line the note modal shows, which is a promise: `⇧⏎` appears only on a terminal
+/// that reports the enhancement, because everywhere else that key *sends the note*.
+pub fn note_keys(enhanced: bool) -> &'static str {
+    if enhanced {
+        NOTE_KEYS_ENHANCED
+    } else {
+        NOTE_KEYS
+    }
+}
 pub const PICK_KEYS: &str = "↑↓ choose   ⏎ send   Esc cancel";
 pub const NO_SELECTION: &str = "select a file (↑↓ or click) · ? for help";
 /// What a flag-only root (no pending rows) shows instead of a file list, in the nav and
@@ -57,6 +71,24 @@ pub fn nothing_pending_short(status: &str) -> String {
 /// terminal's own text selection needs the shift override. The stopgap until the Phase 8
 /// select-to-copy item lands.
 pub const SELECT_NOTE: &str = "shift+drag selects text (mouse capture is on)";
+
+/// The help overlay's newline note where the terminal cannot tell `Shift-Enter` from
+/// `Enter` (ruling P9): the guaranteed key, and why the other one is not offered.
+pub const NEWLINE_NOTE: &str = "^J is a newline in the note (⇧⏎ needs a kitty-protocol terminal)";
+/// …and where it can: the flags were pushed, so the key works and may be named.
+pub const NEWLINE_NOTE_ENHANCED: &str = "⇧⏎ or ^J is a newline in the note (kitty protocol on)";
+
+/// The help overlay's newline line. Like [`note_keys`] it is a promise, made in the one
+/// place a reviewer looks up a key they have not tried: `⇧⏎` is named only where it works.
+/// Which terminals report the protocol is a longer answer than an overlay row, and lives in
+/// `docs/dev/tui.md`.
+pub fn newline_note(enhanced: bool) -> &'static str {
+    if enhanced {
+        NEWLINE_NOTE_ENHANCED
+    } else {
+        NEWLINE_NOTE
+    }
+}
 
 /// Which pane a screen position belongs to (the wheel scrolls the pane under the pointer).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1370,6 +1402,7 @@ fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
         .collect();
     let mut rows = help_columns(&keys, area);
     rows.push(String::new());
+    rows.push(newline_note(app.enhanced).to_owned());
     rows.push(SELECT_NOTE.to_owned());
     let width = (rows.iter().map(|r| r.width()).max().unwrap_or(0) + 4).min(area.width as usize);
     let height = (rows.len() + 4).min(area.height as usize);
@@ -1391,12 +1424,15 @@ fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
         // overlay clips, and what it clips is key rows — never the footer. A reader who
         // cannot see every key can still see what the mouse does and how to leave.
         //
-        // Three rows are reserved, not two: the blank, `SELECT_NOTE`, **and** the
+        // Three rows are reserved: the newline note, `SELECT_NOTE`, **and** the
         // `any key closes` line below them, which is drawn only where the body does not
         // reach. Reserving two put the body's last row on the footer's row, so the footer
         // was the thing the clip dropped (verifier (b) F4).
+        //
+        // The blank separator is *not* reserved — it is the first thing the clip spends.
+        // Reserving it too costs a key row, and at 80×30 the key row it costs is `quit`.
         rows.truncate(cap.saturating_sub(3));
-        rows.push(String::new());
+        rows.push(newline_note(app.enhanced).to_owned());
         rows.push(SELECT_NOTE.to_owned());
         rows.truncate(cap.saturating_sub(1));
     }
@@ -1501,10 +1537,19 @@ fn confirm_box(title: &str, mut rows: Vec<String>, buf: &mut Buffer, area: Rect)
 
 /// The note modal: what is being flagged, the note being typed, and the keys that end it.
 ///
+/// The **title names the target** — ` flag hunk 2 of 3 ` or ` flag whole file ` — so the
+/// frame of the box answers "what am I flagging?" even when a long path has been ellipsized
+/// on the line below it (ruling P4).
+///
 /// The text area is a fixed [`NOTE_ROWS`] lines high whatever is typed, so the box does not
 /// jump under the reader's hands as the note grows; past that it scrolls to keep the caret
 /// (`▌`) in view. The caret is drawn into the text rather than set on the terminal so that
 /// one `App` renders to one buffer — the snapshot tier can see where the cursor is.
+///
+/// The scroll comes from the note's own [`TextBuf`](super::textbuf::TextBuf) viewport, run
+/// on a **copy**: `render` is a function of `&App` and may not move the buffer's `top`. The
+/// copy always starts at the top, so the window still ends at the caret's row — the same
+/// rule the modal has had since Phase 7, now with the buffer's soft wrapping under it.
 fn render_note(app: &App, buf: &mut Buffer, area: Rect) {
     let Some(note) = &app.note else {
         return;
@@ -1513,7 +1558,9 @@ fn render_note(app: &App, buf: &mut Buffer, area: Rect) {
     // border + target + blank + text + blank + keys
     let height = (NOTE_ROWS + 6).min(area.height);
     let rect = centered(area, width, height);
-    let inner = modal_block(" flag ", rect, buf);
+    // Bold, as the kickoff's deliverable 5 asks: the title is the answer to "what am I
+    // flagging?", and it is the one line of the box a reviewer must not skim past.
+    let inner = modal_block(Line::styled(note.target.modal_title(), bold()), rect, buf);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -1522,19 +1569,20 @@ fn render_note(app: &App, buf: &mut Buffer, area: Rect) {
         (ellipsize(&note.target.label(), text_width), bold()),
         (String::new(), Style::new()),
     ];
-    let wrapped = caret_lines(&note.text, note.cursor, text_width.max(1));
-    // The window ends at the caret's line, so a note longer than the box scrolls with it.
-    let caret_at = wrapped
-        .iter()
-        .position(|l| l.contains(NOTE_CARET))
-        .unwrap_or(0);
-    let top = (caret_at + 1).saturating_sub(NOTE_ROWS as usize);
+    let view = note
+        .buf
+        .clone()
+        .viewport(NOTE_ROWS as usize, text_width.max(1), Wrap::Soft);
     for i in 0..NOTE_ROWS as usize {
-        let line = wrapped.get(top + i).cloned().unwrap_or_default();
+        let line = match view.rows.get(i) {
+            Some(text) if i == view.caret.0 => with_caret(text, view.caret.1),
+            Some(text) => text.clone(),
+            None => String::new(),
+        };
         rows.push((line, Style::new()));
     }
     rows.push((String::new(), Style::new()));
-    rows.push((NOTE_KEYS.to_owned(), dim()));
+    rows.push((note_keys(app.enhanced).to_owned(), dim()));
     for (i, (row, style)) in rows.iter().take(inner.height as usize).enumerate() {
         buf.set_stringn(
             inner.x + 1,
@@ -1590,24 +1638,28 @@ fn render_picker(app: &App, buf: &mut Buffer, area: Rect) {
     }
 }
 
-/// `text` split into display lines of at most `width` columns, with [`NOTE_CARET`] inserted
-/// at byte offset `cursor`. Explicit newlines break first, then each paragraph is hard-wrapped
-/// at the column — a note is prose, and a word cut in half is still readable, while a
-/// wrapping rule that hides the caret is not.
-fn caret_lines(text: &str, cursor: usize, width: usize) -> Vec<String> {
-    let mut with_caret = text.to_owned();
-    with_caret.insert_str(cursor.min(with_caret.len()), NOTE_CARET);
-    let mut out = Vec::new();
-    for para in with_caret.split('\n') {
-        let mut line = String::new();
-        for c in para.chars() {
-            if line.width() + c.width().unwrap_or(0) > width {
-                out.push(std::mem::take(&mut line));
-            }
-            line.push(c);
+/// `row` with [`NOTE_CARET`] drawn at display column `col`, padded when the caret sits past
+/// the end of the line (which is where it sits most of the time — one column after the last
+/// character typed).
+fn with_caret(row: &str, col: usize) -> String {
+    let mut out = String::new();
+    let mut at = 0usize;
+    let mut chars = row.chars();
+    for c in chars.by_ref() {
+        if at >= col {
+            out.push_str(NOTE_CARET);
+            out.push(c);
+            out.extend(chars);
+            return out;
         }
-        out.push(line);
+        at += c.width().unwrap_or(0);
+        out.push(c);
     }
+    // Past the end: pad to the column, then the caret.
+    for _ in at..col {
+        out.push(' ');
+    }
+    out.push_str(NOTE_CARET);
     out
 }
 
@@ -1624,10 +1676,10 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 }
 
 /// Clear `rect`, draw the focused border with `title`, and hand back the inside.
-fn modal_block(title: &'static str, rect: Rect, buf: &mut Buffer) -> Rect {
+fn modal_block<'a>(title: impl Into<Line<'a>>, rect: Rect, buf: &mut Buffer) -> Rect {
     Clear.render(rect, buf);
     let block = Block::bordered()
-        .title(title)
+        .title(title.into())
         .border_style(focused_border());
     let inner = block.inner(rect);
     block.render(rect, buf);
@@ -1991,6 +2043,26 @@ mod tests {
         assert!(frame.contains("Esc / h / ←    back"), "{frame}");
         // Ruling 3: the mouse note, until Phase 8's select-to-copy.
         assert!(frame.contains(SELECT_NOTE), "{frame}");
+    }
+
+    /// Ruling P9 in the one place a reviewer looks a key up: the overlay names `⇧⏎` only
+    /// on a terminal that reports the enhancement, and names the key that always works
+    /// everywhere else. Which terminals report it is `docs/dev/tui.md`'s answer, not a row.
+    #[test]
+    fn render_help_promises_shift_enter_only_with_enhancement() {
+        let mut app = App::new();
+        app.help = true;
+        let (plain, _) = frame_of(&app, 100, 30);
+        assert!(plain.contains(NEWLINE_NOTE), "{plain}");
+        assert!(
+            !plain.contains("⇧⏎ or ^J"),
+            "no ⇧⏎ promise without the protocol:\n{plain}"
+        );
+        app.enhanced = true;
+        let (enhanced, _) = frame_of(&app, 100, 30);
+        assert!(enhanced.contains(NEWLINE_NOTE_ENHANCED), "{enhanced}");
+        // Both forms name `^J`: it is the newline that needs no terminal at all.
+        assert!(NEWLINE_NOTE.contains("^J") && NEWLINE_NOTE_ENHANCED.contains("^J"));
     }
 
     /// Deliverable 8: the overlay goes to two columns rather than losing rows off the

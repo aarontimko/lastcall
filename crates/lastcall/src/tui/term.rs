@@ -7,24 +7,49 @@
 //!
 //! Logging never goes to stdout or stderr while the alternate screen is up: `init_tracing`
 //! writes only to `LASTCALL_LOG_FILE` (filtered by `LASTCALL_LOG`, default `info`), and is a
-//! no-op when that variable is unset. These two reads are the only environment access in the
-//! TUI; everything else comes through the engine's `Env`.
+//! no-op when that variable is unset. These reads and [`KEYBOARD_ENV`] are the only
+//! environment access in the TUI; everything else comes through the engine's `Env`.
+//!
+//! **Keyboard enhancement** (Phase 8 deliverable 5, ruling P9). `enter()` asks the terminal
+//! once per process whether it speaks the kitty keyboard protocol and, when it does, pushes
+//! `DISAMBIGUATE_ESCAPE_CODES` so `Shift-Enter` arrives as something other than `Enter` —
+//! the one key the note modal can only promise under that protocol. The probe writes
+//! `ESC [ ? u ESC [ c` and waits up to 2 s for a reply, which is a long time to spend on a
+//! terminal that will never answer, so `LASTCALL_KEYBOARD=plain` skips it: the test harness
+//! sets that, and so can anyone whose terminal is slow to answer. The answer is cached, so
+//! a `$EDITOR` suspend and resume pays for it once. `restore()` pops the flags **before**
+//! leaving the alternate screen, on every exit path — quit, panic and suspend alike.
 
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
-use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Once, OnceLock};
 
 use crossterm::cursor::Show;
-use crossterm::event::{DisableBracketedPaste, DisableMouseCapture, EnableMouseCapture};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    supports_keyboard_enhancement,
 };
 
 /// Set while the terminal is in our raw/alternate-screen state.
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Set while our keyboard-enhancement flags are on the terminal's stack.
+static PUSHED: AtomicBool = AtomicBool::new(false);
 static PANIC_HOOK: Once = Once::new();
+/// The probe's answer, taken once per process (ruling P9).
+static ENHANCED: OnceLock<bool> = OnceLock::new();
+
+/// Set this to `plain` to skip the keyboard-enhancement probe entirely.
+///
+/// An environment switch and **not** a `[config]` key: §6.1 is frozen, and this is a
+/// property of the terminal a session happens to be running in rather than of the user's
+/// preferences.
+pub const KEYBOARD_ENV: &str = "LASTCALL_KEYBOARD";
 
 /// Owns the terminal state; dropping it calls [`restore`].
 #[derive(Debug)]
@@ -54,7 +79,19 @@ pub fn enter() -> io::Result<TerminalGuard> {
     ACTIVE.store(true, Ordering::SeqCst);
     let result = (|| {
         enable_raw_mode()?;
+        // The probe before the alternate screen and before `spawn_input`: it reads the
+        // terminal's reply through crossterm's own internal reader, which the input thread
+        // would otherwise be racing for, and any byte a confused terminal echoes lands on
+        // the normal screen the alternate screen is about to cover.
+        let enhanced = keyboard_enhanced();
         execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+        if enhanced {
+            execute!(
+                io::stdout(),
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            )?;
+            PUSHED.store(true, Ordering::SeqCst);
+        }
         Ok::<(), io::Error>(())
     })();
     if let Err(e) = result {
@@ -76,6 +113,12 @@ pub fn restore() {
     // to report them; the disables are independent so each is attempted.
     // `Show` too: ratatui hides the cursor on every draw and only the normal quit path
     // calls `Terminal::show_cursor`; the panic and `Drop` paths come through here alone.
+    // The keyboard flags come off **first**: they are the terminal's state, not the
+    // alternate screen's, and popping them after the screen is gone leaves the user's shell
+    // reading `Shift-Enter` as an escape sequence.
+    if PUSHED.swap(false, Ordering::SeqCst) {
+        let _ = execute!(out, PopKeyboardEnhancementFlags);
+    }
     let _ = execute!(out, DisableMouseCapture, DisableBracketedPaste, Show);
     let _ = execute!(out, LeaveAlternateScreen);
     let _ = disable_raw_mode();
@@ -85,6 +128,35 @@ pub fn restore() {
 /// True between a successful [`enter`] and the matching [`restore`].
 pub fn is_active() -> bool {
     ACTIVE.load(Ordering::SeqCst)
+}
+
+/// Whether this terminal speaks the kitty keyboard protocol — asked once, then remembered.
+///
+/// Called from [`enter`], so a `$EDITOR` suspend and resume re-pushes the flags without
+/// re-asking (F8, F18). Callers outside the terminal lifecycle — the note modal's key
+/// mapping, its hint line — read the cached answer through `App`.
+pub fn keyboard_enhanced() -> bool {
+    *ENHANCED.get_or_init(|| enhancement_answer(plain_requested(), supports_keyboard_enhancement))
+}
+
+/// `LASTCALL_KEYBOARD=plain`, and only that spelling: an unset variable, an empty one or
+/// any other value means "ask the terminal".
+fn plain_requested() -> bool {
+    std::env::var_os(KEYBOARD_ENV).is_some_and(|v| v == "plain")
+}
+
+/// The rule, apart from the terminal: `plain` wins without asking, and a probe that errors
+/// or times out is a "no".
+///
+/// Failing to "off" is the whole point. Enhancement buys exactly one extra key
+/// (`Shift-Enter`), and every terminal already has `Ctrl-J` for it; guessing "on" from a
+/// failed probe would push flags a terminal never agreed to and change how it reports keys
+/// the app depends on.
+fn enhancement_answer(plain: bool, probe: impl FnOnce() -> io::Result<bool>) -> bool {
+    if plain {
+        return false;
+    }
+    probe().unwrap_or(false)
 }
 
 fn install_panic_hook() {
@@ -131,6 +203,22 @@ mod tests {
         restore();
         restore();
         assert!(!is_active());
+    }
+
+    /// Ruling P9: the switch short-circuits the probe, an error is "off", and only a
+    /// terminal that says yes gets the flags pushed.
+    #[test]
+    fn term_keyboard_enhancement_fails_open_to_plain() {
+        let boom = || Err(io::Error::other("no reply"));
+        assert!(!enhancement_answer(true, || Ok(true)), "plain never asks");
+        assert!(!enhancement_answer(false, boom), "an error is off");
+        assert!(!enhancement_answer(false, || Ok(false)));
+        assert!(enhancement_answer(false, || Ok(true)));
+        // A `plain` answer is never derived from the probe's own timing, so the switch is
+        // the only thing the harness needs to set to keep a scene off the 2 s wait.
+        assert!(!enhancement_answer(true, || panic!(
+            "the probe must not run"
+        )));
     }
 
     #[test]

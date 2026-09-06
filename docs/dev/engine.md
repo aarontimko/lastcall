@@ -425,11 +425,16 @@ undo for the whole path — and an override left with nothing else is removed. B
 ledger (`written: true`) through the same staged-then-commit path as an accept, and both
 rescan afterwards: the rescan is what puts the new `⚑` on the row the UI is about to draw.
 
-A flag is stored as `Flag { note, created_at, hunk: Option<FlagHunk> }` with
-`FlagHunk { index, header, text }` — the hunk as it was **rendered**, not a pointer into a
-diff that will have moved by the time anyone reads it. `SCHEMA_VERSION` is `"1.1"` and every
-write stamps it. The JSON carries both `flags` (the 1.1 list, hunks included) and `flag`
-(the 1.0 mirror of `flags[0]`, **without** its `hunk`); `flag` is written as `null`, never
+A flag is stored as `Flag { note, created_at, hunk: Option<FlagHunk>, summary:
+Option<FlagSummary> }` with `FlagHunk { index, header, text }` — the hunk as it was
+**rendered**, not a pointer into a diff that will have moved by the time anyone reads it —
+and `FlagSummary { hunks, added, deleted }`, the whole-file counterpart (Amendment v1.8).
+Both are additive and optional: a ledger written before v1.8 loads unchanged and
+`SCHEMA_VERSION` stays `"1.1"`. The two are mutually exclusive by construction — `Ops::flag`
+drops a summary offered beside a hunk — so a flag is a hunk flag or a whole-file one, never
+a thing that claims to be both. Every write stamps the version. The JSON carries both
+`flags` (the 1.1 list, hunks and summaries included) and `flag` (the 1.0 mirror of
+`flags[0]`, **without** its `hunk` or its `summary`); `flag` is written as `null`, never
 omitted, when there are no flags.
 
 `of` — the `m` in `hunk n of m` — travels **from the caller** in `RenderedHunk` (verifier
@@ -456,8 +461,24 @@ note: why is this unwrap safe?
 ```
 ````
 
-A file flag omits the `hunk n of m` segment and the diff block. An `unflag`, or a refusal,
-leaves `export` empty.
+A **whole-file** flag says `whole file` where a hunk flag says `hunk n of m`, carries a
+summary line in the hunk block's place, and has no diff block at all (Amendment v1.8,
+ruling P4):
+
+```text
+lastcall flag · alpha · src/tui/render.rs · whole file · 2026-09-05T18:04:00Z
+3 hunks · +12 −4
+note: the whole rewrite needs another look
+```
+
+The summary is `Flag.summary` (`FlagSummary { hunks, added, deleted }`), an **optional**
+1.1 field: it is captured from the row as it was rendered when `m` was pressed, for the
+same reason `of` is (F14), never from a rescan an agent may have invalidated. A flag
+written before v1.8 has none and prints no summary line — the `whole file` segment is
+unconditional, the line is not. A hunk flag never prints one: `Ops::flag` drops a summary
+offered beside a hunk rather than write a flag that claims to be both.
+
+An `unflag`, or a refusal, leaves `export` empty.
 
 Two rules make it safe to paste into a live terminal:
 

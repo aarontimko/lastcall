@@ -109,15 +109,15 @@ pub enum Action {
 
 /// What one keystroke does to the note being typed.
 ///
-/// `Insert` carries a string, not a char, because a bracketed paste arrives as one
-/// `Event::Paste` and must land as one edit — never as a send, whatever it contains.
+/// The editing half is [`EditKey`], the vocabulary the note modal shares with the inline
+/// editor (deliverable 5): everything the buffer knows how to do, including a bracketed
+/// paste, which arrives as one `Event::Paste` and must land as one edit — never as a send,
+/// whatever it contains. `Send` and `Cancel` are the modal's own, because only the modal
+/// knows what ends it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NoteKey {
-    Insert(String),
-    Backspace,
-    /// A line break inside the note: `ctrl-j` everywhere, `alt`/`shift`-Enter where the
-    /// terminal reports them.
-    Newline,
+    /// Anything the note's text buffer does with the keystroke.
+    Edit(EditKey),
     /// Enter: write the flag and close the modal.
     Send,
     /// Esc: close the modal, write nothing.
@@ -209,30 +209,34 @@ pub enum PickKey {
 /// The note modal's action for one key event, consulted before the keymap while
 /// `App.note` is open (deliverable 10).
 ///
-/// Every printable key types; `ctrl-j` breaks the line, and so do `alt-`/`shift-Enter`
-/// **where the terminal reports them** — with no keyboard-enhancement flags Shift-Enter is
-/// byte-identical to Enter, which is why `ctrl-j` is the one that is promised. Esc cancels,
-/// Enter sends. Everything else is swallowed, except a **non-printable** `quit` binding
-/// (`ctrl-c` by default), which quits as it does under the confirm modal — a printable one
-/// (`q`) types its letter, because a note is text.
-pub fn note_action(event: &Event, keymap: &Keymap) -> Option<Action> {
+/// Esc cancels and Enter sends — the modal's own two keys, checked first and last. In
+/// between, [`edit_key`] answers: every printable key types, `ctrl-j` breaks the line, and
+/// so do `alt-Enter` and — **only when `enhanced`** — `shift-Enter`, because with no
+/// keyboard-enhancement flags Shift-Enter is byte-identical to Enter and promising it would
+/// mean sending the note where the reviewer asked for a second line (deliverable 5).
+/// Everything else is swallowed, except a **non-printable** `quit` binding (`ctrl-c` by
+/// default), which quits as it does under the confirm modal — a printable one (`q`) types
+/// its letter, because a note is text.
+pub fn note_action(event: &Event, keymap: &Keymap, enhanced: bool) -> Option<Action> {
     if let Event::Paste(text) = event {
-        return Some(Action::Note(NoteKey::Insert(text.clone())));
+        return Some(Action::Note(NoteKey::Edit(EditKey::Insert(text.clone()))));
     }
     let Event::Key(k) = event else {
         return None;
     };
     let key = Key::of(k)?;
-    let note = match key.code {
-        KeyCode::Enter if key.alt || key.shift => NoteKey::Newline,
-        KeyCode::Enter => NoteKey::Send,
-        KeyCode::Esc => NoteKey::Cancel,
-        KeyCode::Backspace => NoteKey::Backspace,
-        KeyCode::Char('j') if key.ctrl => NoteKey::Newline,
-        KeyCode::Char(c) if !key.ctrl && !key.alt => NoteKey::Insert(c.to_string()),
-        _ => return quit_only(keymap, key),
-    };
-    Some(Action::Note(note))
+    if key.code == KeyCode::Esc {
+        return Some(Action::Note(NoteKey::Cancel));
+    }
+    // The buffer gets first refusal on everything but Esc, so `alt-Enter` and an enhanced
+    // `shift-Enter` are newlines before a bare Enter can be a send.
+    if let Some(edit) = edit_key(&key, enhanced) {
+        return Some(Action::Note(NoteKey::Edit(edit)));
+    }
+    if key.code == KeyCode::Enter {
+        return Some(Action::Note(NoteKey::Send));
+    }
+    quit_only(keymap, key)
 }
 
 /// The picker's action for one key event, on the same terms as [`note_action`]. The picker
@@ -1695,7 +1699,7 @@ mod tests {
         assert_eq!(by_key_effect.1, None, "the modal collects the note first");
         let note = by_key.note.as_ref().expect("the note modal is open");
         assert_eq!(note.target.status_label(), "f1 hunk 3");
-        assert!(note.text.is_empty());
+        assert!(note.text().is_empty());
     }
 
     /// `e` vs a click on the `[e expand]` control of a collapsed row: both ask the engine

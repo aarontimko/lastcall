@@ -339,7 +339,7 @@ fn scenario_a8_flag_with_note_retained_through_accept_all() {
         .engine
         .ops(&s.root)
         .unwrap()
-        .flag(b"f1", "why is this unwrap safe?", None, &NoFault)
+        .flag(b"f1", "why is this unwrap safe?", None, None, &NoFault)
         .unwrap();
     assert!(out.ok());
     let pile = assert_pile!(s.engine, s.root, "f1");
@@ -403,7 +403,7 @@ fn scenario_a8_two_hunk_flags_on_one_file_survive_accept_all() {
             s.engine
                 .ops(&s.root)
                 .unwrap()
-                .flag(b"f1", note, Some(hunk), &NoFault)
+                .flag(b"f1", note, Some(hunk), None, &NoFault)
                 .unwrap()
                 .ok()
         );

@@ -290,13 +290,51 @@ The modal's key discipline (`input::note_action`):
 | key | effect |
 |---|---|
 | any printable character | inserted — the keymap is off, so `q` types a `q` |
-| `Enter` | send: `Effect::Flag`, the modal closes |
+| `Enter` | send: `Effect::Flag`, the modal closes (an **empty** note is refused) |
 | `Ctrl-J` | newline (works in every terminal) |
-| `Alt-Enter`, `Shift-Enter` | newline, where the terminal reports the modifier at all |
-| `Backspace` | delete the character before the caret |
+| `Alt-Enter` | newline, where the terminal reports Alt (Option-as-Meta) |
+| `Shift-Enter` | newline **only** under the kitty keyboard protocol — see below |
+| `←` `→` `↑` `↓`, `Home`/`End`, `PgUp`/`PgDn` | move the caret (`TextBuf::apply`) |
+| `Ctrl-A` / `Ctrl-E` | line start / line end |
+| `Alt-←` / `Alt-→` (or `Ctrl-`) | word left / word right |
+| `Backspace`, `Delete` | delete around the caret |
+| `Alt-Backspace` / `Ctrl-W` | delete the word before the caret |
+| `Ctrl-K` | delete to the end of the line |
+| `Tab` | inserts a tab character |
 | `Esc` | cancel — nothing is written |
 | the `quit` binding, non-printable only | quit (`Ctrl-C` by default): a modal is never a trap |
 | anything else | swallowed |
+
+The modal edits a [`TextBuf`](../../crates/lastcall/src/tui/textbuf.rs), the same buffer the
+inline editor uses, so what is typed round-trips byte for byte.
+
+#### `Shift-Enter`, and which terminals can report it
+
+Without the kitty keyboard protocol `Shift-Enter` is **byte-identical to `Enter`**: the
+terminal sends `\r` either way, so a modal that treated it as a newline would send the note
+instead. Phase 8 asks for the protocol rather than guessing (ruling P9): `term::enter()`
+calls crossterm's `supports_keyboard_enhancement()` **once per process**, before the input
+thread starts, and pushes `DISAMBIGUATE_ESCAPE_CODES` when the answer is `Ok(true)`;
+`term::restore()` pops the flags before leaving the alternate screen on every exit path. An
+`Err` — including the 2 s timeout against a terminal that never answers — is "off".
+
+The key line says which world it is in, and that line is a promise: `⏎ send   ^J newline
+Esc cancel` when the protocol is off, `⏎ send   ⇧⏎ / ^J newline   Esc cancel` when it is on.
+The help overlay carries the same promise in one row (`render::newline_note`).
+
+Terminals that report the protocol (so `⇧⏎` works there):
+
+| reports it | does not |
+|---|---|
+| kitty, WezTerm, foot, Ghostty | Terminal.app |
+| iTerm2 ≥ 3.5 with the option enabled | tmux without `extended-keys` |
+| | herdr's terminal, as of the Gate 7 run |
+
+`LASTCALL_KEYBOARD=plain` skips the probe altogether — an environment switch, not a
+`[config]` key. The PTY harness sets it in `PtyCommand::isolated_lastcall` so no scene pays
+the 2 s timeout; `pty_keyboard_enhancement_probe_is_answered_and_swallowed` unsets it and
+plays a kitty-protocol terminal to prove the query is written, the answer is believed, the
+flags are pushed and popped, and no byte of the reply ever reaches the app as a key.
 
 **Bracketed paste is on for the modal's lifetime and no longer.** The loop enables it when
 `app.note` becomes `Some` and disables it when the modal closes, so a paste arrives as one
@@ -561,9 +599,9 @@ rule adds a row. Nothing here is a promise about the final design.
 | File header controls | `[A accept file] [U restore file]` right-aligned as one run; a run that does not fit is retried without its last label, so a narrow pane loses the newest control first and `[A accept file]` goes last | `tui_accept_controls`, `tui_narrow_60x20` |
 | Hunk header controls | `[a accept] [u restore] [m flag]` with the same drop-from-the-right rule; on an expansion hunk of a collapsed row only `[m flag]` is offered (restore of such a row stays whole-file); at 60 columns all three still fit but crowd the header — the worker flagged this for the pass | `tui_narrow_60x20`, `tui_diff_view_collapsed_expanded` |
 | Flag marker | `  ⚑ <first line of the note>` on the file and hunk header in whatever columns remain after the path and the control run (`marker_budget`); nothing is drawn when fewer than the prefix fits | `tui_diff_view_flagged_hunk`, `tui_nav_flag_counts` |
-| Help overlay (`?`) | one column while the rows fit the height; two columns when they do not **and** the width allows (about 100 columns with these descriptions), gutter 3; when neither fits (80×30 and below with this keymap) it clips key rows from the bottom, never the blank/`SELECT_NOTE`/`any key closes` footer (three rows reserved); at 80×24 the quit rows are among the clipped | `tui_help_overlay` (100×30), `tui_help_overlay_tall` (100×45), `render_help_uses_two_columns_only_when_one_does_not_fit` |
+| Help overlay (`?`) | one column while the rows fit the height; two columns when they do not **and** the width allows (about 100 columns with these descriptions), gutter 3; when neither fits (80×30 and below with this keymap) it clips key rows from the bottom, never the `newline_note`/`SELECT_NOTE`/`any key closes` footer (three rows reserved — the blank separator above them is not, and is the first row the clip spends); at 80×24 the quit rows are among the clipped | `tui_help_overlay` (100×30), `tui_help_overlay_tall` (100×45), `render_help_uses_two_columns_only_when_one_does_not_fit`, `render_help_promises_shift_enter_only_with_enhancement` |
 | Confirm modal | centered box, one question row from the scope; an accept shows live counts, a restore shows the one row; hint line switches to the modal's keys | `tui_restore_confirm`, `render_confirm_modal_shows_live_counts` |
-| Note modal | centered, `NOTE_WIDTH` = 60 columns (clamped to the frame minus 4, floor 8), a fixed `NOTE_ROWS` = 5-line text area that scrolls to keep the caret visible, plus title, target line and the key row `⏎ send   ^J newline   Esc cancel`; bracketed paste is on only while it is open | `tui_note_modal`, PTY `pty_flag_note_exports_when_standalone` |
+| Note modal | centered, `NOTE_WIDTH` = 60 columns (clamped to the frame minus 4, floor 8), a fixed `NOTE_ROWS` = 5-line text area that scrolls to keep the caret visible, plus the title — which **names the target**, ` flag hunk 2 of 3 ` or ` flag whole file ` (agenda (d)) — the target line and the key row, `⏎ send   ^J newline   Esc cancel` or its `⇧⏎` form; bracketed paste is on only while it is open | `tui_note_modal`, `tui_note_modal_scrolled`, `tui_note_modal_whole_file`, PTY `pty_flag_note_exports_when_standalone` |
 | Agent picker | centered, width = widest row + 4, height = rows + 2, both clamped to the frame; first row says the flag is already saved and `Esc` costs only the send; key row `↑↓ choose   ⏎ send   Esc cancel` | `tui_agent_picker` |
 | Collapsed rows | `collapsed (binary) · +a −d · not expandable` / `collapsed (size)` with `[e expand]`; expansion capped at 2,000 lines with `… N lines omitted` | `tui_nav_collapsed_*`, `tui_diff_view_collapsed*` |
 
