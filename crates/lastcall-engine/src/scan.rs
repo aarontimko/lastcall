@@ -100,7 +100,10 @@ pub struct Row {
     pub annotation: Option<Annotation>,
     pub conflicted: bool,
     pub collapsed: Option<Collapsed>,
-    pub flag: Option<Flag>,
+    /// Every flag on the path, oldest first (Amendment v1.7). A file flag has `hunk: None`.
+    /// `#[serde(default)]` so recorded-pile fixtures written before v1.7 still load.
+    #[serde(default)]
+    pub flags: Vec<Flag>,
     pub rename: Option<Rename>,
 }
 
@@ -374,8 +377,14 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
     // applies to every candidate whichever list it came from: an absent cone path is a
     // cone even when an override or `diff-files` names it.
     let root_dir = inputs.store.root();
+    // A restore's in-flight temp file (`restore::RESTORE_TEMP_GLOB`) is never a row: it
+    // exists for the microseconds between `create_new` and `rename`, and a second lastcall
+    // scanning in that window would otherwise show it as an added file the user could
+    // accept. A ghost left by a crash is hidden for the same reason and swept by the next
+    // restore of that name (review F8).
     let candidates: Vec<Vec<u8>> = candidates
         .into_iter()
+        .filter(|p| !crate::restore::is_restore_temp_path(p))
         .filter(|p| {
             !skip.contains(p)
                 || root_dir
@@ -429,10 +438,11 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
                 }),
                 Baseline::Absent | Baseline::Empty => None,
             };
-            let flag = std::str::from_utf8(path)
+            let flags = std::str::from_utf8(path)
                 .ok()
                 .and_then(|s| inputs.ledger.overrides.get(s))
-                .and_then(|o| o.flag.clone());
+                .map(|o| o.flags.clone())
+                .unwrap_or_default();
             let is_conflicted = conflicted.contains(path);
             let lossy = String::from_utf8_lossy(path).into_owned();
             if std::str::from_utf8(path).is_err() {
@@ -477,7 +487,7 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
                 annotation: None,
                 conflicted: is_conflicted,
                 collapsed: None,
-                flag,
+                flags,
                 rename: None,
             };
             rows.push(row);
@@ -858,6 +868,7 @@ pub(crate) mod fixture_tests {
                 tree: &mut self.tree_entries,
                 clock: &self.clock,
                 compaction_threshold: self.compaction_threshold,
+                case_insensitive: self.case_insensitive,
                 staged: std::collections::BTreeMap::new(),
                 lock: crate::ops::DEFAULT_LOCK,
             }
@@ -1058,6 +1069,29 @@ pub(crate) mod fixture_tests {
     }
 
     #[test]
+    fn scan_ignores_restore_temp_files() {
+        let repo = FixtureRepo::new("scan-restore-temp").unwrap();
+        let state = TempDir::new("lc-scan");
+        let h = Harness::new(&repo, &state);
+        // A restore in flight in another lastcall process, and a ghost from one that was
+        // killed between `create_new` and `rename` (F8). Neither is ever a row: a row is
+        // something the user could accept, and these are lastcall's own scratch.
+        repo.write(".f1.lastcall-restore-4242-0", "half-written\n");
+        repo.write("d/.f2.lastcall-restore-4242-1", "half-written\n");
+        // A file that merely looks similar is a real file and keeps its row.
+        repo.write("f1.lastcall-restore-4242-0", "a real file\n");
+        let pile = h.scan().pile;
+        assert!(
+            pile.row(b".f1.lastcall-restore-4242-0").is_none(),
+            "{}",
+            pile_lines(&pile).join(" ")
+        );
+        assert!(pile.row(b"d/.f2.lastcall-restore-4242-1").is_none());
+        assert!(pile.row(b"f1.lastcall-restore-4242-0").is_some());
+        assert_eq!(crate::ops::RESTORE_TEMP_GLOB, ".*.lastcall-restore-*");
+    }
+
+    #[test]
     fn scan_override_paths_are_candidates_and_absent_skip_worktree_is_not() {
         let repo = FixtureRepo::new("scan-ovr").unwrap();
         let state = TempDir::new("lc-scan");
@@ -1070,10 +1104,7 @@ pub(crate) mod fixture_tests {
             Override {
                 blob: Some(Some(other)),
                 mode: Some(Mode::Regular),
-                flag: Some(Flag {
-                    note: "look".into(),
-                    created_at: "t".into(),
-                }),
+                flags: vec![Flag::file("look", "t")],
                 updated_at: "t".into(),
             },
         );
@@ -1086,7 +1117,7 @@ pub(crate) mod fixture_tests {
         assert_eq!(pile_lines(&pile), vec!["f1", "f2"]);
         let f1 = pile.row(b"f1").unwrap();
         assert_eq!(f1.change, Change::Modified);
-        assert_eq!(f1.flag.as_ref().unwrap().note, "look");
+        assert_eq!(f1.flags[0].note, "look");
         repo.remove("f2");
         assert_eq!(pile_lines(&h.scan().pile), vec!["f1"]);
     }

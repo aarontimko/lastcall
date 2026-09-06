@@ -36,7 +36,12 @@ test): 34 testkit = 390, the Phase 6 floor; Phase 6 engine work (draft roots, co
 classes, `hunks_of`, the debounce cap, one remote-ref listing): 215 engine + 34 testkit +
 146 binary lib + 5 binary main = 400; Phase 6 TUI work (the expand key, the drain pass, the
 nav offset, the discovering line, the debug probes): 218 engine + 34 testkit + 164 binary
-lib + 6 binary main = **422**, the Phase 7 floor).
+lib + 6 binary main = **422**, the Phase 7 floor; Phase 7 (the engine half: restore, flags,
+the export renderer and the ledger's 1.1 schema; then the TUI half: the two-column overlay,
+restore, the note modal, the picker and the export fallback, whose reducer tests are the last
+13 of the binary lib's count): 255 engine + 34 testkit + 187 binary lib + 6 binary main =
+**482**; then the verifier (b) review-fix pass, which added seven reducer and render tests
+for F1–F5: 255 engine + 34 testkit + 194 binary lib + 6 binary main = **489**).
 The suite never shrinks across commits. One recorded exception: at the Phase 2 code review
 the three filesystem-live watcher tests (up to 30 s waits, real FSEvents) left the unit tier
 for `crates/lastcall-engine/tests/test_integration_watcher.rs` because they contradicted the
@@ -88,11 +93,35 @@ are stable because fixtures use fixed identities and dates. To update after an i
 schema change: `just golden-update` (sets `LASTCALL_UPDATE_GOLDEN=1`), then review the diff
 and commit the file.
 
+## The flag-export goldens
+
+Two files under `crates/lastcall/tests/golden/` freeze `flags::export`'s bytes, and one
+`just` target rewrites both:
+
+```sh
+just flag-export-golden      # LASTCALL_UPDATE_GOLDEN=1, then a plain run to prove it passes
+```
+
+- `flag_export.md` is written by the engine unit test
+  `flags::tests::flags_export_matches_the_golden` under a `FixedClock`, and covers the
+  awkward shapes on purpose: a hunk flag, a file flag with no diff block, a note full of
+  control bytes in caret form, and a hunk whose own body contains a three-backtick fence, so
+  that block has to open with four.
+- `flag_export_pty.md` is written by the PTY scene
+  `pty_flag_note_exports_when_standalone`, so it is the export as the **built binary**
+  appends it to the fallback file — the whole path, note modal included. Two fields a run
+  can move are normalised before the compare: the root basename to `<R>` and the timestamp
+  to `<T>` (the binary has no clock override, which is why the engine golden and not this
+  one pins a real timestamp).
+
+Regenerate only through the `just` target, review the diff, and commit the file with the
+change that moved it.
+
 ## The e2e tier: snapshots and the PTY
 
 Both files live in `crates/lastcall/tests/`; `docs/dev/tui.md` has the how-to.
 
-`test_e2e_tui_snapshots.rs` renders thirty-three scenes (the sixteen Phase 3 ones; the
+`test_e2e_tui_snapshots.rs` renders thirty-nine scenes (the sixteen Phase 3 ones; the
 seven Phase 4 accept scenes, which drive the real `Engine::accept` from the reducer's own
 `Effect::Accept` and feed `App::accepted`, and where `tui_accept_all_confirm` pins a second
 `_live` frame; and the six Phase 5 herdr scenes — `tui_herdr_status_dots`,
@@ -104,7 +133,12 @@ two, being a list of badge lines and not a frame; and the four Phase 6 ones —
 `fixture_parent::add_draft_root` and so is the **only** scene that is not three roots,
 `tui_nav_collapsed_lockfile`, `tui_nav_collapsed_binary_and_size` and
 `tui_diff_view_collapsed_expanded`, which presses `e` and pins the expansion under the
-collapsed line) through `ratatui::backend::TestBackend`
+collapsed line; and the six Phase 7 ones — `tui_note_modal`, `tui_agent_picker`,
+`tui_restore_confirm`, `tui_diff_view_flagged_hunk`, `tui_nav_flag_counts` and
+`tui_help_overlay_tall`, where the flagging scenes drive `m`, the note a character at a
+time and Enter, then call the real `Engine::flag` with the effect's own arguments and feed
+`App::flagged` back, so the frame is of an `App` the loop could have produced) through
+`ratatui::backend::TestBackend`
 from an `App` fed by a real engine over the shared `fixture_parent` (each scene builds its
 own fixture and state dir under a temp dir) and pins each as two `insta` snapshots under
 `crates/lastcall/tests/snapshots/`: `<scene>_frame` (the symbols, exactly as a 100×30 — or
@@ -142,7 +176,30 @@ over `draft_config_toml`'s four roots — it must, or the child would discover o
 and accepts a hunk in the gitignored `_drafts/` root, then relaunches on the same state dir
 to show it stayed accepted; `wait_first_piles` additionally pins the startup order
 (`lastcall: discovering roots under …` on stderr, then the alternate-screen sequence, then
-`scanning N roots…`). The scenes are serialized (one mutex); the whole file is about 30 s. Timing lines go to `stderr().write_all` so they survive libtest's
+`scanning N roots…`). The four Phase 7 scenes are `pty_restore_hunk_then_file_bytes_match_baseline` (restore one
+hunk, then the file, comparing the bytes on disk with the baseline blob),
+`pty_restore_refused_when_the_file_moved` (the file is renamed under the running loop and
+the refusal is read off the status line), `pty_restore_deletion_recreates_the_file`, and
+`pty_flag_note_exports_when_standalone`, which types a note into the modal with **no herdr
+link** and reads the export back out of the state dir against `flag_export_pty.md`. The note
+it types is four lines and gets there both ways a note can: a raw `0x0a` (what the terminal
+sends for `Ctrl-J`) and a bracketed paste carrying a newline of its own, both through the
+real crossterm reader — so the failure `tui.md` calls the worst this modal has, firing off
+the first line and dropping the rest, is now proven absent end to end and not only in the
+reducer (verifier (b) F6). No PTY
+scene talks to herdr: only `just test-integration-herdr` proves the real pane. The staged
+send is covered in three places, and it takes all three — verifier (b) F1 found that the two
+end tests both passed while the middle was missing, because nothing in the loop built
+`HerdrUpdate::Agents` and the send was unreachable in the binary. The reducer's decision
+(`app_flagged_with_one_agent_stages_without_asking` and the picker tests) injects the
+candidates; `herdr_stage_wraps_the_export_in_bracketed_paste_markers` pins the request's
+shape against an in-memory mock; and **`loop_flag_with_one_agent_reaches_pane_send_text`
+(`tests/test_integration_loop_flag_stage.rs`) is the only test that joins them** — a real
+client over the mock socket, the loop's own `run::herdr_fold`, `Ui::event` for the
+keystrokes, and `run::spawn_flag` / `run::spawn_stage` for the effects, asserting the
+bracketed-paste `pane.send_text` that lands on the socket. A send test that injects its own
+candidates proves the reducer, never the wiring. The scenes are serialized (one
+mutex); the whole file is about 45 s. Timing lines go to `stderr().write_all` so they survive libtest's
 capture — run it with `-- --nocapture` to see them. If the live-update assertion fails on a
 loaded host, report the measured numbers; do not loosen the budget.
 
@@ -230,7 +287,7 @@ cache is proven to have re-bootstrapped by `Cache.resyncs` going `1 -> 2`, not b
 `herdr api schema --json` is 255 KB of JSON-Schema, 91 request and 58 result variants, almost
 none of it ours — diffing all of it would flag every unrelated herdr feature, and an alert
 nobody trusts is not a check. `lastcall_testkit::herdr_schema` projects it onto the surface
-this repo actually consumes: the ten methods we call with their params and result schemas,
+this repo actually consumes: the eleven methods we call with their params and result schemas,
 the fifteen §5.4 lifecycle events plus `pane.agent_status_changed`, the transitive type
 closure, and the `AgentStatus` and `NotificationShowSound` vocabularies the code branches on.
 About 50 KB, key-sorted (`serde_json`'s maps are `BTreeMap`s here — no `preserve_order`), one

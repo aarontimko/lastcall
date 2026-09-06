@@ -223,6 +223,159 @@ from what the user is looking at:
   `y confirm  n cancel  q quit` — exactly the keys that work there, the `quit` label being
   the user's own binding (`render_hint_line_under_the_modal_names_only_its_keys`).
 
+## Restore and flag (Phase 7)
+
+Accept is one of the three answers a reviewer has. The other two are "put that back" and
+"I have a question about this" — `u` / `shift-u` and `m` / `shift-m`.
+
+### Restore (`u`, `shift-u`)
+
+- **Scope** (`App::restore_scope`, `RestoreScope`): the same shape as `accept_scope` with two
+  variants instead of five. `u` on a row with content hunks is the hunk under the diff
+  cursor; on a hunkless row (binary, collapsed, unreadable) it is the file; on a **deletion**
+  row it is also the file, because a deletion row's single hunk *is* the file (F16). `shift-u`
+  is always the file. There is no restore-group and no restore-all: undoing a whole tree at
+  once is not a gesture lastcall offers, which is why `Effect::Restore` carries a `Vec` that
+  never holds more than one request.
+- **A restore asks whenever it removes something.** A hunk restore starts immediately; a
+  file restore opens the confirm modal first. The CAS is the guard either way and the
+  content a restore drops stays addressable in the private store, but a whole file going
+  back is the bigger surprise. The one row where `u` is *not* a hunk restore is an **added**
+  file whose whole content is one hunk: restoring that hunk is the engine's removal path
+  (`ops_restore_hunk_on_an_added_file_removes_it`), so `restore_scope` returns the file
+  scope and the delete question opens (verifier (b) F3 — it used to delete the file with no
+  question and then report `restored f1 hunk 1` about a path that was gone). An added row
+  with several content hunks keeps the hunk scope: there a hunk restore really is partial.
+  The
+  modal is the accept modal with a different scope — `ConfirmScope::{Accept, Restore}` — so
+  there is one modal, one key set and one hint line. `confirm_counts` stays accept-only
+  (F11): a restore covers one row, so there is nothing to tally, and the question comes from
+  `restore_question(scope)`, the only place its wording lives:
+
+  | row | question |
+  |---|---|
+  | modified, 3 hunks | `Restore f1 · 3 hunks?` |
+  | deleted | `Restore f1? (deleted)` |
+  | added since the baseline | `Delete f1? (added since baseline)` |
+
+  The third is not a euphemism to soften: restoring a file the baseline does not have
+  **removes** it, and the status line afterwards says `removed f1 (added since baseline)`.
+- **One at a time**, like accept: `App.restoring` holds the scope in flight and a second
+  restore is ignored with `restore in progress`.
+- **Completion** (`App::restored`): the pile goes through `apply_pile` (seq included), the
+  §6.7 advance rule runs for the selection the restore was asked from, and one status line
+  says what happened — `restored f1 hunk 2`, `restored f1`, `removed f1 (added since
+  baseline)`. Refusals read with their own verb (`Refused::message("restored")`), because a
+  sentence has to say which operation did not happen.
+- The TUI **never opens a worktree file for writing**. Every byte a restore writes goes
+  through `Engine::restore`, and every flag through `Engine::flag`/`unflag`:
+  `rg -n 'e\.(restore|flag|unflag)\(' crates/lastcall/src` finds only `run.rs`'s effect
+  handlers. The one file the TUI opens for writing is the export fallback under the state
+  dir (below).
+
+### Flag (`m`), and the note modal
+
+`m` opens the note modal on what `App::flag_target` names: the hunk under the diff cursor
+when the diff has focus and the row has content hunks, else the file. The synthetic mode
+hunk is not content — there is nothing to quote — so `m` on it flags the file.
+
+**The target is captured when `m` is pressed and never re-read** (F14). Piles keep landing
+while the note is being typed: an agent still writing can reorder the hunks or remove the
+one the note is about, and the flag must not follow. `NoteEntry.target` holds the `Rendered`
+row, the `FlagHunk` (index, header, body) and the `of` count as they were on screen; Enter
+writes exactly that.
+
+The modal's key discipline (`input::note_action`):
+
+| key | effect |
+|---|---|
+| any printable character | inserted — the keymap is off, so `q` types a `q` |
+| `Enter` | send: `Effect::Flag`, the modal closes |
+| `Ctrl-J` | newline (works in every terminal) |
+| `Alt-Enter`, `Shift-Enter` | newline, where the terminal reports the modifier at all |
+| `Backspace` | delete the character before the caret |
+| `Esc` | cancel — nothing is written |
+| the `quit` binding, non-printable only | quit (`Ctrl-C` by default): a modal is never a trap |
+| anything else | swallowed |
+
+**Bracketed paste is on for the modal's lifetime and no longer.** The loop enables it when
+`app.note` becomes `Some` and disables it when the modal closes, so a paste arrives as one
+`Event::Paste` carrying every newline it holds — inserted whole, never mistaken for the
+`Enter` that sends. A pasted multi-line note that fired off its first line and dropped the
+rest would be the worst failure this modal has, and the paste event is what prevents it.
+Mouse clicks are ignored while the modal is open: there is nothing on it to click.
+
+### The send decision
+
+The flag is written first — `Effect::Flag` → `Engine::flag` → `Local::Flagged` — and only
+then does the loop decide where the export goes, from the candidates the last herdr
+derivation found for that root (`HerdrView::candidates`, narrowed by the `w` scope when it
+is on, so the picker covers the ground the nav does):
+
+| candidates | what happens |
+|---|---|
+| exactly one | `Effect::Stage` at once — there is nothing to ask |
+| more than one | the picker modal; `↑↓`/`kj` choose, `Enter` sends, `Esc` drops the send |
+| none, or standalone | `Effect::Export` — the fallback file |
+
+lastcall never picks an agent for the reader. **The flag is on disk before any of this**, so
+`Esc` on the picker loses nothing: the status says `flagged f1 · not sent` and the row keeps
+its `⚑`. The picker is live — a pane that appears or goes away while it is open changes the
+list under the cursor, and the selection is clamped to it; every candidate going away closes
+it rather than showing an empty list.
+
+**Staged, not sent.** `herdr::stage` wraps the export in bracketed-paste markers and calls
+`pane.send_text`, so the payload lands in the agent's input buffer and waits for the human
+to press Enter. The payload ends with `STAGE_TAIL` (a newline and a blank line) **inside**
+the markers: the closing fence gets its own line and the next flag staged into the same
+buffer starts a block of its own. The sponsor's Gate 7 run found three flags running together
+— each closing fence followed on the same line by the next `lastcall flag ·` header, which a
+Markdown reader nests inside the first code block — because the first design left the
+newline out for fear of submitting. Inside bracketed paste a newline is text; and the diff
+already carries dozens, so an application that ignored the markers would have submitted long
+before the tail. The real-pane proof (`herdr_real_send_text_lands_unsubmitted`) stages the
+tail with the rest and shows nothing runs until Enter. A send that
+fails is a status line and nothing more (`flagged f1 · send failed: <reason>`): the flag is
+in the ledger either way, which is why the flag's own label travels with the send —
+`Effect::Stage { flag, .. }` → `Local::Staged { flag, .. }` — rather than being read back
+off `App` when the answer lands.
+
+**The fallback file** is the one file the TUI writes:
+
+```text
+<state_dir>/exports/<root basename>/<YYYY-MM-DD>.md
+```
+
+Appended to, never truncated, with a blank line between entries; the date comes from the
+**engine's clock**, not `SystemTime::now()`, which is what lets a test with a `FixedClock`
+name the file it expects. The status line names the path it wrote:
+`flagged f1 · export → /…/exports/alpha/2026-09-05.md`.
+
+`shift-m` (`unflag`) clears **every** flag on the selected file — Phase 7 has no per-flag
+removal — and says `flags cleared`.
+
+**Every answer carries its own kind and label.** Two flag writes can be in flight at once —
+`m` again while a send is still out, or `m` then `shift-m` on the same row, whose two
+blocking tasks the engine's mutex does not order — so `Local::Flagged` carries `FlagKind`
+(`Flag { label }` or `Unflag`), built from the effect the loop dispatched, and `Staged` and
+`Exported` carry the flag's words with them. Nothing about a flag is read back off a slot on
+`App` when its answer lands: an unflag is never mistaken for a cancelled send (which would
+append a blank entry to the day's export file), and a second flag is never reported as
+`flags cleared` and then dropped. An empty export is never sent by any route.
+
+### Where flags show
+
+- The nav row carries `⚑` for one flag and `⚑2` for two or more: the count is the only thing
+  that says a row has more than one note without opening it.
+- The file header and the flagged hunk's header carry `⚑ <the note's first line>`, dimmed.
+  Only the first line, and only in the room left once the right-aligned controls are
+  reserved (`render::marker_budget` / `flag_marker`) — a note is whatever the reviewer typed,
+  and a flagged row is exactly the one whose `[u restore]` and `[m flag]` they still want.
+- The hunk marker matches on the **header text** the flag stored, not on its index: the index
+  is where the hunk was when it was flagged, and one edit above it moves every later hunk
+  down. A flag whose header no longer appears simply shows no marker rather than marking the
+  wrong hunk.
+
 ## Keys
 
 Defaults (`input::DEFAULT_KEYMAP`, in help-overlay order):
@@ -240,6 +393,10 @@ Defaults (`input::DEFAULT_KEYMAP`, in help-overlay order):
 | `accept` | `a` | on a file row: the one hunk under the diff cursor (a hunkless row — binary, collapsed, deleted, unreadable — whole); on a group: the group; on a root: every row of it (asks above 10 files) | the same hunk |
 | `accept_file` | `shift-a` | accept the selected file whole — the only key that does | |
 | `accept_all` | `ctrl-a` | accept everything listed, every root (asks above 10 files) | |
+| `restore` | `u` | put the hunk under the diff cursor back to its baseline (a hunkless, deleted, or one-hunk added row: the file, which asks) | the same hunk |
+| `restore_file` | `shift-u` | put the selected file back whole — always asks first | |
+| `flag` | `m` | flag it with a note: the hunk under the diff cursor (an expansion's hunk counts), or the file from the nav | the same hunk |
+| `unflag` | `shift-m` | clear every flag on the selected file | |
 | `expand` | `e` | expand the selected collapsed row into hunks ("Collapsed rows" below) | |
 | `ack` | `d` | ack the selected root's herdr ready flag ("herdr in the UI" below) | |
 | `jump` | `g` | focus the selected root's agent in herdr | |
@@ -260,11 +417,25 @@ without touching the selection, and a hidden nav (below 70 columns) can never ho
 
 The confirm modal answers `y` / `enter` (confirm) and `n` / `esc` (cancel) — fixed
 (`input::MODAL_KEYS`), not `[keys]` names, listed last in the help overlay — plus the
-`quit` keys, which quit from inside it; nothing else.
+`quit` keys, which quit from inside it; nothing else. The note modal and the agent picker
+have their own key sets, printed on the modal itself ("Restore and flag" above).
+
+**The help overlay is two columns when one does not fit.** With 27 bindable rows plus the
+modal keys, a single column runs off the bottom of a 30-row terminal, so
+`render::help_columns` splits the rows in half whenever one column would overflow the height
+*and* the pair fits the width — each column sized to its own widest row, because padding both
+to the widest row in the table costs the second column the width it needs. If two columns
+would themselves have to be truncated, one column is no worse, and it stays. The vertical
+clipping that follows eats key rows, never the footer: **three** rows are reserved out of
+the truncation — the blank, the shift-drag note (`render::SELECT_NOTE`) and the
+`any key closes` line — so both survive at any size the overlay is drawn at. At 80 columns,
+the standard width, the pair does not fit and the overlay clips: at 30 lines it reaches the
+`quit` row, at 24 it stops earlier, and the footer is there either way (verifier (b) F4).
 
 Mouse: a left press on a nav entry selects it; on a hunk header it selects that hunk; on a
-hunk header's `[a accept]` it accepts that hunk, on the main view's `[A accept file]` the
-file, on the header's `[Accept All]` everything listed; on the diff body it focuses the
+hunk header's `[a accept]` it accepts that hunk, on `[u restore]` it restores it and on
+`[m flag]` it opens the note modal on it; on the main view's `[A accept file]` /
+`[U restore file]` the file, on the header's `[Accept All]` everything listed; on the diff body it focuses the
 diff; dragging the divider resizes the nav (clamped to 16..=60); the wheel scrolls the pane
 under the pointer, three lines a notch.
 
@@ -282,7 +453,11 @@ nav, and in the main pane one dimmed line instead of a diff —
 story is unchanged and deliberately whole-row: `a` on a collapsed row takes the file (there
 is no hunk to point at) and `A` does the same, which is why an expansion draws **no
 per-hunk `[a accept]` control** — the row header's `[A accept file]` is the only accept on
-that screen.
+that screen. `[u restore]` is off there for the same reason and one more: the row carries no
+hunks, so a hunk restore would ask about nothing; whole-file restore is `U` (verifier (b)
+F5). **`[m flag]` stays.** A flag only quotes — `m` on hunk 2 of 3 of an expansion writes a
+flag about that hunk and the export says `hunk 2 of 3` — so `flag_target` reads
+`App::view_hunks`, the hunks on screen, where accept and restore read the row.
 
 - `e` (or a click on `[e expand]`) emits `Effect::Expand(root, Box<Row>)`; the loop runs
   `Engine::hunks_of` off the UI task and hands the result back as `Local::Expanded`. The
@@ -321,6 +496,26 @@ frames, and they join `tui_accept_controls`, `tui_herdr_scope_notice` and `tui_h
 the pass's input at the Phase 9 kickoff. Nothing in the status line, the header ladder or
 the scope notice moved.
 
+Phase 7 answers that sizing question rather than deferring it: the overlay is **two
+columns** when one column does not fit. `render_help` builds the key rows, then
+`help_columns` measures them — one column stands while `rows + 2 + 4 <= area.height` (the
+`+ 2` is the blank line and `SELECT_NOTE`, the `+ 4` the border, the pad and the `any key
+closes` line); past that it splits the rows in half with `div_ceil`, pads column one to its
+own widest row plus `HELP_GUTTER` (3 spaces) and joins column two beside it. Reading order
+runs **down column one, then down column two** — not across — so the keymap's order is
+still the order you read. If the two columns plus the border would not fit the width, the
+overlay stays one column and clips as before: narrow beats scrambled. `SELECT_NOTE` and
+`any key closes` are never columnised; they stay full width under the body, and the
+truncation reserves all three of their rows (`cap - 3`, then `cap - 1`) rather than letting
+the body's last row land on the footer's. Two columns need about 100 columns with these
+descriptions, so 80 clips; shortening them to fit 80 would cost about twenty columns across
+ten rows and was not worth the truth. The frames are
+`tui_help_overlay` (100×30) and `tui_help_overlay_tall` (100×45): 23 rows still fit one
+column at 30 lines, and Phase 7's four new keys (`u`, `U`, `m`, `M`) take it to 27, which
+is where the split starts — the tall frame is the control that keeps one column pinned.
+The pair is the design pass's input on whether a two-column box is the right answer for a
+keymap that keeps growing.
+
 ### The `[keys]` table (`config.toml`)
 
 ```toml
@@ -344,6 +539,38 @@ mode) and by `lastcall config` (exit 2, so a bad table is visible headlessly):
 
 The effective table is what the hint line and the help overlay show (`App.keymap`), so a
 user sees their own bindings, not the defaults.
+
+## Design pass inputs: the responsive rules (for the Phase 9 Claude Design pass)
+
+The sponsor ruled at the Phase 7 close (§10 2026-09-05) that the bottom hint line and the
+rest of the layout's fine-tuning belong to the Claude Design pass at the Phase 9 kickoff,
+and that until then each phase makes its own judgment call and **records the dynamic
+behaviour here** — "below N columns this happens, above N that happens" — so the pass can
+review the screen holistically rather than one frame at a time. Every rule below is a
+threshold in `render.rs`/`app.rs` with the snapshot that pins it; a phase that adds a
+rule adds a row. Nothing here is a promise about the final design.
+
+| Surface | Rule as built (Phase ≤ 7) | Pinned by |
+|---|---|---|
+| Whole frame | below `MIN_SIZE` = 40×10 the frame is only `too small: 40×10 min` and the hit map is empty | `tui_too_small_30x8`, `render_too_small_is_one_line` |
+| Header | `lastcall  N repos · N files · N hunks  [Accept All]` + the watch notice right-aligned; when both do not fit (about 60 columns) the `[Accept All]` control is dropped and the notice kept (`^A` duplicates the control; nothing else says what is watched) | `tui_narrow_60x20` |
+| Nav pane | outer width `App.nav_width`, 16..=60 (default 28), draggable; hidden below `NAV_MIN_COLS` = 70 columns, when the diff takes the whole body and has focus; keeps its scroll offset across selection changes | `tui_narrow_60x20`, `tui_nav_*` |
+| Hint line (status bar) | built from the keymap in two tiers: tier 2 (`Tab focus`, `r refresh`) is dropped below 70 columns or whenever the line would not fit, then tier 1 (the file and global accept hints, `d ack`/`g jump`/`w scope` when applicable); the accept hint follows the selection (`a accept hunk  A accept file` / `a/A accept file` / `a accept group` / `a accept all in <root>`); while a confirm modal is open the line is exactly `y confirm  n cancel  q quit`; the Phase 7 keys (`u`, `U`, `m`, `M`) are **not** on the hint line — they live on the hunk controls, the `?` overlay and the modal's own key row | `tui_status_line_head_notice`, `render_hints_and_help_follow_the_app_keymap` |
+| Status bar vs hints | the latest engine notice with its age replaces the hints for `STATUS_TTL` = 30 s, then the hints return | `tui_status_line_head_notice` |
+| Scope notice | `scope: <ws> · N repos hidden (w shows all)` (43 columns) crowds the header at 100 columns — carried to the pass since Phase 5 | `tui_herdr_scope_notice`, `tui_herdr_scope_notice_with_status` |
+| File header controls | `[A accept file] [U restore file]` right-aligned as one run; a run that does not fit is retried without its last label, so a narrow pane loses the newest control first and `[A accept file]` goes last | `tui_accept_controls`, `tui_narrow_60x20` |
+| Hunk header controls | `[a accept] [u restore] [m flag]` with the same drop-from-the-right rule; on an expansion hunk of a collapsed row only `[m flag]` is offered (restore of such a row stays whole-file); at 60 columns all three still fit but crowd the header — the worker flagged this for the pass | `tui_narrow_60x20`, `tui_diff_view_collapsed_expanded` |
+| Flag marker | `  ⚑ <first line of the note>` on the file and hunk header in whatever columns remain after the path and the control run (`marker_budget`); nothing is drawn when fewer than the prefix fits | `tui_diff_view_flagged_hunk`, `tui_nav_flag_counts` |
+| Help overlay (`?`) | one column while the rows fit the height; two columns when they do not **and** the width allows (about 100 columns with these descriptions), gutter 3; when neither fits (80×30 and below with this keymap) it clips key rows from the bottom, never the blank/`SELECT_NOTE`/`any key closes` footer (three rows reserved); at 80×24 the quit rows are among the clipped | `tui_help_overlay` (100×30), `tui_help_overlay_tall` (100×45), `render_help_uses_two_columns_only_when_one_does_not_fit` |
+| Confirm modal | centered box, one question row from the scope; an accept shows live counts, a restore shows the one row; hint line switches to the modal's keys | `tui_restore_confirm`, `render_confirm_modal_shows_live_counts` |
+| Note modal | centered, `NOTE_WIDTH` = 60 columns (clamped to the frame minus 4, floor 8), a fixed `NOTE_ROWS` = 5-line text area that scrolls to keep the caret visible, plus title, target line and the key row `⏎ send   ^J newline   Esc cancel`; bracketed paste is on only while it is open | `tui_note_modal`, PTY `pty_flag_note_exports_when_standalone` |
+| Agent picker | centered, width = widest row + 4, height = rows + 2, both clamped to the frame; first row says the flag is already saved and `Esc` costs only the send; key row `↑↓ choose   ⏎ send   Esc cancel` | `tui_agent_picker` |
+| Collapsed rows | `collapsed (binary) · +a −d · not expandable` / `collapsed (size)` with `[e expand]`; expansion capped at 2,000 lines with `… N lines omitted` | `tui_nav_collapsed_*`, `tui_diff_view_collapsed*` |
+
+Open design questions the pass should take, in the order they have come up: whether the
+hint line should carry `u`/`m` (or go to a second tier) once the width allows; whether a
+two-column overlay is the right answer for a keymap that keeps growing; the 60-column
+header crowding; the scope notice at 100 columns; and the select-to-copy cue Phase 8 adds.
 
 ## herdr in the UI (Phase 5)
 
@@ -573,10 +800,13 @@ The two Phase 4 scenes drive the accept loop through the same binary:
   with `nothing pending across 3 roots` and no file row ever drawn (the agent's commit
   moved HEAD, not a baseline); one more edit shows `M f2  +1 −0` and `1 repo · 1 file · 1
   hunk`.
-- `pty_accept_refused_when_file_moves` — `f1`'s diff open, the agent appends a line, `A`
-  goes out before the 750 ms debounce has rescanned: the status reads `f1: changed since
-  rendered; not accepted`, the row stays, the ledger has no override; once the rescan
-  shows `M f1  +2 −1`, `A` accepts.
+- `pty_accept_refused_when_file_moves` — the `watching …` status is on (the watch is live,
+  so the append below is the debounce's to find), `f1`'s diff open, the agent appends a
+  line, `A` goes out before the 750 ms debounce has rescanned: the status reads `f1:
+  changed since rendered; not accepted`, the row stays, the ledger has no override; once
+  the rescan shows `M f1  +2 −1`, `A` accepts. Without that first wait a loaded runner
+  let the FSEvents install land after `A`: its gap-closing rescan found the append and its
+  `watching` notice replaced the refusal on the status row (CI macos-latest 2026-09-05).
 
 Both print `PTY accept …` timing lines. The status bar is asserted as `<text> · <age>`
 exactly, so `accepted f1` cannot pass for `accepted f1 · 1 hunk left`.
@@ -653,5 +883,7 @@ rg -n 'last_pile|scan_all\(|\.scan\(' crates/lastcall/src/tui/app.rs   # nothing
 rg -n 'println!|eprintln!|print!' crates/lastcall/src/tui   # nothing (the messages are in commands/)
 rg -n 'thread::sleep|tokio::time::sleep' crates/lastcall/src/tui   # nothing
 rg -n 'lastcall_engine::herdr' crates/lastcall/src/tui     # only tui/herdr.rs and tui/run.rs (the task side); never app.rs or render.rs
+rg -n 'e\.(restore|flag|unflag)\(' crates/lastcall/src     # only tui/run.rs (restore and flag reach the engine through one seam)
+rg -n 'OpenOptions|File::create|fs::write' crates/lastcall/src   # tui/term.rs (the log file) and tui/run.rs (the export fallback); no worktree file is ever opened for writing
 cargo tree -e normal -p lastcall -p lastcall-engine | grep -c testkit   # 0
 ```

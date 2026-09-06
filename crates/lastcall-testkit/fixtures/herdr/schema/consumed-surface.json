@@ -483,6 +483,21 @@
       },
       "type": "object"
     },
+    "request/PaneSendTextParams": {
+      "properties": {
+        "pane_id": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "pane_id",
+        "text"
+      ],
+      "type": "object"
+    },
     "request/PaneTarget": {
       "properties": {
         "pane_id": {
@@ -2132,6 +2147,16 @@
       ],
       "result": "pane_list"
     },
+    "pane.send_text": {
+      "params": {
+        "$ref": "#/defs/request/PaneSendTextParams"
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "result": "ok"
+    },
     "ping": {
       "params": {
         "$ref": "#/defs/request/PingParams"
@@ -2232,6 +2257,18 @@
         "type",
         "shown",
         "reason"
+      ],
+      "type": "object"
+    },
+    "ok": {
+      "properties": {
+        "type": {
+          "const": "ok",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
       ],
       "type": "object"
     },

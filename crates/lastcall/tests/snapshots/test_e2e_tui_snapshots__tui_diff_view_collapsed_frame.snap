@@ -4,7 +4,7 @@ expression: frame
 ---
 "lastcall  3 repos · 6 files · 5 hunks  standalone  [Accept All]                           watching W"
 "┌──────────────────────────┬───────────────────────────────────────────────────────────────────────┐"
-"│alpha                     │Cargo.lock  A  +3 −0                                    [A accept file]│"
+"│alpha                     │Cargo.lock  A  +3 −0                   [A accept file] [U restore file]│"
 "│  main · 3 files          │collapsed (glob) · +3 −0                                     [e expand]│"
 "│  A Cargo.lock ⊟  +3 −0   │                                                                       │"
 "│  M f1  +1 −1             │                                                                       │"

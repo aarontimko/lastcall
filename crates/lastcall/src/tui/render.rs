@@ -12,6 +12,7 @@ use std::collections::BTreeSet;
 
 use lastcall_engine::count::with_thousands;
 use lastcall_engine::hunks::{EXPAND_LINE_CAP, Hunk, Tag};
+use lastcall_engine::ledger::Flag;
 use lastcall_engine::scan::{Change, Collapsed, Rename, Row};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -23,12 +24,20 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::app::{
     AcceptScope, App, Focus, MIN_SIZE, NAV_MIN_COLS, RootView, Selection, Target, annotation_name,
-    diff_lines, hunk_offsets, plural,
+    diff_lines, hunk_header, hunk_offsets, plural, restore_question,
 };
 use super::herdr::{Dot, Link};
 use super::input::{Action, MODAL_KEYS};
 
 pub const TOO_SMALL: &str = "too small: 40×10 min";
+/// The note modal's box: wide enough for a sentence, narrow enough to sit over the diff.
+pub const NOTE_WIDTH: u16 = 60;
+/// Text-area height, fixed so the box does not resize while the note is being typed.
+pub const NOTE_ROWS: u16 = 5;
+/// The insertion point, drawn into the text (see `render_note`).
+pub const NOTE_CARET: &str = "▌";
+pub const NOTE_KEYS: &str = "⏎ send   ^J newline   Esc cancel";
+pub const PICK_KEYS: &str = "↑↓ choose   ⏎ send   Esc cancel";
 pub const NO_SELECTION: &str = "select a file (↑↓ or click) · ? for help";
 /// What a flag-only root (no pending rows) shows instead of a file list, in the nav and
 /// in the diff pane, so `Enter` has somewhere to land. `<status>` is herdr's own word.
@@ -174,6 +183,14 @@ pub fn render(app: &App, frame: &mut Frame<'_>) -> HitMap {
     }
     if app.confirm.is_some() {
         render_confirm(app, buf, area);
+    }
+    // The note and the picker are the top layer: only one is ever open, and neither can be
+    // open with the confirm (a flag never asks).
+    if app.note.is_some() {
+        render_note(app, buf, area);
+    }
+    if app.picker.is_some() {
+        render_picker(app, buf, area);
     }
     hits
 }
@@ -682,8 +699,12 @@ fn nav_row_line(row: &Row, full_paths: bool, width: usize) -> Line<'static> {
     if row.collapsed.is_some() {
         markers.push_str(" ⊟");
     }
-    if row.flag.is_some() {
-        markers.push_str(" ⚑");
+    // One flag is a bare glyph; several carry the count, so `⚑2` says at a glance that the
+    // row has more than one note on it without opening the diff.
+    match row.flags.len() {
+        0 => {}
+        1 => markers.push_str(" ⚑"),
+        n => markers.push_str(&format!(" ⚑{n}")),
     }
     let conflict = if row.conflicted { "  [conflict]" } else { "" };
     let counts_added = format!("+{}", with_thousands(row.added));
@@ -792,12 +813,34 @@ fn render_main(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
                 .get(root)
                 .and_then(|v| v.row(path).map(|r| (v, r)))
             {
-                let mut header = row_header(row);
                 let control = format!("[{} accept file]", control_key(app, "accept_file"));
-                if let Some(x) = right_align(&mut header, &control, area.width, dim()) {
+                let restore = format!("[{} restore file]", control_key(app, "restore_file"));
+                // The header is built knowing what will be right-aligned after it, so the
+                // flag marker takes the leftover and not the controls' room.
+                let used = row_header(row, 0).width();
+                let mut header = row_header(
+                    row,
+                    marker_budget(area.width, used, &[control.as_str(), restore.as_str()]),
+                );
+                // Two controls here, not three: `[m flag]` is a hunk control, and the nav's
+                // own `m` (which flags the file) has no header line to hang off.
+                let at = right_align_run(
+                    &mut header,
+                    &[control.as_str(), restore.as_str()],
+                    area.width,
+                    dim(),
+                );
+                let (at_accept, at_restore) = (at[0], at[1]);
+                if let Some(x) = at_accept {
                     hits.targets.push((
                         Rect::new(area.x + x, area.y, control.width() as u16, 1),
                         Target::FileAccept,
+                    ));
+                }
+                if let Some(x) = at_restore {
+                    hits.targets.push((
+                        Rect::new(area.x + x, area.y, restore.width() as u16, 1),
+                        Target::FileRestore,
                     ));
                 }
                 lines.push(header);
@@ -840,7 +883,7 @@ fn push_notices(lines: &mut Vec<Line<'static>>, notices: &[String]) {
 }
 
 /// `<path>  <letter>  +a −d  [annotation]  (renamed from <old> 90%)`
-fn row_header(row: &Row) -> Line<'static> {
+fn row_header(row: &Row, budget: usize) -> Line<'static> {
     let mut spans = vec![
         Span::styled(row.path_lossy(), bold()),
         Span::raw(format!("  {}  ", letter(row.change))),
@@ -865,10 +908,38 @@ fn row_header(row: &Row) -> Line<'static> {
         ))),
         None => {}
     }
-    if let Some(f) = &row.flag {
-        spans.push(Span::raw(format!("  ⚑ {}", f.note)));
+    if let Some(f) = row.flags.first() {
+        // Bounded, and the first line only. A note is whatever the reviewer typed — it can
+        // be a paragraph, and it can contain newlines — and this is a one-line header with
+        // the file's controls right-aligned after it. `budget` is what is left once those
+        // are reserved, so the marker never costs the reader a control.
+        if let Some(text) = flag_marker(&f.note, budget) {
+            spans.push(Span::raw(text));
+        }
     }
     Line::from(spans)
+}
+
+/// `  ⚑ <the note's first line>` in at most `budget` columns, or `None` when there is not
+/// enough room to say anything. Shared by the file header and the hunk header so both mark
+/// a flag the same way.
+fn flag_marker(note: &str, budget: usize) -> Option<String> {
+    const PREFIX: usize = 4; // "  ⚑ "
+    if budget < PREFIX + 2 {
+        return None;
+    }
+    let first = note.lines().next().unwrap_or("");
+    if first.is_empty() {
+        return None;
+    }
+    Some(format!("  ⚑ {}", ellipsize(first, budget - PREFIX)))
+}
+
+/// What is left of `width` for a flag marker on a line already holding `used` columns and
+/// about to get a right-aligned run of `controls` (which `right_align` pads by two).
+fn marker_budget(width: u16, used: usize, controls: &[&str]) -> usize {
+    let run = controls.join(" ").width() + 2;
+    (width as usize).saturating_sub(used + run)
 }
 
 fn render_row_body(
@@ -951,13 +1022,17 @@ fn render_row_body(
             let body = area.height.saturating_sub(1).saturating_sub(footer as u16);
             // No per-hunk `[a accept]` inside an expansion: a collapsed row is a single
             // accept (§6.3), so a hunk control there would promise something the reducer
-            // will not do. The row's own `[A accept file]` is the only accept on screen.
+            // will not do. The row's own `[A accept file]` is the only accept on screen,
+            // and `[u restore]` goes with it — the row carries no hunks, so a hunk restore
+            // there would ask about nothing (verifier (b) F5). `[m flag]` stays: `m` on an
+            // expansion hunk quotes that hunk, and the row's flags read beside it.
             render_hunks(
                 app,
                 buf,
                 Rect::new(area.x, area.y + 1, area.width, body),
                 &exp.view.hunks,
-                false,
+                &row.flags,
+                HunkControls::FlagOnly,
                 hits,
             );
             if footer == 1 && area.height >= 2 {
@@ -977,18 +1052,39 @@ fn render_row_body(
         }
         _ => {}
     }
-    render_hunks(app, buf, area, &row.hunks, true, hits);
+    render_hunks(
+        app,
+        buf,
+        area,
+        &row.hunks,
+        &row.flags,
+        HunkControls::All,
+        hits,
+    );
 }
 
-/// Draw `hunks` into `area` from the app's diff cursor, with the `[a accept]` control and
-/// the selected-hunk band. The list is the row's own hunks, or a collapsed row's expansion
+/// Which controls a hunk header carries — and, with them, which hit targets are registered
+/// for it. A control that is not drawn is not clickable: the two are one decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HunkControls {
+    /// A row's own hunks: `[a accept]`, `[u restore]`, `[m flag]`.
+    All,
+    /// A collapsed row's expansion: `[m flag]` only. Accepting or restoring one hunk of a
+    /// row that carries none is not something the reducer will do (§6.3, and the
+    /// expansion's line cap), so the labels that promise it are not drawn.
+    FlagOnly,
+}
+
+/// Draw `hunks` into `area` from the app's diff cursor, with the header controls and the
+/// selected-hunk band. The list is the row's own hunks, or a collapsed row's expansion
 /// ([`App::view_hunks`] decides which the cursor is bounded by).
 fn render_hunks(
     app: &App,
     buf: &mut Buffer,
     area: Rect,
     hunks: &[Hunk],
-    accept_controls: bool,
+    flags: &[Flag],
+    controls: HunkControls,
     hits: &mut HitMap,
 ) {
     if hunks.is_empty() || area.height == 0 {
@@ -1023,13 +1119,36 @@ fn render_hunks(
                 } else {
                     dim()
                 };
-                if accept_controls {
-                    let control = format!("[{} accept]", control_key(app, "accept"));
-                    if let Some(x) = right_align(&mut line, &control, area.width, style) {
-                        hits.targets.push((
-                            Rect::new(area.x + x, area.y + y, control.width() as u16, 1),
-                            Target::HunkAccept(h),
-                        ));
+                let mut labels = Vec::with_capacity(3);
+                let mut targets = Vec::with_capacity(3);
+                if controls == HunkControls::All {
+                    labels.push(format!("[{} accept]", control_key(app, "accept")));
+                    targets.push(Target::HunkAccept(h));
+                    labels.push(format!("[{} restore]", control_key(app, "restore")));
+                    targets.push(Target::HunkRestore(h));
+                }
+                labels.push(format!("[{} flag]", control_key(app, "flag")));
+                targets.push(Target::HunkFlag(h));
+                let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+                if let Some(note) = flag_note_for(flags, hunk) {
+                    // The note reads beside the header it is about, so the reader sees what
+                    // they already said here before they say it again — in the room left
+                    // once the controls are reserved, because a flagged hunk is exactly the
+                    // one whose `[m flag]` and `[u restore]` the reader still wants.
+                    let budget = marker_budget(area.width, line.width(), &refs);
+                    if let Some(text) = flag_marker(&note, budget) {
+                        line.spans.push(Span::styled(text, style));
+                    }
+                }
+                {
+                    let at = right_align_run(&mut line, &refs, area.width, style);
+                    for ((x, label), target) in at.into_iter().zip(&labels).zip(targets) {
+                        if let Some(x) = x {
+                            hits.targets.push((
+                                Rect::new(area.x + x, area.y + y, label.width() as u16, 1),
+                                target,
+                            ));
+                        }
                     }
                 }
                 if h == current {
@@ -1043,6 +1162,21 @@ fn render_hunks(
         h += 1;
         within = 0;
     }
+}
+
+/// The first line of the newest note flagged **on this hunk**, or `None`.
+///
+/// Matched on the header text the flag stored, not on the hunk's index: the index is where
+/// the hunk was when it was flagged, and one edit above it moves every later hunk down. The
+/// header carries the ranges, so it identifies the hunk within the file, and a flag whose
+/// header no longer appears simply shows no marker rather than marking the wrong hunk.
+fn flag_note_for(flags: &[Flag], hunk: &Hunk) -> Option<String> {
+    let header = hunk_header(hunk);
+    flags
+        .iter()
+        .rev()
+        .find(|f| f.hunk.as_ref().is_some_and(|h| h.header == header))
+        .map(|f| f.note.lines().next().unwrap_or("").to_owned())
 }
 
 /// Make `line` a full-width band: pad it out to `width` and put `style` under every span,
@@ -1070,6 +1204,38 @@ fn control_key(app: &App, action: &str) -> String {
 /// Append `control` right-aligned on `line` within `width` columns, at least two columns
 /// after the text; returns its x offset, or `None` when it would not fit (then the line
 /// is left as it was).
+/// Several controls right-aligned as **one** run, space-separated, so a second call cannot
+/// land on top of the first (each would right-align to the same edge). Returns one x offset
+/// per label, in order.
+///
+/// A run that does not fit is retried without its last label, then without its last two, and
+/// so on: a narrow pane loses the newest control rather than all of them, and `[a accept]`
+/// — the oldest, and the one the hint line names first — is the last to go. The labels a
+/// retry dropped come back `None`, and nothing is drawn for them (no hit target either, so
+/// a click there falls through to the hunk header underneath).
+fn right_align_run(
+    line: &mut Line<'static>,
+    labels: &[&str],
+    width: u16,
+    style: Style,
+) -> Vec<Option<u16>> {
+    for n in (1..=labels.len()).rev() {
+        let run = labels[..n].join(" ");
+        // `right_align` leaves the line untouched when it refuses, so each try is clean.
+        if let Some(x) = right_align(line, &run, width, style) {
+            let mut out = Vec::with_capacity(labels.len());
+            let mut at = x;
+            for label in &labels[..n] {
+                out.push(Some(at));
+                at += label.width() as u16 + 1;
+            }
+            out.resize(labels.len(), None);
+            return out;
+        }
+    }
+    vec![None; labels.len()]
+}
+
 fn right_align(line: &mut Line<'static>, control: &str, width: u16, style: Style) -> Option<u16> {
     let used = line.width();
     let need = used + 2 + control.width();
@@ -1086,19 +1252,7 @@ fn right_align(line: &mut Line<'static>, control: &str, width: u16, style: Style
 /// change), then the hunk's lines with their `+`/`-`/space prefix.
 fn hunk_line(hunk: &Hunk, i: usize, current: bool) -> Line<'static> {
     if i == 0 {
-        let text = if hunk.is_mode_change() {
-            format!(
-                "mode {} → {}",
-                mode_of(&hunk.lines[0].1),
-                mode_of(&hunk.lines[1].1)
-            )
-        } else {
-            format!(
-                "@@ -{} +{} @@",
-                range_label(hunk.old_range.start, hunk.old_range.len()),
-                range_label(hunk.new_range.start, hunk.new_range.len())
-            )
-        };
+        let text = hunk_header(hunk);
         let style = if current {
             Style::new().add_modifier(Modifier::REVERSED)
         } else {
@@ -1112,23 +1266,6 @@ fn hunk_line(hunk: &Hunk, i: usize, current: bool) -> Line<'static> {
         Tag::Context => Line::from(format!(" {text}")),
         Tag::Insert => Line::from(Span::styled(format!("+{text}"), green())),
         Tag::Delete => Line::from(Span::styled(format!("-{text}"), red())),
-    }
-}
-
-fn mode_of(line: &[u8]) -> String {
-    String::from_utf8_lossy(line)
-        .trim()
-        .trim_start_matches("mode ")
-        .to_owned()
-}
-
-/// git's `start[,len]`: 1-based start for a non-empty range, the preceding line for an
-/// empty one, and `,len` omitted when it is 1 (as `git diff` prints it).
-fn range_label(start: usize, len: usize) -> String {
-    match len {
-        0 => format!("{start},0"),
-        1 => format!("{}", start + 1),
-        _ => format!("{},{len}", start + 1),
     }
 }
 
@@ -1168,8 +1305,57 @@ fn keys_label(specs: &[impl AsRef<str>]) -> String {
 }
 
 /// The keymap's rows, then the modal's fixed keys, then the mouse note.
+/// Spaces between the two columns of the wide help overlay.
+const HELP_GUTTER: usize = 3;
+
+/// The key rows as the overlay's body: one column, or two when one does not fit.
+///
+/// The overlay has grown a keymap row at a time and it now overflows a 30-line terminal —
+/// and it overflows *silently*, because the body is drawn with `take(inner.height)`: the
+/// rows past the bottom are simply not there, and the help that is supposed to be the
+/// answer to "what are the keys" stops naming half of them. Two columns are the cheapest
+/// fix that keeps every row on screen.
+///
+/// The trigger is the overflow itself (`rows + 4 > area.height`, the same arithmetic the
+/// caller's `height` clamps with) plus enough width for a second column. Order reads **down
+/// the first column, then down the second** — the keymap's own order, so a reader looking
+/// for a key finds it where the config file has it. A short terminal that is also narrow
+/// gets one column and the old truncation; there is nothing better to do with 40 columns.
+fn help_columns(keys: &[String], area: Rect) -> Vec<String> {
+    // `+ 2` for the blank and SELECT_NOTE below the body, `+ 4` for the border, the pad and
+    // the `any key closes` line — the overlay's fixed overhead.
+    if keys.len() + 2 + 4 <= area.height as usize {
+        return keys.to_vec();
+    }
+    let split = keys.len().div_ceil(2);
+    let (left, right) = keys.split_at(split);
+    let width_of = |rows: &[String]| rows.iter().map(|r| r.width()).max().unwrap_or(0);
+    // Each column is only as wide as its own rows need. Padding both to the widest row in
+    // the whole table would cost the columns the very width the second one needs.
+    let stride = width_of(left) + HELP_GUTTER;
+    if stride + width_of(right) + 4 > area.width as usize {
+        // Two columns would have to be truncated to fit, which is the failure this is
+        // fixing. One column and the old vertical clipping is no worse.
+        return keys.to_vec();
+    }
+    left.iter()
+        .enumerate()
+        .map(|(i, l)| match right.get(i) {
+            Some(r) => {
+                let mut line = l.clone();
+                line.push_str(&" ".repeat(stride - l.width()));
+                line.push_str(r);
+                line
+            }
+            // An odd count leaves the last left-column row alone rather than padding it to
+            // a column width nothing sits beside.
+            None => l.clone(),
+        })
+        .collect()
+}
+
 fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
-    let mut rows: Vec<String> = app
+    let keys: Vec<String> = app
         .keymap
         .iter()
         .map(|(name, specs)| (name.as_str(), keys_label(specs)))
@@ -1180,6 +1366,7 @@ fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
         )
         .map(|(name, keys)| format!("{keys:<14} {}", Action::describe(name)))
         .collect();
+    let mut rows = help_columns(&keys, area);
     rows.push(String::new());
     rows.push(SELECT_NOTE.to_owned());
     let width = (rows.iter().map(|r| r.width()).max().unwrap_or(0) + 4).min(area.width as usize);
@@ -1196,7 +1383,22 @@ fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
         .border_style(focused_border());
     let inner = block.inner(rect);
     block.render(rect, buf);
-    for (i, row) in rows.iter().take(inner.height as usize).enumerate() {
+    let cap = inner.height as usize;
+    if rows.len() > cap {
+        // Too narrow for two columns *and* too short for one (80×30 with this keymap): the
+        // overlay clips, and what it clips is key rows — never the footer. A reader who
+        // cannot see every key can still see what the mouse does and how to leave.
+        //
+        // Three rows are reserved, not two: the blank, `SELECT_NOTE`, **and** the
+        // `any key closes` line below them, which is drawn only where the body does not
+        // reach. Reserving two put the body's last row on the footer's row, so the footer
+        // was the thing the clip dropped (verifier (b) F4).
+        rows.truncate(cap.saturating_sub(3));
+        rows.push(String::new());
+        rows.push(SELECT_NOTE.to_owned());
+        rows.truncate(cap.saturating_sub(1));
+    }
+    for (i, row) in rows.iter().take(cap).enumerate() {
         buf.set_stringn(
             inner.x + 1,
             inner.y + i as u16,
@@ -1216,28 +1418,37 @@ fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
     }
 }
 
-/// The confirm modal (§6.7), centered like the help overlay. Its numbers come from
-/// `App::confirm_counts`, i.e. the held piles as they are at this frame: `Accept all <N>
-/// files in <root>?` (one root) or `across <R> repos?`, then `<g> grouped upstream · <c>
-/// collapsed` only when either is non-zero, then the modal's keys.
+/// The confirm modal (§6.7), centered like the help overlay. One box, two operations: the
+/// title is ` accept ` or ` restore ` and the first row comes from the scope.
+///
+/// An accept's numbers come from `App::confirm_counts`, i.e. the held piles as they are at
+/// this frame: `Accept all <N> files in <root>?` (one root) or `across <R> repos?`, then
+/// `<g> grouped upstream · <c> collapsed` only when either is non-zero. A restore covers one
+/// row, so it has one question row and nothing to tally (F11).
 fn render_confirm(app: &App, buf: &mut Buffer, area: Rect) {
-    let Some(counts) = app.confirm_counts() else {
-        return;
+    let (title, mut rows) = match app.confirm_restore() {
+        Some(scope) => (" restore ", vec![restore_question(scope)]),
+        None => {
+            let Some(counts) = app.confirm_counts() else {
+                return;
+            };
+            let target = match counts.roots.as_slice() {
+                [one] => format!("in {one}"),
+                many => format!("across {}", plural(many.len(), "repo")),
+            };
+            let mut rows = vec![format!(
+                "Accept all {} {target}?",
+                plural(counts.files, "file")
+            )];
+            if counts.grouped > 0 || counts.collapsed > 0 {
+                rows.push(format!(
+                    "{} grouped upstream · {} collapsed",
+                    counts.grouped, counts.collapsed
+                ));
+            }
+            (" accept ", rows)
+        }
     };
-    let target = match counts.roots.as_slice() {
-        [one] => format!("in {one}"),
-        many => format!("across {}", plural(many.len(), "repo")),
-    };
-    let mut rows = vec![format!(
-        "Accept all {} {target}?",
-        plural(counts.files, "file")
-    )];
-    if counts.grouped > 0 || counts.collapsed > 0 {
-        rows.push(format!(
-            "{} grouped upstream · {} collapsed",
-            counts.grouped, counts.collapsed
-        ));
-    }
     rows.push(String::new());
     rows.push(
         MODAL_KEYS
@@ -1256,7 +1467,7 @@ fn render_confirm(app: &App, buf: &mut Buffer, area: Rect) {
     );
     Clear.render(rect, buf);
     let block = Block::bordered()
-        .title(" accept ")
+        .title(title)
         .border_style(focused_border());
     let inner = block.inner(rect);
     block.render(rect, buf);
@@ -1270,6 +1481,141 @@ fn render_confirm(app: &App, buf: &mut Buffer, area: Rect) {
             style,
         );
     }
+}
+
+/// The note modal: what is being flagged, the note being typed, and the keys that end it.
+///
+/// The text area is a fixed [`NOTE_ROWS`] lines high whatever is typed, so the box does not
+/// jump under the reader's hands as the note grows; past that it scrolls to keep the caret
+/// (`▌`) in view. The caret is drawn into the text rather than set on the terminal so that
+/// one `App` renders to one buffer — the snapshot tier can see where the cursor is.
+fn render_note(app: &App, buf: &mut Buffer, area: Rect) {
+    let Some(note) = &app.note else {
+        return;
+    };
+    let width = NOTE_WIDTH.min(area.width.saturating_sub(4)).max(8);
+    // border + target + blank + text + blank + keys
+    let height = (NOTE_ROWS + 6).min(area.height);
+    let rect = centered(area, width, height);
+    let inner = modal_block(" flag ", rect, buf);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let text_width = inner.width.saturating_sub(2) as usize;
+    let mut rows: Vec<(String, Style)> = vec![
+        (ellipsize(&note.target.label(), text_width), bold()),
+        (String::new(), Style::new()),
+    ];
+    let wrapped = caret_lines(&note.text, note.cursor, text_width.max(1));
+    // The window ends at the caret's line, so a note longer than the box scrolls with it.
+    let caret_at = wrapped
+        .iter()
+        .position(|l| l.contains(NOTE_CARET))
+        .unwrap_or(0);
+    let top = (caret_at + 1).saturating_sub(NOTE_ROWS as usize);
+    for i in 0..NOTE_ROWS as usize {
+        let line = wrapped.get(top + i).cloned().unwrap_or_default();
+        rows.push((line, Style::new()));
+    }
+    rows.push((String::new(), Style::new()));
+    rows.push((NOTE_KEYS.to_owned(), dim()));
+    for (i, (row, style)) in rows.iter().take(inner.height as usize).enumerate() {
+        buf.set_stringn(
+            inner.x + 1,
+            inner.y + i as u16,
+            row,
+            inner.width.saturating_sub(1) as usize,
+            *style,
+        );
+    }
+}
+
+/// The agent picker: which pane the export goes to. The flag is already on disk when this
+/// opens, so `Esc` costs only the send — which the first row says out loud.
+fn render_picker(app: &App, buf: &mut Buffer, area: Rect) {
+    let Some(picker) = &app.picker else {
+        return;
+    };
+    let mut rows: Vec<(String, Style)> = vec![
+        (format!("flagged {} — send to:", picker.label), bold()),
+        (String::new(), Style::new()),
+    ];
+    for (i, c) in picker.candidates.iter().enumerate() {
+        let mark = if i == picker.selected { "▸ " } else { "  " };
+        rows.push((
+            format!(
+                "{mark}{} · {} · {}",
+                c.label,
+                c.workspace_label,
+                c.status.as_str()
+            ),
+            if i == picker.selected {
+                bold()
+            } else {
+                Style::new()
+            },
+        ));
+    }
+    rows.push((String::new(), Style::new()));
+    rows.push((PICK_KEYS.to_owned(), dim()));
+    let width =
+        (rows.iter().map(|(r, _)| r.width()).max().unwrap_or(0) + 4).min(area.width as usize);
+    let height = (rows.len() + 2).min(area.height as usize);
+    let rect = centered(area, width as u16, height as u16);
+    let inner = modal_block(" send to ", rect, buf);
+    for (i, (row, style)) in rows.iter().take(inner.height as usize).enumerate() {
+        buf.set_stringn(
+            inner.x + 1,
+            inner.y + i as u16,
+            row,
+            inner.width.saturating_sub(1) as usize,
+            *style,
+        );
+    }
+}
+
+/// `text` split into display lines of at most `width` columns, with [`NOTE_CARET`] inserted
+/// at byte offset `cursor`. Explicit newlines break first, then each paragraph is hard-wrapped
+/// at the column — a note is prose, and a word cut in half is still readable, while a
+/// wrapping rule that hides the caret is not.
+fn caret_lines(text: &str, cursor: usize, width: usize) -> Vec<String> {
+    let mut with_caret = text.to_owned();
+    with_caret.insert_str(cursor.min(with_caret.len()), NOTE_CARET);
+    let mut out = Vec::new();
+    for para in with_caret.split('\n') {
+        let mut line = String::new();
+        for c in para.chars() {
+            if line.width() + c.width().unwrap_or(0) > width {
+                out.push(std::mem::take(&mut line));
+            }
+            line.push(c);
+        }
+        out.push(line);
+    }
+    out
+}
+
+/// A `width`×`height` rect centred in `area`, clamped to it.
+fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    )
+}
+
+/// Clear `rect`, draw the focused border with `title`, and hand back the inside.
+fn modal_block(title: &'static str, rect: Rect, buf: &mut Buffer) -> Rect {
+    Clear.render(rect, buf);
+    let block = Block::bordered()
+        .title(title)
+        .border_style(focused_border());
+    let inner = block.inner(rect);
+    block.render(rect, buf);
+    inner
 }
 
 // ---- helpers -----------------------------------------------------------------------------
@@ -1552,14 +1898,6 @@ mod tests {
     }
 
     #[test]
-    fn render_range_label_matches_git() {
-        assert_eq!(range_label(0, 3), "1,3");
-        assert_eq!(range_label(0, 0), "0,0");
-        assert_eq!(range_label(4, 0), "4,0");
-        assert_eq!(range_label(9, 1), "10", "git omits `,1`");
-    }
-
-    #[test]
     fn render_plural() {
         assert_eq!(plural(0, "file"), "0 files");
         assert_eq!(plural(1, "file"), "1 file");
@@ -1619,7 +1957,11 @@ mod tests {
         assert!(frame.contains("? help  x quit"), "{frame}");
         assert!(!frame.contains("q quit"), "{frame}");
         app.help = true;
-        let (frame, _) = frame_of(&app, 80, 30);
+        // 100 wide, not 80: at 80 the table has no room for a second column and the
+        // overlay clips (see `render_help_uses_two_columns_only_when_one_does_not_fit`).
+        // This test is about the overlay following the keymap, so it uses a frame that
+        // shows every row.
+        let (frame, _) = frame_of(&app, 100, 30);
         assert!(frame.contains("x              quit"), "{frame}");
         assert!(!frame.contains("q / Ctrl-C"), "{frame}");
         assert!(
@@ -1633,6 +1975,106 @@ mod tests {
         assert!(frame.contains("Esc / h / ←    back"), "{frame}");
         // Ruling 3: the mouse note, until Phase 8's select-to-copy.
         assert!(frame.contains(SELECT_NOTE), "{frame}");
+    }
+
+    /// Deliverable 8: the overlay goes to two columns rather than losing rows off the
+    /// bottom.
+    ///
+    /// `take(inner.height)` truncates in silence, so a 30-line terminal showed a "keys"
+    /// panel that did not list the keys. The trigger is the overflow, not the row count, so
+    /// the same keymap in a taller terminal keeps the one-column form.
+    #[test]
+    fn render_help_uses_two_columns_only_when_one_does_not_fit() {
+        let mut app = App::new();
+        // 31 rows total: the keymap's own, plus filler, plus the two modal rows. Named
+        // explicitly so the layout under test does not drift with the keymap's length.
+        let modal = MODAL_KEYS.len();
+        while app.keymap.len() + modal < 31 {
+            let n = app.keymap.len();
+            app.keymap
+                .push((format!("filler_{n}"), vec![format!("f{n}")]));
+        }
+        app.keymap.truncate(31 - modal);
+        assert_eq!(app.keymap.len() + modal, 31);
+        app.help = true;
+
+        // Short: two columns, and every row is on screen.
+        let (frame, _) = frame_of(&app, 100, 30);
+        let first = &app.keymap[0].0;
+        let last_left = &app.keymap[31usize.div_ceil(2) - 1].0;
+        let first_right = &app.keymap[31usize.div_ceil(2)].0;
+        let row_of = |name: &str| -> String {
+            let d = Action::describe(name);
+            frame
+                .lines()
+                .find(|l| l.contains(d) && !d.is_empty())
+                .unwrap_or_else(|| panic!("no row for {name} ({d:?}) in\n{frame}"))
+                .to_owned()
+        };
+        // The first row of each column shares a line: order runs down, then across.
+        let top = row_of(first);
+        assert!(
+            top.contains(Action::describe(first_right)),
+            "column one's first row and column two's first row share a line:\n{top}"
+        );
+        assert!(
+            !row_of(last_left).contains(Action::describe(first)),
+            "and the columns are not one long row"
+        );
+        for (name, _) in &app.keymap {
+            let d = Action::describe(name);
+            if !d.is_empty() {
+                assert!(
+                    frame.contains(d),
+                    "row {name:?} fell off the overlay:\n{frame}"
+                );
+            }
+        }
+        assert!(frame.contains(SELECT_NOTE), "{frame}");
+        assert!(frame.contains("any key closes"), "{frame}");
+
+        // Tall: the same rows fit in one column, so nothing is doubled up.
+        let (tall, _) = frame_of(&app, 100, 45);
+        let top = tall
+            .lines()
+            .find(|l| l.contains(Action::describe(first)))
+            .unwrap();
+        assert!(
+            !top.contains(Action::describe(first_right)),
+            "one column at 45 lines:\n{top}"
+        );
+        for (name, _) in &app.keymap {
+            let d = Action::describe(name);
+            if !d.is_empty() {
+                assert!(tall.contains(d), "row {name:?} missing:\n{tall}");
+            }
+        }
+
+        // Narrow and short: one column is all there is room for, truncation and all.
+        let keys: Vec<String> = (0..31).map(|i| format!("k{i:<12} does a thing")).collect();
+        assert_eq!(
+            help_columns(&keys, Rect::new(0, 0, 40, 30)).len(),
+            31,
+            "40 columns cannot hold two"
+        );
+        assert_eq!(help_columns(&keys, Rect::new(0, 0, 100, 30)).len(), 16);
+
+        // Verifier (b) F4. 80 columns is the standard width and has no room for a second
+        // column (the widest left row plus the widest right row plus the gutter and the
+        // border come to 100), so the overlay clips there. What it clips is **key rows**:
+        // the mouse note and `any key closes` are reserved out of the truncation, because a
+        // reader who cannot see every key still has to be able to leave.
+        let mut narrow = App::new();
+        narrow.help = true;
+        for (w, h) in [(80u16, 30u16), (80, 24)] {
+            let (frame, _) = frame_of(&narrow, w, h);
+            assert!(frame.contains("any key closes"), "{w}x{h}:\n{frame}");
+            assert!(frame.contains(SELECT_NOTE), "{w}x{h}:\n{frame}");
+        }
+        // At 30 lines the clip stops after the quit row — the one a reader who opened the
+        // overlay by accident needs most.
+        let (frame, _) = frame_of(&narrow, 80, 30);
+        assert!(frame.contains("q / Ctrl-C     quit"), "{frame}");
     }
 
     /// Under the modal the hint line names only the keys that work there: the modal's
@@ -1750,6 +2192,56 @@ mod tests {
         }
         let (frame, _) = frame_of(&app, 100, 30);
         assert!(frame.contains("[z accept]"), "{frame}");
+    }
+
+    /// Verifier (b) F5: an expansion hunk header carries `[m flag]` and nothing else.
+    ///
+    /// `m` there quotes the hunk under the cursor, so the control that says so is drawn and
+    /// registered. Accept stays off (a collapsed row is a single accept, §6.3) and restore
+    /// with it — the row carries no hunks, so `[u restore]` would open `Restore f1 · 0
+    /// hunks?`. Whole-file restore is still `U`.
+    #[test]
+    fn render_expansion_hunks_offer_flag_but_no_accept_or_restore() {
+        let mut app = three_roots();
+        app.apply(pile_event_seq("alpha", 1, alpha_collapsed(Collapsed::Glob)));
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Open);
+        let asked = app.selected_row().expect("f1").clone();
+        app.set_expanded(root("alpha"), &asked, expansion_of(3, 0));
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut hits = HitMap::default();
+        terminal
+            .draw(|f| {
+                hits = render(&app, f);
+            })
+            .unwrap();
+        let frame = terminal.backend().to_string();
+        assert!(frame.contains("collapsed (glob)"), "{frame}");
+        assert_eq!(
+            frame.matches("[m flag]").count(),
+            3,
+            "one per hunk:\n{frame}"
+        );
+        assert!(!frame.contains("[a accept]"), "{frame}");
+        assert!(!frame.contains("[u restore]"), "{frame}");
+
+        let has = |t: Target| hits.targets.iter().any(|(_, x)| *x == t);
+        for h in 0..3 {
+            assert!(has(Target::HunkFlag(h)), "hunk {h} has a flag target");
+            assert!(
+                !has(Target::HunkRestore(h)),
+                "hunk {h} has no restore target"
+            );
+            assert!(!has(Target::HunkAccept(h)), "hunk {h} has no accept target");
+        }
+        // A click on the control flags that hunk, not the file.
+        let (rect, _) = hits
+            .targets
+            .iter()
+            .find(|(_, t)| *t == Target::HunkFlag(1))
+            .expect("hunk 2's control");
+        assert_eq!(hits.at(rect.x, rect.y), Some(&Target::HunkFlag(1)));
     }
 
     /// The sponsor's ruling: exactly one blank line between consecutive hunks (none before

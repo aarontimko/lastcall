@@ -6,6 +6,7 @@ use common::Fresh;
 use lastcall_engine::config::Config;
 use lastcall_engine::engine::EngineOptions;
 use lastcall_engine::git::Mode;
+use lastcall_engine::ops::Refused;
 use lastcall_engine::roots::Badge;
 use lastcall_engine::scan::{Change, Collapsed, Rename, probe_case_insensitive};
 use lastcall_testkit::assert_pile;
@@ -456,5 +457,329 @@ fn scenario_d11_unicode_and_space_path() {
     assert_pile!(s.engine, s.root, "");
     assert!(s.ledger().overrides.contains_key("docs/résumé draft.md"));
     s.restart();
+    assert_pile!(s.engine, s.root, "");
+}
+
+// ---------------------------------------------------------------------------------------
+// Restore (Phase 7 deliverable 1) — the D scenarios from the write side.
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn scenario_d2_symlink_restore_never_writes_through_the_link() {
+    let mut repo = FixtureRepo::new("d2-restore").unwrap();
+    repo.symlink("f1", "link");
+    repo.commit("add link").unwrap();
+    let mut s = Fresh::over(repo, Config::default(), EngineOptions::default(), false);
+    assert_pile!(s.engine, s.root, "");
+    let pointee_before = s.bytes_at("f1");
+    let mtime_before = std::fs::symlink_metadata(s.repo.path().join("f1"))
+        .unwrap()
+        .modified()
+        .unwrap();
+
+    // (a) The link is repointed and put back. §6.4: a symlink restore is unlink + symlink,
+    // never a write through the link — so `f1` must be untouched in both bytes and mtime.
+    std::fs::remove_file(s.repo.path().join("link")).unwrap();
+    s.repo.symlink("f2", "link");
+    assert_pile!(s.engine, s.root, "link");
+    let out = s.restore_file("link");
+    assert!(out.outcome.ok(), "{:?}", out.outcome);
+    assert!(!out.outcome.written, "a restore never writes the ledger");
+    assert_eq!(
+        std::fs::read_link(s.repo.path().join("link")).unwrap(),
+        std::path::Path::new("f1"),
+        "the link points back at its baseline target"
+    );
+    assert_eq!(s.bytes_at("f1"), pointee_before, "the pointee is untouched");
+    assert_eq!(
+        std::fs::symlink_metadata(s.repo.path().join("f1"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        mtime_before,
+        "the pointee was never opened for writing"
+    );
+    assert_pile!(s.engine, s.root, "", "D2 restore clears the row");
+
+    // (b) The other direction (F10): the baseline is a regular file and the live side is a
+    // symlink pointing at another file. `rename` replaces the link itself; the file the
+    // link pointed at is not written through.
+    let decoy_before = s.bytes_at("f2");
+    let f3_baseline = s.bytes_at("f3");
+    std::fs::remove_file(s.repo.path().join("f3")).unwrap();
+    s.repo.symlink("f2", "f3");
+    assert_pile!(s.engine, s.root, "f3");
+    let out = s.restore_file("f3");
+    assert!(out.outcome.ok(), "{:?}", out.outcome);
+    let meta = std::fs::symlink_metadata(s.repo.path().join("f3")).unwrap();
+    assert!(
+        meta.file_type().is_file(),
+        "the link was replaced by the baseline file, not followed"
+    );
+    assert_eq!(s.bytes_at("f3"), f3_baseline);
+    assert_eq!(s.bytes_at("f2"), decoy_before, "the pointee is untouched");
+    assert_pile!(s.engine, s.root, "");
+}
+
+#[test]
+fn scenario_d3_crlf_restore_keeps_crlf() {
+    let mut repo = FixtureRepo::new("d3-restore").unwrap();
+    // `eol=crlf` and not bare `text=auto`: on a native-LF platform `text=auto` alone makes
+    // git's own checkout write LF, so a restore that wrote the canonical blob would be
+    // *correct* there and the test would prove nothing. `eol=crlf` is the case F2 is about
+    // — the worktree representation and the blob genuinely differ.
+    repo.commit_files(
+        &[
+            (".gitattributes", "* text=auto eol=crlf\n"),
+            ("crlf.txt", "a\r\nb\r\nc\r\n"),
+        ],
+        "crlf",
+    )
+    .unwrap();
+    let mut s = Fresh::over(repo, Config::default(), EngineOptions::default(), false);
+    assert_pile!(s.engine, s.root, "");
+    let original = s.bytes_at("crlf.txt");
+    assert_eq!(original, b"a\r\nb\r\nc\r\n");
+
+    s.repo.write("crlf.txt", "a\r\nB\r\nc\r\n");
+    let row = s.row("crlf.txt");
+    assert_eq!(row.hunks.len(), 1);
+    assert_eq!(
+        s.store()
+            .cat_blob(&row.baseline.as_ref().unwrap().oid)
+            .unwrap(),
+        b"a\nb\nc\n",
+        "the store holds the canonical LF blob, not the worktree's bytes"
+    );
+    let out = s.restore_hunk("crlf.txt", 0);
+    assert!(out.outcome.ok(), "{:?}", out.outcome);
+    // F2: the store's blob is the *canonical* (LF) content, because `hash-object -w` ran
+    // with cwd = root and `text=auto` cleaned it. Writing that blob raw would silently
+    // convert the user's file to LF; `cat-file --filters` puts the CRLF back.
+    assert_eq!(
+        s.bytes_at("crlf.txt"),
+        original,
+        "the restored file is byte-equal to the CRLF original"
+    );
+    assert_pile!(s.engine, s.root, "", "D3 restore clears the row");
+}
+
+/// The D3 case `scenario_d3_crlf_restore_keeps_crlf` deliberately steps around: **bare**
+/// `* text=auto`, where the worktree representation is *not* reproducible from the blob.
+///
+/// Git cleans the user's CRLF file to an LF blob on the way in and writes LF on the way
+/// out, so `cat-file --filters` cannot put the CRLF back. Restoring one hunk used to
+/// rewrite all three line endings and then report a clean pile, so the damage was invisible
+/// as well as unasked-for. The round-trip guard refuses instead (verifier F2, ruled option
+/// (a)): restore never normalises line endings behind the user's back.
+#[test]
+fn scenario_d3_crlf_restore_under_bare_text_auto_is_refused() {
+    let mut repo = FixtureRepo::new("d3-restore-bare").unwrap();
+    repo.commit_files(
+        &[
+            (".gitattributes", "* text=auto\n"),
+            ("crlf.txt", "a\r\nb\r\nc\r\n"),
+        ],
+        "crlf",
+    )
+    .unwrap();
+    let mut s = Fresh::over(repo, Config::default(), EngineOptions::default(), false);
+    let original = s.bytes_at("crlf.txt");
+    assert_eq!(original, b"a\r\nb\r\nc\r\n", "the worktree keeps CRLF");
+
+    let edited = "a\r\nB\r\nc\r\n";
+    s.repo.write("crlf.txt", edited);
+    let pile_before = s.scan();
+    let row = s.row("crlf.txt");
+    assert_eq!(row.hunks.len(), 1, "one changed line");
+
+    let out = s.restore_hunk("crlf.txt", 0);
+    match out.outcome.refused.first() {
+        // Verifier (b) F7: the refusal is its own variant, and its message does not claim
+        // the file could not be hashed — hashing it is how the guard knows.
+        Some(r @ Refused::NotRoundTrippable { .. }) => {
+            assert_eq!(
+                r.message("restored"),
+                "crlf.txt: eol conversion is not round-trippable; not restored"
+            );
+        }
+        other => panic!("expected a round-trip refusal, got {other:?}"),
+    }
+    assert_eq!(
+        s.bytes_at("crlf.txt"),
+        edited.as_bytes(),
+        "the user's bytes are untouched — including the two endings the restore would have rewritten"
+    );
+    assert_eq!(
+        common::pile_string(&s.scan()),
+        common::pile_string(&pile_before),
+        "the pile is unchanged: nothing was hidden"
+    );
+}
+
+#[test]
+fn scenario_d4_restore_deletion_refuses_on_a_case_collision() {
+    let mut s = Fresh::new("d4-restore");
+    if !probe_case_insensitive(&s.root) {
+        eprintln!("D4 restore skipped: {} is case-sensitive", s.root.display());
+        return;
+    }
+    let original = s.bytes_at("f1");
+    std::fs::rename(s.repo.path().join("f1"), s.repo.path().join("F1")).unwrap();
+    assert_pile!(s.engine, s.root, "F1|f1", "D4 case-only rename");
+    assert_eq!(s.row("f1").change, Change::Deleted);
+
+    // F6: `f1` looks absent to `stat` only because APFS folds; `read_dir` shows `F1` right
+    // there. A byte-only absence rule would let `rename(temp, "f1")` fold onto `F1` and
+    // destroy the user's case-only rename.
+    let out = s.restore_file("f1");
+    match out.outcome.refused.first() {
+        Some(r @ Refused::StillPresent { .. }) => {
+            assert!(
+                r.message("restored").contains("F1"),
+                "the colliding entry is named: {}",
+                r.message("restored")
+            );
+        }
+        other => panic!("expected a case-collision refusal, got {other:?}"),
+    }
+    assert_eq!(s.bytes_at("F1"), original, "F1 is untouched");
+    assert_pile!(s.engine, s.root, "F1|f1", "both sides still pending");
+}
+
+/// The same clobber D4 guards against, one code point past ASCII (verifier F1).
+///
+/// The old rule folded with `eq_ignore_ascii_case`, which says `école.md` and `École.md`
+/// are different names. APFS says they are the same one, so the rename landed on the
+/// user's renamed file and replaced its content with the baseline. The fold question now
+/// goes to the filesystem, so this refuses.
+#[test]
+fn scenario_d4_restore_deletion_refuses_on_a_unicode_case_collision() {
+    let mut s = Fresh::new("d4-restore-unicode");
+    if !probe_case_insensitive(&s.root) {
+        eprintln!(
+            "SKIP scenario_d4_restore_deletion_refuses_on_a_unicode_case_collision: {} is case-sensitive",
+            s.root.display()
+        );
+        return;
+    }
+    let lower = "école.md";
+    let upper = "École.md";
+    s.repo.write(lower, "one\n");
+    assert!(
+        s.accept_file(lower).ok(),
+        "the baseline is the accepted blob"
+    );
+    assert_pile!(s.engine, s.root, "");
+
+    std::fs::rename(s.repo.path().join(lower), s.repo.path().join(upper)).unwrap();
+    let newer = b"the user's newer content\n";
+    std::fs::write(s.repo.path().join(upper), newer).unwrap();
+    assert_eq!(s.row(lower).change, Change::Deleted);
+
+    let out = s.restore_file(lower);
+    match out.outcome.refused.first() {
+        Some(r @ Refused::StillPresent { collides_with, .. }) => {
+            assert_eq!(
+                collides_with.as_deref(),
+                Some(upper.as_bytes()),
+                "the colliding entry is named by its real bytes"
+            );
+            assert!(
+                r.message("restored").contains(upper),
+                "the message names it: {}",
+                r.message("restored")
+            );
+        }
+        other => panic!("expected a Unicode case-collision refusal, got {other:?}"),
+    }
+    assert_eq!(
+        s.bytes_at(upper),
+        newer,
+        "the newer bytes survive — this is the data loss the ASCII fold allowed"
+    );
+}
+
+/// APFS is normalization-*insensitive* as well as case-insensitive: `café.md` written NFD
+/// and read back NFC is one file, so the same filesystem-answers-it rule has to cover
+/// normalization and not only case (verifier F1).
+///
+/// **A git root cannot reach this through a row**, and the test says so with evidence:
+/// `core.precomposeunicode` is on by default on macOS, so git precomposes every path it
+/// reports and lastcall only ever sees the NFC name — there is no NFD row to restore. The
+/// guard still has to hold, because [`lastcall_engine::restore::collision`] is what stands
+/// between `rename(temp, name)` and the user's file on **every** root, including a draft
+/// root, whose raw-byte content model has no git in front of it to normalize anything. So
+/// the rule is asserted directly, over a real working directory on the real filesystem.
+#[test]
+fn scenario_d4_restore_deletion_refuses_on_an_nfd_nfc_collision() {
+    let mut s = Fresh::new("d4-restore-nfd");
+    if !probe_case_insensitive(&s.root) {
+        eprintln!(
+            "SKIP scenario_d4_restore_deletion_refuses_on_an_nfd_nfc_collision: {} is case-sensitive",
+            s.root.display()
+        );
+        return;
+    }
+    // `e` + U+0301 (decomposed) vs the precomposed `é`. Different bytes, one grapheme.
+    let nfd = "cafe\u{0301}.md";
+    let nfc = "caf\u{00e9}.md";
+    assert_ne!(nfd.as_bytes(), nfc.as_bytes());
+
+    // The evidence for the paragraph above: created with the decomposed name on disk,
+    // reported by the scan under the precomposed one.
+    s.repo.write(nfd, "one\n");
+    assert_eq!(
+        s.row(nfc).path,
+        nfc.as_bytes(),
+        "git precomposes: the NFD name on disk is reported NFC, so no NFD row exists"
+    );
+    s.repo.remove(nfd);
+    assert_pile!(s.engine, s.root, "");
+
+    // Now the shape the guard exists for: the file on disk carries one normalization and
+    // the *other* name resolves onto it. This is the state in which a deletion restore
+    // must not `rename` over the user's file.
+    let newer = b"the user's newer content\n";
+    s.repo.write(nfc, newer);
+    let collides = lastcall_engine::restore::collision(&s.root, nfd.as_bytes(), true);
+    assert_eq!(
+        collides.as_deref(),
+        Some(nfc.as_bytes()),
+        "the NFD name is taken, and the precomposed entry is what is in the way"
+    );
+    // The byte-exact half is unconditional, and the negative case still says no.
+    assert_eq!(
+        lastcall_engine::restore::collision(&s.root, nfc.as_bytes(), true).as_deref(),
+        Some(nfc.as_bytes())
+    );
+    assert_eq!(
+        lastcall_engine::restore::collision(&s.root, "unrelated.md".as_bytes(), true),
+        None
+    );
+    assert_eq!(s.bytes_at(nfc), newer, "nothing was written over it");
+}
+
+#[test]
+fn scenario_d11_restore_of_a_unicode_and_space_path() {
+    let mut s = Fresh::new("d11-restore");
+    let path = "docs/résumé draft.md";
+    s.repo.write(path, "one\ntwo\nthree\n");
+    assert!(s.accept_file(path).ok());
+    assert_pile!(s.engine, s.root, "");
+    s.repo.write(path, "one\nTWO\nthree\n");
+    assert_pile!(s.engine, s.root, path);
+    let out = s.restore_file(path);
+    assert!(out.outcome.ok(), "{:?}", out.outcome);
+    assert_eq!(s.bytes_at(path), b"one\ntwo\nthree\n");
+    assert_pile!(s.engine, s.root, "", "D11 restore clears the row");
+
+    // And the deletion direction: the whole directory goes, and the restore rebuilds it.
+    s.repo.remove(path);
+    std::fs::remove_dir(s.repo.path().join("docs")).unwrap();
+    assert_pile!(s.engine, s.root, path);
+    let out = s.restore_file(path);
+    assert!(out.outcome.ok(), "{:?}", out.outcome);
+    assert_eq!(s.bytes_at(path), b"one\ntwo\nthree\n");
     assert_pile!(s.engine, s.root, "");
 }

@@ -74,7 +74,7 @@ Legend for the harness column: **H** = verifiable with the git-plumbing harness 
 
 **D3 — CRLF with `text=auto`.** Setup: file with CRLF line endings in a repo with `.gitattributes` `* text=auto`. Action: agent changes one line. Expect: one hunk (numstat 1/1, matching `git diff`), not whole-file churn. Requires hashing with cwd at the root and a relative path; `--stdin --path` from outside the work tree yields 3/3. *(H — verified)*
 
-**D4 — Case-only rename on macOS.** Action: `mv f.txt F.txt`. Expect: git root: pile `[]` or a paired rename row (git sees no change on a case-insensitive FS); draft root: delete+add pair; restore-deletion refuses because case-sensitive listing finds `F.txt`. *(H on macOS only)*
+**D4 — Case-only rename on macOS.** Action: `mv f.txt F.txt`. Expect: git root and draft root alike: a delete+add pair (`f.txt` deleted, `F.txt` added — the scan lists names byte-exactly; git's own status may see no change on a case-insensitive FS, and that is why lastcall does not consult it); restore-deletion of `f.txt` refuses with `F.txt` named as the collision, because the filesystem resolves the name onto the existing entry (any fold rule: ASCII, Unicode case, NFD/NFC). *(H on macOS only; the collision tests skip visibly on a case-sensitive root.)*
 
 **D5 — Unstaged rename.** Action: agent `mv d/old.rs d/new.rs` and edits 2 lines. Expect: one paired rename row "old.rs → new.rs" with 2-line hunk (similarity pairing via temp index), ledger stores delete + add. *(H)*
 

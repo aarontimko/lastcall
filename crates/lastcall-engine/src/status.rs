@@ -56,6 +56,21 @@ pub struct FlagStatus {
     pub note: String,
 }
 
+/// One flag in the additive `flags` array (Amendment v1.7). The hunk *text* stays out of
+/// `status` — the export (`flags::export`) is its outlet.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct FlagEntryStatus {
+    pub note: String,
+    pub created_at: String,
+    pub hunk: Option<FlagHunkStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct FlagHunkStatus {
+    pub index: usize,
+    pub header: String,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum RenameStatus {
@@ -75,7 +90,10 @@ pub struct RowStatus {
     pub annotation: Option<Annotation>,
     pub conflicted: bool,
     pub collapsed: Option<Collapsed>,
+    /// The first flag, as in schema 1.0. Kept for compatibility; `flags` is the full list.
     pub flag: Option<FlagStatus>,
+    /// Every flag on the row, oldest first. Additive in v1.7 (`status_version` stays 1).
+    pub flags: Vec<FlagEntryStatus>,
     pub rename: Option<RenameStatus>,
 }
 
@@ -106,9 +124,21 @@ impl RowStatus {
             annotation: row.annotation,
             conflicted: row.conflicted,
             collapsed: row.collapsed,
-            flag: row.flag.as_ref().map(|f| FlagStatus {
+            flag: row.flags.first().map(|f| FlagStatus {
                 note: f.note.clone(),
             }),
+            flags: row
+                .flags
+                .iter()
+                .map(|f| FlagEntryStatus {
+                    note: f.note.clone(),
+                    created_at: f.created_at.clone(),
+                    hunk: f.hunk.as_ref().map(|h| FlagHunkStatus {
+                        index: h.index,
+                        header: h.header.clone(),
+                    }),
+                })
+                .collect(),
             rename: row.rename.as_ref().map(|r| match r {
                 Rename::From { from, similarity } => RenameStatus::From {
                     from: lossy(from),

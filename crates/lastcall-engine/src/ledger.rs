@@ -28,7 +28,9 @@ use crate::git::{Mode, Oid};
 use crate::paths::RepoPaths;
 use crate::store::RootKind;
 
-pub const SCHEMA_VERSION: &str = "1.0";
+/// `1.1` since Amendment v1.7: `Override.flags` beside the 1.0 `flag` mirror. Only the
+/// **major** gates readability ([`parse`]), so a 1.0 build still opens a 1.1 file.
+pub const SCHEMA_VERSION: &str = "1.1";
 
 /// Lock retry policy: 40 × 50 ms = 2 s, then the operation errors — never write unlocked.
 ///
@@ -120,28 +122,111 @@ pub struct SeenAt {
     pub at: String,
 }
 
-/// A flag on a path; never changes the baseline.
+/// The hunk a flag was raised on, captured as it was on screen (Amendment v1.7).
+///
+/// The rendered text and not a reference to it: a flag outlives the render. By the time the
+/// human sends it to the agent the file has usually moved on — that is what they are
+/// complaining about — and a stored index into a diff that no longer exists would point at
+/// somebody else's lines. `header` is the `@@ -a,b +c,d @@` line and `text` the unified
+/// body with its `+`/`-`/space prefixes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlagHunk {
+    pub index: usize,
+    pub header: String,
+    pub text: String,
+}
+
+/// A flag on a path; never changes the baseline. `hunk` is `None` for a file flag.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Flag {
     pub note: String,
     pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hunk: Option<FlagHunk>,
+}
+
+impl Flag {
+    /// A file flag: a note with no hunk behind it.
+    pub fn file(note: impl Into<String>, created_at: impl Into<String>) -> Self {
+        Self {
+            note: note.into(),
+            created_at: created_at.into(),
+            hunk: None,
+        }
+    }
 }
 
 /// One override. `blob` distinguishes *field absent* (flag-only override: `None`) from
 /// `null` (seen as absent: `Some(None)`) from an oid (`Some(Some(oid))`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Serialised through [`OverrideWire`], which writes the `flags` list **and** a `flag`
+/// mirror of its first entry — see that type for why.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Override {
+    pub blob: Option<Option<Oid>>,
+    pub mode: Option<Mode>,
+    /// Every flag on the path, in the order they were raised (v1.7).
+    pub flags: Vec<Flag>,
+    pub updated_at: String,
+}
+
+/// The on-disk shape of an [`Override`].
+///
+/// **`flag` and `flags` are both written, always.** `flag` is the schema-1.0 mirror of
+/// `flags[0]` (without its `hunk`, which 1.0 has no field for), and it is written as `null`
+/// rather than omitted when there are no flags. A 1.0 reader drops unknown fields on load,
+/// so a 1.0 binary opening a 1.1 file — a merged `main` while this branch is open, or a
+/// second machine sharing the state dir — would erase every flag on its first write. With
+/// the mirror it keeps the first one. Losing the rest under a downgrade is a §11 residual,
+/// not a bug this shape can fix.
+///
+/// Reading is the mirror image: `flags` when the field is present (even empty), otherwise
+/// `flag` lifted into a one-entry list — which is both a genuine 1.0 file and a 1.1 file a
+/// 1.0 binary has written back.
+#[derive(Debug, Serialize, Deserialize)]
+struct OverrideWire {
     #[serde(
         default,
         deserialize_with = "deserialize_double_option",
         skip_serializing_if = "Option::is_none"
     )]
-    pub blob: Option<Option<Oid>>,
+    blob: Option<Option<Oid>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mode: Option<Mode>,
+    mode: Option<Mode>,
+    /// The 1.0 mirror. Never `skip_serializing_if`: a 1.0 reader must see the field.
+    flag: Option<Flag>,
     #[serde(default)]
-    pub flag: Option<Flag>,
-    pub updated_at: String,
+    flags: Option<Vec<Flag>>,
+    updated_at: String,
+}
+
+impl Serialize for Override {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        OverrideWire {
+            blob: self.blob.clone(),
+            mode: self.mode,
+            flag: self.flags.first().map(|f| Flag {
+                note: f.note.clone(),
+                created_at: f.created_at.clone(),
+                hunk: None,
+            }),
+            flags: Some(self.flags.clone()),
+            updated_at: self.updated_at.clone(),
+        }
+        .serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for Override {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let w = OverrideWire::deserialize(d)?;
+        Ok(Override {
+            blob: w.blob,
+            mode: w.mode,
+            flags: w.flags.unwrap_or_else(|| w.flag.into_iter().collect()),
+            updated_at: w.updated_at,
+        })
+    }
 }
 
 fn deserialize_double_option<'de, D>(d: D) -> Result<Option<Option<Oid>>, D::Error>
@@ -154,7 +239,7 @@ where
 impl Override {
     /// Whether the override still carries anything worth storing.
     pub fn is_empty(&self) -> bool {
-        self.blob.is_none() && self.flag.is_none()
+        self.blob.is_none() && self.flags.is_empty()
     }
 }
 
@@ -219,7 +304,14 @@ impl Ledger {
             overrides.entry(k.clone()).or_insert_with(|| v.clone());
         }
         LedgerWire {
-            schema_version: self.schema_version.clone(),
+            // **Every write stamps the current version** (Amendment v1.7 §6.2; verifier
+            // F8). What `to_wire` produces is a 1.1 document — the `flags` list, the `flag`
+            // mirror, `flag` present as `null` rather than omitted — whatever the file we
+            // read said. Re-stamping the version we read meant a 1.0 file gained 1.1 fields
+            // while still claiming 1.0, and a 1.7 file kept a 1.7 stamp after this build had
+            // already dropped every 1.7 field it did not understand. Both are documents
+            // whose own version number is a lie about what is in them.
+            schema_version: SCHEMA_VERSION.to_string(),
             root: self.root.clone(),
             kind: self.kind,
             seen_tree: self.seen_tree.clone(),
@@ -615,7 +707,7 @@ mod tests {
             Override {
                 blob: Some(Some(oid('c'))),
                 mode: Some(Mode::Regular),
-                flag: None,
+                flags: Vec::new(),
                 updated_at: "2026-01-01T00:01:00Z".into(),
             },
         );
@@ -624,7 +716,7 @@ mod tests {
             Override {
                 blob: Some(None),
                 mode: None,
-                flag: None,
+                flags: Vec::new(),
                 updated_at: "2026-01-01T00:02:00Z".into(),
             },
         );
@@ -633,10 +725,7 @@ mod tests {
             Override {
                 blob: None,
                 mode: None,
-                flag: Some(Flag {
-                    note: "check this".into(),
-                    created_at: "2026-01-01T00:03:00Z".into(),
-                }),
+                flags: vec![Flag::file("check this", "2026-01-01T00:03:00Z")],
                 updated_at: "2026-01-01T00:03:00Z".into(),
             },
         );
@@ -648,7 +737,7 @@ mod tests {
         let l = sample();
         let json = l.to_json();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["schema_version"], "1.0");
+        assert_eq!(v["schema_version"], "1.1");
         assert_eq!(v["kind"], "git");
         assert_eq!(v["seen_tree"], oid('a').as_str());
         assert_eq!(v["seen_at"]["head_commit"], oid('b').as_str());
@@ -669,6 +758,149 @@ mod tests {
         assert!(notices.is_empty());
         assert_eq!(back, l);
         assert_eq!(back.to_json(), json, "byte-stable");
+    }
+
+    /// Amendment v1.7: a genuine schema-1.0 file has `flag` and no `flags`; the reader lifts
+    /// the one flag into the list, and it is a file flag (no hunk).
+    #[test]
+    fn ledger_1_0_flag_lifts_into_flags() {
+        let json = r#"{"schema_version":"1.0","root":"/r","kind":"git","seen_tree":null,
+            "seen_at":{"head_commit":null,"branch":null,"at":"x"},
+            "overrides":{"f1":{"flag":{"note":"look","created_at":"t"},"updated_at":"t"},
+                         "f2":{"blob":null,"flag":null,"updated_at":"t"}}}"#;
+        let (l, notices) = parse(json.as_bytes()).unwrap();
+        assert!(notices.is_empty(), "{notices:?}");
+        assert_eq!(l.overrides["f1"].flags, vec![Flag::file("look", "t")]);
+        assert!(l.overrides["f1"].flags[0].hunk.is_none());
+        assert!(
+            l.overrides["f2"].flags.is_empty(),
+            "a null flag is no flags"
+        );
+        // The rewrite gains the `flags` list — and says so: what is written is a 1.1
+        // document, so it is stamped 1.1 (F8), not the 1.0 it was read as.
+        let v: serde_json::Value = serde_json::from_str(&l.to_json()).unwrap();
+        assert_eq!(v["schema_version"], "1.1");
+        assert_eq!(v["overrides"]["f1"]["flags"][0]["note"], "look");
+        assert_eq!(
+            v["overrides"]["f1"]["flag"]["note"], "look",
+            "and the 1.0 mirror is still there"
+        );
+    }
+
+    /// A write says what it wrote (Amendment v1.7 §6.2; verifier F8).
+    ///
+    /// Before this, `to_wire` re-stamped the version it had read. A 1.0 file came back with
+    /// the 1.1 `flags` list inside it and `"schema_version":"1.0"` on the outside, so a
+    /// reader that trusted the stamp — including a future migration keyed on it — was told
+    /// the wrong thing about the bytes it was holding. The same in the other direction: a
+    /// 1.7 file kept its 1.7 stamp after this build had already dropped every field it did
+    /// not understand.
+    #[test]
+    fn ledger_write_always_stamps_the_current_schema_version() {
+        assert_eq!(SCHEMA_VERSION, "1.1");
+        let stamp = |json: &str| -> serde_json::Value {
+            let (l, _) = parse(json.as_bytes()).unwrap();
+            serde_json::from_str(&l.to_json()).unwrap()
+        };
+
+        // Older: a genuine 1.0 file, read and written back.
+        let older = stamp(
+            r#"{"schema_version":"1.0","root":"/r","kind":"git","seen_tree":null,
+            "seen_at":{"head_commit":null,"branch":null,"at":"x"},
+            "overrides":{"f1":{"flag":{"note":"look","created_at":"t"},"updated_at":"t"}}}"#,
+        );
+        assert_eq!(older["schema_version"], "1.1");
+
+        // Newer: a minor version this build does not know. It loads (deliberately), but
+        // what we write back is 1.1 and is stamped 1.1.
+        let newer = stamp(
+            r#"{"schema_version":"1.7","root":"/r","kind":"draft","seen_tree":null,
+            "seen_at":{"head_commit":null,"branch":null,"at":"x"},"overrides":{},"future":true}"#,
+        );
+        assert_eq!(newer["schema_version"], "1.1");
+        assert!(newer.get("future").is_none());
+
+        // And a ledger built in memory, never read from disk at all.
+        let fresh = Ledger::new(
+            Path::new("/r"),
+            RootKind::Git,
+            None,
+            SeenAt {
+                head_commit: None,
+                branch: None,
+                at: "x".into(),
+            },
+        );
+        let v: serde_json::Value = serde_json::from_str(&fresh.to_json()).unwrap();
+        assert_eq!(v["schema_version"], "1.1");
+    }
+
+    /// The dual write: `flag` mirrors `flags[0]` without its hunk, `flags` carries all of
+    /// them with their hunks, and the pair round-trips through the reader unchanged.
+    #[test]
+    fn ledger_1_1_round_trips_both_fields() {
+        let mut l = sample();
+        let hunk = FlagHunk {
+            index: 1,
+            header: "@@ -1,3 +1,3 @@".into(),
+            text: "-a\n+b\n c\n".into(),
+        };
+        l.overrides.insert(
+            "many".into(),
+            Override {
+                blob: None,
+                mode: None,
+                flags: vec![
+                    Flag {
+                        note: "first".into(),
+                        created_at: "t1".into(),
+                        hunk: Some(hunk.clone()),
+                    },
+                    Flag::file("second", "t2"),
+                ],
+                updated_at: "t2".into(),
+            },
+        );
+        let json = l.to_json();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["schema_version"], "1.1");
+        let o = &v["overrides"]["many"];
+        assert_eq!(o["flag"]["note"], "first", "the 1.0 mirror is flags[0]");
+        assert!(
+            o["flag"].get("hunk").is_none(),
+            "the mirror carries no hunk — 1.0 has no field for it"
+        );
+        assert_eq!(o["flags"].as_array().unwrap().len(), 2);
+        assert_eq!(o["flags"][0]["hunk"]["header"], "@@ -1,3 +1,3 @@");
+        assert_eq!(o["flags"][0]["hunk"]["index"], 1);
+        assert!(
+            o["flags"][1].get("hunk").is_none(),
+            "a file flag omits the field"
+        );
+        let (back, notices) = parse(json.as_bytes()).unwrap();
+        assert!(notices.is_empty(), "{notices:?}");
+        assert_eq!(back, l, "flags win over the mirror on the way back");
+        assert_eq!(back.to_json(), json, "byte-stable");
+    }
+
+    /// The post-downgrade shape (F4): a 1.0 binary read this 1.1 file, dropped `flags` as an
+    /// unknown field, and wrote it back with `flag` alone. The first flag survives; the rest
+    /// are the §11 residual.
+    #[test]
+    fn ledger_1_1_with_flags_absent_lifts_flag() {
+        let json = r#"{"schema_version":"1.1","root":"/r","kind":"git","seen_tree":null,
+            "seen_at":{"head_commit":null,"branch":null,"at":"x"},
+            "overrides":{"f1":{"flag":{"note":"first","created_at":"t1"},"updated_at":"t2"}}}"#;
+        let (l, notices) = parse(json.as_bytes()).unwrap();
+        assert!(notices.is_empty(), "{notices:?}");
+        assert_eq!(l.overrides["f1"].flags, vec![Flag::file("first", "t1")]);
+        // An explicitly empty `flags` is authoritative, not a missing one.
+        let cleared = r#"{"schema_version":"1.1","root":"/r","kind":"git","seen_tree":null,
+            "seen_at":{"head_commit":null,"branch":null,"at":"x"},
+            "overrides":{"f1":{"blob":null,"flag":{"note":"stale","created_at":"t1"},
+                               "flags":[],"updated_at":"t2"}}}"#;
+        let (l, _) = parse(cleared.as_bytes()).unwrap();
+        assert!(l.overrides["f1"].flags.is_empty());
     }
 
     #[test]

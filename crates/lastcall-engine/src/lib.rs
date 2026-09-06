@@ -8,6 +8,7 @@ pub mod config;
 pub mod count;
 pub mod engine;
 pub mod env;
+pub mod flags;
 pub mod git;
 pub mod headstate;
 #[cfg(feature = "herdr")]
@@ -17,6 +18,7 @@ pub mod index;
 pub mod ledger;
 pub mod ops;
 pub mod paths;
+pub mod restore;
 pub mod roots;
 pub mod scan;
 pub mod status;

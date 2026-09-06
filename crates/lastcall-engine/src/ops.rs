@@ -24,8 +24,8 @@ use crate::headstate::current_head;
 use crate::hunks::{self, Hunk};
 use crate::index::{IndexError, PrivateIndex};
 use crate::ledger::{
-    self, Baseline, BaselineResolver, Clock, Flag, Ledger, LedgerError, LedgerLock, LoadResult,
-    Override, SeenAt, TreeEntries,
+    self, Baseline, BaselineResolver, Clock, Flag, FlagHunk, Ledger, LedgerError, LedgerLock,
+    LoadResult, Override, SeenAt, TreeEntries,
 };
 use crate::paths::RepoPaths;
 use crate::scan::{Entry, Pile, Row};
@@ -38,11 +38,26 @@ pub enum FaultPoint {
     AfterObjectWrite,
     /// `ledger.json.tmp` is written and synced; the rename has not happened.
     AfterLedgerTmpWrite,
+    /// A restore's temp file is written and synced; the second live CAS and the rename
+    /// have not happened. Unlike the other two this point is also *recoverable*: a test
+    /// that wants to see the cleanup rather than a dead process answers
+    /// [`FaultInjector::fails_at`] instead of killing at [`FaultInjector::at`].
+    AfterTempWrite,
 }
 
 /// The E1 test seam. Production uses [`NoFault`].
 pub trait FaultInjector {
     fn at(&self, point: FaultPoint);
+
+    /// Whether the op should abort at `point` and unwind normally.
+    ///
+    /// [`FaultInjector::at`] is the hard seam — the testkit's implementation SIGKILLs, and
+    /// a killed process cannot then assert that the temp file was removed. Deliverable 1
+    /// has to prove exactly that, so the restore path also asks this soft question, which
+    /// defaults to "no fault" and leaves every existing injector unchanged.
+    fn fails_at(&self, _point: FaultPoint) -> bool {
+        false
+    }
 }
 
 /// Never fires.
@@ -88,45 +103,90 @@ pub enum Refused {
     BaselineMoved { path: Vec<u8> },
     /// The path cannot be hashed (typechange, EACCES, failing filter).
     Unhashable { path: Vec<u8>, reason: String },
-    /// `accept_deletion` on a path that still exists (A7).
-    StillPresent { path: Vec<u8> },
+    /// The baseline blob does not come back through the store's eol conversion as the bytes
+    /// on disk, so writing it would rewrite the user's line endings behind their back
+    /// (verifier F2's guard). Its own variant rather than an `Unhashable` reason because
+    /// the file hashed perfectly well — hashing it is how the guard knows (verifier (b) F7).
+    NotRoundTrippable { path: Vec<u8> },
+    /// `accept_deletion` on a path that still exists (A7), or a deletion **restore** whose
+    /// name is taken. `collides_with` names the directory entry that is in the way when it
+    /// is not the path's own name byte-for-byte — on a case-folding root `f1` is refused
+    /// because `F1` exists, and saying so is the difference between a usable message and a
+    /// baffling one (F6, D4).
+    StillPresent {
+        path: Vec<u8>,
+        collides_with: Option<Vec<u8>>,
+    },
     /// Non-UTF-8 paths cannot be keyed in the ledger in v1.
     NonUtf8Path { path: Vec<u8> },
     /// `accept_hunk` with an index the row does not have.
     NoSuchHunk { path: Vec<u8>, index: usize },
+    /// The path is in a merge conflict (`ls-files -u`): restoring it would write over one
+    /// side of a merge git is still holding open (gate item 4; C4).
+    Conflicted { path: Vec<u8> },
+    /// The hunk list handed to `restore_hunk` does not reassemble the rendered content, so
+    /// "everything but hunk k" would silently drop whatever is missing from it (verifier
+    /// F3). The one refusal that is about the *caller's* view rather than the file.
+    Incomplete { path: Vec<u8> },
+}
+
+impl Refused {
+    /// The refusal in words, with `verb` as the past participle of the operation that did
+    /// not happen (`"accepted"`, `"restored"`).
+    ///
+    /// One vocabulary, two operations: the reasons are identical — the file moved, the
+    /// baseline moved, the path cannot be hashed — and only the sentence's verb differs, so
+    /// the verb is a parameter rather than a second enum. [`std::fmt::Display`] passes
+    /// `"accepted"`, which is what every pre-Phase-7 caller printed.
+    pub fn message(&self, verb: &str) -> String {
+        let lossy = |p: &[u8]| String::from_utf8_lossy(p).into_owned();
+        match self {
+            Refused::Moved { path, .. } => {
+                format!("{}: changed since rendered; not {verb}", lossy(path))
+            }
+            Refused::BaselineMoved { path } => {
+                format!("{}: baseline moved since rendered; not {verb}", lossy(path))
+            }
+            Refused::Unhashable { path, reason } => {
+                format!("{}: cannot hash ({reason}); not {verb}", lossy(path))
+            }
+            Refused::NotRoundTrippable { path } => {
+                format!(
+                    "{}: eol conversion is not round-trippable; not {verb}",
+                    lossy(path)
+                )
+            }
+            Refused::StillPresent {
+                path,
+                collides_with,
+            } => match collides_with {
+                Some(other) if other != path => format!(
+                    "{}: {} is in the way; deletion not {verb}",
+                    lossy(path),
+                    lossy(other)
+                ),
+                _ => format!("{}: still present; deletion not {verb}", lossy(path)),
+            },
+            Refused::NonUtf8Path { path } => {
+                format!("{}: non-UTF-8 path; accept unsupported in v1", lossy(path))
+            }
+            Refused::NoSuchHunk { path, index } => format!("{}: no hunk {index}", lossy(path)),
+            Refused::Conflicted { path } => {
+                format!("{}: unresolved merge conflict; not {verb}", lossy(path))
+            }
+            Refused::Incomplete { path } => {
+                format!(
+                    "{}: only part of the diff is loaded; not {verb}",
+                    lossy(path)
+                )
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for Refused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let lossy = |p: &[u8]| String::from_utf8_lossy(p).into_owned();
-        match self {
-            Refused::Moved { path, .. } => {
-                write!(f, "{}: changed since rendered; not accepted", lossy(path))
-            }
-            Refused::BaselineMoved { path } => {
-                write!(
-                    f,
-                    "{}: baseline moved since rendered; not accepted",
-                    lossy(path)
-                )
-            }
-            Refused::Unhashable { path, reason } => {
-                write!(f, "{}: cannot hash ({reason}); not accepted", lossy(path))
-            }
-            Refused::StillPresent { path } => {
-                write!(f, "{}: still present; deletion not accepted", lossy(path))
-            }
-            Refused::NonUtf8Path { path } => {
-                write!(
-                    f,
-                    "{}: non-UTF-8 path; accept unsupported in v1",
-                    lossy(path)
-                )
-            }
-            Refused::NoSuchHunk { path, index } => {
-                write!(f, "{}: no hunk {index}", lossy(path))
-            }
-        }
+        f.write_str(&self.message("accepted"))
     }
 }
 
@@ -140,7 +200,26 @@ pub enum OpsError {
     Git(#[from] GitError),
     #[error(transparent)]
     Index(#[from] IndexError),
+    /// A restore's write path failed for a reason that is not a refusal: the temp file
+    /// could not be created, written, or renamed. Distinct from every variant above
+    /// because it is the only one that names a path in the user's working tree.
+    #[error("{path}: {source}")]
+    Io {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
 }
+
+impl OpsError {
+    /// `Err(OpsError::Io { .. })` in the shape the restore paths need at their match arms.
+    fn io<T>(path: std::path::PathBuf, source: std::io::Error) -> Result<T, OpsError> {
+        Err(OpsError::Io { path, source })
+    }
+}
+
+/// The basename glob a restore's temp file matches, re-exported here so `scan` and `ops`
+/// share one constant (F8). The rule itself is [`crate::restore::is_restore_temp`].
+pub use crate::restore::RESTORE_TEMP_GLOB;
 
 /// The result of one op: refusals (empty on success) and whether a compaction ran.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -173,6 +252,10 @@ pub struct Ops<'a> {
     pub clock: &'a dyn Clock,
     /// Compaction runs after a write when more overrides than this carry a `blob`.
     pub compaction_threshold: usize,
+    /// Whether the root's filesystem folds case (`scan::probe_case_insensitive`, the same
+    /// value the scan is given). Only the deletion restore reads it, and only to widen
+    /// "the name is free" from byte-exact to case-folded (F6).
+    pub case_insensitive: bool,
     /// Override changes made in memory since the last commit, keyed by path (`None` =
     /// removed). Start empty: `commit` replays them onto the on-disk ledger under the lock
     /// and clears them, so two engines over one root never lose each other's writes.
@@ -220,7 +303,7 @@ impl Ops<'_> {
             .or_insert(Override {
                 blob: None,
                 mode: None,
-                flag: None,
+                flags: Vec::new(),
                 updated_at: now.clone(),
             });
         if equals_tree {
@@ -339,6 +422,7 @@ impl Ops<'_> {
         if std::fs::symlink_metadata(&full).is_ok() {
             return Err(Refused::StillPresent {
                 path: rendered.path.clone(),
+                collides_with: None,
             });
         }
         self.set_override(&key, None, None);
@@ -514,6 +598,524 @@ impl Ops<'_> {
         })
     }
 
+    // -----------------------------------------------------------------------------------
+    // Restore — the only operation in lastcall that writes the user's working tree
+    // -----------------------------------------------------------------------------------
+    //
+    // Read these three together with [`Ops::accept_hunk`] above, and do not harmonise
+    // them. Accept-hunk deliberately has **no** live CAS (Amendment A3): it writes a blob
+    // into the ledger out of the baseline and the hunk the user saw, so a working tree
+    // that moved underneath cannot smuggle anything in. Restore is the exact opposite case
+    // — it writes the working tree — so the live CAS is the entire guard, and it runs
+    // twice: once at entry, and once more immediately before the `rename` (§6.3). The
+    // remaining window between the second hash and the rename is the §11 residual; the
+    // rescan every restore ends with is its mitigation.
+
+    /// Everything both restore routes check before anything is computed, in the order the
+    /// checks have to happen: a UTF-8 path, no unresolved conflict, no symlink in the
+    /// parent chain (F9 — this must precede the first CAS hash, because `hash_path`'s own
+    /// `lstat` follows a swapped parent directory and would happily agree), and no
+    /// `filter` attribute the store cannot promise to reproduce (F2).
+    fn restore_preflight(&self, path: &[u8]) -> Result<(), Refused> {
+        Self::key(path)?;
+        if self.is_conflicted(path) {
+            return Err(Refused::Conflicted {
+                path: path.to_vec(),
+            });
+        }
+        crate::restore::check_parent_chain(self.store.root(), path).map_err(|e| match e {
+            crate::restore::WriteError::Refuse(reason) => Refused::Unhashable {
+                path: path.to_vec(),
+                reason,
+            },
+            crate::restore::WriteError::Moved => Refused::Moved {
+                path: path.to_vec(),
+                live: None,
+            },
+            crate::restore::WriteError::Io { source, .. } => Refused::Unhashable {
+                path: path.to_vec(),
+                reason: source.to_string(),
+            },
+        })?;
+        if let Some(name) = crate::restore::filter_attr(self.store, path) {
+            return Err(Refused::Unhashable {
+                path: path.to_vec(),
+                reason: format!("filter={name}"),
+            });
+        }
+        Ok(())
+    }
+
+    /// Whether the user's index holds `path` at a conflict stage (C4).
+    ///
+    /// Read live rather than taken from `Row.conflicted`: a merge can be resolved or
+    /// started between the render and the keystroke, and for a write the live answer is
+    /// the safe direction in both cases. A root with no user repo (a draft dir) has no
+    /// conflicts, and an unreadable index is not a licence to write — but it is also not a
+    /// reason to refuse every restore, so it fails open exactly as the scan's own notice
+    /// path does.
+    fn is_conflicted(&self, path: &[u8]) -> bool {
+        let Some(rg) = self.repo else { return false };
+        let Ok(out) = rg.run(&["ls-files", "-u", "-z"]) else {
+            return false;
+        };
+        let Ok(entries) = crate::git::parse_ls_files_stage_z(&out) else {
+            return false;
+        };
+        entries.iter().any(|e| e.path == path)
+    }
+
+    /// Whether a `Baseline::Empty` means "this file did not exist at the baseline" (so a
+    /// file restore removes it) or "this root has no baseline yet" (so it must not).
+    ///
+    /// `BaselineResolver` gives `Empty` for both — a path outside the seen tree and a root
+    /// with no seen tree at all (`ledger.rs:589`) — and the kickoff asks for opposite
+    /// behaviour in each: "`Baseline::Empty` → a zero-byte file, never a removal (F17)"
+    /// and "when the baseline is absent (an added file), the file is removed". The seen
+    /// tree is what separates them, and it separates them exactly where F17 points: F17's
+    /// named case is a draft root at `draft_initial = pending`, which *is*
+    /// `seen_tree: None`. A git root's seen tree seeds from HEAD at open, so only a
+    /// genuinely untracked file is `Empty` there, and removing it is what "restore this
+    /// added file" means. Before anything has been seen, nothing has a baseline to go back
+    /// to, and destroying the user's first-sight draft is the one outcome F17 forbids.
+    fn empty_baseline_means_absent(&self) -> bool {
+        self.ledger.seen_tree.is_some()
+    }
+
+    /// The baseline for `path`, CAS'd against the one the row was rendered with.
+    fn restore_baseline(&mut self, rendered: &Rendered) -> Result<Baseline, Refused> {
+        let baseline = {
+            let mut resolver = BaselineResolver::new(
+                self.ledger,
+                self.tree,
+                self.store,
+                std::iter::once(rendered.path.as_slice()),
+            );
+            resolver.baseline(&rendered.path)
+        };
+        let (oid, mode) = match &baseline {
+            Baseline::Present { oid, mode } => (Some(oid.clone()), Some(*mode)),
+            Baseline::Absent | Baseline::Empty => (None, None),
+        };
+        if oid != rendered.baseline || mode != rendered.baseline_mode {
+            return Err(Refused::BaselineMoved {
+                path: rendered.path.clone(),
+            });
+        }
+        Ok(baseline)
+    }
+
+    /// Refuse a restore whose worktree bytes are **not reproducible** from the blob they
+    /// hashed to (verifier F2).
+    ///
+    /// Everything a restore writes goes out through `cat-file --filters`, which is what
+    /// `git checkout` would write. Under `text=auto eol=crlf` that reproduces the user's
+    /// CRLF file exactly. Under **bare** `* text=auto` on a native-LF platform it does not:
+    /// git cleans CRLF to LF on the way in and writes LF on the way out, so a file the user
+    /// keeps with CRLF endings comes back LF. Restoring one hunk of such a file rewrote
+    /// every line ending in it, and — because the canonical blob then matched — the pile
+    /// came back clean, so lastcall could not even show what it had done (invariant 2,
+    /// "over-show, never hide").
+    ///
+    /// The guard is a round trip: materialise the **current** oid (the one the entry CAS
+    /// just verified) through the same filters and compare with the live bytes. Equal means
+    /// the worktree representation is reproducible and a restore can write it back
+    /// faithfully; different means it is not, and lastcall refuses rather than normalising
+    /// the user's line endings behind their back. One extra `cat-file` per restore, and it
+    /// refuses only the genuinely lossy case.
+    ///
+    /// Exempt, all for want of content to compare: draft roots (raw-byte model, no
+    /// filters), symlinks (the blob is the link text), deletion restores (`oid == None`,
+    /// nothing on disk) and mode-only restores (which return before this).
+    fn round_trip_guard(&self, rendered: &Rendered) -> Result<(), Refused> {
+        if self.store.kind() != RootKind::Git || rendered.mode == Some(Mode::Symlink) {
+            return Ok(());
+        }
+        let Some(oid) = rendered.oid.as_ref() else {
+            return Ok(());
+        };
+        let full = self.store.root().join(OsStr::from_bytes(&rendered.path));
+        // Unreadable is the entry CAS's business, not this guard's.
+        let Ok(live) = std::fs::read(&full) else {
+            return Ok(());
+        };
+        let refuse = |reason: &str| {
+            Err(Refused::Unhashable {
+                path: rendered.path.clone(),
+                reason: reason.to_string(),
+            })
+        };
+        match crate::restore::materialise(self.store, oid, &rendered.path) {
+            Ok(back) if back == live => Ok(()),
+            Ok(_) => Err(Refused::NotRoundTrippable {
+                path: rendered.path.clone(),
+            }),
+            // A conversion we cannot run is never a licence to write.
+            Err(_) => refuse("cannot reproduce the worktree bytes"),
+        }
+    }
+
+    /// The bytes `content` should become on disk at `path`: through git's smudge/eol
+    /// conversion on a git root, unchanged on a draft root (F2).
+    fn restore_bytes(&self, path: &[u8], content: &[u8]) -> Result<Vec<u8>, OpsError> {
+        if self.store.kind() != RootKind::Git {
+            return Ok(content.to_vec());
+        }
+        // The blob has to exist before `cat-file` can convert it. Every blob a restore
+        // writes back is one the user already had, so this normally finds the object
+        // already there; a spliced hunk result is new and genuinely needs writing.
+        let oid = self.store.hash_bytes(content)?;
+        match crate::restore::materialise(self.store, &oid, path) {
+            Ok(bytes) => Ok(bytes),
+            // A conversion that fails is not a refusal we can name usefully — but it is
+            // also never a reason to write the unconverted bytes over the user's file.
+            Err(crate::restore::WriteError::Refuse(reason)) => Err(OpsError::Io {
+                path: self.store.root().join(OsStr::from_bytes(path)),
+                source: std::io::Error::other(reason),
+            }),
+            Err(crate::restore::WriteError::Moved) => Err(OpsError::Io {
+                path: self.store.root().join(OsStr::from_bytes(path)),
+                source: std::io::Error::other("moved"),
+            }),
+            Err(crate::restore::WriteError::Io { path, source }) => OpsError::io(path, source),
+        }
+    }
+
+    /// The second live CAS plus the soft fault seam, as a closure the write path calls
+    /// with the temp file on disk and the rename not yet done.
+    fn second_cas<'f>(
+        rendered: &Rendered,
+        store: &'f Store,
+        fault: &'f dyn FaultInjector,
+    ) -> impl FnMut() -> Result<(), crate::restore::WriteError> + 'f {
+        let rendered = rendered.clone();
+        move || {
+            fault.at(FaultPoint::AfterTempWrite);
+            if fault.fails_at(FaultPoint::AfterTempWrite) {
+                return Err(crate::restore::WriteError::Refuse("fault injected".into()));
+            }
+            // The parent chain was walked in the preflight, before the first CAS, and the
+            // temp file has been sitting on disk since then. A directory swapped for a
+            // symlink in that window is invisible to the hash compare below — `hash_path`
+            // resolves through the new parent, and a decoy holding identical bytes makes
+            // the CAS agree (verifier F7). So the walk runs again, here, with the rename
+            // one statement away.
+            if crate::restore::check_parent_chain(store.root(), &rendered.path).is_err() {
+                return Err(crate::restore::WriteError::Moved);
+            }
+            match store.hash_path(&rendered.path) {
+                Current::Present { oid, mode } => {
+                    if rendered.oid.as_ref() == Some(&oid) && rendered.mode == Some(mode) {
+                        Ok(())
+                    } else {
+                        Err(crate::restore::WriteError::Refuse(
+                            "changed since rendered".into(),
+                        ))
+                    }
+                }
+                _ => Err(crate::restore::WriteError::Refuse(
+                    "changed since rendered".into(),
+                )),
+            }
+        }
+    }
+
+    /// Put `content` (or a symlink to it, when `mode` is `Symlink`) at `path`, or remove
+    /// `path` when `content` is `None`. `before` is the second CAS.
+    fn restore_write(
+        &self,
+        path: &[u8],
+        content: Option<&[u8]>,
+        mode: Option<Mode>,
+        before: &mut dyn FnMut() -> Result<(), crate::restore::WriteError>,
+    ) -> Result<Outcome, OpsError> {
+        use crate::restore::{self as rst, WriteError};
+        let result = match (content, mode) {
+            (None, _) => rst::remove(self.store, path, before),
+            (Some(target), Some(Mode::Symlink)) => {
+                rst::write_symlink(self.store, path, target, before)
+            }
+            (Some(bytes), _) => rst::write_bytes(self.store, path, bytes, mode, before),
+        };
+        match result {
+            Ok(()) => Ok(Outcome {
+                refused: Vec::new(),
+                compacted: false,
+                written: false,
+            }),
+            // The second CAS is the only refusal this deep, and it is `Moved` — the same
+            // answer the entry CAS gives, so the TUI has one case to render.
+            Err(WriteError::Refuse(_) | WriteError::Moved) => Ok(Outcome {
+                refused: vec![Refused::Moved {
+                    path: path.to_vec(),
+                    live: None,
+                }],
+                ..Default::default()
+            }),
+            Err(WriteError::Io { path, source }) => OpsError::io(path, source),
+        }
+    }
+
+    /// Restore one hunk: the working file becomes `baseline ⊕ every content hunk but k`.
+    ///
+    /// No reverse-apply and no new diff code — a row's live content *is*
+    /// `baseline ⊕ all hunks` while the live CAS holds, so dropping `k` from the selection
+    /// is exactly "undo hunk k" (kickoff §3.3). The synthetic mode hunk is never in that
+    /// selection: `apply_hunks` would splice its literal `mode 100755` bytes in at offset 0
+    /// (F1). Restoring the mode hunk itself moves the mode alone, writing no bytes.
+    pub fn restore_hunk(
+        &mut self,
+        rendered: &Rendered,
+        hunks: &[Hunk],
+        hunk_index: usize,
+        fault: &dyn FaultInjector,
+    ) -> Result<Outcome, OpsError> {
+        let refuse = |r: Refused| {
+            Ok(Outcome {
+                refused: vec![r],
+                ..Default::default()
+            })
+        };
+        // A deletion row renders as one hunk with its own control (as accept does).
+        if rendered.oid.is_none() {
+            return self.restore_deletion(rendered, fault);
+        }
+        let Some(hunk) = hunks.get(hunk_index) else {
+            return refuse(Refused::NoSuchHunk {
+                path: rendered.path.clone(),
+                index: hunk_index,
+            });
+        };
+        let is_mode = hunk.is_mode_change();
+        if let Err(r) = self.restore_preflight(&rendered.path) {
+            return refuse(r);
+        }
+        if let Err(r) = self.cas_live(rendered) {
+            return refuse(r);
+        }
+        let baseline = match self.restore_baseline(rendered) {
+            Ok(b) => b,
+            Err(r) => return refuse(r),
+        };
+        if is_mode {
+            // D1: the mode hunk goes back to the baseline mode and nothing else is touched
+            // — no temp file, no rename, and on a root that ignores the executable bit,
+            // nothing at all.
+            let mode = match &baseline {
+                Baseline::Present { mode, .. } => Some(*mode),
+                Baseline::Absent | Baseline::Empty => rendered.baseline_mode,
+            };
+            return match crate::restore::set_mode(self.store, &rendered.path, mode) {
+                Ok(()) => Ok(Outcome::default()),
+                Err(crate::restore::WriteError::Io { path, source }) => OpsError::io(path, source),
+                // The leaf is a symlink now, so it is not the row that was rendered (F6).
+                Err(crate::restore::WriteError::Moved) => refuse(Refused::Moved {
+                    path: rendered.path.clone(),
+                    live: None,
+                }),
+                Err(crate::restore::WriteError::Refuse(reason)) => refuse(Refused::Unhashable {
+                    path: rendered.path.clone(),
+                    reason,
+                }),
+            };
+        }
+        // Before any temp file exists: the user's bytes must be reproducible from the blob
+        // we are about to splice into, or nothing is written at all (F2).
+        if let Err(r) = self.round_trip_guard(rendered) {
+            return refuse(r);
+        }
+        let base_bytes = match &baseline {
+            Baseline::Present { oid, .. } => self.store.cat_blob(oid)?,
+            Baseline::Absent | Baseline::Empty => Vec::new(),
+        };
+        // The hunk CAS has to cover the *hunks*, not only the file (verifier F3).
+        //
+        // "Restore hunk k" is `baseline ⊕ every content hunk but k`, and that identity holds
+        // only while the list the caller passed is the complete one. `hunks::expand`
+        // truncates at a line cap, so an expanded collapsed row can hand over a partial list
+        // — and both CASes still pass, because the *file* has not moved. The write would
+        // then be `baseline ⊕ a fragment`, silently discarding every edit the cap dropped.
+        // The store's blobs are canonical, so reassembling the whole list and hashing it is
+        // an exact test: it equals the current oid precisely when nothing is missing.
+        let all: Vec<usize> = hunks
+            .iter()
+            .filter(|h| !h.is_mode_change())
+            .map(|h| h.index)
+            .collect();
+        let whole = hunks::apply_hunks(&base_bytes, hunks, &all);
+        // `cas_live` above proved the row has a current oid and that it is this one.
+        let current = rendered.oid.as_ref().expect("cas_live passed");
+        if self.store.hash_bytes(&whole)? != *current {
+            return refuse(Refused::Incomplete {
+                path: rendered.path.clone(),
+            });
+        }
+        let keep: Vec<usize> = all.iter().copied().filter(|i| *i != hunk_index).collect();
+        // An added file's only content hunk *is* the file (verifier F4; the F16 shape for
+        // additions). "Everything but hunk 0" is nothing at all, and writing a zero-byte
+        // file where the user's added file was left a truncated file and a still-pending
+        // row — recoverable only by pressing restore a second time. Take the removal path
+        // `restore_file` takes for exactly this row.
+        let baseline_absent = matches!(&baseline, Baseline::Absent)
+            || matches!(&baseline, Baseline::Empty if self.empty_baseline_means_absent());
+        if baseline_absent && keep.is_empty() {
+            let mut before = Self::second_cas(rendered, self.store, fault);
+            return self.restore_write(&rendered.path, None, None, &mut before);
+        }
+        let content = hunks::apply_hunks(&base_bytes, hunks, &keep);
+        let bytes = self.restore_bytes(&rendered.path, &content)?;
+        // A content hunk leaves the mode where the live file has it: only the mode hunk
+        // moves the mode, and it may still be pending.
+        let mut before = Self::second_cas(rendered, self.store, fault);
+        self.restore_write(&rendered.path, Some(&bytes), rendered.mode, &mut before)
+    }
+
+    /// Restore the whole file to its baseline.
+    ///
+    /// `Baseline::Empty` writes a zero-byte file and never a removal (F17): "empty" is the
+    /// baseline for a path lastcall has seen with no content, and removing it would delete
+    /// a file the user never asked to lose. `Baseline::Absent` — the file did not exist at
+    /// the baseline — is the one case that removes.
+    pub fn restore_file(
+        &mut self,
+        rendered: &Rendered,
+        fault: &dyn FaultInjector,
+    ) -> Result<Outcome, OpsError> {
+        let refuse = |r: Refused| {
+            Ok(Outcome {
+                refused: vec![r],
+                ..Default::default()
+            })
+        };
+        if rendered.oid.is_none() {
+            return self.restore_deletion(rendered, fault);
+        }
+        if let Err(r) = self.restore_preflight(&rendered.path) {
+            return refuse(r);
+        }
+        if let Err(r) = self.cas_live(rendered) {
+            return refuse(r);
+        }
+        let baseline = match self.restore_baseline(rendered) {
+            Ok(b) => b,
+            Err(r) => return refuse(r),
+        };
+        // A removal has no representation to preserve; every other arm writes bytes over
+        // the user's file and must prove the round trip first (F2).
+        let removes = matches!(&baseline, Baseline::Absent)
+            || matches!(&baseline, Baseline::Empty if self.empty_baseline_means_absent());
+        if !removes && let Err(r) = self.round_trip_guard(rendered) {
+            return refuse(r);
+        }
+        let mut before = Self::second_cas(rendered, self.store, fault);
+        match &baseline {
+            Baseline::Absent => self.restore_write(&rendered.path, None, None, &mut before),
+            Baseline::Empty if self.empty_baseline_means_absent() => {
+                self.restore_write(&rendered.path, None, None, &mut before)
+            }
+            Baseline::Empty => self.restore_write(
+                &rendered.path,
+                Some(&[]),
+                rendered.baseline_mode,
+                &mut before,
+            ),
+            Baseline::Present { oid, mode } => {
+                let content = self.store.cat_blob(oid)?;
+                let bytes = if *mode == Mode::Symlink {
+                    // A symlink's blob *is* the link text; there is nothing to smudge, and
+                    // running it through `cat-file --filters` would be asking git to
+                    // convert a path name.
+                    content
+                } else {
+                    self.restore_bytes(&rendered.path, &content)?
+                };
+                self.restore_write(&rendered.path, Some(&bytes), Some(*mode), &mut before)
+            }
+        }
+    }
+
+    /// Restore a deleted file: put the baseline back where it was.
+    ///
+    /// The CAS here is "still absent", as `accept_deletion`'s is — but absent has to be
+    /// decided from the parent's `read_dir`, byte-for-byte and (on a case-folding root)
+    /// under case folding too. `exists`/`stat` would ask the filesystem, which folds; a
+    /// byte-only rule would call `f1` free while `F1` sits there, and the `rename` would
+    /// then fold onto `F1` and destroy the user's case-only rename (F6, D4).
+    pub fn restore_deletion(
+        &mut self,
+        rendered: &Rendered,
+        fault: &dyn FaultInjector,
+    ) -> Result<Outcome, OpsError> {
+        let refuse = |r: Refused| {
+            Ok(Outcome {
+                refused: vec![r],
+                ..Default::default()
+            })
+        };
+        if let Err(r) = self.restore_preflight(&rendered.path) {
+            return refuse(r);
+        }
+        let root = self.store.root().to_path_buf();
+        let case_insensitive = self.case_insensitive;
+        if let Some(other) = crate::restore::collision(&root, &rendered.path, case_insensitive) {
+            return refuse(Refused::StillPresent {
+                path: rendered.path.clone(),
+                collides_with: Some(other),
+            });
+        }
+        let baseline = match self.restore_baseline(rendered) {
+            Ok(b) => b,
+            Err(r) => return refuse(r),
+        };
+        // `rm -r dir` is the ordinary shape of a deletion, so the directory is often gone
+        // too. Rebuilt component by component under the same lstat rule as the preflight.
+        if let Err(e) = crate::restore::create_parents(&root, &rendered.path) {
+            return match e {
+                crate::restore::WriteError::Refuse(reason) => refuse(Refused::Unhashable {
+                    path: rendered.path.clone(),
+                    reason,
+                }),
+                crate::restore::WriteError::Moved => refuse(Refused::Moved {
+                    path: rendered.path.clone(),
+                    live: None,
+                }),
+                crate::restore::WriteError::Io { path, source } => OpsError::io(path, source),
+            };
+        }
+        let path = rendered.path.clone();
+        let mut before = move || {
+            fault.at(FaultPoint::AfterTempWrite);
+            if fault.fails_at(FaultPoint::AfterTempWrite) {
+                return Err(crate::restore::WriteError::Refuse("fault injected".into()));
+            }
+            match crate::restore::collision(&root, &path, case_insensitive) {
+                Some(_) => Err(crate::restore::WriteError::Refuse("appeared".into())),
+                None => Ok(()),
+            }
+        };
+        match &baseline {
+            // Nothing was there at the baseline and nothing is there now: the row is
+            // already at its baseline, and a restore that writes nothing is a success.
+            Baseline::Absent => Ok(Outcome::default()),
+            Baseline::Empty if self.empty_baseline_means_absent() => Ok(Outcome::default()),
+            Baseline::Empty => self.restore_write(
+                &rendered.path,
+                Some(&[]),
+                rendered.baseline_mode,
+                &mut before,
+            ),
+            Baseline::Present { oid, mode } => {
+                let content = self.store.cat_blob(oid)?;
+                let bytes = if *mode == Mode::Symlink {
+                    content
+                } else {
+                    self.restore_bytes(&rendered.path, &content)?
+                };
+                self.restore_write(&rendered.path, Some(&bytes), Some(*mode), &mut before)
+            }
+        }
+    }
+
     /// Accept everything in `snapshot` at its rendered content (A5), stamp `seen_at`
     /// with the current commit, and reseed the index.
     pub fn accept_all(
@@ -624,11 +1226,16 @@ impl Ops<'_> {
         Ok(())
     }
 
-    /// Set a flag on `path` (A8's Phase 2 slice). Never touches `blob`.
+    /// Append a flag to `path` (A8; Amendment v1.7). Never touches `blob`.
+    ///
+    /// Appends rather than replaces: a review raises several questions about one file, and
+    /// the second one must not silently eat the first. `hunk` carries the rendered hunk for
+    /// a per-hunk flag and is `None` for a file flag.
     pub fn flag(
         &mut self,
         path: &[u8],
         note: &str,
+        hunk: Option<FlagHunk>,
         fault: &dyn FaultInjector,
     ) -> Result<Outcome, OpsError> {
         let key = match Self::key(path) {
@@ -648,12 +1255,13 @@ impl Ops<'_> {
             .or_insert(Override {
                 blob: None,
                 mode: None,
-                flag: None,
+                flags: Vec::new(),
                 updated_at: now.clone(),
             });
-        entry.flag = Some(Flag {
+        entry.flags.push(Flag {
             note: note.to_owned(),
             created_at: now.clone(),
+            hunk,
         });
         entry.updated_at = now;
         let staged = entry.clone();
@@ -666,7 +1274,10 @@ impl Ops<'_> {
         })
     }
 
-    /// Clear the flag on `path`; an override left with nothing is removed.
+    /// Clear **every** flag on `path`; an override left with nothing is removed.
+    ///
+    /// All of them and not one: Phase 7's TUI has no per-flag removal, so "unflag" is the
+    /// undo for the whole path.
     pub fn unflag(&mut self, path: &[u8], fault: &dyn FaultInjector) -> Result<Outcome, OpsError> {
         let key = match Self::key(path) {
             Ok(k) => k,
@@ -680,7 +1291,7 @@ impl Ops<'_> {
         let Some(entry) = self.ledger.overrides.get_mut(&key) else {
             return Ok(Outcome::default());
         };
-        entry.flag = None;
+        entry.flags.clear();
         entry.updated_at = self.clock.now_iso8601();
         if entry.is_empty() {
             self.ledger.overrides.remove(&key);
@@ -737,11 +1348,11 @@ mod tests {
         assert!(a.ledger.overrides.is_empty());
         assert!(a.scan().pile.is_empty(), "f2's accept survived a's fold");
         // A flag set by one side survives an accept by the other.
-        assert!(b.ops().flag(b"f3", "look", &NoFault).unwrap().ok());
+        assert!(b.ops().flag(b"f3", "look", None, &NoFault).unwrap().ok());
         repo.write("f1", "one more\n");
         let r1 = rendered(&a, b"f1");
         assert!(a.ops().accept_file(&r1, &NoFault).unwrap().ok());
-        assert!(a.ledger.overrides["f3"].flag.is_some());
+        assert!(!a.ledger.overrides["f3"].flags.is_empty());
     }
 
     #[test]
@@ -997,7 +1608,7 @@ mod tests {
         repo.write("f3", "accepted\n");
         let r3 = rendered(&h, b"f3");
         h.ops().accept_file(&r3, &NoFault).unwrap();
-        h.ops().flag(b"f3", "keep me", &NoFault).unwrap();
+        h.ops().flag(b"f3", "keep me", None, &NoFault).unwrap();
         repo.write("f1", "one\n");
         repo.remove("f2");
         repo.write("new.txt", "n\n");
@@ -1024,7 +1635,7 @@ mod tests {
         assert_ne!(h.ledger.seen_tree.as_ref().unwrap(), &before_tree);
         assert_eq!(h.ledger.blob_override_count(), 0);
         let o = h.ledger.overrides.get("f3").unwrap();
-        assert_eq!(o.flag.as_ref().unwrap().note, "keep me");
+        assert_eq!(o.flags[0].note, "keep me");
         assert!(o.blob.is_none() && o.mode.is_none());
         let head = Oid::parse(repo.head().unwrap().trim()).unwrap();
         assert_eq!(h.ledger.seen_at.head_commit, Some(head));
@@ -1076,28 +1687,557 @@ mod tests {
         let repo = FixtureRepo::new("ops-flag").unwrap();
         let state = TempDir::new("lc-ops");
         let mut h = Harness::new(&repo, &state);
-        h.ops().flag(b"f1", "note", &NoFault).unwrap();
+        h.ops().flag(b"f1", "note", None, &NoFault).unwrap();
         let o = h.ledger.overrides.get("f1").unwrap();
         assert!(o.blob.is_none());
         assert!(h.scan().pile.is_empty(), "a flag alone is not pending");
         repo.write("f1", "x\n");
+        assert_eq!(h.scan().pile.row(b"f1").unwrap().flags[0].note, "note");
+        h.ops().unflag(b"f1", &NoFault).unwrap();
+        assert!(!h.ledger.overrides.contains_key("f1"));
+        let out = h.ops().unflag(b"nope", &NoFault).unwrap();
+        assert!(!out.written);
+        let out = h.ops().flag(b"bad\xff", "n", None, &NoFault).unwrap();
+        assert!(matches!(out.refused[0], Refused::NonUtf8Path { .. }));
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Restore (deliverable 1). The refusals come first, deliberately: every one of them is
+    // a case where lastcall must NOT have written the user's file, so each asserts the
+    // bytes on disk as well as the `Refused` variant.
+    // -----------------------------------------------------------------------------------
+
+    /// Fails softly at one point instead of killing the process, so a test can assert what
+    /// the unwind left behind (see [`FaultInjector::fails_at`]).
+    struct FailAt(FaultPoint);
+
+    impl FaultInjector for FailAt {
+        fn at(&self, _point: FaultPoint) {}
+        fn fails_at(&self, point: FaultPoint) -> bool {
+            point == self.0
+        }
+    }
+
+    /// Every restore temp file left anywhere under `dir`.
+    fn temp_ghosts(dir: &std::path::Path) -> Vec<String> {
+        let mut out = Vec::new();
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return out;
+        };
+        for e in entries.flatten() {
+            let name = e.file_name();
+            if name == ".git" {
+                continue;
+            }
+            if crate::restore::is_restore_temp(name.as_encoded_bytes()) {
+                out.push(name.to_string_lossy().into_owned());
+            }
+            if e.path().is_dir() {
+                out.extend(temp_ghosts(&e.path()));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn ops_restore_refuses_when_the_file_moved_and_leaves_it_untouched() {
+        let repo = FixtureRepo::new("ops-restore-moved").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        repo.write("f1", "rendered\n");
+        let r = rendered(&h, b"f1");
+        // The agent writes again between the render and the keystroke.
+        repo.write("f1", "moved on\n");
+        let out = h.ops().restore_file(&r, &NoFault).unwrap();
+        assert!(
+            matches!(out.refused.first(), Some(Refused::Moved { .. })),
+            "{out:?}"
+        );
+        assert!(!out.written, "a restore never writes the ledger");
+        assert_eq!(
+            std::fs::read(repo.path().join("f1")).unwrap(),
+            b"moved on\n",
+            "a refused restore leaves the working file exactly as it was"
+        );
+        assert!(temp_ghosts(repo.path()).is_empty());
+    }
+
+    #[test]
+    fn ops_restore_refuses_a_conflicted_path() {
+        let mut repo = FixtureRepo::new("ops-restore-conflict").unwrap();
+        repo.write("f1", "base\n");
+        repo.commit("base").unwrap();
+        repo.checkout_b("side").unwrap();
+        repo.write("f1", "side\n");
+        repo.commit("side").unwrap();
+        repo.checkout("main").unwrap();
+        repo.write("f1", "main\n");
+        repo.commit("main").unwrap();
+        // C4: git leaves the conflict in the index and the markers in the file.
+        let merged = repo.git(&["merge", "side"]);
+        assert!(merged.is_err(), "the merge must conflict: {merged:?}");
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        let row = h.scan().pile.row(b"f1").expect("f1 is pending").clone();
+        assert!(row.conflicted, "the row is conflicted");
+        let before = std::fs::read(repo.path().join("f1")).unwrap();
+        let r = Rendered::of(&row);
+        let out = h.ops().restore_file(&r, &NoFault).unwrap();
+        assert!(
+            matches!(out.refused.first(), Some(Refused::Conflicted { .. })),
+            "{out:?}"
+        );
+        assert_eq!(
+            std::fs::read(repo.path().join("f1")).unwrap(),
+            before,
+            "one side of an unresolved merge is never overwritten"
+        );
+    }
+
+    #[test]
+    fn ops_restore_refuses_a_symlinked_parent_directory() {
+        let mut repo = FixtureRepo::new("ops-restore-parent").unwrap();
+        repo.write("d/f1", "one\n");
+        repo.commit("dir").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        repo.write("d/f1", "two\n");
+        let r = rendered(&h, b"d/f1");
+        // The classic escape: swap the parent for a symlink after the render. `O_NOFOLLOW`
+        // on the leaf would not see this, and `hash_path`'s own `lstat` follows `d` — so
+        // the CAS would agree and the write would land through the link (F9).
+        std::fs::rename(repo.path().join("d"), repo.path().join("d_real")).unwrap();
+        std::os::unix::fs::symlink("d_real", repo.path().join("d")).unwrap();
+        let out = h.ops().restore_file(&r, &NoFault).unwrap();
+        match out.refused.first() {
+            Some(Refused::Unhashable { reason, .. }) => {
+                assert_eq!(reason, "parent is a symlink")
+            }
+            other => panic!("expected a parent-symlink refusal, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(repo.path().join("d_real/f1")).unwrap(),
+            b"two\n",
+            "nothing was written through the link"
+        );
+    }
+
+    #[test]
+    fn ops_restore_refuses_a_filtered_path() {
+        let mut repo = FixtureRepo::new("ops-restore-filter").unwrap();
+        repo.write(".gitattributes", "f1 filter=lfs\n");
+        repo.write("f1", "base\n");
+        repo.commit("attrs").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        repo.write("f1", "edited\n");
+        let r = rendered(&h, b"f1");
+        let out = h.ops().restore_file(&r, &NoFault).unwrap();
+        match out.refused.first() {
+            // The store's blobs are canonical (clean-filtered) content; without the
+            // driver, writing them back would put an LFS pointer where the user's binary
+            // was (F2). Refusing is the only honest answer.
+            Some(Refused::Unhashable { reason, .. }) => assert_eq!(reason, "filter=lfs"),
+            other => panic!("expected a filter refusal, got {other:?}"),
+        }
+        assert_eq!(std::fs::read(repo.path().join("f1")).unwrap(), b"edited\n");
+    }
+
+    /// A truncated hunk list is refused rather than written (verifier F3).
+    ///
+    /// The probe: a 3,000-line file whose first line and last 2,000 lines are edited. The
+    /// row collapses on size, `hunks::expand` truncates at `EXPAND_LINE_CAP`, and the list
+    /// that comes back describes only the first change. Both CASes pass — the file has not
+    /// moved — so "restore hunk 0" used to write `baseline ⊕ nothing` and take all 2,000
+    /// edits with it.
+    #[test]
+    fn ops_restore_hunk_refuses_a_truncated_hunk_list() {
+        let mut repo = FixtureRepo::new("ops-restore-truncated").unwrap();
+        let baseline: String = (0..3_000).map(|i| format!("line {i}\n")).collect();
+        repo.write("big.txt", &baseline);
+        repo.commit("big").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+
+        let mut lines: Vec<String> = (0..3_000).map(|i| format!("line {i}\n")).collect();
+        lines[0] = "EDIT 0\n".to_string();
+        for line in lines.iter_mut().take(3_000).skip(1_000) {
+            *line = line.replace("line", "EDIT");
+        }
+        let edited: String = lines.concat();
+        repo.write("big.txt", &edited);
+
+        let r = rendered(&h, b"big.txt");
+        let expanded = crate::hunks::expand(baseline.as_bytes(), edited.as_bytes());
+        assert!(
+            expanded.omitted_lines > 0,
+            "the fixture must actually overrun the cap"
+        );
+
+        let out = h
+            .ops()
+            .restore_hunk(&r, &expanded.hunks, 0, &NoFault)
+            .unwrap();
+        match out.refused.first() {
+            Some(rf @ Refused::Incomplete { .. }) => assert_eq!(
+                rf.message("restored"),
+                "big.txt: only part of the diff is loaded; not restored"
+            ),
+            other => panic!("expected an incompleteness refusal, got {other:?}"),
+        }
+
+        let after = std::fs::read(repo.path().join("big.txt")).unwrap();
+        assert_eq!(after, edited.as_bytes(), "the file is untouched");
+        assert_eq!(
+            after
+                .split(|b| *b == b'\n')
+                .filter(|l| l.starts_with(b"EDIT"))
+                .count(),
+            2_001,
+            "every edited line survives"
+        );
+    }
+
+    /// The round-trip guard (F2) refuses only the genuinely lossy case. A plain LF file
+    /// under the same bare `* text=auto` that refuses a CRLF file round-trips exactly —
+    /// clean to LF, smudge to LF — so it restores as it always did. Without this the guard
+    /// would be a blanket refusal of every `text=auto` repo, which is most of them.
+    #[test]
+    fn ops_restore_under_bare_text_auto_still_restores_a_plain_lf_file() {
+        let mut repo = FixtureRepo::new("ops-restore-lf").unwrap();
+        repo.write(".gitattributes", "* text=auto\n");
+        repo.write("lf.txt", "a\nb\nc\n");
+        repo.commit("attrs").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        repo.write("lf.txt", "a\nB\nc\n");
+        let r = rendered(&h, b"lf.txt");
+        let out = h.ops().restore_file(&r, &NoFault).unwrap();
+        assert!(out.ok(), "an LF file is round-trippable: {out:?}");
+        assert_eq!(
+            std::fs::read(repo.path().join("lf.txt")).unwrap(),
+            b"a\nb\nc\n",
+            "restored to the baseline, endings untouched"
+        );
+    }
+
+    #[test]
+    fn ops_restore_fault_after_the_temp_write_leaves_no_ghost_and_no_change() {
+        let repo = FixtureRepo::new("ops-restore-fault").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        let baseline = std::fs::read(repo.path().join("f1")).unwrap();
+        repo.write("f1", "edited\n");
+        let r = rendered(&h, b"f1");
+        let out = h
+            .ops()
+            .restore_file(&r, &FailAt(FaultPoint::AfterTempWrite))
+            .unwrap();
+        assert!(!out.ok(), "the fault aborts the restore: {out:?}");
+        assert_eq!(
+            std::fs::read(repo.path().join("f1")).unwrap(),
+            b"edited\n",
+            "the rename never happened"
+        );
+        assert!(
+            temp_ghosts(repo.path()).is_empty(),
+            "the temp file is removed on every error after it exists"
+        );
+        // And the same restore without the fault does land, so the failure was the fault
+        // and not the shape of the request.
+        let out = h.ops().restore_file(&r, &NoFault).unwrap();
+        assert!(out.ok(), "{out:?}");
+        assert_eq!(std::fs::read(repo.path().join("f1")).unwrap(), baseline);
+    }
+
+    /// The parent directory is swapped for a symlink while the temp file is on disk
+    /// (verifier F7, probe P2).
+    ///
+    /// Two things went wrong at once and each is fatal on its own. The second CAS only
+    /// hashed the *path*, and `hash_path` resolves through the new parent — so a decoy
+    /// directory holding the same bytes made the compare agree and the restore wrote the
+    /// baseline into a directory the user never pointed at. And the rename and the cleanup
+    /// unlink were both by path too, so they went to the decoy while the temp file stayed
+    /// behind in the real directory forever.
+    #[test]
+    fn ops_restore_parent_swapped_after_temp_write_is_moved_and_leaves_no_ghost() {
+        /// Swaps `d` for a symlink to a decoy with identical bytes, once, at the moment the
+        /// temp file exists and the rename has not happened.
+        struct SwapParent {
+            root: std::path::PathBuf,
+            live: Vec<u8>,
+            done: std::cell::Cell<bool>,
+        }
+
+        impl FaultInjector for SwapParent {
+            fn at(&self, point: FaultPoint) {
+                if point != FaultPoint::AfterTempWrite || self.done.replace(true) {
+                    return;
+                }
+                let d = self.root.join("d");
+                std::fs::rename(&d, self.root.join("d_real")).unwrap();
+                let decoy = self.root.join("d_decoy");
+                std::fs::create_dir(&decoy).unwrap();
+                // The same bytes and the same mode: the point is that the CAS *agrees*.
+                std::fs::write(decoy.join("f1"), &self.live).unwrap();
+                std::os::unix::fs::symlink("d_decoy", &d).unwrap();
+            }
+        }
+
+        let repo = FixtureRepo::new("ops-restore-swap").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        repo.write("d/f1", "base\n");
+        h.mark_seen();
+        repo.write("d/f1", "edited\n");
+        let r = rendered(&h, b"d/f1");
+        let swap = SwapParent {
+            root: repo.path().to_path_buf(),
+            live: b"edited\n".to_vec(),
+            done: std::cell::Cell::new(false),
+        };
+
+        let out = h.ops().restore_file(&r, &swap).unwrap();
+        assert!(swap.done.get(), "the swap must actually have fired");
+        assert!(!out.ok(), "a swapped parent is a refusal: {out:?}");
+        assert_eq!(
+            out.refused,
+            vec![Refused::Moved {
+                path: b"d/f1".to_vec(),
+                live: None
+            }],
+            "and the refusal is Moved, not an Io error"
+        );
+
+        // The directory that was verified is the one every step of the write acted in, so
+        // the temp file was unlinked from it — no ghost, and nothing else left behind.
+        let mut real: Vec<String> = std::fs::read_dir(repo.path().join("d_real"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        real.sort();
+        assert_eq!(real, vec!["f1".to_string()]);
+        assert_eq!(
+            std::fs::read(repo.path().join("d_real/f1")).unwrap(),
+            b"edited\n",
+            "the rename never happened"
+        );
+        assert_eq!(
+            std::fs::read(repo.path().join("d_decoy/f1")).unwrap(),
+            b"edited\n",
+            "and nothing was written through the symlink into the decoy"
+        );
+        assert!(temp_ghosts(repo.path()).is_empty());
+    }
+
+    #[test]
+    fn ops_restore_hunk_leaves_the_other_hunks_pending() {
+        let repo = FixtureRepo::new("ops-restore-hunk").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        let base: String = (0..30).map(|i| format!("line {i}\n")).collect();
+        repo.write("f1", &base);
+        h.mark_seen();
+        let edited = base
+            .replace("line 2\n", "LINE 2\n")
+            .replace("line 27\n", "LINE 27\n");
+        repo.write("f1", &edited);
+        let row = h.scan().pile.row(b"f1").unwrap().clone();
+        assert_eq!(row.hunks.len(), 2);
+        let r = Rendered::of(&row);
+        let out = h.ops().restore_hunk(&r, &row.hunks, 0, &NoFault).unwrap();
+        assert!(out.ok(), "{out:?}");
+        assert!(!out.written, "no ledger write");
+        // Exactly hunk 0 was undone: the file is the baseline with hunk 1 still applied.
+        assert_eq!(
+            std::fs::read(repo.path().join("f1")).unwrap(),
+            base.replace("line 27\n", "LINE 27\n").as_bytes(),
+        );
+        let after = h.scan().pile.row(b"f1").unwrap().clone();
+        assert_eq!(after.hunks.len(), 1, "the other hunk is still pending");
+        assert!(after.hunks[0].lines.iter().any(|(_, l)| l == b"LINE 27\n"));
+        assert!(temp_ghosts(repo.path()).is_empty());
+    }
+
+    #[test]
+    fn ops_restore_hunk_on_a_row_with_a_mode_hunk_writes_no_mode_bytes() {
+        let repo = FixtureRepo::new("ops-restore-hunk-mode").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        if !h.store.filemode() {
+            eprintln!("skipped: the root does not honour core.filemode");
+            return;
+        }
+        let base: String = (0..30).map(|i| format!("line {i}\n")).collect();
+        repo.write("f1", &base);
+        h.mark_seen();
+        let edited = base
+            .replace("line 2\n", "LINE 2\n")
+            .replace("line 27\n", "LINE 27\n");
+        repo.write("f1", &edited);
+        repo.chmod_x("f1", true);
+        let row = h.scan().pile.row(b"f1").unwrap().clone();
+        assert_eq!(row.hunks.len(), 3, "two content hunks and the mode hunk");
+        assert!(row.hunks[2].is_mode_change());
+        let r = Rendered::of(&row);
+        let out = h.ops().restore_hunk(&r, &row.hunks, 0, &NoFault).unwrap();
+        assert!(out.ok(), "{out:?}");
+        // F1: the mode hunk's literal `mode 100755` line must never reach `apply_hunks`,
+        // which would splice it in at offset 0.
+        assert_eq!(
+            std::fs::read(repo.path().join("f1")).unwrap(),
+            base.replace("line 27\n", "LINE 27\n").as_bytes(),
+        );
         assert_eq!(
             h.scan()
                 .pile
                 .row(b"f1")
                 .unwrap()
-                .flag
+                .current
                 .as_ref()
                 .unwrap()
-                .note,
-            "note"
+                .mode,
+            Mode::Executable,
+            "a content-hunk restore leaves the mode where the live file has it"
         );
-        h.ops().unflag(b"f1", &NoFault).unwrap();
-        assert!(!h.ledger.overrides.contains_key("f1"));
-        let out = h.ops().unflag(b"nope", &NoFault).unwrap();
-        assert!(!out.written);
-        let out = h.ops().flag(b"bad\xff", "n", &NoFault).unwrap();
-        assert!(matches!(out.refused[0], Refused::NonUtf8Path { .. }));
+    }
+
+    #[test]
+    fn ops_restore_mode_only_hunk_chmods_and_writes_no_bytes() {
+        let repo = FixtureRepo::new("ops-restore-mode").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        if !h.store.filemode() {
+            eprintln!("skipped: the root does not honour core.filemode");
+            return;
+        }
+        repo.chmod_x("f1", true);
+        let row = h.scan().pile.row(b"f1").unwrap().clone();
+        assert_eq!(row.hunks.len(), 1);
+        assert!(row.hunks[0].is_mode_change(), "D1: mode only");
+        let before = std::fs::read(repo.path().join("f1")).unwrap();
+        let r = Rendered::of(&row);
+        let out = h.ops().restore_hunk(&r, &row.hunks, 0, &NoFault).unwrap();
+        assert!(out.ok(), "{out:?}");
+        assert_eq!(
+            std::fs::read(repo.path().join("f1")).unwrap(),
+            before,
+            "a mode restore writes no bytes"
+        );
+        assert!(
+            h.scan().pile.is_empty(),
+            "the mode is back at the baseline, so nothing is pending"
+        );
+        assert!(
+            temp_ghosts(repo.path()).is_empty(),
+            "the mode path never makes a temp file at all"
+        );
+    }
+
+    #[test]
+    fn ops_restore_removes_an_added_file() {
+        let repo = FixtureRepo::new("ops-restore-added").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        repo.write("added", "new\n");
+        let row = h.scan().pile.row(b"added").unwrap().clone();
+        assert_eq!(row.change, Change::Added);
+        let r = Rendered::of(&row);
+        let out = h.ops().restore_file(&r, &NoFault).unwrap();
+        assert!(out.ok(), "{out:?}");
+        assert!(
+            !repo.path().join("added").exists(),
+            "a file that did not exist at the baseline is removed, not truncated"
+        );
+        assert!(h.scan().pile.is_empty());
+    }
+
+    /// The hunk route reaches the same place the file route does for an added file
+    /// (verifier F4). It used to write a zero-byte file and leave the row pending.
+    #[test]
+    fn ops_restore_hunk_on_an_added_file_removes_it() {
+        let repo = FixtureRepo::new("ops-restore-added-hunk").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        repo.write("added", "new\n");
+        let row = h.scan().pile.row(b"added").unwrap().clone();
+        assert_eq!(row.change, Change::Added);
+        assert_eq!(
+            row.hunks.len(),
+            1,
+            "the addition renders as one content hunk"
+        );
+        let r = Rendered::of(&row);
+        let out = h.ops().restore_hunk(&r, &row.hunks, 0, &NoFault).unwrap();
+        assert!(out.ok(), "{out:?}");
+        assert!(
+            !repo.path().join("added").exists(),
+            "the row's only content hunk is the file: restoring it removes the file"
+        );
+        assert!(h.scan().pile.is_empty(), "and the row is gone");
+    }
+
+    /// The neighbouring case that must NOT remove: a first-sight root, where every row is
+    /// "added" but nothing has a baseline to go back to (F17).
+    #[test]
+    fn ops_restore_hunk_at_first_sight_does_not_remove() {
+        let repo = FixtureRepo::new("ops-restore-added-hunk-fs").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        h.ledger.seen_tree = None;
+        repo.write("added", "new\n");
+        let row = h.scan().pile.row(b"added").unwrap().clone();
+        let r = Rendered::of(&row);
+        let out = h.ops().restore_hunk(&r, &row.hunks, 0, &NoFault).unwrap();
+        assert!(out.ok(), "{out:?}");
+        assert!(
+            repo.path().join("added").exists(),
+            "with no seen tree there is no baseline to go back to; the draft survives"
+        );
+    }
+
+    #[test]
+    fn ops_restore_at_first_sight_writes_a_zero_byte_file_and_never_removes() {
+        let repo = FixtureRepo::new("ops-restore-firstsight").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        // F17's case: a root with no seen tree at all (a draft root at
+        // `draft_initial = pending`). Every row is "added" there, but nothing has a
+        // baseline to go back to, so a restore must not destroy the user's file.
+        h.ledger.seen_tree = None;
+        h.tree_entries = TreeEntries::new();
+        repo.write("f1", "draft\n");
+        let r = rendered(&h, b"f1");
+        let out = h.ops().restore_file(&r, &NoFault).unwrap();
+        assert!(out.ok(), "{out:?}");
+        assert!(
+            repo.path().join("f1").exists(),
+            "F17: `Baseline::Empty` at first sight is never a removal"
+        );
+        assert_eq!(std::fs::read(repo.path().join("f1")).unwrap(), b"");
+    }
+
+    #[test]
+    fn ops_restore_deletion_recreates_a_missing_parent() {
+        let mut repo = FixtureRepo::new("ops-restore-mkparent").unwrap();
+        repo.write("d/sub/f1", "content\n");
+        repo.commit("nested").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        // `rm -r d` is the ordinary shape of this deletion, so the directories go too.
+        repo.remove("d/sub/f1");
+        std::fs::remove_dir(repo.path().join("d/sub")).unwrap();
+        std::fs::remove_dir(repo.path().join("d")).unwrap();
+        let row = h.scan().pile.row(b"d/sub/f1").unwrap().clone();
+        assert_eq!(row.change, Change::Deleted);
+        let r = Rendered::of(&row);
+        let out = h.ops().restore_deletion(&r, &NoFault).unwrap();
+        assert!(out.ok(), "{out:?}");
+        assert_eq!(
+            std::fs::read(repo.path().join("d/sub/f1")).unwrap(),
+            b"content\n"
+        );
+        assert!(h.scan().pile.is_empty());
     }
 
     /// Kickoff deliverable 8 (ii)/(iii): property tests over one draft root per test — a
@@ -1237,6 +2377,7 @@ mod tests {
                     tree: &mut self.tree,
                     clock: &self.clock,
                     compaction_threshold: 500,
+                    case_insensitive: false,
                     staged: BTreeMap::new(),
                     lock: DEFAULT_LOCK,
                 }

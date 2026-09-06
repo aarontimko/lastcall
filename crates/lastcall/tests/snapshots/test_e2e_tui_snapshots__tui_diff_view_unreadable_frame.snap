@@ -4,7 +4,7 @@ expression: frame
 ---
 "lastcall  3 repos · 5 files · 4 hunks  standalone  [Accept All]                           watching W"
 "┌──────────────────────────┬───────────────────────────────────────────────────────────────────────┐"
-"│alpha                     │f2  T  +0 −0                                            [A accept file]│"
+"│alpha                     │f2  T  +0 −0                           [A accept file] [U restore file]│"
 "│  main · 2 files          │f2: cannot hash (typechange: a directory where a file was); shown pendi│"
 "│  M f1  +1 −1             │                                                                       │"
 "│  T f2  +0 −0             │                                                                       │"

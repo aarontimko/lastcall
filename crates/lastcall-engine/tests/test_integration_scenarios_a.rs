@@ -4,7 +4,9 @@
 mod common;
 
 use common::Fresh;
+use lastcall_engine::engine::RestoreRequest;
 use lastcall_engine::git::Oid;
+use lastcall_engine::ledger::FlagHunk;
 use lastcall_engine::ops::{NoFault, Refused, Rendered};
 use lastcall_engine::scan::Change;
 use lastcall_testkit::assert_pile;
@@ -228,6 +230,105 @@ fn scenario_a7_accept_deletion_and_recreate() {
 }
 
 #[test]
+fn scenario_a7_restore_deletion_recreates_the_baseline_blob() {
+    let mut s = Fresh::new("a7-restore");
+    let baseline_bytes = s.bytes_at("f3");
+    s.repo.remove("f3");
+    let pile = assert_pile!(s.engine, s.root, "f3", "A7 deletion pending");
+    let row = pile.row(b"f3").unwrap();
+    assert_eq!(row.change, Change::Deleted);
+    let baseline_oid = row
+        .baseline
+        .as_ref()
+        .expect("a deletion has a baseline")
+        .oid
+        .clone();
+
+    let out = s.restore_file("f3");
+    assert!(out.outcome.ok(), "{:?}", out.outcome);
+    assert!(
+        !out.outcome.written,
+        "a restore never writes the ledger: the baseline stays where it was"
+    );
+    // Byte-identical to the baseline blob, and hash-compared: the file that comes back is
+    // the object the store still holds, not a re-render of it.
+    assert_eq!(s.bytes_at("f3"), baseline_bytes);
+    assert_eq!(
+        s.store().hash_bytes(&s.bytes_at("f3")).unwrap(),
+        baseline_oid,
+        "the recreated file hashes to the baseline blob"
+    );
+    assert_pile!(s.engine, s.root, "", "A7 restore clears the deletion row");
+    assert!(
+        !s.ledger().overrides.contains_key("f3"),
+        "no override was created by the restore"
+    );
+}
+
+/// Gate item 1, engine half: the mid-review mutation. An agent writes to the file between
+/// the frame the human is looking at and the key they press. The restore must refuse and
+/// leave the agent's bytes alone — the CAS is the whole guard, and this is the case it
+/// exists for.
+#[test]
+fn scenario_gate1_mid_review_mutation_refuses_the_restore_and_keeps_the_mutated_bytes() {
+    let mut s = Fresh::new("gate1");
+    s.repo
+        .write("f1", "A1\na2\na3\na4\na5\na6\na7\na8\na9\nA10\n");
+    // The frame the human is reading.
+    let row = s.row("f1");
+    assert_eq!(row.hunks.len(), 2);
+    let rendered = Rendered::of(&row);
+
+    // The agent writes again while they read it.
+    let mutated = b"A1\na2\na3\na4\na5\na6\na7\na8\na9\nA10\nAGENT WROTE THIS\n";
+    s.repo.write("f1", mutated);
+
+    let restored = s
+        .engine
+        .restore(
+            &s.root,
+            RestoreRequest::Hunk {
+                rendered,
+                hunks: row.hunks.clone(),
+                index: 0,
+            },
+        )
+        .expect("restore");
+    assert!(
+        matches!(&restored.outcome.refused[..], [Refused::Moved { path, .. }] if path == b"f1"),
+        "{:?}",
+        restored.outcome
+    );
+    assert_eq!(
+        s.bytes_at("f1"),
+        mutated,
+        "byte compare: the agent's write survived untouched"
+    );
+    assert!(!restored.outcome.written, "no ledger write");
+    // The pile that comes back is the rescan, so the human sees the new delta rather than
+    // the frame they acted on.
+    let after = restored.pile.row(b"f1").expect("f1 is still pending");
+    assert_eq!(after.hunks.len(), 2);
+    assert!(
+        after.hunks[1]
+            .lines
+            .iter()
+            .any(|(_, l)| l == b"AGENT WROTE THIS\n"),
+        "the returned pile shows the new delta: {:?}",
+        after.hunks
+    );
+    assert_eq!(
+        Refused::Moved {
+            path: b"f1".to_vec(),
+            live: None
+        }
+        .message("restored"),
+        "f1: changed since rendered; not restored",
+        "the wording the PTY half (deliverable 11) asserts on the status line"
+    );
+}
+
+#[test]
 fn scenario_a8_flag_with_note_retained_through_accept_all() {
     let mut s = Fresh::new("a8");
     s.repo
@@ -238,15 +339,16 @@ fn scenario_a8_flag_with_note_retained_through_accept_all() {
         .engine
         .ops(&s.root)
         .unwrap()
-        .flag(b"f1", "why is this unwrap safe?", &NoFault)
+        .flag(b"f1", "why is this unwrap safe?", None, &NoFault)
         .unwrap();
     assert!(out.ok());
     let pile = assert_pile!(s.engine, s.root, "f1");
     let row = pile.row(b"f1").unwrap();
     assert_eq!(
-        row.flag.as_ref().map(|f| f.note.as_str()),
+        row.flags.first().map(|f| f.note.as_str()),
         Some("why is this unwrap safe?")
     );
+    assert!(row.flags[0].hunk.is_none(), "a file flag carries no hunk");
     assert_eq!(row.baseline, before.baseline, "baseline unchanged");
     assert_eq!(row.hunks, before.hunks, "hunks unchanged");
     let over = &s.ledger().overrides["f1"];
@@ -260,7 +362,69 @@ fn scenario_a8_flag_with_note_retained_through_accept_all() {
         .expect("flag retained as flag-only");
     assert!(over.blob.is_none());
     assert_eq!(
-        over.flag.as_ref().map(|f| f.note.as_str()),
-        Some("why is this unwrap safe?")
+        over.flags
+            .iter()
+            .map(|f| f.note.as_str())
+            .collect::<Vec<_>>(),
+        vec!["why is this unwrap safe?"]
     );
+}
+
+/// A8, extended (Amendment v1.7): two **hunk** flags on one file are both retained through
+/// accept-all, oldest first, each with the hunk text as it was on screen.
+#[test]
+fn scenario_a8_two_hunk_flags_on_one_file_survive_accept_all() {
+    let mut s = Fresh::new("a8-hunks");
+    s.repo
+        .write("f1", "A1\na2\na3\na4\na5\na6\na7\na8\na9\nA10\n");
+    let pile = assert_pile!(s.engine, s.root, "f1");
+    let row = pile.row(b"f1").unwrap();
+    assert_eq!(row.hunks.len(), 2, "an edit at each end is two hunks");
+    let capture = |h: &lastcall_engine::hunks::Hunk| FlagHunk {
+        index: h.index,
+        header: format!(
+            "@@ -{},{} +{},{} @@",
+            h.old_range.start + 1,
+            h.old_range.len(),
+            h.new_range.start + 1,
+            h.new_range.len()
+        ),
+        text: String::from_utf8_lossy(
+            &h.lines
+                .iter()
+                .flat_map(|(_, l)| l.clone())
+                .collect::<Vec<u8>>(),
+        )
+        .into_owned(),
+    };
+    let (h0, h1) = (capture(&row.hunks[0]), capture(&row.hunks[1]));
+    for (note, hunk) in [("first line?", h0.clone()), ("last line?", h1.clone())] {
+        assert!(
+            s.engine
+                .ops(&s.root)
+                .unwrap()
+                .flag(b"f1", note, Some(hunk), &NoFault)
+                .unwrap()
+                .ok()
+        );
+    }
+    let pile = assert_pile!(s.engine, s.root, "f1");
+    let row = pile.row(b"f1").unwrap();
+    assert_eq!(
+        row.flags
+            .iter()
+            .map(|f| f.note.as_str())
+            .collect::<Vec<_>>(),
+        vec!["first line?", "last line?"],
+        "oldest first"
+    );
+    assert!(s.accept_all().ok());
+    assert_pile!(s.engine, s.root, "");
+    let over = s.ledger().overrides.get("f1").expect("flags retained");
+    assert!(over.blob.is_none(), "accept-all left a flag-only override");
+    assert_eq!(over.flags.len(), 2);
+    assert_eq!(over.flags[0].hunk.as_ref().unwrap(), &h0);
+    assert_eq!(over.flags[1].hunk.as_ref().unwrap(), &h1);
+    // The captured text is what was on screen, not a re-derivation from a moved file.
+    assert!(over.flags[0].hunk.as_ref().unwrap().text.contains("A1"));
 }

@@ -20,18 +20,22 @@
 //! the tty and nothing in the restore sequence wakes it, so it polls with a 50 ms timeout
 //! under a stop flag and exits on its own shortly after the loop ends.
 
+use std::collections::BTreeMap;
 use std::io;
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crossterm::event::{Event, MouseButton, MouseEvent, MouseEventKind};
-use lastcall_engine::engine::{AcceptRequest, Engine};
+use crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, Event, MouseButton, MouseEvent, MouseEventKind,
+};
+use lastcall_engine::engine::{AcceptRequest, Engine, RenderedHunk, RestoreRequest};
 use lastcall_engine::env::Env;
 use lastcall_engine::herdr::HerdrEvent;
-use lastcall_engine::herdr::client::ClientHandle;
+use lastcall_engine::herdr::client::{Cache, ClientHandle};
 use lastcall_engine::herdr::transport::SocketTransport;
 use lastcall_engine::hunks::Expanded;
 use lastcall_engine::scan::{Pile, Row};
@@ -40,9 +44,13 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 
-use super::app::{AcceptFailed, AcceptResult, App, Changed, Effect, RootMeta};
+use super::app::{
+    AcceptFailed, AcceptResult, App, Changed, Effect, FlagKind, FlagResult, RestoreResult, RootMeta,
+};
 use super::herdr::{self, HerdrLink, HerdrPlan, HerdrUpdate, Link, ToastMsg};
-use super::input::{Action, Key, Keymap, modal_action, pointer, to_action};
+use super::input::{
+    Action, Key, Keymap, modal_action, note_action, pick_action, pointer, to_action,
+};
 use super::render::{HitMap, Pane, render};
 use super::term;
 
@@ -65,6 +73,31 @@ pub enum Local {
     Pile(PathBuf, u64, Pile),
     /// An `Effect::Accept` finished: one result per root it covered.
     Accepted(Vec<(PathBuf, AcceptResult)>),
+    /// An `Effect::Restore` finished. Shaped like `Accepted` though a restore covers one
+    /// root, so the two reducers read the same way.
+    Restored(Vec<(PathBuf, RestoreResult)>),
+    /// An `Effect::Flag` or `Effect::Unflag` finished: the root it covered, **which of the
+    /// two it was** (with the flag's words), and the ledger write's answer. One root, never
+    /// a list — a flag is always one path.
+    ///
+    /// The kind is built from the effect that started this write rather than read off a
+    /// slot on `App`, so two writes in flight cannot be told apart wrongly (F2).
+    Flagged {
+        root: PathBuf,
+        kind: FlagKind,
+        result: FlagResult,
+    },
+    /// An `Effect::Stage` finished: the flag's words and whether `pane.send_text` landed.
+    Staged {
+        flag: String,
+        result: Result<(), String>,
+    },
+    /// An `Effect::Export` finished: the flag's words, and the file the export was appended
+    /// to or why not.
+    Exported {
+        label: String,
+        result: Result<PathBuf, String>,
+    },
     /// The engine's roots after a `SyncRoots`.
     Roots(Vec<RootMeta>),
     /// The `Refresh` finished (all its piles were sent first).
@@ -115,6 +148,39 @@ impl Ui {
         // default, everywhere — the help overlay lets `Quit` through the same way); every
         // other key is swallowed. `Esc` is the modal's cancel first, so it never quits.
         // Every non-key event but `Resize` is dropped before it can touch the app.
+        // The note modal is a text field: every printable key is content, so it is
+        // consulted *before* the keymap and swallows it whole — only the keymap's `quit`
+        // keys survive, and only in their non-printable form (`note_action`'s `quit_only`,
+        // so `q` types a q). `Event::Paste` is why bracketed paste is on while the modal
+        // lives: a pasted traceback arrives as one insert rather than a key storm.
+        if self.app.note.is_some() {
+            match event {
+                Event::Key(_) | Event::Paste(_) => {
+                    return match note_action(event, &self.keymap) {
+                        Some(action) => self.app.handle(action),
+                        None => (Changed::No, None),
+                    };
+                }
+                // A resize still reaches the app below (and invalidates the hit map); the
+                // mouse is dropped, so a click behind the modal cannot move the selection.
+                Event::Resize(..) => {}
+                _ => return (Changed::No, None),
+            }
+        }
+        // The picker is a list, not a field: arrows and `j`/`k` move, Enter sends, Esc
+        // cancels, the keymap's `quit` keys quit, everything else is swallowed.
+        if self.app.picker.is_some() {
+            match event {
+                Event::Key(_) => {
+                    return match pick_action(event, &self.keymap) {
+                        Some(action) => self.app.handle(action),
+                        None => (Changed::No, None),
+                    };
+                }
+                Event::Resize(..) => {}
+                _ => return (Changed::No, None),
+            }
+        }
         if self.app.confirm.is_some() {
             match event {
                 Event::Key(k) => {
@@ -170,6 +236,10 @@ impl Ui {
         match local {
             Local::Pile(root, seq, pile) => self.app.apply(EngineEvent::Pile { root, seq, pile }),
             Local::Accepted(results) => (self.app.accepted(results), None),
+            Local::Restored(results) => (self.app.restored(results), None),
+            Local::Flagged { root, kind, result } => self.app.flagged(root, kind, result),
+            Local::Staged { flag, result } => (self.app.staged(flag, result), None),
+            Local::Exported { label, result } => (self.app.exported(label, result), None),
             Local::Roots(metas) => (self.app.sync_roots(metas), None),
             Local::RefreshDone => (self.app.refresh_done(), None),
             Local::Notice(root, text) => self.app.apply(EngineEvent::Notice { root, text }),
@@ -498,6 +568,176 @@ fn spawn_accept(
     });
 }
 
+/// `Effect::Restore`: the working-tree write, off the UI task, in one `blocking` closure so
+/// the op and its rescan are one critical section — the same shape as `spawn_accept`, and
+/// the only place in the TUI that reaches `Engine::restore`.
+fn spawn_restore(
+    engine: &Arc<Mutex<Engine>>,
+    tx: mpsc::UnboundedSender<Local>,
+    reqs: Vec<(PathBuf, RestoreRequest)>,
+) {
+    let engine = engine.clone();
+    tokio::spawn(async move {
+        let restore = tokio::spawn(async move {
+            blocking(&engine, move |e| {
+                reqs.into_iter()
+                    .map(|(root, req)| {
+                        let result = e.restore(&root, req).map_err(|e| AcceptFailed::of(&e));
+                        (root, result)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+        });
+        if let Some(results) = joined(restore, &tx, "restore").await {
+            let _ = tx.send(Local::Restored(results));
+        }
+    });
+}
+
+/// `Effect::Flag`: the ledger write and its rescan in one `blocking` closure, the same
+/// shape as `spawn_accept`. The engine renders the export (only it has the flag's
+/// `created_at`), so the answer carries the paste-ready text the send will use.
+///
+/// Public for the same reason [`herdr_fold`] is: `tests/test_integration_loop_flag_stage.rs`
+/// drives the loop's own dispatch rather than a hand-written stand-in for it.
+pub fn spawn_flag(
+    engine: &Arc<Mutex<Engine>>,
+    tx: mpsc::UnboundedSender<Local>,
+    root: PathBuf,
+    path: Vec<u8>,
+    note: String,
+    hunk: Option<RenderedHunk>,
+    label: String,
+) {
+    let engine = engine.clone();
+    let back = root.clone();
+    tokio::spawn(async move {
+        let task = tokio::spawn(async move {
+            blocking(&engine, move |e| {
+                e.flag(&root, &path, &note, hunk)
+                    .map_err(|e| AcceptFailed::of(&e))
+            })
+            .await
+        });
+        if let Some(result) = joined(task, &tx, "flag").await {
+            let _ = tx.send(Local::Flagged {
+                root: back,
+                kind: FlagKind::Flag { label },
+                result,
+            });
+        }
+    });
+}
+
+/// `Effect::Unflag`: [`Engine::unflag`] under the same lock discipline. Its answer is a
+/// `Local::Flagged` too — an unflag is a flag write with an empty export — carrying
+/// [`FlagKind::Unflag`] so the reducer reads it as one however it is interleaved (F2).
+fn spawn_unflag(
+    engine: &Arc<Mutex<Engine>>,
+    tx: mpsc::UnboundedSender<Local>,
+    root: PathBuf,
+    path: Vec<u8>,
+) {
+    let engine = engine.clone();
+    let back = root.clone();
+    tokio::spawn(async move {
+        let task = tokio::spawn(async move {
+            blocking(&engine, move |e| {
+                e.unflag(&root, &path).map_err(|e| AcceptFailed::of(&e))
+            })
+            .await
+        });
+        if let Some(result) = joined(task, &tx, "unflag").await {
+            let _ = tx.send(Local::Flagged {
+                root: back,
+                kind: FlagKind::Unflag,
+                result,
+            });
+        }
+    });
+}
+
+/// `Effect::Stage`: `pane.send_text` the export into one agent pane, bracketed-paste
+/// wrapped by [`herdr::stage`] so it lands unsubmitted. No link means no send: the flag is
+/// already on disk, and `App::staged` says so.
+///
+/// Public for the same reason [`herdr_fold`] is: `tests/test_integration_loop_flag_stage.rs`
+/// drives the loop's own dispatch rather than a hand-written stand-in for it.
+pub fn spawn_stage(
+    transport: Option<SocketTransport>,
+    tx: mpsc::UnboundedSender<Local>,
+    pane_id: String,
+    flag: String,
+    export: String,
+) {
+    tokio::spawn(async move {
+        let result = match transport {
+            Some(t) => herdr::stage(&t, &pane_id, &export).await,
+            None => Err("no herdr link".to_owned()),
+        };
+        let _ = tx.send(Local::Staged { flag, result });
+    });
+}
+
+/// `Effect::Export`: append the export to `<state_dir>/exports/<root basename>/<date>.md`.
+///
+/// The one file the TUI writes, and the only writer of it — no worktree file is ever opened
+/// for writing here. Append, never truncate: a day's flags on one root accumulate in one
+/// file, each separated by a blank line, so the fallback reads as a log rather than as the
+/// last thing that happened.
+fn spawn_export(
+    tx: mpsc::UnboundedSender<Local>,
+    state_dir: PathBuf,
+    date: String,
+    root: PathBuf,
+    label: String,
+    export: String,
+) {
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            let dir = state_dir.join("exports").join(export_dir_name(&root));
+            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            let path = dir.join(format!("{date}.md"));
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .map_err(|e| e.to_string())?;
+            let mut body = export;
+            if !body.ends_with('\n') {
+                body.push('\n');
+            }
+            body.push('\n');
+            f.write_all(body.as_bytes()).map_err(|e| e.to_string())?;
+            Ok(path)
+        })
+        .await;
+        let result = match result {
+            Ok(r) => r,
+            Err(e) => Err(e.to_string()),
+        };
+        let _ = tx.send(Local::Exported { label, result });
+    });
+}
+
+/// The export file's directory name: the root's basename, or `root` for a filesystem root
+/// with none. A basename that is not UTF-8 is `to_string_lossy`'d rather than refused — the
+/// name is a label for a human, not a key.
+/// The export file's date stamp: the engine's own clock, ISO-8601, cut at the day. Reading
+/// it from the engine's clock rather than `SystemTime::now()` is what lets a test with a
+/// `FixedClock` name the file it expects.
+fn export_date(clock: &Arc<dyn lastcall_engine::ledger::Clock + Send + Sync>) -> String {
+    clock.now_iso8601().chars().take(10).collect()
+}
+
+fn export_dir_name(root: &std::path::Path) -> String {
+    match root.file_name() {
+        Some(name) => name.to_string_lossy().into_owned(),
+        None => "root".to_owned(),
+    }
+}
+
 /// `Effect::Expand`: one collapsed row's hunks off the UI task (deliverable 4). The row
 /// travels with the request, so the diff is computed from the oids the screen was showing;
 /// a failure is a notice, never a fatal — the row is still there to accept whole.
@@ -632,15 +872,44 @@ fn herdr_rederive(ui: &mut Ui, link: &Herdr) -> (Changed, Option<Effect>) {
     let Some(cache) = link.handle.as_ref().and_then(ClientHandle::snapshot) else {
         return (Changed::No, None);
     };
+    herdr_fold(ui, &cache, link.workspace_id.as_deref())
+}
+
+/// The socket-free half of [`herdr_rederive`]: one snapshot in, three folds out. Split out
+/// and public so a test can drive it — a `ClientHandle` only exists behind a live client,
+/// and the loop is exactly where verifier (b) F1 found the missing emitter
+/// (`tests/test_integration_loop_flag_stage.rs` takes a real client's snapshot through it).
+///
+/// **Three** updates, not two: the rollup (`Roots`) answers "how is this root doing?" and
+/// the candidate map (`Agents`) answers "which agent could take this export?". Nothing else
+/// builds `HerdrUpdate::Agents`, so leaving it out left `HerdrView::candidates` empty
+/// forever and every flag fell through to the export file — the staged send and the picker
+/// were dead code in the built binary. Re-derived on every snapshot, exactly like the
+/// rollup, so a pane that appears or goes away moves both.
+///
+/// `agents_for(.., None)` walks **every** workspace: the `w` scope narrowing belongs to
+/// `HerdrView::candidates`, which already applies it to whatever this map holds.
+pub fn herdr_fold(
+    ui: &mut Ui,
+    cache: &Cache,
+    workspace_id: Option<&str>,
+) -> (Changed, Option<Effect>) {
     let metas: Vec<RootMeta> = ui.app.roots.values().map(|v| v.meta.clone()).collect();
-    let scope = link
-        .workspace_id
-        .as_deref()
-        .and_then(|id| herdr::derive_scope(&cache, &metas, id));
-    let roots = herdr::derive(&cache, &metas);
+    let scope = workspace_id.and_then(|id| herdr::derive_scope(cache, &metas, id));
+    let roots = herdr::derive(cache, &metas);
+    let agents: BTreeMap<PathBuf, Vec<herdr::AgentCandidate>> = metas
+        .iter()
+        .map(|m| {
+            (
+                m.path.clone(),
+                herdr::agents_for(cache, &metas, &m.path, None),
+            )
+        })
+        .collect();
     let (c1, _) = ui.app.handle(Action::Herdr(HerdrUpdate::Scope(scope)));
     let (c2, effect) = ui.app.handle(Action::Herdr(HerdrUpdate::Roots(roots)));
-    (c1.or(c2), effect)
+    let (c3, _) = ui.app.handle(Action::Herdr(HerdrUpdate::Agents(agents)));
+    (c1.or(c2).or(c3), effect)
 }
 
 /// `Effect::Focus`: `agent.focus` off the UI task; the verdict comes back as
@@ -744,6 +1013,11 @@ pub fn run(
     let stop = spawn_input(input_tx)?;
     let (local_tx, mut local_rx) = mpsc::unbounded_channel::<Local>();
 
+    // Copied out before the engine is moved into its watcher: both are immutable for the
+    // life of the process, and the export path is resolved without taking the engine lock.
+    let state_dir = engine.layout().state_dir().to_path_buf();
+    let clock = engine.options().clock.clone();
+
     let mut link = Herdr::default();
     let (outcome, watcher) = runtime.block_on(async {
         let mut watcher = engine.run(timings);
@@ -780,6 +1054,11 @@ pub fn run(
             // A press the previous pass refused to fold (see [`drain`]): folded here,
             // after that pass drew, so it resolves against the frame the user saw.
             let mut held: Option<Event> = None;
+            // Bracketed paste is on only while the note modal lives. It is a terminal mode,
+            // not an app mode, so it is toggled here rather than through an `Effect`: the
+            // modal can close by sending, by cancelling or by quitting, and one comparison
+            // after every pass covers all three without a variant per exit.
+            let mut paste_on = false;
             loop {
                 // Copied out so the timer future borrows nothing a handler assigns to.
                 let due = worktree_due;
@@ -902,6 +1181,50 @@ pub fn run(
                         Effect::Accept(reqs) => {
                             spawn_accept(&watcher.engine, local_tx.clone(), reqs)
                         }
+                        Effect::Restore(reqs) => {
+                            spawn_restore(&watcher.engine, local_tx.clone(), reqs)
+                        }
+                        Effect::Flag {
+                            root,
+                            path,
+                            note,
+                            hunk,
+                            label,
+                        } => spawn_flag(
+                            &watcher.engine,
+                            local_tx.clone(),
+                            root,
+                            path,
+                            note,
+                            hunk,
+                            label,
+                        ),
+                        Effect::Unflag { root, path } => {
+                            spawn_unflag(&watcher.engine, local_tx.clone(), root, path)
+                        }
+                        Effect::Stage {
+                            pane_id,
+                            flag,
+                            export,
+                        } => spawn_stage(
+                            link.transport.clone(),
+                            local_tx.clone(),
+                            pane_id,
+                            flag,
+                            export,
+                        ),
+                        Effect::Export {
+                            root,
+                            label,
+                            export,
+                        } => spawn_export(
+                            local_tx.clone(),
+                            state_dir.clone(),
+                            export_date(&clock),
+                            root,
+                            label,
+                            export,
+                        ),
                         Effect::Expand(root, row) => {
                             spawn_expand(&watcher.engine, local_tx.clone(), root, row)
                         }
@@ -935,6 +1258,17 @@ pub fn run(
                         break;
                     }
                     None => {}
+                }
+                if ui.app.note.is_some() != paste_on {
+                    paste_on = ui.app.note.is_some();
+                    // Before the draw, so the frame that first shows the modal is already
+                    // able to receive a paste. A terminal that does not support the mode
+                    // ignores the sequence; a write that fails is not worth ending on.
+                    let _ = if paste_on {
+                        crossterm::execute!(io::stdout(), EnableBracketedPaste)
+                    } else {
+                        crossterm::execute!(io::stdout(), DisableBracketedPaste)
+                    };
                 }
                 if pass.changed == Changed::Yes {
                     // Deliverable 8: one line per repaint, saying why and how long. A
@@ -1303,6 +1637,49 @@ mod tests {
             left += 1;
         }
         assert_eq!(left, 8);
+    }
+
+    /// Verifier (b) F1: the loop's fold of one herdr snapshot has to emit the **candidate
+    /// map** as well as the rollup, or `HerdrView::candidates` is empty forever and the
+    /// staged send and the picker are unreachable in the built binary — every flag falls
+    /// through to the export file whatever herdr shows.
+    ///
+    /// One agent pane under `/W/alpha` and one under `/W/beta`: after the fold each root
+    /// has exactly its own candidate, which is the input `App::flagged`'s `1 =>` arm reads.
+    #[test]
+    fn run_drain_rederive_sends_the_agent_candidates_beside_the_roots() {
+        use crate::tui::herdr::testfix::{cache, pane};
+
+        let mut ui = ui();
+        assert!(
+            ui.app.herdr.candidates(&root("alpha")).is_empty(),
+            "no snapshot has been folded yet"
+        );
+
+        let snapshot = cache(vec![
+            pane("p-alpha", "ws1", "/W/alpha", Some("claude"), "working"),
+            pane("p-beta", "ws1", "/W/beta", Some("claude"), "idle"),
+            // Not agent-bearing: a plain shell in the same root is not a send target.
+            pane("p-shell", "ws1", "/W/alpha", None, "unknown"),
+        ]);
+        let (changed, _) = herdr_fold(&mut ui, &snapshot, None);
+        assert_eq!(changed, Changed::Yes);
+
+        assert_eq!(ui.app.herdr.candidates(&root("alpha")).len(), 1);
+        assert_eq!(
+            ui.app.herdr.candidates(&root("alpha"))[0].pane_id,
+            "p-alpha"
+        );
+        assert_eq!(ui.app.herdr.candidates(&root("beta")).len(), 1);
+        // A root with no agent under it gets an entry, and it is empty — the export-file
+        // fallback, which is what the `0 =>` arm is for.
+        assert!(ui.app.herdr.candidates(&root("notes")).is_empty());
+
+        // The map re-derives on every snapshot, like the rollup: the pane goes away and so
+        // does the candidate.
+        let (changed, _) = herdr_fold(&mut ui, &cache(vec![]), None);
+        assert_eq!(changed, Changed::Yes);
+        assert!(ui.app.herdr.candidates(&root("alpha")).is_empty());
     }
 
     /// The §11 hardening, at the loop's level: a watcher pile carrying a seq below the one

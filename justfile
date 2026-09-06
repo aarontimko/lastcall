@@ -34,6 +34,12 @@ lint:
     cargo fmt --all --check
     cargo clippy --workspace --all-targets -- -D warnings
     cargo check -p lastcall-engine --no-default-features
+    # Safe wrappers only: `nix`, never a direct `libc` call or dependency. A raw
+    # `libc::open` would be `unsafe`, and `unsafe_code = "forbid"` is workspace-wide —
+    # this grep catches the dependency edge before someone reaches for the escape hatch
+    # (docs/spec/96-phase7-kickoff.md, design review F3).
+    ! grep -rn --include='*.rs' 'libc::' crates
+    ! grep -rn --include='Cargo.toml' '^libc' crates
 
 # The canonical unit suite: in-module #[cfg(test)] only. Deterministic, no network, no
 # sockets except the in-test mock, no git repos except temp fixtures.
@@ -74,6 +80,15 @@ test-scenarios:
 # Rewrite crates/lastcall/tests/golden/status_multi_repo.json from the built binary.
 golden-update:
     LASTCALL_UPDATE_GOLDEN=1 cargo test -p lastcall --test test_integration_status_golden
+
+# Rewrite the flag-export goldens (crates/lastcall/tests/golden/flag_export*.md), then
+# prove they pass. `flag_export.md` is written by an engine unit test with a FixedClock
+# (the binary has no clock override); `flag_export_pty.md` by the TUI's PTY scene.
+flag-export-golden:
+    LASTCALL_UPDATE_GOLDEN=1 cargo test -p lastcall-engine --lib flags::tests::flags_export_matches_the_golden
+    cargo test -p lastcall-engine --lib flags::
+    LASTCALL_UPDATE_GOLDEN=1 cargo test -p lastcall --test test_e2e_tui_pty -- pty_flag_note_exports_when_standalone
+    cargo test -p lastcall --test test_e2e_tui_pty -- pty_flag_note_exports_when_standalone
 
 # Rewrite the Phase 3 TUI snapshots (crates/lastcall/tests/snapshots/), then prove they pass.
 snapshots-update:

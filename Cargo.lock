@@ -873,6 +873,7 @@ version = "0.1.0"
 dependencies = [
  "globset",
  "lastcall-testkit",
+ "nix 0.31.3",
  "notify",
  "proptest",
  "serde",
