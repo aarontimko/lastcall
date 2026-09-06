@@ -993,8 +993,12 @@ fn render_main(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
 /// not what is on screen, and that is worth more than one line of status.
 fn render_editor_header(ed: &Editor, buf: &mut Buffer, area: Rect) {
     // The keys live in the hint line, where every other key hint in the TUI lives; the
-    // header is the answer to "what am I in, and where in it?" and stays short enough to
-    // survive a narrow frame without ellipsizing the line number away.
+    // header is the answer to "what am I in, and where in it?" — short enough that at the
+    // 60-column floor the fixture's paths keep the whole line. Past that `ellipsize` cuts
+    // from the **tail**, so a long enough path costs the `· unsaved` and then the
+    // `line N/M` — the wrong end to lose, since the position is the part that changes as
+    // you type. A head-ellipsis of the path would be strictly better and is the header's
+    // entry for the design pass (verifier (b) on decision 10); `tui.md` records it too.
     let text = format!(
         "editing {} · {}{}",
         String::from_utf8_lossy(&ed.rendered.path),
