@@ -192,6 +192,27 @@ numbers only once a load has run longer than a second. The rules as built (`App:
   (`wait_first_piles`); `watch --json` prints the tick as
   `{"event":"scanned","root":…,"rows":N}` and is otherwise unchanged.
 
+**Seeing the hold slowly.** On a developer's checkout the hold is over in a second or two
+and the counter never shows; the design is for the user with hundreds of repos or a slow
+disk, and the way to look at it as they will is `just probe-tui-slow`, or
+`PATH=$PWD/scripts/slowgit:$PATH SLOWGIT_SLOW_REPO=<name> lastcall` over any parent dir.
+`scripts/slowgit/git` is a `git` that sleeps before the two subcommands only the scan runs
+(`diff-files`, `ls-files` — `SLOWGIT_MS` per call, default 800 ms, four calls per root)
+and then execs the real one, so discovery still runs at full speed and only the
+"checking status" phase stretches; one root named by `SLOWGIT_SLOW_REPO` gets
+`SLOWGIT_SLOW_MS` (default 2,500 ms) per call and is the last without its ✓. The sponsor
+approved the hold on exactly this view (§10 2026-09-07 (v)): a 20-root workspace held for
+~11 s with the counter ticking, the ✓s filling in, and the slow repo visibly the one
+holding things up. Any UX change to the hold should be looked at both ways — fast, where
+the rule is "one calm frame, no digits", and slow, where the rule is "you can see who is
+holding things up". The first thing the slow view found was a launch race the fast view
+had always hidden: `run::run` read the root list through the engine lock *after*
+`engine.run`, and the watcher's initial `scan_all` takes that lock the moment it starts,
+so whichever got there first won — on a fast checkout the TUI, on the stretched scan the
+watcher, and the `discovering roots…` line then stood for the whole scan with no hold at
+all. The roots are now read while the engine is still owned, before the watcher exists
+(`root_metas(&engine)`), so the first frame never waits on a scan.
+
 **One known cost sits in front of all of that.** `term::enter()` asks the terminal whether it
 speaks the kitty keyboard protocol (`CSI ? u`, then `CSI c`) before the input thread starts,
 and a terminal that answers neither costs crossterm's full **2 s timeout** — once per

@@ -245,6 +245,24 @@ that uses it — one `shift-i` on `alpha/src/parse.rs`'s second hunk, asserting 
 integration tier because it is the argv proof, not the terminal-handover proof; the PTY
 scenes are the latter.
 
+### The slow git (`scripts/slowgit/git`)
+
+Not a test fixture but a viewing aid, kept beside the probe editor here because it is the
+same idea — a stand-in program driven by the environment. The engine spawns `git` through
+`PATH` (`git::base_command`), so a `git` placed first on `PATH` that sleeps and then execs
+the real one stretches the scans without touching the code or the build. It sleeps only
+before `diff-files` and `ls-files`, the two subcommands the scan runs and discovery does
+not (the split was measured by logging every call of a launch: discovery is `rev-parse`,
+`config`, `symbolic-ref`, `cat-file --batch-check`, `ls-tree`), so the
+`lastcall: discovering roots…` line and the first frame arrive as fast as ever and only
+the launch hold — `discovered N roots, checking status…`, then the counter and the ✓s —
+is prolonged. `just probe-tui-slow` runs `probe-tui` under it with `alpha` as the slow
+root; `SLOWGIT_MS`, `SLOWGIT_SLOW_REPO`, `SLOWGIT_SLOW_MS` tune it. Use it whenever a
+change touches what the screen shows *while* it is waiting — the fast path hides all of
+that — and when checking a UI on hardware slower than the machine it was built on.
+**No test uses it**: the harness never touches `PATH`, and a scene that needs a slow scan
+gets it from fixture size, not from a sleeping `git`.
+
 ### `LASTCALL_KEYBOARD=plain` in the harness
 
 `isolated_lastcall` also sets `LASTCALL_KEYBOARD=plain`. The harness answers no terminal

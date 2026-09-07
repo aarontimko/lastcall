@@ -386,6 +386,20 @@ probe-tui-screen:
     LASTCALL_PROBE_BIN="$PWD/target/release/lastcall" \
         cargo test -p lastcall --test test_e2e_tui_pty probe_tui_screen -- --ignored --nocapture
 
+# `probe-tui` with the scans stretched: scripts/slowgit/git goes first on PATH and sleeps
+# before the scan-only git calls (SLOWGIT_MS per call, default 800; four per root), with
+# one root slower (SLOWGIT_SLOW_REPO, default alpha; SLOWGIT_SLOW_MS per call, default
+# 2500) — the launch hold's counter and per-root ✓ marks, as a user with hundreds of repos
+# or a slow disk would see them (docs/dev/tui.md "Seeing the hold slowly"). Discovery,
+# before the screen opens, runs at full speed. `r` (refresh) is stretched the same way.
+probe-tui-slow:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export PATH="$PWD/scripts/slowgit:$PATH"
+    export SLOWGIT_SLOW_REPO="${SLOWGIT_SLOW_REPO:-alpha}"
+    echo "--- slow git on PATH: SLOWGIT_MS=${SLOWGIT_MS:-800} per scan call, ${SLOWGIT_SLOW_REPO} at SLOWGIT_SLOW_MS=${SLOWGIT_SLOW_MS:-2500} ---"
+    just probe-tui
+
 # The performance baseline (docs/dev/bench.md; not a gate): the four scenarios of
 # crates/lastcall/tests/test_bench.rs — 100 clones / 4,000 rows, one 100,000-line diff, a
 # 1,000-file burst under watch, a 50,000-file drop against the row cap — on the RELEASE

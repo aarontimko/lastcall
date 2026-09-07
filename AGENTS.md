@@ -21,6 +21,7 @@ just test-scenarios         # the docs/spec/01-scenarios.md suites (real git, te
 just probe-status           # release binary: status + status --json over a three-root fixture
 just probe-tui              # release binary: the interactive TUI over the same fixture (--poll 1)
 just probe-tui-screen       # the PTY harness's transcript of the live-update demo (3 s)
+just probe-tui-slow         # probe-tui with the scans stretched (scripts/slowgit): the launch hold at scale
 just bench                  # the performance baseline on the release build (docs/dev/bench.md; ~4 min; not a gate)
 just snapshots-update       # rewrite the TUI snapshots, then prove they pass; read every diff
 just test-prepush           # what the pre-push hook runs: integration tier + 64-case proptests

@@ -1,0 +1,39 @@
+#!/bin/sh
+# A slow `git` for looking at lastcall's launch hold the way a user with hundreds of
+# repos, or a slow disk, sees it: sleeps before the git calls that only the *scan* makes
+# (`diff-files`, `ls-files`), then execs the real git — so root discovery (before the
+# screen opens) runs at full speed and only the "checking status" phase is stretched.
+# Put this directory first on PATH; `just probe-tui-slow` does. Docs: docs/dev/tui.md
+# "Seeing the hold slowly" and docs/dev/testing.md "The slow git".
+#   SLOWGIT_MS        delay per scan call, milliseconds (default 800; four calls per root)
+#   SLOWGIT_SLOW_REPO substring of a repo path that gets SLOWGIT_SLOW_MS instead
+#   SLOWGIT_SLOW_MS   delay per scan call inside that repo (default 2500)
+self_dir=$(cd "$(dirname "$0")" && pwd)
+sub=""
+skip=0
+for a in "$@"; do
+  if [ "$skip" = 1 ]; then skip=0; continue; fi
+  case "$a" in
+    -c) skip=1 ;;
+    -*) ;;
+    *) sub=$a; break ;;
+  esac
+done
+case "$sub" in
+  diff-files|ls-files)
+    ms=${SLOWGIT_MS:-800}
+    case "$PWD" in
+      *"${SLOWGIT_SLOW_REPO:-/nonexistent-slow-repo/}"*) ms=${SLOWGIT_SLOW_MS:-2500} ;;
+    esac
+    sleep "$(awk "BEGIN { print $ms / 1000 }")"
+    ;;
+esac
+real=""
+old_ifs=$IFS; IFS=:
+for dir in $PATH; do
+  [ "$dir" = "$self_dir" ] && continue
+  if [ -x "$dir/git" ]; then real="$dir/git"; break; fi
+done
+IFS=$old_ifs
+[ -n "$real" ] || { echo "slowgit: no real git on PATH" >&2; exit 127; }
+exec "$real" "$@"
