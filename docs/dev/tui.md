@@ -146,11 +146,51 @@ screen to draw into, so `commands/tui.rs` prints one line to **stderr** first �
 happy path, it scrolls away with the shell's scrollback when the alternate screen opens,
 and the PTY harness pins the order: the line, then `\x1b[?1049h`, then `scanning N roots…`
 (`wait_first_piles`). Then `run::run` builds the runtime as
-`watch` does, enters the terminal, seeds the app with the engine's roots (`sync_roots`) and
-the status `scanning N roots…`, and draws the empty state — the first piles arrive through
-the watcher a moment later (about 1.6 s on the fixture under the PTY harness). `--poll N`
+`watch` does, enters the terminal, seeds the app with the engine's roots (`sync_roots`),
+starts the **launch hold** (`App::start_loading`) and the status `scanning N roots…`, and
+draws the hold's pane — the first piles arrive through the watcher a moment later (about
+1.6 s on the fixture under the PTY harness), and the listing lands as one frame when the
+last root has reported. `--poll N`
 shortens the HEAD-poll and rescan backstops exactly as for `watch` (`just probe-tui` uses
 `--poll 1`, the deterministic setting on a host whose FSEvents are unreliable).
+
+#### The launch hold (Gate 8 sponsor run, 2026-09-07)
+
+The engine's initial pass used to scan the first root on its own so its pile reached the
+screen early (Phase 5 deliverable 1b); the sponsor's recording showed the cost — one repo
+listed for ~100 ms as if it were the only one with changes, then the full list — and ruled
+it out: "discovered N roots, checking status…" and nothing listed until every root has
+reported, with per-repo progress so one huge repo holding things up is visible, and
+numbers only once a load has run longer than a second. The rules as built (`App::Loading`,
+`render_main`'s `None` arm, `Loading::COUNTER_AFTER` = 1 s):
+
+- **From `sync_roots` until every root has reported, `App::is_listed` is false** for every
+  root, the header counts `0 repos`, and the right pane reads
+  `discovered N roots, checking status…` with one line per root (`  <name>  <branch>`) —
+  the same lines as the empty state, so the frame does not jump when the hold ends.
+- **A root "reports" three ways:** the watcher's `EngineEvent::Scanned { root, rows }`
+  (sent from the pool thread the moment that root's scan returns, before the batch's
+  piles land — `Engine::scan_all_with`'s hook, `try_send` from under the engine lock so a
+  full channel drops a tick rather than parking a worker behind a lock the consumer may
+  be waiting on), its `Pile`, or a `scan failed` notice. A **global** notice
+  (`watching …`, `watch installation failed`) ends the hold outright — every such notice
+  comes after the initial scans, so whatever has not reported never will. No roots → no
+  hold.
+- **The first second is a static line.** Below `COUNTER_AFTER` there are no digits: a
+  fast launch shows one calm frame, not a flash of `loading… 23423423432`. From one
+  second on (`Loading::counting`, measured on the app clock, so the `Tick` action redraws
+  while the hold is on) the pane adds a dim
+  `K of N repos checked · F files pending so far · Ss` and a `✓` beside each root that
+  has reported — a single slow repo is then the one without a `✓`. `F` is the sum of the
+  reported roots' pending rows; there is no intra-repo progress (the time is inside
+  `git`), and the seconds counter is the liveness signal.
+- **The solo first-root scan is gone** from `watcher::run_loop`: every root goes through
+  the one `scan_all` on the pool, and the piles land together in path order with
+  `scan_seq` numbered that way. `bench.md` S1's `first_pile_ms` changed meaning with it
+  (see the note there). The PTY harness pins the order: `discovered 3 roots, checking
+  status…` before the first row, and `nothing pending across 3 roots` never before it
+  (`wait_first_piles`); `watch --json` prints the tick as
+  `{"event":"scanned","root":…,"rows":N}` and is otherwise unchanged.
 
 **One known cost sits in front of all of that.** `term::enter()` asks the terminal whether it
 speaks the kitty keyboard protocol (`CSI ? u`, then `CSI c`) before the input thread starts,
@@ -938,6 +978,7 @@ rule adds a row. Nothing here is a promise about the final design.
 | Editor body (Phase 8) | five-column gutter, then the file with **no wrap**; a clipped row ends in a dim `→` and `End` is the way to the rest. The caret line is tinted (indexed 238) and the entered hunk banded (236), so the editor needs a 256-colour terminal to look right and degrades to "no tint" rather than to noise. Hint line becomes exactly `^S save   Esc close` | `tui_editor_open`, `tui_editor_narrow_60x20` (which asserts the `→` is on the frame) |
 | Copy cue (Phase 8) | a centered one-line reverse-video `copied to clipboard` over the diff pane for 2 s; **not** the status line, so it cannot evict an engine notice, and the two can be on screen together | `tui_copy_cue`, `render_selection_is_reverse_video_and_the_cue_sits_over_the_diff` |
 | Diff selection (Phase 8) | selected lines are full-width reverse video; the pane scrolls only enough to keep the selection's moving end visible, never a line per keystroke | `tui_diff_selection`, `app_select_extends_with_the_cursor_and_y_copies_the_range` |
+| Launch hold (Gate 8 sponsor run) | nothing listed until every root reports; right pane `discovered N roots, checking status…` + one line per root; from 1 s a dim `K of N repos checked · F files pending so far · Ss` and a `✓` per reported root; the herdr `waiting for herdr scope…` hold (same section) can follow it on a scoped launch — two different holding texts in a row is a pass item, as is the `✓` column's placement | `render_loading_pane_counts_only_after_one_second`, `app_loading_holds_the_listing_until_every_root_reports`, PTY `wait_first_piles` |
 
 Open design questions the pass should take, in the order they have come up: whether the
 hint line should carry `u`/`m` (or go to a second tier) once the width allows; whether a

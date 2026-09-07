@@ -59,6 +59,16 @@ over the 100 roots. The screen metrics run from spawning `lastcall tui --poll 1`
 first root's pile (`1 repo · 40 files`) and to the header showing every root
 (`100 repos · 4,000 files`); the RSS peak is read after two further one-second rescans.
 
+> **`first_pile_ms` changed meaning at the Gate 8 sponsor run (`9d2fd4a`, 2026-09-07).**
+> The TUI no longer lists a root until every root has reported (the launch hold,
+> `tui.md` "Startup and the first frame"), so `1 repo · 40 files` is never on screen; the
+> harness now waits for the hold's counter line to show a first root reported
+> (`K of 100 repos checked`, `K` ≥ 1). The counter appears one second into the hold, so
+> from that commit on `first_pile_ms` **floors at ~1,000 ms** and reads "the first root was
+> done by then", not "the first root was listed then". `first_frame_ms` keeps its meaning
+> (every root in the header) and is the number to compare across runs. Runs A–F below were
+> measured under the old meaning.
+
 | metric | value |
 |---|---|
 | `open_ms` | 33050 |
@@ -340,8 +350,9 @@ still git-process bound; there are simply fewer processes. The pool is the rest:
 the pool and one third from the batching, and the last piece was the watcher: its initial
 pass used to scan one root at a time behind the engine mutex, which the pool cannot help,
 so the gap between the first pile and the full frame stayed at ~22 s until that pass became
-one `scan_all` (S1's first pile is still streamed on its own, so `first_pile_ms` is
-unaffected). `peak_rss_kb` moves by less than the sampler's noise: eight concurrent roots
+one `scan_all` (S1's first pile was still streamed on its own at this point, so
+`first_pile_ms` was unaffected; the Gate 8 sponsor run folded that solo scan into the
+batch — see the note under S1). `peak_rss_kb` moves by less than the sampler's noise: eight concurrent roots
 cost about 0.4 MB over one on S1, and nothing near a per-root allocation.
 
 ## Phase 6 (run D): one remote-ref listing per scan
