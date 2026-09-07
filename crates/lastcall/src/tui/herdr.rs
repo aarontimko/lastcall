@@ -14,6 +14,7 @@
 //! `Client::spawn`), [`focus`] (`agent.focus`), and [`toast_loop`] — the coalescing
 //! `notification.show` sender, the one call site of that method in this crate.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -36,6 +37,8 @@ use super::app::RootMeta;
 
 /// The env var herdr sets in every pane it owns; the first half of §6.6 provenance.
 pub const WORKSPACE_ID_VAR: &str = "HERDR_WORKSPACE_ID";
+/// The pane we were started in, from herdr's pane environment.
+pub const PANE_ID_VAR: &str = "HERDR_PANE_ID";
 /// How long a request to herdr may take before we give up on it.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long the first `ping` of discovery may take.
@@ -250,6 +253,13 @@ pub struct HerdrView {
     pub toast: bool,
     /// Every candidate pane per root, across every workspace, from the last derivation.
     pub candidates: BTreeMap<PathBuf, Vec<AgentCandidate>>,
+    /// `true` from launch until the first scope verdict, when we were started in a herdr
+    /// pane with `[herdr] scope = workspace`. Nothing is listed while it holds: the first
+    /// pile can land before the link's first snapshot, and a root listed for 200 ms and
+    /// then hidden by the scope is the launch flash the Gate 8 sponsor run recorded. Any
+    /// verdict clears it — a derived scope (even `None`), a standalone start, a connect
+    /// that failed, a link that dropped before its first snapshot.
+    pub scope_pending: bool,
 }
 
 impl HerdrView {
@@ -513,6 +523,9 @@ pub struct HerdrPlan {
     pub scoped: bool,
     /// `HERDR_WORKSPACE_ID` from the pane we were started in, if any.
     pub workspace_id: Option<String>,
+    /// `HERDR_PANE_ID` from the pane we were started in, if any: the one pane whose
+    /// `foreground_cwd` is **ours** (see [`own_pane_scrubbed`]).
+    pub pane_id: Option<String>,
 }
 
 impl HerdrPlan {
@@ -523,7 +536,37 @@ impl HerdrPlan {
             toast: config.toast,
             scoped: config.scope == HerdrScope::Workspace,
             workspace_id: env.var(WORKSPACE_ID_VAR).map(str::to_owned),
+            pane_id: env.var(PANE_ID_VAR).map(str::to_owned),
         }
+    }
+}
+
+/// The cache with our own pane's `foreground_cwd` cleared (its `cwd` stays).
+///
+/// herdr's `foreground_cwd` is the cwd of the pane's foreground process group, sampled
+/// from the process table — and in the pane lastcall runs in, that group is lastcall and
+/// every `git` it spawns. During the initial scans herdr reported our pane as being in
+/// whichever root a `git` child was running in at that instant, `pane_updated` carried it
+/// over, and the pane-containment scope (deliverable 8) narrowed to that root: the Gate 8
+/// sponsor run's launch flashed `BMAD-METHOD` → empty → one stray repo → all, as the scope
+/// went `None` → `{user-memory-openwiki-test}` → `{drydock}` → `None` behind our own
+/// scans. Our own pane's foreground is never evidence about the workspace, so it is
+/// dropped before any derivation; the shell's `cwd` is still where the pane lives.
+///
+/// Borrows when there is nothing to scrub, so the common path copies nothing.
+pub fn own_pane_scrubbed<'a>(cache: &'a Cache, own_pane: Option<&str>) -> Cow<'a, Cache> {
+    let Some(own) = own_pane else {
+        return Cow::Borrowed(cache);
+    };
+    match cache.panes.get(own) {
+        Some(record) if record.info.foreground_cwd.is_some() => {
+            let mut scrubbed = cache.clone();
+            if let Some(record) = scrubbed.panes.get_mut(own) {
+                record.info.foreground_cwd = None;
+            }
+            Cow::Owned(scrubbed)
+        }
+        _ => Cow::Borrowed(cache),
     }
 }
 
@@ -1361,6 +1404,54 @@ mod tests {
             None,
             "a workspace id the snapshot does not know scopes nothing"
         );
+    }
+
+    /// The Gate 8 sponsor run's launch flash: lastcall's own pane reported a
+    /// `foreground_cwd` that followed the `git` children of the scans, and the containment
+    /// fallback narrowed the scope to whichever root was being scanned. Scrubbed, our pane
+    /// still counts — by its shell `cwd` — and every other pane keeps its foreground.
+    #[test]
+    fn herdr_own_pane_foreground_never_steers_the_scope() {
+        let mut cache = cache(vec![
+            pane("p1", "w2", B, None, "idle"),
+            // Our pane: the shell sits above the roots, a scan is running in alpha.
+            foregrounded(pane("p2", "w2", "/W", None, "idle"), A),
+        ]);
+        // A workspace with no worktree provenance: the containment fallback decides.
+        cache
+            .workspaces
+            .insert("w2".to_owned(), workspace("w2", "dev/git parent", None));
+        let of = |cache: &Cache| derive_scope(cache, &roots(), "w2").map(|s| s.roots);
+        let both: BTreeSet<PathBuf> = [PathBuf::from(A), PathBuf::from(B)].into_iter().collect();
+        let beta: BTreeSet<PathBuf> = [PathBuf::from(B)].into_iter().collect();
+        assert_eq!(of(&cache), Some(both), "raw, our own scan steers the scope");
+
+        let scrubbed = own_pane_scrubbed(&cache, Some("p2"));
+        assert!(matches!(scrubbed, Cow::Owned(_)));
+        assert_eq!(
+            of(&scrubbed),
+            Some(beta),
+            "scrubbed, only the other pane places it"
+        );
+        assert_eq!(
+            scrubbed.panes["p2"].info.cwd.as_deref(),
+            Some("/W"),
+            "the shell cwd is untouched"
+        );
+        assert_eq!(
+            cache.panes["p2"].info.foreground_cwd.as_deref(),
+            Some(A),
+            "the caller's cache is not mutated"
+        );
+
+        // Nothing to scrub borrows: no own pane, an own pane the snapshot does not know,
+        // an own pane with no foreground of its own.
+        for own in [None, Some("nobody"), Some("p1")] {
+            assert!(
+                matches!(own_pane_scrubbed(&cache, own), Cow::Borrowed(_)),
+                "{own:?}"
+            );
+        }
     }
 
     /// Ruling 9 + ruling 10: `done` opens exactly one episode; an ack survives further

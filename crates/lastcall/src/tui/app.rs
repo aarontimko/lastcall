@@ -1018,12 +1018,24 @@ impl App {
     /// it survives the active workspace scope (deliverable 8). `working`/`idle`/`unknown`
     /// never list a root by themselves; they annotate one already listed.
     pub fn is_listed(&self, view: &RootView) -> bool {
-        self.herdr.in_scope(&view.meta.path)
+        !self.herdr.scope_pending
+            && self.herdr.in_scope(&view.meta.path)
             && (view.listed()
                 || self
                     .herdr
                     .flag(&view.meta.path)
                     .is_some_and(|f| f.attention()))
+    }
+
+    /// The scope verdict is in (any verdict — see `HerdrView::scope_pending`): list the
+    /// roots. `Changed::Yes` only when something was being held back.
+    pub fn scope_settled(&mut self) -> Changed {
+        if !self.herdr.scope_pending {
+            return Changed::No;
+        }
+        self.herdr.scope_pending = false;
+        self.reconcile_selection();
+        Changed::Yes
     }
 
     /// Roots the active scope hides that would otherwise be listed: the `N` of the
@@ -1291,6 +1303,13 @@ impl App {
         if view.pile == pile {
             return Changed::No;
         }
+        tracing::debug!(
+            root = %view.meta.name,
+            seq,
+            rows = pile.rows.len(),
+            was = view.pile.rows.len(),
+            "pile"
+        );
         let fresh = pile
             .notices
             .iter()
@@ -3184,10 +3203,13 @@ impl App {
             }
             HerdrUpdate::Reconnecting => {
                 self.herdr.link = Link::Reconnecting;
+                // A link that dropped before its first snapshot never sends a scope.
+                self.scope_settled();
                 (Changed::Yes, None)
             }
             HerdrUpdate::Standalone { reason } => {
                 self.herdr.link = Link::Standalone { reason };
+                self.scope_settled();
                 (Changed::Yes, None)
             }
             // The picker is live: a pane that appeared or went away while it is open
@@ -3235,9 +3257,17 @@ impl App {
                 (changed, effect)
             }
             HerdrUpdate::Scope(scope) => {
+                // The first verdict lists the roots even when it is the same `None` the
+                // view started with.
+                let settled = self.scope_settled();
                 if self.herdr.scope == scope {
-                    return (Changed::No, None);
+                    return (settled, None);
                 }
+                tracing::debug!(
+                    from = ?self.herdr.scope.as_ref().map(|s| &s.roots),
+                    to = ?scope.as_ref().map(|s| &s.roots),
+                    "herdr scope"
+                );
                 self.herdr.scope = scope;
                 self.reconcile_selection();
                 (Changed::Yes, None)
@@ -5634,6 +5664,70 @@ mod tests {
 
     /// Deliverable 8: the scope hides the roots outside it, the notice counts exactly what
     /// it hid, and `w` shows all. Without a derived scope `w` does nothing at all.
+    /// The Gate 8 sponsor run's launch flash: the first pile landed before the first scope
+    /// verdict, was listed, and was hidden a moment later. While `scope_pending` nothing is
+    /// listed; the first verdict lists — even a `None` equal to the starting value — and so
+    /// does a link that will never deliver one (standalone, or dropped before its snapshot).
+    #[test]
+    fn app_scope_pending_holds_the_listing_until_the_first_verdict() {
+        let launched = || {
+            let mut app = App::new();
+            app.herdr.scoped = true;
+            app.herdr.scope_pending = true;
+            app.sync_roots(vec![meta("alpha"), meta("beta")]);
+            app.apply(pile_event("alpha", pile("alpha")));
+            assert_eq!(app.listed_roots().count(), 0, "held back until the verdict");
+            assert_eq!(app.scope_notice(), None, "no scope is active yet");
+            app
+        };
+        let listed = |app: &App| {
+            app.listed_roots()
+                .map(|v| v.meta.name.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let mut app = launched();
+        assert_eq!(
+            app.handle(Action::Herdr(HerdrUpdate::Scope(None))).0,
+            Changed::Yes,
+            "the first verdict redraws even when it is the `None` the view started with"
+        );
+        assert!(!app.herdr.scope_pending);
+        assert_eq!(listed(&app), vec!["alpha".to_owned()]);
+        assert_eq!(
+            app.handle(Action::Herdr(HerdrUpdate::Scope(None))),
+            (Changed::No, None),
+            "the same verdict again is not a redraw"
+        );
+        assert_eq!(app.scope_settled(), Changed::No, "nothing was pending");
+
+        // A scope that hides the pile: held back, then hidden — never listed in between.
+        let mut app = launched();
+        let beta = Scope {
+            label: "beta".to_owned(),
+            roots: [root("beta")].into_iter().collect(),
+        };
+        assert_eq!(
+            app.handle(Action::Herdr(HerdrUpdate::Scope(Some(beta)))).0,
+            Changed::Yes
+        );
+        assert!(listed(&app).is_empty());
+        assert_eq!(app.scoped_out(), 1);
+
+        // No verdict is ever coming.
+        for update in [
+            HerdrUpdate::Standalone {
+                reason: "off".to_owned(),
+            },
+            HerdrUpdate::Reconnecting,
+        ] {
+            let mut app = launched();
+            app.handle(Action::Herdr(update.clone()));
+            assert!(!app.herdr.scope_pending, "{update:?}");
+            assert_eq!(listed(&app), vec!["alpha".to_owned()], "{update:?}");
+        }
+    }
+
     #[test]
     fn app_herdr_scope_hides_roots_and_w_shows_all() {
         let mut app = three_roots();

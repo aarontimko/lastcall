@@ -164,7 +164,7 @@ async fn loop_flag_with_one_agent_reaches_pane_send_text() {
 
     // The loop's fold. Without `HerdrUpdate::Agents` (F1) this is where the send dies: the
     // candidate list stays empty and `App::flagged` takes the export-file arm.
-    let (changed, _) = herdr_fold(&mut ui, &cache, None);
+    let (changed, _) = herdr_fold(&mut ui, &cache, None, None);
     assert_eq!(changed, Changed::Yes);
     let candidates = ui.app.herdr.candidates(&alpha);
     assert_eq!(

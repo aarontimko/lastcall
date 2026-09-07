@@ -53,6 +53,9 @@ pub fn note_keys(enhanced: bool) -> &'static str {
 }
 pub const PICK_KEYS: &str = "↑↓ choose   ⏎ send   Esc cancel";
 pub const NO_SELECTION: &str = "select a file (↑↓ or click) · ? for help";
+/// The right pane while the herdr scope verdict is still pending at launch
+/// (`HerdrView::scope_pending`): nothing is listed yet, so nothing is selectable.
+pub const SCOPE_PENDING: &str = "waiting for herdr scope…";
 /// What a flag-only root (no pending rows) shows instead of a file list, in the nav and
 /// in the diff pane, so `Enter` has somewhere to land. `<status>` is herdr's own word.
 pub fn nothing_pending(status: &str) -> String {
@@ -852,7 +855,34 @@ fn render_main(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
     let mut lines: Vec<Line> = Vec::new();
     match &app.selection {
         None => {
-            if app.listed_roots().next().is_none() {
+            if app.herdr.scope_pending {
+                // Deliberately not "nothing pending": the piles may be in and held back.
+                lines.push(Line::from(Span::styled(SCOPE_PENDING, dim())));
+            } else if let (Some(scope), hidden @ 1..) = (
+                app.herdr
+                    .active_scope()
+                    .filter(|_| app.listed_roots().next().is_none()),
+                app.scoped_out(),
+            ) {
+                // Under a scope, the roots it hides are not "nothing pending": name the
+                // scope, list what it covers, and say how many it hides.
+                lines.push(Line::from(format!("nothing pending in {}", scope.label)));
+                for view in app
+                    .roots
+                    .values()
+                    .filter(|v| scope.roots.contains(&v.meta.path))
+                {
+                    lines.push(Line::from(format!(
+                        "  {}  {}",
+                        view.meta.name,
+                        view.meta.branch_label()
+                    )));
+                }
+                lines.push(Line::from(Span::styled(
+                    format!("{} hidden (w shows all)", plural(hidden, "repo")),
+                    dim(),
+                )));
+            } else if app.listed_roots().next().is_none() {
                 lines.push(Line::from(format!(
                     "nothing pending across {}",
                     plural(app.roots.len(), "root")
@@ -2838,6 +2868,52 @@ mod tests {
         // Nothing under the width of the counts alone survives but the counts.
         let (narrow, _) = frame_of(&app, 40, 12);
         assert!(narrow.contains("lastcall  0 repos"), "{narrow}");
+    }
+
+    /// Gate 8 sponsor run: under a scope whose roots have nothing pending, "nothing pending
+    /// across 4 roots" was a lie — three of them had piles the scope was hiding. The empty
+    /// state names the scope, lists what it covers, and counts what it hides; while the
+    /// verdict is still pending it says that instead.
+    #[test]
+    fn render_empty_state_under_a_scope_names_it_and_counts_the_hidden() {
+        use crate::tui::herdr::{HerdrUpdate, Scope};
+        let mut app = three_roots();
+        app.sync_roots(vec![
+            meta("alpha"),
+            meta("beta"),
+            meta("notes"),
+            meta("quiet"),
+        ]);
+        app.herdr.scoped = true;
+        app.handle(Action::Herdr(HerdrUpdate::Scope(Some(Scope {
+            label: "w2".to_owned(),
+            roots: [root("quiet")].into_iter().collect(),
+        }))));
+        assert_eq!(app.listed_roots().count(), 0);
+        let (frame, _) = frame_of(&app, 100, 12);
+        assert!(frame.contains("nothing pending in w2"), "{frame}");
+        assert!(
+            frame.contains("  quiet  "),
+            "the in-scope root is listed: {frame}"
+        );
+        assert!(
+            !frame.contains("  alpha  "),
+            "the hidden roots are not: {frame}"
+        );
+        assert!(frame.contains("3 repos hidden (w shows all)"), "{frame}");
+        assert!(!frame.contains("nothing pending across"), "{frame}");
+
+        // `w` shows all: the ordinary listing, no empty state at all.
+        app.handle(Action::ScopeToggle);
+        let (frame, _) = frame_of(&app, 100, 12);
+        assert!(frame.contains(NO_SELECTION), "{frame}");
+
+        // Before the first verdict nothing is listed and the pane says why.
+        app.handle(Action::ScopeToggle);
+        app.herdr.scope_pending = true;
+        let (frame, _) = frame_of(&app, 100, 12);
+        assert!(frame.contains(SCOPE_PENDING), "{frame}");
+        assert!(!frame.contains("nothing pending"), "{frame}");
     }
 
     /// Deliverable 8 / ruling 1: the scope notice is mandatory *while the scope is

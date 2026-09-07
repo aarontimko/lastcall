@@ -283,7 +283,8 @@ impl Ui {
             return (Changed::No, None);
         };
         match action {
-            Action::Resize(..) => {
+            Action::Resize(w, h) => {
+                tracing::debug!(w, h, "resize");
                 self.hits = None;
                 self.app.handle(action)
             }
@@ -1159,6 +1160,7 @@ pub(crate) struct Herdr {
     events: Option<mpsc::Receiver<HerdrEvent>>,
     toast: Option<mpsc::UnboundedSender<ToastMsg>>,
     workspace_id: Option<String>,
+    pane_id: Option<String>,
 }
 
 impl Herdr {
@@ -1187,6 +1189,7 @@ impl Herdr {
             events: Some(link.events),
             toast,
             workspace_id: link.plan.workspace_id,
+            pane_id: link.plan.pane_id,
         }
     }
 }
@@ -1227,7 +1230,12 @@ fn herdr_rederive(ui: &mut Ui, link: &Herdr) -> (Changed, Option<Effect>) {
     let Some(cache) = link.handle.as_ref().and_then(ClientHandle::snapshot) else {
         return (Changed::No, None);
     };
-    herdr_fold(ui, &cache, link.workspace_id.as_deref())
+    herdr_fold(
+        ui,
+        &cache,
+        link.workspace_id.as_deref(),
+        link.pane_id.as_deref(),
+    )
 }
 
 /// The socket-free half of [`herdr_rederive`]: one snapshot in, three folds out. Split out
@@ -1244,11 +1252,18 @@ fn herdr_rederive(ui: &mut Ui, link: &Herdr) -> (Changed, Option<Effect>) {
 ///
 /// `agents_for(.., None)` walks **every** workspace: the `w` scope narrowing belongs to
 /// `HerdrView::candidates`, which already applies it to whatever this map holds.
+///
+/// `own_pane` is the pane lastcall runs in: its `foreground_cwd` is scrubbed first
+/// ([`herdr::own_pane_scrubbed`]) — it follows our own `git` children and steered the
+/// scope through every root being scanned in the Gate 8 sponsor run.
 pub fn herdr_fold(
     ui: &mut Ui,
     cache: &Cache,
     workspace_id: Option<&str>,
+    own_pane: Option<&str>,
 ) -> (Changed, Option<Effect>) {
+    let cache = herdr::own_pane_scrubbed(cache, own_pane);
+    let cache = cache.as_ref();
     let metas: Vec<RootMeta> = ui.app.roots.values().map(|v| v.meta.clone()).collect();
     let scope = workspace_id.and_then(|id| herdr::derive_scope(cache, &metas, id));
     let roots = herdr::derive(cache, &metas);
@@ -1443,6 +1458,10 @@ pub fn run(
             // loop's own arm, like everything else.
             ui.app.herdr.scoped = plan.scoped;
             ui.app.herdr.toast = plan.toast;
+            // Nothing is listed until the link says what the scope is (or that there is
+            // no link): the first pile otherwise lands before the first snapshot and is
+            // hidden a moment later — the launch flash of the Gate 8 sponsor run.
+            ui.app.herdr.scope_pending = plan.scoped && plan.workspace_id.is_some();
             let mut connecting = Some(tokio::spawn(async move {
                 herdr::connect(&env, plan).await
             }));
@@ -1533,9 +1552,10 @@ pub fn run(
                         Some(Err(badge)) => {
                             let changed = if badge == Link::Off { Changed::No } else { Changed::Yes };
                             ui.app.herdr.link = badge;
-                            (changed, None)
+                            (changed.or(ui.app.scope_settled()), None)
                         }
-                        None => (Changed::No, None),
+                        // The task died without a verdict: no scope is ever coming.
+                        None => (ui.app.scope_settled(), None),
                     }),
                     _ = async {
                         match due {
@@ -1792,6 +1812,10 @@ pub fn run(
                     tracing::debug!(
                         cause = pass.cause.unwrap_or("unknown"),
                         ms = started.elapsed().as_millis() as u64,
+                        roots = ui.app.roots.len(),
+                        listed = ui.app.listed_roots().count(),
+                        scope = ui.app.herdr.active_scope().map(|s| s.label.as_str()),
+                        selected = ui.app.selection.is_some(),
                         "draw"
                     );
                 }
@@ -2175,7 +2199,7 @@ mod tests {
             // Not agent-bearing: a plain shell in the same root is not a send target.
             pane("p-shell", "ws1", "/W/alpha", None, "unknown"),
         ]);
-        let (changed, _) = herdr_fold(&mut ui, &snapshot, None);
+        let (changed, _) = herdr_fold(&mut ui, &snapshot, None, None);
         assert_eq!(changed, Changed::Yes);
 
         assert_eq!(ui.app.herdr.candidates(&root("alpha")).len(), 1);
@@ -2190,7 +2214,7 @@ mod tests {
 
         // The map re-derives on every snapshot, like the rollup: the pane goes away and so
         // does the candidate.
-        let (changed, _) = herdr_fold(&mut ui, &cache(vec![]), None);
+        let (changed, _) = herdr_fold(&mut ui, &cache(vec![]), None, None);
         assert_eq!(changed, Changed::Yes);
         assert!(ui.app.herdr.candidates(&root("alpha")).is_empty());
     }
