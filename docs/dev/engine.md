@@ -425,11 +425,16 @@ undo for the whole path — and an override left with nothing else is removed. B
 ledger (`written: true`) through the same staged-then-commit path as an accept, and both
 rescan afterwards: the rescan is what puts the new `⚑` on the row the UI is about to draw.
 
-A flag is stored as `Flag { note, created_at, hunk: Option<FlagHunk> }` with
-`FlagHunk { index, header, text }` — the hunk as it was **rendered**, not a pointer into a
-diff that will have moved by the time anyone reads it. `SCHEMA_VERSION` is `"1.1"` and every
-write stamps it. The JSON carries both `flags` (the 1.1 list, hunks included) and `flag`
-(the 1.0 mirror of `flags[0]`, **without** its `hunk`); `flag` is written as `null`, never
+A flag is stored as `Flag { note, created_at, hunk: Option<FlagHunk>, summary:
+Option<FlagSummary> }` with `FlagHunk { index, header, text }` — the hunk as it was
+**rendered**, not a pointer into a diff that will have moved by the time anyone reads it —
+and `FlagSummary { hunks, added, deleted }`, the whole-file counterpart (Amendment v1.8).
+Both are additive and optional: a ledger written before v1.8 loads unchanged and
+`SCHEMA_VERSION` stays `"1.1"`. The two are mutually exclusive by construction — `Ops::flag`
+drops a summary offered beside a hunk — so a flag is a hunk flag or a whole-file one, never
+a thing that claims to be both. Every write stamps the version. The JSON carries both
+`flags` (the 1.1 list, hunks and summaries included) and `flag` (the 1.0 mirror of
+`flags[0]`, **without** its `hunk` or its `summary`); `flag` is written as `null`, never
 omitted, when there are no flags.
 
 `of` — the `m` in `hunk n of m` — travels **from the caller** in `RenderedHunk` (verifier
@@ -456,8 +461,28 @@ note: why is this unwrap safe?
 ```
 ````
 
-A file flag omits the `hunk n of m` segment and the diff block. An `unflag`, or a refusal,
-leaves `export` empty.
+A **whole-file** flag says `whole file` where a hunk flag says `hunk n of m`, carries a
+summary line in the hunk block's place, and has no diff block at all (Amendment v1.8,
+ruling P4):
+
+```text
+lastcall flag · alpha · src/tui/render.rs · whole file · 2026-09-05T18:04:00Z
+3 hunks · +12 −4
+note: the whole rewrite needs another look
+```
+
+The summary is `Flag.summary` (`FlagSummary { hunks, added, deleted }`), an **optional**
+1.1 field: it is captured from the row as it was rendered when `m` was pressed, for the
+same reason `of` is (F14), never from a rescan an agent may have invalidated. A flag
+written before v1.8 has none and prints no summary line — the `whole file` segment is
+unconditional, the line is not. A hunk flag never prints one: `Ops::flag` drops a summary
+offered beside a hunk rather than write a flag that claims to be both. The TUI also sends
+**no** summary for a collapsed row nobody expanded (verifier (a) F2): there are no hunks
+the scan counted, and on a `Binary` row the `+a −d` are not line counts of a diff — an
+absent line is honest where `0 hunks · +1 −1` would be a claim about the file
+(`app_flag_on_a_collapsed_row_carries_no_summary`).
+
+An `unflag`, or a refusal, leaves `export` empty.
 
 Two rules make it safe to paste into a live terminal:
 
@@ -473,8 +498,163 @@ Two rules make it safe to paste into a live terminal:
   leading run any line inside it starts with, minimum three. A diff line that is exactly
   ` ``` ` would otherwise close the block and spill the rest of the hunk into prose.
 
-`ExportContext.attribution` (`last touched by <agent> · session <id>`) is always `None` in
-Phase 7; Phase 8 provides it.
+`ExportContext.attribution` (`last touched by <agent> · session <id>`) is still always
+`None`. Phase 7 said "Phase 8 provides it"; Phase 8's deliverable list does not contain it,
+so the field is carried unwritten and the line is never printed. Whichever phase adds the
+herdr attribution to a flag owns it.
+
+## Editing (Phase 8)
+
+Phase 8 adds the third thing a reviewer does with a hunk: change it. Two engine entry
+points serve it — `Engine::read_rendered` hands the TUI a file's bytes, and
+`Engine::save` writes an edited buffer back — plus `Hunk::editor_line`, which is the
+line both editors open at. `SCHEMA_VERSION` is unchanged: a save records an **override**,
+the same ledger shape an accept records, so nothing on disk grew a field.
+
+```rust
+pub struct SaveRequest { pub rendered: Rendered, pub bytes: Vec<u8> }
+pub struct Saved { pub outcome: Outcome, pub seq: u64, pub pile: Pile }
+
+impl Engine {
+    pub fn read_rendered(&self, root: &Path, rendered: &Rendered) -> Result<Vec<u8>, Refused>;
+    pub fn save(&mut self, root: &Path, req: SaveRequest) -> Result<Saved, EngineError>;
+}
+impl Hunk { pub fn editor_line(&self) -> usize; }
+```
+
+`save_with(.., &dyn FaultInjector)` is the E1 twin, as for accept and restore. Unlike a
+restore, `Saved.outcome.written` is `true`: a save writes the working tree *and* the
+override.
+
+**The write seam did not widen.** `Ops::save_file` reaches the working tree through
+`restore::write_bytes`, so `restore.rs` is still the only file in the engine that opens a
+path under a root for writing, and the gate grep says so:
+`rg 'openat|renameat|OpenOptions|File::create|fs::write' crates/lastcall-engine/src --glob '!*test*'`
+— every hit outside `restore.rs` writes under the **state dir** (`ledger.rs`, `index.rs`,
+`store.rs`, `roots.rs`, `flags.rs`'s golden writer, `engine.rs`); `ops.rs`'s two hits are
+inside its own `#[cfg(test)] mod tests`, which the glob does not exclude because the module
+is in the file. A new hit under a root anywhere else is a verifier failure (kickoff
+Boundaries, F2).
+
+### `read_rendered` — the bytes the inline editor gets
+
+`read_rendered(root, rendered)` is read-only: no write, no temp file, and **no ledger lock**,
+so it can run on the blocking pool while the UI keeps drawing. It refuses the two rows a
+save refuses outright (a deletion — "the file is gone"; a symlink — "not a regular file"),
+CASes against the row on screen, reads the file, and hashes the fresh read through
+`hash_bytes_as` to compare with `rendered.oid`: a mismatch is the agent that wrote between
+the CAS and the read, and comes back as `Refused::Moved`. Then two limits the editor needs
+and the save does not: over `collapse_size_bytes` and anything holding a NUL or invalid
+UTF-8 are `NotEditable`, because a `TextBuf` is text. `$EDITOR` (`shift-i`) has neither
+limit — it never loads the file into lastcall — which is why the TUI's refusal for the
+inline editor names the other key (`use shift-i: <why>`).
+Tests: `engine_read_rendered_opens_text_and_refuses_binary_and_oversize`,
+`engine_read_rendered_refuses_a_file_that_moved_since_it_was_rendered`.
+
+### `save_file` — the order is the rule
+
+`Ops::save_file` is the **second** operation that writes the user's working tree, and the
+only new one. It shares `restore::write_bytes` with the restore, so there is still exactly
+one function in the crate that opens a path under a root for writing. Its order:
+
+1. **Row shape.** `rendered.oid.is_none()` (a deletion) and `Mode::Symlink` are
+   `NotEditable`: there is no file to write into, and a symlink's "content" is its target,
+   so writing bytes at it either follows the link or replaces it — neither is an edit of the
+   row on screen. (`ops_save_file_refuses_a_symlink_and_a_deletion`.)
+2. **`restore_preflight`** — the restore's own preflight verbatim: a non-UTF-8 path key, a
+   conflicted index entry (`Refused::Conflicted`), a parent chain that changed under us
+   (`check_parent_chain`), and a `filter=` attribute on the path, which lastcall will not
+   write through.
+3. **The entry CAS** (`cas_live`), the same live compare-and-swap a restore takes. Unlike
+   accept — which has no live CAS on purpose (Amendment A3), because it never touches the
+   working tree — a save *writes*, so the CAS is the entire guard. **Do not harmonise the
+   two.**
+4. **The oid, before anything is written.** `Store::hash_bytes_as(rel, bytes)` runs
+   `git hash-object -w --path=<rel> --stdin` under the same `GIT_DIR`/`GIT_WORK_TREE`/cwd a
+   scan uses, so the path's `.gitattributes` — `text=auto`, `eol`, a clean filter — act
+   exactly as they will on the scanned file, and the answer is *the oid the next scan will
+   compute*. `--path` is the whole difference from `hash_bytes`, which passes none because
+   its input is already-canonical blob content.
+   The order is design review F1 and is easy to get wrong: `write_bytes`'s `before_rename`
+   hook takes no arguments and cannot reach the temp file, and a fresh read *after* the
+   rename would hash whatever an agent wrote in the rename-to-ledger window and bless it.
+   Recording the oid of the bytes we wrote means such a write is **pending** at the rescan,
+   which is invariant 2's direction.
+   `-w` writes the object, so a save that is then refused leaves an **orphan blob** in the
+   store (verifier (a) F6). Deliberate, and the same class of orphan a scan's `hash_path -w`
+   leaves for content nobody accepts: the store is never gc'd (§11), the object is small,
+   and the alternative is the window F1 closed. Do not "fix" it into a post-rename read.
+5. **The write**, through `restore_write` → `restore::write_bytes`, with the **second CAS**
+   in `before_rename` — so, as in a restore, the file is checked twice. The bytes go down
+   verbatim (the caller read the worktree file, CRLF and all, so what comes back is what the
+   user saw) with the **live** mode, so the executable bit survives and the override's mode
+   matches what the next scan will `lstat`.
+   (`ops_save_file_keeps_the_executable_bit`, `scenario_d3_save_of_a_crlf_text_auto_file_round_trips`.)
+6. **The ledger, after the file.** Only once the bytes are on disk does `set_override` record
+   `(oid, mode)` and `commit` write the ledger. A crash in that window leaves the new bytes
+   and the old ledger — the edit is pending, nothing the user typed is lost, and that is the
+   fail-open direction. (`ops_save_file_that_dies_before_the_ledger_shows_the_edit_pending`;
+   a failure *before* the rename leaves no trace at all —
+   `ops_save_file_that_fails_before_the_rename_leaves_no_trace`.)
+
+The baseline is never touched: a save advances the **override**, which is what "the user is
+never asked to review their own just-typed change" means (§6.3, invariant 8). The proof that
+it holds is the pile, not the ledger: `Engine::save` runs the op and the rescan in one
+critical section like `accept_with`, and a clean save leaves the row **gone**
+(`ops_save_file_is_cas_and_the_rescan_shows_zero_pending`, and the proptest
+`ops_save_then_scan_pends_nothing_for_any_bytes`, whose generator mixes CRLF, a lone CR, a
+missing trailing newline, tabs, NUL and non-ASCII — 64 cases in prepush). The rescan is also
+the §11 mitigation for the hash-then-rename window, exactly as for a restore, and the
+orphaned open descriptor residual is inherited unchanged.
+
+An `Err` out of the op — the ledger's failure, not the file's — drops the staged override
+and re-reads the ledger from disk, so the saved bytes show up as *pending* at the next scan.
+That is the honest answer when the file is written and the record of it is not. The refusal
+vocabulary is the shared one, read with the verb `"saved"` — `Moved`, `Unhashable`,
+`Conflicted`, `NonUtf8Path` — plus one variant Phase 8 adds, `NotEditable { path, why }`,
+which carries its own reason and spells its own sentence (`<path>: <why>; not saved`)
+because "not saved" is the only verb it can ever take.
+
+### `editor_line` — where both editors open
+
+`Hunk::editor_line()` is the one-based line in the **new** file that a hunk's first
+non-context line sits on: it walks the hunk's leading context, so a hunk with three context
+lines before the change opens on the change and not on the `@@` header. A pure insertion
+lands on its first inserted line; a pure deletion lands on the line *after* the removed run,
+because the new file has nothing else to point at, and that can be one past the end — both
+callers clamp (`TextBuf::open` to the buffer, and every `$EDITOR` in the basename table
+clamps a `+N` past the end to the last line). The synthetic mode hunk answers 1 and is never
+an editor target: there is no text in it. (`hunk_editor_line_skips_leading_context`.)
+
+### The blessing on `$EDITOR` return, and its residual
+
+`shift-i` hands the file to the user's own editor, which writes on its own account —
+lastcall never writes around it, and there is no CAS it could take over bytes it did not
+produce. So the return path is a *question*, not a write: the loop re-hashes the path
+(`Effect::EditorReturned`) and `App::editor_returned` decides.
+
+| what the file is on return | what happens |
+|---|---|
+| the same oid **and** mode as the row | `no change`; nothing is asked |
+| gone | `<path>: deleted on return; left pending` |
+| unhashable (fifo, typechange, `EACCES`) | `<path>: <why> on return; left pending` |
+| a symlink now | `<path>: not a regular file on return; left pending` |
+| changed, and a confirm/note/picker is already open | `<path>: changed on return; left pending` (verifier (a) F1) |
+| changed, and the screen is free | a confirm: bless the file at what the editor left |
+
+**The residual is deliberate.** "Left pending" is not a lost edit: the row keeps whatever
+the editor wrote and is reviewed like any other pending row, which is the fail-open
+direction and the only safe one — an editor return arrives on a channel, and replacing a
+question the user is reading with a different one would make their next `y` answer something
+they never saw. A blessing that *is* taken is an ordinary accept of the live row
+(`AcceptScope::Bless`), so it goes through the same ledger path, the same rescan and the same
+§6.7 advance as `A`.
+
+Two windows nothing closes, and nothing can: between the editor's save and lastcall's hash,
+and between that hash and the confirm's accept, another writer can change the file. The
+second is covered — the accept is CAS'd against the row the confirm named, so it refuses —
+and the first shows up as a normal pending row at the next scan. That is the whole guarantee
+$EDITOR admits of.
 
 ## `status --json` schema (`status_version: 1`)
 

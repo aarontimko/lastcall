@@ -16,20 +16,21 @@ use std::time::{Duration, Instant};
 use lastcall_engine::count::with_thousands;
 use lastcall_engine::engine::{
     AcceptRequest, Accepted, EngineError, Flagged, RenderedHunk, RestoreRequest, Restored,
-    RootState,
+    RootState, Saved,
 };
-use lastcall_engine::git::Oid;
+use lastcall_engine::git::{Mode, Oid};
 use lastcall_engine::headstate::InProgress;
 use lastcall_engine::hunks::{Expanded, Hunk, Tag};
-use lastcall_engine::ledger::{FlagHunk, LedgerError};
-use lastcall_engine::ops::{OpsError, Rendered};
+use lastcall_engine::ledger::{FlagHunk, FlagSummary, LedgerError};
+use lastcall_engine::ops::{OpsError, Refused, Rendered};
 use lastcall_engine::roots::Badge;
 use lastcall_engine::scan::{Annotation, Change, Collapsed, Entry, Group, Pile, Row};
-use lastcall_engine::store::RootKind;
+use lastcall_engine::store::{Current, RootKind};
 use lastcall_engine::watcher::EngineEvent;
 
 use super::herdr::{AgentCandidate, HerdrUpdate, HerdrView, Link, ToastRequest};
-use super::input::{Action, Keymap, NoteKey, PickKey};
+use super::input::{Action, EditKey, EditorKey, Keymap, NoteKey, PickKey};
+use super::textbuf::{TextBuf, Wrap};
 
 pub const NAV_WIDTH_DEFAULT: u16 = 28;
 pub const NAV_WIDTH_MIN: u16 = 16;
@@ -38,6 +39,13 @@ pub const NAV_WIDTH_MAX: u16 = 60;
 pub const NAV_MIN_COLS: u16 = 70;
 /// Below this the frame is the one-line "terminal too small" message.
 pub const MIN_SIZE: (u16, u16) = (40, 10);
+/// How far `PageUp` / `PageDown` move inside the note modal: its visible text height
+/// (`render::NOTE_ROWS`), so a page is the page the reviewer can see.
+pub const NOTE_PAGE: usize = super::render::NOTE_ROWS as usize;
+/// The inline editor's line-number gutter: four columns of number and one of `▎`
+/// (deliverable 8). The reducer needs it to clamp the horizontal scroll to the same text
+/// width the renderer draws.
+pub const EDITOR_GUTTER: usize = 5;
 
 /// The per-root metadata the nav and the empty state show. Built from a `RootState` under
 /// the engine lock (`RootMeta::of`), then owned by the app so rendering never locks.
@@ -103,6 +111,38 @@ impl RootMeta {
 /// One root as the UI sees it: metadata plus the whole last pile (what every accept is
 /// built from: `Rendered::of` on a held row, `AcceptRequest::All` on the held pile), with
 /// the pile's groups split out for the nav.
+/// The launch hold (Gate 8 sponsor run ruling, spec §10 2026-09-07): from the first
+/// `sync_roots` until every root has reported, nothing is listed and the right pane reads
+/// `discovered N roots, checking status…`, so one repo is never shown as if it were the
+/// only one with changes while the rest are still being scanned. After one second the pane
+/// adds `K of N repos checked · F files pending so far · Ss` and a ✓ beside each root
+/// that has reported — a single slow repo is then visible as the one without its ✓. A
+/// report is a `Scanned` tick, the root's pile, or a scan-failed notice; a global notice
+/// (`watching …`) ends the hold outright, whatever has reported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Loading {
+    /// When the hold began, on the app clock (`App::now`).
+    pub started: Instant,
+    /// Roots that have reported → their pending rows.
+    pub checked: BTreeMap<PathBuf, usize>,
+}
+
+impl Loading {
+    /// How long a load runs before the counter line and the ✓s appear: below this a
+    /// static line is all there is, so a fast launch shows one calm frame, not a flash of
+    /// digits.
+    pub const COUNTER_AFTER: Duration = Duration::from_secs(1);
+
+    pub fn files(&self) -> usize {
+        self.checked.values().sum()
+    }
+
+    /// Whether the counter line is shown at `now`.
+    pub fn counting(&self, now: Instant) -> bool {
+        now.duration_since(self.started) >= Self::COUNTER_AFTER
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RootView {
     pub meta: RootMeta,
@@ -224,6 +264,12 @@ pub enum Changed {
     No,
 }
 
+impl From<bool> for Changed {
+    fn from(yes: bool) -> Changed {
+        if yes { Changed::Yes } else { Changed::No }
+    }
+}
+
 impl Changed {
     pub fn or(self, other: Changed) -> Changed {
         if self == Changed::Yes || other == Changed::Yes {
@@ -260,6 +306,9 @@ pub enum Effect {
         /// The hunk **as it was rendered** when `m` was pressed, with the total the export
         /// names. `None` flags the file.
         hunk: Option<RenderedHunk>,
+        /// The row's shape when `m` was pressed, for a whole-file flag; `None` beside a
+        /// `hunk` (Amendment v1.8).
+        summary: Option<FlagSummary>,
         /// What the status line calls this flag (`f1`, `f1 hunk 2`). It travels with the
         /// write so its answer can name it without `App` holding a slot (F2).
         label: String,
@@ -292,6 +341,50 @@ pub enum Effect {
     Focus(String),
     /// Tell the toast task which ready episodes opened and which ended (deliverable 6).
     Toast(ToastRequest),
+    /// Suspend the TUI and open the user's `$EDITOR` on this path, at this line
+    /// (deliverable 7; ruling P3). The loop owns the whole sequence — the CAS that proves
+    /// the row is still what the user is looking at, the terminal handover, the child, and
+    /// the resume — because every step of it is terminal or process state the reducer
+    /// cannot see. `line` is [`Hunk::editor_line`] of the hunk under the cursor: the first
+    /// line the agent actually changed, never the leading context above it (F9).
+    EditExternal {
+        root: PathBuf,
+        /// The row as it was on screen. The loop refuses to open when the working tree no
+        /// longer matches it, and the same value comes back as the `rendered` of the
+        /// [`Effect::EditorReturned`] the resume raises, so the blessing question is asked
+        /// against what the user saw.
+        rendered: Rendered,
+        line: usize,
+    },
+    /// The `$EDITOR` child exited: rehash this path off the UI task (`Engine::current`)
+    /// and bring the answer back as [`Local::EditorReturned`](super::run::Local), which
+    /// [`App::editor_returned`] folds (Phase 8 deliverable 3). The `rendered` row is the
+    /// one the editor was opened on, so the comparison is against what the user saw and
+    /// not against a pile the watcher may have applied while the editor had the terminal.
+    EditorReturned {
+        root: PathBuf,
+        rendered: Rendered,
+    },
+    /// Read the live bytes of this row off the UI task (`Engine::read_rendered`) and bring
+    /// them back as [`Local::EditRead`](super::run::Local), which opens the inline editor
+    /// (deliverable 8). The whole opening context travels — the row, the line, the gutter
+    /// marks and the band — because it is computed from the pile that was on screen when
+    /// `i` was pressed, and a watcher pile that lands while the read is in flight must not
+    /// move the marks under the file the user asked for.
+    EditInline(EditOpen),
+    /// Write the inline editor's buffer back through `Engine::save` (deliverable 1's CAS'd
+    /// op) and bring the answer back as [`Local::Saved`](super::run::Local). `rendered` is
+    /// the row the editor was opened on, so the save's compare-and-swap is against what the
+    /// user saw — an agent that wrote meanwhile is a refusal, never an overwrite.
+    Save {
+        root: PathBuf,
+        rendered: Rendered,
+        bytes: Vec<u8>,
+    },
+    /// Put `bytes` on the user's clipboard with an OSC 52 write (deliverable 9). The
+    /// payload is already capped ([`super::clipboard::CAP`]) and already the text the diff
+    /// pane showed: the loop's only job is to encode it and hand it to the terminal.
+    Copy(Vec<u8>),
     /// `Engine::hunks_of` for one collapsed row, off the UI task; the answer comes back as
     /// `Local::Expanded`. The **row** travels, not just its path: the expansion is computed
     /// from the oids the row was rendered from, so it shows exactly the delta the counts
@@ -312,6 +405,108 @@ pub struct Expansion {
     pub baseline: Option<Entry>,
     pub current: Option<Entry>,
     pub view: Expanded,
+}
+
+/// Everything the inline editor needs to open, captured when `i` was pressed
+/// (deliverable 8).
+///
+/// It travels to the engine read and back so the editor is built from the pile the user was
+/// looking at: the marks and the band are line numbers in *that* file, and a pile that
+/// lands while the read is in flight cannot renumber them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditOpen {
+    pub root: PathBuf,
+    pub rendered: Rendered,
+    /// One-based line to put the caret on: [`Hunk::editor_line`] of the hunk under the
+    /// cursor (F9), the same line `shift-i` hands `$EDITOR`.
+    pub line: usize,
+    /// Zero-based lines covered by **every** pending hunk of the row, so the gutter can
+    /// show the reader where the rest of the agent's work is while they type.
+    pub marks: Vec<usize>,
+    /// Zero-based `(first, last)` of the hunk the editor opened at — the band. `None` for a
+    /// row with no content hunk at all (a mode-only change opens at line 1 with no band).
+    pub band: Option<(usize, usize)>,
+    /// Which open this is: [`App::edit_gen`] at the moment `i` was pressed. It travels to
+    /// the read and back so [`App::edit_read`] can tell the answer it is waiting for from
+    /// an answer to an open that is no longer the live one (verifier (b) F2).
+    pub generation: u64,
+}
+
+/// The inline editor, if open (deliverable 8; ruling P3).
+///
+/// It holds the **whole file** in a [`TextBuf`] and replaces the diff pane, so the reader
+/// edits with the context around the hunk in front of them and the same mental model
+/// `shift-i` gives them. The row it was opened on is kept verbatim: it is what the save's
+/// compare-and-swap is against, and what the refusal messages name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Editor {
+    pub root: PathBuf,
+    pub rendered: Rendered,
+    pub buf: TextBuf,
+    /// Zero-based lines inside a pending hunk, `▎` in the gutter. Kept in step with
+    /// insertions and deletions above them, so the marks stay on the lines they describe as
+    /// the reader types (they never become a second source of truth about the file — the
+    /// next scan's hunks are).
+    pub marks: Vec<usize>,
+    /// The entered hunk's zero-based `(first, last)`, tinted as a band. It follows an edit
+    /// above it like a mark, and **grows** with an edit inside it.
+    pub band: Option<(usize, usize)>,
+    /// The one-based line the editor opened at, for the `Esc, then i to reload` path and
+    /// for the tests that prove the caret landed on the agent's first changed line.
+    pub line_at_open: usize,
+    /// A save is in flight: a second `Ctrl-S` is ignored until it answers, so one buffer
+    /// cannot be written twice concurrently.
+    pub saving: bool,
+    /// The last save was refused: the header is red until the next key (the reader has to
+    /// see that the file on disk is not what is in front of them).
+    pub alarm: bool,
+}
+
+impl Editor {
+    /// Whether line `i` (zero-based) is inside the band.
+    pub fn in_band(&self, i: usize) -> bool {
+        matches!(self.band, Some((a, b)) if i >= a && i <= b)
+    }
+
+    /// Whether line `i` (zero-based) carries a gutter mark.
+    pub fn marked(&self, i: usize) -> bool {
+        self.marks.binary_search(&i).is_ok()
+    }
+
+    /// Move the marks and the band after an edit that changed the line count by `delta` at
+    /// line `at` (both zero-based).
+    ///
+    /// A mark strictly **below** the edit moves with it; a mark on the edited line stays,
+    /// because the line the reader is typing on is the line the mark described. The band's
+    /// end moves on `>=` rather than `>`, which is the whole difference between the two:
+    /// splitting the band's last line leaves both halves inside the hunk the reader
+    /// entered, so the tint has to grow with it.
+    fn shift(&mut self, at: usize, delta: isize) {
+        if delta == 0 {
+            return;
+        }
+        let inside = self.marked(at);
+        let moved = |x: usize| -> usize { x.saturating_add_signed(delta) };
+        for m in &mut self.marks {
+            if *m > at {
+                *m = moved(*m);
+            }
+        }
+        // Lines typed *into* a marked line are part of the change the mark describes, so
+        // they are marked too — which is also what keeps the marks and the band agreeing
+        // about a hunk the reader is typing inside.
+        if inside && delta > 0 {
+            self.marks.extend((at + 1)..=at + delta as usize);
+        }
+        self.marks.sort_unstable();
+        self.marks.dedup();
+        self.marks.retain(|m| *m < self.buf.line_count());
+        if let Some((a, b)) = self.band {
+            let a2 = if a > at { moved(a) } else { a };
+            let b2 = if b >= at { moved(b) } else { b };
+            self.band = (a2 <= b2).then_some((a2, b2.min(self.buf.line_count() - 1)));
+        }
+    }
 }
 
 /// What one accept covers (§6.7): the key to the status text, the confirm modal's live
@@ -338,6 +533,20 @@ pub enum AcceptScope {
     Root(PathBuf),
     /// Every row of every listed root.
     All,
+    /// The post-`$EDITOR` blessing (deliverable 3, ruling P1): accept **the bytes the
+    /// editor left on disk**, not the ones the row was rendered from.
+    ///
+    /// The only scope that carries its own [`Rendered`]. Every other variant is resolved
+    /// against the held `RootView` at [`App::accept_requests`] time, which is exactly what
+    /// a blessing must not do: the live oid was read by `Engine::current` after the editor
+    /// exited, and the view still holds the pre-edit row (the watcher's pile for the save
+    /// may not have arrived, and if it has, the row's oid is the same live one anyway).
+    Bless {
+        root: PathBuf,
+        path: Vec<u8>,
+        /// The pre-edit row with `oid`/`mode` replaced by what is on disk now.
+        rendered: Box<Rendered>,
+    },
 }
 
 /// An accept the loop is running: its scope and the rows each request covered, so the
@@ -410,6 +619,13 @@ pub enum FlagTarget {
     File {
         root: PathBuf,
         path: Vec<u8>,
+        /// The row's shape as it was on screen: the export prints it instead of a diff
+        /// (ruling P4, Amendment v1.8), and the modal's title says `whole file` because of
+        /// it.
+        ///
+        /// `None` on a collapsed row that was never expanded: there is nothing the scan
+        /// counted, and the export then prints no summary line (verifier (a) F2).
+        summary: Option<FlagSummary>,
     },
 }
 
@@ -427,14 +643,40 @@ impl FlagTarget {
     }
 
     /// The modal's first line, and the words the status line uses for the flag afterwards:
-    /// `f1 · hunk 2 of 3` or `f1 (file)`.
+    /// `f1 · hunk 2 of 3` or `f1 · whole file`.
+    ///
+    /// `whole file` and not `(file)`: it is the same phrase the export's header uses, so
+    /// what the reviewer saw when they raised the flag and what the agent reads are one
+    /// wording (ruling P4).
     pub fn label(&self) -> String {
         let lossy = String::from_utf8_lossy(self.path()).into_owned();
         match self {
             FlagTarget::Hunk { hunk, of, .. } => {
                 format!("{lossy} · hunk {} of {of}", hunk.index + 1)
             }
-            FlagTarget::File { .. } => format!("{lossy} (file)"),
+            FlagTarget::File { .. } => format!("{lossy} · whole file"),
+        }
+    }
+
+    /// The note modal's border title: ` flag hunk 2 of 3 ` / ` flag whole file `.
+    ///
+    /// The title names the target so the question "what am I about to flag?" is answered by
+    /// the frame of the box, not only by a line inside it that a long path can crowd.
+    pub fn modal_title(&self) -> String {
+        match self {
+            FlagTarget::Hunk { hunk, of, .. } => {
+                format!(" flag hunk {} of {of} ", hunk.index + 1)
+            }
+            FlagTarget::File { .. } => " flag whole file ".to_owned(),
+        }
+    }
+
+    /// The shape a whole-file flag covers; `None` for a hunk flag, which quotes its lines
+    /// instead, and `None` for a collapsed row that was never expanded (F2).
+    pub fn summary(&self) -> Option<FlagSummary> {
+        match self {
+            FlagTarget::Hunk { .. } => None,
+            FlagTarget::File { summary, .. } => *summary,
         }
     }
 
@@ -459,13 +701,23 @@ impl FlagTarget {
     }
 }
 
-/// The note modal: what is being flagged, and the note as typed so far.
+/// The note modal: what is being flagged, and the note being typed.
+///
+/// The note lives in the same [`TextBuf`] the inline editor uses (deliverable 5), so every
+/// motion the buffer knows — word jumps, `Ctrl-A`/`Ctrl-E`, `Ctrl-K`, page keys — works
+/// here without the modal implementing any of them, and a note longer than the box scrolls
+/// through the buffer's own viewport.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NoteEntry {
     pub target: FlagTarget,
-    pub text: String,
-    /// Insertion point as a **byte** offset into `text`, always on a char boundary.
-    pub cursor: usize,
+    pub buf: TextBuf,
+}
+
+impl NoteEntry {
+    /// The note as it will be written.
+    pub fn text(&self) -> String {
+        self.buf.text()
+    }
 }
 
 /// The agent picker: which pane the export goes to when more than one is a candidate. The
@@ -506,6 +758,12 @@ pub enum FlagKind {
 pub enum ConfirmScope {
     Accept(AcceptScope),
     Restore(RestoreScope),
+    /// `Esc` on a dirty inline editor (deliverable 8): `y` throws the buffer away and
+    /// closes, `n` goes back to it. The only scope that runs no engine op at all — what it
+    /// guards is unwritten text, which lives nowhere but the buffer behind the modal.
+    Discard {
+        path: Vec<u8>,
+    },
 }
 
 /// The confirm modal. Only the scope is stored: an accept's numbers are recomputed from the
@@ -534,6 +792,32 @@ pub const ACCEPT_IN_PROGRESS: &str = "accept in progress";
 pub const NOTHING_TO_ACCEPT: &str = "nothing to accept";
 pub const RESTORE_IN_PROGRESS: &str = "restore in progress";
 pub const NOTHING_TO_RESTORE: &str = "nothing to restore";
+/// What `shift-i` says on a row there is no file to open (deliverable 7).
+pub const NOT_EDITABLE: &str = "not editable";
+
+/// The copy cue's text, and how long it stays up. Two seconds is long enough to read and
+/// short enough that a reader who copied twice sees the second one arrive.
+pub const COPIED: &str = "copied to clipboard";
+pub const CUE_SECS: u64 = 2;
+
+/// A selection the terminal would not take whole. It names the size because the only thing
+/// the reader can do about it is select less, and they need to know by how much.
+pub fn too_large_text(bytes: usize) -> String {
+    format!(
+        "selection too large to copy ({} KiB; the terminal would drop it)",
+        bytes.div_ceil(1024)
+    )
+}
+/// What the status says when the engine will not hand the inline editor the file's bytes
+/// (deliverable 8): the reason, and the key that *can* open it anyway.
+pub fn use_shift_i(why: &str) -> String {
+    format!("use shift-i: {why}")
+}
+/// A save refused because the file moved under the editor: the buffer is still there, and
+/// the two keys that get the reader out of it are spelled out (deliverable 8).
+pub fn save_refused_text(path: &str) -> String {
+    format!("{path}: changed since you opened it; not saved — Esc, then i to reload")
+}
 
 /// How long a status notice stays on the status line before the key hints return.
 pub const STATUS_TTL: Duration = Duration::from_secs(30);
@@ -549,6 +833,10 @@ pub type RestoreResult = Result<Restored, AcceptFailed>;
 
 /// One root's flag (or unflag) result, on the same terms.
 pub type FlagResult = Result<Flagged, AcceptFailed>;
+
+/// The inline editor's save result (deliverable 8), classified like an accept's: a save is
+/// an op on one root's ledger and fails for the same two reasons.
+pub type SaveResult = Result<Saved, AcceptFailed>;
 
 /// Why one root's accept failed.
 ///
@@ -574,6 +862,37 @@ impl AcceptFailed {
     }
 }
 
+/// A live line selection in the diff pane (deliverable 9): both ends are **absolute diff
+/// line indices** into [`App::view_hunks`], and either may be the larger.
+///
+/// The anchor is where the selection started — the `v` keypress, or the mouse press — and
+/// the cursor is where it has been dragged or scrolled to. Keeping them unordered is what
+/// lets a reader select upwards and then back down through the anchor without the range
+/// jumping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sel {
+    pub anchor: usize,
+    pub cursor: usize,
+}
+
+impl Sel {
+    /// `(first, last)`, inclusive and in screen order.
+    pub fn range(&self) -> (usize, usize) {
+        (self.anchor.min(self.cursor), self.anchor.max(self.cursor))
+    }
+}
+
+/// A short-lived message over the diff pane, independent of the status line (deliverable
+/// 9). The status line is the record of what the *engine* did; a copy is a thing the
+/// terminal did, and overwriting an accept's or a refusal's status with it would lose the
+/// more important of the two.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cue {
+    pub text: String,
+    /// Cleared by the first `Tick` at or after this instant.
+    pub until: Instant,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct App {
     pub roots: BTreeMap<PathBuf, RootView>,
@@ -591,6 +910,21 @@ pub struct App {
     /// clamp in `render_nav` handles a list that shrank underneath it.
     pub nav_top: usize,
     pub dragging: bool,
+    /// The live line selection in the diff pane, if any (deliverable 9). Cleared by `Esc`,
+    /// by a copy, and by anything that changes which row the diff is showing.
+    pub sel: Option<Sel>,
+    /// The diff line a **mouse press** landed on, while the button is still down: the
+    /// anchor a `Drag` would extend from, and the answer to "where did this drag start?"
+    /// that keeps a divider drag a divider drag (design review F13). `None` for a press
+    /// anywhere else, which is why a drag over the nav selects nothing.
+    pub press_line: Option<usize>,
+    /// Whether a `Drag` has reached a different line since that press. A press and a
+    /// release with nothing in between is a click, not a zero-length copy — including when
+    /// the two arrive in one drained pass, because this is state and not a comparison of
+    /// timestamps.
+    pub drag_moved: bool,
+    /// The copy cue, if one is up.
+    pub cue: Option<Cue>,
     pub full_paths: bool,
     pub show_remote: bool,
     pub help: bool,
@@ -617,6 +951,22 @@ pub struct App {
     pub note: Option<NoteEntry>,
     /// The agent picker, if open (deliverable 10).
     pub picker: Option<Picker>,
+    /// The inline editor, if open (deliverable 8). While it is, it replaces the diff pane
+    /// and swallows every key the confirm modal above it does not take — `q` included, so
+    /// a keymap letter types itself (F16).
+    pub editor: Option<Editor>,
+    /// The generation of the last [`Effect::EditInline`] issued, and whether its answer is
+    /// still the one to honour (verifier (b) F2).
+    ///
+    /// The read runs off the UI task, so `i` pressed twice in one burst — key repeat, a
+    /// pasted `ii`, a second press while a slow disk answers the first — used to produce
+    /// two reads whose answers both opened an editor, the second one throwing away
+    /// whatever the reader had typed into the first. `edit_pending` is `Some(gen)` from the
+    /// press until its answer lands: a press while it is set asks for nothing, and an
+    /// answer whose `generation` is not the pending one is dropped.
+    pub edit_pending: Option<u64>,
+    /// Monotonic counter behind [`App::edit_pending`]; every open gets its own number.
+    pub edit_gen: u64,
     /// The confirm modal, if open: every action but `Tick`/`Resize`/`Confirm`/`Cancel`/
     /// `Quit` is ignored while it is (`Quit` passes as it does through the help overlay:
     /// `q` and ctrl-c quit by default, everywhere).
@@ -624,6 +974,8 @@ pub struct App {
     /// Everything herdr says, and the local ack episodes (Phase 5). Socket-free: the
     /// reducer never sees the client's own types.
     pub herdr: HerdrView,
+    /// The launch hold, until every root has reported. See [`Loading`].
+    pub loading: Option<Loading>,
     /// The one collapsed row whose hunks `e` fetched, if any. A view, never a baseline;
     /// see [`Expansion`].
     pub expanded: Option<Expansion>,
@@ -631,6 +983,13 @@ pub struct App {
     /// Seeded from the defaults; worker 3b replaces it after `Keymap::from_config` so the
     /// hint line and the help overlay show the user's own bindings.
     pub keymap: Vec<(String, Vec<String>)>,
+    /// Whether this terminal reports the kitty keyboard protocol, asked once by
+    /// [`super::term::enter`] and set by the loop before the first frame (ruling P9).
+    ///
+    /// It changes exactly two things: `Shift-Enter` is a newline in the note modal, and the
+    /// modal's key line says so. `false` — the default, and what every terminal that does
+    /// not answer gets — promises `Ctrl-J` alone, which always works.
+    pub enhanced: bool,
 }
 
 impl Default for App {
@@ -649,6 +1008,10 @@ impl App {
             nav_width: NAV_WIDTH_DEFAULT,
             nav_top: 0,
             dragging: false,
+            sel: None,
+            press_line: None,
+            drag_moved: false,
+            cue: None,
             full_paths: false,
             show_remote: false,
             help: false,
@@ -662,11 +1025,16 @@ impl App {
             restoring: None,
             note: None,
             picker: None,
+            editor: None,
+            edit_pending: None,
+            edit_gen: 0,
             confirm: None,
             herdr: HerdrView::default(),
+            loading: None,
             expanded: None,
             // The canonical spellings (`shift-a` shows as `A`), as `Keymap::table` gives.
             keymap: Keymap::defaults().table(),
+            enhanced: false,
         }
     }
 
@@ -685,12 +1053,54 @@ impl App {
     /// it survives the active workspace scope (deliverable 8). `working`/`idle`/`unknown`
     /// never list a root by themselves; they annotate one already listed.
     pub fn is_listed(&self, view: &RootView) -> bool {
-        self.herdr.in_scope(&view.meta.path)
+        self.loading.is_none()
+            && !self.herdr.scope_pending
+            && self.herdr.in_scope(&view.meta.path)
             && (view.listed()
                 || self
                     .herdr
                     .flag(&view.meta.path)
                     .is_some_and(|f| f.attention()))
+    }
+
+    /// Begin the launch hold over the roots `sync_roots` just installed (see [`Loading`]).
+    /// With no roots there is nothing to wait for.
+    pub fn start_loading(&mut self) {
+        self.loading = (!self.roots.is_empty()).then(|| Loading {
+            started: self.now,
+            checked: BTreeMap::new(),
+        });
+    }
+
+    /// One root has reported during the hold; the hold ends when every known root has.
+    /// `Changed::Yes` while the hold is on (the pane counts), `No` once it is over.
+    fn root_reported(&mut self, root: PathBuf, rows: usize) -> Changed {
+        let Some(loading) = &mut self.loading else {
+            return Changed::No;
+        };
+        loading.checked.insert(root, rows);
+        if self.roots.keys().all(|r| loading.checked.contains_key(r)) {
+            self.end_loading();
+        }
+        Changed::Yes
+    }
+
+    /// End the launch hold: list the roots.
+    fn end_loading(&mut self) {
+        if self.loading.take().is_some() {
+            self.reconcile_selection();
+        }
+    }
+
+    /// The scope verdict is in (any verdict — see `HerdrView::scope_pending`): list the
+    /// roots. `Changed::Yes` only when something was being held back.
+    pub fn scope_settled(&mut self) -> Changed {
+        if !self.herdr.scope_pending {
+            return Changed::No;
+        }
+        self.herdr.scope_pending = false;
+        self.reconcile_selection();
+        Changed::Yes
     }
 
     /// Roots the active scope hides that would otherwise be listed: the `N` of the
@@ -893,7 +1303,12 @@ impl App {
     /// Fold one engine event in. `Head` and `RootsChanged` ask the loop for `SyncRoots`.
     pub fn apply(&mut self, event: EngineEvent) -> (Changed, Option<Effect>) {
         match event {
-            EngineEvent::Pile { root, seq, pile } => (self.apply_pile(root, seq, pile), None),
+            EngineEvent::Pile { root, seq, pile } => {
+                let rows = pile.rows.len();
+                let changed = self.apply_pile(root.clone(), seq, pile);
+                (changed.or(self.root_reported(root, rows)), None)
+            }
+            EngineEvent::Scanned { root, rows } => (self.root_reported(root, rows), None),
             EngineEvent::Head {
                 root,
                 from,
@@ -932,6 +1347,16 @@ impl App {
                 (result, effect)
             }
             EngineEvent::Notice { root, text } => {
+                match &root {
+                    // A failed scan is still that root's report.
+                    Some(r) if text.starts_with("scan failed") => {
+                        self.root_reported(r.clone(), 0);
+                    }
+                    // Every global notice comes after the initial scans (`watching …`,
+                    // `watch installation failed`): whatever has not reported never will.
+                    None => self.end_loading(),
+                    Some(_) => {}
+                }
                 let text = match root.and_then(|r| self.roots.get(&r).map(|v| v.meta.name.clone()))
                 {
                     Some(name) => format!("{name}: {text}"),
@@ -958,6 +1383,13 @@ impl App {
         if view.pile == pile {
             return Changed::No;
         }
+        tracing::debug!(
+            root = %view.meta.name,
+            seq,
+            rows = pile.rows.len(),
+            was = view.pile.rows.len(),
+            "pile"
+        );
         let fresh = pile
             .notices
             .iter()
@@ -1174,6 +1606,9 @@ impl App {
                     out.push((root.clone(), AcceptRequest::All(view.pile.clone())));
                 }
             }
+            AcceptScope::Bless { root, rendered, .. } => {
+                out.push((root.clone(), AcceptRequest::File((**rendered).clone())));
+            }
             AcceptScope::All => {
                 // "Every listed root" is the nav's own rule (deliverable 8): a root the
                 // active scope hides is not on screen, so accept-all never touches it.
@@ -1203,7 +1638,9 @@ impl App {
             counts.roots.push(self.root_name(root));
         };
         match scope {
-            AcceptScope::Hunk { root, path, .. } | AcceptScope::File { root, path, .. } => {
+            AcceptScope::Hunk { root, path, .. }
+            | AcceptScope::File { root, path, .. }
+            | AcceptScope::Bless { root, path, .. } => {
                 if let Some(row) = self.roots.get(root).and_then(|v| v.row(path)) {
                     tally(root, &[row]);
                 }
@@ -1233,7 +1670,7 @@ impl App {
             ConfirmScope::Accept(ref scope) => Some(self.counts_of(scope)),
             // A restore covers one row: there is nothing to tally, and the modal's rows
             // come from the scope itself (F11).
-            ConfirmScope::Restore(_) => None,
+            ConfirmScope::Restore(_) | ConfirmScope::Discard { .. } => None,
         }
     }
 
@@ -1241,8 +1678,104 @@ impl App {
     pub fn confirm_restore(&self) -> Option<&RestoreScope> {
         match self.confirm.as_ref()?.scope {
             ConfirmScope::Restore(ref scope) => Some(scope),
-            ConfirmScope::Accept(_) => None,
+            ConfirmScope::Accept(_) | ConfirmScope::Discard { .. } => None,
         }
+    }
+
+    /// The buffer the confirm modal is asking to throw away, if it is asking that
+    /// (deliverable 8), on the same terms as [`App::confirm_restore`].
+    pub fn confirm_discard(&self) -> Option<&[u8]> {
+        match self.confirm.as_ref()?.scope {
+            ConfirmScope::Discard { ref path } => Some(path),
+            _ => None,
+        }
+    }
+
+    /// The blessing the confirm modal is asking about, if it is asking about one: the path
+    /// the `$EDITOR` session changed. Kept beside [`App::confirm_restore`] so `render_confirm`
+    /// asks one question per shape and never matches the scope enum itself.
+    pub fn confirm_bless(&self) -> Option<&[u8]> {
+        match self.confirm.as_ref()?.scope {
+            ConfirmScope::Accept(AcceptScope::Bless { ref path, .. }) => Some(path),
+            _ => None,
+        }
+    }
+
+    /// The `$EDITOR` child exited and the path was rehashed: decide what the session meant
+    /// (deliverable 3; ruling P1 = Amendment v1.8).
+    ///
+    /// lastcall cannot tell who wrote the bytes — the user's editor, or an agent that wrote
+    /// while the editor had the terminal — so a *changed* file is never blessed silently:
+    /// it opens the confirm, and the user, who knows whether they saved, answers it. That
+    /// confirm is what makes the blessing an admissible exception to invariant 3 ("accept is
+    /// metadata-only and never a fresh read"): the answer, not the read, is the review.
+    ///
+    /// Everything else writes nothing:
+    /// - **unchanged** (the same oid *and* mode) — the usual outcome of a look-and-quit, and
+    ///   of every non-waiting editor (`code` without `--wait`), whose later save arrives as
+    ///   an ordinary pending row;
+    /// - **gone**, **a symlink**, or **unhashable** on return — there is no content to
+    ///   bless, and the row stays pending with the reason on the status line;
+    /// - **another modal is already open** (a confirm, the note, the agent picker) — the
+    ///   question would replace one the user is reading, so it is not asked at all.
+    pub fn editor_returned(
+        &mut self,
+        root: PathBuf,
+        rendered: Rendered,
+        live: Current,
+    ) -> (Changed, Option<Effect>) {
+        let path = String::from_utf8_lossy(&rendered.path).into_owned();
+        let (oid, mode) = match live {
+            Current::Absent => {
+                self.set_status(format!("{path}: deleted on return; left pending"));
+                return (Changed::Yes, None);
+            }
+            // `hash_path` phrases these: `not a regular file` for a fifo or socket,
+            // `typechange: a directory where a file was`, an `EACCES` message. Each is a
+            // reason a reader can act on, so it is passed through rather than flattened.
+            Current::Unhashable(why) => {
+                self.set_status(format!("{path}: {why} on return; left pending"));
+                return (Changed::Yes, None);
+            }
+            // A symlink hashes fine — it is its target's bytes — but it is not a file the
+            // editor edited in place, so it takes the same sentence a fifo does.
+            Current::Present {
+                mode: Mode::Symlink,
+                ..
+            } => {
+                self.set_status(format!(
+                    "{path}: not a regular file on return; left pending"
+                ));
+                return (Changed::Yes, None);
+            }
+            Current::Present { oid, mode } => (oid, mode),
+        };
+        if rendered.oid.as_ref() == Some(&oid) && rendered.mode == Some(mode) {
+            self.set_status("no change");
+            return (Changed::Yes, None);
+        }
+        // Another question is already on screen. The return arrives on a channel, so a
+        // confirm the user opened between the resume and the reply (or a note, or the agent
+        // picker) would be silently replaced and the next `y` would answer *this* question
+        // instead of the one they read — verifier (a) F1. The row keeps the editor's delta,
+        // so the edit is not lost: it is reviewed as an ordinary pending row.
+        if self.confirm.is_some() || self.note.is_some() || self.picker.is_some() {
+            self.set_status(format!("{path}: changed on return; left pending"));
+            return (Changed::Yes, None);
+        }
+        let live_rendered = Rendered {
+            oid: Some(oid),
+            mode: Some(mode),
+            ..rendered
+        };
+        self.confirm = Some(Confirm {
+            scope: ConfirmScope::Accept(AcceptScope::Bless {
+                root,
+                path: live_rendered.path.clone(),
+                rendered: Box::new(live_rendered),
+            }),
+        });
+        (Changed::Yes, None)
     }
 
     fn group_rows(&self, root: &Path, kind: Annotation) -> Vec<&Row> {
@@ -1335,7 +1868,371 @@ impl App {
                 });
             }
         }
-        Some(FlagTarget::File { root, path })
+        // The shape travels with a whole-file flag because the export has no diff to show
+        // (ruling P4): the counts are the row's as rendered, taken now, for the same reason
+        // `of` is (F14).
+        //
+        // Except on a collapsed row nobody expanded: it has no hunks to count, and on a
+        // Binary row the `+a −d` are not line counts of anything the scan diffed. A summary
+        // there would tell the agent a changed file has zero hunks, which is a claim about
+        // the file rather than about lastcall's view of it — so there is no summary and the
+        // export prints no summary line (verifier (a) F2).
+        let counted = row.collapsed.is_none() || self.expansion().is_some();
+        Some(FlagTarget::File {
+            root,
+            path,
+            summary: counted.then_some(FlagSummary {
+                hunks: content,
+                added: row.added,
+                deleted: row.deleted,
+            }),
+        })
+    }
+
+    /// What `shift-i` (and, in deliverable 8, `i`) would open: the selected row and the
+    /// **one-based line** an editor should land on inside it.
+    ///
+    /// The row is the one the user is looking at and the line is the one they are looking
+    /// at inside it: with the diff focused and a content hunk under the cursor, that hunk's
+    /// [`Hunk::editor_line`] — the first line the agent actually changed, never
+    /// `new_range.start + 1`, which is three lines of leading context above it (design
+    /// review F9). From the nav, and from a diff cursor parked on the synthetic mode hunk
+    /// (there is no text in it to open at), the row's **first content** hunk; a row with no
+    /// content hunk at all — a collapsed file nobody expanded, a binary row — opens at
+    /// line 1, which is the honest answer for "somewhere in this file".
+    ///
+    /// `None` on the three rows there is no file to open: a **deletion** (the path is gone
+    /// — restoring it is `u`, not an editor), a **symlink** (opening it would edit its
+    /// target, which is a different file from the one the row is about) and a path whose
+    /// bytes are **not UTF-8** (the argv handed to the editor is built from it, and a byte
+    /// string that is not text is not something to hand a process blind). The caller says
+    /// [`NOT_EDITABLE`]; deliverable 8's own refusals are the engine's, and say more.
+    pub fn edit_target(&self) -> Option<(PathBuf, Rendered, usize)> {
+        let Selection::Row(root, path) = self.selection.clone()? else {
+            return None;
+        };
+        let row = self.roots.get(&root)?.row(&path)?;
+        if row.change == Change::Deleted {
+            return None;
+        }
+        if !matches!(
+            row.current.as_ref().map(|e| e.mode),
+            Some(Mode::Regular) | Some(Mode::Executable)
+        ) {
+            return None;
+        }
+        if std::str::from_utf8(&path).is_err() {
+            return None;
+        }
+        let line = self.edit_hunk().map_or(1, |h| h.editor_line());
+        Some((root, Rendered::of(row), line))
+    }
+
+    /// The content hunk an editor key opens at: the one under the diff cursor when the diff
+    /// has focus, else the row's first — the choice deliverable 7 made for the `$EDITOR`
+    /// line, shared with deliverable 8 so `i` and `shift-i` can never land on two different
+    /// hunks of one row. The synthetic mode hunk is never it: there is no text in it.
+    fn edit_hunk(&self) -> Option<&Hunk> {
+        let hunks = self.view_hunks();
+        let under_cursor = (self.effective_focus() == Focus::Diff)
+            .then(|| hunks.get(self.diff.hunk.min(hunks.len().saturating_sub(1))))
+            .flatten()
+            .filter(|h| !h.is_mode_change());
+        under_cursor.or_else(|| hunks.iter().find(|h| !h.is_mode_change()))
+    }
+
+    /// `i`: ask the loop for the row's live bytes, so the inline editor can open on them.
+    ///
+    /// Nothing is drawn on the way out — the read is one `lstat` and one file read off the
+    /// UI task — and the marks and the band are computed **here**, from the pile that is on
+    /// screen, so the editor that opens describes the file the reader was looking at.
+    ///
+    /// One open at a time (verifier (b) F2). An editor that is already up swallows `i` as
+    /// text, so the first arm is defence for a caller that is not the keymap; the second is
+    /// the one that fires — a second press while the first read is still in flight asks for
+    /// nothing, because the editor it would open is the editor about to open. Neither says
+    /// anything: the reader is looking at the buffer they asked for either way.
+    fn edit_inline(&mut self) -> (Changed, Option<Effect>) {
+        if !matches!(self.selection, Some(Selection::Row(..))) {
+            return (Changed::No, None);
+        }
+        if self.editor.is_some() || self.edit_pending.is_some() {
+            return (Changed::No, None);
+        }
+        let Some((root, rendered, line)) = self.edit_target() else {
+            self.set_status(NOT_EDITABLE);
+            return (Changed::Yes, None);
+        };
+        let mut marks: Vec<usize> = self
+            .view_hunks()
+            .iter()
+            .filter(|h| !h.is_mode_change())
+            .flat_map(|h| h.new_range.clone())
+            .collect();
+        marks.sort_unstable();
+        marks.dedup();
+        let band = self
+            .edit_hunk()
+            .filter(|h| !h.new_range.is_empty())
+            .map(|h| (h.new_range.start, h.new_range.end - 1));
+        self.edit_gen += 1;
+        self.edit_pending = Some(self.edit_gen);
+        (
+            Changed::No,
+            Some(Effect::EditInline(EditOpen {
+                root,
+                rendered,
+                line,
+                marks,
+                band,
+                generation: self.edit_gen,
+            })),
+        )
+    }
+
+    /// The engine answered [`Effect::EditInline`]: open the editor on the bytes, or say why
+    /// this file will not go in a buffer (deliverable 8).
+    ///
+    /// A [`Refused::NotEditable`] prints its `why` on its own and names the key that opens
+    /// the file anyway — `use shift-i: binary` — because "no" is only half an answer when
+    /// there is a second way in. Every other refusal is the CAS speaking, and says so in
+    /// the vocabulary every other refused op uses.
+    ///
+    /// An answer to an open that is no longer the pending one is dropped without a word
+    /// (verifier (b) F2): it would open an editor over the one the reader is typing in, or
+    /// print the refusal of a file they have stopped asking about.
+    pub fn edit_read(
+        &mut self,
+        open: EditOpen,
+        result: Result<Vec<u8>, Refused>,
+    ) -> (Changed, Option<Effect>) {
+        if self.edit_pending != Some(open.generation) {
+            return (Changed::No, None);
+        }
+        self.edit_pending = None;
+        let text = match result {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(text) => text,
+                // The engine already refused non-UTF-8; this is the belt to that braces, and
+                // it says the same thing the engine would have.
+                Err(_) => {
+                    self.set_status(use_shift_i("binary"));
+                    return (Changed::Yes, None);
+                }
+            },
+            Err(Refused::NotEditable { why, .. }) => {
+                self.set_status(use_shift_i(&why));
+                return (Changed::Yes, None);
+            }
+            Err(r) => {
+                self.set_status(r.message("opened"));
+                return (Changed::Yes, None);
+            }
+        };
+        let buf = TextBuf::open(&text, open.line);
+        let last = buf.line_count() - 1;
+        let mut marks = open.marks;
+        marks.retain(|m| *m <= last);
+        let band = open
+            .band
+            .filter(|(a, _)| *a <= last)
+            .map(|(a, b)| (a, b.min(last)));
+        self.editor = Some(Editor {
+            root: open.root,
+            rendered: open.rendered,
+            buf,
+            marks,
+            band,
+            line_at_open: open.line,
+            saving: false,
+            alarm: false,
+        });
+        self.clamp_editor();
+        (Changed::Yes, None)
+    }
+
+    /// One keystroke inside the inline editor.
+    ///
+    /// Every key clears the red header a refused save left: the reader has seen it. The
+    /// buffer owns the text, the cursor and the scroll; this owns the marks, which have to
+    /// be told what the edit did to the line numbering — [`Editor::shift`] — and the
+    /// clamp, which is the reducer's because the renderer may not move what it draws.
+    fn editor_key(&mut self, key: EditorKey) -> (Changed, Option<Effect>) {
+        let page = self.page_rows();
+        let Some(ed) = self.editor.as_mut() else {
+            return (Changed::No, None);
+        };
+        let seen = std::mem::replace(&mut ed.alarm, false);
+        let mut changed = Changed::from(seen);
+        match key {
+            EditorKey::Edit(edit) => {
+                let (lines_before, at_before) = (ed.buf.line_count(), ed.buf.cursor.line);
+                let moved = ed.buf.apply(edit, page);
+                let delta = ed.buf.line_count() as isize - lines_before as isize;
+                // The edit's line is the *higher* of the two the caret sat on: a backspace
+                // that joins two lines leaves the caret on the first, an inserted newline on
+                // the second, and in both cases everything strictly below that line moved.
+                ed.shift(at_before.min(ed.buf.cursor.line), delta);
+                changed = changed.or(Changed::from(moved));
+                self.clamp_editor();
+                (changed, None)
+            }
+            EditorKey::Click(dy, dx) => {
+                let (line, col) = (ed.buf.top + dy as usize, ed.buf.left + dx as usize);
+                ed.buf.click(line, col);
+                self.clamp_editor();
+                (Changed::Yes, None)
+            }
+            EditorKey::Scroll(delta) => {
+                let key = if delta < 0 {
+                    EditKey::Up
+                } else {
+                    EditKey::Down
+                };
+                let mut moved = false;
+                for _ in 0..delta.unsigned_abs() {
+                    moved |= ed.buf.apply(key.clone(), page);
+                }
+                changed = changed.or(Changed::from(moved));
+                self.clamp_editor();
+                (changed, None)
+            }
+            EditorKey::Save => {
+                if ed.saving {
+                    return (changed, None);
+                }
+                ed.saving = true;
+                let effect = Effect::Save {
+                    root: ed.root.clone(),
+                    rendered: ed.rendered.clone(),
+                    bytes: ed.buf.text().into_bytes(),
+                };
+                (Changed::Yes, Some(effect))
+            }
+            EditorKey::Close => {
+                if ed.buf.dirty() {
+                    let path = ed.rendered.path.clone();
+                    self.confirm = Some(Confirm {
+                        scope: ConfirmScope::Discard { path },
+                    });
+                } else {
+                    self.editor = None;
+                }
+                (Changed::Yes, None)
+            }
+        }
+    }
+
+    /// The columns the editor's text has, from the size the last `Resize` reported: the
+    /// frame minus the nav, its borders and the line-number gutter.
+    ///
+    /// The renderer lays out from the frame's own area and this from `App::size`, which are
+    /// the same rectangle — the loop feeds both from one resize event — so the window the
+    /// reducer clamps to is the window the reader sees.
+    fn editor_cols(&self) -> usize {
+        let inner = if self.nav_visible() {
+            let w = self.nav_width.min(self.size.0.saturating_sub(20));
+            self.size.0.saturating_sub(w + 1)
+        } else {
+            self.size.0.saturating_sub(2)
+        };
+        usize::from(inner).saturating_sub(EDITOR_GUTTER).max(1)
+    }
+
+    /// Scroll the editor's buffer so the caret is inside the window (F19). Called after
+    /// every key and every resize; `render_editor` then draws the window as it stands.
+    fn clamp_editor(&mut self) {
+        let (rows, cols) = (self.page_rows(), self.editor_cols());
+        if let Some(ed) = self.editor.as_mut() {
+            ed.buf.viewport(rows, cols, Wrap::None);
+        }
+    }
+
+    /// The loop's answer to an [`Effect::Save`] (deliverable 8; gate item 1 through the UI).
+    ///
+    /// A clean save is the whole point of the phase: the pile that comes back has the row
+    /// **gone** (the override is the bytes that were just written), the editor closes, and
+    /// the §6.7 advance rule moves the selection off the row exactly as an accept would.
+    ///
+    /// Every other answer keeps the buffer: a `Moved` means an agent wrote the file while
+    /// the reader was typing, and throwing their text away to show them that would be the
+    /// worst possible reading of "not saved" — so the buffer stays, the header goes red
+    /// until the next key, and the status spells out the two keys that reload the file
+    /// (F17 for the errors, which keep it for the same reason).
+    pub fn saved(&mut self, root: PathBuf, path: Vec<u8>, result: SaveResult) -> Changed {
+        let mine = self
+            .editor
+            .as_ref()
+            .is_some_and(|e| e.rendered.path == path && e.root == root);
+        if mine && let Some(ed) = self.editor.as_mut() {
+            ed.saving = false;
+        }
+        let before = self.selection.clone();
+        let name = String::from_utf8_lossy(&path).into_owned();
+        match result {
+            Ok(Saved {
+                outcome, seq, pile, ..
+            }) => {
+                let refused = outcome.refused.first().cloned();
+                self.apply_pile(root.clone(), seq, pile);
+                match refused {
+                    None => {
+                        if mine {
+                            self.editor = None;
+                        }
+                        self.advance_after(
+                            &AcceptScope::File {
+                                root,
+                                path,
+                                deleted: false,
+                            },
+                            before,
+                            true,
+                        );
+                        self.set_status(format!("saved {name}"));
+                    }
+                    Some(Refused::Moved { .. }) => {
+                        if let Some(ed) = self.editor.as_mut() {
+                            ed.alarm = true;
+                        }
+                        self.set_status(save_refused_text(&name));
+                    }
+                    Some(other) => self.set_status(other.message("saved")),
+                }
+            }
+            Err(AcceptFailed::LedgerBusy) => self.set_status(format!(
+                "ledger busy in {} — try again",
+                self.root_name(&root)
+            )),
+            Err(AcceptFailed::Other(e)) => {
+                self.set_status(format!("{}: {e}", self.root_name(&root)))
+            }
+        }
+        Changed::Yes
+    }
+
+    /// `shift-i`: hand the loop the suspend-and-open sequence, or say why there is nothing
+    /// to open. Nothing is drawn on the way out — the next frame the user sees is either
+    /// their editor or the resumed TUI — so a row that *can* be opened returns
+    /// [`Changed::No`] and lets the loop's own status line speak on resume.
+    fn edit_external(&mut self) -> (Changed, Option<Effect>) {
+        if !matches!(self.selection, Some(Selection::Row(..))) {
+            return (Changed::No, None);
+        }
+        match self.edit_target() {
+            Some((root, rendered, line)) => (
+                Changed::No,
+                Some(Effect::EditExternal {
+                    root,
+                    rendered,
+                    line,
+                }),
+            ),
+            None => {
+                self.set_status(NOT_EDITABLE);
+                (Changed::Yes, None)
+            }
+        }
     }
 
     /// `m`: open the note modal on what `flag_target` names.
@@ -1345,40 +2242,24 @@ impl App {
         };
         self.note = Some(NoteEntry {
             target,
-            text: String::new(),
-            cursor: 0,
+            buf: TextBuf::from(""),
         });
         (Changed::Yes, None)
     }
 
     /// One keystroke inside the note modal. Enter is the only exit that writes.
+    ///
+    /// Every edit goes to the buffer, which owns the cursor and the scroll: the modal has
+    /// no text state of its own beyond it. A key the buffer answers "nothing moved" to is
+    /// not a frame — `Home` at the start of a line redraws nothing.
     fn note_key(&mut self, key: NoteKey) -> (Changed, Option<Effect>) {
         let Some(entry) = self.note.as_mut() else {
             return (Changed::No, None);
         };
         match key {
-            NoteKey::Insert(text) => {
-                entry.text.insert_str(entry.cursor, &text);
-                entry.cursor += text.len();
-                (Changed::Yes, None)
-            }
-            NoteKey::Newline => {
-                entry.text.insert(entry.cursor, '\n');
-                entry.cursor += 1;
-                (Changed::Yes, None)
-            }
-            NoteKey::Backspace => {
-                let cut = entry.text[..entry.cursor]
-                    .chars()
-                    .next_back()
-                    .map(char::len_utf8)
-                    .unwrap_or(0);
-                if cut == 0 {
-                    return (Changed::No, None);
-                }
-                entry.cursor -= cut;
-                entry.text.remove(entry.cursor);
-                (Changed::Yes, None)
+            NoteKey::Edit(edit) => {
+                let moved = entry.buf.apply(edit, NOTE_PAGE);
+                (Changed::from(moved), None)
             }
             NoteKey::Cancel => {
                 self.note = None;
@@ -1391,8 +2272,9 @@ impl App {
                 let effect = Effect::Flag {
                     root: entry.target.root().to_path_buf(),
                     path: entry.target.path().to_vec(),
-                    note: entry.text,
+                    note: entry.text(),
                     hunk: entry.target.rendered_hunk(),
+                    summary: entry.target.summary(),
                     label: entry.target.status_label(),
                 };
                 (Changed::Yes, Some(effect))
@@ -1757,6 +2639,10 @@ impl App {
                 let suffix = if *deleted { " (deleted)" } else { "" };
                 format!("accepted {}{suffix}", lossy(path))
             }
+            // The blessing says `reviewed`, not `accepted`: what was marked seen is the
+            // content the user's own editor session left, which is the whole point of the
+            // confirm they just answered (ruling P1).
+            AcceptScope::Bless { path, .. } => format!("reviewed {}", lossy(path)),
             AcceptScope::Group { kind, .. } => format!(
                 "accepted {} · {}",
                 annotation_name(*kind),
@@ -1865,6 +2751,9 @@ impl App {
         }
         self.selection = next;
         self.diff = DiffCursor::default();
+        // A selection is a range of *this* row's diff lines; the moment the row changes the
+        // range means nothing, so it goes rather than pointing at another file's text.
+        self.sel = None;
         self.drop_stale_expansion();
         Changed::Yes
     }
@@ -1947,6 +2836,36 @@ impl App {
         Changed::Yes
     }
 
+    /// Move a live selection's far end `delta` lines and scroll only as far as it takes to
+    /// keep that end on screen.
+    ///
+    /// This is what `nav_up`/`nav_down`/`page` do while a selection is running, in place of
+    /// [`Self::scroll_by`]. The diff pane has no per-line cursor of its own — its cursor
+    /// *is* the first visible line — and moving that as the selection grew would push the
+    /// lines being selected off the top of the pane, one per keystroke. So while `v` is
+    /// live the selection's own end is the cursor, and `v j j y` copies the three lines the
+    /// reader can see.
+    fn move_sel_cursor(&mut self, delta: isize) -> Changed {
+        let (Some(sel), rows) = (self.sel, self.page_rows()) else {
+            return Changed::No;
+        };
+        let max = diff_lines(self.view_hunks()).saturating_sub(1) as isize;
+        let next = (sel.cursor as isize + delta).clamp(0, max) as usize;
+        if next == sel.cursor {
+            return Changed::No;
+        }
+        self.sel = Some(Sel {
+            cursor: next,
+            ..sel
+        });
+        self.diff.scroll = self
+            .diff
+            .scroll
+            .min(next)
+            .max(next.saturating_sub(rows.saturating_sub(1)));
+        Changed::Yes
+    }
+
     /// Move the hunk cursor and scroll so its header is the first visible line.
     fn move_hunk(&mut self, delta: isize) -> Changed {
         let (len, offsets) = {
@@ -1964,7 +2883,84 @@ impl App {
         }
         self.diff.hunk = next;
         self.diff.scroll = scroll;
+        self.follow_selection();
         Changed::Yes
+    }
+
+    // ---- select to copy (deliverable 9) ---------------------------------------------------
+
+    /// Drag a live selection's moving end along with the diff cursor. Called by everything
+    /// that moves the cursor — the nav keys, a page, `hunk_next`, the wheel over the diff —
+    /// because the cursor *is* the selection's far end, whatever moved it. A selection that
+    /// began with the mouse is taken over by the keyboard here rather than being dropped:
+    /// the anchor is still where the reader put it.
+    fn follow_selection(&mut self) {
+        if let Some(sel) = &mut self.sel {
+            sel.cursor = self.diff.scroll;
+        }
+    }
+
+    /// `v`: anchor a selection at the diff cursor, or, with one already running, pull its
+    /// moving end to the cursor. There is no per-line cursor in the diff pane — the cursor
+    /// *is* [`DiffCursor::scroll`], the first visible line — so `v j j y` copies three
+    /// lines, which is the sequence the kickoff names.
+    fn start_selection(&mut self) -> Changed {
+        if self.selected_row().is_none() || self.view_hunks().is_empty() {
+            return Changed::No;
+        }
+        let at = self.diff.scroll;
+        let next = Sel {
+            anchor: self.sel.map_or(at, |s| s.anchor),
+            cursor: at,
+        };
+        if self.sel == Some(next) {
+            return Changed::No;
+        }
+        self.sel = Some(next);
+        Changed::Yes
+    }
+
+    /// The bytes `y` would put on the clipboard: the selection's lines, or — with no
+    /// selection — the hunk under the cursor whole, header included.
+    pub fn copy_payload(&self) -> Option<Vec<u8>> {
+        let hunks = self.view_hunks();
+        if hunks.is_empty() {
+            return None;
+        }
+        let Some(sel) = self.sel else {
+            let hunk = hunks.get(self.diff.hunk.min(hunks.len() - 1))?;
+            return Some(format!("{}\n{}", hunk_header(hunk), hunk_body(hunk)).into_bytes());
+        };
+        let last = diff_lines(hunks).checked_sub(1)?;
+        let (a, b) = sel.range();
+        let mut out = String::new();
+        for i in a.min(last)..=b.min(last) {
+            out.push_str(&diff_line_text(hunks, i)?);
+            out.push('\n');
+        }
+        Some(out.into_bytes())
+    }
+
+    /// `y`, and the mouse release that ends a drag: copy, clear the selection, raise the
+    /// cue. Over the cap nothing is written and the selection **stays**, because the only
+    /// thing the reader can do about it is select less and they need the range to shrink.
+    fn copy_selection(&mut self) -> (Changed, Option<Effect>) {
+        let Some(bytes) = self.copy_payload() else {
+            return (Changed::No, None);
+        };
+        if bytes.len() > super::clipboard::CAP {
+            self.set_status(too_large_text(bytes.len()));
+            return (Changed::Yes, None);
+        }
+        self.sel = None;
+        // The status line is the record of what the engine did; a copy is a thing the
+        // terminal did, so it gets its own cue and leaves an accept's or a refusal's
+        // sentence on screen.
+        self.cue = Some(Cue {
+            text: COPIED.to_owned(),
+            until: self.now + Duration::from_secs(CUE_SECS),
+        });
+        (Changed::Yes, Some(Effect::Copy(bytes)))
     }
 
     // ---- user actions --------------------------------------------------------------------
@@ -2012,6 +3008,14 @@ impl App {
             NavDown if nav => self.move_selection(1),
             NavPageUp if nav => self.move_selection(-page),
             NavPageDown if nav => self.move_selection(page),
+            // In the diff with a selection running, these keys move its far end
+            // (deliverable 9); with none, they scroll the pane as they always have.
+            NavUp if self.sel.is_some() => self.move_sel_cursor(-1),
+            NavDown if self.sel.is_some() => self.move_sel_cursor(1),
+            NavPageUp if self.sel.is_some() => self.move_sel_cursor(-page),
+            NavPageDown if self.sel.is_some() => self.move_sel_cursor(page),
+            ScrollUp(n) if self.sel.is_some() => self.move_sel_cursor(-(n as isize)),
+            ScrollDown(n) if self.sel.is_some() => self.move_sel_cursor(n as isize),
             NavUp => self.scroll_by(-1),
             NavDown => self.scroll_by(1),
             NavPageUp => self.scroll_by(-page),
@@ -2037,7 +3041,40 @@ impl App {
                 }
                 None => self.move_selection(1),
             },
+            // Esc peels one layer: a live selection first (cleared, never copied), and only
+            // then the focus. A reader who selected by mistake gets out of it without
+            // losing the pane they were reading.
+            Back if self.sel.is_some() => {
+                self.sel = None;
+                Changed::Yes
+            }
             Back => self.set_focus(Focus::Nav),
+            Select if self.effective_focus() == Focus::Diff => self.start_selection(),
+            Select => Changed::No,
+            Copy if self.effective_focus() == Focus::Diff => return self.copy_selection(),
+            Copy => Changed::No,
+            // Only a drag whose press landed in the diff body selects; `press_line` is set
+            // by the loop from the last frame's rectangle, so a drag that began on the
+            // divider is still a divider drag (design review F13).
+            SelectTo(line) => match self.press_line {
+                Some(anchor) => {
+                    let last = diff_lines(self.view_hunks()).saturating_sub(1);
+                    let cursor = line.min(last);
+                    let next = Sel {
+                        anchor: anchor.min(last),
+                        cursor,
+                    };
+                    if cursor != next.anchor {
+                        self.drag_moved = true;
+                    }
+                    if self.sel == Some(next) {
+                        return (Changed::No, None);
+                    }
+                    self.sel = Some(next);
+                    Changed::Yes
+                }
+                None => Changed::No,
+            },
             FocusToggle => match self.focus {
                 Focus::Nav => self.set_focus(Focus::Diff),
                 Focus::Diff => self.set_focus(Focus::Nav),
@@ -2084,6 +3121,9 @@ impl App {
             },
             Flag => return self.open_note(),
             Unflag => return self.unflag_selected(),
+            Edit => return self.edit_inline(),
+            EditExternal => return self.edit_external(),
+            Editor(key) => return self.editor_key(key),
             Note(key) => return self.note_key(key),
             Pick(key) => return self.pick_key(key),
             // `Confirm` here is `Action::Confirm` (`use Action::*` above), so the modal's
@@ -2106,10 +3146,27 @@ impl App {
                     self.confirm = None;
                     return self.start_restore(scope);
                 }
+                // The one confirm that runs no op: `y` throws the buffer away and closes
+                // the editor behind it, and nothing on disk was ever touched.
+                Some(ConfirmScope::Discard { .. }) => {
+                    self.confirm = None;
+                    self.editor = None;
+                    Changed::Yes
+                }
                 None => Changed::No,
             },
             Cancel => {
+                // A declined blessing is worth a sentence: the user has just been asked a
+                // question about a file, and silence would leave them guessing whether the
+                // `n` landed. The row itself stays, showing the editor's delta like any
+                // other pending change.
+                let declined = self
+                    .confirm_bless()
+                    .map(|p| String::from_utf8_lossy(p).into_owned());
                 if self.confirm.take().is_some() {
+                    if let Some(path) = declined {
+                        self.set_status(format!("{path} left pending"));
+                    }
                     Changed::Yes
                 } else {
                     Changed::No
@@ -2136,21 +3193,47 @@ impl App {
             }
             Release => {
                 self.dragging = false;
+                let anchor = self.press_line.take();
+                let dragged = std::mem::take(&mut self.drag_moved);
+                // A press and a release with nothing in between is a click, not a
+                // zero-length copy — and this is state, not a comparison of timestamps, so
+                // it holds when both arrive in one drained pass.
+                if dragged && anchor.is_some() && self.sel.is_some() {
+                    return self.copy_selection();
+                }
                 Changed::No
             }
             Resize(w, h) => {
                 self.size = (w, h);
+                // F19: the editor's window is the frame's, so a resize that shrinks it must
+                // scroll the caret back into view before the next draw.
+                self.clamp_editor();
                 Changed::Yes
             }
             Tick => {
                 self.now += Duration::from_secs(1);
-                match &self.status {
+                // The cue is on its own clock, so it goes when its two seconds are up
+                // whatever the status line is doing.
+                let cue_went = match &self.cue {
+                    Some(c) if self.now >= c.until => {
+                        self.cue = None;
+                        true
+                    }
+                    _ => false,
+                };
+                let status = match &self.status {
                     Some(s) if self.now.duration_since(s.at) >= STATUS_TTL => {
                         self.status = None; // the hints come back
                         Changed::Yes
                     }
                     Some(_) => Changed::Yes,
                     None => Changed::No,
+                };
+                // The loading pane carries a seconds counter.
+                if cue_went || self.loading.is_some() {
+                    Changed::Yes
+                } else {
+                    status
                 }
             }
         };
@@ -2205,10 +3288,13 @@ impl App {
             }
             HerdrUpdate::Reconnecting => {
                 self.herdr.link = Link::Reconnecting;
+                // A link that dropped before its first snapshot never sends a scope.
+                self.scope_settled();
                 (Changed::Yes, None)
             }
             HerdrUpdate::Standalone { reason } => {
                 self.herdr.link = Link::Standalone { reason };
+                self.scope_settled();
                 (Changed::Yes, None)
             }
             // The picker is live: a pane that appeared or went away while it is open
@@ -2256,9 +3342,17 @@ impl App {
                 (changed, effect)
             }
             HerdrUpdate::Scope(scope) => {
+                // The first verdict lists the roots even when it is the same `None` the
+                // view started with.
+                let settled = self.scope_settled();
                 if self.herdr.scope == scope {
-                    return (Changed::No, None);
+                    return (settled, None);
                 }
+                tracing::debug!(
+                    from = ?self.herdr.scope.as_ref().map(|s| &s.roots),
+                    to = ?scope.as_ref().map(|s| &s.roots),
+                    "herdr scope"
+                );
                 self.herdr.scope = scope;
                 self.reconcile_selection();
                 (Changed::Yes, None)
@@ -2493,6 +3587,35 @@ pub fn diff_lines(hunks: &[Hunk]) -> usize {
     (0..hunks.len()).map(|i| hunk_block(hunks, i)).sum()
 }
 
+/// Diff line `i` of `hunks` exactly as the pane shows it, or `None` past the end: the
+/// header for a hunk's first line, `+`/`-`/space and the line's own text for its body, and
+/// the empty string for the blank separator between two hunks.
+///
+/// This is what a copy puts on the clipboard, and it is the same text
+/// [`hunk_header`]/[`hunk_body`] give a flag export — tabs stay tabs, because the paste
+/// target wants the file's own bytes; only the *screen* expands them.
+pub fn diff_line_text(hunks: &[Hunk], i: usize) -> Option<String> {
+    let offsets = hunk_offsets(hunks);
+    let h = offsets.partition_point(|&o| o <= i).checked_sub(1)?;
+    let within = i - offsets[h];
+    let hunk = &hunks[h];
+    if within == 0 {
+        return Some(hunk_header(hunk));
+    }
+    if within >= hunk_height(hunk) {
+        // The blank separator line: on screen it spaces two hunks apart, and in a copy it
+        // does the same.
+        return (within < hunk_block(hunks, h)).then(String::new);
+    }
+    let (tag, bytes) = &hunk.lines[within - 1];
+    let prefix = match tag {
+        Tag::Context => ' ',
+        Tag::Insert => '+',
+        Tag::Delete => '-',
+    };
+    Some(format!("{prefix}{}", hunk_line_text(bytes)))
+}
+
 /// Total diff lines of a row's own hunks. The diff pane may be showing an expansion
 /// instead ([`App::view_hunks`]); this is the row's shape, not the screen's.
 pub fn diff_len(row: &Row) -> usize {
@@ -2695,6 +3818,30 @@ pub(crate) mod testfix {
         p
     }
 
+    /// alpha's pile with `f1` given one hunk per zero-based new-side `(start, end)` range,
+    /// all cloned from `f1`'s own (whose first line is a deletion, so
+    /// [`Hunk::editor_line`] of each is `start + 1`).
+    ///
+    /// The recorded fixture's `f1` has a single hunk at `0..4`, which is not enough to say
+    /// anything about *which* lines the inline editor marks or tints: the deliverable-8
+    /// tests need hunks at line numbers they can tell apart.
+    pub fn alpha_ranges(ranges: &[(usize, usize)]) -> Pile {
+        let mut p = pile("alpha");
+        let first = p.rows[0].hunks[0].clone();
+        p.rows[0].hunks = ranges
+            .iter()
+            .enumerate()
+            .map(|(i, (start, end))| {
+                let mut h = first.clone();
+                h.index = i;
+                h.new_range = *start..*end;
+                h.old_range = *start..*end;
+                h
+            })
+            .collect();
+        p
+    }
+
     /// A pile of `n` rows `p00`..`pNN` cloned from alpha's `f1`; the first `upstream` of
     /// them annotated `Upstream` (so `groups()` lists them) and the first `collapsed`
     /// of the rest collapsed.
@@ -2748,7 +3895,8 @@ pub(crate) mod testfix {
 mod tests {
     use super::testfix::*;
     use super::*;
-    use crate::tui::input::note_action;
+    use crate::tui::input::{EditKey, editor_action, note_action};
+    use crate::tui::textbuf::Pos;
     use crossterm::event::{Event, KeyCode, KeyModifiers};
     use lastcall_engine::roots::RootsChanged;
     /// Phase 6 deliverable 4: `e` is silent where it has nothing to do — a binary row
@@ -3175,6 +4323,215 @@ mod tests {
             Some(row("beta", "u2")),
             "a vanished group advances to the root's first remaining row"
         );
+    }
+
+    // ---- the post-$EDITOR blessing (Phase 8 deliverable 3) -----------------------------
+
+    /// The row `f1` was rendered from, and the same row with the editor's bytes on it.
+    fn editor_pair(app: &App) -> (Rendered, Current) {
+        let rendered = Rendered::of(app.roots[&root("alpha")].row(b"f1").expect("f1"));
+        let live = Current::Present {
+            oid: Oid::parse(&"e".repeat(40)).expect("a well-formed oid"),
+            mode: rendered.mode.expect("f1 is not a deletion"),
+        };
+        (rendered, live)
+    }
+
+    /// Deliverable 3 / ruling P1: a file the editor session changed is never blessed
+    /// silently. `Enter` sends the accept **with the live oid** — not the one on the held
+    /// row — and `Esc` sends nothing and says the row is still pending.
+    #[test]
+    fn app_editor_return_asks_before_blessing_a_changed_file() {
+        let mut app = three_roots();
+        app.select(Some(row("alpha", "f1")));
+        let (rendered, live) = editor_pair(&app);
+        let Current::Present { oid: live_oid, .. } = live.clone() else {
+            unreachable!("built as Present");
+        };
+
+        // The return itself writes nothing: it opens the question.
+        let (changed, effect) = app.editor_returned(root("alpha"), rendered.clone(), live.clone());
+        assert_eq!(changed, Changed::Yes);
+        assert_eq!(effect, None, "the confirm is the only thing that happens");
+        assert_eq!(
+            app.confirm_bless(),
+            Some(&b"f1"[..]),
+            "the confirm names the path the editor had open"
+        );
+        assert!(app.accepting.is_none(), "nothing is in flight yet");
+
+        // `y` / Enter: the request carries what is on disk now, and the held row's own oid
+        // is nowhere in it — that is the whole of the blessing.
+        let (changed, effect) = app.handle(Action::Confirm);
+        assert_eq!(changed, Changed::Yes);
+        assert!(app.confirm.is_none());
+        let reqs = requests(effect);
+        assert_eq!(
+            reqs,
+            vec![(
+                root("alpha"),
+                AcceptRequest::File(Rendered {
+                    oid: Some(live_oid.clone()),
+                    ..rendered.clone()
+                })
+            )]
+        );
+        assert_ne!(rendered.oid, Some(live_oid), "the live oid is a new one");
+        assert_eq!(status(&app), "accepting…");
+
+        // The answer names the session, not an accept: `reviewed`, and the row is gone.
+        app.accepted(vec![accepted_ok(
+            "alpha",
+            4,
+            without(pile("alpha"), &["f1"]),
+        )]);
+        assert_eq!(status(&app), "reviewed f1");
+        assert!(app.roots[&root("alpha")].row(b"f1").is_none());
+
+        // Esc: no effect at all, and the row is still there to review the ordinary way.
+        let mut app = three_roots();
+        app.select(Some(row("alpha", "f1")));
+        let (rendered, live) = editor_pair(&app);
+        app.editor_returned(root("alpha"), rendered, live);
+        let (changed, effect) = app.handle(Action::Cancel);
+        assert_eq!(changed, Changed::Yes);
+        assert_eq!(effect, None, "a declined blessing writes nothing");
+        assert!(app.confirm.is_none());
+        assert!(app.accepting.is_none());
+        assert_eq!(status(&app), "f1 left pending");
+        assert!(app.roots[&root("alpha")].row(b"f1").is_some());
+    }
+
+    /// A look-and-quit — and every non-waiting editor, which returns before the user has
+    /// saved — leaves the file byte-identical: no question, no write, one word.
+    #[test]
+    fn app_editor_return_skips_an_unchanged_file() {
+        let mut app = three_roots();
+        app.select(Some(row("alpha", "f1")));
+        let rendered = Rendered::of(app.roots[&root("alpha")].row(b"f1").expect("f1"));
+        let live = Current::Present {
+            oid: rendered.oid.clone().expect("f1 is not a deletion"),
+            mode: rendered.mode.expect("f1 is not a deletion"),
+        };
+        let (changed, effect) = app.editor_returned(root("alpha"), rendered.clone(), live);
+        assert_eq!(changed, Changed::Yes);
+        assert_eq!(effect, None);
+        assert!(app.confirm.is_none(), "nothing to ask about");
+        assert_eq!(status(&app), "no change");
+
+        // The mode alone is enough to make it a change: `chmod +x` inside the editor is a
+        // delta the ledger has to record, so it asks.
+        let live = Current::Present {
+            oid: rendered.oid.clone().expect("f1 is not a deletion"),
+            mode: Mode::Executable,
+        };
+        app.editor_returned(root("alpha"), rendered, live);
+        assert_eq!(app.confirm_bless(), Some(&b"f1"[..]));
+    }
+
+    /// Nothing on disk to bless: the file is gone, or it is not a regular file. Each says
+    /// which, and each leaves the row exactly as it was.
+    #[test]
+    fn app_editor_return_leaves_a_deleted_file_pending() {
+        let mut app = three_roots();
+        app.select(Some(row("alpha", "f1")));
+        let rendered = Rendered::of(app.roots[&root("alpha")].row(b"f1").expect("f1"));
+        let held = app.clone();
+
+        for (live, expect) in [
+            (Current::Absent, "f1: deleted on return; left pending"),
+            (
+                Current::Present {
+                    oid: Oid::parse(&"e".repeat(40)).expect("a well-formed oid"),
+                    mode: Mode::Symlink,
+                },
+                "f1: not a regular file on return; left pending",
+            ),
+            (
+                Current::Unhashable("typechange: a directory where a file was".into()),
+                "f1: typechange: a directory where a file was on return; left pending",
+            ),
+        ] {
+            let (changed, effect) = app.editor_returned(root("alpha"), rendered.clone(), live);
+            assert_eq!(changed, Changed::Yes);
+            assert_eq!(effect, None, "nothing is written");
+            assert!(app.confirm.is_none(), "and nothing is asked");
+            assert_eq!(status(&app), expect);
+            assert!(app.accepting.is_none());
+            assert_eq!(
+                app.roots[&root("alpha")].row(b"f1"),
+                held.roots[&root("alpha")].row(b"f1"),
+                "the row is untouched"
+            );
+        }
+    }
+
+    /// Verifier (a) F1: the return arrives on a channel, so a question can already be on
+    /// screen when it lands. Replacing it would mean the next `y` answers a question the
+    /// user never read — so the blessing is not asked at all and the row stays pending with
+    /// the editor's delta on it.
+    #[test]
+    fn app_editor_return_leaves_the_row_pending_when_a_modal_is_open() {
+        // A confirm: accept-all over twelve files, waiting for its answer.
+        let mut app = three_roots();
+        app.apply(pile_event("alpha", rows_n(12, 0, 0)));
+        app.select(Some(Selection::Root(root("alpha"))));
+        app.handle(Action::Accept);
+        let asked = app.confirm.clone();
+        assert!(asked.is_some(), "the accept-all question is up");
+
+        let rendered = Rendered::of(app.roots[&root("alpha")].row(b"p00").expect("p00"));
+        let live = Current::Present {
+            oid: Oid::parse(&"e".repeat(40)).expect("a well-formed oid"),
+            mode: rendered.mode.expect("not a deletion"),
+        };
+        let (changed, effect) = app.editor_returned(root("alpha"), rendered.clone(), live.clone());
+        assert_eq!(changed, Changed::Yes, "only the status moved");
+        assert_eq!(effect, None);
+        assert_eq!(app.confirm, asked, "the accept-all question is untouched");
+        assert_eq!(app.confirm_bless(), None, "and it is not a blessing");
+        assert_eq!(status(&app), "p00: changed on return; left pending");
+        assert!(
+            app.roots[&root("alpha")].row(b"p00").is_some(),
+            "the row is still there to review the ordinary way"
+        );
+
+        // The note modal: the same answer.
+        let mut app = note_open();
+        let rendered = Rendered::of(app.roots[&root("alpha")].row(b"f1").expect("f1"));
+        let live = Current::Present {
+            oid: Oid::parse(&"e".repeat(40)).expect("a well-formed oid"),
+            mode: rendered.mode.expect("not a deletion"),
+        };
+        app.editor_returned(root("alpha"), rendered.clone(), live.clone());
+        assert!(app.note.is_some(), "the note is still being typed");
+        assert!(app.confirm.is_none(), "nothing was asked over it");
+        assert_eq!(status(&app), "f1: changed on return; left pending");
+
+        // The agent picker: likewise.
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.handle(agents_of(
+            "alpha",
+            vec![
+                agent("w1:p1", "claude", "lastcall"),
+                agent("w2:p3", "codex", "spike"),
+            ],
+        ));
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Flag);
+        type_note(&mut app, "look at this");
+        app.handle(Action::Note(NoteKey::Send));
+        app.flagged(
+            root("alpha"),
+            flag_of("f1"),
+            flagged_ok("EXPORT", 1, pile("alpha")),
+        );
+        assert!(app.picker.is_some(), "the picker is up");
+        app.editor_returned(root("alpha"), rendered, live);
+        assert!(app.picker.is_some(), "and it stays up");
+        assert!(app.confirm.is_none());
+        assert_eq!(status(&app), "f1: changed on return; left pending");
     }
 
     #[test]
@@ -4392,6 +5749,141 @@ mod tests {
 
     /// Deliverable 8: the scope hides the roots outside it, the notice counts exactly what
     /// it hid, and `w` shows all. Without a derived scope `w` does nothing at all.
+    /// The launch hold (Gate 8 sponsor run ruling): nothing is listed until every root has
+    /// reported — by a `Scanned` tick, its pile, or a scan-failed notice; a global notice
+    /// ends the hold outright; no roots means no hold; the clock redraws while it is on.
+    #[test]
+    fn app_loading_holds_the_listing_until_every_root_reports() {
+        let launched = || {
+            let mut app = App::new();
+            app.sync_roots(vec![meta("alpha"), meta("beta")]);
+            app.start_loading();
+            assert!(app.loading.is_some());
+            app
+        };
+        let listed = |app: &App| {
+            app.listed_roots()
+                .map(|v| v.meta.name.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let mut app = launched();
+        assert_eq!(
+            app.handle(Action::Tick).0,
+            Changed::Yes,
+            "the counter ticks"
+        );
+        app.apply(pile_event("alpha", pile("alpha")));
+        assert!(listed(&app).is_empty(), "held: beta has not reported");
+        assert_eq!(
+            app.loading.as_ref().unwrap().checked.get(&root("alpha")),
+            Some(&pile("alpha").rows.len())
+        );
+        assert_eq!(
+            app.apply(EngineEvent::Scanned {
+                root: root("beta"),
+                rows: 3
+            })
+            .0,
+            Changed::Yes
+        );
+        assert!(app.loading.is_none(), "every root reported");
+        assert_eq!(listed(&app), vec!["alpha".to_owned()]);
+        assert_eq!(
+            app.apply(EngineEvent::Scanned {
+                root: root("beta"),
+                rows: 3
+            }),
+            (Changed::No, None),
+            "a tick after the hold is nothing"
+        );
+
+        // A failed scan is that root's report; a global notice ends the hold outright.
+        let mut app = launched();
+        app.apply(EngineEvent::Notice {
+            root: Some(root("alpha")),
+            text: "scan failed: boom".into(),
+        });
+        assert_eq!(
+            app.loading.as_ref().unwrap().checked.get(&root("alpha")),
+            Some(&0)
+        );
+        app.apply(EngineEvent::Notice {
+            root: None,
+            text: "watching /W (2 roots)".into(),
+        });
+        assert!(app.loading.is_none());
+
+        // No roots: nothing to wait for.
+        let mut app = App::new();
+        app.start_loading();
+        assert!(app.loading.is_none());
+    }
+
+    /// The Gate 8 sponsor run's launch flash: the first pile landed before the first scope
+    /// verdict, was listed, and was hidden a moment later. While `scope_pending` nothing is
+    /// listed; the first verdict lists — even a `None` equal to the starting value — and so
+    /// does a link that will never deliver one (standalone, or dropped before its snapshot).
+    #[test]
+    fn app_scope_pending_holds_the_listing_until_the_first_verdict() {
+        let launched = || {
+            let mut app = App::new();
+            app.herdr.scoped = true;
+            app.herdr.scope_pending = true;
+            app.sync_roots(vec![meta("alpha"), meta("beta")]);
+            app.apply(pile_event("alpha", pile("alpha")));
+            assert_eq!(app.listed_roots().count(), 0, "held back until the verdict");
+            assert_eq!(app.scope_notice(), None, "no scope is active yet");
+            app
+        };
+        let listed = |app: &App| {
+            app.listed_roots()
+                .map(|v| v.meta.name.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let mut app = launched();
+        assert_eq!(
+            app.handle(Action::Herdr(HerdrUpdate::Scope(None))).0,
+            Changed::Yes,
+            "the first verdict redraws even when it is the `None` the view started with"
+        );
+        assert!(!app.herdr.scope_pending);
+        assert_eq!(listed(&app), vec!["alpha".to_owned()]);
+        assert_eq!(
+            app.handle(Action::Herdr(HerdrUpdate::Scope(None))),
+            (Changed::No, None),
+            "the same verdict again is not a redraw"
+        );
+        assert_eq!(app.scope_settled(), Changed::No, "nothing was pending");
+
+        // A scope that hides the pile: held back, then hidden — never listed in between.
+        let mut app = launched();
+        let beta = Scope {
+            label: "beta".to_owned(),
+            roots: [root("beta")].into_iter().collect(),
+        };
+        assert_eq!(
+            app.handle(Action::Herdr(HerdrUpdate::Scope(Some(beta)))).0,
+            Changed::Yes
+        );
+        assert!(listed(&app).is_empty());
+        assert_eq!(app.scoped_out(), 1);
+
+        // No verdict is ever coming.
+        for update in [
+            HerdrUpdate::Standalone {
+                reason: "off".to_owned(),
+            },
+            HerdrUpdate::Reconnecting,
+        ] {
+            let mut app = launched();
+            app.handle(Action::Herdr(update.clone()));
+            assert!(!app.herdr.scope_pending, "{update:?}");
+            assert_eq!(listed(&app), vec!["alpha".to_owned()], "{update:?}");
+        }
+    }
+
     #[test]
     fn app_herdr_scope_hides_roots_and_w_shows_all() {
         let mut app = three_roots();
@@ -4882,6 +6374,666 @@ mod tests {
         assert_eq!(by_file.confirm_restore(), Some(&scope));
     }
 
+    /// Deliverable 7's refusals. `shift-i` opens a *file* at a *line*, so there are three
+    /// rows it has nothing to open: a deletion (no file), a symlink or any other non-regular
+    /// mode (nothing an editor edits in place, and following it would edit the target
+    /// instead), and a path that is not UTF-8 (there is no `&str` to build an argv from
+    /// without mangling it). Each answers `not editable` and produces no effect — the
+    /// keystroke must never fall through to "open something else".
+    ///
+    /// The positive case is the integration scene `editor_launch_lands_at_the_right_line`,
+    /// which is the only place the argv can actually be seen.
+    #[test]
+    fn app_edit_external_refuses_rows_with_nothing_to_open() {
+        // A row `shift-i` *does* open, so the refusals below are about the row and not
+        // about the key being unwired.
+        let mut ok = three_roots();
+        ok.handle(Action::Resize(100, 30));
+        ok.select(Some(row("alpha", "f1")));
+        let (changed, effect) = ok.handle(Action::EditExternal);
+        assert_eq!(changed, Changed::No, "the screen does not move to open one");
+        assert!(
+            matches!(effect, Some(Effect::EditExternal { .. })),
+            "{effect:?}"
+        );
+        assert!(ok.edit_target().is_some());
+
+        /// Select `path`, open it, and demand the refusal: no effect, and the status says
+        /// so rather than the key quietly doing nothing.
+        fn refuses(app: &mut App, path: &[u8], what: &str) {
+            app.handle(Action::Resize(100, 30));
+            app.select(Some(Selection::Row(root("alpha"), path.to_vec())));
+            app.handle(Action::Open);
+            assert!(app.edit_target().is_none(), "{what} has nothing to open");
+            let (changed, effect) = app.handle(Action::EditExternal);
+            assert_eq!(effect, None, "{what}: no editor is spawned");
+            assert_eq!(changed, Changed::Yes, "{what}: the status moved");
+            assert_eq!(status(app), NOT_EDITABLE, "{what}");
+        }
+
+        let mut deletion = three_roots();
+        deletion.apply(pile_event_seq("alpha", 1, alpha_as(Change::Deleted)));
+        refuses(&mut deletion, b"f1", "a deletion");
+
+        let mut symlink = three_roots();
+        let mut p = pile("alpha");
+        p.rows[0].current = p.rows[0].current.clone().map(|e| Entry {
+            mode: Mode::Symlink,
+            ..e
+        });
+        symlink.apply(pile_event_seq("alpha", 1, p));
+        refuses(&mut symlink, b"f1", "a symlink");
+
+        let mut non_utf8 = three_roots();
+        let mut p = pile("alpha");
+        p.rows[0].path = vec![0xff, 0xfe];
+        non_utf8.apply(pile_event_seq("alpha", 1, p));
+        refuses(&mut non_utf8, &[0xff, 0xfe], "a non-UTF-8 path");
+    }
+
+    // ---- deliverable 8: the inline editor -------------------------------------------------
+
+    /// `i` on the selection: the effect the loop would be handed, with the read unanswered.
+    fn edit_open(app: &mut App) -> EditOpen {
+        let (changed, effect) = app.handle(Action::Edit);
+        assert_eq!(
+            changed,
+            Changed::No,
+            "nothing is drawn to ask the loop for the bytes"
+        );
+        match effect {
+            Some(Effect::EditInline(open)) => open,
+            other => panic!("an inline-edit effect, got {other:?}"),
+        }
+    }
+
+    /// `i` answered with `text` as the row's live bytes; hands back the `EditOpen` the
+    /// reducer built so a test can assert on the marks it asked for.
+    fn edit_on(app: &mut App, text: &str) -> EditOpen {
+        let open = edit_open(app);
+        let echo = open.clone();
+        assert_eq!(
+            app.edit_read(open, Ok(text.as_bytes().to_vec())),
+            (Changed::Yes, None)
+        );
+        assert!(app.editor.is_some(), "the editor opened");
+        echo
+    }
+
+    /// `n` lines `l0`..`lN`, each terminated — a file long enough to hold marks at line
+    /// numbers the assertions can tell apart.
+    fn lines_of(n: usize) -> String {
+        (0..n).map(|i| format!("l{i}\n")).collect()
+    }
+
+    /// A clean save answer: the row is gone from the rescan, which is what the engine
+    /// returns when the bytes the editor wrote are the bytes the ledger now blesses.
+    fn saved_ok(seq: u64, pile: Pile) -> SaveResult {
+        Ok(Saved {
+            outcome: lastcall_engine::ops::Outcome::default(),
+            seq,
+            pile,
+        })
+    }
+
+    /// A save answer that refused with `refused` — the pile still carries the row.
+    fn saved_refusing(seq: u64, pile: Pile, refused: Refused) -> SaveResult {
+        Ok(Saved {
+            outcome: lastcall_engine::ops::Outcome {
+                refused: vec![refused],
+                ..Default::default()
+            },
+            seq,
+            pile,
+        })
+    }
+
+    /// The editor opens where `shift-i` would put `$EDITOR` — the hunk under the diff
+    /// cursor, at its first *changed* line — and it marks the lines of **every** pending
+    /// hunk in the row, not only the one it entered: the reader is looking at the whole
+    /// file now, and the gutter is what tells them where the rest of the agent's work is.
+    /// The band is the entered hunk alone.
+    #[test]
+    fn app_edit_opens_at_the_hunk_line_and_marks_its_lines() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.apply(pile_event_seq(
+            "alpha",
+            1,
+            alpha_ranges(&[(5, 9), (20, 23)]),
+        ));
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Open);
+        assert_eq!(app.handle(Action::HunkNext).0, Changed::Yes);
+        assert_eq!(app.diff.hunk, 1, "the cursor is on the second hunk");
+
+        let open = edit_on(&mut app, &lines_of(40));
+        assert_eq!(
+            open.line, 21,
+            "the second hunk's first changed line, one-based (its `new_range` starts at 20 \
+             and its first line is a deletion)"
+        );
+        assert_eq!(
+            open.marks,
+            vec![5, 6, 7, 8, 20, 21, 22],
+            "both hunks' lines are marked"
+        );
+        assert_eq!(open.band, Some((20, 22)), "the band is the hunk it entered");
+
+        let ed = app.editor.as_ref().expect("open");
+        assert_eq!(ed.root, root("alpha"));
+        assert_eq!(ed.rendered.path, b"f1");
+        assert_eq!(ed.line_at_open, 21);
+        assert_eq!(
+            ed.buf.cursor,
+            Pos { line: 20, col: 0 },
+            "the caret is on the zero-based line the one-based `line` names"
+        );
+        assert_eq!(
+            ed.buf.text(),
+            lines_of(40),
+            "the whole file is in the buffer"
+        );
+        assert!(!ed.buf.dirty(), "opening a file changes nothing");
+        assert!(!ed.saving && !ed.alarm);
+        for i in [5, 8, 20, 22] {
+            assert!(ed.marked(i), "line {i} is inside a hunk");
+        }
+        for i in [4, 9, 19, 23] {
+            assert!(!ed.marked(i), "line {i} is not");
+        }
+        assert!(
+            ed.in_band(20) && ed.in_band(22),
+            "the entered hunk is tinted"
+        );
+        assert!(!ed.in_band(5) && !ed.in_band(23), "and nothing else is");
+
+        // From the nav there is no hunk under a cursor, so `i` opens at the row's *first*
+        // hunk — the same choice `shift-i` makes, so the two keys never disagree.
+        let mut from_nav = three_roots();
+        from_nav.handle(Action::Resize(100, 30));
+        from_nav.apply(pile_event_seq(
+            "alpha",
+            1,
+            alpha_ranges(&[(5, 9), (20, 23)]),
+        ));
+        from_nav.select(Some(row("alpha", "f1")));
+        assert_eq!(from_nav.effective_focus(), Focus::Nav);
+        let open = edit_on(&mut from_nav, &lines_of(40));
+        assert_eq!(open.line, 6);
+        assert_eq!(open.band, Some((5, 8)));
+        assert_eq!(
+            open.line,
+            from_nav.edit_target().expect("openable").2,
+            "`i` and `shift-i` ask for the same line"
+        );
+    }
+
+    /// Verifier (b) F2: two `i` in one burst used to open two editors, the second read's
+    /// answer replacing the buffer the reader had already typed into. Now the second press
+    /// asks for nothing while the first read is in flight, and an answer to an open that is
+    /// no longer pending — a duplicate, or a read that was already superseded — is dropped.
+    #[test]
+    fn app_edit_does_not_replace_a_dirty_editor() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.select(Some(row("alpha", "f1")));
+
+        let open = edit_open(&mut app);
+        assert_eq!(
+            app.edit_pending,
+            Some(open.generation),
+            "the read is in flight"
+        );
+        assert_eq!(
+            app.handle(Action::Edit),
+            (Changed::No, None),
+            "a second `i` while the first read is out asks for nothing"
+        );
+        assert_eq!(
+            app.edit_pending,
+            Some(open.generation),
+            "and does not move the open the answer will be matched against"
+        );
+
+        assert_eq!(
+            app.edit_read(open.clone(), Ok(lines_of(10).into_bytes())),
+            (Changed::Yes, None)
+        );
+        assert_eq!(app.edit_pending, None, "the open is answered");
+        app.handle(Action::Editor(EditorKey::Edit(EditKey::Insert(
+            "mine ".to_owned(),
+        ))));
+        let typed = app.editor.as_ref().expect("open").buf.text();
+        assert!(typed.starts_with("mine l0"), "the reader typed: {typed:?}");
+        assert!(app.editor.as_ref().expect("open").buf.dirty());
+
+        // The second read's answer — the same file, a fresh copy off the disk — lands.
+        assert_eq!(
+            app.edit_read(open, Ok(lines_of(10).into_bytes())),
+            (Changed::No, None),
+            "an answer nobody is waiting for is dropped"
+        );
+        let ed = app.editor.as_ref().expect("still open");
+        assert_eq!(ed.buf.text(), typed, "the typed text survives");
+        assert!(ed.buf.dirty(), "and the buffer is still dirty");
+
+        // Belt to that braces: `i` with an editor up (no keymap path reaches it — the
+        // editor eats the key as text) opens nothing over the buffer either.
+        assert_eq!(app.handle(Action::Edit), (Changed::No, None));
+        assert_eq!(
+            app.editor.as_ref().expect("still open").buf.text(),
+            typed,
+            "the buffer is untouched"
+        );
+    }
+
+    /// Esc on a buffer nobody typed in closes it outright; Esc on a dirty one asks, and the
+    /// question names the file. Cancelling puts the reader back in their text with every
+    /// character still there — the whole point of asking.
+    #[test]
+    fn app_edit_dirty_esc_asks_and_clean_esc_closes() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.select(Some(row("alpha", "f1")));
+
+        edit_on(&mut app, &lines_of(10));
+        assert_eq!(
+            app.handle(Action::Editor(EditorKey::Close)),
+            (Changed::Yes, None)
+        );
+        assert!(app.editor.is_none(), "a clean buffer just closes");
+        assert_eq!(app.confirm_discard(), None, "and nothing was asked");
+
+        edit_on(&mut app, &lines_of(10));
+        app.handle(Action::Editor(EditorKey::Edit(EditKey::Insert(
+            "typed".to_owned(),
+        ))));
+        assert!(app.editor.as_ref().expect("open").buf.dirty());
+        assert_eq!(
+            app.handle(Action::Editor(EditorKey::Close)),
+            (Changed::Yes, None)
+        );
+        assert_eq!(app.confirm_discard(), Some(&b"f1"[..]), "it asks, by name");
+        assert!(
+            app.editor.is_some(),
+            "and the buffer is still there to keep"
+        );
+
+        assert_eq!(app.handle(Action::Cancel), (Changed::Yes, None));
+        assert_eq!(app.confirm_discard(), None);
+        let ed = app.editor.as_ref().expect("kept");
+        assert!(
+            ed.buf.text().starts_with("typedl0\n"),
+            "cancelling kept every character: {:?}",
+            ed.buf.text()
+        );
+
+        // Answering yes is the only path that throws the text away.
+        app.handle(Action::Editor(EditorKey::Close));
+        assert_eq!(app.confirm_discard(), Some(&b"f1"[..]), "it asks again");
+        assert_eq!(app.handle(Action::Confirm), (Changed::Yes, None));
+        assert!(app.editor.is_none());
+        assert_eq!(app.confirm_discard(), None);
+    }
+
+    /// `Ctrl-S` while the engine has not answered yet is ignored — one buffer is never
+    /// written twice at once — and a save the engine **refuses** keeps every character:
+    /// the file moved under the reader, and discarding their work to tell them so would be
+    /// the worst possible reading of "not saved". The header goes red until the next key
+    /// and the status spells out the two keys that reload.
+    #[test]
+    fn app_edit_save_refused_keeps_the_buffer() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.select(Some(row("alpha", "f1")));
+        edit_on(&mut app, &lines_of(4));
+        app.handle(Action::Editor(EditorKey::Edit(EditKey::Insert(
+            "mine ".to_owned(),
+        ))));
+
+        let (changed, effect) = app.handle(Action::Editor(EditorKey::Save));
+        assert_eq!(changed, Changed::Yes);
+        let Some(Effect::Save {
+            root: r,
+            rendered,
+            bytes,
+        }) = effect
+        else {
+            panic!("a save effect, got {effect:?}");
+        };
+        assert_eq!(r, root("alpha"));
+        assert_eq!(rendered.path, b"f1");
+        assert_eq!(
+            String::from_utf8(bytes).expect("utf-8"),
+            "mine l0\nl1\nl2\nl3\n",
+            "the bytes are the buffer, verbatim"
+        );
+        assert!(app.editor.as_ref().expect("open").saving);
+        assert_eq!(
+            app.handle(Action::Editor(EditorKey::Save)),
+            (Changed::No, None),
+            "a second Ctrl-S while the first is in flight writes nothing"
+        );
+
+        let refused = Refused::Moved {
+            path: b"f1".to_vec(),
+            live: None,
+        };
+        assert_eq!(
+            app.saved(
+                root("alpha"),
+                b"f1".to_vec(),
+                saved_refusing(2, pile("alpha"), refused)
+            ),
+            Changed::Yes
+        );
+        let ed = app.editor.as_ref().expect("the buffer is kept");
+        assert_eq!(ed.buf.text(), "mine l0\nl1\nl2\nl3\n");
+        assert!(ed.buf.dirty(), "still unsaved, and it says so");
+        assert!(ed.alarm, "the header is red");
+        assert!(!ed.saving, "and Ctrl-S works again");
+        assert_eq!(
+            status(&app),
+            "f1: changed since you opened it; not saved — Esc, then i to reload"
+        );
+
+        // Any key means the reader has seen the red header.
+        app.handle(Action::Editor(EditorKey::Edit(EditKey::Right)));
+        assert!(!app.editor.as_ref().expect("open").alarm);
+    }
+
+    /// Typing above a mark moves it: the mark describes the agent's line, not the line
+    /// number it happened to have when the editor opened, so a newline inserted above it
+    /// has to carry it down or the gutter starts lying.
+    #[test]
+    fn app_edit_marks_follow_insertions_above_them() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.apply(pile_event_seq(
+            "alpha",
+            1,
+            alpha_ranges(&[(5, 9), (20, 23)]),
+        ));
+        app.select(Some(row("alpha", "f1")));
+        edit_on(&mut app, &lines_of(40));
+        assert_eq!(app.editor.as_ref().expect("open").band, Some((5, 8)));
+
+        // Put the caret on line 0 — above everything — and break the line there.
+        app.handle(Action::Editor(EditorKey::Click(0, 0)));
+        assert_eq!(app.editor.as_ref().expect("open").buf.cursor.line, 0);
+        app.handle(Action::Editor(EditorKey::Edit(EditKey::Newline)));
+
+        let ed = app.editor.as_ref().expect("open");
+        assert_eq!(ed.buf.line_count(), 41, "one line longer");
+        assert_eq!(
+            ed.marks,
+            vec![6, 7, 8, 9, 21, 22, 23],
+            "every mark moved down by the one line inserted above it"
+        );
+        assert_eq!(ed.band, Some((6, 9)), "and so did the band");
+
+        // A deletion above them carries them back.
+        app.handle(Action::Editor(EditorKey::Click(0, 0)));
+        app.handle(Action::Editor(EditorKey::Edit(EditKey::Delete)));
+        let ed = app.editor.as_ref().expect("open");
+        assert_eq!(ed.buf.line_count(), 40);
+        assert_eq!(ed.marks, vec![5, 6, 7, 8, 20, 21, 22]);
+        assert_eq!(ed.band, Some((5, 8)));
+    }
+
+    /// Typing *inside* the band grows it. Splitting the hunk's last line leaves both halves
+    /// inside the hunk the reader entered, so the tint has to cover both — which is the one
+    /// place the band and a bare mark part company (`>=` at the end, not `>`).
+    #[test]
+    fn app_edit_band_follows_insertions_inside_it() {
+        let open_at_band = |lines: &str| {
+            let mut app = three_roots();
+            app.handle(Action::Resize(100, 30));
+            app.apply(pile_event_seq("alpha", 1, alpha_ranges(&[(5, 9)])));
+            app.select(Some(row("alpha", "f1")));
+            edit_on(&mut app, lines);
+            assert_eq!(app.editor.as_ref().expect("open").band, Some((5, 8)));
+            app
+        };
+
+        // The band's last line, split in two: the band ends one lower.
+        let mut app = open_at_band(&lines_of(20));
+        app.handle(Action::Editor(EditorKey::Click(
+            8 - app.editor.as_ref().unwrap().buf.top as u16,
+            1,
+        )));
+        assert_eq!(app.editor.as_ref().expect("open").buf.cursor.line, 8);
+        app.handle(Action::Editor(EditorKey::Edit(EditKey::Newline)));
+        let ed = app.editor.as_ref().expect("open");
+        assert_eq!(ed.band, Some((5, 9)), "the band grew with the split");
+        assert!(ed.marked(9), "and the new line is inside the hunk too");
+
+        // A line inserted in the middle of the band grows it the same way.
+        let mut app = open_at_band(&lines_of(20));
+        app.handle(Action::Editor(EditorKey::Click(6, 0)));
+        assert_eq!(app.editor.as_ref().expect("open").buf.cursor.line, 6);
+        app.handle(Action::Editor(EditorKey::Edit(EditKey::Newline)));
+        let ed = app.editor.as_ref().expect("open");
+        assert_eq!(ed.band, Some((5, 9)));
+        assert_eq!(ed.marks, vec![5, 6, 7, 8, 9]);
+    }
+
+    /// The engine's refusals, scripted: a row that will not go in a buffer says **why** and
+    /// names the key that opens it anyway, because "no" is only half an answer when there
+    /// is a second way in. Every other refusal is the compare-and-swap speaking, in the
+    /// vocabulary every other refused op uses. In none of them does an editor open.
+    #[test]
+    fn app_edit_refuses_binary_and_oversize_rows() {
+        let refuses = |result: Result<Vec<u8>, Refused>, expected: &str| {
+            let mut app = three_roots();
+            app.handle(Action::Resize(100, 30));
+            app.select(Some(row("alpha", "f1")));
+            let open = edit_open(&mut app);
+            assert_eq!(app.edit_read(open, result), (Changed::Yes, None));
+            assert!(app.editor.is_none(), "no editor opened: {expected}");
+            assert_eq!(status(&app), expected);
+        };
+
+        let not_editable = |why: &str| {
+            Err(Refused::NotEditable {
+                path: b"f1".to_vec(),
+                why: why.to_owned(),
+            })
+        };
+        refuses(not_editable("binary"), "use shift-i: binary");
+        refuses(not_editable("over 512 KiB"), "use shift-i: over 512 KiB");
+        refuses(
+            not_editable("the file is gone"),
+            "use shift-i: the file is gone",
+        );
+        refuses(
+            Err(Refused::Moved {
+                path: b"f1".to_vec(),
+                live: None,
+            }),
+            "f1: changed since rendered; not opened",
+        );
+        refuses(
+            Err(Refused::Unhashable {
+                path: b"f1".to_vec(),
+                reason: "permission denied".to_owned(),
+            }),
+            "f1: cannot hash (permission denied); not opened",
+        );
+        // Belt to the engine's braces: bytes that are not text never reach a `String`.
+        refuses(Ok(vec![0x61, 0xff, 0x0a]), "use shift-i: binary");
+    }
+
+    /// A save that never reached the ledger keeps the buffer for the same reason a refused
+    /// one does, and names the root so the reader knows which engine spoke.
+    #[test]
+    fn app_edit_save_error_keeps_the_buffer() {
+        let after = |result: SaveResult, expected: &str| {
+            let mut app = three_roots();
+            app.handle(Action::Resize(100, 30));
+            app.select(Some(row("alpha", "f1")));
+            edit_on(&mut app, &lines_of(4));
+            app.handle(Action::Editor(EditorKey::Edit(EditKey::Insert(
+                "mine ".to_owned(),
+            ))));
+            app.handle(Action::Editor(EditorKey::Save));
+            assert_eq!(
+                app.saved(root("alpha"), b"f1".to_vec(), result),
+                Changed::Yes
+            );
+            let ed = app.editor.as_ref().expect("the buffer is kept");
+            assert_eq!(ed.buf.text(), "mine l0\nl1\nl2\nl3\n");
+            assert!(!ed.saving, "Ctrl-S works again");
+            assert!(!ed.alarm, "an error is not the file moving under them");
+            assert_eq!(status(&app), expected);
+        };
+
+        after(
+            Err(AcceptFailed::LedgerBusy),
+            "ledger busy in alpha — try again",
+        );
+        after(
+            Err(AcceptFailed::Other("disk full".to_owned())),
+            "alpha: disk full",
+        );
+        after(
+            saved_refusing(
+                2,
+                pile("alpha"),
+                Refused::NotRoundTrippable {
+                    path: b"f1".to_vec(),
+                },
+            ),
+            "f1: eol conversion is not round-trippable; not saved",
+        );
+    }
+
+    /// A clean save is the whole point of the phase: the rescan has the row gone, the
+    /// editor closes, and the §6.7 advance moves the selection off the row exactly as an
+    /// accept would.
+    #[test]
+    fn app_edit_save_closes_the_editor_and_advances() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.select(Some(row("alpha", "f1")));
+        edit_on(&mut app, &lines_of(4));
+        app.handle(Action::Editor(EditorKey::Edit(EditKey::Insert(
+            "mine ".to_owned(),
+        ))));
+        app.handle(Action::Editor(EditorKey::Save));
+
+        let rescan = without(pile("alpha"), &["f1"]);
+        assert_eq!(
+            app.saved(root("alpha"), b"f1".to_vec(), saved_ok(2, rescan)),
+            Changed::Yes
+        );
+        assert!(app.editor.is_none(), "the editor closed");
+        assert_eq!(status(&app), "saved f1");
+        assert_eq!(
+            app.selection,
+            Some(row("alpha", "f2")),
+            "the selection moved off the row that is gone"
+        );
+    }
+
+    /// A bracketed paste lands as one edit and comes back out byte for byte — tabs, both
+    /// line endings, and all — because a paste that is silently reformatted is a paste that
+    /// corrupted the reader's file.
+    #[test]
+    fn app_edit_paste_inserts_verbatim() {
+        let km = Keymap::defaults();
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.select(Some(row("alpha", "f1")));
+        edit_on(&mut app, "a\nb\n");
+
+        let pasted = "one\r\n\ttwo\nthree";
+        let action = editor_action(&Event::Paste(pasted.to_owned()), &km, app.enhanced)
+            .expect("a paste is handled");
+        assert_eq!(
+            action,
+            Action::Editor(EditorKey::Edit(EditKey::Insert(pasted.to_owned()))),
+            "one event, one edit"
+        );
+        assert_eq!(app.handle(action), (Changed::Yes, None));
+
+        let ed = app.editor.as_ref().expect("open");
+        assert_eq!(
+            ed.buf.text(),
+            "one\n\ttwo\nthreea\nb\n",
+            "every character is in the file — the tab, the text and the split — with the \
+             CRLF taken to the buffer's own ending (verifier (a) F3), which is the one \
+             thing a paste may not carry into a file that never used it"
+        );
+        assert_eq!(
+            ed.buf.cursor,
+            Pos { line: 2, col: 5 },
+            "and the caret is at the end of what was pasted"
+        );
+
+        // The save carries the same bytes the buffer shows.
+        let (_, effect) = app.handle(Action::Editor(EditorKey::Save));
+        let Some(Effect::Save { bytes, .. }) = effect else {
+            panic!("a save effect, got {effect:?}");
+        };
+        assert_eq!(bytes, b"one\n\ttwo\nthreea\nb\n");
+
+        // The same paste into a file that *is* CRLF keeps its CRLF: the rule is the file's
+        // ending, not a preference for `\n`.
+        let mut crlf = three_roots();
+        crlf.handle(Action::Resize(100, 30));
+        crlf.select(Some(row("alpha", "f1")));
+        edit_on(&mut crlf, "a\r\nb\r\n");
+        crlf.handle(Action::Editor(EditorKey::Edit(EditKey::Insert(
+            pasted.to_owned(),
+        ))));
+        assert_eq!(
+            crlf.editor.as_ref().expect("open").buf.text(),
+            "one\r\n\ttwo\r\nthreea\r\nb\r\n"
+        );
+    }
+
+    /// The reducer owns the scroll (F19): the renderer is handed a `&App` and may not move
+    /// what it is drawing, so a `Resize` has to re-clamp the buffer's window itself or the
+    /// caret ends up off the screen it is being drawn on.
+    #[test]
+    fn app_edit_resize_reclamps_the_viewport() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 40));
+        app.apply(pile_event_seq("alpha", 1, alpha_ranges(&[(120, 124)])));
+        app.select(Some(row("alpha", "f1")));
+        edit_on(&mut app, &lines_of(200));
+
+        let inside = |app: &App| {
+            let ed = app.editor.as_ref().expect("open");
+            let rows = app.page_rows();
+            assert!(
+                ed.buf.top <= ed.buf.cursor.line && ed.buf.cursor.line < ed.buf.top + rows,
+                "caret {} is outside the {rows}-row window at {}",
+                ed.buf.cursor.line,
+                ed.buf.top
+            );
+            (ed.buf.top, rows)
+        };
+        let (tall_top, tall_rows) = inside(&app);
+        assert_eq!(tall_rows, 36, "40 rows less the header, status and borders");
+        assert_eq!(app.editor.as_ref().expect("open").buf.cursor.line, 120);
+
+        // Shrink the frame: the same caret has to be inside a much smaller window.
+        assert_eq!(app.handle(Action::Resize(100, 12)), (Changed::Yes, None));
+        let (short_top, short_rows) = inside(&app);
+        assert_eq!(short_rows, 8);
+        assert!(
+            short_top > tall_top,
+            "the window scrolled down to keep the caret: {tall_top} -> {short_top}"
+        );
+
+        // Growing it again keeps the caret on screen too.
+        app.handle(Action::Resize(100, 40));
+        inside(&app);
+    }
+
     /// `m` flags what is on screen: from the nav there is no hunk under a cursor, so the
     /// flag is the file; from the diff it is the hunk the cursor is on, captured with the
     /// header and body the reader was looking at.
@@ -4898,15 +7050,28 @@ mod tests {
         let target = app.note.as_ref().expect("open").target.clone();
         assert!(matches!(target, FlagTarget::File { .. }), "{target:?}");
         assert_eq!(target.rendered_hunk(), None, "the file, not a hunk");
-        assert_eq!(target.label(), "f1 (file)");
+        assert_eq!(target.label(), "f1 · whole file");
+        assert_eq!(target.modal_title(), " flag whole file ");
+
+        type_note(&mut app, "the whole rewrite needs another look");
+        let row_now = app.roots[&root("alpha")]
+            .row(b"f1")
+            .expect("the row")
+            .clone();
         let (_, effect) = app.handle(Action::Note(NoteKey::Send));
         assert_eq!(
             effect,
             Some(Effect::Flag {
                 root: root("alpha"),
                 path: b"f1".to_vec(),
-                note: String::new(),
+                note: "the whole rewrite needs another look".to_owned(),
                 hunk: None,
+                // Ruling P4: with no diff to quote, the export carries the row's shape.
+                summary: Some(FlagSummary {
+                    hunks: 3,
+                    added: row_now.added,
+                    deleted: row_now.deleted,
+                }),
                 label: "f1".to_owned(),
             })
         );
@@ -4919,6 +7084,12 @@ mod tests {
         app.handle(Action::Flag);
         let target = app.note.as_ref().expect("open").target.clone();
         assert_eq!(target.label(), "f1 · hunk 3 of 3");
+        assert_eq!(target.modal_title(), " flag hunk 3 of 3 ");
+        assert_eq!(
+            target.summary(),
+            None,
+            "a hunk flag quotes its lines instead"
+        );
         let rendered = target.rendered_hunk().expect("a hunk flag");
         assert_eq!(rendered.of, 3, "content hunks, as the screen counted them");
         assert_eq!(rendered.hunk.index, 2);
@@ -4927,6 +7098,57 @@ mod tests {
             hunk_header(&app.view_hunks()[2]),
             "the header the reader was looking at"
         );
+    }
+
+    /// Verifier (a) F2: a collapsed row nobody expanded has no hunks the scan counted, so a
+    /// whole-file flag on it carries **no** summary rather than one claiming `0 hunks`. On a
+    /// Binary row the line counts are not even line counts of a diff. Expanding a Glob row
+    /// gives the counts back, because then there is something on screen to count.
+    #[test]
+    fn app_flag_on_a_collapsed_row_carries_no_summary() {
+        for kind in [Collapsed::Glob, Collapsed::Binary] {
+            let mut app = three_roots();
+            app.handle(Action::Resize(100, 30));
+            app.apply(pile_event_seq("alpha", 1, alpha_collapsed(kind)));
+            app.select(Some(row("alpha", "f1")));
+
+            app.handle(Action::Flag);
+            let target = app.note.as_ref().expect("open").target.clone();
+            assert_eq!(target.label(), "f1 · whole file", "{kind:?}");
+            assert_eq!(
+                target.summary(),
+                None,
+                "{kind:?}: nothing was diffed, so nothing is claimed"
+            );
+
+            // …and the flag the engine seam receives carries the absence too.
+            let (_, effect) = app.handle(Action::Note(NoteKey::Send));
+            let Some(Effect::Flag { summary, hunk, .. }) = effect else {
+                panic!("{kind:?}: Enter sends: {effect:?}");
+            };
+            assert_eq!(summary, None, "{kind:?}");
+            assert_eq!(hunk, None, "{kind:?}: a whole-file flag");
+        }
+
+        // Expanded, the Glob row has hunks on screen and the summary comes back.
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.apply(pile_event_seq("alpha", 1, alpha_collapsed(Collapsed::Glob)));
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Expand);
+        let asked = app.selected_row().expect("f1").clone();
+        app.set_expanded(root("alpha"), &asked, expansion_of(2, 0));
+        assert_eq!(app.view_hunks().len(), 2, "the expansion is on screen");
+
+        app.handle(Action::Flag);
+        let summary = app
+            .note
+            .as_ref()
+            .expect("open")
+            .target
+            .summary()
+            .expect("an expanded row counts");
+        assert_eq!(summary.hunks, 2, "the hunks the reader can see");
     }
 
     /// F14: the target is captured when `m` is pressed. A pile that lands while the note is
@@ -4954,6 +7176,7 @@ mod tests {
         );
         assert_eq!(app.view_hunks().len(), 1, "the screen did move on");
 
+        type_note(&mut app, "look at this");
         let (_, effect) = app.handle(Action::Note(NoteKey::Send));
         let Some(Effect::Flag { hunk, .. }) = effect else {
             panic!("a flag effect: {effect:?}");
@@ -4993,6 +7216,7 @@ mod tests {
 
         // …and the write carries it, so the export quotes that hunk and counts `of 3`.
         app.handle(Action::Flag);
+        type_note(&mut app, "look at this");
         let (_, effect) = app.handle(Action::Note(NoteKey::Send));
         let Some(Effect::Flag { hunk, label, .. }) = effect else {
             panic!("a flag effect: {effect:?}");
@@ -5026,7 +7250,7 @@ mod tests {
         ));
         app.select(Some(row("alpha", "f1")));
         app.handle(Action::Flag);
-        app.handle(Action::Note(NoteKey::Insert("why?".to_owned())));
+        type_note(&mut app, "why?");
         let (_, flag) = app.handle(Action::Note(NoteKey::Send));
         assert!(
             matches!(flag, Some(Effect::Flag { ref label, .. }) if label == "f1"),
@@ -5066,6 +7290,7 @@ mod tests {
         ));
         app.select(Some(row("alpha", "f1")));
         app.handle(Action::Flag);
+        type_note(&mut app, "look at this");
         app.handle(Action::Note(NoteKey::Send));
 
         let (changed, effect) = app.flagged(
@@ -5115,6 +7340,7 @@ mod tests {
         ));
         app.select(Some(row("alpha", "f1")));
         app.handle(Action::Flag);
+        type_note(&mut app, "look at this");
         app.handle(Action::Note(NoteKey::Send));
 
         let (changed, effect) = app.flagged(
@@ -5143,6 +7369,7 @@ mod tests {
 
         // A write that failed says which flag it was and why.
         app.handle(Action::Flag);
+        type_note(&mut app, "look at this");
         app.handle(Action::Note(NoteKey::Send));
         app.flagged(
             root("alpha"),
@@ -5168,6 +7395,7 @@ mod tests {
         ));
         app.select(Some(row("alpha", "f1")));
         app.handle(Action::Flag);
+        type_note(&mut app, "look at this");
         app.handle(Action::Note(NoteKey::Send));
         app.flagged(
             root("alpha"),
@@ -5188,6 +7416,7 @@ mod tests {
 
         // A send that landed adds nothing: the optimistic line is already on screen.
         app.handle(Action::Flag);
+        type_note(&mut app, "look at this");
         app.handle(Action::Note(NoteKey::Send));
         app.flagged(
             root("alpha"),
@@ -5214,6 +7443,7 @@ mod tests {
         // f1 is flagged and staged; `pane.send_text` has not answered yet.
         app.select(Some(row("alpha", "f1")));
         app.handle(Action::Flag);
+        type_note(&mut app, "look at this");
         app.handle(Action::Note(NoteKey::Send));
         let (_, effect) = app.flagged(
             root("alpha"),
@@ -5225,6 +7455,7 @@ mod tests {
         // The reviewer does not wait for the socket: f2 gets its own note.
         app.select(Some(row("alpha", "f2")));
         app.handle(Action::Flag);
+        type_note(&mut app, "look at this");
         app.handle(Action::Note(NoteKey::Send));
 
         // f1's send lands, then f2's ledger write.
@@ -5255,6 +7486,7 @@ mod tests {
         app.handle(Action::Resize(100, 30));
         app.select(Some(row("alpha", "f1")));
         app.handle(Action::Flag);
+        type_note(&mut app, "look at this");
         app.handle(Action::Note(NoteKey::Send));
         let (_, effect) = app.flagged(
             root("alpha"),
@@ -5265,6 +7497,7 @@ mod tests {
 
         app.select(Some(row("alpha", "f2")));
         app.handle(Action::Flag);
+        type_note(&mut app, "look at this");
         app.handle(Action::Note(NoteKey::Send));
 
         let out = PathBuf::from("/S/exports/alpha/2026-09-05.md");
@@ -5301,6 +7534,7 @@ mod tests {
         app.handle(Action::Resize(100, 30));
         app.select(Some(row("alpha", "f1")));
         app.handle(Action::Flag);
+        type_note(&mut app, "look at this");
         app.handle(Action::Note(NoteKey::Send));
         let (_, unflag) = app.handle(Action::Unflag);
         assert_eq!(
@@ -5347,39 +7581,75 @@ mod tests {
         note_key_event(KeyCode::Char(c), KeyModifiers::NONE)
     }
 
+    /// Type `text` into the open note modal as one insert (what a paste does).
+    fn type_note(app: &mut App, text: &str) {
+        app.handle(Action::Note(NoteKey::Edit(EditKey::Insert(
+            text.to_owned(),
+        ))));
+    }
+
+    /// Open the note modal on `alpha`'s `f1` with nothing typed yet.
+    fn note_open() -> App {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Flag);
+        app
+    }
+
+    /// One key event through the modal's own mapping and into the app.
+    fn note_feed(app: &mut App, event: &Event) -> (Changed, Option<Effect>) {
+        let action =
+            note_action(event, &Keymap::defaults(), app.enhanced).expect("the modal answers it");
+        app.handle(action)
+    }
+
+    /// An **empty** note sends: the flag is the message (Phase 7 kickoff deliverable 10, as
+    /// ratified). Phase 8 briefly refused it; verifier (a) decision (7) caught that as a
+    /// regression against ratified behaviour and this test pins the ratified shape so the
+    /// next reader does not re-derive the refusal from first principles.
+    #[test]
+    fn app_note_modal_empty_note_sends() {
+        let mut app = note_open();
+        assert_eq!(
+            app.note.as_ref().expect("open").text(),
+            "",
+            "nothing typed yet"
+        );
+
+        let (changed, effect) = app.handle(Action::Note(NoteKey::Send));
+        assert_eq!(changed, Changed::Yes, "the send redraws");
+        assert!(app.note.is_none(), "the modal closes on the send");
+        let Some(Effect::Flag { note, path, .. }) = effect else {
+            panic!("an empty note is still a flag: {effect:?}");
+        };
+        assert_eq!(note, "", "the flag carries the empty note verbatim");
+        assert_eq!(path, b"f1".to_vec());
+    }
+
     /// The note modal's line discipline. Enter sends; the bindings a terminal reports for a
-    /// deliberate line break (`Ctrl-J` everywhere, `Alt-Enter` and `Shift-Enter` where they
-    /// are reported at all) break the line instead; Esc closes it and writes nothing.
+    /// deliberate line break (`Ctrl-J` everywhere, `Alt-Enter` where Alt is reported) break
+    /// the line instead; Esc closes it and writes nothing.
     #[test]
     fn app_note_modal_enter_sends_ctrl_j_and_alt_enter_break_the_line_esc_cancels() {
-        let km = Keymap::defaults();
-        let open = || {
-            let mut app = three_roots();
-            app.handle(Action::Resize(100, 30));
-            app.select(Some(row("alpha", "f1")));
-            app.handle(Action::Flag);
-            app
-        };
-        let feed = |app: &mut App, event: &Event| {
-            let action = note_action(event, &km).expect("the modal answers it");
-            app.handle(action)
-        };
         let enter = note_key_event(KeyCode::Enter, KeyModifiers::NONE);
 
         for newline in [
             note_key_event(KeyCode::Char('j'), KeyModifiers::CONTROL),
             note_key_event(KeyCode::Enter, KeyModifiers::ALT),
-            note_key_event(KeyCode::Enter, KeyModifiers::SHIFT),
+            // Verifier (a) F5: chat UIs read `Ctrl-Enter` as a line break, and where the
+            // terminal cannot tell it from `Enter` this arm is simply never reached.
+            note_key_event(KeyCode::Enter, KeyModifiers::CONTROL),
         ] {
-            let mut app = open();
+            let mut app = note_open();
             for c in "one".chars() {
-                feed(&mut app, &note_char(c));
+                note_feed(&mut app, &note_char(c));
             }
-            assert_eq!(feed(&mut app, &newline), (Changed::Yes, None));
-            feed(&mut app, &note_char('2'));
-            assert_eq!(app.note.as_ref().expect("open").text, "one\n2");
+            assert_eq!(note_feed(&mut app, &newline), (Changed::Yes, None));
+            note_feed(&mut app, &note_char('2'));
+            assert_eq!(app.note.as_ref().expect("open").text(), "one\n2");
 
-            let (_, effect) = feed(&mut app, &enter);
+            let (_, effect) = note_feed(&mut app, &enter);
             assert!(app.note.is_none(), "Enter closes it");
             let Some(Effect::Flag { note, .. }) = effect else {
                 panic!("Enter sends: {effect:?}");
@@ -5387,25 +7657,136 @@ mod tests {
             assert_eq!(note, "one\n2", "both lines, as typed");
         }
 
-        // Backspace walks back a character at a time; Esc throws the lot away.
+        // Backspace walks back a character at a time; Esc throws the lot away. `^H` is
+        // Backspace too (verifier (a) F4): crossterm reports the byte 0x08 as ctrl-h, and a
+        // terminal set to send it for its Backspace key must not lose the key.
+        for backspace in [
+            note_key_event(KeyCode::Backspace, KeyModifiers::NONE),
+            note_key_event(KeyCode::Char('h'), KeyModifiers::CONTROL),
+        ] {
+            let mut app = note_open();
+            type_note(&mut app, "xy");
+            assert_eq!(note_feed(&mut app, &backspace), (Changed::Yes, None));
+            assert_eq!(app.note.as_ref().expect("open").text(), "x");
+        }
         let backspace = note_key_event(KeyCode::Backspace, KeyModifiers::NONE);
-        let mut app = open();
-        feed(&mut app, &note_char('x'));
-        feed(&mut app, &backspace);
-        assert_eq!(app.note.as_ref().expect("open").text, "");
+        let mut app = note_open();
+        note_feed(&mut app, &note_char('x'));
+        note_feed(&mut app, &backspace);
+        assert_eq!(app.note.as_ref().expect("open").text(), "");
         assert_eq!(
-            feed(&mut app, &backspace),
+            note_feed(&mut app, &backspace),
             (Changed::No, None),
             "nothing to delete, nothing to draw"
         );
-        feed(&mut app, &note_char('y'));
-        let (changed, effect) = feed(&mut app, &note_key_event(KeyCode::Esc, KeyModifiers::NONE));
+        note_feed(&mut app, &note_char('y'));
+        let (changed, effect) =
+            note_feed(&mut app, &note_key_event(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(
             (changed, effect),
             (Changed::Yes, None),
             "Esc writes nothing"
         );
         assert!(app.note.is_none(), "Esc closes the note and writes nothing");
+    }
+
+    /// `Shift-Enter` is a newline **only** under the kitty keyboard protocol (ruling P9).
+    ///
+    /// With no enhancement flags the terminal sends the same bytes for `Enter` and
+    /// `Shift-Enter`, so treating the reported `SHIFT` as a line break would mean the note
+    /// sometimes breaks and sometimes sends depending on which terminal happens to set the
+    /// bit — the worst of the two. Off, it sends; on, it breaks the line.
+    #[test]
+    fn app_note_modal_shift_enter_is_a_newline_only_with_enhancement() {
+        let shift_enter = note_key_event(KeyCode::Enter, KeyModifiers::SHIFT);
+
+        let mut plain = note_open();
+        assert!(!plain.enhanced, "the default is the honest one");
+        type_note(&mut plain, "one");
+        let (_, effect) = note_feed(&mut plain, &shift_enter);
+        assert!(plain.note.is_none(), "without enhancement it sends");
+        let Some(Effect::Flag { note, .. }) = effect else {
+            panic!("a flag effect: {effect:?}");
+        };
+        assert_eq!(note, "one");
+
+        let mut enhanced = note_open();
+        enhanced.enhanced = true;
+        type_note(&mut enhanced, "one");
+        assert_eq!(note_feed(&mut enhanced, &shift_enter), (Changed::Yes, None));
+        type_note(&mut enhanced, "2");
+        assert_eq!(
+            enhanced.note.as_ref().expect("open").text(),
+            "one\n2",
+            "with enhancement it breaks the line"
+        );
+
+        // The key line promises exactly what the mapping does.
+        assert!(!super::super::render::note_keys(false).contains('⇧'));
+        assert!(super::super::render::note_keys(true).contains("⇧⏎ / ^J newline"));
+    }
+
+    /// Every motion the shared buffer knows reaches the note: arrows, word jumps,
+    /// `Ctrl-A`/`Ctrl-E`, `Ctrl-K`, `Ctrl-W`, and the page keys.
+    #[test]
+    fn app_note_modal_arrow_and_word_keys_move_the_caret() {
+        let mut app = note_open();
+        type_note(&mut app, "alpha beta gamma");
+        let pos = |app: &App| app.note.as_ref().expect("open").buf.cursor;
+        assert_eq!(pos(&app), Pos { line: 0, col: 16 });
+
+        // Left, then a word jump back over `gamma`, then Home and End.
+        assert_eq!(
+            note_feed(&mut app, &note_key_event(KeyCode::Left, KeyModifiers::NONE)),
+            (Changed::Yes, None)
+        );
+        assert_eq!(pos(&app), Pos { line: 0, col: 15 });
+        note_feed(&mut app, &note_key_event(KeyCode::Left, KeyModifiers::ALT));
+        assert_eq!(pos(&app).col, 11, "the start of `gamma`");
+        note_feed(
+            &mut app,
+            &note_key_event(KeyCode::Char('a'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(pos(&app).col, 0, "Ctrl-A is the start of the line");
+        note_feed(
+            &mut app,
+            &note_key_event(KeyCode::Right, KeyModifiers::CONTROL),
+        );
+        assert_eq!(pos(&app).col, 5, "Ctrl-→ is the end of `alpha`");
+        note_feed(
+            &mut app,
+            &note_key_event(KeyCode::Char('e'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(pos(&app).col, 16, "Ctrl-E is the end of the line");
+
+        // Ctrl-W eats the word behind the caret; Ctrl-K the rest of the line.
+        note_feed(
+            &mut app,
+            &note_key_event(KeyCode::Char('w'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(app.note.as_ref().expect("open").text(), "alpha beta ");
+        note_feed(
+            &mut app,
+            &note_key_event(KeyCode::Char('a'), KeyModifiers::CONTROL),
+        );
+        note_feed(
+            &mut app,
+            &note_key_event(KeyCode::Char('k'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(app.note.as_ref().expect("open").text(), "");
+
+        // A move with nowhere to go is not a frame.
+        assert_eq!(
+            note_feed(&mut app, &note_key_event(KeyCode::Up, KeyModifiers::NONE)),
+            (Changed::No, None)
+        );
+        assert_eq!(
+            note_feed(
+                &mut app,
+                &note_key_event(KeyCode::PageDown, KeyModifiers::NONE)
+            ),
+            (Changed::No, None)
+        );
     }
 
     /// A bracketed paste is one event carrying many characters, newlines included. It is
@@ -5420,8 +7801,12 @@ mod tests {
         app.handle(Action::Flag);
 
         let pasted = "first line\nsecond line\n";
-        let action = note_action(&Event::Paste(pasted.to_owned()), &km).expect("paste is handled");
-        assert_eq!(action, Action::Note(NoteKey::Insert(pasted.to_owned())));
+        let action = note_action(&Event::Paste(pasted.to_owned()), &km, app.enhanced)
+            .expect("paste is handled");
+        assert_eq!(
+            action,
+            Action::Note(NoteKey::Edit(EditKey::Insert(pasted.to_owned())))
+        );
         let (changed, effect) = app.handle(action);
         assert_eq!(
             (changed, effect),
@@ -5429,11 +7814,15 @@ mod tests {
             "inserted, not sent"
         );
         let note = app.note.as_ref().expect("still open");
-        assert_eq!(note.text, pasted);
-        assert_eq!(note.cursor, pasted.len(), "the caret is after the paste");
+        assert_eq!(note.text(), pasted);
+        assert_eq!(
+            note.buf.cursor,
+            Pos { line: 2, col: 0 },
+            "the caret is after the paste, on the line its last newline opened"
+        );
 
         // A second paste lands after the first, and Enter is still what sends.
-        app.handle(note_action(&Event::Paste("third".to_owned()), &km).expect("handled"));
+        app.handle(note_action(&Event::Paste("third".to_owned()), &km, false).expect("handled"));
         let (_, effect) = app.handle(Action::Note(NoteKey::Send));
         let Some(Effect::Flag { note, .. }) = effect else {
             panic!("a flag effect: {effect:?}");
@@ -5454,13 +7843,13 @@ mod tests {
 
         for c in "qa?rewfo".chars() {
             assert_eq!(
-                note_action(&note_char(c), &km),
-                Some(Action::Note(NoteKey::Insert(c.to_string()))),
+                note_action(&note_char(c), &km, false),
+                Some(Action::Note(NoteKey::Edit(EditKey::Insert(c.to_string())))),
                 "{c} is text inside the modal"
             );
-            app.handle(Action::Note(NoteKey::Insert(c.to_string())));
+            app.handle(Action::Note(NoteKey::Edit(EditKey::Insert(c.to_string()))));
         }
-        assert_eq!(app.note.as_ref().expect("open").text, "qa?rewfo");
+        assert_eq!(app.note.as_ref().expect("open").text(), "qa?rewfo");
         assert!(!app.help, "no key escaped to the keymap");
         assert!(app.confirm.is_none());
 
@@ -5468,25 +7857,343 @@ mod tests {
         assert_eq!(
             note_action(
                 &note_key_event(KeyCode::Char('A'), KeyModifiers::SHIFT),
-                &km
+                &km,
+                false
             ),
-            Some(Action::Note(NoteKey::Insert("A".to_owned())))
+            Some(Action::Note(NoteKey::Edit(EditKey::Insert("A".to_owned()))))
         );
 
-        // Bindings the modal has no use for are swallowed rather than reaching the keymap.
+        // Keys the buffer has no answer for are swallowed rather than reaching the keymap.
         for event in [
-            note_key_event(KeyCode::Tab, KeyModifiers::NONE),
-            note_key_event(KeyCode::PageDown, KeyModifiers::NONE),
-            note_key_event(KeyCode::Char('a'), KeyModifiers::CONTROL),
-            note_key_event(KeyCode::Left, KeyModifiers::NONE),
+            note_key_event(KeyCode::F(1), KeyModifiers::NONE),
+            note_key_event(KeyCode::Insert, KeyModifiers::NONE),
+            note_key_event(KeyCode::Char('x'), KeyModifiers::CONTROL),
         ] {
-            assert_eq!(note_action(&event, &km), None, "{event:?} does nothing");
+            assert_eq!(
+                note_action(&event, &km, false),
+                None,
+                "{event:?} does nothing"
+            );
         }
 
         // Ctrl-C is the one binding that still fires, and it does not write the note.
         let ctrl_c = note_key_event(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert_eq!(note_action(&ctrl_c, &km), Some(Action::Quit));
+        assert_eq!(note_action(&ctrl_c, &km, false), Some(Action::Quit));
         let (_, effect) = app.handle(Action::Quit);
         assert_eq!(effect, Some(Effect::Quit), "quitting writes no flag");
+    }
+
+    // ---- deliverable 11: the reducer's remaining promises -------------------------------
+
+    /// From the nav there is no diff cursor to read, so both editor keys open at the row's
+    /// **first** hunk — and a row with no hunks at all opens at line 1.
+    #[test]
+    fn app_edit_external_from_the_nav_uses_the_first_hunk_line() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        // Three hunks at known places; `f1`'s own first line is a deletion, so each hunk's
+        // editor line is its `new_range.start + 1`.
+        app.apply(pile_event_seq(
+            "alpha",
+            1,
+            alpha_ranges(&[(4, 8), (20, 24), (40, 44)]),
+        ));
+        app.select(Some(row("alpha", "f1")));
+        assert_eq!(app.effective_focus(), Focus::Nav);
+        let (_, effect) = app.handle(Action::EditExternal);
+        let Some(Effect::EditExternal { line, .. }) = effect else {
+            panic!("an external-edit effect, got {effect:?}");
+        };
+        assert_eq!(line, 5, "the first hunk's first changed line");
+
+        // In the diff the cursor decides, which is the whole reason the nav needs a rule.
+        app.handle(Action::Open);
+        app.handle(Action::HunkNext);
+        let (_, effect) = app.handle(Action::EditExternal);
+        let Some(Effect::EditExternal { line, .. }) = effect else {
+            panic!("an external-edit effect, got {effect:?}");
+        };
+        assert_eq!(line, 21, "the hunk under the cursor");
+
+        // A collapsed row carries no hunks: there is no line to name, so it opens at 1.
+        let mut collapsed = three_roots();
+        collapsed.handle(Action::Resize(100, 30));
+        collapsed.apply(pile_event_seq("alpha", 1, alpha_collapsed(Collapsed::Glob)));
+        collapsed.select(Some(row("alpha", "f1")));
+        let (_, effect) = collapsed.handle(Action::EditExternal);
+        let Some(Effect::EditExternal { line, .. }) = effect else {
+            panic!("an external-edit effect, got {effect:?}");
+        };
+        assert_eq!(line, 1);
+    }
+
+    /// Every modal owns the keyboard while it is open, and that includes the three keys
+    /// Phase 8 added: `i`, `shift-i` and `v` do nothing under the note, the picker or the
+    /// confirm, and nothing under the help overlay but close it.
+    #[test]
+    fn app_edit_and_select_are_swallowed_while_a_modal_is_open() {
+        let keys = [
+            Action::Edit,
+            Action::EditExternal,
+            Action::Select,
+            Action::Copy,
+        ];
+
+        // The confirm: a restore is waiting on an answer, and an editor opened over it
+        // would take the keys that answer it.
+        let mut confirm = diff_at_f1();
+        confirm.handle(Action::RestoreFile);
+        assert!(confirm.confirm.is_some());
+        for action in keys.clone() {
+            assert_eq!(
+                confirm.handle(action.clone()),
+                (Changed::No, None),
+                "{action:?}"
+            );
+        }
+        assert!(confirm.confirm.is_some(), "and the question is still up");
+        assert!(confirm.editor.is_none() && confirm.sel.is_none());
+
+        // The note modal, which is itself a text field: `i` and `v` are characters in it,
+        // and `Ui::event` never turns them into these actions — but the reducer refuses
+        // them too, so neither path can open an editor under a modal.
+        let mut note = diff_at_f1();
+        note.handle(Action::Flag);
+        assert!(note.note.is_some());
+        for action in keys.clone() {
+            assert_eq!(
+                note.handle(action.clone()),
+                (Changed::No, None),
+                "{action:?}"
+            );
+        }
+        assert!(note.note.is_some() && note.editor.is_none() && note.sel.is_none());
+
+        // The help overlay is not a modal but a layer: the first key closes it and is
+        // spent doing so, exactly as every other key is.
+        for action in keys {
+            let mut help = diff_at_f1();
+            help.help = true;
+            assert_eq!(
+                help.handle(action.clone()),
+                (Changed::Yes, None),
+                "{action:?}"
+            );
+            assert!(!help.help, "{action:?} closed the overlay");
+            assert!(help.editor.is_none() && help.sel.is_none(), "{action:?}");
+        }
+    }
+
+    // ---- deliverable 9: select to copy ---------------------------------------------------
+
+    /// alpha with `f1` given two identical hunks, focused in the diff at line 0.
+    ///
+    /// Each hunk is the fixture's own: header `@@ -1,4 +1,4 @@` then `-a1`, `+A1`, ` a2`,
+    /// ` a3`, ` a4` — six diff lines, a blank separator, six more.
+    fn diff_at_f1() -> App {
+        let mut app = three_roots();
+        app.apply(pile_event("alpha", alpha_two_hunks()));
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Open);
+        assert_eq!(app.effective_focus(), Focus::Diff);
+        assert_eq!(diff_lines(app.view_hunks()), 13);
+        app
+    }
+
+    fn copied(effect: Option<Effect>) -> String {
+        match effect {
+            Some(Effect::Copy(bytes)) => String::from_utf8(bytes).expect("utf-8 payload"),
+            other => panic!("expected a copy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn app_select_extends_with_the_cursor_and_y_copies_the_range() {
+        let mut app = diff_at_f1();
+        // There is no per-line cursor in the diff pane: the cursor *is* the first visible
+        // line, so `v j j y` copies three lines counted from where the reader was.
+        assert_eq!(app.diff.scroll, 0);
+        assert_eq!(app.handle(Action::Select), (Changed::Yes, None));
+        assert_eq!(
+            app.sel,
+            Some(Sel {
+                anchor: 0,
+                cursor: 0
+            })
+        );
+        for _ in 0..2 {
+            app.handle(Action::NavDown);
+        }
+        // The pane does *not* scroll under the selection: the far end moved, and the three
+        // selected lines are the three the reader can see.
+        assert_eq!(app.diff.scroll, 0);
+        assert_eq!(
+            app.sel,
+            Some(Sel {
+                anchor: 0,
+                cursor: 2
+            })
+        );
+        let (changed, effect) = app.handle(Action::Copy);
+        assert_eq!(changed, Changed::Yes);
+        assert_eq!(copied(effect), "@@ -1,4 +1,4 @@\n-a1\n+A1\n");
+        assert_eq!(app.sel, None, "a copy clears the selection");
+        assert_eq!(app.cue.as_ref().map(|c| c.text.as_str()), Some(COPIED));
+
+        // Upwards from the middle: the range is whichever way round the two ends are, and
+        // the pane scrolls only as far as it takes to keep the far end on screen.
+        for _ in 0..3 {
+            app.handle(Action::NavDown);
+        }
+        assert_eq!(
+            app.diff.scroll, 3,
+            "with no selection the keys still scroll"
+        );
+        app.handle(Action::Select);
+        app.handle(Action::NavUp);
+        app.handle(Action::NavUp);
+        assert_eq!(
+            app.sel,
+            Some(Sel {
+                anchor: 3,
+                cursor: 1
+            })
+        );
+        assert_eq!(app.diff.scroll, 1, "the far end pulled the pane up with it");
+        assert_eq!(copied(app.handle(Action::Copy).1), "-a1\n+A1\n a2\n");
+
+        // Esc clears without copying, and leaves the pane where it was.
+        app.handle(Action::Select);
+        assert_eq!(app.handle(Action::Back), (Changed::Yes, None));
+        assert_eq!(app.sel, None);
+        assert_eq!(app.effective_focus(), Focus::Diff, "Esc peeled one layer");
+        assert_eq!(app.handle(Action::Back), (Changed::Yes, None));
+        assert_eq!(app.effective_focus(), Focus::Nav, "the second one focuses");
+        // And with the nav focused neither key does anything.
+        assert_eq!(app.handle(Action::Select), (Changed::No, None));
+        assert_eq!(app.handle(Action::Copy), (Changed::No, None));
+    }
+
+    #[test]
+    fn app_y_without_a_selection_copies_the_hunk() {
+        let mut app = diff_at_f1();
+        let whole = "@@ -1,4 +1,4 @@\n-a1\n+A1\n a2\n a3\n a4\n";
+        assert_eq!(copied(app.handle(Action::Copy).1), whole);
+        assert_eq!(app.sel, None);
+        // The *hunk under the cursor*, not the first: `n` moves the cursor and `y` follows.
+        app.handle(Action::HunkNext);
+        assert_eq!(app.diff.hunk, 1);
+        assert_eq!(copied(app.handle(Action::Copy).1), whole);
+        // A selection that spans the separator carries it, exactly as the pane shows it.
+        app.handle(Action::HunkPrev);
+        app.handle(Action::Select);
+        for _ in 0..8 {
+            app.handle(Action::NavDown);
+        }
+        assert_eq!(
+            copied(app.handle(Action::Copy).1),
+            "@@ -1,4 +1,4 @@\n-a1\n+A1\n a2\n a3\n a4\n\n@@ -1,4 +1,4 @@\n-a1\n"
+        );
+        // Nothing selected and nothing to select: a row with no hunks copies nothing.
+        let mut empty = three_roots();
+        empty.select(Some(row("alpha", "f1")));
+        empty.apply(pile_event("alpha", alpha_collapsed(Collapsed::Glob)));
+        empty.handle(Action::Open);
+        assert_eq!(empty.handle(Action::Copy), (Changed::No, None));
+    }
+
+    #[test]
+    fn app_copy_cue_lasts_two_seconds_and_leaves_the_status_alone() {
+        let mut app = diff_at_f1();
+        app.set_status("saved f1");
+        app.handle(Action::Copy);
+        assert_eq!(app.cue.as_ref().map(|c| c.text.as_str()), Some(COPIED));
+        assert_eq!(
+            app.status.as_ref().map(|s| s.text.as_str()),
+            Some("saved f1"),
+            "a copy is a thing the terminal did; the status is the engine's record"
+        );
+        // One second in, the cue is still up; the second tick reaches `until` and clears it.
+        assert_eq!(app.handle(Action::Tick).0, Changed::Yes);
+        assert!(app.cue.is_some(), "one second is not two");
+        assert_eq!(app.handle(Action::Tick).0, Changed::Yes);
+        assert_eq!(app.cue, None);
+        assert_eq!(
+            app.status.as_ref().map(|s| s.text.as_str()),
+            Some("saved f1"),
+            "and the status outlives it"
+        );
+    }
+
+    #[test]
+    fn app_mouse_drag_selects_rows_and_release_copies() {
+        let mut app = diff_at_f1();
+        // A press with no drag after it is a click, not a zero-length copy — the loop
+        // clears `sel` on the press and nothing here puts one back.
+        app.press_line = Some(1);
+        assert_eq!(app.handle(Action::Release), (Changed::No, None));
+        assert_eq!(app.sel, None);
+        assert_eq!(app.press_line, None, "the release ends the gesture");
+
+        // A drag from line 1 to line 4, then the release that copies it.
+        app.press_line = Some(1);
+        assert_eq!(app.handle(Action::SelectTo(2)).0, Changed::Yes);
+        assert!(app.drag_moved);
+        assert_eq!(app.handle(Action::SelectTo(4)).0, Changed::Yes);
+        assert_eq!(
+            app.sel,
+            Some(Sel {
+                anchor: 1,
+                cursor: 4
+            })
+        );
+        assert_eq!(app.handle(Action::SelectTo(4)).0, Changed::No, "no repaint");
+        let (changed, effect) = app.handle(Action::Release);
+        assert_eq!(changed, Changed::Yes);
+        assert_eq!(copied(effect), "-a1\n+A1\n a2\n a3\n");
+        assert_eq!(app.sel, None);
+        assert!(!app.drag_moved);
+
+        // A drag whose press did not land in the diff body — the divider's, or the nav's —
+        // selects nothing at all (design review F13).
+        assert_eq!(app.press_line, None);
+        assert_eq!(app.handle(Action::SelectTo(3)), (Changed::No, None));
+        assert_eq!(app.sel, None);
+        // And a drag past the last diff line stops at it rather than copying blanks.
+        app.press_line = Some(11);
+        app.handle(Action::SelectTo(999));
+        assert_eq!(
+            app.sel,
+            Some(Sel {
+                anchor: 11,
+                cursor: 12
+            })
+        );
+    }
+
+    #[test]
+    fn app_copy_over_the_cap_writes_nothing() {
+        let mut app = three_roots();
+        let mut big = pile("alpha");
+        big.rows[0].hunks[0].lines = vec![(Tag::Insert, vec![b'x'; 40 * 1024])];
+        app.apply(pile_event("alpha", big));
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Open);
+        let payload = app.copy_payload().expect("a payload to refuse");
+        assert!(payload.len() > super::super::clipboard::CAP);
+        let (changed, effect) = app.handle(Action::Copy);
+        assert_eq!(changed, Changed::Yes);
+        assert_eq!(effect, None, "nothing is written over the cap");
+        assert_eq!(app.cue, None, "and no cue claims otherwise");
+        assert_eq!(
+            app.status.as_ref().map(|s| s.text.as_str()),
+            Some("selection too large to copy (41 KiB; the terminal would drop it)")
+        );
+        // The selection stays: the only thing the reader can do is select less.
+        app.handle(Action::Select);
+        app.handle(Action::NavDown);
+        let sel = app.sel;
+        app.handle(Action::Copy);
+        assert_eq!(app.sel, sel, "still there to shrink");
     }
 }

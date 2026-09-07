@@ -18,9 +18,9 @@ use std::path::{Path, PathBuf};
 
 use lastcall::tui::app::{AcceptFailed, App, Changed, Effect, FlagKind, RootMeta, Selection};
 use lastcall::tui::herdr::{AgentCandidate, Attention, Dot, HerdrUpdate, RootAgents, Scope};
-use lastcall::tui::input::{Action, NoteKey, PickKey};
+use lastcall::tui::input::{Action, EditKey, EditorKey, NoteKey, PickKey};
 use lastcall::tui::render::{render, styles};
-use lastcall_engine::engine::{Engine, EngineOptions};
+use lastcall_engine::engine::{Engine, EngineOptions, SaveRequest};
 use lastcall_engine::env::Env;
 use lastcall_engine::ops::NoFault;
 use lastcall_engine::scan::{Annotation, Change, Collapsed, Pile};
@@ -776,8 +776,10 @@ fn tui_accept_last_hunk_advances() {
     snapshot("tui_accept_last_hunk_advances", &app, W, H);
 }
 
-/// §6.7: accepting a repo's last file collapses the repo out of the nav. alpha's `f1`
-/// then `f2` accepted whole; alpha unlists and the selection moves to beta's first row.
+/// §6.7: accepting a repo's last file collapses the repo out of the nav. alpha's `f1`,
+/// `f2` then `src/parse.rs` accepted whole; alpha unlists and the selection moves to
+/// beta's first row. (`src/parse.rs` is deliverable 10's addition: alpha has three
+/// pending files, and it sorts last, so it is the last file here.)
 #[test]
 fn tui_accept_last_file_collapses_repo() {
     let scene = Scene::build();
@@ -798,6 +800,22 @@ fn tui_accept_last_file_collapses_repo() {
     let (_, effect) = app.handle(Action::AcceptFile);
     run_accept(&mut app, &mut engine, effect);
     assert_eq!(status_text(&app), "accepted f2");
+    assert!(
+        app.roots[&alpha].listed(),
+        "alpha still has src/parse.rs pending"
+    );
+    assert_eq!(
+        app.selection,
+        Some(Selection::Row(
+            alpha.clone(),
+            fixture_parent::PARSE_RS.as_bytes().to_vec()
+        )),
+        "the next row in alpha"
+    );
+
+    let (_, effect) = app.handle(Action::AcceptFile);
+    run_accept(&mut app, &mut engine, effect);
+    assert_eq!(status_text(&app), "accepted src/parse.rs");
     assert!(
         !app.roots[&alpha].listed(),
         "alpha collapsed out of the nav"
@@ -899,13 +917,80 @@ fn tui_accept_all_confirm() {
     assert!(engine.scan(&beta).expect("scan").is_empty());
 }
 
+/// Phase 8 deliverable 3 / ruling P1: the `$EDITOR` session ended and `f1` on disk is not
+/// what the row was rendered from, so the blessing asks before it writes. `y` accepts the
+/// bytes the editor left — the row goes, and the ledger holds the *live* oid, not the one
+/// the screen was showing when the editor opened.
+#[test]
+fn tui_editor_return_confirm() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let alpha = root_named(&engine, "alpha");
+    let mut app = app_of(&mut engine);
+    select_row(&mut app, &alpha, "f1");
+    let rendered = lastcall_engine::ops::Rendered::of(app.roots[&alpha].row(b"f1").expect("f1"));
+
+    // What the editor did: it wrote the file while lastcall was suspended. The row on
+    // screen is still the pre-edit one — no pile has arrived — which is exactly the state
+    // the return path has to handle.
+    scene
+        .repo("alpha")
+        .write("f1", "the line the editor left behind\n");
+    let live = engine.current(&alpha, b"f1").expect("a watched root");
+    let lastcall_engine::store::Current::Present { oid: live_oid, .. } = live.clone() else {
+        panic!("f1 is a regular file: {live:?}");
+    };
+    assert_ne!(
+        Some(&live_oid),
+        rendered.oid.as_ref(),
+        "the editor changed it"
+    );
+
+    let (changed, effect) = app.editor_returned(alpha.clone(), rendered, live);
+    assert_eq!(changed, Changed::Yes);
+    assert_eq!(effect, None, "the question comes first");
+    let (frame, _) = draw(&app, W, H);
+    assert!(
+        frame.contains("f1 edited — mark every hunk in it reviewed?"),
+        "{frame}"
+    );
+    assert!(frame.contains("y / ⏎ confirm    n / Esc cancel"), "{frame}");
+    snapshot("tui_editor_return_confirm", &app, W, H);
+
+    // `y`: the accept carries the live oid, so the row is gone and nothing was re-read.
+    let (_, effect) = app.handle(Action::Confirm);
+    let Some(Effect::Accept(ref reqs)) = effect else {
+        panic!("an accept effect, got {effect:?}");
+    };
+    assert_eq!(reqs.len(), 1);
+    run_accept(&mut app, &mut engine, effect);
+    assert_eq!(status_text(&app), "reviewed f1");
+    assert!(app.roots[&alpha].row(b"f1").is_none());
+    assert!(
+        engine
+            .scan(&alpha)
+            .expect("scan")
+            .rows
+            .iter()
+            .all(|r| r.path != b"f1"),
+        "the blessed content is the baseline: nothing pending for f1"
+    );
+    assert_eq!(
+        std::fs::read_to_string(scene.repo("alpha").path().join("f1")).unwrap(),
+        "the line the editor left behind\n",
+        "the blessing is metadata: the file the editor wrote is untouched"
+    );
+}
+
 /// G0 Q5: exactly 10 files accept without asking. Only alpha is pending (beta and notes
-/// marked seen), with `f1`, `f2` and eight generated files; `ctrl-a` folds it at once.
+/// marked seen), with `f1`, `f2`, deliverable 10's `src/parse.rs` and seven generated
+/// files; `ctrl-a` folds it at once. The generated count is what keeps the pile at
+/// exactly ten — the threshold is the subject here, not alpha's shape.
 #[test]
 fn tui_accept_all_no_confirm_at_10() {
     let scene = Scene::build();
     let alpha_repo = scene.repo("alpha");
-    for i in 1..=8 {
+    for i in 1..=7 {
         alpha_repo.write(&format!("g{i:02}"), format!("generated {i}\n"));
     }
     let mut engine = scene.engine();
@@ -932,12 +1017,14 @@ fn tui_accept_all_no_confirm_at_10() {
 
 /// Ruling 1: an engine capped at 3 rows over alpha with 5 pending files shows the first
 /// three by path, `3+ files` in the nav and header, and the notice under the root's
-/// main-view header.
+/// main-view header. The five are `f1`, `f2`, deliverable 10's `src/parse.rs` (which
+/// sorts last, so it is one of the omitted two) and two generated files — the cap and
+/// the omitted count are the subject here, not alpha's shape.
 #[test]
 fn tui_row_cap_notice() {
     let scene = Scene::build();
     let alpha_repo = scene.repo("alpha");
-    for i in 1..=3 {
+    for i in 1..=2 {
         alpha_repo.write(&format!("g{i}"), format!("generated {i}\n"));
     }
     let mut engine = scene.engine_with(EngineOptions {
@@ -1173,6 +1260,13 @@ fn tui_herdr_scope_notice_with_status() {
 
 // --- Phase 7: restore and flag ----------------------------------------------------------
 
+/// Type into the open note modal one character at a time, as the reader does.
+fn type_note(app: &mut App, note: &str) {
+    for c in note.chars() {
+        app.handle(Action::Note(NoteKey::Edit(EditKey::Insert(c.to_string()))));
+    }
+}
+
 /// Flag whatever the cursor is on, exactly as the loop does it: `m`, the note a character
 /// at a time, Enter, then the engine call the effect asked for and its answer fed back.
 /// Nothing here reaches around the reducer — the frames are of an `App` the loop could
@@ -1183,21 +1277,22 @@ fn flag_here(app: &mut App, engine: &mut Engine, note: &str) {
         Changed::Yes,
         "the note modal opens"
     );
-    for c in note.chars() {
-        app.handle(Action::Note(NoteKey::Insert(c.to_string())));
-    }
+    type_note(app, note);
     let (_, effect) = app.handle(Action::Note(NoteKey::Send));
     let Some(Effect::Flag {
         root,
         path,
         note,
         hunk,
+        summary,
         label,
     }) = effect
     else {
         panic!("a flag effect: {effect:?}");
     };
-    let flagged = engine.flag(&root, &path, &note, hunk).expect("flag");
+    let flagged = engine
+        .flag(&root, &path, &note, hunk, summary)
+        .expect("flag");
     assert!(flagged.outcome.refused.is_empty(), "{:?}", flagged.outcome);
     app.flagged(root, FlagKind::Flag { label }, Ok(flagged));
 }
@@ -1212,8 +1307,9 @@ fn candidate(pane: &str, label: &str, workspace: &str, status: Attention) -> Age
     }
 }
 
-/// The note modal over the diff: what is being flagged, the note as typed (two lines, the
-/// caret at the end), and the keys that end it.
+/// The note modal over the diff: the **title names the hunk** being flagged, the first line
+/// repeats it with the path, the note is as typed (two lines, the caret at the end), and the
+/// key line promises `^J` alone — this terminal reports no keyboard enhancement.
 #[test]
 fn tui_note_modal() {
     let scene = Scene::build();
@@ -1223,11 +1319,69 @@ fn tui_note_modal() {
     select_row(&mut app, &alpha, "f1");
     app.handle(Action::Open);
     app.handle(Action::Flag);
-    for c in "this rewrite loses the guard\nwhy?".chars() {
-        app.handle(Action::Note(NoteKey::Insert(c.to_string())));
-    }
+    type_note(&mut app, "this rewrite loses the guard\nwhy?");
     assert!(app.note.is_some());
+    let (frame, _) = draw(&app, W, H);
+    assert!(
+        frame.contains("flag hunk 1 of"),
+        "the title names it: {frame}"
+    );
+    assert!(frame.contains("⏎ send   ^J newline"), "{frame}");
     snapshot("tui_note_modal", &app, W, H);
+}
+
+/// A note taller than the box scrolls with the caret: eight lines typed, the caret moved up
+/// to line 7, and the five visible rows are lines 3 to 7 — the window ends at the caret.
+#[test]
+fn tui_note_modal_scrolled() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    let alpha = root_named(&engine, "alpha");
+    select_row(&mut app, &alpha, "f1");
+    app.handle(Action::Open);
+    app.handle(Action::Flag);
+    let note: Vec<String> = (1..=8).map(|n| format!("note line {n}")).collect();
+    type_note(&mut app, &note.join("\n"));
+    // Up once: off line 8 and onto line 7, which is where the window now ends.
+    app.handle(Action::Note(NoteKey::Edit(EditKey::Up)));
+    assert_eq!(
+        app.note.as_ref().expect("open").buf.cursor.line,
+        6,
+        "the caret is on line 7 (0-based 6)"
+    );
+    let (frame, _) = draw(&app, W, H);
+    for n in 3..=7 {
+        assert!(
+            frame.contains(&format!("note line {n}")),
+            "line {n}: {frame}"
+        );
+    }
+    for n in [1, 2, 8] {
+        assert!(
+            !frame.contains(&format!("note line {n}")),
+            "line {n} is scrolled out: {frame}"
+        );
+    }
+    snapshot("tui_note_modal_scrolled", &app, W, H);
+}
+
+/// `m` from the nav has no hunk under a cursor, so the flag is the whole file: the title
+/// says `whole file`, the first line says `f1 · whole file`, and the export the send will
+/// build carries the row's shape instead of a diff (ruling P4).
+#[test]
+fn tui_note_modal_whole_file() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    let alpha = root_named(&engine, "alpha");
+    select_row(&mut app, &alpha, "f1");
+    app.handle(Action::Flag);
+    type_note(&mut app, "the whole rewrite needs another look");
+    let (frame, _) = draw(&app, W, H);
+    assert!(frame.contains("flag whole file"), "the title: {frame}");
+    assert!(frame.contains("f1 · whole file"), "the first line: {frame}");
+    snapshot("tui_note_modal_whole_file", &app, W, H);
 }
 
 /// Two agents under one root: the picker asks which, naming each pane's workspace and
@@ -1317,4 +1471,242 @@ fn tui_nav_flag_counts() {
 
     app.select(Some(Selection::Root(alpha.clone())));
     snapshot("tui_nav_flag_counts", &app, W, H);
+}
+
+// ---- Phase 8 deliverable 8: the inline editor -------------------------------------------
+
+/// `i` on the selection, answered by the **real** engine — the loop's `Effect::EditInline`
+/// round trip with no editor process anywhere near it.
+fn open_editor(app: &mut App, engine: &Engine) {
+    let (changed, effect) = app.handle(Action::Edit);
+    assert_eq!(
+        changed,
+        Changed::No,
+        "nothing is drawn to ask for the bytes"
+    );
+    let Some(Effect::EditInline(open)) = effect else {
+        panic!("an inline-edit effect, got {effect:?}");
+    };
+    let bytes = engine.read_rendered(&open.root, &open.rendered);
+    assert!(bytes.is_ok(), "src/parse.rs opens: {bytes:?}");
+    assert_eq!(app.edit_read(open, bytes), (Changed::Yes, None));
+    assert!(app.editor.is_some(), "the editor is open");
+}
+
+/// Select alpha's `src/parse.rs`, open the diff and put the cursor on the **middle** hunk —
+/// the shared start of every editor scene, and the one hunk whose line number proves the
+/// editor landed somewhere the fixture chose rather than at the top of the file.
+fn at_parse_rs_middle_hunk(app: &mut App, engine: &Engine, alpha: &Path) {
+    select_row(app, alpha, fixture_parent::PARSE_RS);
+    app.handle(Action::Open);
+    app.handle(Action::HunkNext);
+    let hunks = app.view_hunks();
+    assert_eq!(hunks.len(), 3, "three separated agent hunks");
+    assert_eq!(
+        hunks[1].editor_line(),
+        fixture_parent::parse_rs_edit2_line(),
+        "the middle hunk's first changed line, from the fixture text"
+    );
+    let _ = engine;
+}
+
+/// The editor open on the middle hunk: the whole file in a buffer, the caret on the agent's
+/// first changed line, the entered hunk tinted as a band, `▎` on the lines of the other two
+/// hunks, and a header that names the file and the line.
+#[test]
+fn tui_editor_open() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    let alpha = root_named(&engine, "alpha");
+    at_parse_rs_middle_hunk(&mut app, &engine, &alpha);
+    open_editor(&mut app, &engine);
+
+    let ed = app.editor.as_ref().expect("open");
+    assert_eq!(ed.line_at_open, fixture_parent::parse_rs_edit2_line());
+    assert_eq!(
+        ed.buf.text(),
+        fixture_parent::PARSE_RS_EDITED,
+        "the buffer is the file on disk"
+    );
+    assert!(ed.band.is_some(), "the entered hunk is tinted: {ed:?}");
+    let (frame, _) = draw(&app, W, H);
+    assert!(
+        frame.contains(&format!(
+            "editing src/parse.rs · line {}",
+            fixture_parent::parse_rs_edit2_line()
+        )),
+        "{frame}"
+    );
+    assert!(frame.contains("^S save   Esc close"), "{frame}");
+    snapshot("tui_editor_open", &app, W, H);
+}
+
+// ---- deliverable 9: select to copy -------------------------------------------------------
+
+/// Three selected lines of `src/parse.rs`'s middle hunk in reverse video, the rest of the
+/// pane untouched: what `v j j` looks like before the `y`.
+#[test]
+fn tui_diff_selection() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    let alpha = root_named(&engine, "alpha");
+    at_parse_rs_middle_hunk(&mut app, &engine, &alpha);
+    app.handle(Action::Select);
+    app.handle(Action::NavDown);
+    app.handle(Action::NavDown);
+    let sel = app.sel.expect("a selection");
+    assert_eq!(sel.range().1 - sel.range().0, 2, "three lines");
+    assert!(app.copy_payload().is_some());
+    snapshot("tui_diff_selection", &app, W, H);
+}
+
+/// The cue after the copy: a centred box over the diff pane, and the status line still
+/// saying what the engine last did.
+#[test]
+fn tui_copy_cue() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    let alpha = root_named(&engine, "alpha");
+    at_parse_rs_middle_hunk(&mut app, &engine, &alpha);
+    app.set_status("saved src/parse.rs");
+    let (_, effect) = app.handle(Action::Copy);
+    let Some(Effect::Copy(bytes)) = effect else {
+        panic!("a copy effect, got {effect:?}");
+    };
+    assert!(
+        String::from_utf8_lossy(&bytes).starts_with("@@ -"),
+        "the hunk under the cursor, header first"
+    );
+    assert!(app.cue.is_some());
+    let (frame, _) = draw(&app, W, H);
+    assert!(frame.contains("copied to clipboard"), "{frame}");
+    assert!(frame.contains("saved src/parse.rs"), "{frame}");
+    snapshot("tui_copy_cue", &app, W, H);
+}
+
+/// The hint line with the diff focused on a wide frame: `v select` and `y copy` are the
+/// last two hints on it, and the first to go when the line has to shrink.
+#[test]
+fn tui_hint_diff_focus() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    let alpha = root_named(&engine, "alpha");
+    at_parse_rs_middle_hunk(&mut app, &engine, &alpha);
+    app.handle(Action::Resize(140, 20));
+    let (frame, _) = draw(&app, 140, 20);
+    assert!(frame.contains("v select  y copy"), "{frame}");
+    let (narrow, _) = draw(&app, W, H);
+    assert!(!narrow.contains("y copy"), "{narrow}");
+    snapshot("tui_hint_diff_focus", &app, 140, 20);
+}
+
+/// Esc on a buffer that has been typed in asks before throwing the text away, and the
+/// question names the file.
+#[test]
+fn tui_editor_dirty_confirm() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    let alpha = root_named(&engine, "alpha");
+    at_parse_rs_middle_hunk(&mut app, &engine, &alpha);
+    open_editor(&mut app, &engine);
+
+    app.handle(Action::Editor(EditorKey::Edit(EditKey::Insert(
+        "// typed by the reviewer".to_owned(),
+    ))));
+    assert!(app.editor.as_ref().expect("open").buf.dirty());
+    app.handle(Action::Editor(EditorKey::Close));
+    assert_eq!(app.confirm_discard(), Some(&b"src/parse.rs"[..]));
+    let (frame, _) = draw(&app, W, H);
+    assert!(
+        frame.contains("Discard changes to src/parse.rs?"),
+        "{frame}"
+    );
+    snapshot("tui_editor_dirty_confirm", &app, W, H);
+}
+
+/// A save the engine refuses because an agent wrote the file while the reader was typing:
+/// the buffer is kept whole, the header goes red, and the status names the two keys that
+/// reload.
+#[test]
+fn tui_editor_save_refused() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    let alpha = root_named(&engine, "alpha");
+    at_parse_rs_middle_hunk(&mut app, &engine, &alpha);
+    open_editor(&mut app, &engine);
+    app.handle(Action::Editor(EditorKey::Edit(EditKey::Insert(
+        "// typed by the reviewer\n".to_owned(),
+    ))));
+
+    // The agent writes the file underneath the open buffer.
+    scene
+        .repo("alpha")
+        .write(fixture_parent::PARSE_RS, "the agent got there first\n");
+
+    let (_, effect) = app.handle(Action::Editor(EditorKey::Save));
+    let Some(Effect::Save {
+        root,
+        rendered,
+        bytes,
+    }) = effect
+    else {
+        panic!("a save effect, got {effect:?}");
+    };
+    let result = engine
+        .save(&root, SaveRequest { rendered, bytes })
+        .map_err(|e| AcceptFailed::of(&e));
+    let refused = result
+        .as_ref()
+        .expect("the ledger answered")
+        .outcome
+        .refused
+        .clone();
+    assert!(
+        matches!(
+            refused.first(),
+            Some(lastcall_engine::ops::Refused::Moved { .. })
+        ),
+        "the compare-and-swap saw the agent's write: {refused:?}"
+    );
+    app.saved(root, fixture_parent::PARSE_RS.as_bytes().to_vec(), result);
+
+    let ed = app.editor.as_ref().expect("the buffer is kept");
+    assert!(ed.alarm, "the header is red");
+    assert!(
+        ed.buf.text().contains("// typed by the reviewer"),
+        "every character the reviewer typed is still there"
+    );
+    let (frame, _) = draw(&app, W, H);
+    assert!(
+        frame.contains("changed since you opened it; not saved — Esc, then i to reload"),
+        "{frame}"
+    );
+    // Nothing was written: the file on disk is still the agent's.
+    let on_disk = std::fs::read_to_string(alpha.join(fixture_parent::PARSE_RS)).expect("read");
+    assert_eq!(on_disk, "the agent got there first\n");
+    snapshot("tui_editor_save_refused", &app, W, H);
+}
+
+/// The editor at 60×20: the gutter and the band survive, and long lines are cut at the
+/// right edge with `→` rather than wrapped — an editor that reflows a reader's code while
+/// they type in it is lying about the file.
+#[test]
+fn tui_editor_narrow_60x20() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    let alpha = root_named(&engine, "alpha");
+    at_parse_rs_middle_hunk(&mut app, &engine, &alpha);
+    app.handle(Action::Resize(60, 20));
+    open_editor(&mut app, &engine);
+
+    let (frame, _) = draw(&app, 60, 20);
+    assert!(frame.contains('→'), "a clipped line says so: {frame}");
+    snapshot("tui_editor_narrow_60x20", &app, 60, 20);
 }

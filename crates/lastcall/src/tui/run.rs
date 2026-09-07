@@ -16,14 +16,24 @@
 //! `restore()` first — the shell is sane even if shutdown hangs — then a bounded
 //! `watcher.join()`, then a bounded runtime shutdown ([`shut_down`]).
 //!
-//! The reader thread is never joined: `crossterm::event::read()` blocks in `mio::Poll` on
-//! the tty and nothing in the restore sequence wakes it, so it polls with a 50 ms timeout
-//! under a stop flag and exits on its own shortly after the loop ends.
+//! The reader thread is never joined **on the quit path**: `crossterm::event::read()` blocks
+//! in `mio::Poll` on the tty and nothing in the restore sequence wakes it, so it polls with a
+//! 50 ms timeout under a stop flag and exits on its own shortly after the loop ends. The
+//! `$EDITOR` suspend *does* join it ([`Suspend::run`]), because there the thread must be gone
+//! rather than merely told to stop: two processes reading the same tty would split the
+//! user's keystrokes between the editor and a dead TUI (design review F8).
+//!
+//! **While `$EDITOR` owns the terminal the `select!` does not run at all.** The handover is
+//! synchronous inside the effect dispatch, so watcher piles, herdr events and ticks queue on
+//! their channels and are drained in the pass that follows the resume. One of those piles may
+//! be the watcher's own notice of the editor's save, so the frame right after a resume can
+//! show the edit pending for an instant before the blessing question replaces it — documented
+//! in `docs/dev/tui.md`, not a defect.
 
 use std::collections::BTreeMap;
 use std::io;
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -32,32 +42,45 @@ use std::time::Duration;
 use crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, Event, MouseButton, MouseEvent, MouseEventKind,
 };
-use lastcall_engine::engine::{AcceptRequest, Engine, RenderedHunk, RestoreRequest};
+use lastcall_engine::engine::{AcceptRequest, Engine, RenderedHunk, RestoreRequest, SaveRequest};
 use lastcall_engine::env::Env;
 use lastcall_engine::herdr::HerdrEvent;
 use lastcall_engine::herdr::client::{Cache, ClientHandle};
 use lastcall_engine::herdr::transport::SocketTransport;
 use lastcall_engine::hunks::Expanded;
+use lastcall_engine::ledger::FlagSummary;
+use lastcall_engine::ops::{Refused, Rendered};
 use lastcall_engine::scan::{Pile, Row};
+use lastcall_engine::store::Current;
 use lastcall_engine::watcher::{EngineEvent, EngineTimings, Watcher, blocking};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Rect;
 use tokio::sync::mpsc;
 
 use super::app::{
-    AcceptFailed, AcceptResult, App, Changed, Effect, FlagKind, FlagResult, RestoreResult, RootMeta,
+    AcceptFailed, AcceptResult, App, Changed, EditOpen, Effect, FlagKind, FlagResult,
+    RestoreResult, RootMeta, SaveResult,
 };
+use super::clipboard::Osc52;
+use super::editor::EditorCommand;
 use super::herdr::{self, HerdrLink, HerdrPlan, HerdrUpdate, Link, ToastMsg};
 use super::input::{
-    Action, Key, Keymap, modal_action, note_action, pick_action, pointer, to_action,
+    Action, EditorKey, Key, Keymap, editor_action, modal_action, note_action, pick_action, pointer,
+    to_action,
 };
 use super::render::{HitMap, Pane, render};
 use super::term;
 
 /// How long the quit path waits for the watcher, and then for the runtime.
 pub const SHUTDOWN_BUDGET: Duration = Duration::from_millis(500);
-/// The reader thread's poll timeout: how long after the loop ends it can linger.
+/// The reader thread's poll timeout: how long after the loop ends it can linger, and how
+/// long the `$EDITOR` suspend's join can take.
 pub const INPUT_POLL: Duration = Duration::from_millis(50);
+/// How long the resume from an `$EDITOR` suspend spends swallowing interrupts (F4). See
+/// [`Signals::resume`]: a `^C` typed at the editor is delivered to lastcall too, and without
+/// this window it would quit the loop the moment the loop starts running again.
+pub const EDITOR_SETTLE: Duration = Duration::from_millis(50);
 /// Status-line ages advance this often.
 pub const TICK: Duration = Duration::from_secs(1);
 /// How long a burst of `worktree.*` events is coalesced before one discovery rescan
@@ -109,6 +132,29 @@ pub enum Local {
     Fatal(String),
     /// A herdr request the loop made off the UI task came back (`agent.focus`, a toast).
     Herdr(HerdrUpdate),
+    /// An `Effect::EditorReturned` finished: what the work tree holds at the path the
+    /// `$EDITOR` session had open (Phase 8 deliverable 3). The row the editor was opened on
+    /// travels back with the answer so the reducer compares against what the user saw.
+    EditorReturned {
+        root: PathBuf,
+        rendered: Rendered,
+        live: Current,
+    },
+    /// An `Effect::EditInline` finished: the live bytes of the row the inline editor is
+    /// opening on, or the refusal that says why it will not open (deliverable 8). The
+    /// opening context travels back with the answer, so the marks and the band belong to
+    /// the pile `i` was pressed on.
+    EditRead {
+        open: EditOpen,
+        result: Result<Vec<u8>, Refused>,
+    },
+    /// An `Effect::Save` finished. The `path` travels because the answer must be able to
+    /// name the file even when the editor was closed while the write was in flight.
+    Saved {
+        root: PathBuf,
+        path: Vec<u8>,
+        result: SaveResult,
+    },
     /// An `Effect::Expand` finished: one collapsed row's on-demand hunks (deliverable 4).
     /// The row `hunks_of` was given travels back with the answer, so the app can tell an
     /// answer for the oids on screen from one for oids a pile has since replaced.
@@ -156,7 +202,7 @@ impl Ui {
         if self.app.note.is_some() {
             match event {
                 Event::Key(_) | Event::Paste(_) => {
-                    return match note_action(event, &self.keymap) {
+                    return match note_action(event, &self.keymap, self.app.enhanced) {
                         Some(action) => self.app.handle(action),
                         None => (Changed::No, None),
                     };
@@ -196,16 +242,72 @@ impl Ui {
                 _ => return (Changed::No, None),
             }
         }
+        // The inline editor is a text field over the whole diff pane, so it is consulted
+        // after the three modals that can sit *above* it — the discard confirm is one of
+        // them — and before the keymap, which it swallows whole: every printable key is a
+        // character of the file, `q` included (F16). Only a non-printable `quit` binding
+        // survives, as it does under the note modal. The mouse is the editor's too: a click
+        // puts the caret where it landed and the wheel scrolls, both resolved here because
+        // the pane's rectangle is a fact about the last frame and not about the app.
+        if self.app.editor.is_some() {
+            match event {
+                Event::Key(_) | Event::Paste(_) => {
+                    return match editor_action(event, &self.keymap, self.app.enhanced) {
+                        Some(action) => self.app.handle(action),
+                        None => (Changed::No, None),
+                    };
+                }
+                Event::Mouse(_) => {
+                    return match to_action(event, &self.keymap) {
+                        Some(Action::Press(x, y)) => match self.editor_text_at(x, y) {
+                            Some((dy, dx)) => {
+                                self.app.handle(Action::Editor(EditorKey::Click(dy, dx)))
+                            }
+                            None => (Changed::No, None),
+                        },
+                        Some(Action::ScrollUp(n)) => self
+                            .app
+                            .handle(Action::Editor(EditorKey::Scroll(-(n as i32)))),
+                        Some(Action::ScrollDown(n)) => {
+                            self.app.handle(Action::Editor(EditorKey::Scroll(n as i32)))
+                        }
+                        _ => (Changed::No, None),
+                    };
+                }
+                // A resize still reaches the app below, and invalidates the hit map with it.
+                Event::Resize(..) => {}
+                _ => return (Changed::No, None),
+            }
+        }
         let Some(action) = to_action(event, &self.keymap) else {
             return (Changed::No, None);
         };
         match action {
-            Action::Resize(..) => {
+            Action::Resize(w, h) => {
+                tracing::debug!(w, h, "resize");
                 self.hits = None;
                 self.app.handle(action)
             }
-            Action::Press(x, y) => match self.hits.as_ref().and_then(|h| h.at(x, y)).cloned() {
-                Some(target) => self.app.hit(target),
+            Action::Press(x, y) => {
+                // Deliverable 9: the anchor is taken from the frame the user pressed on,
+                // **before** `hit` runs — a press on a hunk header moves the diff cursor,
+                // and an anchor read after that would be the header's new scroll rather
+                // than the line under the pointer. A press anywhere but the diff body
+                // (the nav, the divider, the header) leaves it `None`, which is what keeps
+                // a divider drag a divider drag.
+                self.app.press_line = self.diff_line_at(x, y);
+                self.app.drag_moved = false;
+                self.app.sel = None;
+                match self.hits.as_ref().and_then(|h| h.at(x, y)).cloned() {
+                    Some(target) => self.app.hit(target),
+                    None => (Changed::No, None),
+                }
+            }
+            // A drag with the divider held is the divider's (`App::handle` owns it); any
+            // other drag is a selection, and the reducer ignores it unless the press landed
+            // in the diff body (design review F13).
+            Action::Drag(x, y) if !self.app.dragging => match self.diff_line_at(x, y) {
+                Some(line) => self.app.handle(Action::SelectTo(line)),
                 None => (Changed::No, None),
             },
             Action::ScrollUp(_) | Action::ScrollDown(_) if !self.app.help => {
@@ -224,6 +326,24 @@ impl Ui {
             }
             other => self.app.handle(other),
         }
+    }
+
+    /// Where `(x, y)` lands in the editor's **text** area, as a `(row, column)` offset
+    /// inside it — the gutter and the borders already subtracted. `None` when the last
+    /// frame drew no editor, or when the point is outside it.
+    /// The **absolute diff line** `(x, y)` sits on, or `None` when the point is outside the
+    /// last frame's diff body. Absolute, not a screen row: the pane is drawn from
+    /// `App::diff.scroll`, and a selection outlives the scrolling that follows it.
+    fn diff_line_at(&self, x: u16, y: u16) -> Option<usize> {
+        let rect = self.hits.as_ref()?.diff_body?;
+        rect.contains(ratatui::layout::Position::new(x, y))
+            .then(|| self.app.diff.scroll + (y - rect.y) as usize)
+    }
+
+    fn editor_text_at(&self, x: u16, y: u16) -> Option<(u16, u16)> {
+        let rect = self.hits.as_ref()?.editor?;
+        rect.contains(ratatui::layout::Position::new(x, y))
+            .then(|| (y - rect.y, x - rect.x))
     }
 
     /// Fold one watcher event in.
@@ -248,6 +368,13 @@ impl Ui {
                 (Changed::No, Some(Effect::Quit))
             }
             Local::Herdr(update) => self.app.handle(Action::Herdr(update)),
+            Local::EditorReturned {
+                root,
+                rendered,
+                live,
+            } => self.app.editor_returned(root, rendered, live),
+            Local::EditRead { open, result } => self.app.edit_read(open, result),
+            Local::Saved { root, path, result } => (self.app.saved(root, path, result), None),
             Local::Expanded(root, row, view) => (self.app.set_expanded(root, &row, view), None),
         }
     }
@@ -489,12 +616,19 @@ fn block_bounded<F: Future>(
     rt.block_on(async { tokio::time::timeout(budget, fut).await.ok() })
 }
 
-/// The detached reader thread: `poll(INPUT_POLL)` + `read()` under a stop flag, forwarding
-/// every event. Returns the flag; the thread is never joined (module docs).
-fn spawn_input(tx: mpsc::UnboundedSender<Event>) -> io::Result<Arc<AtomicBool>> {
+/// The reader thread: `poll(INPUT_POLL)` + `read()` under a stop flag, forwarding every
+/// event.
+///
+/// Returns the flag **and the handle**. The quit path only raises the flag and lets the
+/// thread end on its own (module docs); the `$EDITOR` suspend joins it, which is why the
+/// handle is returned at all (design review F8). The join is bounded by one [`INPUT_POLL`]
+/// because the thread is never blocked in `read()` for longer than that.
+fn spawn_input(
+    tx: mpsc::UnboundedSender<Event>,
+) -> io::Result<(Arc<AtomicBool>, std::thread::JoinHandle<()>)> {
     let stop = Arc::new(AtomicBool::new(false));
     let flag = stop.clone();
-    std::thread::Builder::new()
+    let handle = std::thread::Builder::new()
         .name("lastcall-input".to_owned())
         .spawn(move || {
             while !flag.load(Ordering::Relaxed) {
@@ -512,10 +646,10 @@ fn spawn_input(tx: mpsc::UnboundedSender<Event>) -> io::Result<Arc<AtomicBool>> 
                 }
             }
         })?;
-    Ok(stop)
+    Ok((stop, handle))
 }
 
-fn root_metas(engine: &mut Engine) -> Vec<RootMeta> {
+fn root_metas(engine: &Engine) -> Vec<RootMeta> {
     engine.roots().iter().map(|r| RootMeta::of(r)).collect()
 }
 
@@ -595,27 +729,90 @@ fn spawn_restore(
     });
 }
 
+/// `Effect::EditInline`: read the row's live bytes for the inline editor, off the UI task.
+///
+/// One `lstat`, one `hash-object`, one `read` and one more `hash-object` — no ledger lock
+/// and nothing written — but it is still file I/O on a path that may be on a slow disk, so
+/// it goes through `blocking` like every other engine call the loop makes.
+fn spawn_read_rendered(
+    engine: &Arc<Mutex<Engine>>,
+    tx: mpsc::UnboundedSender<Local>,
+    open: EditOpen,
+) {
+    let engine = engine.clone();
+    tokio::spawn(async move {
+        let root = open.root.clone();
+        let rendered = open.rendered.clone();
+        let read = tokio::spawn(async move {
+            blocking(&engine, move |e| e.read_rendered(&root, &rendered)).await
+        });
+        if let Some(result) = joined(read, &tx, "read_rendered").await {
+            let _ = tx.send(Local::EditRead { open, result });
+        }
+    });
+}
+
+/// `Effect::Save`: the CAS'd write and its rescan in one `blocking` closure, the same shape
+/// as `spawn_restore`. The path travels to the answer so it can name the file whatever the
+/// editor did in the meantime.
+fn spawn_save(
+    engine: &Arc<Mutex<Engine>>,
+    tx: mpsc::UnboundedSender<Local>,
+    root: PathBuf,
+    rendered: Rendered,
+    bytes: Vec<u8>,
+) {
+    let engine = engine.clone();
+    tokio::spawn(async move {
+        let path = rendered.path.clone();
+        let at = root.clone();
+        let save = tokio::spawn(async move {
+            blocking(&engine, move |e| {
+                e.save(&at, SaveRequest { rendered, bytes })
+                    .map_err(|e| AcceptFailed::of(&e))
+            })
+            .await
+        });
+        if let Some(result) = joined(save, &tx, "save").await {
+            let _ = tx.send(Local::Saved { root, path, result });
+        }
+    });
+}
+
+/// One `Effect::Flag`'s payload, carried whole into [`spawn_flag`]. It is the effect's own
+/// fields under a name: `root`, `path`, the `note`, the rendered `hunk` (`None` for a
+/// whole-file flag), its `summary` (`Some` only for a whole-file one — Amendment v1.8) and
+/// the `label` the answer will speak with.
+pub struct FlagRequest {
+    pub root: PathBuf,
+    pub path: Vec<u8>,
+    pub note: String,
+    pub hunk: Option<RenderedHunk>,
+    pub summary: Option<FlagSummary>,
+    pub label: String,
+}
+
 /// `Effect::Flag`: the ledger write and its rescan in one `blocking` closure, the same
 /// shape as `spawn_accept`. The engine renders the export (only it has the flag's
 /// `created_at`), so the answer carries the paste-ready text the send will use.
 ///
 /// Public for the same reason [`herdr_fold`] is: `tests/test_integration_loop_flag_stage.rs`
 /// drives the loop's own dispatch rather than a hand-written stand-in for it.
-pub fn spawn_flag(
-    engine: &Arc<Mutex<Engine>>,
-    tx: mpsc::UnboundedSender<Local>,
-    root: PathBuf,
-    path: Vec<u8>,
-    note: String,
-    hunk: Option<RenderedHunk>,
-    label: String,
-) {
+pub fn spawn_flag(engine: &Arc<Mutex<Engine>>, tx: mpsc::UnboundedSender<Local>, req: FlagRequest) {
+    let FlagRequest {
+        root,
+        path,
+        note,
+        hunk,
+        summary,
+        label,
+    } = req;
     let engine = engine.clone();
     let back = root.clone();
     tokio::spawn(async move {
         let task = tokio::spawn(async move {
             blocking(&engine, move |e| {
-                e.flag(&root, &path, &note, hunk)
+                e.flag(&root, &path, &note, hunk, summary)
                     .map_err(|e| AcceptFailed::of(&e))
             })
             .await
@@ -767,11 +964,170 @@ fn spawn_expand(
     });
 }
 
+/// One `Engine::current` off the UI task, awaited in place.
+///
+/// Every failure becomes a [`Current::Unhashable`] with its own words rather than a notice or
+/// a panic: an `Err` from `current` (only `NoSuchRoot` — it does no ledger work) and a
+/// panicking engine task alike. The editor path then has exactly one shape and one sentence
+/// for "there is nothing to bless": the file is left pending and the reason is named.
+async fn editor_current(engine: &Arc<Mutex<Engine>>, root: PathBuf, path: Vec<u8>) -> Current {
+    let engine = engine.clone();
+    let task =
+        tokio::spawn(async move { blocking(&engine, move |e| e.current(&root, &path)).await });
+    match task.await {
+        Ok(Ok(live)) => live,
+        Ok(Err(e)) => Current::Unhashable(e.to_string()),
+        Err(e) => Current::Unhashable(format!("engine task failed: {e}")),
+    }
+}
+
+/// Everything the `$EDITOR` handover takes apart and puts back (deliverable 7).
+///
+/// Grouped into one borrow because the sequence is ordered and every step of it is state the
+/// reducer cannot see: the terminal, the guard that owns its mode, the reader thread and the
+/// channel it feeds, and the signal streams.
+struct Suspend<'a> {
+    ui: &'a mut Ui,
+    terminal: &'a mut Screen,
+    guard: &'a mut term::TerminalGuard,
+    stop: &'a mut Arc<AtomicBool>,
+    reader: &'a mut Option<std::thread::JoinHandle<()>>,
+    input: &'a mut mpsc::UnboundedReceiver<Event>,
+    signals: &'a mut Signals,
+}
+
+impl Suspend<'_> {
+    /// Give the terminal to `cmd`, wait for it, and take the terminal back. **Every step is
+    /// load-bearing and the order is the whole point** (kickoff deliverable 7; design review
+    /// F4 and F8):
+    ///
+    /// 1. **Stop and join the reader thread.** Told-to-stop is not enough: a thread still
+    ///    inside `crossterm::event::read()` competes with the editor for the same tty and
+    ///    splits the user's keystrokes between the two. It polls at [`INPUT_POLL`], so the
+    ///    join costs at most that.
+    /// 2. **`term::restore()`** — which pops the keyboard-enhancement flags *before* leaving
+    ///    the alternate screen, so the editor starts on a terminal reporting keys the way its
+    ///    own reader expects (`term.rs`).
+    /// 3. **Spawn the child** with the three standard descriptors inherited and `cwd` at the
+    ///    root, and wait for it. Its signal dispositions are the shell's own: `exec` resets
+    ///    every *handler* to `SIG_DFL`, and lastcall installs handlers (tokio's) rather than
+    ///    `SIG_IGN`, so nothing this process did is inherited and a `^C` at the editor
+    ///    interrupts the editor.
+    /// 4. **[`Signals::resume`]** before anything is drawn: the same `^C` was delivered to
+    ///    lastcall too, and the loop must not read it as "quit" the moment it runs again.
+    /// 5. **`term::enter()`**, then **replace the guard without dropping it**. The old guard's
+    ///    `Drop` calls `restore()`, which would now undo the *live* terminal it never owned,
+    ///    so it is forgotten rather than dropped.
+    /// 6. **A fresh channel and a fresh reader thread.** The old channel can still hold the
+    ///    key release of `shift-i` or a `Resize` the editor caused, neither of which means
+    ///    anything to the resumed TUI.
+    /// 7. **Clear and a synthetic `Resize`** to the size the terminal has *now*: the
+    ///    editor may have been resized, and ratatui's back buffer describes a screen the
+    ///    editor has since painted over. Through `Terminal::resize` rather than
+    ///    `Terminal::clear`, which would ask the terminal for its cursor position and wait
+    ///    two seconds for an answer that may never come.
+    ///
+    /// `Ok(None)` means the child ran (whatever its exit status: an editor that quits with an
+    /// error still wrote, or did not, and the return path is what decides). `Ok(Some(status))`
+    /// means it never started — `editor not found: <program>` — and there is nothing to bless. `Err`
+    /// is a failure to take the terminal *back*, which is fatal: there is no screen to report
+    /// it on.
+    async fn run(
+        &mut self,
+        cmd: &EditorCommand,
+        file: &Path,
+        line: usize,
+        cwd: &Path,
+    ) -> io::Result<Option<String>> {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.reader.take() {
+            let _ = handle.join();
+        }
+        term::restore();
+
+        let spawned = std::process::Command::new(&cmd.program)
+            .args(cmd.argv(file, line))
+            .current_dir(cwd)
+            .status();
+
+        self.signals.resume().await;
+
+        let fresh = term::enter()?;
+        std::mem::forget(std::mem::replace(self.guard, fresh));
+        nudge_the_tty();
+
+        let (tx, rx) = mpsc::unbounded_channel::<Event>();
+        let (stop, handle) = spawn_input(tx)?;
+        *self.stop = stop;
+        *self.reader = Some(handle);
+        *self.input = rx;
+
+        // **Not** `Terminal::clear()`, which is the obvious call and the wrong one: it
+        // snapshots the cursor with a terminal *query* (DSR), so it needs a reply — from a
+        // terminal the freshly spawned reader thread is now polling, and which a terminal
+        // that never answers turns into crossterm's two-second timeout and then an `Err`
+        // that would be fatal here. `Terminal::resize` does exactly what the resume needs
+        // and asks the terminal nothing: it clears the screen and resets the back buffer, so
+        // the next draw paints every cell of a screen the editor has painted over.
+        if let Ok((w, h)) = crossterm::terminal::size() {
+            self.terminal.resize(Rect::new(0, 0, w, h))?;
+            self.ui.app.handle(Action::Resize(w, h));
+        }
+        Ok(match spawned {
+            Ok(status) => {
+                tracing::debug!(program = %cmd.program, ?status, "editor exited");
+                None
+            }
+            Err(e) => Some(spawn_failure(&cmd.program, &e)),
+        })
+    }
+}
+
+/// Ask the terminal where its cursor is, and never read the answer (verifier (b) F1).
+///
+/// A key typed in the window between the editor exiting and `term::enter()` finishing used
+/// to sit in the tty unnoticed until the *next* key, which then delivered both at once — a
+/// `q` or a `y` that looked like it did nothing. The cause is below crossterm: its mio/kqueue
+/// event source registers the tty **once per process** with `EV_CLEAR` (edge-triggered), and
+/// xnu's `TIOCSETA` moves a pending cooked line into the raw queue without `ttwakeup`, so no
+/// knote fires for a byte that is already readable. `poll` therefore reports nothing while
+/// `read(2)` would return the byte immediately.
+///
+/// `ESC [ 6 n` (DSR) makes the terminal send something of its own. That arrival is an edge
+/// the kqueue does fire on, and the `read` it wakes drains the whole buffer — the stuck key
+/// included. The reply (`ESC [ <row> ; <col> R`) is parsed by crossterm as an internal
+/// `CursorPosition` event, which its public `read()` filter never surfaces and which cannot
+/// make `poll` return true: it costs one entry in crossterm's queue per suspend and nothing
+/// else. A terminal that does not answer is left exactly as it was — the byte still waits
+/// for the next key, which is the residual `tui.md` records.
+///
+/// Fire-and-forget by design: waiting for the answer would be `crossterm::cursor::position`,
+/// which polls through the very source this is working around.
+fn nudge_the_tty() {
+    let mut out = io::stdout();
+    let _ = out.write_all(b"\x1b[6n");
+    let _ = out.flush();
+}
+
+/// Why the `$EDITOR` child never started, as a status line (verifier (b) F4).
+///
+/// The **verb leads**: `render_status` ellipsizes from the tail, and `$EDITOR` is often an
+/// absolute path (`/opt/homebrew/Cellar/…/bin/nvim`), so `<program>: not found` used to
+/// leave a status row that was all path and no answer — the reader saw their editor's name
+/// and no reason at all. Whatever gets cut off now is the tail of a path they typed.
+fn spawn_failure(program: &str, e: &io::Error) -> String {
+    if e.kind() == io::ErrorKind::NotFound {
+        format!("editor not found: {program}")
+    } else {
+        format!("editor failed: {e}: {program}")
+    }
+}
+
 /// `Effect::SyncRoots`: re-read every root's metadata off the UI task.
 fn spawn_sync_roots(engine: &Arc<Mutex<Engine>>, tx: mpsc::UnboundedSender<Local>) {
     let engine = engine.clone();
     tokio::spawn(async move {
-        let read = tokio::spawn(async move { blocking(&engine, root_metas).await });
+        let read = tokio::spawn(async move { blocking(&engine, |e| root_metas(e)).await });
         if let Some(metas) = joined(read, &tx, "root sync").await {
             let _ = tx.send(Local::Roots(metas));
         }
@@ -804,6 +1160,7 @@ pub(crate) struct Herdr {
     events: Option<mpsc::Receiver<HerdrEvent>>,
     toast: Option<mpsc::UnboundedSender<ToastMsg>>,
     workspace_id: Option<String>,
+    pane_id: Option<String>,
 }
 
 impl Herdr {
@@ -832,6 +1189,7 @@ impl Herdr {
             events: Some(link.events),
             toast,
             workspace_id: link.plan.workspace_id,
+            pane_id: link.plan.pane_id,
         }
     }
 }
@@ -872,7 +1230,12 @@ fn herdr_rederive(ui: &mut Ui, link: &Herdr) -> (Changed, Option<Effect>) {
     let Some(cache) = link.handle.as_ref().and_then(ClientHandle::snapshot) else {
         return (Changed::No, None);
     };
-    herdr_fold(ui, &cache, link.workspace_id.as_deref())
+    herdr_fold(
+        ui,
+        &cache,
+        link.workspace_id.as_deref(),
+        link.pane_id.as_deref(),
+    )
 }
 
 /// The socket-free half of [`herdr_rederive`]: one snapshot in, three folds out. Split out
@@ -889,11 +1252,18 @@ fn herdr_rederive(ui: &mut Ui, link: &Herdr) -> (Changed, Option<Effect>) {
 ///
 /// `agents_for(.., None)` walks **every** workspace: the `w` scope narrowing belongs to
 /// `HerdrView::candidates`, which already applies it to whatever this map holds.
+///
+/// `own_pane` is the pane lastcall runs in: its `foreground_cwd` is scrubbed first
+/// ([`herdr::own_pane_scrubbed`]) — it follows our own `git` children and steered the
+/// scope through every root being scanned in the Gate 8 sponsor run.
 pub fn herdr_fold(
     ui: &mut Ui,
     cache: &Cache,
     workspace_id: Option<&str>,
+    own_pane: Option<&str>,
 ) -> (Changed, Option<Effect>) {
+    let cache = herdr::own_pane_scrubbed(cache, own_pane);
+    let cache = cache.as_ref();
     let metas: Vec<RootMeta> = ui.app.roots.values().map(|v| v.meta.clone()).collect();
     let scope = workspace_id.and_then(|id| herdr::derive_scope(cache, &metas, id));
     let roots = herdr::derive(cache, &metas);
@@ -952,10 +1322,28 @@ struct Signals {
 
 impl Signals {
     /// Needs a runtime context (`Runtime::enter`).
+    ///
+    /// `SIGQUIT` is registered and the stream is dropped on the spot. Registering installs
+    /// tokio's handler for the life of the process, which is the disposition the `$EDITOR`
+    /// suspend needs and the safe stand-in for the design review's `SIG_IGN` (F4): a `^\`
+    /// typed while the editor owns a *cooked* terminal would otherwise reach lastcall with
+    /// its default disposition and dump core behind the editor, leaving no one to restore
+    /// the screen. It costs nothing the rest of the time, because under raw mode `^\` is a
+    /// byte and not a signal. It is done this way rather than with `nix`'s `sigaction`
+    /// because that is an `unsafe fn` and this workspace is `unsafe_code = "forbid"` — see
+    /// the report's ruling note. The child is unaffected either way: `exec` resets handlers
+    /// to `SIG_DFL`, and only `SIG_IGN` would have been inherited.
+    ///
+    /// The residual (verifier (b) F5): the handler is installed for the **life of the
+    /// process** and nobody ever reads the stream, so `kill -QUIT <lastcall>` from another
+    /// terminal does nothing at all — not just during a suspend. Anyone reaching for
+    /// `SIGQUIT` on a lastcall they think is hung should use `TERM` or `INT`, which quit
+    /// through the restore path; `tui.md`'s suspend step 4 says so too.
     fn register() -> Signals {
         #[cfg(unix)]
         {
             use tokio::signal::unix::{SignalKind, signal};
+            let _ = signal(SignalKind::quit());
             Signals {
                 int: signal(SignalKind::interrupt()).ok(),
                 term: signal(SignalKind::terminate()).ok(),
@@ -965,6 +1353,29 @@ impl Signals {
         {
             Signals {}
         }
+    }
+
+    /// Put the streams back after an `$EDITOR` suspend, and swallow what the suspend latched
+    /// (design review F4).
+    ///
+    /// A `^C` typed at the editor goes to the whole foreground process group, so lastcall
+    /// receives it too. Nothing was polling `recv()` at the time, but the stream **remembers**
+    /// that it fired, and the first `select!` of the resumed loop would take that as the user
+    /// asking to quit — a keystroke aimed at `vim` ending the review. Fresh streams do not
+    /// carry the old notification; the drain that follows closes the remaining window, where
+    /// the runtime's signal driver has read the signal but not yet published it. For
+    /// [`EDITOR_SETTLE`] after a resume, an interrupt is therefore ignored — a real `ctrl-c`
+    /// in that window has to be pressed again. `SIGTERM` is deliberately **not** drained: it
+    /// is not something a terminal types.
+    async fn resume(&mut self) {
+        *self = Signals::register();
+        #[cfg(unix)]
+        if let Some(int) = self.int.as_mut() {
+            let deadline = tokio::time::Instant::now() + EDITOR_SETTLE;
+            while let Ok(Some(())) = tokio::time::timeout_at(deadline, int.recv()).await {}
+        }
+        #[cfg(not(unix))]
+        tokio::time::sleep(EDITOR_SETTLE).await;
     }
 
     async fn recv(&mut self) {
@@ -1006,25 +1417,37 @@ pub fn run(
         let _ctx = runtime.enter();
         Signals::register()
     };
-    let guard = term::enter()?;
+    let mut guard = term::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut ui = Ui::new(App::new(), keymap);
+    // Asked once, inside `enter`, before the input thread exists; the app reads the cached
+    // answer so the note modal promises `⇧⏎` only where it works (ruling P9).
+    ui.app.enhanced = term::keyboard_enhanced();
     let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Event>();
-    let stop = spawn_input(input_tx)?;
+    // Both are replaced wholesale by an `$EDITOR` suspend, which joins the thread and opens
+    // a fresh channel; `reader` is `None` only while that handover is in flight.
+    let (mut input_stop, input_thread) = spawn_input(input_tx)?;
+    let mut reader = Some(input_thread);
     let (local_tx, mut local_rx) = mpsc::unbounded_channel::<Local>();
 
     // Copied out before the engine is moved into its watcher: both are immutable for the
     // life of the process, and the export path is resolved without taking the engine lock.
     let state_dir = engine.layout().state_dir().to_path_buf();
     let clock = engine.options().clock.clone();
+    // The roots too — read while the engine is still ours, not through the lock after
+    // `engine.run`: the watcher's initial `scan_all` takes that lock the moment it starts,
+    // and a `blocking(root_metas)` queued behind it would hold the first frame for the
+    // whole scan (the slow-git view, `just probe-tui-slow`, showed the `discovering…`
+    // line standing for ten seconds and no launch hold at all).
+    let metas = root_metas(&engine);
 
     let mut link = Herdr::default();
     let (outcome, watcher) = runtime.block_on(async {
         let mut watcher = engine.run(timings);
         let outcome: io::Result<ExitCode> = async {
-            let metas = blocking(&watcher.engine, root_metas).await;
             let n = metas.len();
             ui.app.sync_roots(metas);
+            ui.app.start_loading();
             ui.app.set_status(format!(
                 "scanning {n} root{}…",
                 if n == 1 { "" } else { "s" }
@@ -1041,6 +1464,10 @@ pub fn run(
             // loop's own arm, like everything else.
             ui.app.herdr.scoped = plan.scoped;
             ui.app.herdr.toast = plan.toast;
+            // Nothing is listed until the link says what the scope is (or that there is
+            // no link): the first pile otherwise lands before the first snapshot and is
+            // hidden a moment later — the launch flash of the Gate 8 sponsor run.
+            ui.app.herdr.scope_pending = plan.scoped && plan.workspace_id.is_some();
             let mut connecting = Some(tokio::spawn(async move {
                 herdr::connect(&env, plan).await
             }));
@@ -1054,10 +1481,12 @@ pub fn run(
             // A press the previous pass refused to fold (see [`drain`]): folded here,
             // after that pass drew, so it resolves against the frame the user saw.
             let mut held: Option<Event> = None;
-            // Bracketed paste is on only while the note modal lives. It is a terminal mode,
-            // not an app mode, so it is toggled here rather than through an `Effect`: the
-            // modal can close by sending, by cancelling or by quitting, and one comparison
-            // after every pass covers all three without a variant per exit.
+            // Bracketed paste is on while the note modal **or the inline editor** lives
+            // (F12): both hold a text buffer, and a paste into either must arrive as one
+            // insert. It is a terminal mode, not an app mode, so it is toggled here rather
+            // than through an `Effect`: either can close by sending, by cancelling or by
+            // quitting, and one comparison after every pass covers all of it without a
+            // variant per exit.
             let mut paste_on = false;
             loop {
                 // Copied out so the timer future borrows nothing a handler assigns to.
@@ -1129,9 +1558,10 @@ pub fn run(
                         Some(Err(badge)) => {
                             let changed = if badge == Link::Off { Changed::No } else { Changed::Yes };
                             ui.app.herdr.link = badge;
-                            (changed, None)
+                            (changed.or(ui.app.scope_settled()), None)
                         }
-                        None => (Changed::No, None),
+                        // The task died without a verdict: no scope is ever coming.
+                        None => (ui.app.scope_settled(), None),
                     }),
                     _ = async {
                         match due {
@@ -1170,7 +1600,12 @@ pub fn run(
                     worktree_due = Some(tokio::time::Instant::now() + WORKTREE_DEBOUNCE);
                 }
                 let mut stop = pass.stop;
-                for effect in pass.effects {
+                // A queue rather than the vector itself: the `$EDITOR` suspend finishes by
+                // asking for deliverable 3's return path, and that has to run in **this**
+                // pass, after the resume and before the frame the user sees next.
+                let mut effects: std::collections::VecDeque<Effect> = pass.effects.into();
+                let mut redraw = pass.changed;
+                while let Some(effect) = effects.pop_front() {
                     match effect {
                         // `Pass::of` and `Pass::fold` both route a quit into `Pass::stop`, so
                         // this arm is belt and braces — and never a `break`, which would only
@@ -1184,20 +1619,40 @@ pub fn run(
                         Effect::Restore(reqs) => {
                             spawn_restore(&watcher.engine, local_tx.clone(), reqs)
                         }
+                        Effect::EditInline(open) => {
+                            spawn_read_rendered(&watcher.engine, local_tx.clone(), open)
+                        }
+                        Effect::Save {
+                            root,
+                            rendered,
+                            bytes,
+                        } => spawn_save(&watcher.engine, local_tx.clone(), root, rendered, bytes),
+                        // Deliverable 9. OSC 52 is write-only: the terminal never answers,
+                        // so there is nothing to check and a write that fails is not worth
+                        // ending the loop on — the reducer has already raised the cue, and
+                        // a terminal that does not implement the sequence simply drops it
+                        // (`docs/dev/tui.md` says which do).
+                        Effect::Copy(bytes) => {
+                            let _ = crossterm::execute!(io::stdout(), Osc52(bytes));
+                        }
                         Effect::Flag {
                             root,
                             path,
                             note,
                             hunk,
+                            summary,
                             label,
                         } => spawn_flag(
                             &watcher.engine,
                             local_tx.clone(),
-                            root,
-                            path,
-                            note,
-                            hunk,
-                            label,
+                            FlagRequest {
+                                root,
+                                path,
+                                note,
+                                hunk,
+                                summary,
+                                label,
+                            },
                         ),
                         Effect::Unflag { root, path } => {
                             spawn_unflag(&watcher.engine, local_tx.clone(), root, path)
@@ -1225,6 +1680,89 @@ pub fn run(
                             label,
                             export,
                         ),
+                        Effect::EditExternal {
+                            root,
+                            rendered,
+                            line,
+                        } => {
+                            let path = String::from_utf8_lossy(&rendered.path).into_owned();
+                            let cmd = match EditorCommand::resolve(&|n| std::env::var(n).ok()) {
+                                Ok(cmd) => cmd,
+                                Err(e) => {
+                                    ui.app.set_status(e.to_string());
+                                    redraw = Changed::Yes;
+                                    continue;
+                                }
+                            };
+                            // The CAS: the file must still be the one the row describes.
+                            // Opening an editor on bytes the user has not seen is how a
+                            // review tool talks someone into saving over an agent's newer
+                            // work — so the answer is to refuse and let the next pile
+                            // redraw the row, never to open and hope.
+                            let live = editor_current(
+                                &watcher.engine,
+                                root.clone(),
+                                rendered.path.clone(),
+                            )
+                            .await;
+                            let same = matches!(
+                                &live,
+                                Current::Present { oid, mode }
+                                    if rendered.oid.as_ref() == Some(oid)
+                                        && rendered.mode == Some(*mode)
+                            );
+                            if !same {
+                                ui.app
+                                    .set_status(format!("{path}: changed since rendered; not opened"));
+                                redraw = Changed::Yes;
+                                continue;
+                            }
+                            // `edit_target` refused a path that is not UTF-8, so this holds.
+                            let Ok(rel) = std::str::from_utf8(&rendered.path) else {
+                                ui.app.set_status(super::app::NOT_EDITABLE.to_owned());
+                                redraw = Changed::Yes;
+                                continue;
+                            };
+                            let file = root.join(rel);
+                            // Overwritten by the return path below; it is what the status
+                            // line holds while the editor owns the screen, and the only
+                            // place the "no line flag known" half of `opened_note` is said.
+                            ui.app.set_status(cmd.opened_note());
+                            let spawn_failed = Suspend {
+                                ui: &mut ui,
+                                terminal: &mut terminal,
+                                guard: &mut guard,
+                                stop: &mut input_stop,
+                                reader: &mut reader,
+                                input: &mut input_rx,
+                                signals: &mut signals,
+                            }
+                            .run(&cmd, &file, line, &root)
+                            .await?;
+                            redraw = Changed::Yes;
+                            match spawn_failed {
+                                Some(why) => ui.app.set_status(why),
+                                None => effects.push_back(Effect::EditorReturned {
+                                    root,
+                                    rendered,
+                                }),
+                            }
+                        }
+                        Effect::EditorReturned { root, rendered } => {
+                            let live = editor_current(
+                                &watcher.engine,
+                                root.clone(),
+                                rendered.path.clone(),
+                            )
+                            .await;
+                            let (changed, next) = ui.local(Local::EditorReturned {
+                                root,
+                                rendered,
+                                live,
+                            });
+                            redraw = redraw.or(changed);
+                            effects.extend(next);
+                        }
                         Effect::Expand(root, row) => {
                             spawn_expand(&watcher.engine, local_tx.clone(), root, row)
                         }
@@ -1259,8 +1797,9 @@ pub fn run(
                     }
                     None => {}
                 }
-                if ui.app.note.is_some() != paste_on {
-                    paste_on = ui.app.note.is_some();
+                let wants_paste = ui.app.note.is_some() || ui.app.editor.is_some();
+                if wants_paste != paste_on {
+                    paste_on = wants_paste;
                     // Before the draw, so the frame that first shows the modal is already
                     // able to receive a paste. A terminal that does not support the mode
                     // ignores the sequence; a write that fails is not worth ending on.
@@ -1270,7 +1809,7 @@ pub fn run(
                         crossterm::execute!(io::stdout(), DisableBracketedPaste)
                     };
                 }
-                if pass.changed == Changed::Yes {
+                if redraw == Changed::Yes {
                     // Deliverable 8: one line per repaint, saying why and how long. A
                     // `draw` per pile in a burst is the symptom deliverable 6 removed, and
                     // this is how the sponsor sees it stay removed.
@@ -1279,6 +1818,10 @@ pub fn run(
                     tracing::debug!(
                         cause = pass.cause.unwrap_or("unknown"),
                         ms = started.elapsed().as_millis() as u64,
+                        roots = ui.app.roots.len(),
+                        listed = ui.app.listed_roots().count(),
+                        scope = ui.app.herdr.active_scope().map(|s| s.label.as_str()),
+                        selected = ui.app.selection.is_some(),
                         "draw"
                     );
                 }
@@ -1296,7 +1839,7 @@ pub fn run(
         (outcome, watcher)
     });
 
-    stop.store(true, Ordering::Relaxed);
+    input_stop.store(true, Ordering::Relaxed);
     let mut real = RealShutdown {
         terminal: Some(terminal),
         guard: Some(guard),
@@ -1662,7 +2205,7 @@ mod tests {
             // Not agent-bearing: a plain shell in the same root is not a send target.
             pane("p-shell", "ws1", "/W/alpha", None, "unknown"),
         ]);
-        let (changed, _) = herdr_fold(&mut ui, &snapshot, None);
+        let (changed, _) = herdr_fold(&mut ui, &snapshot, None, None);
         assert_eq!(changed, Changed::Yes);
 
         assert_eq!(ui.app.herdr.candidates(&root("alpha")).len(), 1);
@@ -1677,7 +2220,7 @@ mod tests {
 
         // The map re-derives on every snapshot, like the rollup: the pane goes away and so
         // does the candidate.
-        let (changed, _) = herdr_fold(&mut ui, &cache(vec![]), None);
+        let (changed, _) = herdr_fold(&mut ui, &cache(vec![]), None, None);
         assert_eq!(changed, Changed::Yes);
         assert!(ui.app.herdr.candidates(&root("alpha")).is_empty());
     }
@@ -1835,6 +2378,75 @@ mod tests {
         let (x, y) = target_center(&ui, &Target::NavRoot(root("alpha")));
         ui.event(&mouse(MouseEventKind::Down(MouseButton::Left), x, y));
         assert_eq!(ui.app.selection, Some(Selection::Root(root("alpha"))));
+    }
+
+    /// Deliverable 9's mouse half, where it actually lives: the press anchor comes from the
+    /// last frame's rectangle, a drag becomes `SelectTo`, the release copies — and the
+    /// divider drag is untouched (design review F13).
+    #[test]
+    fn run_mouse_drag_in_the_diff_selects_and_the_divider_drag_still_resizes() {
+        let mut ui = ui();
+        ui.app.apply(pile_event("alpha", alpha_two_hunks()));
+        ui.app.select(Some(row("alpha", "f1")));
+        ui.app.handle(Action::Open);
+        render_into(&mut ui);
+        let body = ui.hits.as_ref().unwrap().diff_body.expect("the hunk lines");
+
+        // Press on the second body row, drag two rows down, release.
+        let press = mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            body.x + 2,
+            body.y + 1,
+        );
+        ui.event(&press);
+        assert_eq!(ui.app.press_line, Some(1), "absolute, not a screen row");
+        assert!(ui.app.sel.is_none(), "a press alone selects nothing");
+        ui.event(&mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            body.x + 2,
+            body.y + 3,
+        ));
+        assert_eq!(ui.app.sel.map(|s| s.range()), Some((1, 3)));
+        let (changed, effect) = ui.event(&mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            body.x + 2,
+            body.y + 3,
+        ));
+        assert_eq!(changed, Changed::Yes);
+        assert_eq!(
+            effect,
+            Some(Effect::Copy(b"-a1\n+A1\n a2\n".to_vec())),
+            "the release copies the rows the drag covered"
+        );
+        assert!(ui.app.sel.is_none());
+
+        // A press and a release with no drag between them is a click: it moves the cursor
+        // to the hunk it landed on and copies nothing.
+        render_into(&mut ui);
+        let before = ui.app.diff;
+        ui.event(&press);
+        let (changed, effect) = ui.event(&mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            body.x + 2,
+            body.y + 1,
+        ));
+        assert_eq!((changed, effect), (Changed::No, None));
+        assert_eq!(ui.app.diff, before);
+        assert!(ui.app.sel.is_none());
+
+        // The divider drag is a divider drag: the press is outside the diff body, so no
+        // anchor is taken and the drag resizes the nav as it always has.
+        render_into(&mut ui);
+        let (dx, dy) = target_center(&ui, &Target::Divider);
+        ui.event(&mouse(MouseEventKind::Down(MouseButton::Left), dx, dy));
+        assert_eq!(ui.app.press_line, None);
+        assert!(ui.app.dragging);
+        let width = ui.app.nav_width;
+        ui.event(&mouse(MouseEventKind::Drag(MouseButton::Left), dx + 4, dy));
+        assert_eq!(ui.app.nav_width, width + 4);
+        assert!(ui.app.sel.is_none(), "and it selects nothing");
+        ui.event(&mouse(MouseEventKind::Up(MouseButton::Left), dx + 4, dy));
+        assert!(!ui.app.dragging);
     }
 
     #[test]
@@ -2063,6 +2675,30 @@ mod tests {
             notice: Some("committed on main (1 commit)".into()),
         });
         assert_eq!((changed, effect), (Changed::Yes, Some(Effect::SyncRoots)));
+    }
+
+    /// Verifier (b) F4: `$EDITOR` is often an absolute path, `render_status` ellipsizes from
+    /// the tail, and the old `<program>: not found` therefore drew a status row of pure path
+    /// with the answer cut off. The verb leads now, so a 120-character program name loses
+    /// its own tail and nothing else.
+    #[test]
+    fn run_editor_spawn_failure_leads_with_the_verb() {
+        let long = format!("/var/folders/{}/bin/vi", "x".repeat(100));
+        assert!(long.len() > 100, "wider than the status row");
+        let missing = spawn_failure(&long, &io::Error::from(io::ErrorKind::NotFound));
+        assert!(missing.starts_with("editor not found: "), "{missing}");
+        assert!(
+            spawn_failure(&long, &io::Error::from(io::ErrorKind::PermissionDenied))
+                .starts_with("editor failed: "),
+        );
+
+        let mut ui = ui();
+        ui.app.set_status(missing);
+        let frame = frame_of(&ui);
+        assert!(
+            frame.contains("editor not found"),
+            "the verb survives the truncation:\n{frame}"
+        );
     }
 
     #[test]

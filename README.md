@@ -28,7 +28,9 @@ survives a restart. Phase 5 adds the herdr overlay (below). Phase 6 adds draft d
 a root of its own) and collapsed rows: a lockfile, a binary or a very large file is one
 accept, not a wall of hunks, and `e` expands one on demand when you do want to read it.
 Phase 7 adds the other two answers a reviewer has: restoring a hunk or a file to what it
-was, and flagging one with a note that goes straight to the agent that wrote it.
+was, and flagging one with a note that goes straight to the agent that wrote it. Phase 8 adds
+the fourth: editing in place — `i` for lastcall's own editor, `shift-i` for yours — plus
+`v`/`y` to copy diff lines to the clipboard of the machine you are actually sitting at.
 
 ## Try it
 
@@ -42,7 +44,8 @@ cd ~/src/some-repo
 
 The left pane lists each repo (branch, file count) and its pending files with `+added
 −removed` counts; the right pane is the selected file's diff. `↑↓`/`jk` move, `enter` opens
-a diff, `n`/`p` step hunks, `f` shows full paths, `o` shows `org/repo`, `r` rescans, `?`
+a diff, `n`/`p` step hunks, `f` shows full paths, `o` shows `org/repo`, `r` rescans, `i` and
+`shift-i` open the file for editing, `v`/`y` copy diff lines, `?`
 lists every key, `q` quits; the mouse works too (click a row or a hunk header, drag the
 divider, wheel to scroll). Edit a file in another terminal and its counts change on screen
 within about a second. Reviewing is accepting: `a` accepts the hunk under the cursor (or,
@@ -56,7 +59,7 @@ single `⊟` row instead of a diff: `a` or `A` accepts it whole, and `e` expands
 lockfile/large-file kind into real hunks (up to 2,000 lines; a binary is never expandable).
 The pile shrinks to `nothing pending`, and a relaunch on the same state dir starts
 from there, whatever the agent committed in between (an agent's commit moves HEAD, never
-your baseline). Not yet: editing in place (Phase 8). `lastcall tui --poll 2` polls every 2 s if filesystem events are late or
+your baseline). `lastcall tui --poll 2` polls every 2 s if filesystem events are late or
 missing.
 ### Put it back
 
@@ -93,6 +96,30 @@ link, it is appended to `~/.local/state/lastcall/exports/<repo>/<date>.md`, read
 hand. The flag is written before any of this, so cancelling the send loses nothing: the row
 keeps its `⚑` (`⚑2` for two notes) and the note reads beside the hunk it is about.
 `shift-m` clears a file's flags.
+
+### Edit in place
+
+The fourth answer is to fix it yourself. `i` opens the file **inside lastcall**, right where
+the diff pane was, with the caret on the current hunk's first changed line: the whole file is
+there, every other pending hunk is marked `▎` in the gutter, and the hunk you came in on is
+tinted so you can see which change you were reading. Type; `Ctrl-S` saves; `Esc` closes (and
+asks first if you have unsaved changes). A save writes the file and advances your baseline in
+one step, so the row disappears — you are never asked to review your own just-typed change.
+If an agent wrote the file while you were typing, the save is refused, your buffer is kept
+and the header turns red: `Esc`, then `i`, reloads.
+
+`shift-i` hands the file to **your own editor** instead — `$VISUAL`, else `$EDITOR`, else
+`vi` — at the same line, with the flags it wants (`vim +21 …`, `code --goto file:21 --wait`,
+and so on for the editors it knows). lastcall gives up the terminal, waits, takes it back,
+and asks whether to accept whatever you left. Use it for anything lastcall will not put in a
+buffer: a binary, a very large file, or an editor you would rather not live without.
+
+`v` starts a line selection in the diff and `↑↓` extend it; `y` copies it — or, with nothing
+selected, the whole hunk under the cursor. A drag with the mouse does the same. The copy goes
+out over OSC 52, which means it reaches the clipboard of the terminal you are sitting at even
+when lastcall is running over ssh or inside tmux. Inside tmux that needs
+`set -g set-clipboard on`; some terminals ship with OSC 52 turned off. Selections over 32 KiB
+are refused rather than half-delivered.
 
 Keys are rebindable in `config.toml`, one spec or a list per action (the full grammar and
 table: [`docs/dev/tui.md`](docs/dev/tui.md)):

@@ -88,9 +88,36 @@ pub enum Action {
     Flag,
     /// Clear every flag on the selected file.
     Unflag,
+    /// Open the selected file in the **inline** editor, at the line of the hunk under the
+    /// cursor (deliverable 8; `Effect::EditInline`). The same rows `EditExternal` opens,
+    /// and only when the engine will hand the bytes over: a binary or oversize file says
+    /// `use shift-i: <why>` instead.
+    Edit,
+    /// Suspend the TUI and open the selected file in `$VISUAL`/`$EDITOR`, at the line of
+    /// the hunk under the cursor (deliverable 7; `Effect::EditExternal`). A row with
+    /// nothing to open — a deletion, a symlink, a path that is not UTF-8 — says
+    /// `not editable` instead.
+    EditExternal,
     /// One edit inside the note modal. Never key-bound: while the modal is open every key
     /// is resolved by [`note_action`] before the keymap is consulted.
     Note(NoteKey),
+    /// One keystroke inside the inline editor. Never key-bound, for the same reason:
+    /// [`editor_action`] resolves everything while `App::editor` is open, so a keymap
+    /// letter — `q` included — types itself (F16).
+    Editor(EditorKey),
+    /// Start a line selection in the diff at the cursor line, or extend the one that is
+    /// already running (deliverable 9). Whole lines only: the unit the reader is reviewing
+    /// in is a diff line, and a half-line copied out of a `-` and a `+` is not a thing
+    /// anyone means to paste.
+    Select,
+    /// Copy the selection — or, with none, the hunk under the cursor — to the system
+    /// clipboard through OSC 52 (`Effect::Copy`), and clear the selection.
+    Copy,
+    /// Extend a **mouse** selection to diff line `n` (absolute, not a screen row). Built by
+    /// the loop from a `Drag`, which is the only place the pane's rectangle is known; the
+    /// reducer ignores it unless a press landed in the diff body first, which is how a
+    /// divider drag stays a divider drag (design review F13).
+    SelectTo(usize),
     /// One move inside the agent picker. Never key-bound, for the same reason.
     Pick(PickKey),
     /// Answer the confirm modal (`y` / `Enter`); nothing outside it.
@@ -109,19 +136,101 @@ pub enum Action {
 
 /// What one keystroke does to the note being typed.
 ///
-/// `Insert` carries a string, not a char, because a bracketed paste arrives as one
-/// `Event::Paste` and must land as one edit — never as a send, whatever it contains.
+/// The editing half is [`EditKey`], the vocabulary the note modal shares with the inline
+/// editor (deliverable 5): everything the buffer knows how to do, including a bracketed
+/// paste, which arrives as one `Event::Paste` and must land as one edit — never as a send,
+/// whatever it contains. `Send` and `Cancel` are the modal's own, because only the modal
+/// knows what ends it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NoteKey {
-    Insert(String),
-    Backspace,
-    /// A line break inside the note: `ctrl-j` everywhere, `alt`/`shift`-Enter where the
-    /// terminal reports them.
-    Newline,
+    /// Anything the note's text buffer does with the keystroke.
+    Edit(EditKey),
     /// Enter: write the flag and close the modal.
     Send,
     /// Esc: close the modal, write nothing.
     Cancel,
+}
+
+/// One edit inside a text buffer ([`super::textbuf::TextBuf`]), for the two places that
+/// hold one: the note modal (deliverable 5) and the inline editor (deliverable 8).
+///
+/// Deliberately *only* the buffer's own vocabulary. `Send`, `Cancel`, `Save` and a paste's
+/// destination are the caller's business — the note modal sends a flag where the editor
+/// writes a file — so they stay out of here and the same mapping serves both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditKey {
+    /// Text to put in verbatim. A `String`, not a `char`, because a bracketed paste arrives
+    /// as one `Event::Paste` and must land as one edit, whatever it contains.
+    Insert(String),
+    Newline,
+    Backspace,
+    Delete,
+    Left,
+    Right,
+    Up,
+    Down,
+    WordLeft,
+    WordRight,
+    WordBackspace,
+    Home,
+    End,
+    /// `Ctrl-K`: from the cursor to the end of the line.
+    KillToEnd,
+    PageUp,
+    PageDown,
+}
+
+/// The buffer edit one key event asks for, or nothing (Phase 8 deliverable 4).
+///
+/// Everything a terminal reports for the motions people expect in a text field, and nothing
+/// else: `Enter` and `Esc` are **not** here, because what they mean depends on who is
+/// holding the buffer — the note modal sends and cancels, the inline editor saves and
+/// closes. The caller checks those first and asks this second.
+///
+/// `Shift-Enter` is a newline only when the terminal can tell it apart from `Enter`, which
+/// is why `enhanced` is a parameter: with no keyboard-enhancement flags the two are the
+/// same byte, and promising a key that silently sends the note instead is worse than not
+/// promising it (deliverable 5). `Ctrl-J` is the binding that always works.
+///
+/// `Ctrl-Enter` is a newline too (verifier (a) F5): every chat UI the reviewer came from
+/// treats it as one, and it is only ever distinguishable from `Enter` under the same kitty
+/// protocol `Shift-Enter` needs — so where it can be told apart it breaks the line, and
+/// where it cannot it is a plain `Enter` and sends, which is the honest default.
+///
+/// `Ctrl-H` is `Backspace` (verifier (a) F4): crossterm parses the byte `0x08` as
+/// `Char('h') + CONTROL` — only `0x7f` is `KeyCode::Backspace` — so a terminal configured
+/// to send `^H` for its Backspace key (xterm `backarrowKey`, some tmux and urxvt setups)
+/// would otherwise lose Backspace entirely.
+pub fn edit_key(key: &Key, enhanced: bool) -> Option<EditKey> {
+    let alt_or_ctrl = key.alt || key.ctrl;
+    Some(match key.code {
+        KeyCode::Enter if key.alt || key.ctrl => EditKey::Newline,
+        KeyCode::Enter if key.shift && enhanced => EditKey::Newline,
+        KeyCode::Char('j') if key.ctrl => EditKey::Newline,
+        KeyCode::Backspace if key.alt || key.ctrl => EditKey::WordBackspace,
+        KeyCode::Char('w') if key.ctrl => EditKey::WordBackspace,
+        KeyCode::Char('h') if key.ctrl => EditKey::Backspace,
+        KeyCode::Backspace => EditKey::Backspace,
+        KeyCode::Delete => EditKey::Delete,
+        KeyCode::Left if alt_or_ctrl => EditKey::WordLeft,
+        KeyCode::Right if alt_or_ctrl => EditKey::WordRight,
+        KeyCode::Left => EditKey::Left,
+        KeyCode::Right => EditKey::Right,
+        KeyCode::Up => EditKey::Up,
+        KeyCode::Down => EditKey::Down,
+        KeyCode::Home => EditKey::Home,
+        KeyCode::End => EditKey::End,
+        KeyCode::Char('a') if key.ctrl => EditKey::Home,
+        KeyCode::Char('e') if key.ctrl => EditKey::End,
+        KeyCode::Char('k') if key.ctrl => EditKey::KillToEnd,
+        KeyCode::PageUp => EditKey::PageUp,
+        KeyCode::PageDown => EditKey::PageDown,
+        KeyCode::Tab if !alt_or_ctrl => EditKey::Insert("\t".to_owned()),
+        // A printable is text. That is what keeps a keymap letter — `q`, `a`, `i` — from
+        // being swallowed by the buffer while a modal is open: it types itself.
+        KeyCode::Char(c) if !alt_or_ctrl => EditKey::Insert(c.to_string()),
+        _ => return None,
+    })
 }
 
 /// What one keystroke does in the agent picker.
@@ -135,33 +244,93 @@ pub enum PickKey {
     Cancel,
 }
 
-/// The note modal's action for one key event, consulted before the keymap while
-/// `App.note` is open (deliverable 10).
+/// What one keystroke does inside the inline editor (deliverable 8).
 ///
-/// Every printable key types; `ctrl-j` breaks the line, and so do `alt-`/`shift-Enter`
-/// **where the terminal reports them** — with no keyboard-enhancement flags Shift-Enter is
-/// byte-identical to Enter, which is why `ctrl-j` is the one that is promised. Esc cancels,
-/// Enter sends. Everything else is swallowed, except a **non-printable** `quit` binding
-/// (`ctrl-c` by default), which quits as it does under the confirm modal — a printable one
-/// (`q`) types its letter, because a note is text.
-pub fn note_action(event: &Event, keymap: &Keymap) -> Option<Action> {
+/// The same shape as [`NoteKey`] — the buffer's own vocabulary plus the two keys only the
+/// holder can decide — with the editor's answers instead of the modal's: `Ctrl-S` writes
+/// the file, `Esc` closes it (asking first when the buffer is dirty). The mouse is here
+/// too, because the editor is the one place a click means "put the caret there".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditorKey {
+    /// Anything the buffer does with the keystroke.
+    Edit(EditKey),
+    /// `Ctrl-S`: write the buffer back through the engine's CAS'd save.
+    Save,
+    /// `Esc`: close a clean buffer, ask about a dirty one.
+    Close,
+    /// A click at this **pane-relative** row and column of the text area (the gutter is
+    /// already subtracted): the reducer adds the buffer's own scroll.
+    Click(u16, u16),
+    /// The wheel: `+n` down, `-n` up.
+    Scroll(i32),
+}
+
+/// The inline editor's action for one key event, consulted before the keymap while
+/// `App::editor` is open (deliverable 8; F16).
+///
+/// `Esc` and `Ctrl-S` are the editor's own two keys, checked first; `Enter` is a newline,
+/// not a send, because this is a file and not a message. Everything else [`edit_key`]
+/// answers, so every keymap letter types itself — the reason `q` cannot quit from inside
+/// the editor, and the reason a **non-printable** `quit` binding (`ctrl-c` by default)
+/// still can, exactly as it does under the note modal.
+pub fn editor_action(event: &Event, keymap: &Keymap, enhanced: bool) -> Option<Action> {
     if let Event::Paste(text) = event {
-        return Some(Action::Note(NoteKey::Insert(text.clone())));
+        return Some(Action::Editor(EditorKey::Edit(EditKey::Insert(
+            text.clone(),
+        ))));
     }
     let Event::Key(k) = event else {
         return None;
     };
     let key = Key::of(k)?;
-    let note = match key.code {
-        KeyCode::Enter if key.alt || key.shift => NoteKey::Newline,
-        KeyCode::Enter => NoteKey::Send,
-        KeyCode::Esc => NoteKey::Cancel,
-        KeyCode::Backspace => NoteKey::Backspace,
-        KeyCode::Char('j') if key.ctrl => NoteKey::Newline,
-        KeyCode::Char(c) if !key.ctrl && !key.alt => NoteKey::Insert(c.to_string()),
-        _ => return quit_only(keymap, key),
+    if key.code == KeyCode::Esc {
+        return Some(Action::Editor(EditorKey::Close));
+    }
+    if key.code == KeyCode::Char('s') && key.ctrl && !key.alt {
+        return Some(Action::Editor(EditorKey::Save));
+    }
+    // Before `edit_key`, which only makes a newline of an `Enter` that carries a modifier:
+    // in a file every `Enter` breaks the line.
+    if key.code == KeyCode::Enter && !key.ctrl && !key.alt {
+        return Some(Action::Editor(EditorKey::Edit(EditKey::Newline)));
+    }
+    if let Some(edit) = edit_key(&key, enhanced) {
+        return Some(Action::Editor(EditorKey::Edit(edit)));
+    }
+    quit_only(keymap, key)
+}
+
+/// The note modal's action for one key event, consulted before the keymap while
+/// `App.note` is open (deliverable 10).
+///
+/// Esc cancels and Enter sends — the modal's own two keys, checked first and last. In
+/// between, [`edit_key`] answers: every printable key types, `ctrl-j` breaks the line, and
+/// so do `alt-Enter` and — **only when `enhanced`** — `shift-Enter`, because with no
+/// keyboard-enhancement flags Shift-Enter is byte-identical to Enter and promising it would
+/// mean sending the note where the reviewer asked for a second line (deliverable 5).
+/// Everything else is swallowed, except a **non-printable** `quit` binding (`ctrl-c` by
+/// default), which quits as it does under the confirm modal — a printable one (`q`) types
+/// its letter, because a note is text.
+pub fn note_action(event: &Event, keymap: &Keymap, enhanced: bool) -> Option<Action> {
+    if let Event::Paste(text) = event {
+        return Some(Action::Note(NoteKey::Edit(EditKey::Insert(text.clone()))));
+    }
+    let Event::Key(k) = event else {
+        return None;
     };
-    Some(Action::Note(note))
+    let key = Key::of(k)?;
+    if key.code == KeyCode::Esc {
+        return Some(Action::Note(NoteKey::Cancel));
+    }
+    // The buffer gets first refusal on everything but Esc, so `alt-Enter` and an enhanced
+    // `shift-Enter` are newlines before a bare Enter can be a send.
+    if let Some(edit) = edit_key(&key, enhanced) {
+        return Some(Action::Note(NoteKey::Edit(edit)));
+    }
+    if key.code == KeyCode::Enter {
+        return Some(Action::Note(NoteKey::Send));
+    }
+    quit_only(keymap, key)
 }
 
 /// The picker's action for one key event, on the same terms as [`note_action`]. The picker
@@ -214,6 +383,10 @@ pub const DEFAULT_KEYMAP: &[(&str, &[&str])] = &[
     ("restore_file", &["shift-u"]),
     ("flag", &["m"]),
     ("unflag", &["shift-m"]),
+    ("select", &["v"]),
+    ("copy", &["y"]),
+    ("edit", &["i"]),
+    ("edit_external", &["shift-i"]),
     ("ack", &["d"]),
     ("jump", &["g"]),
     ("scope", &["w"]),
@@ -270,6 +443,10 @@ impl Action {
             "restore_file" => Action::RestoreFile,
             "flag" => Action::Flag,
             "unflag" => Action::Unflag,
+            "select" => Action::Select,
+            "copy" => Action::Copy,
+            "edit" => Action::Edit,
+            "edit_external" => Action::EditExternal,
             "ack" => Action::Ack,
             "jump" => Action::Jump,
             "scope" => Action::ScopeToggle,
@@ -302,6 +479,16 @@ impl Action {
             "restore_file" => "restore the whole file",
             "flag" => "flag it with a note",
             "unflag" => "clear the file's flags",
+            // Deliverable 7 wrote this description out in full ("open the file in $EDITOR at
+            // the hunk under the cursor"); design review F15 and deliverable 11 cap every
+            // help row at 30 columns and name this one `$EDITOR at the hunk`, because the
+            // help overlay at 100×30 falls back to one clipped column the moment the two
+            // widest rows plus 7 exceed the width. The overlay is the only place a reader
+            // ever sees a description, so the short form is the one that survives.
+            "select" => "select lines",
+            "copy" => "copy selection",
+            "edit" => "edit in place",
+            "edit_external" => "$EDITOR at the hunk",
             "ack" => "ack the agent flag",
             "jump" => "jump to the agent in herdr",
             "scope" => "workspace scope on/off",
@@ -863,9 +1050,56 @@ mod tests {
         assert_eq!(to_action(&key('q'), &km), Some(Action::Refresh));
     }
 
+    /// Deliverable 11: the four keys Phase 8 added are configurable like every other one —
+    /// `[keys]` resolves them by name, the override replaces the default, and the help
+    /// overlay has a short description for each (design review F15).
+    #[test]
+    fn keys_config_accepts_the_phase8_actions() {
+        for (name, default, action) in [
+            ("edit", 'i', Action::Edit),
+            ("edit_external", 'I', Action::EditExternal),
+            ("select", 'v', Action::Select),
+            ("copy", 'y', Action::Copy),
+        ] {
+            assert_eq!(Action::from_name(name), Some(action.clone()), "{name}");
+            let described = Action::describe(name);
+            assert!(!described.is_empty(), "{name} has no help row");
+            assert!(
+                described.chars().count() <= 30,
+                "{name}: {described:?} would cost the overlay its second column"
+            );
+            // The default, then an override of it: `ctrl-t` is bound to nothing, so the
+            // only way it can resolve is through the config.
+            let km = Keymap::defaults();
+            assert_eq!(
+                to_action(&key(default), &km),
+                Some(action.clone()),
+                "{name}"
+            );
+            let km = Keymap::from_config(&keys(&[(name, &["ctrl-t"])])).unwrap();
+            assert_eq!(
+                to_action(&key_code(KeyCode::Char('t'), KeyModifiers::CONTROL), &km),
+                Some(action.clone()),
+                "{name} rebinds"
+            );
+            assert_eq!(
+                to_action(&key(default), &km),
+                None,
+                "{name}'s default is replaced, not appended"
+            );
+        }
+        // And an unknown name is still an error, so a typo is not silently a no-op.
+        assert!(matches!(
+            Keymap::from_config(&keys(&[("copy_selection", &["y"])])),
+            Err(KeymapError::UnknownAction { .. })
+        ));
+    }
+
     #[test]
     fn input_override_replaces_defaults_rather_than_appending() {
-        let km = Keymap::from_config(&keys(&[("quit", &["x"]), ("scroll_up", &["v"])])).unwrap();
+        // `z`, not `v`: `v` is `select`'s default since deliverable 9, and binding it to a
+        // second action is the `Duplicate` this test is not about.
+        let km = Keymap::from_config(&keys(&[("quit", &["x"]), ("scroll_up", &["z"])])).unwrap();
         assert_eq!(to_action(&key('x'), &km), Some(Action::Quit));
         assert_eq!(to_action(&key('q'), &km), None, "q no longer quits");
         assert_eq!(
@@ -873,7 +1107,7 @@ mod tests {
             None,
             "ctrl-c no longer quits either: the entry replaced both defaults"
         );
-        assert_eq!(to_action(&key('v'), &km), Some(Action::ScrollUp(1)));
+        assert_eq!(to_action(&key('z'), &km), Some(Action::ScrollUp(1)));
         let table = km.table();
         let quit = table.iter().position(|(n, _)| n == "quit").unwrap();
         assert_eq!(table[quit].1, vec!["x".to_owned()]);
@@ -884,7 +1118,7 @@ mod tests {
         );
         assert_eq!(
             table.last().unwrap(),
-            &("scroll_up".to_owned(), vec!["v".to_owned()]),
+            &("scroll_up".to_owned(), vec!["z".to_owned()]),
             "a newly bound action is appended"
         );
         let untouched = table.iter().find(|(n, _)| n == "nav_up").unwrap();
@@ -1341,7 +1575,13 @@ mod tests {
             (Action::RestoreFile, "key"),
             (Action::Flag, "key"),
             (Action::Unflag, "key"),
+            (Action::Select, "key"),
+            (Action::Copy, "key"),
+            (Action::SelectTo(0), "mouse"),
+            (Action::Edit, "key"),
+            (Action::EditExternal, "key"),
             (Action::Note(NoteKey::Send), "modal-note"),
+            (Action::Editor(EditorKey::Save), "modal-note"),
             (Action::Pick(PickKey::Send), "modal-note"),
             (Action::Ack, "key"),
             (Action::Jump, "key"),
@@ -1401,16 +1641,22 @@ mod tests {
             | Action::RestoreFile
             | Action::Flag
             | Action::Unflag
+            | Action::Select
+            | Action::Copy
+            | Action::SelectTo(_)
+            | Action::Edit
+            | Action::EditExternal
             | Action::Note(_)
+            | Action::Editor(_)
             | Action::Pick(_)
             | Action::Confirm
             | Action::Cancel
             | Action::Ack
             | Action::Jump
             | Action::ScopeToggle
-            | Action::Herdr(_) => 37,
+            | Action::Herdr(_) => 43,
         };
-        assert_eq!(table.len(), 37);
+        assert_eq!(table.len(), 43);
     }
 
     #[test]
@@ -1427,7 +1673,10 @@ mod tests {
         assert_eq!(modal_action(Key::parse("a").unwrap()), None);
         // Outside the modal the same keys keep their keymap meaning (or none).
         assert_eq!(to_action(&key('n'), &km), Some(Action::HunkNext));
-        assert_eq!(to_action(&key('y'), &km), None);
+        // `y` is the confirm key *inside* the modal and the copy key outside it
+        // (deliverable 9): the two never collide, because `modal_action` is consulted only
+        // while `App::confirm` is open and the keymap only when it is not.
+        assert_eq!(to_action(&key('y'), &km), Some(Action::Copy));
         assert!(
             km.bindings()
                 .iter()
@@ -1624,7 +1873,7 @@ mod tests {
         assert_eq!(by_key_effect.1, None, "the modal collects the note first");
         let note = by_key.note.as_ref().expect("the note modal is open");
         assert_eq!(note.target.status_label(), "f1 hunk 3");
-        assert!(note.text.is_empty());
+        assert!(note.text().is_empty());
     }
 
     /// `e` vs a click on the `[e expand]` control of a collapsed row: both ask the engine

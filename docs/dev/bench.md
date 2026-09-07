@@ -59,6 +59,16 @@ over the 100 roots. The screen metrics run from spawning `lastcall tui --poll 1`
 first root's pile (`1 repo · 40 files`) and to the header showing every root
 (`100 repos · 4,000 files`); the RSS peak is read after two further one-second rescans.
 
+> **`first_pile_ms` changed meaning at the Gate 8 sponsor run (`9d2fd4a`, 2026-09-07).**
+> The TUI no longer lists a root until every root has reported (the launch hold,
+> `tui.md` "Startup and the first frame"), so `1 repo · 40 files` is never on screen; the
+> harness now waits for the hold's counter line to show a first root reported
+> (`K of 100 repos checked`, `K` ≥ 1). The counter appears one second into the hold, so
+> from that commit on `first_pile_ms` **floors at ~1,000 ms** and reads "the first root was
+> done by then", not "the first root was listed then". `first_frame_ms` keeps its meaning
+> (every root in the header) and is the number to compare across runs. Runs A–F below were
+> measured under the old meaning.
+
 | metric | value |
 |---|---|
 | `open_ms` | 33050 |
@@ -340,8 +350,9 @@ still git-process bound; there are simply fewer processes. The pool is the rest:
 the pool and one third from the batching, and the last piece was the watcher: its initial
 pass used to scan one root at a time behind the engine mutex, which the pool cannot help,
 so the gap between the first pile and the full frame stayed at ~22 s until that pass became
-one `scan_all` (S1's first pile is still streamed on its own, so `first_pile_ms` is
-unaffected). `peak_rss_kb` moves by less than the sampler's noise: eight concurrent roots
+one `scan_all` (S1's first pile was still streamed on its own at this point, so
+`first_pile_ms` was unaffected; the Gate 8 sponsor run folded that solo scan into the
+batch — see the note under S1). `peak_rss_kb` moves by less than the sampler's noise: eight concurrent roots
 cost about 0.4 MB over one on S1, and nothing near a per-root allocation.
 
 ## Phase 6 (run D): one remote-ref listing per scan
@@ -534,6 +545,161 @@ BENCH S4 omitted=40000
 
 All five scenarios passed in one invocation (`5 passed; 0 failed`, 111 s of measured time
 after a 55 s fixture build): unlike run D, S2's assertion needed no second pass.
+
+## Phase 8 (run F): editing costs the scan nothing
+
+`docs/spec/97-phase8-kickoff.md`. Phase 8 adds `Engine::read_rendered`, `Engine::save`, the
+inline editor, the `$EDITOR` suspend and select-to-copy. Every one of them runs **from a
+keystroke** — none is on the scan path, none is in a draw, and `save` adds no git process to
+a scan (its own `hash-object` is paid once, by the save). Run E's claim, repeated for the
+same reason: the counts are the evidence.
+
+Machine block: unchanged from above except the date (**2026-09-06**) and the commit (this
+branch's tip, `334ba73`). Command: `just bench`, all five scenarios, `--test-threads=1`,
+**one** run. `5 passed; 0 failed`, 120.65 s of measured time.
+
+### The counts did not move
+
+| scenario | metric | run D | run E | run F |
+|---|---|---|---|---|
+| S1 | `open_spawns` | 1102 | 1102 | **1102** |
+| S1 | `scan_all_spawns` | 1600 | 1600 | **1600** |
+| S1 | `rows` / `roots` | 4000 / 100 | 4000 / 100 | **4000 / 100** |
+| S1h | `open_spawns` / `scan_all_spawns` | 552 / 800 | 552 / 800 | **552 / 800** |
+| S2 | `scan_spawns` / `hunks` | 16 / 2 | 16 / 2 | **16 / 2** |
+| S3 | `files` | 1000 | 1000 | **1000** |
+| S4 | `scan_spawns` | 15 | 15 | **15** |
+| S4 | `rows_shown` / `omitted` | 10000 / 40000 | 10000 / 40000 | **10000 / 40000** |
+
+Bit-identical to run D and run E. A phase that writes the working tree, the ledger and the
+user's clipboard from a keystroke still costs the scan nothing.
+
+### Wall times
+
+Read against **run D**, per run E's own instruction (run E did not re-establish the
+baseline). The band the Variance section records is ±2 % for metrics over 100 ms.
+
+| scenario | metric | run D | run E | run F | Δ vs D |
+|---|---|---|---|---|---|
+| S1 | `open_ms` | 3682 | 4142 | 4724 | +28.3 % |
+| S1 | `scan_all_ms` | 3853 | 3991 | 4402 | +14.2 % |
+| S1 | `first_pile_ms` | 4370 | 4744 | 5173 | +18.4 % |
+| S1 | `first_frame_ms` | 7533 | 8319 | 9150 | +21.5 % |
+| S1h | `scan_all_ms` | 2999 | 3183 | 3384 | +12.8 % |
+| S1h | `first_frame_ms` | 3994 | 4429 | 4877 | +22.1 % |
+| S2 | `scan_ms` | 206 | 237 | 262 | +27.2 % |
+| S2 | `open_ms` | 13 | 15 | 12 | −7.7 % |
+| S2 | `hunk_next_ms` | 13 | 15 | 10 | −23.1 % |
+| S3 | `settle_ms` | 1539 | 1566 | 1546 | +0.5 % |
+| S3_events | `settle_ms` | 1528 | 1543 | 1567 | +2.6 % |
+| S4 | `scan_ms` | 1540 | 1669 | 1746 | +13.4 % |
+| S4 | `settle_ms` | 5123 | 5344 | 5930 | +15.8 % |
+
+**No row moved beyond noise for a reason this phase can be held to, and one row is worth
+naming.** The wall times are up on run D by the same *pattern* run E recorded and for the
+same reason: this is a single run on a workstation that was building and testing the phase
+at the same time, not a quiet machine. The evidence that it is load and not code is the
+same two facts. First, every count above is identical, so no scenario is doing more work.
+Second, the spread still tracks how process-heavy a scenario is — S3, which spawns no git
+per file, is inside the band at +0.5 % / +2.6 %, while the spawn-heavy S1, S2 and S4 move
+most, and process creation is what a busy machine slows down. The in-process S2 interactions
+that Phase 8 might plausibly have touched went the *other* way — `open_ms` 13 → 12,
+`hunk_next_ms` 13 → 10, `page_down_ms` 14 → 12 against run D — which no amount of load
+explains as an improvement and which is consistent with "the diff pane's code did not get
+slower". They are also 10–15 ms values with a 10 ms harness granularity, so they are worth
+no more than that. `peak_rss_kb` moves both ways inside its ±15 % band (S1 21728 → 21664,
+S2 53680 → 49152, S4 78608 → 86368 against run D).
+
+The honest reading, again: **run F establishes that Phase 8 changed no counts. It does not
+re-establish the wall-time baseline, and neither did run E.** Two runs on a quiet machine are
+still owed; the phase that needs the number should take them and compare against run D.
+
+Nothing in the bench measures the editor, the save or the clipboard: `test_bench.rs` gained
+no scenario. That is deliberate — none of the three is on a path a scan or a frame takes, and
+a scenario that pressed `i` would be measuring the PTY harness. The one cost Phase 8 *does*
+add to a launch is not a scan cost at all, and it has its own section below.
+
+### The raw `BENCH` lines
+
+```text
+BENCH S1 open_ms=4724
+BENCH S1 open_spawns=1102
+BENCH S1 roots=100
+BENCH S1 rows=4000
+BENCH S1 scan_all_ms=4402
+BENCH S1 scan_all_spawns=1600
+BENCH S1 first_pile_ms=5173
+BENCH S1 first_frame_ms=9150
+BENCH S1 peak_rss_kb=21664
+BENCH S1h open_ms=2335
+BENCH S1h open_spawns=552
+BENCH S1h roots=50
+BENCH S1h rows=4000
+BENCH S1h scan_all_ms=3384
+BENCH S1h scan_all_spawns=800
+BENCH S1h first_pile_ms=2784
+BENCH S1h first_frame_ms=4877
+BENCH S1h peak_rss_kb=20192
+BENCH S2 file_bytes=1100001
+BENCH S2 hunks=2
+BENCH S2 scan_ms=262
+BENCH S2 scan_spawns=16
+BENCH S2 open_ms=12
+BENCH S2 hunk_next_ms=10
+BENCH S2 page_down_ms=12
+BENCH S2 peak_rss_kb=49152
+BENCH S2_default_config open_ms=12
+BENCH S3 files=1000
+BENCH S3 settle_ms=1546
+BENCH S3 peak_rss_kb=11168
+BENCH S3_events files=1000
+BENCH S3_events settle_ms=1567
+BENCH S3_events peak_rss_kb=10416
+BENCH S4 capped_count_ms=4106
+BENCH S4 settle_ms=5930
+BENCH S4 peak_rss_kb=86368
+BENCH S4 scan_ms=1746
+BENCH S4 scan_spawns=15
+BENCH S4 rows_shown=10000
+BENCH S4 omitted=40000
+```
+
+## Known costs
+
+Not scan costs and not scenarios: things a user can *wait* for that no `BENCH` line
+measures. The sponsor asked for this section at the Phase 8 kickoff (ruling P9, 2026-09-06)
+so that a cost decided in one phase does not become a mystery in the next. **Every later
+phase adds its own rows here.**
+
+### The keyboard-enhancement probe — up to 2 s at launch
+
+`term::enter()` asks the terminal whether it speaks the kitty keyboard protocol before the
+input thread starts: crossterm's `supports_keyboard_enhancement()` writes `CSI ? u` followed
+by `CSI c` and waits for a reply. A terminal that answers *either* query costs a round trip
+(microseconds on a local pty, one network round trip over ssh). **A terminal that answers
+neither costs crossterm's full 2 s timeout, before the first frame is drawn.**
+
+| | |
+|---|---|
+| what it buys | exactly one key: `Shift-Enter` as a newline in the note modal and the inline editor. `Ctrl-J` does the same everywhere, always |
+| when it is paid | once per process, before the input thread starts. The answer is a `OnceLock`, so an `$EDITOR` suspend's `term::enter()` re-pushes the flags without re-asking and pays nothing (F8, F18) |
+| worst case | 2 s, added to launch, on top of root discovery — which on S1's hundred roots is already ~3.7 s |
+| how to skip it | `LASTCALL_KEYBOARD=plain` (an environment switch, deliberately **not** a `[config]` key — §6.1 is frozen). Exactly that spelling; anything else means "ask" |
+| who skips it | the PTY harness, in `PtyCommand::isolated_lastcall`, or every e2e scene would pay 2 s |
+| failure direction | a probe that errors or times out is a **no**: the flags are never pushed, and the key row promises `^J newline` rather than `⇧⏎` |
+
+Terminals known to answer (so `⇧⏎` works there): kitty, WezTerm, foot, Ghostty, and
+iTerm2 ≥ 3.5 with the option enabled. Known **not** to: Terminal.app, tmux without
+`extended-keys`, and herdr's own terminal as of the Gate 7 run — which is the case that
+matters, because a herdr pane is where lastcall is meant to live.
+
+**The flip, if the sponsor's herdr launch pays the 2 s.** Ruling P9's Alt is a one-line
+change in `term.rs`: never probe, and push the flags only when `TERM` names a
+kitty-protocol terminal (`xterm-kitty`, `wezterm`, `foot`, `xterm-ghostty`). No query, no
+round trip, no timeout — at the price of missing iTerm2 and tmux `extended-keys`, which
+report the protocol but do not say so in `TERM`. Two-way door; the measurement the sponsor
+takes at the gate is what decides it. **Not measured here**, because the bench harness answers
+no queries and would only ever report the worst case.
 
 ## What the first run found
 

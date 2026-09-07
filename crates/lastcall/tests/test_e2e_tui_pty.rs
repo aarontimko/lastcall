@@ -20,6 +20,7 @@
 //! release binary, printing the final screen and the exit code.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -196,7 +197,19 @@ impl Fixture {
     /// `lastcall tui --poll 1` in a 100×30 PTY; `None` only when this host has no PTY
     /// (written as a visible SKIP).
     fn spawn_tui(&self, bin: &Path) -> Option<PtyTui> {
-        match self.command(bin).args(["tui", "--poll", "1"]).spawn() {
+        self.spawn_tui_env(bin, &[])
+    }
+
+    /// [`Fixture::spawn_tui`] with extra environment for the child. Only the Phase 8 editor
+    /// scenes use it, to point `$EDITOR` at their own probe script: `isolated_lastcall`
+    /// removes `$VISUAL` and `$EDITOR` from every child, so a scene that says nothing here
+    /// cannot reach an editor at all.
+    fn spawn_tui_env(&self, bin: &Path, env: &[(&str, OsString)]) -> Option<PtyTui> {
+        let mut cmd = self.command(bin).args(["tui", "--poll", "1"]);
+        for (key, value) in env {
+            cmd = cmd.env(key, value);
+        }
+        match cmd.spawn() {
             Ok(p) => Some(p),
             Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
                 note(&format!("SKIP: this host cannot open a pty: {e}"));
@@ -298,8 +311,10 @@ fn rows_listed(s: &vt100::Screen) -> bool {
 }
 
 /// Wait for the first piles; returns how long they took. Also proves the first frame was
-/// the empty state with the `scanning` status: in the raw transcript that text precedes
-/// the first file row.
+/// the launch hold (`discovered 3 roots, checking status…`) with the `scanning` status:
+/// in the raw transcript that text precedes the first file row — and the empty state
+/// (`nothing pending across 3 roots`) never does, since every root here has rows (the
+/// Gate 8 sponsor run's ruling: no repo is listed until every root has reported).
 /// The status row reads `watching <parent> (3 roots)`: the FSEvents watch is installed and
 /// its gap-closing rescans are done, so from here a file change is found by the live watch
 /// and its debounce rather than by a startup rescan. The temp path is long, so only the
@@ -327,9 +342,14 @@ fn wait_first_piles(pty: &mut PtyTui) -> Duration {
         "the scanning status ({scanning}) precedes the first row ({first_row})"
     );
     assert!(
-        find_words(&raw, &["nothing", "pending", "across", "3", "roots"])
+        find_words(&raw, &["discovered", "3", "roots,", "checking", "status…"])
             .is_some_and(|i| i < first_row),
-        "the first frame is the empty state"
+        "the first frame is the launch hold"
+    );
+    assert!(
+        find_words(&raw, &["nothing", "pending", "across", "3", "roots"])
+            .is_none_or(|i| i > first_row),
+        "the empty state never shows before the rows"
     );
     let alt_on = find(&raw, ALT_SCREEN_ON).expect("alternate screen on");
     assert!(find(&raw, MOUSE_ON).is_some(), "mouse capture is on");
@@ -354,6 +374,25 @@ fn wait_first_piles(pty: &mut PtyTui) -> Duration {
     assert!(pty.screen(|s| s.alternate_screen()));
     assert!(pty.screen(|s| s.mouse_protocol_mode() != vt100::MouseProtocolMode::None));
     took
+}
+
+/// Poll the raw transcript until it contains `needle`; returns how long that took. The
+/// screen is no use here: the bytes wanted are a terminal *query*, which vt100 consumes
+/// without drawing anything.
+fn wait_raw(pty: &mut PtyTui, needle: &[u8], timeout: Duration) -> Duration {
+    let start = Instant::now();
+    loop {
+        if find(&pty.raw(), needle).is_some() {
+            return start.elapsed();
+        }
+        assert!(
+            start.elapsed() < timeout,
+            "{:?} not written within {timeout:?}; transcript:\n{:?}",
+            String::from_utf8_lossy(needle),
+            String::from_utf8_lossy(&pty.raw())
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// After an exit: the transcript's tail leaves the terminal sane and carries no tracing.
@@ -465,8 +504,9 @@ fn pty_live_update_hunk_nav_click_and_quit() {
             "edit-to-screen min of two tries {best:?} exceeds {LIVE_UPDATE_BUDGET:?} (try1 {try1:?}, try2 {try2:?})"
         );
     }
-    // The header's totals are live too: 3 repos, 5 files, 6 hunks (f1 now has two).
-    pty.wait_for_text("3 repos · 5 files · 6 hunks", Duration::from_secs(5))
+    // The header's totals are live too: 3 repos, 6 files, 9 hunks (f1 now has two, and
+    // alpha's `src/parse.rs` carries the fixture's three separated hunks).
+    pty.wait_for_text("3 repos · 6 files · 9 hunks", Duration::from_secs(5))
         .unwrap_or_else(|e| panic!("header totals: {e}"));
 
     // (3) select f1 (↓ to alpha, ↓ to f1), open it, then `n`: the second hunk header is
@@ -700,7 +740,7 @@ const F1_TWO_HUNKS: &str = "A1\na2\na3\na4\na5\na6\na7\na8\na9\nA10\n";
 const F2_EDIT: &str = "b\nagent edit\nmore\n";
 const F2_EDIT_AGAIN: &str = "b\nagent edit\nmore\nagain\n";
 const F3_EDIT: &str = "c changed\n";
-/// Added files so that after the hunk and file accepts `ctrl-a` still covers eleven files
+/// Added files so that after the hunk and file accepts `ctrl-a` still covers twelve files
 /// (> `CONFIRM_ABOVE`), which drives the confirm modal through the real terminal.
 const ADDED: [&str; 6] = ["g01", "g02", "g03", "g04", "g05", "g06"];
 
@@ -737,11 +777,11 @@ fn pty_accept_loop_and_restart() {
     let first = wait_first_piles(&mut pty);
     pty.wait_for(LONG, |s| {
         let t = s.contents();
-        t.contains("M f3") && t.contains("A g06") && t.contains("3 repos · 12 files")
+        t.contains("M f3") && t.contains("A g06") && t.contains("3 repos · 13 files")
     })
-    .unwrap_or_else(|e| panic!("all twelve rows: {e}"));
+    .unwrap_or_else(|e| panic!("all thirteen rows: {e}"));
     note(&format!(
-        "PTY accept loop: 12 files on screen after {first:.3?}"
+        "PTY accept loop: 13 files on screen after {first:.3?}"
     ));
 
     // (1) open f1: two hunks; `a` accepts the first, the row shrinks to the second.
@@ -775,19 +815,19 @@ fn pty_accept_loop_and_restart() {
         t.elapsed()
     ));
 
-    // (3) `ctrl-a`: eleven files across three roots is above the confirm threshold; the
+    // (3) `ctrl-a`: twelve files across three roots is above the confirm threshold; the
     // modal counts u1 as the one grouped upstream row; `y` folds all three ledgers.
     pty.send(b"\x01").expect("ctrl-a");
     pty.wait_for(Duration::from_secs(5), |s| {
         let text = s.contents();
-        text.contains("Accept all 11 files across 3 repos?")
+        text.contains("Accept all 12 files across 3 repos?")
             && text.contains("1 grouped upstream · 0 collapsed")
     })
     .unwrap_or_else(|e| panic!("confirm modal: {e}"));
     let t = Instant::now();
     pty.send(b"y").expect("y");
     pty.wait_for(OVERLOADED, |s| {
-        status_is(s, "accepted 11 files in 3 repos")
+        status_is(s, "accepted 12 files in 3 repos")
             && s.contents().contains("nothing pending across 3 roots")
     })
     .unwrap_or_else(|e| panic!("accept all: {e}"));
@@ -813,7 +853,7 @@ fn pty_accept_loop_and_restart() {
     // The seen tree itself, listed from the root's store: one entry per path of alpha's
     // working tree as accepted and nothing else — f1 and f2 at the blobs the agent left
     // (hashed here from the same files: f1 is the whole edit, hunk then file), f3 as the
-    // agent's commit has it, the six added files.
+    // agent's commit has it, the six added files, and the fixture's `src/parse.rs`.
     let store = alpha_state.join("store");
     let seen_tree = after["seen_tree"].as_str().expect("seen_tree is an oid");
     let listing = alpha
@@ -837,6 +877,7 @@ fn pty_accept_loop_and_restart() {
         .collect();
     let mut expected = vec!["f1", "f2", "f3"];
     expected.extend(ADDED);
+    expected.push(fixture_parent::PARSE_RS);
     assert_eq!(
         entries.keys().copied().collect::<Vec<_>>(),
         expected,
@@ -1845,13 +1886,59 @@ fn pty_flag_note_exports_when_standalone() {
     );
 
     let path = export_file(&fx.state, "alpha");
-    let actual = normalise_export(&std::fs::read_to_string(&path).expect("the export file"));
+    let hunk_export = normalise_export(&std::fs::read_to_string(&path).expect("the export file"));
     for line in NOTE.lines() {
         assert!(
-            actual.contains(line),
-            "every line of the note reaches the export:\n{actual}"
+            hunk_export.contains(line),
+            "every line of the note reaches the export:\n{hunk_export}"
         );
     }
+
+    // Amendment v1.8 / ruling P4: `m` from the **nav** flags the whole file. Esc drops the
+    // diff focus first, so the second `m` has no hunk under it. The header says `whole
+    // file` where the first one said `hunk 2 of 2`, a summary line follows it, and there is
+    // no diff block — the export below is the golden that pins all three.
+    // Two writes: `\x1b` and `m` in one would reach the reader as `alt-m`, not two keys.
+    pty.send(b"\x1b").expect("esc");
+    pty.wait_for(Duration::from_secs(5), |s| !s.contents().contains("⏎ send"))
+        .unwrap_or_else(|e| panic!("esc leaves the diff focus: {e}"));
+    pty.send(b"m").expect("m");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        let t = s.contents();
+        t.contains("f1 · whole file") && t.contains("flag whole file")
+    })
+    .unwrap_or_else(|e| panic!("the whole-file note modal: {e}"));
+
+    /// The second note, the whole-file one.
+    const WHOLE: &str = "the whole file needs another pass";
+
+    pty.send(WHOLE.as_bytes()).expect("the whole-file note");
+    pty.send(b"\r").expect("enter");
+    pty.wait_for(OVERLOADED, |s| {
+        let (_, cols) = s.size();
+        s.rows(0, cols)
+            .last()
+            .is_some_and(|r| r.contains("flagged f1 · export → "))
+    })
+    .unwrap_or_else(|e| panic!("the whole-file export status: {e}"));
+
+    let ledger = fx.ledger("alpha");
+    let flags = &ledger["overrides"]["f1"]["flags"];
+    assert_eq!(flags.as_array().map(Vec::len), Some(2), "{ledger}");
+    assert_eq!(flags[1]["note"].as_str(), Some(WHOLE), "{ledger}");
+    assert!(
+        flags[1]["hunk"].is_null(),
+        "a whole-file flag carries no hunk: {ledger}"
+    );
+    assert_eq!(flags[1]["summary"]["hunks"].as_u64(), Some(2), "{ledger}");
+    assert_eq!(flags[1]["summary"]["added"].as_u64(), Some(2), "{ledger}");
+    assert_eq!(flags[1]["summary"]["deleted"].as_u64(), Some(2), "{ledger}");
+
+    let actual = normalise_export(&std::fs::read_to_string(&path).expect("the export file"));
+    assert!(
+        actual.starts_with(&hunk_export),
+        "the whole-file export is appended after the hunk one:\n{actual}"
+    );
     if std::env::var_os("LASTCALL_UPDATE_GOLDEN").is_some() {
         std::fs::write(FLAG_EXPORT_PTY_GOLDEN, &actual).expect("write golden");
         note(&format!("golden rewritten: {FLAG_EXPORT_PTY_GOLDEN}"));
@@ -1865,6 +1952,756 @@ fn pty_flag_note_exports_when_standalone() {
              intended)\n--- expected ---\n{expected}\n--- actual ---\n{actual}"
         );
     }
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}
+
+/// Ruling P9, the other half: the scene that **does not** set `LASTCALL_KEYBOARD=plain`.
+///
+/// Every other PTY scene sets it (`PtyCommand::isolated_lastcall`) so none of them pays
+/// crossterm's 2 s probe timeout against a harness that answers nothing. This one removes
+/// it and plays the terminal: it waits for the query crossterm writes to `/dev/tty`
+/// (`CSI ? u`, then the `CSI c` that bounds it), answers as a kitty-protocol terminal
+/// would, and then checks the three things that can go wrong.
+///
+/// 1. the query is actually written — the probe ran;
+/// 2. the app still reaches its first frame, and the enhanced key hint proves the answer
+///    was believed and the flags were pushed (`CSI > 1 u` in the transcript);
+/// 3. no byte of the reply ever surfaces as a key — crossterm's own reader consumes it
+///    before the input thread starts, so the screen carries no `?0u` / `?62` text, no
+///    modal opened by itself, and the app is still running to be quit.
+#[test]
+fn pty_keyboard_enhancement_probe_is_answered_and_swallowed() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let spawned = fx
+        .command(&bin())
+        .env_remove("LASTCALL_KEYBOARD")
+        .args(["tui", "--poll", "1"])
+        .spawn();
+    let mut pty = match spawned {
+        Ok(p) => p,
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+            note(&format!("SKIP: this host cannot open a pty: {e}"));
+            return;
+        }
+        Err(e) => panic!("spawn lastcall tui: {e}"),
+    };
+
+    // (1) The probe writes `CSI ? u` (and the `CSI c` whose reply bounds the wait).
+    let waited = wait_raw(&mut pty, b"\x1b[?u", Duration::from_secs(5));
+    note(&format!(
+        "PTY keyboard probe: query written after {waited:.3?}"
+    ));
+    assert!(
+        find(&pty.raw(), b"\x1b[c").is_some(),
+        "the device-attributes query that bounds the wait is written too"
+    );
+
+    // Answer the way kitty, WezTerm, foot or Ghostty would: the flags report, then DA1.
+    pty.send(b"\x1b[?0u\x1b[?62;1;6c").expect("the reply");
+
+    // (2) The app still starts…
+    wait_first_piles(&mut pty);
+    assert!(
+        find(&pty.raw(), b"\x1b[>1u").is_some(),
+        "the disambiguate flag is pushed once the probe says yes"
+    );
+    // …and it believed the answer: the enhanced hint is the one the note modal draws only
+    // when `term::keyboard_enhanced()` said yes.
+    // `jj` past the root header onto `f1`, then `m` on it.
+    pty.send(b"jj").expect("jj");
+    pty.wait_for(Duration::from_secs(5), |s| s.contents().contains("f1  M "))
+        .unwrap_or_else(|e| panic!("f1 is the selected row: {e}"));
+    pty.send(b"m").expect("m");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        s.contents().contains("⇧⏎ / ^J newline")
+    })
+    .unwrap_or_else(|e| panic!("the enhanced note-modal hint: {e}"));
+
+    // (3) Nothing of the reply reached the app as input.
+    pty.send(b"\x1b").expect("esc");
+    pty.wait_for(Duration::from_secs(5), |s| !s.contents().contains("⏎ send"))
+        .unwrap_or_else(|e| panic!("esc closes the modal: {e}"));
+    let screen = pty.screen_text();
+    for stray in ["?0u", "62;1;6", "[?62"] {
+        assert!(
+            !screen.contains(stray),
+            "no reply byte was echoed as typing ({stray}):\n{screen}"
+        );
+    }
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert!(
+        find(&pty.raw()[since..], b"\x1b[<1u").is_some(),
+        "the pushed flags are popped before the alternate screen is left"
+    );
+    assert_clean_exit(&pty, since);
+}
+
+// ---- Phase 8 deliverable 7: `$EDITOR` -----------------------------------------------------
+
+/// The probe editor (`tests/probe/editor.sh`) as a symlink named `vim` inside `dir`, plus
+/// the log it appends to. The **symlink's** name is what `editor.rs`'s basename table keys
+/// off, so a scene reaching this gets `+<line> <file>` argv; the absolute path is what
+/// `$EDITOR` is set to, so nothing goes on `PATH` and no editor of the developer's is
+/// reachable (`isolated_lastcall` removed `$VISUAL` and `$EDITOR` outright).
+fn probe_vim(dir: &Path) -> (PathBuf, PathBuf) {
+    let bindir = dir.join("probe-bin");
+    std::fs::create_dir_all(&bindir).expect("the probe bin dir");
+    let vim = bindir.join("vim");
+    if !vim.exists() {
+        std::os::unix::fs::symlink(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/probe/editor.sh"),
+            &vim,
+        )
+        .expect("the `vim` symlink");
+    }
+    (vim, dir.join("editor.log"))
+}
+
+/// What the probe editor "saves": `PARSE_RS_EDITED` with one more line **inside the middle
+/// hunk**, right under the line `shift-i` puts the cursor on. That placement is the point:
+/// the blessing has to cover the whole live file, not just the hunk the editor was opened
+/// at, and a line somewhere else would not tell those two apart from the row alone.
+fn parse_rs_saved() -> String {
+    let mut out = String::new();
+    for line in fixture_parent::PARSE_RS_EDITED.lines() {
+        out.push_str(line);
+        out.push('\n');
+        if line == fixture_parent::PARSE_RS_EDIT2 {
+            out.push_str("            // typed in $EDITOR\n");
+        }
+    }
+    assert!(
+        out.len() > fixture_parent::PARSE_RS_EDITED.len(),
+        "the marker line is in the edited text"
+    );
+    out
+}
+
+/// Move the nav selection to `parse.rs`, open it, and step to its **second** hunk — the one
+/// with real leading context (design review F5, F9). `jjjj` walks alpha's nav
+/// (root, f1, f2, src/parse.rs); `⏎` focuses the diff, which is where `shift-i` reads the
+/// hunk under the cursor from.
+fn open_parse_rs_hunk_2(pty: &mut PtyTui) {
+    pty.wait_for_text("M parse.rs  +10 −2", LONG)
+        .unwrap_or_else(|e| panic!("the parse.rs row: {e}"));
+    pty.send(b"jjjj\r").expect("keys");
+    pty.wait_for_text("parse.rs  M  +10 −2", LONG)
+        .unwrap_or_else(|e| panic!("parse.rs opens in the diff pane: {e}"));
+    let first = hunk_headers(pty)
+        .first()
+        .map(|(_, r)| header_text(r))
+        .expect("a hunk header on screen");
+    assert!(
+        first.starts_with("@@ -1,"),
+        "hunk 1 is the module doc at the top of the file, not {first}"
+    );
+    pty.send(b"n").expect("n");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        let (_, cols) = s.size();
+        s.rows(0, cols)
+            .find(|r| r.contains("@@ -"))
+            .is_some_and(|r| !header_text(&r).starts_with("@@ -1,"))
+    })
+    .unwrap_or_else(|e| panic!("`n` scrolls hunk 2's header to the top: {e}"));
+}
+
+/// Gate item 2 end to end: an `$EDITOR` session that **saves** leaves nothing pending — the
+/// user is asked whether they meant it, and `Enter` blesses the whole live file.
+///
+/// Both halves of ruling P1 are here, in one process because that is the only way to show
+/// they are the same question answered differently:
+///
+/// * `Enter` on `alpha/src/parse.rs` — the row goes away entirely (invariant 8 for the
+///   session: what the editor left behind *is* the reviewed content, not just the hunk that
+///   was open), and the file on disk holds the line the editor wrote;
+/// * `Esc` on `alpha/f1`, whose row the same probe editor also rewrites — the row **stays**,
+///   with the editor's own change pending on it like any agent's.
+///
+/// The second half is on a different file for a plain reason: after the first one is blessed
+/// there is no `parse.rs` row left to press `shift-i` on.
+#[test]
+fn pty_editor_save_pends_nothing() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let (vim, log) = probe_vim(&fx.state);
+    let saved = parse_rs_saved();
+    let Some(mut pty) = fx.spawn_tui_env(
+        &bin(),
+        &[
+            ("EDITOR", vim.into_os_string()),
+            ("LASTCALL_PROBE_EDITOR_LOG", log.clone().into_os_string()),
+            ("LASTCALL_PROBE_EDITOR_WRITE", saved.clone().into()),
+        ],
+    ) else {
+        return;
+    };
+    wait_first_piles(&mut pty);
+    // Before `shift-i`, not for the timing: the watcher emits its `watching <parent>
+    // (3 roots)` notice once, and a notice is a **status**, so one that arrived while the
+    // editor had the terminal would drain over the return path's own status the moment the
+    // loop ran again. Waiting for it here is the scene saying which status it is reading.
+    wait_watching(&mut pty);
+
+    // (1) `shift-i` on parse.rs hunk 2; the probe rewrites the file and exits.
+    open_parse_rs_hunk_2(&mut pty);
+    let t = Instant::now();
+    pty.send(b"I").expect("shift-i");
+    pty.wait_for_text("mark every hunk in it reviewed?", LONG)
+        .unwrap_or_else(|e| panic!("the blessing confirm after the editor exits: {e}"));
+    note(&format!(
+        "PTY editor: save to confirm in {:.3?}",
+        t.elapsed()
+    ));
+    assert_eq!(
+        std::fs::read_to_string(fx.parent.join("alpha").join(fixture_parent::PARSE_RS))
+            .expect("parse.rs"),
+        saved,
+        "the editor's save is on disk before the question is answered"
+    );
+
+    // `Enter` = yes: the whole live file is accepted, so the row is gone.
+    pty.send(b"\r").expect("enter");
+    pty.wait_for(OVERLOADED, |s| {
+        status_is(s, "reviewed src/parse.rs") && !s.contents().contains("M parse.rs")
+    })
+    .unwrap_or_else(|e| panic!("Enter blesses the session's content: {e}"));
+    assert_eq!(
+        std::fs::read_to_string(fx.parent.join("alpha").join(fixture_parent::PARSE_RS))
+            .expect("parse.rs"),
+        saved,
+        "blessing is metadata: the bytes the editor wrote are untouched"
+    );
+
+    // (2) the same editor on `f1`, answered `Esc`: the row stays, pending the editor's own
+    // change. Nothing is written by lastcall either way — this is the half that shows the
+    // confirm is a real question and not a formality.
+    select_until(&mut pty, "f1  M");
+    pty.send(b"\r").expect("open f1");
+    pty.wait_for_text("@@ -", Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("f1's diff: {e}"));
+    pty.send(b"I").expect("shift-i");
+    pty.wait_for_text("f1 edited — mark every hunk in it reviewed?", LONG)
+        .unwrap_or_else(|e| panic!("the blessing confirm for f1: {e}"));
+    pty.send(b"\x1b").expect("esc");
+    pty.wait_for(OVERLOADED, |s| {
+        status_is(s, "f1 left pending") && s.contents().contains("M f1")
+    })
+    .unwrap_or_else(|e| panic!("Esc leaves the row pending: {e}"));
+    assert_eq!(
+        std::fs::read_to_string(fx.parent.join("alpha/f1")).expect("f1"),
+        saved,
+        "declining changes nothing on disk either"
+    );
+
+    // The probe ran twice, and both times through the `vim` symlink at an absolute path.
+    let logged = std::fs::read_to_string(&log).expect("the probe log");
+    assert_eq!(
+        logged.lines().filter(|l| l.starts_with("argv: +")).count(),
+        2,
+        "two editor sessions with a `+<line>` argv:\n{logged}"
+    );
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}
+
+/// Design review F4: a `^C` typed while `$EDITOR` owns the terminal must not quit lastcall.
+///
+/// During the suspend the tty is back in cooked mode, so the `\x03` is not a key event —
+/// the line discipline turns it into a `SIGINT` for the whole foreground process group,
+/// which is the editor **and** lastcall. The editor dies from it (that is what a user
+/// pressing `^C` in `vim` expects); lastcall's tokio handler latches it, and `Signals::
+/// resume` is what stops the loop reading that latch as "quit" the moment it runs again.
+///
+/// Nothing here can be proved from a reducer: the signal never reaches the reducer, and the
+/// only observable is that the frame comes back instead of the process ending.
+#[test]
+fn pty_editor_ctrl_c_does_not_quit_lastcall() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let (vim, log) = probe_vim(&fx.state);
+    let Some(mut pty) = fx.spawn_tui_env(
+        &bin(),
+        &[
+            ("EDITOR", vim.into_os_string()),
+            ("LASTCALL_PROBE_EDITOR_LOG", log.clone().into_os_string()),
+            // Long enough that the `^C` lands while the script is still running, short
+            // enough that a `^C` that never arrives does not hang the scene.
+            ("LASTCALL_PROBE_EDITOR_SLEEP", "1".into()),
+        ],
+    ) else {
+        return;
+    };
+    wait_first_piles(&mut pty);
+    // The watcher's one-shot `watching …` notice, before the suspend rather than during it
+    // (see `pty_editor_save_pends_nothing`).
+    wait_watching(&mut pty);
+    open_parse_rs_hunk_2(&mut pty);
+
+    pty.send(b"I").expect("shift-i");
+    // The probe writes its log line before it sleeps, so this is "the editor has the
+    // terminal now" — no fixed sleep on our side.
+    let start = Instant::now();
+    loop {
+        if std::fs::read_to_string(&log).is_ok_and(|t| t.contains("cwd: ")) {
+            break;
+        }
+        assert!(
+            start.elapsed() < LONG,
+            "the probe editor never started:\n{}",
+            pty.screen_text()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    pty.send(b"\x03").expect("^C at the editor");
+
+    // The script wrote nothing, so the return path's answer is `no change` — and its being
+    // on screen at all is the assertion: lastcall is alive, back on the alternate screen,
+    // with the row it left.
+    pty.wait_for(LONG, |s| status_is(s, "no change"))
+        .unwrap_or_else(|e| panic!("the TUI is back after the ^C: {e}"));
+    let back = start.elapsed();
+    note(&format!("PTY editor ^C: frame back after {back:.3?}"));
+    // The probe was told to sleep a second. Coming back sooner is the proof that the `^C`
+    // reached the *child* — a sleep that simply finished would look the same on screen.
+    assert!(
+        back < Duration::from_secs(1),
+        "the ^C interrupted the editor rather than the sleep running out ({back:?})"
+    );
+    assert!(
+        pty.screen(|s| s.alternate_screen()),
+        "back on the alternate screen"
+    );
+    assert!(
+        pty.screen_text().contains("parse.rs  M  +10 −2"),
+        "the same row is still open:\n{}",
+        pty.screen_text()
+    );
+
+    // …and the keyboard still reaches it — with a **second `^C`**, which is the half of the
+    // claim the scene used to leave to a `q` (verifier (b) F3). It proves two things at
+    // once: `Signals::resume`'s drain swallowed the editor's interrupt and not this one,
+    // and the resumed terminal is back in raw mode, where `\x03` is a key event the keymap
+    // quits on rather than a signal. It goes out well past `EDITOR_SETTLE` (50 ms), which
+    // is the window the docs promise a `ctrl-c` has to be repeated in.
+    std::thread::sleep(Duration::from_millis(300));
+    let since = pty.raw().len();
+    pty.send(b"\x03").expect("^C after the resume");
+    let status = pty
+        .wait_exit(QUIT_BUDGET)
+        .expect("a real ^C a moment after the resume quits");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}
+
+/// Verifier (b) F1: a key typed while `$EDITOR` owns the terminal must act on the **resume**
+/// and not wait for a second key.
+///
+/// The bug it guards is below crossterm and macOS-only. crossterm registers the tty with
+/// kqueue once per process and edge-triggered (`EV_CLEAR`); xnu's raw-mode switch moves the
+/// pending cooked line into the raw queue without waking anyone, so the byte is readable and
+/// never reported — verifier (b) watched `poll` return `Ok(false)` 134 times over 6.7 s with
+/// a `n` sitting in the queue, and the *next* key delivered both at once. `Suspend::run`
+/// therefore writes one `ESC [ 6 n` after `term::enter()`: the terminal's reply is an edge
+/// the kqueue does fire on, and the read it wakes drains the stuck byte with it.
+///
+/// So the scene needs a terminal that answers — `PtyCommand::answer_cursor_position`, which
+/// no other scene turns on. On a terminal that stays silent the byte still waits for the
+/// next key; that residual is in `tui.md`'s suspend step list, and it is why this scene
+/// cannot be written without the harness switch.
+///
+/// `n` is the key on purpose: one printable byte, so nothing here depends on how the line
+/// discipline treats `\r` or on crossterm's lone-`ESC` disambiguation.
+#[test]
+fn pty_editor_key_typed_during_the_editor_is_not_stuck() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let (vim, log) = probe_vim(&fx.state);
+    let saved = parse_rs_saved();
+    let spawned = fx
+        .command(&bin())
+        .args(["tui", "--poll", "1"])
+        .env("EDITOR", vim.into_os_string())
+        .env("LASTCALL_PROBE_EDITOR_LOG", log.clone().into_os_string())
+        // The editor saves, so the return path opens the blessing confirm — the `n` typed
+        // during the sleep is the answer to it.
+        .env("LASTCALL_PROBE_EDITOR_WRITE", saved.clone())
+        .env("LASTCALL_PROBE_EDITOR_SLEEP", "1")
+        .answer_cursor_position()
+        .spawn();
+    let mut pty = match spawned {
+        Ok(p) => p,
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+            note(&format!("SKIP: this host cannot open a pty: {e}"));
+            return;
+        }
+        Err(e) => panic!("spawn lastcall tui: {e}"),
+    };
+    wait_first_piles(&mut pty);
+    wait_watching(&mut pty);
+    open_parse_rs_hunk_2(&mut pty);
+
+    pty.send(b"I").expect("shift-i");
+    // The probe logs `cwd:` before it sleeps: the editor owns the terminal from here.
+    let start = Instant::now();
+    loop {
+        if std::fs::read_to_string(&log).is_ok_and(|t| t.contains("cwd: ")) {
+            break;
+        }
+        assert!(
+            start.elapsed() < LONG,
+            "the probe editor never started:\n{}",
+            pty.screen_text()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    pty.send(b"n").expect("n while the editor sleeps");
+
+    // …and nothing else is ever sent. Before the fix this waited forever: the confirm sat
+    // on screen unanswered until a second key arrived.
+    let answered = pty
+        .wait_for(Duration::from_secs(5), |s| {
+            status_is(s, "src/parse.rs left pending")
+        })
+        .unwrap_or_else(|e| {
+            panic!("the `n` typed during the editor answers the confirm on the resume: {e}")
+        });
+    note(&format!(
+        "PTY editor stuck key: answered {answered:.3?} after the send"
+    ));
+    let screen = pty.screen_text();
+    assert!(
+        !screen.contains("mark every hunk in it reviewed?"),
+        "the confirm is gone:\n{screen}"
+    );
+    assert!(
+        screen.contains("M parse.rs"),
+        "and the row is still pending, which is what `n` means:\n{screen}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fx.parent.join("alpha").join(fixture_parent::PARSE_RS))
+            .expect("parse.rs"),
+        saved,
+        "declining wrote nothing: the editor's bytes are what is on disk"
+    );
+
+    // The mechanism, on the wire: exactly one cursor-position request, written by the
+    // resume and by nothing else (`LASTCALL_KEYBOARD=plain` skips the other query lastcall
+    // knows how to write).
+    let raw = pty.raw();
+    assert_eq!(
+        raw.windows(4).filter(|w| *w == b"\x1b[6n").count(),
+        1,
+        "one DSR nudge, from the one suspend"
+    );
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}
+
+/// The inline editor's header, as [`render::render_editor_header`] writes it for the middle
+/// hunk of `src/parse.rs` — the line number comes from the fixture text, not from the
+/// engine under test.
+fn editing_parse_rs() -> String {
+    format!(
+        "editing src/parse.rs · line {}/",
+        fixture_parent::parse_rs_edit2_line()
+    )
+}
+
+/// Gate item 1 end to end: `i` opens the file **in** lastcall, typed and pasted text lands
+/// in the buffer, and `Ctrl-S` writes it under the same compare-and-swap an accept uses —
+/// after which the row is gone with nothing left pending, because the bytes on disk are the
+/// bytes the ledger just blessed.
+///
+/// Two files, because they are two different round trips:
+///
+/// * `alpha/src/parse.rs`, which ends in a newline: typing, a **bracketed paste** of two
+///   lines, then `^S`. Every character is on disk and the row is gone.
+/// * `notes/n2.md`, rewritten **without** a trailing newline before the child starts
+///   (design review F6): saving it back must not grow one. A buffer that quietly terminates
+///   the last line rewrites a file the reader never touched that way, and the diff the next
+///   agent sees would be lastcall's, not theirs.
+#[test]
+fn pty_edit_inline_save_pends_nothing() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    // The agent's edit to the draft note, minus the trailing newline.
+    let n2 = fx.parent.join("notes/n2.md");
+    std::fs::write(&n2, "# note 2\n\nedited").expect("the no-EOL draft");
+
+    let Some(mut pty) = fx.spawn_tui(&bin()) else {
+        return;
+    };
+    wait_first_piles(&mut pty);
+    // The watcher's one-shot `watching <parent> (3 roots)` notice is a status; waiting for
+    // it here means the `saved …` status below is the one this scene put there.
+    wait_watching(&mut pty);
+
+    // (1) parse.rs, opened at the middle hunk.
+    open_parse_rs_hunk_2(&mut pty);
+    let t = Instant::now();
+    pty.send(b"i").expect("i");
+    pty.wait_for_text(&editing_parse_rs(), LONG)
+        .unwrap_or_else(|e| panic!("the inline editor opens at the hunk's line: {e}"));
+    note(&format!("PTY inline editor: open in {:.3?}", t.elapsed()));
+
+    // Type a line, then paste two more as one bracketed paste.
+    pty.send(b"// typed inline\r").expect("typing");
+    pty.wait_for_text("// typed inline", Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("the typed line is in the buffer: {e}"));
+    pty.send(b"\x1b[200~// pasted one\n// pasted two\n\x1b[201~")
+        .expect("paste");
+    pty.wait_for_text("// pasted two", Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("the pasted block is in the buffer: {e}"));
+
+    let t = Instant::now();
+    pty.send(b"\x13").expect("ctrl-s");
+    pty.wait_for(OVERLOADED, |s| {
+        status_is(s, "saved src/parse.rs") && !s.contents().contains("M parse.rs")
+    })
+    .unwrap_or_else(|e| panic!("^S saves and the row goes away: {e}"));
+    note(&format!(
+        "PTY inline editor: ^S to saved in {:.3?}",
+        t.elapsed()
+    ));
+
+    let on_disk = std::fs::read_to_string(fx.parent.join("alpha").join(fixture_parent::PARSE_RS))
+        .expect("parse.rs");
+    for line in ["// typed inline", "// pasted one", "// pasted two"] {
+        assert!(on_disk.contains(line), "{line} is on disk:\n{on_disk}");
+    }
+    assert!(
+        on_disk.contains(fixture_parent::PARSE_RS_EDIT2),
+        "and the agent's own line survived the round trip"
+    );
+    assert!(
+        !pty.screen_text().contains("editing src/parse.rs"),
+        "a clean save closes the editor:\n{}",
+        pty.screen_text()
+    );
+
+    // (2) the draft note with no trailing newline. `Esc` first: the save left the focus in
+    // the diff pane, where `j` scrolls the diff instead of walking the nav.
+    pty.send(b"\x1b").expect("esc back to the nav");
+    select_until(&mut pty, "n2.md  M");
+    pty.send(b"\r").expect("open n2.md");
+    pty.wait_for_text("@@ -", Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("n2.md's diff: {e}"));
+    pty.send(b"i").expect("i");
+    pty.wait_for_text("editing n2.md · line", LONG)
+        .unwrap_or_else(|e| panic!("the inline editor on the draft note: {e}"));
+    pty.send(b"more ").expect("typing");
+    pty.wait_for_text("more ", Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("the typed text is in the buffer: {e}"));
+    pty.send(b"\x13").expect("ctrl-s");
+    pty.wait_for(OVERLOADED, |s| {
+        status_is(s, "saved n2.md") && !s.contents().contains("M n2.md")
+    })
+    .unwrap_or_else(|e| panic!("^S saves the draft note: {e}"));
+
+    let note_text = std::fs::read_to_string(&n2).expect("n2.md");
+    assert!(
+        note_text.contains("more "),
+        "the typed text is on disk: {note_text:?}"
+    );
+    assert!(
+        !note_text.ends_with('\n'),
+        "saving a file with no trailing newline must not grow one (F6): {note_text:?}"
+    );
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}
+
+/// The save's compare-and-swap on screen: an agent writes the file while the reader is
+/// typing in it, and `^S` refuses. Nothing is written, **every character the reader typed
+/// stays in the buffer** — throwing their work away to tell them the file moved would be
+/// the worst possible reading of "not saved" — and the status names the two keys that
+/// reload.
+#[test]
+fn pty_edit_inline_save_refused_when_the_file_moved() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let Some(mut pty) = fx.spawn_tui(&bin()) else {
+        return;
+    };
+    wait_first_piles(&mut pty);
+    wait_watching(&mut pty);
+
+    pty.send(b"jj\r").expect("keys");
+    pty.wait_for_text("f1  M  +1 −1", Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("f1 open: {e}"));
+    pty.send(b"i").expect("i");
+    pty.wait_for_text("editing f1 · line", LONG)
+        .unwrap_or_else(|e| panic!("the inline editor on f1: {e}"));
+    pty.send(b"typed but never saved ").expect("typing");
+    pty.wait_for_text("typed but never saved", Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("the typed text is in the buffer: {e}"));
+
+    // The agent writes f1 underneath the open buffer.
+    fx.append("alpha/f1", "moved while the editor was open\n");
+    let before = std::fs::read(fx.parent.join("alpha/f1")).expect("read f1");
+
+    let t = Instant::now();
+    pty.send(b"\x13").expect("ctrl-s");
+    pty.wait_for(OVERLOADED, |s| {
+        status_is(
+            s,
+            "f1: changed since you opened it; not saved — Esc, then i to reload",
+        )
+    })
+    .unwrap_or_else(|e| panic!("the refusal status: {e}"));
+    note(&format!(
+        "PTY inline save refused: status after {:.3?}",
+        t.elapsed()
+    ));
+    assert_eq!(
+        std::fs::read(fx.parent.join("alpha/f1")).expect("read f1"),
+        before,
+        "a refused save writes nothing at all"
+    );
+    let screen = pty.screen_text();
+    assert!(
+        screen.contains("editing f1 · line") && screen.contains("typed but never saved"),
+        "the buffer is kept whole:\n{screen}"
+    );
+
+    // Esc asks before throwing the text away; `y` is the only thing that does.
+    pty.send(b"\x1b").expect("esc");
+    pty.wait_for_text("Discard changes to f1?", Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("the discard question: {e}"));
+    pty.send(b"y").expect("y");
+    pty.wait_for(OVERLOADED, |s| {
+        !s.contents().contains("editing f1") && s.contents().contains("M f1")
+    })
+    .unwrap_or_else(|e| panic!("the editor closes and the row is still pending: {e}"));
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}
+
+/// RFC 4648 base64, decoded independently of the encoder the scene is checking (verifier
+/// (b) F6). Padding is trusted to be well formed — the input is one OSC 52 payload lastcall
+/// just wrote — and any byte outside the alphabet is a failure, not a skip.
+fn base64_decode(s: &str) -> Vec<u8> {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let digits: Vec<u8> = s
+        .bytes()
+        .take_while(|b| *b != b'=')
+        .map(|b| {
+            ALPHABET
+                .iter()
+                .position(|a| *a == b)
+                .unwrap_or_else(|| panic!("{:?} is not base64", b as char)) as u8
+        })
+        .collect();
+    let mut out = Vec::with_capacity(digits.len() * 3 / 4);
+    for quad in digits.chunks(4) {
+        let n = quad
+            .iter()
+            .enumerate()
+            .fold(0u32, |acc, (i, d)| acc | (*d as u32) << (18 - 6 * i));
+        // A 4-digit group carries three bytes, a 3-digit group two, a 2-digit group one.
+        for i in 0..quad.len() - 1 {
+            out.push((n >> (16 - 8 * i)) as u8);
+        }
+    }
+    out
+}
+
+/// Deliverable 9 end to end: `v j j` selects three diff lines, `y` copies them, and the one
+/// thing lastcall can actually prove about a clipboard over ssh is on the wire — a single
+/// OSC 52 write whose base64 is the three lines as the pane drew them.
+///
+/// OSC 52 is write-only: no terminal answers it, so "the clipboard now holds this" is not
+/// a claim any test can make. The sponsor's own check at the PR is the other half (design
+/// review F14).
+#[test]
+fn pty_copy_writes_osc52_with_the_selected_lines() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let Some(mut pty) = fx.spawn_tui(&bin()) else {
+        return;
+    };
+    wait_first_piles(&mut pty);
+    wait_watching(&mut pty);
+    open_parse_rs_hunk_2(&mut pty);
+
+    // The three lines the pane is about to hand over: the hunk header `n` scrolled to the
+    // top, and the two under it.
+    let top = hunk_headers(&pty)
+        .first()
+        .map(|(row, _)| *row)
+        .expect("hunk 2's header at the top of the pane");
+    let rows = pty.rows();
+    let pane = col_of(&rows[top as usize], "@@ -").expect("the diff pane's left edge");
+    let on_screen: Vec<String> = (top..top + 3)
+        .map(|r| {
+            let text: String = rows[r as usize].chars().skip(pane as usize).collect();
+            // The pane's right border is part of the screen row, not of the diff line.
+            text.trim_end().trim_end_matches('│').trim_end().to_owned()
+        })
+        .collect();
+
+    let before = pty.raw().len();
+    pty.send(b"vjjy").expect("v j j y");
+    pty.wait_for_text("copied to clipboard", Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("the cue says the copy happened: {e}"));
+
+    // Exactly one OSC 52 write, and it is this copy's.
+    let raw = pty.raw();
+    let osc: Vec<usize> = (0..raw.len())
+        .filter(|i| raw[*i..].starts_with(b"\x1b]52;c;"))
+        .collect();
+    assert_eq!(osc.len(), 1, "one OSC 52 write, at {osc:?}");
+    assert!(osc[0] >= before, "and it is the one this scene asked for");
+    let payload = &raw[osc[0] + b"\x1b]52;c;".len()..];
+    let end = payload.iter().position(|b| *b == 0x07).expect("the BEL");
+    let encoded = String::from_utf8(payload[..end].to_vec()).expect("base64 is ascii");
+
+    // The first line is the header the screen shows; the two after it are the pane's own
+    // lines, `+`/`-`/space and all. **Decoded** here rather than re-encoded (verifier (b)
+    // F6): comparing against `clipboard::base64` would be comparing the encoder under test
+    // with itself, and an encoder that is wrong the same way twice would pass.
+    let header = header_text(&rows[top as usize]);
+    assert!(
+        on_screen[0].starts_with(&header) && on_screen[0].ends_with("[m flag]"),
+        "the header row carries its controls, and they are not part of the line: {:?}",
+        on_screen[0]
+    );
+    let expected = format!("{header}\n{}\n{}\n", on_screen[1], on_screen[2]);
+    assert_eq!(
+        String::from_utf8(base64_decode(&encoded)).expect("the payload is the pane's text"),
+        expected,
+        "the payload decodes to the rows that were on screen (encoded: {encoded})"
+    );
+    assert!(
+        expected.len() <= lastcall::tui::clipboard::CAP,
+        "well under the 32 KiB cap"
+    );
 
     let since = pty.raw().len();
     pty.send(b"q").expect("q");

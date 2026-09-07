@@ -146,11 +146,81 @@ screen to draw into, so `commands/tui.rs` prints one line to **stderr** first �
 happy path, it scrolls away with the shell's scrollback when the alternate screen opens,
 and the PTY harness pins the order: the line, then `\x1b[?1049h`, then `scanning N roots…`
 (`wait_first_piles`). Then `run::run` builds the runtime as
-`watch` does, enters the terminal, seeds the app with the engine's roots (`sync_roots`) and
-the status `scanning N roots…`, and draws the empty state — the first piles arrive through
-the watcher a moment later (about 1.6 s on the fixture under the PTY harness). `--poll N`
+`watch` does, enters the terminal, seeds the app with the engine's roots (`sync_roots`),
+starts the **launch hold** (`App::start_loading`) and the status `scanning N roots…`, and
+draws the hold's pane — the first piles arrive through the watcher a moment later (about
+1.6 s on the fixture under the PTY harness), and the listing lands as one frame when the
+last root has reported. `--poll N`
 shortens the HEAD-poll and rescan backstops exactly as for `watch` (`just probe-tui` uses
 `--poll 1`, the deterministic setting on a host whose FSEvents are unreliable).
+
+#### The launch hold (Gate 8 sponsor run, 2026-09-07)
+
+The engine's initial pass used to scan the first root on its own so its pile reached the
+screen early (Phase 5 deliverable 1b); the sponsor's recording showed the cost — one repo
+listed for ~100 ms as if it were the only one with changes, then the full list — and ruled
+it out: "discovered N roots, checking status…" and nothing listed until every root has
+reported, with per-repo progress so one huge repo holding things up is visible, and
+numbers only once a load has run longer than a second. The rules as built (`App::Loading`,
+`render_main`'s `None` arm, `Loading::COUNTER_AFTER` = 1 s):
+
+- **From `sync_roots` until every root has reported, `App::is_listed` is false** for every
+  root, the header counts `0 repos`, and the right pane reads
+  `discovered N roots, checking status…` with one line per root (`  <name>  <branch>`) —
+  the same lines as the empty state, so the frame does not jump when the hold ends.
+- **A root "reports" three ways:** the watcher's `EngineEvent::Scanned { root, rows }`
+  (sent from the pool thread the moment that root's scan returns, before the batch's
+  piles land — `Engine::scan_all_with`'s hook, `try_send` from under the engine lock so a
+  full channel drops a tick rather than parking a worker behind a lock the consumer may
+  be waiting on), its `Pile`, or a `scan failed` notice. A **global** notice
+  (`watching …`, `watch installation failed`) ends the hold outright — every such notice
+  comes after the initial scans, so whatever has not reported never will. No roots → no
+  hold.
+- **The first second is a static line.** Below `COUNTER_AFTER` there are no digits: a
+  fast launch shows one calm frame, not a flash of `loading… 23423423432`. From one
+  second on (`Loading::counting`, measured on the app clock, so the `Tick` action redraws
+  while the hold is on) the pane adds a dim
+  `K of N repos checked · F files pending so far · Ss` and a `✓` beside each root that
+  has reported — a single slow repo is then the one without a `✓`. `F` is the sum of the
+  reported roots' pending rows; there is no intra-repo progress (the time is inside
+  `git`), and the seconds counter is the liveness signal.
+- **The solo first-root scan is gone** from `watcher::run_loop`: every root goes through
+  the one `scan_all` on the pool, and the piles land together in path order with
+  `scan_seq` numbered that way. `bench.md` S1's `first_pile_ms` changed meaning with it
+  (see the note there). The PTY harness pins the order: `discovered 3 roots, checking
+  status…` before the first row, and `nothing pending across 3 roots` never before it
+  (`wait_first_piles`); `watch --json` prints the tick as
+  `{"event":"scanned","root":…,"rows":N}` and is otherwise unchanged.
+
+**Seeing the hold slowly.** On a developer's checkout the hold is over in a second or two
+and the counter never shows; the design is for the user with hundreds of repos or a slow
+disk, and the way to look at it as they will is `just probe-tui-slow`, or
+`PATH=$PWD/scripts/slowgit:$PATH SLOWGIT_SLOW_REPO=<name> lastcall` over any parent dir.
+`scripts/slowgit/git` is a `git` that sleeps before the two subcommands only the scan runs
+(`diff-files`, `ls-files` — `SLOWGIT_MS` per call, default 800 ms, four calls per root)
+and then execs the real one, so discovery still runs at full speed and only the
+"checking status" phase stretches; one root named by `SLOWGIT_SLOW_REPO` gets
+`SLOWGIT_SLOW_MS` (default 2,500 ms) per call and is the last without its ✓. The sponsor
+approved the hold on exactly this view (§10 2026-09-07 (v)): a 20-root workspace held for
+~11 s with the counter ticking, the ✓s filling in, and the slow repo visibly the one
+holding things up. Any UX change to the hold should be looked at both ways — fast, where
+the rule is "one calm frame, no digits", and slow, where the rule is "you can see who is
+holding things up". The first thing the slow view found was a launch race the fast view
+had always hidden: `run::run` read the root list through the engine lock *after*
+`engine.run`, and the watcher's initial `scan_all` takes that lock the moment it starts,
+so whichever got there first won — on a fast checkout the TUI, on the stretched scan the
+watcher, and the `discovering roots…` line then stood for the whole scan with no hold at
+all. The roots are now read while the engine is still owned, before the watcher exists
+(`root_metas(&engine)`), so the first frame never waits on a scan.
+
+**One known cost sits in front of all of that.** `term::enter()` asks the terminal whether it
+speaks the kitty keyboard protocol (`CSI ? u`, then `CSI c`) before the input thread starts,
+and a terminal that answers neither costs crossterm's full **2 s timeout** — once per
+process, before the first frame — the answer is a `OnceLock`, so an `$EDITOR` resume
+re-pushes the flags without re-asking and pays nothing (F8, F18).
+`LASTCALL_KEYBOARD=plain` skips it entirely. The full entry, with the
+terminals known to answer and the one-line flip to a `TERM` allowlist, is
+[`bench.md` "Known costs"](bench.md#known-costs).
 
 ### Quit, in the only safe order
 
@@ -290,13 +360,60 @@ The modal's key discipline (`input::note_action`):
 | key | effect |
 |---|---|
 | any printable character | inserted — the keymap is off, so `q` types a `q` |
-| `Enter` | send: `Effect::Flag`, the modal closes |
+| `Enter` | send: `Effect::Flag`, the modal closes (an empty note is allowed: the flag is the message) |
 | `Ctrl-J` | newline (works in every terminal) |
-| `Alt-Enter`, `Shift-Enter` | newline, where the terminal reports the modifier at all |
-| `Backspace` | delete the character before the caret |
+| `Alt-Enter` | newline, where the terminal reports Alt (Option-as-Meta) |
+| `Ctrl-Enter` | newline, where the terminal can tell it from `Enter` — the same kitty-protocol condition as `Shift-Enter`; everywhere else those bytes *are* `Enter` and send |
+| `Shift-Enter` | newline **only** under the kitty keyboard protocol — see below |
+| `←` `→` `↑` `↓`, `Home`/`End`, `PgUp`/`PgDn` | move the caret (`TextBuf::apply`) |
+| `Ctrl-A` / `Ctrl-E` | line start / line end |
+| `Alt-←` / `Alt-→` (or `Ctrl-`) | word left / word right |
+| `Backspace`, `Delete` | delete around the caret |
+| `Ctrl-H` | Backspace: crossterm reports the byte `0x08` as ctrl-h (only `0x7f` is `Backspace`), so a terminal set to send `^H` for its Backspace key keeps the key |
+| `Alt-Backspace` / `Ctrl-W` | delete the word before the caret |
+| `Ctrl-K` | delete to the end of the line |
+| `Tab` | inserts a tab character |
 | `Esc` | cancel — nothing is written |
 | the `quit` binding, non-printable only | quit (`Ctrl-C` by default): a modal is never a trap |
 | anything else | swallowed |
+
+The buffer gets first refusal, so **a `[keys] quit` bound to `ctrl-a`, `ctrl-e`, `ctrl-h`,
+`ctrl-j`, `ctrl-k` or `ctrl-w` is typed or moved as an edit inside the buffer, not obeyed**
+(verifier (a) F7). That is the intended direction — a note is text, and losing a line to a
+rebound quit is worse than needing `Ctrl-C` — but it is the reason to keep `quit` on a key
+the buffer has no use for. `Ctrl-U` is swallowed with no edit at all.
+
+
+The modal edits a [`TextBuf`](../../crates/lastcall/src/tui/textbuf.rs), the same buffer the
+inline editor uses, so what is typed round-trips byte for byte.
+
+#### `Shift-Enter`, and which terminals can report it
+
+Without the kitty keyboard protocol `Shift-Enter` is **byte-identical to `Enter`**: the
+terminal sends `\r` either way, so a modal that treated it as a newline would send the note
+instead. Phase 8 asks for the protocol rather than guessing (ruling P9): `term::enter()`
+calls crossterm's `supports_keyboard_enhancement()` **once per process**, before the input
+thread starts, and pushes `DISAMBIGUATE_ESCAPE_CODES` when the answer is `Ok(true)`;
+`term::restore()` pops the flags before leaving the alternate screen on every exit path. An
+`Err` — including the 2 s timeout against a terminal that never answers — is "off".
+
+The key line says which world it is in, and that line is a promise: `⏎ send   ^J newline
+Esc cancel` when the protocol is off, `⏎ send   ⇧⏎ / ^J newline   Esc cancel` when it is on.
+The help overlay carries the same promise in one row (`render::newline_note`).
+
+Terminals that report the protocol (so `⇧⏎` works there):
+
+| reports it | does not |
+|---|---|
+| kitty, WezTerm, foot, Ghostty | Terminal.app |
+| iTerm2 ≥ 3.5 with the option enabled | tmux without `extended-keys` |
+| | herdr's terminal, as of the Gate 7 run |
+
+`LASTCALL_KEYBOARD=plain` skips the probe altogether — an environment switch, not a
+`[config]` key. The PTY harness sets it in `PtyCommand::isolated_lastcall` so no scene pays
+the 2 s timeout; `pty_keyboard_enhancement_probe_is_answered_and_swallowed` unsets it and
+plays a kitty-protocol terminal to prove the query is written, the answer is believed, the
+flags are pushed and popped, and no byte of the reply ever reaches the app as a key.
 
 **Bracketed paste is on for the modal's lifetime and no longer.** The loop enables it when
 `app.note` becomes `Some` and disables it when the modal closes, so a paste arrives as one
@@ -376,6 +493,312 @@ append a blank entry to the day's export file), and a second flag is never repor
   down. A flag whose header no longer appears simply shows no marker rather than marking the
   wrong hunk.
 
+## Editing (Phase 8)
+
+Phase 8 adds the fourth answer: change it. Three keys and one shared buffer.
+
+| key | what it is |
+|---|---|
+| `i` (`edit`) | the **inline editor**: the file replaces the diff pane, `Ctrl-S` saves it through the engine's CAS |
+| `shift-i` (`edit_external`) | suspend lastcall, hand the terminal to `$VISUAL`/`$EDITOR` at the same line, and ask about what came back |
+| `v` / `y` (`select` / `copy`) | select diff lines and put them on the clipboard over OSC 52 |
+
+Both editors open on the **same line**: `App::edit_hunk` picks the content hunk under the
+diff cursor when the diff has focus and the row's first content hunk otherwise, and
+`Hunk::editor_line()` turns it into a one-based line past the hunk's leading context. The
+synthetic mode hunk is never it — there is no text in it — and a row with no content hunk at
+all opens at line 1. `i` and `shift-i` share the function, which is what keeps them from
+landing on two different hunks of one row; the rule is pinned once per key —
+`app_edit_external_from_the_nav_uses_the_first_hunk_line` (nav → first hunk, diff → the hunk
+under the cursor, a collapsed row → line 1) and
+`app_edit_opens_at_the_hunk_line_and_marks_its_lines`.
+
+`App::edit_target` refuses before either key does anything: a deleted row, a mode that is
+not `Regular`/`Executable` (a symlink, a fifo), or a path that is not UTF-8 — status
+`not editable` (`app::NOT_EDITABLE`), one sentence, because there is nothing behind it. The
+inline editor's *other* refusals come from the engine and say more (below).
+
+**Both keys are swallowed while a modal is open.** `Ui::event` routes note → picker →
+confirm → editor → keymap, so `i`, `shift-i`, `v` and `y` are the modal's text or nothing
+while a question is on screen (`app_edit_and_select_are_swallowed_while_a_modal_is_open`).
+
+### The text buffer
+
+`tui/textbuf.rs` is one editable buffer with two consumers — the note modal and the inline
+editor — and one rule that governs the file:
+
+> **`TextBuf::from(t).text() == t` for every UTF-8 `t`.**
+
+A review tool that edits a file hands back exactly what it was given plus the user's change
+and nothing else, so: line **endings live beside the text** (`Line::end`, `Ending::{Lf,CrLf}`),
+a file with no trailing newline keeps not having one (`last_terminated`), a lone `\r` inside
+a line is an ordinary character, and a BOM is char 0 of line 0 at zero columns. The proptest
+`textbuf_round_trips_any_utf8_text` is the statement of the rule; every operation is written so
+it holds afterwards (design review F6).
+
+- **Columns.** `cursor.col` is a **char index**, so no edit can land inside a code point.
+  The screen measures something else: `col_width` walks with `unicode-width` and a `\t`
+  advances to the next multiple of `TAB_STOP` = 8, which is what `cat`, `less` and git's own
+  diff agree on, so a file looks the same in the editor and in the diff pane beside it.
+  `want_col` — the sticky column that survives a vertical move over a short line — is a
+  *display* column, because that is what the eye tracks
+  (`textbuf_wide_and_combining_chars_keep_columns_honest`).
+- **`top` means what the wrap mode says.** `Wrap::None` (the inline editor): `top` is the
+  first logical line and `left` scrolls sideways. `Wrap::Soft` (the note modal): long lines
+  break for display only, `top` is the first display row and `left` stays 0. A buffer is
+  rendered in one mode for its whole life, so the two readings never meet on one value.
+- **A terminated buffer's final newline is not editable** (verifier (a) F9). `from("\n")` is
+  one line with `last_terminated = true`, the cursor cannot pass the end of the last line,
+  and no `Delete` inside lastcall can strip a file's trailing newline. That is vim's `eol`
+  semantics, it is consistent both ways (`""` plus a `Newline` is two unterminated lines
+  that also round-trip to `"\n"`), and `shift-i` is the way out of it.
+- **A pasted `\r\n` takes the buffer's dominant ending** (verifier (a) F3): `CrLf` only when
+  the buffer already uses it, so pasting Windows text into an LF file does not sprinkle CRs
+  through it (`textbuf_paste_of_crlf_takes_the_buffers_dominant_ending`).
+- **`join_up` keeps the lower line's ending** (verifier (a) F8): backspacing at column 0
+  merges the text upward, and the surviving line ends the way the line that swallowed the
+  other one did.
+
+`input::edit_key` is the buffer's key map, shared by both consumers and by nothing else:
+
+| key | edit |
+|---|---|
+| any printable, `Tab` | `Insert` (a tab is a real `\t`) |
+| a bracketed paste | one `Insert` of the whole payload, newlines and all |
+| `←` `→` `↑` `↓`, `Home`/`End`, `PgUp`/`PgDn` | move the caret |
+| `Ctrl-A` / `Ctrl-E` | line start / line end |
+| `Alt-←`/`Alt-→` (or the ctrl forms) | word left / word right |
+| `Backspace`, `Delete` | delete around the caret |
+| `Ctrl-H` | `Backspace` — crossterm reports the byte `0x08` as ctrl-h, only `0x7f` is `Backspace` (verifier (a) F4) |
+| `Alt-Backspace` / `Ctrl-W` | delete the word before the caret |
+| `Ctrl-K` | delete to end of line |
+| `Ctrl-J`, `Alt-Enter` | newline, always |
+| `Ctrl-Enter`, `Shift-Enter` | newline **only** under the kitty keyboard protocol (verifier (a) F5) — see "`Shift-Enter`, and which terminals can report it" above |
+
+`Enter` and `Esc` are deliberately **not** in the table: what they mean depends on who holds
+the buffer. The note modal sends and cancels; the inline editor breaks the line and closes.
+Each caller checks its own two keys and asks `edit_key` second — which is also why the
+buffer gets first refusal on ctrl-letters, and why a `[keys] quit` bound to one of them is
+typed rather than obeyed (verifier (a) F7).
+
+### The inline editor (`i`)
+
+`i` does not open the editor: it asks the loop for the file's bytes (`Effect::EditInline`),
+which `Engine::read_rendered` answers off the UI task. The **marks and the band are computed
+in the reducer, before the read** — from the pile that is on screen — so the editor that
+opens describes the file the reader was looking at, and a pile landing while the read is in
+flight cannot renumber them.
+
+The engine's refusals arrive as `App::edit_read`:
+
+- `Refused::NotEditable` (binary, over `collapse_size_bytes`) prints
+  `use shift-i: <why>` — "no" is only half an answer when there is a second way in, and
+  `$EDITOR` never loads the file into lastcall so neither limit applies to it.
+- everything else is the CAS speaking, in the vocabulary every other refused op uses.
+
+**Layout** (`render::render_editor`). The editor replaces the diff pane; the nav stays.
+Header: `editing <path> · line N/M[ · unsaved]`, ellipsized, **bold — or red while
+`ed.alarm`**, which is set by a refused save and cleared by the next key. Body: a
+five-column gutter (`EDITOR_GUTTER`), then the file, no wrapping. The gutter carries the
+line number, and `▎` (`EDITOR_MARK`) on **every line inside any pending hunk of the row** —
+so the reader can see the rest of the agent's work while they type in one part of it. The
+hunk they *entered* is tinted whole (`EDITOR_BAND_BG`, indexed 236) with its marks bold; the
+caret's line is tinted brighter (`EDITOR_CURSOR_BG`, 238). A row that runs off the right edge
+ends in a dim `→` (`EDITOR_CLIPPED`) — the editor does not wrap, and the rest of the line is
+one `End` away. The caret is drawn **reversed**, not left to the terminal's own cursor,
+because the frame is the only thing a snapshot and a PTY scene can see. The hint line becomes
+exactly `^S save   Esc close` (`render::EDITOR_HINTS`).
+
+Marks and the band follow the typing (`Editor::shift`): a mark strictly *below* an edit
+moves with it, a mark on the edited line stays, and the band's end moves on `>=` rather than
+`>` — splitting the band's last line leaves both halves inside the hunk the reader entered,
+so the tint **grows**. The marks are never a second source of truth about the file; the next
+scan's hunks are.
+
+Nothing in the renderer scrolls. `App::clamp_editor` runs after every key and every resize
+and calls `TextBuf::viewport(page_rows, editor_cols, Wrap::None)`; `render_editor` draws the
+window as it stands, so the frame never depends on when it was drawn (F19). `editor_cols` is
+computed from `App::size` and the renderer lays out from the frame's area — the loop feeds
+both from one resize event, so they are the same rectangle.
+
+**The mouse is here too**, because the editor is the one place a click means "put the caret
+there": `EditorKey::Click(dy, dx)` is pane-relative with the gutter already subtracted and
+the reducer adds the buffer's own scroll; the wheel is `EditorKey::Scroll(±n)`.
+
+**Save answers** (`App::saved`). `Ctrl-S` sends `Effect::Save`; a second `Ctrl-S` while one
+is in flight is ignored (`Editor::saving`), so one buffer is never written twice at once.
+
+| answer | what happens |
+|---|---|
+| clean save | the row is **gone** from the pile that comes back, the editor closes, the §6.7 advance moves the selection off the row exactly as an accept would, status `saved <path>` |
+| `Refused::Moved` | the buffer **stays**, the header goes red, status `<path>: changed since you opened it; not saved — Esc, then i to reload` |
+| any other refusal | the buffer stays, the engine's own sentence on the status line |
+| `LedgerBusy` / an error | the buffer stays, `ledger busy in <root> — try again` or `<root>: <e>` |
+
+Every non-clean answer keeps the text. An agent writing the file while the reader was typing
+is the one case where throwing their buffer away would be the worst possible reading of "not
+saved" (F17).
+
+`Esc` on a clean buffer closes it; on a dirty one it asks — a confirm reading
+`Discard changes to <path>?` — because the buffer is the only copy.
+
+### `shift-i`, and the suspend/resume sequence
+
+`editor.rs` resolves `$VISUAL`, else `$EDITOR`, else `vi` (POSIX guarantees it). A variable
+that is *set but blank* is an error rather than a fall-through — `VISUAL=` in a profile is a
+mistake worth naming. **No shell**: the value is split on ASCII whitespace and the pieces are
+argv, so `EDITOR='code --wait'` works and quotes and `$` are ordinary characters. Running an
+inherited environment variable through a shell would make a review tool spawn arbitrary shell
+code; the wrapper-script case is served by pointing the variable at the script.
+
+The line flag comes from a **basename** table, so `/usr/local/bin/nvim` and `nvim` take the
+same flags: `+<line> <file>` (vi, vim, nvim, view, nano, micro, emacs, emacsclient, kak),
+`<file>:<line>` (hx), `<file>:<line> --wait` (subl, zed), `--goto <file>:<line> --wait`
+(code, codium). Anything else opens with the file alone and the status says
+`opened in <name> (no line flag known)`. **Non-waiting editors return before their save** —
+`code` without `--wait`, `emacsclient -n`, anything through `open`: the child exits at once,
+the file is unchanged when lastcall looks, the status says `no change`, and the user's later
+save arrives as an ordinary pending row.
+
+Before the spawn, the loop takes the same **live CAS** an accept would: if the file is not
+the one the row describes, it says `<path>: changed since rendered; not opened` and opens
+nothing. Talking someone into saving over an agent's newer work is exactly what a review tool
+must not do.
+
+Then `run::Suspend::run`. **Every step is load-bearing and the order is the whole point**
+(deliverable 7; design review F4 and F8):
+
+1. **Stop and join the reader thread.** Told-to-stop is not enough: a thread still inside
+   `crossterm::event::read()` competes with the editor for the same tty and splits the
+   keystrokes between them. It polls at `INPUT_POLL`, so the join costs at most that. (This
+   is the one place the reader thread is ever joined — the quit path deliberately does not.)
+2. **`term::restore()`**, which pops the keyboard-enhancement flags *before* leaving the
+   alternate screen, so the editor starts on a terminal reporting keys the way its own reader
+   expects.
+3. **Spawn the child** with the three standard descriptors inherited and cwd at the root, and
+   wait. Its signal dispositions are the shell's own: `exec` resets every *handler* to
+   `SIG_DFL`, and lastcall installs handlers (tokio's) rather than `SIG_IGN`, so nothing this
+   process did is inherited and a `^C` at the editor interrupts the **editor**.
+4. **`Signals::resume`** before anything is drawn: that same `^C` was delivered to lastcall
+   too, and the loop must not read it as "quit" the moment it runs again. For
+   `EDITOR_SETTLE` = 50 ms after the resume an interrupt is ignored — a real `ctrl-c` a
+   moment later still quits (`pty_editor_ctrl_c_does_not_quit_lastcall`, which now **ends**
+   with that second `^C` 300 ms after the resume rather than with a `q` — verifier (b) F3).
+   **Residual (verifier (b) F5):** `Signals::register` also
+   registers `SIGQUIT` and drops the stream on the spot, and tokio's handler stays installed
+   for the life of the process — so `kill -QUIT <lastcall>` from another terminal does
+   nothing at all, at any time, not just during a suspend. That is deliberate (it is what
+   keeps a `^\` at the cooked editor from dumping core behind it, and `sigaction` is
+   `unsafe`), but a lastcall that ignores SIGQUIT is not hung: `kill -TERM` and `kill -INT`
+   both quit through the restore path.
+5. **`term::enter()`, then replace the guard without dropping it.** The old guard's `Drop`
+   calls `restore()`, which would now undo the *live* terminal it never owned, so it is
+   `mem::forget`ten rather than dropped. Then **one `ESC [ 6 n`**, fire-and-forget
+   (`run::nudge_the_tty`, verifier (b) F1). A key typed in this window used to sit in the tty
+   until the *next* key, which delivered both at once — a `q` or a `y` that looked like it
+   did nothing: crossterm registers the tty with kqueue once per process and edge-triggered
+   (`EV_CLEAR`), and xnu's `TIOCSETA` moves the pending cooked line into the raw queue
+   without `ttwakeup`, so nothing fires for a byte that is already readable. The terminal's
+   reply is an edge the kqueue does fire on, and the read it wakes drains the stuck byte with
+   it; the reply itself is parsed by crossterm as an internal `CursorPosition` that `read()`
+   never surfaces. **Residual:** on a terminal that does not answer DSR nothing changes —
+   the key is still delivered with the next one. `pty_editor_key_typed_during_the_editor_is_not_stuck`
+   proves the fixed path with the harness playing a terminal that answers
+   (`PtyCommand::answer_cursor_position`, `testing.md`).
+6. **A fresh channel and a fresh reader thread.** The old channel can still hold the key
+   release of `shift-i`, or a `Resize` the editor caused — neither means anything to the
+   resumed TUI.
+7. **A synthetic `Resize` to the size the terminal has now.** Through `Terminal::resize`,
+   **not** `Terminal::clear`: clear snapshots the cursor with a DSR *query*, which needs a
+   reply from a terminal the freshly spawned reader is now polling, and a terminal that never
+   answers turns that into crossterm's two-second timeout and then an `Err` that would be
+   fatal here. `resize` clears the screen and resets the back buffer and asks the terminal
+   nothing.
+
+A spawn that never started (`editor not found: <program>`, the verb first because the status
+row ellipsizes from the tail and `$EDITOR` is often an absolute path) is a status line and
+nothing else. A child that ran — whatever its exit status; an editor that quits with an error
+still wrote, or did not — produces `Effect::EditorReturned`, and the answer table is in
+[`engine.md`](engine.md) under "The blessing on `$EDITOR` return": `no change`, one of the
+four `left pending` sentences, or the confirm
+`<path> edited — mark every hunk in it reviewed?` (`y`/`Enter` → an accept of
+the live row, status `reviewed <path>`; `n`/`Esc` → nothing written, the row stays pending).
+
+**Why the question is about intent, not detection.** The Gate 8 sponsor run read the first
+wording (`changed while your editor was open`) as "someone else touched this" after an
+ordinary save. lastcall only knows the bytes differ from when the editor opened; it cannot
+tell who wrote them — the editor's save and an agent's write look identical from outside —
+but the *user* knows whether they saved, and the whole file was open, so the honest question
+is whether every hunk in it is now reviewed. No count is shown: the row on screen may predate
+the save. So a prompt after a session in which they saved nothing is
+how an agent's write announces itself, and answering `n` costs nothing but a row that stays
+pending. The guard for the other half — an agent writing the file **while** the session is
+open — is not lastcall's at all: it is the editor's own changed-on-disk warning (vim's
+`W12 Warning: File ... has changed since editing started`, VS Code's reload prompt, Emacs's
+"has changed on disk; really edit the buffer?", Helix's `:w` refusal). lastcall relies on it
+and says so here rather than pretending to a guard it cannot hold: for the duration of the
+suspend lastcall is not running, has no terminal, and reads nothing.
+The `left pending` case that is easiest to misread is the one verifier (a) F1 added: a
+confirm, note or picker already on screen is **never** replaced by the return, because the
+return arrives on a channel and the reader's next `y` would answer a question they never saw.
+The row keeps the editor's delta either way, so nothing is lost — it is reviewed as an
+ordinary pending row.
+
+Effects queued while the editor owned the screen are drained in the pass after the resume,
+and one of them may be the watcher's own notice of the editor's save, so the frame right
+after a resume can already show the new pile.
+
+### Select to copy (`v`, `y`), and OSC 52
+
+The diff pane has no per-line cursor — `DiffCursor` is `{ hunk, scroll }` — so the selection
+carries its own: `Sel { anchor, cursor }` over **absolute diff-line indices**. `v`
+(`Action::Select`) anchors at the top visible line; while a selection is live `↑↓`, `PgUp`,
+`PgDn` and the wheel move `sel.cursor` and `App::move_sel_cursor` scrolls the pane only
+enough to keep the cursor on screen, so the selected lines stay under the reader's eye
+instead of sliding off the top. `Esc` clears the selection and keeps the focus. Selected rows
+are drawn full-width reverse-video (`render_hunks`).
+
+`y` (`Action::Copy`) copies the selection's lines; **with no selection it copies the hunk
+under the cursor whole**, header included, which is the common case and needs no `v` at all.
+The payload is built by `app::diff_line_text` from the hunks, not from the screen: it keeps
+tabs as tabs (matching `hunk_body` and the flag export) where the pane expands them, because
+the paste target wants the file's own bytes. Both keys are guarded on
+`effective_focus() == Focus::Diff`.
+
+**The mouse does the same gesture.** A left press inside `HitMap.diff_body` takes the anchor
+**before** `App::hit` runs — a press on a hunk header moves `diff.scroll`, so an anchor read
+afterwards would be wrong — a drag sends `Action::SelectTo(line)`, and the release copies
+*only* if the pointer actually moved. A press outside the diff body takes no anchor, which is
+what keeps the divider drag a divider drag, and a press-and-release with no motion is still an
+ordinary click (`run_mouse_drag_in_the_diff_selects_and_the_divider_drag_still_resizes`).
+
+**Why OSC 52 and nothing else.** lastcall runs over ssh, inside tmux and inside a herdr pane,
+where `pbcopy`/`xclip` would put the text on the *wrong* machine's clipboard. `ESC ] 52 ; c ;
+<base64> BEL` asks the terminal the user is actually sitting at. The caveats are real and the
+UI cannot hide them:
+
+- **It is write-only.** The terminal never acknowledges, so lastcall cannot know the copy
+  landed. The cue below says "we wrote it", not "you have it".
+- **tmux drops it unless `set-clipboard on`** (the default is `external`, which forwards but
+  does not set tmux's own buffer; `off` discards). Some terminals ship with OSC 52 disabled
+  for security. If nothing arrives on the clipboard, that is where to look.
+- **There is a size cap.** `clipboard::CAP` is 32 KiB of *payload*; terminals silently drop
+  oversized sequences, and half a paste is worse than none. Over the cap lastcall writes
+  nothing and says
+  `selection too large to copy (N KiB; the terminal would drop it)` — and **keeps the
+  selection**, because the only thing the reader can do about it is select less and they need
+  the range in front of them to shrink it (`app_copy_over_the_cap_writes_nothing`).
+
+The base64 is hand-rolled in `tui/clipboard.rs` (RFC 4648, no dependency) and pinned against
+the RFC's own vectors; `Osc52` is a crossterm `Command`, so the escape goes out the same
+`execute!` path every other terminal write uses.
+
+**The cue.** A copy raises `App.cue` — a centered, reverse-video `copied to clipboard`
+(`app::COPIED`) over the diff, for `CUE_SECS` = 2 seconds, cleared by the `Tick` arm. It is
+deliberately **not** the status line: the status carries engine notices with a 30 s TTL, and
+a copy must not evict `saved src/parse.rs`. `tui_copy_cue` pins a frame where both are on
+screen at once.
+
 ## Keys
 
 Defaults (`input::DEFAULT_KEYMAP`, in help-overlay order):
@@ -397,6 +820,10 @@ Defaults (`input::DEFAULT_KEYMAP`, in help-overlay order):
 | `restore_file` | `shift-u` | put the selected file back whole — always asks first | |
 | `flag` | `m` | flag it with a note: the hunk under the diff cursor (an expansion's hunk counts), or the file from the nav | the same hunk |
 | `unflag` | `shift-m` | clear every flag on the selected file | |
+| `edit` | `i` | open the selected file in the **inline editor**, caret on the current hunk's first changed line ("The inline editor" below) | the same |
+| `edit_external` | `shift-i` | suspend and open `$VISUAL`/`$EDITOR` on that file at that line ("`shift-i`" below) | the same |
+| `select` | `v` | — (diff focus only) | start a line selection at the **top visible** diff line; `↑↓` then extend it |
+| `copy` | `y` | — (diff focus only) | copy the selection, or the hunk under the cursor, over OSC 52 |
 | `expand` | `e` | expand the selected collapsed row into hunks ("Collapsed rows" below) | |
 | `ack` | `d` | ack the selected root's herdr ready flag ("herdr in the UI" below) | |
 | `jump` | `g` | focus the selected root's agent in herdr | |
@@ -440,10 +867,11 @@ diff; dragging the divider resizes the nav (clamped to 16..=60); the wheel scrol
 under the pointer, three lines a notch.
 
 **Selecting text.** `term::enter` turns mouse capture on, so a plain drag is ours, not the
-terminal's. Hold **shift** while dragging to select and copy with the terminal's own
-selection (every terminal we target honours the shift override). The help overlay says so
-in its last line (`render::SELECT_NOTE`); it is the stopgap until the Phase 8 select-to-copy
-item lands.
+terminal's. Inside the diff pane a plain drag is now lastcall's own line selection, which
+copies on release ("Select to copy" below); anywhere else, hold **shift** while dragging to
+select and copy with the terminal's own selection (every terminal we target honours the
+shift override). The help overlay says both in its last line
+(`render::SELECT_NOTE` — `shift+drag selects text (mouse capture is on) · v/y copies`).
 
 ### Collapsed rows and `e` (Phase 6)
 
@@ -561,16 +989,24 @@ rule adds a row. Nothing here is a promise about the final design.
 | File header controls | `[A accept file] [U restore file]` right-aligned as one run; a run that does not fit is retried without its last label, so a narrow pane loses the newest control first and `[A accept file]` goes last | `tui_accept_controls`, `tui_narrow_60x20` |
 | Hunk header controls | `[a accept] [u restore] [m flag]` with the same drop-from-the-right rule; on an expansion hunk of a collapsed row only `[m flag]` is offered (restore of such a row stays whole-file); at 60 columns all three still fit but crowd the header — the worker flagged this for the pass | `tui_narrow_60x20`, `tui_diff_view_collapsed_expanded` |
 | Flag marker | `  ⚑ <first line of the note>` on the file and hunk header in whatever columns remain after the path and the control run (`marker_budget`); nothing is drawn when fewer than the prefix fits | `tui_diff_view_flagged_hunk`, `tui_nav_flag_counts` |
-| Help overlay (`?`) | one column while the rows fit the height; two columns when they do not **and** the width allows (about 100 columns with these descriptions), gutter 3; when neither fits (80×30 and below with this keymap) it clips key rows from the bottom, never the blank/`SELECT_NOTE`/`any key closes` footer (three rows reserved); at 80×24 the quit rows are among the clipped | `tui_help_overlay` (100×30), `tui_help_overlay_tall` (100×45), `render_help_uses_two_columns_only_when_one_does_not_fit` |
+| Help overlay (`?`) | one column while the rows fit the height; two columns when they do not **and** the width allows (about 100 columns with these descriptions), gutter 3; when neither fits (80×30 and below with this keymap) it clips key rows from the bottom, never the `newline_note`/`SELECT_NOTE`/`any key closes` footer (three rows reserved — the blank separator above them is not, and is the first row the clip spends); at 80×24 the quit rows are among the clipped | `tui_help_overlay` (100×30), `tui_help_overlay_tall` (100×45), `render_help_uses_two_columns_only_when_one_does_not_fit`, `render_help_promises_shift_enter_only_with_enhancement` |
 | Confirm modal | centered box, one question row from the scope; an accept shows live counts, a restore shows the one row; hint line switches to the modal's keys | `tui_restore_confirm`, `render_confirm_modal_shows_live_counts` |
-| Note modal | centered, `NOTE_WIDTH` = 60 columns (clamped to the frame minus 4, floor 8), a fixed `NOTE_ROWS` = 5-line text area that scrolls to keep the caret visible, plus title, target line and the key row `⏎ send   ^J newline   Esc cancel`; bracketed paste is on only while it is open | `tui_note_modal`, PTY `pty_flag_note_exports_when_standalone` |
+| Note modal | centered, `NOTE_WIDTH` = 60 columns (clamped to the frame minus 4, floor 8), a fixed `NOTE_ROWS` = 5-line text area that scrolls to keep the caret visible, plus the title — which **names the target**, ` flag hunk 2 of 3 ` or ` flag whole file ` (agenda (d)) — the target line and the key row, `⏎ send   ^J newline   Esc cancel` or its `⇧⏎` form; bracketed paste is on only while it is open | `tui_note_modal`, `tui_note_modal_scrolled`, `tui_note_modal_whole_file`, PTY `pty_flag_note_exports_when_standalone` |
 | Agent picker | centered, width = widest row + 4, height = rows + 2, both clamped to the frame; first row says the flag is already saved and `Esc` costs only the send; key row `↑↓ choose   ⏎ send   Esc cancel` | `tui_agent_picker` |
 | Collapsed rows | `collapsed (binary) · +a −d · not expandable` / `collapsed (size)` with `[e expand]`; expansion capped at 2,000 lines with `… N lines omitted` | `tui_nav_collapsed_*`, `tui_diff_view_collapsed*` |
+| Hint line, tier 3 (Phase 8) | `v select  y copy` are added **only** when the diff has focus and only on a frame wide enough for a third tier — the threshold is the width of the whole line, so with the default keymap it is **128 columns** on a file row (`a accept hunk  A accept file`) and **121** on a root row (`a accept all in alpha`), and wider again while a herdr hint (`d ack`, `g jump`, `w scope`) is on the line — because they are dropped *before* every pre-existing hint, so no narrower frame loses a hint it used to have. Below that the two keys are named only in the `?` overlay and in `SELECT_NOTE`. The line then reads `↑↓ select … v select  y copy`: two senses of "select" on one line, kept because the kickoff wrote the label — the wording is a pass item | `render_hints_follow_the_selection` (the 140-column assertion, the 128/127 and 121/120 thresholds, and that the nav at 140 has no `y copy`), `tui_hint_diff_focus` (140×20) |
+| Editor header (Phase 8) | `editing <path> · line N/M[ · unsaved]`, bold, or red while a save stands refused, and **truncated from the tail** by `render::ellipsize` — so a long path eats the `line N/M` and then the `· unsaved` before it loses any of itself. That is the wrong end to lose on a narrow frame (the position is the part that changes as you type) and it is the header's entry for the pass; at 60 columns with the fixture's `src/parse.rs` everything still fits | `tui_editor_narrow_60x20`, `tui_editor_save_refused` (the red header) |
+| Editor body (Phase 8) | five-column gutter, then the file with **no wrap**; a clipped row ends in a dim `→` and `End` is the way to the rest. The caret line is tinted (indexed 238) and the entered hunk banded (236), so the editor needs a 256-colour terminal to look right and degrades to "no tint" rather than to noise. Hint line becomes exactly `^S save   Esc close` | `tui_editor_open`, `tui_editor_narrow_60x20` (which asserts the `→` is on the frame) |
+| Copy cue (Phase 8) | a centered one-line reverse-video `copied to clipboard` over the diff pane for 2 s; **not** the status line, so it cannot evict an engine notice, and the two can be on screen together | `tui_copy_cue`, `render_selection_is_reverse_video_and_the_cue_sits_over_the_diff` |
+| Diff selection (Phase 8) | selected lines are full-width reverse video; the pane scrolls only enough to keep the selection's moving end visible, never a line per keystroke | `tui_diff_selection`, `app_select_extends_with_the_cursor_and_y_copies_the_range` |
+| Launch hold (Gate 8 sponsor run) | nothing listed until every root reports; right pane `discovered N roots, checking status…` + one line per root; from 1 s a dim `K of N repos checked · F files pending so far · Ss` and a `✓` per reported root; the herdr `waiting for herdr scope…` hold (same section) can follow it on a scoped launch — two different holding texts in a row is a pass item, as is the `✓` column's placement | `render_loading_pane_counts_only_after_one_second`, `app_loading_holds_the_listing_until_every_root_reports`, PTY `wait_first_piles` |
 
 Open design questions the pass should take, in the order they have come up: whether the
 hint line should carry `u`/`m` (or go to a second tier) once the width allows; whether a
 two-column overlay is the right answer for a keymap that keeps growing; the 60-column
-header crowding; the scope notice at 100 columns; and the select-to-copy cue Phase 8 adds.
+header crowding; the scope notice at 100 columns; the select-to-copy cue's placement and
+duration; the two senses of "select" on the tier-3 hint line; and whether the editor header
+should keep the path or the position when the frame will not hold both.
 
 ## herdr in the UI (Phase 5)
 
@@ -651,6 +1087,25 @@ scope: <workspace label> · 3 repos hidden (w shows all)
 `w` toggles it for the session; `scope = "all"` starts with it off. A hidden root is still
 watched — the scope is a view, not a filter on the engine.
 
+Three rules from the Gate 8 sponsor run's launch flash (spec §10 2026-09-06 (iii)):
+
+- **Our own pane never steers the scope.** herdr's `foreground_cwd` is the foreground
+  process group's cwd, and in the pane lastcall runs in that group is lastcall and its `git`
+  children — during the scans it pointed at whichever root was being scanned and the
+  containment fallback followed it. `HERDR_PANE_ID` (also through `Env`) names our pane and
+  `herdr::own_pane_scrubbed` clears its `foreground_cwd` before every derivation
+  (`herdr_fold`); the shell `cwd` still places the pane.
+- **Nothing is listed before the first verdict.** `HerdrView::scope_pending` is set at
+  launch when a scope is configured and a workspace id is known, and `App::is_listed` is
+  false while it holds; the right pane reads `waiting for herdr scope…`. Any verdict clears
+  it (`App::scope_settled`): a `Scope` update — even the `None` the view started with — a
+  standalone start, a failed connect, a link that dropped before its snapshot. Without the
+  hold the first pile was listed for one frame and hidden by the scope on the next.
+- **The empty state under a scope names it.** With a scope active and nothing listed the
+  pane reads `nothing pending in <label>`, the in-scope roots, and
+  `N repos hidden (w shows all)`; `nothing pending across N roots` is only ever true with
+  no scope hiding anything.
+
 ### Configuration
 
 lastcall's own `config.toml`:
@@ -726,6 +1181,15 @@ While the confirm modal is open `hit` ignores every target, and `Ui::event` drop
 mouse event — press, drag, release, wheel — before it reaches the app at all (the wheel over
 the nav otherwise calls `move_selection` directly, around `handle`'s gate); only its keys,
 the `quit` keys and `Resize` get through (`run_mouse_is_dropped_under_the_modal_but_resize_passes`).
+
+**Two rectangles sit beside the target list** rather than in it, because they answer "where
+in this pane?" and not "what did I hit?": `HitMap.diff_body` (the hunk-lines rectangle,
+narrower than `Target::DiffBody`) and `HitMap.editor` (the inline editor's text area, with
+the gutter already subtracted). `run::diff_line_at` turns a press inside `diff_body` into an
+absolute diff-line index for the selection anchor, and it is read **before** `App::hit` runs
+— a press on a hunk header moves `diff.scroll`, so an anchor read afterwards would name a
+different line. A press outside `diff_body` takes no anchor at all, which is exactly what
+keeps a divider drag a divider drag.
 
 ## Adding a widget, with a snapshot
 
@@ -811,6 +1275,24 @@ The two Phase 4 scenes drive the accept loop through the same binary:
 Both print `PTY accept …` timing lines. The status bar is asserted as `<text> · <age>`
 exactly, so `accepted f1` cannot pass for `accepted f1 · 1 hunk left`.
 
+The Phase 8 scenes are the ones that need a **child process** and a real terminal handover,
+which is exactly what neither a reducer test nor a snapshot can reach:
+`pty_editor_save_pends_nothing` (`shift-i`, the probe editor rewrites the file, the return
+confirm, `y`, and the row is gone), `pty_editor_ctrl_c_does_not_quit_lastcall` (a `^C` typed
+while the editor owns the terminal kills the *editor*; lastcall is still up on resume, and
+the scene then exits on a second `^C` 300 ms later — past `EDITOR_SETTLE`, so the drain
+swallowed the editor's interrupt and not this one), `pty_editor_key_typed_during_the_editor_is_not_stuck` (an `n` typed while the probe editor
+sleeps answers the return confirm on the resume, with no second keystroke — the DSR nudge of
+step 5), `pty_edit_inline_save_pends_nothing` and
+`pty_edit_inline_save_refused_when_the_file_moved` (`i`, type, `^S`, against a file an agent
+rewrites underneath), `pty_copy_writes_osc52_with_the_selected_lines` (`vjjy`, then the raw
+transcript is searched for exactly one `\x1b]52;c;` and its base64 decoded — by the test's own
+RFC 4648 decoder, never by the encoder under test — back to the three rows that were on
+screen) and `pty_keyboard_enhancement_probe_is_answered_and_swallowed`.
+`isolated_lastcall` removes `$VISUAL` and `$EDITOR` from every child — no scene may reach the
+developer's own editor — so an editor scene points `$EDITOR` at an absolute path inside its
+own temp dir; `docs/dev/testing.md` has the probe script.
+
 ## Probes and logging
 
 - `just probe-tui` — release build, a fixture parent in `/tmp/lc-probe-<pid>/`, then the
@@ -832,8 +1314,12 @@ exactly, so `accepted f1` cannot pass for `accepted f1 · 1 hunk left`.
 - `LASTCALL_LOG_FILE=/path/to/log lastcall` — `tracing` never writes to the terminal while
   the screen is up; with this variable set the TUI appends to that file, filtered by
   `LASTCALL_LOG` (an `EnvFilter` directive, default `info`). Unset, there is no subscriber at
-  all. These two reads are the only environment access under `tui/`; everything else comes
-  through the engine's `Env`.
+  all. Phase 8 adds two more environment reads under `tui/` and no others:
+  `LASTCALL_KEYBOARD` (`term.rs`, ruling P9) and the `$VISUAL`/`$EDITOR` lookup that
+  `run.rs` hands `EditorCommand::resolve` as a closure — the resolver itself is pure and
+  reads nothing, which is why every row of its table is a unit test. Everything else still
+  comes through the engine's `Env`; `textbuf.rs`'s `PROPTEST_CASES` read is inside
+  `#[cfg(test)]`.
 
 ### What `debug` says (Phase 6 deliverable 8)
 
@@ -876,7 +1362,7 @@ sibling lib test scanning on a subscriber-free thread would poison it.
 
 ```sh
 rg -n 'Command::new\("git"\)' crates                       # engine git.rs, plus the testkit's fixture builder; nothing under tui/
-rg -n 'std::env::var|home_dir\(' crates/lastcall/src        # the two LASTCALL_LOG* reads in tui/term.rs, plus LASTCALL_PARALLELISM in commands/mod.rs (test-only override, never under tui/)
+rg -n 'std::env::var|home_dir\(' crates/lastcall/src        # tui/term.rs: the two LASTCALL_LOG* reads and LASTCALL_KEYBOARD; tui/run.rs: the $VISUAL/$EDITOR closure it hands EditorCommand::resolve; commands/mod.rs: LASTCALL_PARALLELISM (test-only override, never under tui/); tui/textbuf.rs: PROPTEST_CASES, inside #[cfg(test)]
 rg -n 'lock\(' crates/lastcall/src/tui                      # nothing
 rg -n 'Rendered::of' crates/lastcall/src                    # only tui/app.rs (requests come from the held rows)
 rg -n 'last_pile|scan_all\(|\.scan\(' crates/lastcall/src/tui/app.rs   # nothing (the reducer never scans)
@@ -885,5 +1371,8 @@ rg -n 'thread::sleep|tokio::time::sleep' crates/lastcall/src/tui   # nothing
 rg -n 'lastcall_engine::herdr' crates/lastcall/src/tui     # only tui/herdr.rs and tui/run.rs (the task side); never app.rs or render.rs
 rg -n 'e\.(restore|flag|unflag)\(' crates/lastcall/src     # only tui/run.rs (restore and flag reach the engine through one seam)
 rg -n 'OpenOptions|File::create|fs::write' crates/lastcall/src   # tui/term.rs (the log file) and tui/run.rs (the export fallback); no worktree file is ever opened for writing
+rg -n 'e\.save\(|e\.read_rendered\(' crates/lastcall/src        # only tui/run.rs (the inline editor reaches the engine through one seam, like restore and flag)
+rg -n 'Command::new' crates/lastcall/src/tui                # only tui/run.rs's `$EDITOR` spawn (Suspend::run); nothing else in the TUI starts a process
+rg -n 'openat|renameat|OpenOptions|File::create|fs::write' crates/lastcall-engine/src --glob '!*test*'   # restore.rs is the only file that opens a path under a root; every other hit writes under the state dir (ops.rs's two are in its own in-file `mod tests`)
 cargo tree -e normal -p lastcall -p lastcall-engine | grep -c testkit   # 0
 ```

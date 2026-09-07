@@ -59,17 +59,20 @@ test-integration:
 test-e2e:
     cargo test --workspace --test 'test_e2e_*'
 
-# What the pre-push hook runs (`just hooks-install`): the integration tier, then the
-# store-backed proptests in ops::tests::proptests at 64 cases — the unit tier runs them
-# at 8 so every commit stays fast. Run it by hand before a push from a machine without
-# the hook. Each step says what it is doing; the first failure stops the push.
+# What the pre-push hook runs (`just hooks-install`): the integration tier, then every
+# proptest at 64 cases — the store-backed ones in ops::tests::proptests and the text
+# buffer's round trip in tui::textbuf (Phase 8). The unit tier runs them at 8 so every
+# commit stays fast. Run it by hand before a push from a machine without the hook. Each
+# step says what it is doing; the first failure stops the push.
 test-prepush:
     #!/usr/bin/env bash
     set -euo pipefail
-    echo "--- test-prepush 1/2: just test-integration ---"
+    echo "--- test-prepush 1/3: just test-integration ---"
     just test-integration
-    echo "--- test-prepush 2/2: PROPTEST_CASES=64 cargo test -p lastcall-engine --lib proptests ---"
+    echo "--- test-prepush 2/3: PROPTEST_CASES=64 cargo test -p lastcall-engine --lib proptests ---"
     PROPTEST_CASES=64 cargo test -p lastcall-engine --lib proptests
+    echo "--- test-prepush 3/3: PROPTEST_CASES=64 cargo test -p lastcall --lib proptests ---"
+    PROPTEST_CASES=64 cargo test -p lastcall --lib proptests
     echo "--- test-prepush: green ---"
 
 # All three tiers, in order.
@@ -382,6 +385,20 @@ probe-tui-screen:
     cargo build --release -p lastcall
     LASTCALL_PROBE_BIN="$PWD/target/release/lastcall" \
         cargo test -p lastcall --test test_e2e_tui_pty probe_tui_screen -- --ignored --nocapture
+
+# `probe-tui` with the scans stretched: scripts/slowgit/git goes first on PATH and sleeps
+# before the scan-only git calls (SLOWGIT_MS per call, default 800; four per root), with
+# one root slower (SLOWGIT_SLOW_REPO, default alpha; SLOWGIT_SLOW_MS per call, default
+# 2500) — the launch hold's counter and per-root ✓ marks, as a user with hundreds of repos
+# or a slow disk would see them (docs/dev/tui.md "Seeing the hold slowly"). Discovery,
+# before the screen opens, runs at full speed. `r` (refresh) is stretched the same way.
+probe-tui-slow:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export PATH="$PWD/scripts/slowgit:$PATH"
+    export SLOWGIT_SLOW_REPO="${SLOWGIT_SLOW_REPO:-alpha}"
+    echo "--- slow git on PATH: SLOWGIT_MS=${SLOWGIT_MS:-800} per scan call, ${SLOWGIT_SLOW_REPO} at SLOWGIT_SLOW_MS=${SLOWGIT_SLOW_MS:-2500} ---"
+    just probe-tui
 
 # The performance baseline (docs/dev/bench.md; not a gate): the four scenarios of
 # crates/lastcall/tests/test_bench.rs — 100 clones / 4,000 rows, one 100,000-line diff, a

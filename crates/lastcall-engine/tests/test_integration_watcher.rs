@@ -14,11 +14,58 @@ use lastcall_testkit::fixture_repo::FixtureRepo;
 use lastcall_testkit::tmp::TempDir;
 use notify::{RecursiveMode, Watcher as _};
 
+/// The next event that is not a `Scanned` progress tick: these tests watch piles, heads
+/// and notices; the ticks are counted by `watcher_reports_each_root_scanned_before_its_pile`.
 async fn next_event(w: &mut Watcher, deadline: Duration) -> Option<EngineEvent> {
-    tokio::time::timeout(deadline, w.events.recv())
-        .await
-        .ok()
-        .flatten()
+    let until = tokio::time::Instant::now() + deadline;
+    loop {
+        let left = until.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(left, w.events.recv())
+            .await
+            .ok()
+            .flatten()
+        {
+            Some(EngineEvent::Scanned { .. }) => continue,
+            other => return other,
+        }
+    }
+}
+
+/// Every root is reported `Scanned` before any pile of the initial batch: the TUI's
+/// launch hold counts the reports and lists nothing until the last one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watcher_reports_each_root_scanned_before_its_pile() {
+    let repo = FixtureRepo::new("watch-scanned").unwrap();
+    let state = TempDir::new("lc-watch-state");
+    let env = repo.engine_env(state.path());
+    let engine = open_engine(repo.parent_dir(), &env, state.path(), Config::default());
+    let mut w = engine.run(EngineTimings {
+        debounce: Duration::from_millis(100),
+        head_poll: Duration::from_millis(250),
+        rescan: Duration::from_secs(60),
+        ..EngineTimings::default()
+    });
+    let mut scanned = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no initial pile within 5 s"
+        );
+        match tokio::time::timeout(Duration::from_secs(5), w.events.recv())
+            .await
+            .ok()
+            .flatten()
+        {
+            Some(EngineEvent::Scanned { root, .. }) => scanned.push(root),
+            Some(EngineEvent::Pile { root, .. }) => {
+                assert_eq!(scanned, vec![root], "the root reported before its pile");
+                break;
+            }
+            other => panic!("unexpected before the first pile: {other:?}"),
+        }
+    }
+    w.stop();
 }
 
 /// Consume events until the watch is live (registering an FSEvents stream can take

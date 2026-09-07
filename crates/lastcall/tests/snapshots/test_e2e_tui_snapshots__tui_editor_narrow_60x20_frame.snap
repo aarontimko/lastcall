@@ -1,0 +1,25 @@
+---
+source: crates/lastcall/tests/test_e2e_tui_snapshots.rs
+assertion_line: 180
+expression: frame
+---
+"editing src/parse.rs · line 21/62                           "
+"┌──────────────────────────────────────────────────────────┐"
+"│   6▎#[derive(Debug, Clone, PartialEq, Eq)]               │"
+"│   7 pub struct Record {                                  │"
+"│   8     pub key: String,                                 │"
+"│   9     pub value: String,                               │"
+"│  10     pub line: usize,                                 │"
+"│  11 }                                                    │"
+"│  12                                                      │"
+"│  13 /// Parse `text` into one record per `key = value` l→│"
+"│  14 ///                                                  │"
+"│  15 /// Blank lines and `#` comments are skipped. A line→│"
+"│  16 /// error: it is simply not a record, which keeps th→│"
+"│  17 pub fn parse(text: &str) -> Vec<Record> {            │"
+"│  18▎    let mut out = Vec::new();                        │"
+"│  19▎    for (i, raw) in text.lines().enumerate() {       │"
+"│  20▎        let line = raw.trim();                       │"
+"│  21▎        if line.is_empty() || line.starts_with('#') →│"
+"└──────────────────────────────────────────────────────────┘"
+"^S save   Esc close                                         "

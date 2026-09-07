@@ -18,19 +18,19 @@ use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 
 use crate::config::{Config, DraftInitial, Loaded, Resolved};
 use crate::env::Env;
-use crate::git::{self, ConfigList, GitError, Oid, RepoGit};
+use crate::git::{self, ConfigList, GitError, Mode, Oid, RepoGit};
 use crate::headstate::{self, HeadState, TransitionFacts};
 use crate::hunks::{self, Hunk};
 use crate::index::{IndexError, PrivateIndex};
 use crate::ledger::{
-    self, Clock, FlagHunk, Ledger, LedgerError, LedgerLock, LoadResult, SeenAt, SystemClock,
-    TreeEntries,
+    self, Clock, FlagHunk, FlagSummary, Ledger, LedgerError, LedgerLock, LoadResult, SeenAt,
+    SystemClock, TreeEntries,
 };
-use crate::ops::{FaultInjector, NoFault, Ops, OpsError, Outcome, Rendered};
+use crate::ops::{self, FaultInjector, NoFault, Ops, OpsError, Outcome, Refused, Rendered};
 use crate::paths::{Layout, ParentId, ParentMeta, RepoPaths, RootId};
 use crate::roots::{self, Badge, DiscoverInputs, Discovery, RootsChanged};
-use crate::scan::{self, Pile, Row, ScanError, ScanInputs};
-use crate::store::{RepoFacts, RootKind, Store, StoreError};
+use crate::scan::{self, Entry, Pile, Row, ScanError, ScanInputs};
+use crate::store::{Current, RepoFacts, RootKind, Store, StoreError};
 use crate::upstream::{self, Classifier};
 
 /// The oldest git the engine accepts (`--path-format=absolute`, `ls-files --others -z`
@@ -325,6 +325,27 @@ pub enum RestoreRequest {
 /// `pile` is the rescan that shows the result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Restored {
+    pub outcome: Outcome,
+    /// [`Engine::scan_seq`] of `pile`.
+    pub seq: u64,
+    pub pile: Pile,
+}
+
+/// One editor save as a UI asks for it (§6.3 "editor save"; Phase 8 deliverable 1).
+///
+/// `rendered` is what the buffer was read from — the CAS target — and `bytes` is the
+/// buffer verbatim, line endings and a missing trailing newline included.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaveRequest {
+    pub rendered: Rendered,
+    pub bytes: Vec<u8>,
+}
+
+/// What [`Engine::save`] produced. Like [`Restored`] plus the ledger: a save writes the
+/// working tree *and* the override, so `outcome.written` is `true` on success, and `pile`
+/// is the rescan that should show the saved row gone (invariant 8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Saved {
     pub outcome: Outcome,
     /// [`Engine::scan_seq`] of `pile`.
     pub seq: u64,
@@ -947,6 +968,19 @@ impl Engine {
     /// carries the [`Engine::scan_seq`] of the scan that produced it (a failed scan reports
     /// the number of the last one that succeeded; its pile is the error).
     pub fn scan_all(&mut self) -> Vec<(PathBuf, u64, Result<Pile, EngineError>)> {
+        self.scan_all_with(&|_, _| {})
+    }
+
+    /// [`Engine::scan_all`] with a progress hook: `on_scanned(root, rows)` runs on the pool
+    /// thread the moment that root's scan returns (`rows` = pending rows, 0 for a failed
+    /// scan), before the serial apply step. A consumer can count roots as they finish —
+    /// the TUI's `N of M repos checked` — while the piles themselves still land together,
+    /// in path order, with `scan_seq` numbered that way. The hook runs under the engine
+    /// lock: keep it to a counter or a `try_send`.
+    pub fn scan_all_with(
+        &mut self,
+        on_scanned: &(dyn Fn(&Path, usize) + Sync),
+    ) -> Vec<(PathBuf, u64, Result<Pile, EngineError>)> {
         let mut results: BTreeMap<PathBuf, (u64, Result<Pile, EngineError>)> = BTreeMap::new();
         for _ in 0..3 {
             let todo: Vec<PathBuf> = self
@@ -973,6 +1007,7 @@ impl Engine {
             let scanned = parallel_map(states, width, |(p, state)| {
                 let started = std::time::Instant::now();
                 let r = scan_root(state, &ctx);
+                on_scanned(&p, r.as_ref().map(|pile| pile.rows.len()).unwrap_or(0));
                 (p, started, r)
             });
             for (p, started, r) in scanned {
@@ -1232,6 +1267,139 @@ impl Engine {
         })
     }
 
+    /// What the work tree holds at `path` **right now** — one `lstat` plus, for a file,
+    /// one `hash-object -w` (Phase 8 deliverable 3).
+    ///
+    /// The read the post-`$EDITOR` blessing is built on: the TUI has a [`Rendered`] row
+    /// from before the editor ran and needs to know what the editor left behind. It is a
+    /// plain read — no ledger, no override, no scan — so it stays cheap enough to run on
+    /// the one path the user just edited, and it is the same `hash_path` a scan would use,
+    /// which is what makes the oid it returns comparable with a row's.
+    ///
+    /// A blessing built on this answer is the **one** deliberate exception to invariant 3
+    /// (accept is never a fresh read), and it is guarded by a confirm the user answers:
+    /// §6.3's editor-save row and §11's residual both say so (Amendment v1.8, ruling P1).
+    pub fn current(&self, root: &Path, path: &[u8]) -> Result<Current, EngineError> {
+        let state = self
+            .roots
+            .get(root)
+            .ok_or_else(|| EngineError::NoSuchRoot(root.to_path_buf()))?;
+        Ok(state.store.hash_path(path))
+    }
+
+    /// The live bytes of `rendered`, for the inline editor to open on — or the refusal that
+    /// says why the file will not go in a text buffer (Phase 8 deliverable 8; F11).
+    ///
+    /// The size cap and the binary rule are **engine** decisions, not the reducer's: the cap
+    /// is `[config] collapse_size_bytes`, which the TUI never sees, and "binary" here means
+    /// exactly what a text buffer cannot hold — bytes that are not UTF-8, or that carry a
+    /// NUL. Both come back as [`Refused::NotEditable`], whose `why` the status line prints
+    /// on its own (`use shift-i: <why>`), so the user is pointed at the key that *can* open
+    /// the file.
+    ///
+    /// The order is CAS, read, **re-hash what was read**: [`ops::cas_live`] proves the file
+    /// is still the row that was drawn, and hashing the bytes that came back closes the
+    /// window between that check and the read — an agent that rewrote the file in between
+    /// gets a [`Refused::Moved`] rather than an editor full of content the row never
+    /// described. Nothing is written and no ledger lock is taken.
+    pub fn read_rendered(&self, root: &Path, rendered: &Rendered) -> Result<Vec<u8>, Refused> {
+        let not_editable = |why: &str| Refused::NotEditable {
+            path: rendered.path.clone(),
+            why: why.to_owned(),
+        };
+        let unhashable = |reason: String| Refused::Unhashable {
+            path: rendered.path.clone(),
+            reason,
+        };
+        // The same two rows `Ops::save_file` refuses outright: a deletion has no file to
+        // open, and a symlink's content is its target — opening it would edit whatever it
+        // points at, which is not the row on screen.
+        if rendered.oid.is_none() {
+            return Err(not_editable("the file is gone"));
+        }
+        if rendered.mode == Some(Mode::Symlink) {
+            return Err(not_editable("not a regular file"));
+        }
+        let state = self
+            .roots
+            .get(root)
+            .ok_or_else(|| unhashable(format!("no such root: {}", root.display())))?;
+        let live = ops::cas_live(&state.store, rendered)?;
+        let full = state
+            .store
+            .root()
+            .join(std::ffi::OsStr::from_bytes(&rendered.path));
+        let bytes = std::fs::read(&full).map_err(|e| unhashable(e.to_string()))?;
+        // The read is a *fresh* read, so it is hashed through the store's own conversion
+        // (the same one `hash_path` applies) and compared with the row. A mismatch is the
+        // agent that wrote between the CAS and the read.
+        let oid = state
+            .store
+            .hash_bytes_as(&rendered.path, &bytes)
+            .map_err(|e| unhashable(e.to_string()))?;
+        if rendered.oid.as_ref() != Some(&oid) {
+            return Err(Refused::Moved {
+                path: rendered.path.clone(),
+                live: Some(Entry {
+                    oid,
+                    mode: live.mode,
+                }),
+            });
+        }
+        let cap = self.config.collapse_size_bytes;
+        if bytes.len() as u64 > cap {
+            return Err(not_editable(&format!("over {} KiB", cap / 1024)));
+        }
+        if bytes.contains(&0) || std::str::from_utf8(&bytes).is_err() {
+            return Err(not_editable("binary"));
+        }
+        Ok(bytes)
+    }
+
+    /// Write an editor buffer back to the working tree and advance the path's baseline to
+    /// it (§6.3 "editor save"; invariant 8 — the user is never asked to review their own
+    /// just-typed change).
+    ///
+    /// The same op-then-rescan critical section as [`Engine::accept_with`], and for the
+    /// extra reason that a save has: `pile` is what proves the invariant, because a clean
+    /// save must leave the row *gone*. The rescan is also the §11 mitigation for the
+    /// hash-then-rename window, exactly as it is for a restore.
+    pub fn save(&mut self, root: &Path, req: SaveRequest) -> Result<Saved, EngineError> {
+        self.save_with(root, req, &NoFault)
+    }
+
+    /// [`Engine::save`] with a fault injector.
+    pub fn save_with(
+        &mut self,
+        root: &Path,
+        req: SaveRequest,
+        fault: &dyn FaultInjector,
+    ) -> Result<Saved, EngineError> {
+        let result = {
+            let mut ops = self.ops(root)?;
+            ops.save_file(&req.rendered, &req.bytes, fault)
+        };
+        let outcome = match result {
+            Ok(o) => o,
+            Err(e) => {
+                // The file may well be on disk — the failure is the ledger's — so the
+                // staged override is dropped and the on-disk ledger re-read. The next scan
+                // then shows the saved bytes as *pending*, which is the honest answer.
+                if let Some(state) = self.roots.get_mut(root) {
+                    state.ledger_stamp = None;
+                    state.reload_ledger_if_changed();
+                }
+                return Err(EngineError::Ops(e));
+            }
+        };
+        let pile = self.scan(root)?;
+        Ok(Saved {
+            outcome,
+            seq: self.scan_seq,
+            pile,
+        })
+    }
+
     /// Flag `path` — optionally one hunk of it — with a note, and render the export.
     ///
     /// Op-then-rescan like [`Engine::accept_with`], though a flag never changes a baseline:
@@ -1239,15 +1407,17 @@ impl Engine {
     /// `hunk n of **m**` total does **not** come from it — [`RenderedHunk::of`] carries the
     /// count the caller had on screen (verifier F5), because a rescan reads the file as it
     /// is now and an agent that rewrote it between the render and the keystroke would
-    /// otherwise produce a `hunk 2 of 1` that never existed.
+    /// otherwise produce a `hunk 2 of 1` that never existed. `summary` travels with a
+    /// whole-file flag for the same reason (Amendment v1.8) and is ignored for a hunk flag.
     pub fn flag(
         &mut self,
         root: &Path,
         path: &[u8],
         note: &str,
         hunk: Option<RenderedHunk>,
+        summary: Option<FlagSummary>,
     ) -> Result<Flagged, EngineError> {
-        self.flag_with(root, path, note, hunk, &NoFault)
+        self.flag_with(root, path, note, hunk, summary, &NoFault)
     }
 
     /// [`Engine::flag`] with a fault injector.
@@ -1257,6 +1427,7 @@ impl Engine {
         path: &[u8],
         note: &str,
         hunk: Option<RenderedHunk>,
+        summary: Option<FlagSummary>,
         fault: &dyn FaultInjector,
     ) -> Result<Flagged, EngineError> {
         // The total the export will name, taken now, from what the caller rendered — not
@@ -1265,7 +1436,7 @@ impl Engine {
         let hunk = hunk.map(|h| h.hunk);
         let (outcome, written) = {
             let mut ops = self.ops(root)?;
-            match ops.flag(path, note, hunk, fault) {
+            match ops.flag(path, note, hunk, summary, fault) {
                 Ok(o) => {
                     // The flag as the ledger now holds it: `created_at` is the op's clock
                     // reading, which the UI has no way to reproduce.
@@ -1905,7 +2076,7 @@ pub(crate) mod tests {
             of: row.hunks.len(),
         };
         let out = engine
-            .flag(&root, b"f1", "why is this changed?", Some(hunk))
+            .flag(&root, b"f1", "why is this changed?", Some(hunk), None)
             .unwrap();
         assert!(out.outcome.ok() && out.outcome.written);
         let base = root.file_name().unwrap().to_string_lossy().into_owned();
@@ -1924,7 +2095,9 @@ pub(crate) mod tests {
         assert_eq!(out.pile.row(b"f1").unwrap().flags.len(), 1);
 
         // A second, file-level flag: no hunk segment, no diff block, and it appends.
-        let out = engine.flag(&root, b"f1", "and this file", None).unwrap();
+        let out = engine
+            .flag(&root, b"f1", "and this file", None, None)
+            .unwrap();
         assert!(!out.export.contains("```") && !out.export.contains("hunk"));
         assert!(out.export.ends_with("note: and this file"));
         assert_eq!(out.pile.row(b"f1").unwrap().flags.len(), 2);
@@ -1982,6 +2155,7 @@ pub(crate) mod tests {
                     },
                     of: rendered_total,
                 }),
+                None,
             )
             .unwrap();
         assert!(out.outcome.ok() && out.outcome.written);
@@ -2004,7 +2178,7 @@ pub(crate) mod tests {
         let state = TempDir::new("lc-eng-flag-bad");
         let mut engine = open_engine(&repo, &state, Config::default());
         let root = only_root(&engine);
-        let out = engine.flag(&root, b"bad\xff", "n", None).unwrap();
+        let out = engine.flag(&root, b"bad\xff", "n", None, None).unwrap();
         assert!(matches!(
             out.outcome.refused[..],
             [crate::ops::Refused::NonUtf8Path { .. }]
@@ -2832,6 +3006,70 @@ pub(crate) mod tests {
         );
     }
 
+    /// Deliverable 8, F11: the inline editor's read decides binary-ness and the size cap
+    /// **here**, because `collapse_size_bytes` is engine config the reducer cannot see. The
+    /// three answers in one test, on three rows of one root: the text file opens, the PNG
+    /// and the oversize file come back as `NotEditable` with the `why` the status prints.
+    #[test]
+    fn engine_read_rendered_opens_text_and_refuses_binary_and_oversize() {
+        let mut repo = FixtureRepo::new("eng-read").unwrap();
+        repo.commit_files(
+            &[
+                ("t.txt", "one\n"),
+                ("img.png", "seed\n"),
+                ("big.txt", "seed\n"),
+            ],
+            "seed",
+        )
+        .unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let config = Config {
+            collapse_size_bytes: 4 * 1024,
+            ..Config::default()
+        };
+        let mut engine = open_engine(&repo, &state, config);
+        let root = only_root(&engine);
+        repo.write("t.txt", "one\ntwo\n");
+        let mut png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR".to_vec();
+        png.resize(1_024, b'\x42');
+        repo.write("img.png", &png);
+        repo.write("big.txt", "x".repeat(5_000));
+        let pile = engine.scan(&root).unwrap();
+        let of = |name: &[u8]| Rendered::of(pile.row(name).unwrap());
+
+        assert_eq!(
+            engine.read_rendered(&root, &of(b"t.txt")).unwrap(),
+            b"one\ntwo\n",
+            "the live bytes, verbatim"
+        );
+        match engine.read_rendered(&root, &of(b"img.png")) {
+            Err(Refused::NotEditable { why, .. }) => assert_eq!(why, "binary"),
+            other => panic!("{other:?}"),
+        }
+        match engine.read_rendered(&root, &of(b"big.txt")) {
+            Err(Refused::NotEditable { why, .. }) => assert_eq!(why, "over 4 KiB"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The CAS and the re-hash: a write between the render and the read is a `Moved`, and
+    /// the editor never opens on content the row did not describe.
+    #[test]
+    fn engine_read_rendered_refuses_a_file_that_moved_since_it_was_rendered() {
+        let repo = FixtureRepo::new("eng-read-moved").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let root = only_root(&engine);
+        repo.write("f1", "first\n");
+        let pile = engine.scan(&root).unwrap();
+        let rendered = Rendered::of(pile.row(b"f1").unwrap());
+        repo.write("f1", "an agent got here first\n");
+        match engine.read_rendered(&root, &rendered) {
+            Err(Refused::Moved { path, .. }) => assert_eq!(path, b"f1"),
+            other => panic!("{other:?}"),
+        }
+    }
+
     /// An unknown root is an error, not a panic or an empty expansion.
     #[test]
     fn engine_hunks_of_on_an_unknown_root_is_no_such_root() {
@@ -3079,6 +3317,37 @@ pub(crate) mod tests {
 
     /// R5: discovery re-runs when a scan first sees a nested repo, not on every
     /// `scan_all` while one exists.
+    /// The progress hook fires once per root, as each scan returns, with that root's row
+    /// count — including a nested root discovered on the way, which the retry round scans.
+    #[test]
+    fn engine_scan_all_with_reports_every_root_as_it_finishes() {
+        let repo = FixtureRepo::new("eng-progress").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let nested = repo.path().join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        repo.git_at(&nested, &["init", "-q", "-b", "main"]).unwrap();
+        std::fs::write(nested.join("n"), "n\n").unwrap();
+        repo.write("f1", "pending\n");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let seen = std::sync::Mutex::new(Vec::<(PathBuf, usize)>::new());
+        let results = engine
+            .scan_all_with(&|root, rows| seen.lock().unwrap().push((root.to_path_buf(), rows)));
+        let seen = seen.into_inner().unwrap();
+        assert_eq!(results.len(), 2, "the nested repo became a root");
+        assert_eq!(seen.len(), results.len(), "one report per root: {seen:?}");
+        for (root, _seq, result) in &results {
+            let rows = result.as_ref().map(|p| p.rows.len()).unwrap_or(0);
+            assert!(
+                seen.iter().filter(|(r, n)| r == root && *n == rows).count() == 1,
+                "{root:?} reported with {rows} rows exactly once: {seen:?}"
+            );
+        }
+        assert!(
+            seen.iter().any(|(_, n)| *n > 0),
+            "the pending file is counted: {seen:?}"
+        );
+    }
+
     #[test]
     fn engine_scan_all_rediscovers_only_when_nested_repos_change() {
         let repo = FixtureRepo::new("eng-nested").unwrap();

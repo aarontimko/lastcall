@@ -20,6 +20,8 @@ expression: style
 5 12..14 Red Reset -
 5 27..28 Cyan Reset -
 6 0..1 Cyan Reset -
+6 15..18 Green Reset -
+6 19..21 Red Reset -
 6 27..28 Cyan Reset -
 7 0..1 Cyan Reset -
 7 27..28 Cyan Reset -

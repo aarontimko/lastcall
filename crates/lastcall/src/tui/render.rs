@@ -23,11 +23,12 @@ use ratatui::widgets::{Block, Clear, Widget};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::app::{
-    AcceptScope, App, Focus, MIN_SIZE, NAV_MIN_COLS, RootView, Selection, Target, annotation_name,
-    diff_lines, hunk_header, hunk_offsets, plural, restore_question,
+    self, AcceptScope, App, Editor, Focus, MIN_SIZE, NAV_MIN_COLS, RootView, Selection, Target,
+    annotation_name, diff_lines, hunk_header, hunk_offsets, plural, restore_question,
 };
 use super::herdr::{Dot, Link};
 use super::input::{Action, MODAL_KEYS};
+use super::textbuf::Wrap;
 
 pub const TOO_SMALL: &str = "too small: 40×10 min";
 /// The note modal's box: wide enough for a sentence, narrow enough to sit over the diff.
@@ -36,9 +37,25 @@ pub const NOTE_WIDTH: u16 = 60;
 pub const NOTE_ROWS: u16 = 5;
 /// The insertion point, drawn into the text (see `render_note`).
 pub const NOTE_CARET: &str = "▌";
+/// The note modal's key line where the terminal cannot tell `Shift-Enter` from `Enter`.
 pub const NOTE_KEYS: &str = "⏎ send   ^J newline   Esc cancel";
+/// …and where it can (the kitty keyboard protocol; ruling P9).
+pub const NOTE_KEYS_ENHANCED: &str = "⏎ send   ⇧⏎ / ^J newline   Esc cancel";
+
+/// The key line the note modal shows, which is a promise: `⇧⏎` appears only on a terminal
+/// that reports the enhancement, because everywhere else that key *sends the note*.
+pub fn note_keys(enhanced: bool) -> &'static str {
+    if enhanced {
+        NOTE_KEYS_ENHANCED
+    } else {
+        NOTE_KEYS
+    }
+}
 pub const PICK_KEYS: &str = "↑↓ choose   ⏎ send   Esc cancel";
 pub const NO_SELECTION: &str = "select a file (↑↓ or click) · ? for help";
+/// The right pane while the herdr scope verdict is still pending at launch
+/// (`HerdrView::scope_pending`): nothing is listed yet, so nothing is selectable.
+pub const SCOPE_PENDING: &str = "waiting for herdr scope…";
 /// What a flag-only root (no pending rows) shows instead of a file list, in the nav and
 /// in the diff pane, so `Enter` has somewhere to land. `<status>` is herdr's own word.
 pub fn nothing_pending(status: &str) -> String {
@@ -54,9 +71,46 @@ pub fn nothing_pending_short(status: &str) -> String {
 }
 
 /// The help overlay's mouse note (ruling 3): `term::enter` turns mouse capture on, so the
-/// terminal's own text selection needs the shift override. The stopgap until the Phase 8
-/// select-to-copy item lands.
-pub const SELECT_NOTE: &str = "shift+drag selects text (mouse capture is on)";
+/// terminal's own text selection needs the shift override. It stays now that deliverable 9
+/// has landed — shift+drag is still the terminal-native path, and the one that works where
+/// OSC 52 does not — with `v`/`y` named beside it. 62 columns, so the note fits inside the
+/// overlay at 80 (design review F19).
+pub const SELECT_NOTE: &str = "shift+drag selects text (mouse capture is on) · v/y copies";
+
+/// The inline editor's line-number gutter: four columns of number and one for the `▎` that
+/// marks a line inside a pending hunk (deliverable 8). `App::EDITOR_GUTTER` is the same
+/// number, and the reducer clamps the horizontal scroll to the text width it leaves.
+pub const EDITOR_GUTTER: u16 = app::EDITOR_GUTTER as u16;
+/// The mark on a line inside a pending hunk.
+pub const EDITOR_MARK: &str = "▎";
+/// The tint on every line of the hunk the editor was opened at, so the reader can see the
+/// region they entered while they type around it (the sponsor's addition to ruling P3).
+pub const EDITOR_BAND_BG: Color = Color::Indexed(236);
+/// The cursor's line, over the band.
+pub const EDITOR_CURSOR_BG: Color = Color::Indexed(238);
+/// Drawn in the last column of a row whose content runs off the right edge — the editor
+/// does not soft-wrap, so this is how a reader knows there is more.
+pub const EDITOR_CLIPPED: &str = "→";
+/// The hint line while the editor is open: the two keys that are not text.
+pub const EDITOR_HINTS: &str = "^S save   Esc close";
+
+/// The help overlay's newline note where the terminal cannot tell `Shift-Enter` from
+/// `Enter` (ruling P9): the guaranteed key, and why the other one is not offered.
+pub const NEWLINE_NOTE: &str = "^J is a newline in the note (⇧⏎ needs a kitty-protocol terminal)";
+/// …and where it can: the flags were pushed, so the key works and may be named.
+pub const NEWLINE_NOTE_ENHANCED: &str = "⇧⏎ or ^J is a newline in the note (kitty protocol on)";
+
+/// The help overlay's newline line. Like [`note_keys`] it is a promise, made in the one
+/// place a reviewer looks up a key they have not tried: `⇧⏎` is named only where it works.
+/// Which terminals report the protocol is a longer answer than an overlay row, and lives in
+/// `docs/dev/tui.md`.
+pub fn newline_note(enhanced: bool) -> &'static str {
+    if enhanced {
+        NEWLINE_NOTE_ENHANCED
+    } else {
+        NEWLINE_NOTE
+    }
+}
 
 /// Which pane a screen position belongs to (the wheel scrolls the pane under the pointer).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +132,16 @@ pub struct HitMap {
     /// [`NAV_MIN_COLS`], or in a frame with no nav pane — so a narrow window does not reset
     /// an offset the user will see again when it widens.
     pub nav_top: Option<usize>,
+    /// The inline editor's **text** area (the gutter already subtracted), when this frame
+    /// drew one: what turns a click into a caret position (deliverable 8). Not a `Target`,
+    /// because a target says *what* was clicked and this has to answer *where*.
+    pub editor: Option<Rect>,
+    /// The rectangle the **hunk lines** were drawn into, when this frame drew any
+    /// (deliverable 9): what turns a mouse press or drag into a diff line. Like
+    /// [`HitMap::editor`] it is a *where*, not a *what*, so it is not a `Target` — and it
+    /// is narrower than `Target::DiffBody`, which covers the whole pane including the
+    /// expansion header and the empty states.
+    pub diff_body: Option<Rect>,
 }
 
 impl HitMap {
@@ -131,11 +195,20 @@ pub fn render(app: &App, frame: &mut Frame<'_>) -> HitMap {
     let header = Rect::new(area.x, area.y, area.width, 1);
     let status = Rect::new(area.x, area.bottom() - 1, area.width, 1);
     let body = Rect::new(area.x, area.y + 1, area.width, area.height - 2);
-    render_header(app, buf, header, &mut hits);
+    match &app.editor {
+        Some(ed) => render_editor_header(ed, buf, header),
+        None => render_header(app, buf, header, &mut hits),
+    }
     render_status(app, buf, status);
 
     let nav_visible = area.width >= NAV_MIN_COLS;
-    let focus = if nav_visible { app.focus } else { Focus::Diff };
+    // The editor lives in the diff pane and holds every key, so the focused border follows
+    // it there whatever `app.focus` says: the nav is not where the typing goes.
+    let focus = if nav_visible && app.editor.is_none() {
+        app.focus
+    } else {
+        Focus::Diff
+    };
     let (nav_area, main_area) = if nav_visible {
         let w = app.nav_width.min(area.width.saturating_sub(20));
         (
@@ -154,7 +227,10 @@ pub fn render(app: &App, frame: &mut Frame<'_>) -> HitMap {
     let main_inner = main_block.inner(main_area);
     main_block.render(main_area, buf);
     hits.main = Some(main_inner);
-    render_main(app, buf, main_inner, &mut hits);
+    match &app.editor {
+        Some(ed) => render_editor(ed, buf, main_inner, &mut hits),
+        None => render_main(app, buf, main_inner, &mut hits),
+    }
 
     if let Some(nav_area) = nav_area {
         let nav_block = Block::bordered().border_style(if focus == Focus::Nav {
@@ -174,10 +250,21 @@ pub fn render(app: &App, frame: &mut Frame<'_>) -> HitMap {
         );
         hits.nav = Some(nav_inner);
         render_nav(app, buf, nav_inner, &mut hits);
+        // The nav stays on screen while the editor is open — the reader keeps the list of
+        // what is left to review in front of them — but dimmed, because none of its keys
+        // work until the editor closes.
+        if app.editor.is_some() {
+            buf.set_style(nav_inner, dim());
+        }
         hits.targets
             .push((Rect::new(x, body.y, 1, body.height), Target::Divider));
     }
 
+    // Deliverable 9: the copy cue sits over the diff pane, under every modal — a copy is
+    // not a question, and it must never hide the one being asked.
+    if let Some(cue) = &app.cue {
+        render_cue(&cue.text, buf, main_inner);
+    }
     if app.help {
         render_help(app, buf, area);
     }
@@ -381,6 +468,12 @@ fn render_status(app: &App, buf: &mut Buffer, area: Rect) {
 /// exactly the keys that work there (the modal's own, fixed, and the keymap's `quit`).
 pub fn hints(app: &App, width: u16) -> String {
     let first = |action: &str| app.keys_for(action).first().map(|s| hint_label(s));
+    // The editor swallows the keymap, so naming the keymap's keys here would name keys that
+    // type themselves. Its own two live in the header as well: the hint line is where every
+    // other mode's keys are, and a reader who looks down should not find the nav's.
+    if app.editor.is_some() {
+        return EDITOR_HINTS.to_owned();
+    }
     if app.confirm.is_some() {
         let modal = |name: &str| {
             MODAL_KEYS
@@ -419,7 +512,9 @@ pub fn hints(app: &App, width: u16) -> String {
         Some(AcceptScope::Root(root)) => accept
             .as_ref()
             .map(|k| format!("{k} accept all in {}", app.root_name(root))),
-        Some(AcceptScope::All) | None => None,
+        // `Bless` is never what the *selection* covers — it is built by the editor-return
+        // path and lives only inside a confirm — so the hint line has nothing to say for it.
+        Some(AcceptScope::All) | Some(AcceptScope::Bless { .. }) | None => None,
     };
     let file = match &scope {
         Some(AcceptScope::Hunk { .. }) => accept_file.map(|k| format!("{k} accept file")),
@@ -443,6 +538,13 @@ pub fn hints(app: &App, width: u16) -> String {
         .is_some_and(|f| f.attention())
         .then(|| first("jump").map(|k| format!("{k} jump")))
         .flatten();
+    let diff = app.effective_focus() == Focus::Diff;
+    let select_hint = diff
+        .then(|| first("select").map(|k| format!("{k} select")))
+        .flatten();
+    let copy_hint = diff
+        .then(|| first("copy").map(|k| format!("{k} copy")))
+        .flatten();
     let scope = app
         .herdr
         .scope
@@ -464,6 +566,12 @@ pub fn hints(app: &App, width: u16) -> String {
         (scope, 2),
         (first("focus_toggle").map(|k| format!("{k} focus")), 2),
         (first("refresh").map(|k| format!("{k} refresh")), 2),
+        // Deliverable 9: the diff pane's own two keys, on the widest line only. Their own
+        // tier, dropped before anything that was on the line before them, so no narrower
+        // frame loses a hint it used to have — and the help overlay and its mouse note name
+        // them at every width.
+        (select_hint, 3),
+        (copy_hint, 3),
         (first("help").map(|k| format!("{k} help")), 0),
         (first("quit").map(|k| format!("{k} quit")), 0),
     ];
@@ -476,9 +584,11 @@ pub fn hints(app: &App, width: u16) -> String {
             .join("  ")
     };
     let fits = |s: &str| s.width() <= width as usize;
-    let full = join(2);
-    if width >= NAV_MIN_COLS && fits(&full) {
-        return full;
+    for tier in [3, 2] {
+        let line = join(tier);
+        if width >= NAV_MIN_COLS && fits(&line) {
+            return line;
+        }
     }
     let mid = join(1);
     if fits(&mid) { mid } else { join(0) }
@@ -745,7 +855,61 @@ fn render_main(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
     let mut lines: Vec<Line> = Vec::new();
     match &app.selection {
         None => {
-            if app.listed_roots().next().is_none() {
+            if let Some(loading) = &app.loading {
+                // The launch hold (`Loading`): a static line, then after a second the
+                // counter and a ✓ per reported root — the slow one is the one without.
+                lines.push(Line::from(format!(
+                    "discovered {}, checking status…",
+                    plural(app.roots.len(), "root")
+                )));
+                let counting = loading.counting(app.now);
+                if counting {
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "{} of {} checked · {} pending so far · {}s",
+                            loading.checked.len(),
+                            plural(app.roots.len(), "repo"),
+                            plural(loading.files(), "file"),
+                            app.now.duration_since(loading.started).as_secs()
+                        ),
+                        dim(),
+                    )));
+                }
+                for view in app.roots.values() {
+                    let mut text = format!("  {}  {}", view.meta.name, view.meta.branch_label());
+                    if counting && loading.checked.contains_key(&view.meta.path) {
+                        text.push_str("  ✓");
+                    }
+                    lines.push(Line::from(text));
+                }
+            } else if app.herdr.scope_pending {
+                // Deliberately not "nothing pending": the piles may be in and held back.
+                lines.push(Line::from(Span::styled(SCOPE_PENDING, dim())));
+            } else if let (Some(scope), hidden @ 1..) = (
+                app.herdr
+                    .active_scope()
+                    .filter(|_| app.listed_roots().next().is_none()),
+                app.scoped_out(),
+            ) {
+                // Under a scope, the roots it hides are not "nothing pending": name the
+                // scope, list what it covers, and say how many it hides.
+                lines.push(Line::from(format!("nothing pending in {}", scope.label)));
+                for view in app
+                    .roots
+                    .values()
+                    .filter(|v| scope.roots.contains(&v.meta.path))
+                {
+                    lines.push(Line::from(format!(
+                        "  {}  {}",
+                        view.meta.name,
+                        view.meta.branch_label()
+                    )));
+                }
+                lines.push(Line::from(Span::styled(
+                    format!("{} hidden (w shows all)", plural(hidden, "repo")),
+                    dim(),
+                )));
+            } else if app.listed_roots().next().is_none() {
                 lines.push(Line::from(format!(
                     "nothing pending across {}",
                     plural(app.roots.len(), "root")
@@ -873,6 +1037,97 @@ fn render_main(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
     }
     for (i, line) in lines.iter().take(area.height as usize).enumerate() {
         buf.set_line(area.x, area.y + i as u16, line, area.width);
+    }
+}
+
+/// `editing <path> · line <n>/<total> · ^S save   Esc close` — the header row while the
+/// inline editor is open (deliverable 8).
+///
+/// It replaces the app header wholesale rather than sitting beside it: the counts, the
+/// herdr badge and `[Accept All]` all describe a review the reader has stepped out of, and
+/// the `[Accept All]` control in particular is a click target that must not be live while
+/// a buffer is open. Red until the next key when a save was refused — the file on disk is
+/// not what is on screen, and that is worth more than one line of status.
+fn render_editor_header(ed: &Editor, buf: &mut Buffer, area: Rect) {
+    // The keys live in the hint line, where every other key hint in the TUI lives; the
+    // header is the answer to "what am I in, and where in it?" — short enough that at the
+    // 60-column floor the fixture's paths keep the whole line. Past that `ellipsize` cuts
+    // from the **tail**, so a long enough path costs the `· unsaved` and then the
+    // `line N/M` — the wrong end to lose, since the position is the part that changes as
+    // you type. A head-ellipsis of the path would be strictly better and is the header's
+    // entry for the design pass (verifier (b) on decision 10); `tui.md` records it too.
+    let text = format!(
+        "editing {} · {}{}",
+        String::from_utf8_lossy(&ed.rendered.path),
+        ed.buf.position_label(),
+        if ed.buf.dirty() { " · unsaved" } else { "" },
+    );
+    let style = if ed.alarm { red() } else { bold() };
+    buf.set_stringn(
+        area.x,
+        area.y,
+        ellipsize(&text, area.width as usize),
+        area.width as usize,
+        style,
+    );
+}
+
+/// The inline editor in the diff pane: a five-column gutter, then the file (deliverable 8).
+///
+/// The gutter carries the line number and, on every line inside a pending hunk, a `▎` — so
+/// the reader can see the rest of the agent's work while they type in one part of it. The
+/// hunk they *entered* is tinted whole, its marks bold: that band is the answer to "which
+/// change was I looking at?", and it grows as they type inside it.
+///
+/// Nothing here scrolls the buffer. `TextBuf::view` draws the window the reducer clamped
+/// after the last key ([`App::clamp_editor`]), because a renderer that moved what it draws
+/// would make the frame depend on when it was drawn.
+fn render_editor(ed: &Editor, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
+    if area.width <= EDITOR_GUTTER || area.height == 0 {
+        return;
+    }
+    let text_w = area.width - EDITOR_GUTTER;
+    let text = Rect::new(area.x + EDITOR_GUTTER, area.y, text_w, area.height);
+    hits.editor = Some(text);
+    let view = ed.buf.view(area.height as usize, text_w as usize);
+    for (i, row) in view.rows.iter().enumerate() {
+        let n = view.first_line + i;
+        let (marked, in_band) = (ed.marked(n), ed.in_band(n));
+        let mark_style = match (marked, in_band) {
+            (true, true) => bold(),
+            (true, false) => Style::new(),
+            (false, _) => dim(),
+        };
+        let mut line = Line::from(vec![
+            Span::styled(format!("{:>4}", n + 1), dim()),
+            Span::styled(
+                if marked { EDITOR_MARK } else { " " }.to_owned(),
+                mark_style,
+            ),
+            Span::raw(row.clone()),
+        ]);
+        let row_style = match (n == ed.buf.cursor.line, in_band) {
+            (true, _) => Style::new().bg(EDITOR_CURSOR_BG),
+            (false, true) => Style::new().bg(EDITOR_BAND_BG),
+            (false, false) => Style::new(),
+        };
+        band(&mut line, area.width, row_style);
+        let y = area.y + i as u16;
+        buf.set_line(area.x, y, &line, area.width);
+        // The right edge, after the line is down: a row that runs off it says so, because
+        // the editor does not wrap and the rest of the line is one `End` away.
+        if view.clipped.get(i) == Some(&true) && text_w > 0 {
+            buf[(text.right() - 1, y)]
+                .set_symbol(EDITOR_CLIPPED)
+                .set_style(row_style.patch(dim()));
+        }
+    }
+    // The caret, reversed rather than left to the terminal's own cursor: the frame is the
+    // only thing a snapshot and a PTY scene can see.
+    let (cy, cx) = view.caret;
+    if (cy as u16) < area.height && (cx as u16) < text_w {
+        let cell = &mut buf[(text.x + cx as u16, area.y + cy as u16)];
+        cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
     }
 }
 
@@ -1094,6 +1349,10 @@ fn render_hunks(
     let offsets = hunk_offsets(hunks);
     let scroll = app.diff.scroll.min(total.saturating_sub(1));
     let current = app.diff.hunk.min(hunks.len() - 1);
+    // Deliverable 9: where a mouse press or drag turns into a diff line, and the inclusive
+    // line range a live selection covers.
+    hits.diff_body = Some(area);
+    let selected = app.sel.map(|s| s.range());
     // The hunk containing `scroll`, and the line within it.
     let mut h = offsets.partition_point(|&o| o <= scroll).saturating_sub(1);
     let mut within = scroll - offsets[h];
@@ -1154,6 +1413,18 @@ fn render_hunks(
                 if h == current {
                     band(&mut line, area.width, style);
                 }
+            }
+            // Last, and over the hunk band: a selection is the reader's own mark, and it
+            // reads as one run across the pane whatever is underneath it.
+            if selected.is_some_and(|(a, b)| {
+                let at = offsets[h] + within;
+                at >= a && at <= b
+            }) {
+                band(
+                    &mut line,
+                    area.width,
+                    Style::new().add_modifier(Modifier::REVERSED),
+                );
             }
             buf.set_line(area.x, area.y + y, &line, area.width);
             within += 1;
@@ -1355,7 +1626,7 @@ fn help_columns(keys: &[String], area: Rect) -> Vec<String> {
 }
 
 fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
-    let keys: Vec<String> = app
+    let named: Vec<(&str, String)> = app
         .keymap
         .iter()
         .map(|(name, specs)| (name.as_str(), keys_label(specs)))
@@ -1364,10 +1635,12 @@ fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
                 .iter()
                 .map(|(name, specs)| (*name, keys_label(specs))),
         )
-        .map(|(name, keys)| format!("{keys:<14} {}", Action::describe(name)))
+        .map(|(name, keys)| (name, format!("{keys:<14} {}", Action::describe(name))))
         .collect();
+    let keys: Vec<String> = named.iter().map(|(_, row)| row.clone()).collect();
     let mut rows = help_columns(&keys, area);
     rows.push(String::new());
+    rows.push(newline_note(app.enhanced).to_owned());
     rows.push(SELECT_NOTE.to_owned());
     let width = (rows.iter().map(|r| r.width()).max().unwrap_or(0) + 4).min(area.width as usize);
     let height = (rows.len() + 4).min(area.height as usize);
@@ -1389,12 +1662,26 @@ fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
         // overlay clips, and what it clips is key rows — never the footer. A reader who
         // cannot see every key can still see what the mouse does and how to leave.
         //
-        // Three rows are reserved, not two: the blank, `SELECT_NOTE`, **and** the
+        // Three rows are reserved: the newline note, `SELECT_NOTE`, **and** the
         // `any key closes` line below them, which is drawn only where the body does not
         // reach. Reserving two put the body's last row on the footer's row, so the footer
         // was the thing the clip dropped (verifier (b) F4).
+        //
+        // The blank separator is *not* reserved — it is the first thing the clip spends.
+        // Reserving it too costs a key row, and at 80×30 the key row it costs is `quit`.
         rows.truncate(cap.saturating_sub(3));
-        rows.push(String::new());
+        // …and `quit` is pinned to the end of what survives. The keymap grows — Phase 8
+        // alone adds four rows — and a clip that simply takes the first N pushes the last
+        // row off first, which in this keymap is the one row a reader who opened the overlay
+        // by accident most needs. `any key closes` gets them out of the overlay; this gets
+        // them out of lastcall. It costs the row above it, never the footer.
+        if let Some((_, quit)) = named.iter().find(|(name, _)| *name == "quit")
+            && !rows.iter().any(|r| r.contains(quit.as_str()))
+        {
+            rows.truncate(cap.saturating_sub(4));
+            rows.push(quit.clone());
+        }
+        rows.push(newline_note(app.enhanced).to_owned());
         rows.push(SELECT_NOTE.to_owned());
         rows.truncate(cap.saturating_sub(1));
     }
@@ -1418,15 +1705,31 @@ fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
     }
 }
 
-/// The confirm modal (§6.7), centered like the help overlay. One box, two operations: the
-/// title is ` accept ` or ` restore ` and the first row comes from the scope.
+/// The confirm modal (§6.7), centered like the help overlay. One box, three operations: the
+/// title is ` accept `, ` restore ` or ` review `, and the first row comes from the scope.
 ///
 /// An accept's numbers come from `App::confirm_counts`, i.e. the held piles as they are at
 /// this frame: `Accept all <N> files in <root>?` (one root) or `across <R> repos?`, then
 /// `<g> grouped upstream · <c> collapsed` only when either is non-zero. A restore covers one
-/// row, so it has one question row and nothing to tally (F11).
+/// row, so it has one question row and nothing to tally (F11). So does the post-`$EDITOR`
+/// blessing (Phase 8 deliverable 3), whose question names the path and nothing else. It is
+/// framed as *intent* ("edited — mark every hunk reviewed?"), never as detection: lastcall
+/// only knows the bytes differ from when the editor opened, not who wrote them, and the
+/// sponsor's Gate 8 run read the earlier "changed while your editor was open" as a claim that
+/// someone else had. No hunk count either — the row on screen may predate the save.
 fn render_confirm(app: &App, buf: &mut Buffer, area: Rect) {
-    let (title, mut rows) = match app.confirm_restore() {
+    if let Some(path) = app.confirm_bless() {
+        let question = format!(
+            "{} edited — mark every hunk in it reviewed?",
+            String::from_utf8_lossy(path)
+        );
+        return confirm_box(" review ", vec![question], buf, area);
+    }
+    if let Some(path) = app.confirm_discard() {
+        let question = format!("Discard changes to {}?", String::from_utf8_lossy(path));
+        return confirm_box(" discard ", vec![question], buf, area);
+    }
+    let (title, rows) = match app.confirm_restore() {
         Some(scope) => (" restore ", vec![restore_question(scope)]),
         None => {
             let Some(counts) = app.confirm_counts() else {
@@ -1449,6 +1752,11 @@ fn render_confirm(app: &App, buf: &mut Buffer, area: Rect) {
             (" accept ", rows)
         }
     };
+    confirm_box(title, rows, buf, area);
+}
+
+/// The box every confirm shares: the question rows, a blank line, then the modal keys.
+fn confirm_box(title: &str, mut rows: Vec<String>, buf: &mut Buffer, area: Rect) {
     rows.push(String::new());
     rows.push(
         MODAL_KEYS
@@ -1485,10 +1793,19 @@ fn render_confirm(app: &App, buf: &mut Buffer, area: Rect) {
 
 /// The note modal: what is being flagged, the note being typed, and the keys that end it.
 ///
+/// The **title names the target** — ` flag hunk 2 of 3 ` or ` flag whole file ` — so the
+/// frame of the box answers "what am I flagging?" even when a long path has been ellipsized
+/// on the line below it (ruling P4).
+///
 /// The text area is a fixed [`NOTE_ROWS`] lines high whatever is typed, so the box does not
 /// jump under the reader's hands as the note grows; past that it scrolls to keep the caret
 /// (`▌`) in view. The caret is drawn into the text rather than set on the terminal so that
 /// one `App` renders to one buffer — the snapshot tier can see where the cursor is.
+///
+/// The scroll comes from the note's own [`TextBuf`](super::textbuf::TextBuf) viewport, run
+/// on a **copy**: `render` is a function of `&App` and may not move the buffer's `top`. The
+/// copy always starts at the top, so the window still ends at the caret's row — the same
+/// rule the modal has had since Phase 7, now with the buffer's soft wrapping under it.
 fn render_note(app: &App, buf: &mut Buffer, area: Rect) {
     let Some(note) = &app.note else {
         return;
@@ -1497,7 +1814,9 @@ fn render_note(app: &App, buf: &mut Buffer, area: Rect) {
     // border + target + blank + text + blank + keys
     let height = (NOTE_ROWS + 6).min(area.height);
     let rect = centered(area, width, height);
-    let inner = modal_block(" flag ", rect, buf);
+    // Bold, as the kickoff's deliverable 5 asks: the title is the answer to "what am I
+    // flagging?", and it is the one line of the box a reviewer must not skim past.
+    let inner = modal_block(Line::styled(note.target.modal_title(), bold()), rect, buf);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -1506,19 +1825,20 @@ fn render_note(app: &App, buf: &mut Buffer, area: Rect) {
         (ellipsize(&note.target.label(), text_width), bold()),
         (String::new(), Style::new()),
     ];
-    let wrapped = caret_lines(&note.text, note.cursor, text_width.max(1));
-    // The window ends at the caret's line, so a note longer than the box scrolls with it.
-    let caret_at = wrapped
-        .iter()
-        .position(|l| l.contains(NOTE_CARET))
-        .unwrap_or(0);
-    let top = (caret_at + 1).saturating_sub(NOTE_ROWS as usize);
+    let view = note
+        .buf
+        .clone()
+        .viewport(NOTE_ROWS as usize, text_width.max(1), Wrap::Soft);
     for i in 0..NOTE_ROWS as usize {
-        let line = wrapped.get(top + i).cloned().unwrap_or_default();
+        let line = match view.rows.get(i) {
+            Some(text) if i == view.caret.0 => with_caret(text, view.caret.1),
+            Some(text) => text.clone(),
+            None => String::new(),
+        };
         rows.push((line, Style::new()));
     }
     rows.push((String::new(), Style::new()));
-    rows.push((NOTE_KEYS.to_owned(), dim()));
+    rows.push((note_keys(app.enhanced).to_owned(), dim()));
     for (i, (row, style)) in rows.iter().take(inner.height as usize).enumerate() {
         buf.set_stringn(
             inner.x + 1,
@@ -1574,24 +1894,28 @@ fn render_picker(app: &App, buf: &mut Buffer, area: Rect) {
     }
 }
 
-/// `text` split into display lines of at most `width` columns, with [`NOTE_CARET`] inserted
-/// at byte offset `cursor`. Explicit newlines break first, then each paragraph is hard-wrapped
-/// at the column — a note is prose, and a word cut in half is still readable, while a
-/// wrapping rule that hides the caret is not.
-fn caret_lines(text: &str, cursor: usize, width: usize) -> Vec<String> {
-    let mut with_caret = text.to_owned();
-    with_caret.insert_str(cursor.min(with_caret.len()), NOTE_CARET);
-    let mut out = Vec::new();
-    for para in with_caret.split('\n') {
-        let mut line = String::new();
-        for c in para.chars() {
-            if line.width() + c.width().unwrap_or(0) > width {
-                out.push(std::mem::take(&mut line));
-            }
-            line.push(c);
+/// `row` with [`NOTE_CARET`] drawn at display column `col`, padded when the caret sits past
+/// the end of the line (which is where it sits most of the time — one column after the last
+/// character typed).
+fn with_caret(row: &str, col: usize) -> String {
+    let mut out = String::new();
+    let mut at = 0usize;
+    let mut chars = row.chars();
+    for c in chars.by_ref() {
+        if at >= col {
+            out.push_str(NOTE_CARET);
+            out.push(c);
+            out.extend(chars);
+            return out;
         }
-        out.push(line);
+        at += c.width().unwrap_or(0);
+        out.push(c);
     }
+    // Past the end: pad to the column, then the caret.
+    for _ in at..col {
+        out.push(' ');
+    }
+    out.push_str(NOTE_CARET);
     out
 }
 
@@ -1607,11 +1931,31 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     )
 }
 
+/// The copy cue: one centred, `Clear`-backed line over the diff pane (deliverable 9). It is
+/// deliberately not the status line — the status is the record of what the *engine* did,
+/// and a copy must not overwrite an accept's or a refusal's sentence.
+fn render_cue(text: &str, buf: &mut Buffer, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let rect = centered(area, text.width() as u16 + 2, 1);
+    Clear.render(rect, buf);
+    buf.set_line(
+        rect.x,
+        rect.y,
+        &Line::from(Span::styled(
+            format!(" {text} "),
+            Style::new().add_modifier(Modifier::REVERSED),
+        )),
+        rect.width,
+    );
+}
+
 /// Clear `rect`, draw the focused border with `title`, and hand back the inside.
-fn modal_block(title: &'static str, rect: Rect, buf: &mut Buffer) -> Rect {
+fn modal_block<'a>(title: impl Into<Line<'a>>, rect: Rect, buf: &mut Buffer) -> Rect {
     Clear.render(rect, buf);
     let block = Block::bordered()
-        .title(title)
+        .title(title.into())
         .border_style(focused_border());
     let inner = block.inner(rect);
     block.render(rect, buf);
@@ -1977,6 +2321,51 @@ mod tests {
         assert!(frame.contains(SELECT_NOTE), "{frame}");
     }
 
+    /// Deliverable 11 (design review F15): the four keys Phase 8 added are all on screen at
+    /// 100×30, which holds only while their descriptions stay short enough for the overlay
+    /// to keep two columns — `help_columns` falls back to one clipped column the moment the
+    /// two widest rows plus 7 exceed the width.
+    #[test]
+    fn render_help_shows_the_phase8_keys_at_100x30() {
+        let mut app = three_roots();
+        app.help = true;
+        let (frame, _) = frame_of(&app, 100, 30);
+        for (key, action) in [
+            ("i", "edit"),
+            ("I", "edit_external"),
+            ("v", "select"),
+            ("y", "copy"),
+        ] {
+            let row = format!("{key:<15}{}", Action::describe(action));
+            assert!(frame.contains(&row), "no {row:?} row:\n{frame}");
+            assert!(
+                Action::describe(action).width() <= 30,
+                "{action} would cost the overlay its second column"
+            );
+        }
+        assert!(frame.contains(SELECT_NOTE), "{frame}");
+    }
+
+    /// Ruling P9 in the one place a reviewer looks a key up: the overlay names `⇧⏎` only
+    /// on a terminal that reports the enhancement, and names the key that always works
+    /// everywhere else. Which terminals report it is `docs/dev/tui.md`'s answer, not a row.
+    #[test]
+    fn render_help_promises_shift_enter_only_with_enhancement() {
+        let mut app = App::new();
+        app.help = true;
+        let (plain, _) = frame_of(&app, 100, 30);
+        assert!(plain.contains(NEWLINE_NOTE), "{plain}");
+        assert!(
+            !plain.contains("⇧⏎ or ^J"),
+            "no ⇧⏎ promise without the protocol:\n{plain}"
+        );
+        app.enhanced = true;
+        let (enhanced, _) = frame_of(&app, 100, 30);
+        assert!(enhanced.contains(NEWLINE_NOTE_ENHANCED), "{enhanced}");
+        // Both forms name `^J`: it is the newline that needs no terminal at all.
+        assert!(NEWLINE_NOTE.contains("^J") && NEWLINE_NOTE_ENHANCED.contains("^J"));
+    }
+
     /// Deliverable 8: the overlay goes to two columns rather than losing rows off the
     /// bottom.
     ///
@@ -2134,6 +2523,32 @@ mod tests {
         );
         app.handle(Action::Open);
         assert_eq!(hints(&app, 120), nav_line, "the diff pane says the same");
+        // Deliverable 9: `v select  y copy` are the diff pane's own keys on their own tier
+        // (3), dropped before every hint that was on the line before them — so a frame that
+        // loses them keeps `Tab focus`/`r refresh` and everything under it.
+        assert_eq!(
+            hints(&app, 140),
+            "↑↓ select  ⏎ open  n/p hunk  a accept hunk  A accept file  ^A accept all  Tab focus  r refresh  v select  y copy  ? help  q quit"
+        );
+        // The threshold `tui.md` quotes, pinned (verifier (b) F7): the tier-3 line for a
+        // file row is exactly 128 columns wide, so 128 shows it and 127 falls back to the
+        // tier-2 line — which is the same one the nav gets.
+        assert_eq!(hints(&app, 128), hints(&app, 140));
+        assert_eq!(hints(&app, 127), nav_line, "one column short of tier 3");
+        // What the line says depends on the selection, so the threshold does too: a root
+        // row trades `a accept hunk  A accept file` for `a accept all in <root>`, which is
+        // seven columns shorter with this fixture's names.
+        let mut at_root = app.clone();
+        at_root.select(Some(Selection::Root(root("alpha"))));
+        assert!(hints(&at_root, 121).contains("y copy"));
+        assert!(!hints(&at_root, 120).contains("y copy"));
+        assert!(!nav_line.contains("y copy"), "the nav has no copy key");
+        app.handle(Action::Back);
+        assert!(
+            !hints(&app, 140).contains("y copy"),
+            "and the nav still has none at any width"
+        );
+        app.handle(Action::Open);
         app.select(Some(Selection::Root(root("alpha"))));
         assert!(
             hints(&app, 100).contains("n/p hunk  a accept all in alpha  ^A accept all"),
@@ -2307,6 +2722,66 @@ mod tests {
         );
     }
 
+    /// Deliverable 9: the selected lines are one reverse-video run across the pane, the
+    /// hunk lines' rectangle is reported for the mouse, and the cue sits over the diff.
+    #[test]
+    fn render_selection_is_reverse_video_and_the_cue_sits_over_the_diff() {
+        let mut app = three_roots();
+        app.apply(pile_event("alpha", alpha_two_hunks()));
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Open);
+        app.handle(Action::Resize(100, 30));
+        // Lines 1..=3 of the diff: `-a1`, `+A1`, ` a2` — not the header, so the run cannot
+        // be mistaken for the selected-hunk band.
+        app.handle(Action::NavDown);
+        app.handle(Action::Select);
+        app.handle(Action::NavDown);
+        app.handle(Action::NavDown);
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut hits = None;
+        terminal.draw(|f| hits = Some(render(&app, f))).unwrap();
+        let hits = hits.unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let body = hits.diff_body.expect("the hunk lines' rectangle");
+        let main = hits.main.expect("the diff pane");
+        assert!(main.union(body) == main, "the body is inside the pane");
+        // The first `j` scrolled (no selection yet), the two after it only moved the
+        // selection's far end — so line 1 is the top row and the selection is the three
+        // rows from there.
+        assert_eq!(app.diff.scroll, 1);
+        assert_eq!(app.sel.map(|s| s.range()), Some((1, 3)));
+        // Every cell of every selected row, edge to edge — the underlying `+`/`-` colours
+        // stay, so the run is one *modifier* across the pane rather than one style span.
+        let styled = styles(&buf);
+        for y in body.y..body.y + 3 {
+            for x in body.x..body.right() {
+                assert!(
+                    buf[(x, y)].modifier.contains(Modifier::REVERSED),
+                    "({x}, {y}) is not selected:\n{styled}"
+                );
+            }
+        }
+        assert!(
+            !buf[(body.x, body.y + 3)]
+                .modifier
+                .contains(Modifier::REVERSED),
+            "and the line after it is not selected"
+        );
+
+        // The cue is centred over the diff pane and says so.
+        app.handle(Action::Copy);
+        let (frame, _) = frame_of(&app, 100, 30);
+        let cue = frame
+            .lines()
+            .find(|l| l.contains(super::super::app::COPIED))
+            .expect(&frame);
+        let at = cue.find(super::super::app::COPIED).unwrap() as u16;
+        assert!(
+            at > main.x && at < main.right(),
+            "the cue is over the diff pane, not the nav: {cue:?}"
+        );
+    }
+
     #[test]
     fn render_confirm_modal_shows_live_counts() {
         let mut app = three_roots();
@@ -2420,6 +2895,106 @@ mod tests {
         // Nothing under the width of the counts alone survives but the counts.
         let (narrow, _) = frame_of(&app, 40, 12);
         assert!(narrow.contains("lastcall  0 repos"), "{narrow}");
+    }
+
+    /// The loading pane (Gate 8 sponsor run ruling): a static line in the first second, no
+    /// digits; from one second the counter line and a ✓ per reported root.
+    #[test]
+    fn render_loading_pane_counts_only_after_one_second() {
+        let mut app = App::new();
+        app.sync_roots(vec![meta("alpha"), meta("beta"), meta("notes")]);
+        app.start_loading();
+        app.apply(lastcall_engine::watcher::EngineEvent::Scanned {
+            root: root("alpha"),
+            rows: 1200,
+        });
+        let (frame, _) = frame_of(&app, 100, 12);
+        assert!(
+            frame.contains("discovered 3 roots, checking status…"),
+            "{frame}"
+        );
+        assert!(
+            !frame.contains("checked"),
+            "no digits in the first second: {frame}"
+        );
+        assert!(!frame.contains('✓'), "{frame}");
+        assert!(!frame.contains("nothing pending"), "{frame}");
+        assert!(
+            frame.contains("lastcall  0 repos"),
+            "nothing is listed: {frame}"
+        );
+
+        app.handle(Action::Tick);
+        let (frame, _) = frame_of(&app, 100, 12);
+        assert!(
+            frame.contains("1 of 3 repos checked · 1,200 files pending so far · 1s"),
+            "{frame}"
+        );
+        let line = |name: &str| {
+            frame
+                .lines()
+                .find(|l| l.contains(&format!("  {name}  ")))
+                .unwrap_or_else(|| panic!("{name} listed: {frame}"))
+                .to_owned()
+        };
+        assert!(line("alpha").contains('✓'), "{frame}");
+        assert!(!line("beta").contains('✓'), "{frame}");
+
+        // The last report ends the hold: the ordinary listing.
+        app.apply(lastcall_engine::watcher::EngineEvent::Scanned {
+            root: root("beta"),
+            rows: 0,
+        });
+        app.apply(pile_event("notes", pile("notes")));
+        let (frame, _) = frame_of(&app, 100, 12);
+        assert!(!frame.contains("checking status"), "{frame}");
+        assert!(frame.contains(NO_SELECTION), "{frame}");
+    }
+
+    /// Gate 8 sponsor run: under a scope whose roots have nothing pending, "nothing pending
+    /// across 4 roots" was a lie — three of them had piles the scope was hiding. The empty
+    /// state names the scope, lists what it covers, and counts what it hides; while the
+    /// verdict is still pending it says that instead.
+    #[test]
+    fn render_empty_state_under_a_scope_names_it_and_counts_the_hidden() {
+        use crate::tui::herdr::{HerdrUpdate, Scope};
+        let mut app = three_roots();
+        app.sync_roots(vec![
+            meta("alpha"),
+            meta("beta"),
+            meta("notes"),
+            meta("quiet"),
+        ]);
+        app.herdr.scoped = true;
+        app.handle(Action::Herdr(HerdrUpdate::Scope(Some(Scope {
+            label: "w2".to_owned(),
+            roots: [root("quiet")].into_iter().collect(),
+        }))));
+        assert_eq!(app.listed_roots().count(), 0);
+        let (frame, _) = frame_of(&app, 100, 12);
+        assert!(frame.contains("nothing pending in w2"), "{frame}");
+        assert!(
+            frame.contains("  quiet  "),
+            "the in-scope root is listed: {frame}"
+        );
+        assert!(
+            !frame.contains("  alpha  "),
+            "the hidden roots are not: {frame}"
+        );
+        assert!(frame.contains("3 repos hidden (w shows all)"), "{frame}");
+        assert!(!frame.contains("nothing pending across"), "{frame}");
+
+        // `w` shows all: the ordinary listing, no empty state at all.
+        app.handle(Action::ScopeToggle);
+        let (frame, _) = frame_of(&app, 100, 12);
+        assert!(frame.contains(NO_SELECTION), "{frame}");
+
+        // Before the first verdict nothing is listed and the pane says why.
+        app.handle(Action::ScopeToggle);
+        app.herdr.scope_pending = true;
+        let (frame, _) = frame_of(&app, 100, 12);
+        assert!(frame.contains(SCOPE_PENDING), "{frame}");
+        assert!(!frame.contains("nothing pending"), "{frame}");
     }
 
     /// Deliverable 8 / ruling 1: the scope notice is mandatory *while the scope is
