@@ -649,7 +649,7 @@ fn spawn_input(
     Ok((stop, handle))
 }
 
-fn root_metas(engine: &mut Engine) -> Vec<RootMeta> {
+fn root_metas(engine: &Engine) -> Vec<RootMeta> {
     engine.roots().iter().map(|r| RootMeta::of(r)).collect()
 }
 
@@ -1127,7 +1127,7 @@ fn spawn_failure(program: &str, e: &io::Error) -> String {
 fn spawn_sync_roots(engine: &Arc<Mutex<Engine>>, tx: mpsc::UnboundedSender<Local>) {
     let engine = engine.clone();
     tokio::spawn(async move {
-        let read = tokio::spawn(async move { blocking(&engine, root_metas).await });
+        let read = tokio::spawn(async move { blocking(&engine, |e| root_metas(e)).await });
         if let Some(metas) = joined(read, &tx, "root sync").await {
             let _ = tx.send(Local::Roots(metas));
         }
@@ -1434,12 +1434,17 @@ pub fn run(
     // life of the process, and the export path is resolved without taking the engine lock.
     let state_dir = engine.layout().state_dir().to_path_buf();
     let clock = engine.options().clock.clone();
+    // The roots too — read while the engine is still ours, not through the lock after
+    // `engine.run`: the watcher's initial `scan_all` takes that lock the moment it starts,
+    // and a `blocking(root_metas)` queued behind it would hold the first frame for the
+    // whole scan (the slow-git view, `just probe-tui-slow`, showed the `discovering…`
+    // line standing for ten seconds and no launch hold at all).
+    let metas = root_metas(&engine);
 
     let mut link = Herdr::default();
     let (outcome, watcher) = runtime.block_on(async {
         let mut watcher = engine.run(timings);
         let outcome: io::Result<ExitCode> = async {
-            let metas = blocking(&watcher.engine, root_metas).await;
             let n = metas.len();
             ui.app.sync_roots(metas);
             ui.app.start_loading();
