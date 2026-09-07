@@ -1025,6 +1025,25 @@ scope: <workspace label> · 3 repos hidden (w shows all)
 `w` toggles it for the session; `scope = "all"` starts with it off. A hidden root is still
 watched — the scope is a view, not a filter on the engine.
 
+Three rules from the Gate 8 sponsor run's launch flash (spec §10 2026-09-06 (iii)):
+
+- **Our own pane never steers the scope.** herdr's `foreground_cwd` is the foreground
+  process group's cwd, and in the pane lastcall runs in that group is lastcall and its `git`
+  children — during the scans it pointed at whichever root was being scanned and the
+  containment fallback followed it. `HERDR_PANE_ID` (also through `Env`) names our pane and
+  `herdr::own_pane_scrubbed` clears its `foreground_cwd` before every derivation
+  (`herdr_fold`); the shell `cwd` still places the pane.
+- **Nothing is listed before the first verdict.** `HerdrView::scope_pending` is set at
+  launch when a scope is configured and a workspace id is known, and `App::is_listed` is
+  false while it holds; the right pane reads `waiting for herdr scope…`. Any verdict clears
+  it (`App::scope_settled`): a `Scope` update — even the `None` the view started with — a
+  standalone start, a failed connect, a link that dropped before its snapshot. Without the
+  hold the first pile was listed for one frame and hidden by the scope on the next.
+- **The empty state under a scope names it.** With a scope active and nothing listed the
+  pane reads `nothing pending in <label>`, the in-scope roots, and
+  `N repos hidden (w shows all)`; `nothing pending across N roots` is only ever true with
+  no scope hiding anything.
+
 ### Configuration
 
 lastcall's own `config.toml`:
