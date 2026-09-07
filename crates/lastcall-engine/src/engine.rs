@@ -968,6 +968,19 @@ impl Engine {
     /// carries the [`Engine::scan_seq`] of the scan that produced it (a failed scan reports
     /// the number of the last one that succeeded; its pile is the error).
     pub fn scan_all(&mut self) -> Vec<(PathBuf, u64, Result<Pile, EngineError>)> {
+        self.scan_all_with(&|_, _| {})
+    }
+
+    /// [`Engine::scan_all`] with a progress hook: `on_scanned(root, rows)` runs on the pool
+    /// thread the moment that root's scan returns (`rows` = pending rows, 0 for a failed
+    /// scan), before the serial apply step. A consumer can count roots as they finish —
+    /// the TUI's `N of M repos checked` — while the piles themselves still land together,
+    /// in path order, with `scan_seq` numbered that way. The hook runs under the engine
+    /// lock: keep it to a counter or a `try_send`.
+    pub fn scan_all_with(
+        &mut self,
+        on_scanned: &(dyn Fn(&Path, usize) + Sync),
+    ) -> Vec<(PathBuf, u64, Result<Pile, EngineError>)> {
         let mut results: BTreeMap<PathBuf, (u64, Result<Pile, EngineError>)> = BTreeMap::new();
         for _ in 0..3 {
             let todo: Vec<PathBuf> = self
@@ -994,6 +1007,7 @@ impl Engine {
             let scanned = parallel_map(states, width, |(p, state)| {
                 let started = std::time::Instant::now();
                 let r = scan_root(state, &ctx);
+                on_scanned(&p, r.as_ref().map(|pile| pile.rows.len()).unwrap_or(0));
                 (p, started, r)
             });
             for (p, started, r) in scanned {
@@ -3303,6 +3317,37 @@ pub(crate) mod tests {
 
     /// R5: discovery re-runs when a scan first sees a nested repo, not on every
     /// `scan_all` while one exists.
+    /// The progress hook fires once per root, as each scan returns, with that root's row
+    /// count — including a nested root discovered on the way, which the retry round scans.
+    #[test]
+    fn engine_scan_all_with_reports_every_root_as_it_finishes() {
+        let repo = FixtureRepo::new("eng-progress").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let nested = repo.path().join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        repo.git_at(&nested, &["init", "-q", "-b", "main"]).unwrap();
+        std::fs::write(nested.join("n"), "n\n").unwrap();
+        repo.write("f1", "pending\n");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let seen = std::sync::Mutex::new(Vec::<(PathBuf, usize)>::new());
+        let results = engine
+            .scan_all_with(&|root, rows| seen.lock().unwrap().push((root.to_path_buf(), rows)));
+        let seen = seen.into_inner().unwrap();
+        assert_eq!(results.len(), 2, "the nested repo became a root");
+        assert_eq!(seen.len(), results.len(), "one report per root: {seen:?}");
+        for (root, _seq, result) in &results {
+            let rows = result.as_ref().map(|p| p.rows.len()).unwrap_or(0);
+            assert!(
+                seen.iter().filter(|(r, n)| r == root && *n == rows).count() == 1,
+                "{root:?} reported with {rows} rows exactly once: {seen:?}"
+            );
+        }
+        assert!(
+            seen.iter().any(|(_, n)| *n > 0),
+            "the pending file is counted: {seen:?}"
+        );
+    }
+
     #[test]
     fn engine_scan_all_rediscovers_only_when_nested_repos_change() {
         let repo = FixtureRepo::new("eng-nested").unwrap();

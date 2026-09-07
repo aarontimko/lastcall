@@ -117,6 +117,14 @@ pub enum EngineEvent {
         root: Option<PathBuf>,
         text: String,
     },
+    /// Progress only: `root`'s scan just returned on the pool with `rows` pending rows; its
+    /// pile follows when the whole `scan_all` lands (piles arrive together, in path order).
+    /// Sent with `try_send` from under the engine lock, so a full channel drops one rather
+    /// than parking a worker — a consumer counts these, never waits on them.
+    Scanned {
+        root: PathBuf,
+        rows: usize,
+    },
 }
 
 /// The running watcher: the event stream, the shared engine, and a stop switch.
@@ -430,7 +438,19 @@ async fn scan_root(
 /// Scan every root in one engine call — the bounded pool — and emit the piles in path
 /// order. One lock for the whole set instead of one per root.
 async fn scan_all_roots(engine: &Arc<Mutex<Engine>>, tx: &mpsc::Sender<EngineEvent>) -> bool {
-    let results = blocking(engine, |e| e.scan_all()).await;
+    let progress = tx.clone();
+    let results = blocking(engine, move |e| {
+        e.scan_all_with(&|root, rows| {
+            // From the pool thread, under the engine lock: never block here — the consumer
+            // may be the one waiting for the lock. A dropped tick costs one ✓ until the
+            // pile lands.
+            let _ = progress.try_send(EngineEvent::Scanned {
+                root: root.to_path_buf(),
+                rows,
+            });
+        })
+    })
+    .await;
     for (root, seq, result) in results {
         let ok = match result {
             Ok(pile) => emit(tx, EngineEvent::Pile { root, seq, pile }).await,
@@ -562,17 +582,14 @@ async fn run_loop(
         roots.clone(),
     ));
     let mut reinstall = false;
-    // Initial scans. The first root is scanned on its own so the first pile reaches the
-    // screen as early as it ever did; the rest go through one `scan_all`, which runs them
-    // on the engine's bounded pool instead of one at a time behind the engine mutex
-    // (Phase 5 deliverable 1b — this loop was the whole gap between `first_pile_ms` and
-    // `first_frame_ms` on the 100-root bench).
-    if let Some(first) = roots.first().map(|r| r.path.clone())
-        && !scan_root(&engine, &tx, first).await
-    {
-        return;
-    }
-    if roots.len() > 1 && !scan_all_roots(&engine, &tx).await {
+    // Initial scans: every root through one `scan_all` on the engine's bounded pool (Phase
+    // 5 deliverable 1b), each root reported as `Scanned` the moment it finishes, the piles
+    // landing together in path order. The first root used to be scanned on its own so its
+    // pile reached the screen early; the Gate 8 sponsor run ruled that frame misleading
+    // (one repo listed as if it were the only one with changes while the rest were still
+    // being scanned), so the TUI lists nothing until every root has reported and the head
+    // start bought nothing — `first_pile_ms` on the bench is now the batch's arrival.
+    if !scan_all_roots(&engine, &tx).await {
         return;
     }
 

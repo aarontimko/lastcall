@@ -111,6 +111,38 @@ impl RootMeta {
 /// One root as the UI sees it: metadata plus the whole last pile (what every accept is
 /// built from: `Rendered::of` on a held row, `AcceptRequest::All` on the held pile), with
 /// the pile's groups split out for the nav.
+/// The launch hold (Gate 8 sponsor run ruling, spec §10 2026-09-07): from the first
+/// `sync_roots` until every root has reported, nothing is listed and the right pane reads
+/// `discovered N roots, checking status…`, so one repo is never shown as if it were the
+/// only one with changes while the rest are still being scanned. After one second the pane
+/// adds `K of N repos checked · F files pending so far · Ss` and a ✓ beside each root
+/// that has reported — a single slow repo is then visible as the one without its ✓. A
+/// report is a `Scanned` tick, the root's pile, or a scan-failed notice; a global notice
+/// (`watching …`) ends the hold outright, whatever has reported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Loading {
+    /// When the hold began, on the app clock (`App::now`).
+    pub started: Instant,
+    /// Roots that have reported → their pending rows.
+    pub checked: BTreeMap<PathBuf, usize>,
+}
+
+impl Loading {
+    /// How long a load runs before the counter line and the ✓s appear: below this a
+    /// static line is all there is, so a fast launch shows one calm frame, not a flash of
+    /// digits.
+    pub const COUNTER_AFTER: Duration = Duration::from_secs(1);
+
+    pub fn files(&self) -> usize {
+        self.checked.values().sum()
+    }
+
+    /// Whether the counter line is shown at `now`.
+    pub fn counting(&self, now: Instant) -> bool {
+        now.duration_since(self.started) >= Self::COUNTER_AFTER
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RootView {
     pub meta: RootMeta,
@@ -942,6 +974,8 @@ pub struct App {
     /// Everything herdr says, and the local ack episodes (Phase 5). Socket-free: the
     /// reducer never sees the client's own types.
     pub herdr: HerdrView,
+    /// The launch hold, until every root has reported. See [`Loading`].
+    pub loading: Option<Loading>,
     /// The one collapsed row whose hunks `e` fetched, if any. A view, never a baseline;
     /// see [`Expansion`].
     pub expanded: Option<Expansion>,
@@ -996,6 +1030,7 @@ impl App {
             edit_gen: 0,
             confirm: None,
             herdr: HerdrView::default(),
+            loading: None,
             expanded: None,
             // The canonical spellings (`shift-a` shows as `A`), as `Keymap::table` gives.
             keymap: Keymap::defaults().table(),
@@ -1018,13 +1053,43 @@ impl App {
     /// it survives the active workspace scope (deliverable 8). `working`/`idle`/`unknown`
     /// never list a root by themselves; they annotate one already listed.
     pub fn is_listed(&self, view: &RootView) -> bool {
-        !self.herdr.scope_pending
+        self.loading.is_none()
+            && !self.herdr.scope_pending
             && self.herdr.in_scope(&view.meta.path)
             && (view.listed()
                 || self
                     .herdr
                     .flag(&view.meta.path)
                     .is_some_and(|f| f.attention()))
+    }
+
+    /// Begin the launch hold over the roots `sync_roots` just installed (see [`Loading`]).
+    /// With no roots there is nothing to wait for.
+    pub fn start_loading(&mut self) {
+        self.loading = (!self.roots.is_empty()).then(|| Loading {
+            started: self.now,
+            checked: BTreeMap::new(),
+        });
+    }
+
+    /// One root has reported during the hold; the hold ends when every known root has.
+    /// `Changed::Yes` while the hold is on (the pane counts), `No` once it is over.
+    fn root_reported(&mut self, root: PathBuf, rows: usize) -> Changed {
+        let Some(loading) = &mut self.loading else {
+            return Changed::No;
+        };
+        loading.checked.insert(root, rows);
+        if self.roots.keys().all(|r| loading.checked.contains_key(r)) {
+            self.end_loading();
+        }
+        Changed::Yes
+    }
+
+    /// End the launch hold: list the roots.
+    fn end_loading(&mut self) {
+        if self.loading.take().is_some() {
+            self.reconcile_selection();
+        }
     }
 
     /// The scope verdict is in (any verdict — see `HerdrView::scope_pending`): list the
@@ -1238,7 +1303,12 @@ impl App {
     /// Fold one engine event in. `Head` and `RootsChanged` ask the loop for `SyncRoots`.
     pub fn apply(&mut self, event: EngineEvent) -> (Changed, Option<Effect>) {
         match event {
-            EngineEvent::Pile { root, seq, pile } => (self.apply_pile(root, seq, pile), None),
+            EngineEvent::Pile { root, seq, pile } => {
+                let rows = pile.rows.len();
+                let changed = self.apply_pile(root.clone(), seq, pile);
+                (changed.or(self.root_reported(root, rows)), None)
+            }
+            EngineEvent::Scanned { root, rows } => (self.root_reported(root, rows), None),
             EngineEvent::Head {
                 root,
                 from,
@@ -1277,6 +1347,16 @@ impl App {
                 (result, effect)
             }
             EngineEvent::Notice { root, text } => {
+                match &root {
+                    // A failed scan is still that root's report.
+                    Some(r) if text.starts_with("scan failed") => {
+                        self.root_reported(r.clone(), 0);
+                    }
+                    // Every global notice comes after the initial scans (`watching …`,
+                    // `watch installation failed`): whatever has not reported never will.
+                    None => self.end_loading(),
+                    Some(_) => {}
+                }
                 let text = match root.and_then(|r| self.roots.get(&r).map(|v| v.meta.name.clone()))
                 {
                     Some(name) => format!("{name}: {text}"),
@@ -3149,7 +3229,12 @@ impl App {
                     Some(_) => Changed::Yes,
                     None => Changed::No,
                 };
-                if cue_went { Changed::Yes } else { status }
+                // The loading pane carries a seconds counter.
+                if cue_went || self.loading.is_some() {
+                    Changed::Yes
+                } else {
+                    status
+                }
             }
         };
         (changed, None)
@@ -5664,6 +5749,77 @@ mod tests {
 
     /// Deliverable 8: the scope hides the roots outside it, the notice counts exactly what
     /// it hid, and `w` shows all. Without a derived scope `w` does nothing at all.
+    /// The launch hold (Gate 8 sponsor run ruling): nothing is listed until every root has
+    /// reported — by a `Scanned` tick, its pile, or a scan-failed notice; a global notice
+    /// ends the hold outright; no roots means no hold; the clock redraws while it is on.
+    #[test]
+    fn app_loading_holds_the_listing_until_every_root_reports() {
+        let launched = || {
+            let mut app = App::new();
+            app.sync_roots(vec![meta("alpha"), meta("beta")]);
+            app.start_loading();
+            assert!(app.loading.is_some());
+            app
+        };
+        let listed = |app: &App| {
+            app.listed_roots()
+                .map(|v| v.meta.name.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let mut app = launched();
+        assert_eq!(
+            app.handle(Action::Tick).0,
+            Changed::Yes,
+            "the counter ticks"
+        );
+        app.apply(pile_event("alpha", pile("alpha")));
+        assert!(listed(&app).is_empty(), "held: beta has not reported");
+        assert_eq!(
+            app.loading.as_ref().unwrap().checked.get(&root("alpha")),
+            Some(&pile("alpha").rows.len())
+        );
+        assert_eq!(
+            app.apply(EngineEvent::Scanned {
+                root: root("beta"),
+                rows: 3
+            })
+            .0,
+            Changed::Yes
+        );
+        assert!(app.loading.is_none(), "every root reported");
+        assert_eq!(listed(&app), vec!["alpha".to_owned()]);
+        assert_eq!(
+            app.apply(EngineEvent::Scanned {
+                root: root("beta"),
+                rows: 3
+            }),
+            (Changed::No, None),
+            "a tick after the hold is nothing"
+        );
+
+        // A failed scan is that root's report; a global notice ends the hold outright.
+        let mut app = launched();
+        app.apply(EngineEvent::Notice {
+            root: Some(root("alpha")),
+            text: "scan failed: boom".into(),
+        });
+        assert_eq!(
+            app.loading.as_ref().unwrap().checked.get(&root("alpha")),
+            Some(&0)
+        );
+        app.apply(EngineEvent::Notice {
+            root: None,
+            text: "watching /W (2 roots)".into(),
+        });
+        assert!(app.loading.is_none());
+
+        // No roots: nothing to wait for.
+        let mut app = App::new();
+        app.start_loading();
+        assert!(app.loading.is_none());
+    }
+
     /// The Gate 8 sponsor run's launch flash: the first pile landed before the first scope
     /// verdict, was listed, and was hidden a moment later. While `scope_pending` nothing is
     /// listed; the first verdict lists — even a `None` equal to the starting value — and so

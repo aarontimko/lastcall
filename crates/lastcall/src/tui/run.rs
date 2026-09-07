@@ -1442,6 +1442,7 @@ pub fn run(
             let metas = blocking(&watcher.engine, root_metas).await;
             let n = metas.len();
             ui.app.sync_roots(metas);
+            ui.app.start_loading();
             ui.app.set_status(format!(
                 "scanning {n} root{}…",
                 if n == 1 { "" } else { "s" }

@@ -173,6 +173,18 @@ impl Bench {
     }
 }
 
+/// The launch hold's counter line shows at least one root reported: `K of N repos
+/// checked` with `K` ≥ 1. The counter appears one second into the hold, so the earliest
+/// this can be true is ~1,000 ms after spawn (`Loading::COUNTER_AFTER`).
+fn first_checked(s: &vt100::Screen) -> bool {
+    let text = s.contents();
+    text.lines().any(|l| {
+        l.trim_start()
+            .split_once(" of ")
+            .is_some_and(|(k, rest)| rest.contains("repos checked") && k != "0")
+    })
+}
+
 /// The status bar reads `watching …`: the watch is installed and the post-install
 /// rescans are done (before that it reads `scanning N roots…`).
 fn watching(s: &vt100::Screen) -> bool {
@@ -288,11 +300,13 @@ fn bench_s1_clones_100_rows_4000() {
     bench(S, "scan_all_ms", wall.as_millis());
     bench(S, "scan_all_spawns", spawns);
 
-    // Spawn → the first root listed (the first pile), then → every root in the header.
+    // Spawn → the first root reported on the launch hold's counter (`N of 100 repos
+    // checked`, which the pane shows from one second in — so this floors at ~1,000 ms),
+    // then → every root in the header (the hold ends, the listing lands as one frame).
     let t = Instant::now();
     let mut pty = b.tui(&["tui", "--poll", "1"]);
-    pty.wait_for(LONG, |s| s.contents().contains("1 repo · 40 files"))
-        .unwrap_or_else(|e| panic!("first pile: {e}"));
+    pty.wait_for(LONG, first_checked)
+        .unwrap_or_else(|e| panic!("first root checked: {e}"));
     bench(S, "first_pile_ms", t.elapsed().as_millis());
     pty.wait_for_text("100 repos · 4,000 files", LONG)
         .unwrap_or_else(|e| panic!("header: {e}"));
@@ -368,8 +382,8 @@ fn bench_s1h_clones_50_files_80_rows_4000() {
 
     let t = Instant::now();
     let mut pty = b.tui(&["tui", "--poll", "1"]);
-    pty.wait_for(LONG, |s| s.contents().contains("1 repo · 80 files"))
-        .unwrap_or_else(|e| panic!("first pile: {e}"));
+    pty.wait_for(LONG, first_checked)
+        .unwrap_or_else(|e| panic!("first root checked: {e}"));
     bench(S, "first_pile_ms", t.elapsed().as_millis());
     pty.wait_for_text("50 repos · 4,000 files", LONG)
         .unwrap_or_else(|e| panic!("header: {e}"));

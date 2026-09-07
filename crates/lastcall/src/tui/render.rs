@@ -855,7 +855,34 @@ fn render_main(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
     let mut lines: Vec<Line> = Vec::new();
     match &app.selection {
         None => {
-            if app.herdr.scope_pending {
+            if let Some(loading) = &app.loading {
+                // The launch hold (`Loading`): a static line, then after a second the
+                // counter and a ✓ per reported root — the slow one is the one without.
+                lines.push(Line::from(format!(
+                    "discovered {}, checking status…",
+                    plural(app.roots.len(), "root")
+                )));
+                let counting = loading.counting(app.now);
+                if counting {
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "{} of {} checked · {} pending so far · {}s",
+                            loading.checked.len(),
+                            plural(app.roots.len(), "repo"),
+                            plural(loading.files(), "file"),
+                            app.now.duration_since(loading.started).as_secs()
+                        ),
+                        dim(),
+                    )));
+                }
+                for view in app.roots.values() {
+                    let mut text = format!("  {}  {}", view.meta.name, view.meta.branch_label());
+                    if counting && loading.checked.contains_key(&view.meta.path) {
+                        text.push_str("  ✓");
+                    }
+                    lines.push(Line::from(text));
+                }
+            } else if app.herdr.scope_pending {
                 // Deliberately not "nothing pending": the piles may be in and held back.
                 lines.push(Line::from(Span::styled(SCOPE_PENDING, dim())));
             } else if let (Some(scope), hidden @ 1..) = (
@@ -2868,6 +2895,60 @@ mod tests {
         // Nothing under the width of the counts alone survives but the counts.
         let (narrow, _) = frame_of(&app, 40, 12);
         assert!(narrow.contains("lastcall  0 repos"), "{narrow}");
+    }
+
+    /// The loading pane (Gate 8 sponsor run ruling): a static line in the first second, no
+    /// digits; from one second the counter line and a ✓ per reported root.
+    #[test]
+    fn render_loading_pane_counts_only_after_one_second() {
+        let mut app = App::new();
+        app.sync_roots(vec![meta("alpha"), meta("beta"), meta("notes")]);
+        app.start_loading();
+        app.apply(lastcall_engine::watcher::EngineEvent::Scanned {
+            root: root("alpha"),
+            rows: 1200,
+        });
+        let (frame, _) = frame_of(&app, 100, 12);
+        assert!(
+            frame.contains("discovered 3 roots, checking status…"),
+            "{frame}"
+        );
+        assert!(
+            !frame.contains("checked"),
+            "no digits in the first second: {frame}"
+        );
+        assert!(!frame.contains('✓'), "{frame}");
+        assert!(!frame.contains("nothing pending"), "{frame}");
+        assert!(
+            frame.contains("lastcall  0 repos"),
+            "nothing is listed: {frame}"
+        );
+
+        app.handle(Action::Tick);
+        let (frame, _) = frame_of(&app, 100, 12);
+        assert!(
+            frame.contains("1 of 3 repos checked · 1,200 files pending so far · 1s"),
+            "{frame}"
+        );
+        let line = |name: &str| {
+            frame
+                .lines()
+                .find(|l| l.contains(&format!("  {name}  ")))
+                .unwrap_or_else(|| panic!("{name} listed: {frame}"))
+                .to_owned()
+        };
+        assert!(line("alpha").contains('✓'), "{frame}");
+        assert!(!line("beta").contains('✓'), "{frame}");
+
+        // The last report ends the hold: the ordinary listing.
+        app.apply(lastcall_engine::watcher::EngineEvent::Scanned {
+            root: root("beta"),
+            rows: 0,
+        });
+        app.apply(pile_event("notes", pile("notes")));
+        let (frame, _) = frame_of(&app, 100, 12);
+        assert!(!frame.contains("checking status"), "{frame}");
+        assert!(frame.contains(NO_SELECTION), "{frame}");
     }
 
     /// Gate 8 sponsor run: under a scope whose roots have nothing pending, "nothing pending

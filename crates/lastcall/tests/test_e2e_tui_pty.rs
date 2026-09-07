@@ -311,8 +311,10 @@ fn rows_listed(s: &vt100::Screen) -> bool {
 }
 
 /// Wait for the first piles; returns how long they took. Also proves the first frame was
-/// the empty state with the `scanning` status: in the raw transcript that text precedes
-/// the first file row.
+/// the launch hold (`discovered 3 roots, checking status…`) with the `scanning` status:
+/// in the raw transcript that text precedes the first file row — and the empty state
+/// (`nothing pending across 3 roots`) never does, since every root here has rows (the
+/// Gate 8 sponsor run's ruling: no repo is listed until every root has reported).
 /// The status row reads `watching <parent> (3 roots)`: the FSEvents watch is installed and
 /// its gap-closing rescans are done, so from here a file change is found by the live watch
 /// and its debounce rather than by a startup rescan. The temp path is long, so only the
@@ -340,9 +342,14 @@ fn wait_first_piles(pty: &mut PtyTui) -> Duration {
         "the scanning status ({scanning}) precedes the first row ({first_row})"
     );
     assert!(
-        find_words(&raw, &["nothing", "pending", "across", "3", "roots"])
+        find_words(&raw, &["discovered", "3", "roots,", "checking", "status…"])
             .is_some_and(|i| i < first_row),
-        "the first frame is the empty state"
+        "the first frame is the launch hold"
+    );
+    assert!(
+        find_words(&raw, &["nothing", "pending", "across", "3", "roots"])
+            .is_none_or(|i| i > first_row),
+        "the empty state never shows before the rows"
     );
     let alt_on = find(&raw, ALT_SCREEN_ON).expect("alternate screen on");
     assert!(find(&raw, MOUSE_ON).is_some(), "mouse capture is on");

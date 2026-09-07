@@ -146,6 +146,15 @@ fn print_event(json: bool, event: &EngineEvent) {
                 ),
             },
         ),
+        EngineEvent::Scanned { root, rows } => print_line(
+            json,
+            &serde_json::json!({
+                "event": "scanned",
+                "root": root,
+                "rows": rows,
+            }),
+            || format!("{}  scanned · {rows} pending", name(root)),
+        ),
         EngineEvent::RootsChanged(changed) => print_line(
             json,
             &serde_json::json!({
