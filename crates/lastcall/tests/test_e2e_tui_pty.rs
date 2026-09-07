@@ -2149,7 +2149,7 @@ fn pty_editor_save_pends_nothing() {
     open_parse_rs_hunk_2(&mut pty);
     let t = Instant::now();
     pty.send(b"I").expect("shift-i");
-    pty.wait_for_text("mark as reviewed?", LONG)
+    pty.wait_for_text("mark every hunk in it reviewed?", LONG)
         .unwrap_or_else(|e| panic!("the blessing confirm after the editor exits: {e}"));
     note(&format!(
         "PTY editor: save to confirm in {:.3?}",
@@ -2183,7 +2183,7 @@ fn pty_editor_save_pends_nothing() {
     pty.wait_for_text("@@ -", Duration::from_secs(5))
         .unwrap_or_else(|e| panic!("f1's diff: {e}"));
     pty.send(b"I").expect("shift-i");
-    pty.wait_for_text("f1 changed while your editor was open", LONG)
+    pty.wait_for_text("f1 edited — mark every hunk in it reviewed?", LONG)
         .unwrap_or_else(|e| panic!("the blessing confirm for f1: {e}"));
     pty.send(b"\x1b").expect("esc");
     pty.wait_for(OVERLOADED, |s| {
@@ -2377,7 +2377,7 @@ fn pty_editor_key_typed_during_the_editor_is_not_stuck() {
     ));
     let screen = pty.screen_text();
     assert!(
-        !screen.contains("mark as reviewed?"),
+        !screen.contains("mark every hunk in it reviewed?"),
         "the confirm is gone:\n{screen}"
     );
     assert!(

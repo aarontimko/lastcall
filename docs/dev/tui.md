@@ -660,12 +660,16 @@ nothing else. A child that ran — whatever its exit status; an editor that quit
 still wrote, or did not — produces `Effect::EditorReturned`, and the answer table is in
 [`engine.md`](engine.md) under "The blessing on `$EDITOR` return": `no change`, one of the
 four `left pending` sentences, or the confirm
-`<path> changed while your editor was open — mark as reviewed?` (`y`/`Enter` → an accept of
+`<path> edited — mark every hunk in it reviewed?` (`y`/`Enter` → an accept of
 the live row, status `reviewed <path>`; `n`/`Esc` → nothing written, the row stays pending).
 
-**What that confirm guards, and what it does not.** lastcall cannot tell who wrote the bytes
-on the disk — the editor's save and an agent's write look identical from outside — but the
-*user* knows whether they saved. So a prompt after a session in which they saved nothing is
+**Why the question is about intent, not detection.** The Gate 8 sponsor run read the first
+wording (`changed while your editor was open`) as "someone else touched this" after an
+ordinary save. lastcall only knows the bytes differ from when the editor opened; it cannot
+tell who wrote them — the editor's save and an agent's write look identical from outside —
+but the *user* knows whether they saved, and the whole file was open, so the honest question
+is whether every hunk in it is now reviewed. No count is shown: the row on screen may predate
+the save. So a prompt after a session in which they saved nothing is
 how an agent's write announces itself, and answering `n` costs nothing but a row that stays
 pending. The guard for the other half — an agent writing the file **while** the session is
 open — is not lastcall's at all: it is the editor's own changed-on-disk warning (vim's

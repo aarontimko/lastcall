@@ -951,7 +951,7 @@ fn tui_editor_return_confirm() {
     assert_eq!(effect, None, "the question comes first");
     let (frame, _) = draw(&app, W, H);
     assert!(
-        frame.contains("f1 changed while your editor was open — mark as reviewed?"),
+        frame.contains("f1 edited — mark every hunk in it reviewed?"),
         "{frame}"
     );
     assert!(frame.contains("y / ⏎ confirm    n / Esc cancel"), "{frame}");

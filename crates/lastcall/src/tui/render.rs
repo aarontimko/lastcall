@@ -1655,12 +1655,15 @@ fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
 /// this frame: `Accept all <N> files in <root>?` (one root) or `across <R> repos?`, then
 /// `<g> grouped upstream · <c> collapsed` only when either is non-zero. A restore covers one
 /// row, so it has one question row and nothing to tally (F11). So does the post-`$EDITOR`
-/// blessing (Phase 8 deliverable 3), whose question names the path and nothing else: the
-/// user is being asked about their own editor session, not about a count.
+/// blessing (Phase 8 deliverable 3), whose question names the path and nothing else. It is
+/// framed as *intent* ("edited — mark every hunk reviewed?"), never as detection: lastcall
+/// only knows the bytes differ from when the editor opened, not who wrote them, and the
+/// sponsor's Gate 8 run read the earlier "changed while your editor was open" as a claim that
+/// someone else had. No hunk count either — the row on screen may predate the save.
 fn render_confirm(app: &App, buf: &mut Buffer, area: Rect) {
     if let Some(path) = app.confirm_bless() {
         let question = format!(
-            "{} changed while your editor was open — mark as reviewed?",
+            "{} edited — mark every hunk in it reviewed?",
             String::from_utf8_lossy(path)
         );
         return confirm_box(" review ", vec![question], buf, area);
