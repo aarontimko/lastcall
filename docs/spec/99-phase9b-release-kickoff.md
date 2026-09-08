@@ -1,4 +1,8 @@
-# Phase 9 Kickoff Prompt (operational artifact, not design)
+# Phase 9b Kickoff Prompt — the release half (operational artifact, not design)
+
+**PARKED 2026-09-07 — rulings still PROPOSED.** The sponsor split Phase 9: the behaviour and TUI items he ruled on are [`98-phase9a-kickoff.md`](98-phase9a-kickoff.md) (FROZEN, in flight); this file keeps everything else exactly as folded at `ffeff5f` — `lastcall update`, the release workflow, the container smoke, the docs, bench run G, the deferral-ledger review, repo visibility (P13) — for a later kickoff, when it will be re-based on 9a's merged main and re-reviewed. Three items are **parked as a named circle-back** (§3.5 "herdr scope: is it over-complicated?"): deliverable 8 / P6 (sibling-pane scope jitter), design-pass D7 (the scope notice) and D10 plus the status-line age concept. Superseded by 9a: deliverable 0 (the ledger discrepancy — closed, cause = the sponsor's `LASTCALL_STATE_DIR=$(mktemp -d)` invocation), deliverable 1 (`status` names its store — built in 9a), deliverable 6/7 and P5 (replaced by 9a ruling R2: every repo stays listed, cursor to the repo row, `t` hides empty repos), D1 (replaced by R4), D2–D5, D9, D12 (built in 9a), D8 (rejected: keep as built). File and line references below are at `15b2db0` and will drift. The original header follows.
+
+# Phase 9 Kickoff Prompt (operational artifact, not design) — as folded at `ffeff5f`
 
 **Rulings: PROPOSED 2026-09-07 — the adversarial design review (F1–F27) and the Design pass (D1–D25) are folded (see "Design review fold"); pending the sponsor's verdicts on P1–P13 and D1–D12. Nothing below is frozen; the "Rulings" section is the orchestrator's Rec/Alt draft. Changes to this file after the freeze are orchestrator-only and dated.**
 
