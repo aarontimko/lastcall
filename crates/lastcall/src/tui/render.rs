@@ -925,45 +925,52 @@ fn render_main(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
             } else if app.herdr.scope_pending {
                 // Deliberately not "nothing pending": the piles may be in and held back.
                 lines.push(Line::from(Span::styled(SCOPE_PENDING, dim())));
-            } else if let (Some(scope), hidden @ 1..) = (
-                app.herdr
-                    .active_scope()
-                    .filter(|_| app.listed_roots().next().is_none()),
-                app.scoped_out(),
-            ) {
-                // Under a scope, the roots it hides are not "nothing pending": name the
-                // scope, list what it covers, and say how many it hides.
-                lines.push(Line::from(format!("nothing pending in {}", scope.label)));
-                for view in app
-                    .roots
-                    .values()
-                    .filter(|v| scope.roots.contains(&v.meta.path))
-                {
-                    lines.push(Line::from(format!(
-                        "  {}  {}",
-                        view.meta.name,
-                        view.meta.branch_label()
-                    )));
-                }
-                lines.push(Line::from(Span::styled(
-                    format!("{} hidden (w shows all)", plural(hidden, "repo")),
-                    dim(),
-                )));
-            } else if app.listed_roots().next().is_none() {
-                lines.push(Line::from(format!(
-                    "nothing pending across {}",
-                    plural(app.roots.len(), "root")
-                )));
-                for view in app.roots.values() {
-                    let mut text = format!("  {}  {}", view.meta.name, view.meta.branch_label());
-                    for label in [view.meta.badge_label(), view.meta.in_progress_label()]
-                        .into_iter()
-                        .flatten()
+            } else if app.listed_roots().all(|v| v.rows().is_empty()) {
+                // Nothing on the nav has a file row — including the case where the nav is
+                // empty. This pane is then the **empty state**, not a prompt: since
+                // Amendment v1.9 the ordinary all-clean launch lists three empty repo
+                // rows and selects none of them, and `select a file (↑↓ or click)` over
+                // three `0 files` rows invites choosing a file that does not exist
+                // (verifier (a) F5).
+                if let Some(scope) = app.herdr.active_scope() {
+                    // Under a scope, the roots it hides are not "nothing pending": name the
+                    // scope, list what it covers, and say how many it hides. Gated on the
+                    // scope alone — while it was gated on `scoped_out() >= 1` a scope that
+                    // hid only empty repos fell through to the global text, which then
+                    // listed the very repos the scope was hiding (verifier (a) F6).
+                    lines.push(Line::from(format!("nothing pending in {}", scope.label)));
+                    for view in app
+                        .roots
+                        .values()
+                        .filter(|v| scope.roots.contains(&v.meta.path))
                     {
-                        text.push_str("  ");
-                        text.push_str(&label);
+                        lines.push(Line::from(format!(
+                            "  {}  {}",
+                            view.meta.name,
+                            view.meta.branch_label()
+                        )));
                     }
-                    lines.push(Line::from(text));
+                    lines.push(Line::from(Span::styled(
+                        format!("{} hidden (w shows all)", plural(app.scoped_out(), "repo")),
+                        dim(),
+                    )));
+                } else {
+                    lines.push(Line::from(format!(
+                        "nothing pending across {}",
+                        plural(app.roots.len(), "repo")
+                    )));
+                    for view in app.roots.values() {
+                        let mut text =
+                            format!("  {}  {}", view.meta.name, view.meta.branch_label());
+                        for label in [view.meta.badge_label(), view.meta.in_progress_label()]
+                            .into_iter()
+                            .flatten()
+                        {
+                            text.push_str("  ");
+                            text.push_str(&label);
+                        }
+                        lines.push(Line::from(text));
+                    }
                 }
             } else {
                 lines.push(Line::from(Span::styled(NO_SELECTION, dim())));
@@ -2921,7 +2928,7 @@ mod tests {
     fn render_empty_app_shows_empty_state_and_hints() {
         let app = App::new();
         let (frame, styles) = frame_of(&app, 100, 12);
-        assert!(frame.contains("nothing pending across 0 roots"), "{frame}");
+        assert!(frame.contains("nothing pending across 0 repos"), "{frame}");
         assert!(
             frame.contains("lastcall  0 repos · 0 files · 0 hunks"),
             "{frame}"
@@ -3007,6 +3014,47 @@ mod tests {
         let (frame, _) = frame_of(&app, 100, 12);
         assert!(!frame.contains("checking status"), "{frame}");
         assert!(frame.contains(NO_SELECTION), "{frame}");
+    }
+
+    /// Verifier (a) F5 and F6. F5: the sponsor's most common launch is "everything is
+    /// clean", and since v1.9 that frame lists three empty repo rows with nothing selected
+    /// — where `select a file (↑↓ or click)` invited choosing a file that does not exist.
+    /// F6: a scope that hides only *empty* repos used to fall through the scoped arm's
+    /// `scoped_out() >= 1` gate to the global text, which then listed the very repos the
+    /// scope was hiding.
+    #[test]
+    fn render_all_clean_frame_is_the_empty_state_not_a_prompt() {
+        use crate::tui::herdr::{HerdrUpdate, Scope};
+        let mut app = three_roots();
+        for name in ["alpha", "beta", "notes"] {
+            app.apply(pile_event_seq(
+                name,
+                1,
+                lastcall_engine::scan::Pile::default(),
+            ));
+        }
+        assert_eq!(app.listed_roots().count(), 3, "every repo stays listed");
+        assert_eq!(app.selection, None, "and none of them is selected");
+        let (frame, _) = frame_of(&app, 100, 12);
+        assert!(frame.contains("nothing pending across 3 repos"), "{frame}");
+        assert!(!frame.contains(NO_SELECTION), "{frame}");
+
+        app.herdr.scoped = true;
+        app.handle(Action::Herdr(HerdrUpdate::Scope(Some(Scope {
+            label: "w1".to_owned(),
+            roots: [root("beta")].into_iter().collect(),
+        }))));
+        let (frame, _) = frame_of(&app, 100, 12);
+        assert!(frame.contains("nothing pending in w1"), "{frame}");
+        assert!(frame.contains("2 repos hidden (w shows all)"), "{frame}");
+        assert!(
+            !frame.contains("nothing pending across"),
+            "never the global text under a scope: {frame}"
+        );
+        assert!(
+            !frame.contains("  alpha  ") && !frame.contains("  notes  "),
+            "the repos the scope hides are not listed: {frame}"
+        );
     }
 
     /// Gate 8 sponsor run: under a scope whose roots have nothing pending, "nothing pending

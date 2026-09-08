@@ -183,8 +183,9 @@ fn snapshot(name: &str, app: &App, w: u16, h: u16) {
 
 /// §6.7 (Amendment v1.9): a repo with nothing pending is a nav row, not an absence — the
 /// one clean repo here is a dim name-and-branch row with no file rows under it. The
-/// `None` arm's `nothing pending across N` is now the zero-repos-listed case, which `t`
-/// reaches by hiding the only repo there is.
+/// `None` arm's `nothing pending across N repos` is what a frame with no *pending* row
+/// says — the one repo here is empty, so it says it whether or not `t` has taken the row
+/// off the nav (verifier (a) F5).
 #[test]
 fn tui_empty_state() {
     let scene = Scene::clean();
@@ -194,10 +195,13 @@ fn tui_empty_state() {
     assert!(app.roots.values().all(|v| !v.listed()), "nothing pending");
     snapshot("tui_empty_state", &app, W, H);
 
+    let (frame, _) = draw(&app, W, H);
+    assert!(frame.contains("nothing pending across 1 repo"), "{frame}");
+
     app.handle(Action::HideEmpty);
     assert!(app.nav_entries().is_empty());
     let (frame, _) = draw(&app, W, H);
-    assert!(frame.contains("nothing pending across"), "{frame}");
+    assert!(frame.contains("nothing pending across 1 repo"), "{frame}");
 }
 
 #[test]
@@ -1094,9 +1098,9 @@ fn tui_accept_all_no_confirm_at_10() {
     );
     assert!(engine.scan(&alpha).expect("scan").is_empty());
     let (frame, _) = draw(&app, W, H);
-    // Not the `None` arm's `nothing pending across N` any more — three repos are listed,
-    // so the pane is the no-selection prompt over three empty repo rows (v1.9).
-    assert!(!frame.contains("nothing pending across"), "{frame}");
+    // Three repos are listed and every one of them is empty, so the pane is the empty
+    // state over three empty repo rows — not `select a file` (v1.9; verifier (a) F5).
+    assert!(frame.contains("nothing pending across 3 repos"), "{frame}");
     assert!(frame.contains("alpha"), "{frame}");
     snapshot("tui_accept_all_no_confirm_at_10", &app, W, H);
 }

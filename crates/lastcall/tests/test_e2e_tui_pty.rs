@@ -313,7 +313,7 @@ fn rows_listed(s: &vt100::Screen) -> bool {
 /// Wait for the first piles; returns how long they took. Also proves the first frame was
 /// the launch hold (`discovered 3 roots, checking status…`) with the `scanning` status:
 /// in the raw transcript that text precedes the first file row — and the empty state
-/// (`nothing pending across 3 roots`) never does, since every root here has rows (the
+/// (`nothing pending across 3 repos`) never does, since every root here has rows (the
 /// Gate 8 sponsor run's ruling: no repo is listed until every root has reported).
 /// The status row reads `watching <parent> (3 roots)`: the FSEvents watch is installed and
 /// its gap-closing rescans are done, so from here a file change is found by the live watch
@@ -347,7 +347,7 @@ fn wait_first_piles(pty: &mut PtyTui) -> Duration {
         "the first frame is the launch hold"
     );
     assert!(
-        find_words(&raw, &["nothing", "pending", "across", "3", "roots"])
+        find_words(&raw, &["nothing", "pending", "across", "3", "repos"])
             .is_none_or(|i| i > first_row),
         "the empty state never shows before the rows"
     );
@@ -939,9 +939,10 @@ fn pty_accept_loop_and_restart() {
     );
     note(&format!("PTY relaunch: scanned after {:.3?}", t.elapsed()));
     let text = pty.screen_text();
-    // Amendment v1.9: every repo stays on the nav, so this is three name-and-branch rows
-    // and the no-selection prompt — `nothing pending across N` is the zero-listed case now.
-    assert!(!text.contains("nothing pending across"), "{text}");
+    // Amendment v1.9: every repo stays on the nav, so this is three name-and-branch rows;
+    // and every one of them is empty, so the pane is the empty state rather than a prompt
+    // to select a file that is not there (verifier (a) F5).
+    assert!(text.contains("nothing pending across 3 repos"), "{text}");
     assert!(text.contains("3 repos · 0 files · 0 hunks"), "{text}");
     let raw = pty.raw();
     for row in ["M f1", "M f2", "M f3", "A g01", "A u1", "M n2.md"] {

@@ -4,8 +4,8 @@ expression: frame
 ---
 "lastcall  1 repo · 0 files · 0 hunks  standalone  [Accept All]                            watching W"
 "┌──────────────────────────┬───────────────────────────────────────────────────────────────────────┐"
-"│solo                      │select a file (↑↓ or click) · ? for help                               │"
-"│  main · 0 files          │                                                                       │"
+"│solo                      │nothing pending across 1 repo                                          │"
+"│  main · 0 files          │  solo  main                                                           │"
 "│                          │                                                                       │"
 "│                          │                                                                       │"
 "│                          │                                                                       │"
