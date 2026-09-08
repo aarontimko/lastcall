@@ -987,9 +987,9 @@ fn pty_accept_loop_and_restart() {
 /// live, and launch sets one (`watching <parent> (3 roots)`), so the hint-line half waits
 /// out `app::STATUS_TTL` (30s) once — which also puts it before the accept, while every
 /// repo still has rows and `t` therefore hides nothing but the label. And the scene widens
-/// the terminal for it: while the hint tiers are all-or-nothing (decision (1);
-/// deliverable 4 replaces them with a drop order) the toggle sits on the widest tier, so
-/// the 100-column default does not carry it.
+/// the terminal for it: the toggle is near the middle of deliverable 4's drop order, so the
+/// scene reads it at a width where the whole line fits rather than depending on what the
+/// 100-column default happens to keep.
 #[test]
 fn pty_accept_last_file_lands_on_the_repo_row_then_t_hides_it() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());

@@ -159,11 +159,13 @@ effective values and any notices). Every key is optional and an unknown key is a
 | `collapsed_globs` | the nine common lockfiles | paths shown as one collapsed row instead of hunks: `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `Cargo.lock`, `poetry.lock`, `uv.lock`, `Gemfile.lock`, `go.sum`, `composer.lock` |
 | `collapse_size_bytes` | `524288` (512 KiB) | files **larger** than this collapse too; must be > 0. A file with a NUL byte in its first 8,000 is binary and collapses whatever this says |
 | `ignore_globs` | `.git/**`, `node_modules/**`, `target/**`, `vendor/**`, `.venv/**` | scope the filesystem watcher only — an ignored path never wakes a scan, but the next scan still shows a tracked edit under it |
+| `hide_empty_repos` | `false` | what the TUI's `t` toggle starts as: `false` shows **every** repo under a parent dir on the nav, pending or not; `true` opens with the repos that have nothing pending hidden (one carrying a herdr attention flag stays). `t` flips it for the session; the headless `status` commands never filtered by pending state and are unaffected |
 
 ```toml
 parent_dirs = ["/Users/me/src"]
 draft_dirs = ["_drafts/**", "notes"]
 draft_initial = "seen"
+hide_empty_repos = false
 collapsed_globs = ["package-lock.json", "Cargo.lock", "*.min.js"]
 collapse_size_bytes = 524288
 ```

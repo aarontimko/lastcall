@@ -13,7 +13,7 @@ child and never falls back to a `herdr` on `PATH`.
 |---|---|---|---|
 | unit | `just test-unit` = `cargo test --workspace --lib --bins` | in-module `#[cfg(test)]` only | everywhere, incl. macOS CI |
 | integration | `just test-integration` = `cargo test --workspace --test 'test_integration_*'` | real git; the four-test real-herdr subset when `LASTCALL_TEST_HERDR_BIN` is set (`just test-integration-herdr` sets it from the pinned release; `just test-integration-herdr-latest` from herdr's newest) | CI via `just test-integration-herdr`; Linux blocking, macOS best-effort; the latest-release run is the weekly `herdr-compat` workflow, never a blocker |
-| e2e | `just test-e2e` = `cargo test --workspace --test 'test_e2e_*'` | the TUI: twenty-nine `TestBackend` snapshot scenes and ten PTY scenes against the built binary (`docs/dev/tui.md`) | everywhere; the PTY file skips with a visible reason only where no pseudo-terminal can be opened |
+| e2e | `just test-e2e` = `cargo test --workspace --test 'test_e2e_*'` | the TUI: fifty-two `TestBackend` snapshot scenes and twenty-five PTY scenes against the built binary (`docs/dev/tui.md`) | everywhere; the PTY file skips with a visible reason only where no pseudo-terminal can be opened |
 | bench | `just bench` = release build, then `cargo test --release -p lastcall --test test_bench -- --ignored --nocapture --test-threads=1` | the four `#[ignore]`d baseline scenarios (`docs/dev/bench.md`); **not a gate** in Phase 4 — targets are set at the Phase 9 kickoff | by hand, on the machine named in `bench.md` |
 | pre-push | `just test-prepush` = `just test-integration`, then `PROPTEST_CASES=64 cargo test -p lastcall-engine --lib proptests` | the integration tier plus the two store-backed proptests at 64 cases (the unit tier runs them at 8) | the pre-push hook; by hand before a push from a machine without the hook |
 
@@ -41,7 +41,7 @@ the export renderer and the ledger's 1.1 schema; then the TUI half: the two-colu
 restore, the note modal, the picker and the export fallback, whose reducer tests are the last
 13 of the binary lib's count): 255 engine + 34 testkit + 187 binary lib + 6 binary main =
 **482**; then the verifier (b) review-fix pass, which added seven reducer and render tests
-for F1–F5: 255 engine + 34 testkit + 194 binary lib + 6 binary main = **489**).
+for F1–F5: 255 engine + 34 testkit + 194 binary lib + 6 binary main = **489**; Phase 8 (save under CAS, the `$EDITOR` handover, the inline editor, select-to-copy, the launch hold): 271 engine + 35 testkit + 250 binary lib + 6 binary main = **562**, the Phase 9 floor; Phase 9a (the `status` store fields, every repo listed and `t`, the neighbour rule, the hint line's drop order, the focus-true opening, the launch hold's one vocabulary and scope fold, the editor header, the help overlay's clip row, and the verifier (a) folds): 274 engine + 35 testkit + 267 binary lib + 6 binary main = **582**, the Phase 9b floor).
 The suite never shrinks across commits. One recorded exception: at the Phase 2 code review
 the three filesystem-live watcher tests (up to 30 s waits, real FSEvents) left the unit tier
 for `crates/lastcall-engine/tests/test_integration_watcher.rs` because they contradicted the
@@ -128,7 +128,7 @@ change that moved it.
 
 Both files live in `crates/lastcall/tests/`; `docs/dev/tui.md` has the how-to.
 
-`test_e2e_tui_snapshots.rs` renders forty-nine scenes (the sixteen Phase 3 ones; the
+`test_e2e_tui_snapshots.rs` renders fifty-two scenes (the sixteen Phase 3 ones; the
 seven Phase 4 accept scenes, which drive the real `Engine::accept` from the reducer's own
 `Effect::Accept` and feed `App::accepted`, and where `tui_accept_all_confirm` pins a second
 `_live` frame; and the six Phase 5 herdr scenes — `tui_herdr_status_dots`,
@@ -149,8 +149,13 @@ Phase 8 ones — `tui_note_modal_scrolled` and `tui_note_modal_whole_file` for t
 text area and its target title, `tui_editor_return_confirm` for the `$EDITOR` blessing,
 `tui_editor_open`, `tui_editor_dirty_confirm`, `tui_editor_save_refused` and
 `tui_editor_narrow_60x20` for the inline editor, and `tui_diff_selection`, `tui_copy_cue`
-and `tui_hint_diff_focus` — the last snapshotted at **140×20**, the only scene wide enough
-for the hint line's third tier) through `ratatui::backend::TestBackend`
+and `tui_hint_diff_focus` — the last snapshotted at **142×20**, the only scene wide enough
+for the whole diff-focused hint line; and the five Phase 9a ones — `tui_nav_empty_repo_row` and
+`tui_hide_empty_toggle` (three roots, one with nothing pending, before and after `t`),
+`tui_accept_last_file_lands_on_the_repo_row` (renamed from `tui_accept_last_file_collapses_repo`,
+because the frame changed meaning under Amendment v1.9), `tui_editor_long_path_60x20` (the
+head-ellipsized editor header) and `tui_help_overlay_80x24` (the clipped overlay's `… N more keys`
+row)) through `ratatui::backend::TestBackend`
 from an `App` fed by a real engine over the shared `fixture_parent` (each scene builds its
 own fixture and state dir under a temp dir) and pins each as two `insta` snapshots under
 `crates/lastcall/tests/snapshots/`: `<scene>_frame` (the symbols, exactly as a 100×30 — or
@@ -188,7 +193,8 @@ over `draft_config_toml`'s four roots — it must, or the child would discover o
 and accepts a hunk in the gitignored `_drafts/` root, then relaunches on the same state dir
 to show it stayed accepted; `wait_first_piles` additionally pins the startup order
 (`lastcall: discovering roots under …` on stderr, then the alternate-screen sequence, then
-`scanning N roots…`). The four Phase 7 scenes are `pty_restore_hunk_then_file_bytes_match_baseline` (restore one
+the hold's own pane text `discovered N repos, checking status…` — Phase 9a deliverable 5 took
+`scanning N roots…` off the status line, and `wait_first_piles` pins that it stays off). The four Phase 7 scenes are `pty_restore_hunk_then_file_bytes_match_baseline` (restore one
 hunk, then the file, comparing the bytes on disk with the baseline blob),
 `pty_restore_refused_when_the_file_moved` (the file is renamed under the running loop and
 the refusal is read off the status line), `pty_restore_deletion_recreates_the_file`, and
@@ -198,7 +204,13 @@ it types is four lines and gets there both ways a note can: a raw `0x0a` (what t
 sends for `Ctrl-J`) and a bracketed paste carrying a newline of its own, both through the
 real crossterm reader — so the failure `tui.md` calls the worst this modal has, firing off
 the first line and dropping the rest, is now proven absent end to end and not only in the
-reducer (verifier (b) F6). No PTY
+reducer (verifier (b) F6). The Phase 9a scene
+`pty_accept_last_file_lands_on_the_repo_row_then_t_hides_it` accepts a repo's last row through
+the terminal and asserts the cursor on that repo's own name row with `nothing pending in` on the
+pane, then `t` hiding the repo and `t` bringing it back; it is the slow one — the bottom row is
+the status line while a status is live, and launch sets one, so the scene waits out
+`app::STATUS_TTL` (30 s) once before it can read the hint line (Phase 9a verifier (a) F8: about
+36 s of the file's time is that wait). No PTY
 scene talks to herdr: only `just test-integration-herdr` proves the real pane. The staged
 send is covered in three places, and it takes all three — verifier (b) F1 found that the two
 end tests both passed while the middle was missing, because nothing in the loop built
