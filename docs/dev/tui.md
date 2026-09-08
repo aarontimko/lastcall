@@ -165,9 +165,17 @@ numbers only once a load has run longer than a second. The rules as built (`App:
 `render_main`'s `None` arm, `Loading::COUNTER_AFTER` = 1 s):
 
 - **From `sync_roots` until every root has reported, `App::is_listed` is false** for every
-  root, the header counts `0 repos`, and the right pane reads
-  `discovered N roots, checking status…` with one line per root (`  <name>  <branch>`) —
-  the same lines as the empty state, so the frame does not jump when the hold ends.
+  root, and the right pane reads `discovered N repos, checking status…` with one line per
+  root (`  <name>  <branch>`) — the same lines as the empty state, so the frame does not
+  jump when the hold ends. **repos** is the user-facing noun wherever a count is shown
+  here and in the empty states; `root` stays the config and CLI word (Design pass D3,
+  ruling R5). The header agrees with the pane rather than contradicting it: while the hold
+  is on it reads `lastcall  N repos · checking status…` — the one count it knows and none
+  of the ones it does not — with `[Accept All]` dim, as it is whenever nothing is listed.
+  The **status line is not** set to a second sentence about the same wait: `run.rs` writes
+  no `scanning N roots…`, the pane is the hold's home and its only clock, and the bottom
+  row shows the hints exactly as the empty state does until the engine's own `watching …`
+  notice lands.
 - **A root "reports" three ways:** the watcher's `EngineEvent::Scanned { root, rows }`
   (sent from the pool thread the moment that root's scan returns, before the batch's
   piles land — `Engine::scan_all_with`'s hook, `try_send` from under the engine lock so a
@@ -180,15 +188,17 @@ numbers only once a load has run longer than a second. The rules as built (`App:
   fast launch shows one calm frame, not a flash of `loading… 23423423432`. From one
   second on (`Loading::counting`, measured on the app clock, so the `Tick` action redraws
   while the hold is on) the pane adds a dim
-  `K of N repos checked · F files pending so far · Ss` and a `✓` beside each root that
-  has reported — a single slow repo is then the one without a `✓`. `F` is the sum of the
-  reported roots' pending rows; there is no intra-repo progress (the time is inside
+  `K of N checked · F files pending so far · Ss` and a `✓` in the **leading column** of
+  each root that has reported (Design pass D4, ruling R6: the tick takes the row's own
+  two-space indent — `✓ alpha  main` / `  beta  main` — so the ticks line up whatever the
+  branch labels are and the slow repo is the one gap in the column, a glance rather than a
+  read). `F` is the sum of the reported roots' pending rows; there is no intra-repo progress (the time is inside
   `git`), and the seconds counter is the liveness signal.
 - **The solo first-root scan is gone** from `watcher::run_loop`: every root goes through
   the one `scan_all` on the pool, and the piles land together in path order with
   `scan_seq` numbered that way. `bench.md` S1's `first_pile_ms` changed meaning with it
-  (see the note there). The PTY harness pins the order: `discovered 3 roots, checking
-  status…` before the first row, and `nothing pending across 3 roots` never before it
+  (see the note there). The PTY harness pins the order: `discovered 3 repos, checking
+  status…` before the first row, and `nothing pending across 3 repos` never before it
   (`wait_first_piles`); `watch --json` prints the tick as
   `{"event":"scanned","root":…,"rows":N}` and is otherwise unchanged.
 
@@ -200,7 +210,7 @@ disk, and the way to look at it as they will is `just probe-tui-slow`, or
 (`diff-files`, `ls-files` — `SLOWGIT_MS` per call, default 800 ms, four calls per root)
 and then execs the real one, so discovery still runs at full speed and only the
 "checking status" phase stretches; one root named by `SLOWGIT_SLOW_REPO` gets
-`SLOWGIT_SLOW_MS` (default 2,500 ms) per call and is the last without its ✓. The sponsor
+`SLOWGIT_SLOW_MS` (default 2,500 ms) per call and is the last gap in the ✓ column. The sponsor
 approved the hold on exactly this view (§10 2026-09-07 (v)): a 20-root workspace held for
 ~11 s with the counter ticking, the ✓s filling in, and the slow repo visibly the one
 holding things up. Any UX change to the hold should be looked at both ways — fast, where

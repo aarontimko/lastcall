@@ -113,10 +113,11 @@ impl RootMeta {
 /// the pile's groups split out for the nav.
 /// The launch hold (Gate 8 sponsor run ruling, spec §10 2026-09-07): from the first
 /// `sync_roots` until every root has reported, nothing is listed and the right pane reads
-/// `discovered N roots, checking status…`, so one repo is never shown as if it were the
+/// `discovered N repos, checking status…`, so one repo is never shown as if it were the
 /// only one with changes while the rest are still being scanned. After one second the pane
-/// adds `K of N repos checked · F files pending so far · Ss` and a ✓ beside each root
-/// that has reported — a single slow repo is then visible as the one without its ✓. A
+/// adds `K of N checked · F files pending so far · Ss` and a ✓ in the **leading column**
+/// of each root that has reported (Design pass D4) — a single slow repo is then visible as
+/// the one gap in that column. A
 /// report is a `Scanned` tick, the root's pile, or a scan-failed notice; a global notice
 /// (`watching …`) ends the hold outright, whatever has reported.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -1022,11 +1022,22 @@ fn render_main(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
                     )));
                 }
                 for view in app.roots.values() {
-                    let mut text = format!("  {}  {}", view.meta.name, view.meta.branch_label());
-                    if counting && loading.checked.contains_key(&view.meta.path) {
-                        text.push_str("  ✓");
-                    }
-                    lines.push(Line::from(text));
+                    // Design pass D4 / ruling R6: the tick takes the row's own two-space
+                    // indent instead of following the branch label, so every tick lands in
+                    // the same column and the root still being scanned is the one gap in
+                    // it — a glance, not a read down a ragged edge. Nothing moves when the
+                    // ticks appear (the indent is already there), so the one-calm-frame
+                    // rule for a fast launch still holds.
+                    let tick = if counting && loading.checked.contains_key(&view.meta.path) {
+                        "✓ "
+                    } else {
+                        "  "
+                    };
+                    lines.push(Line::from(format!(
+                        "{tick}{}  {}",
+                        view.meta.name,
+                        view.meta.branch_label()
+                    )));
                 }
             } else if app.herdr.scope_pending {
                 // Deliberately not "nothing pending": the piles may be in and held back.
@@ -3214,7 +3225,8 @@ mod tests {
     }
 
     /// The loading pane (Gate 8 sponsor run ruling): a static line in the first second, no
-    /// digits; from one second the counter line and a ✓ per reported root. Design pass D3
+    /// digits; from one second the counter line and a ✓ in the leading column of each
+    /// reported root (Design pass D4, ruling R6). Design pass D3
     /// (ruling R5): **repos** is the noun, the counter line does not repeat it, and the
     /// header says `3 repos · checking status…` rather than three counts it does not know.
     #[test]
@@ -3252,15 +3264,12 @@ mod tests {
             frame.contains("1 of 3 checked · 1,200 files pending so far · 1s"),
             "{frame}"
         );
-        let line = |name: &str| {
-            frame
-                .lines()
-                .find(|l| l.contains(&format!("  {name}  ")))
-                .unwrap_or_else(|| panic!("{name} listed: {frame}"))
-                .to_owned()
-        };
-        assert!(line("alpha").contains('✓'), "{frame}");
-        assert!(!line("beta").contains('✓'), "{frame}");
+        // Design pass D4 (ruling R6): the tick is a leading column in the row's own
+        // indent, so the ticks line up whatever the branch labels are and the root still
+        // being scanned is the gap in the column.
+        assert!(frame.contains("✓ alpha  main"), "{frame}");
+        assert!(frame.contains("  beta  main"), "{frame}");
+        assert!(!frame.contains("main  ✓"), "not a suffix: {frame}");
 
         // The last report ends the hold: the ordinary listing.
         app.apply(lastcall_engine::watcher::EngineEvent::Scanned {
