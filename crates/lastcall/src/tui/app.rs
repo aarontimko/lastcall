@@ -1143,6 +1143,12 @@ impl App {
 
     /// Roots the active scope hides that would otherwise be listed: the `N` of the
     /// `scope: … · N repos hidden (w shows all)` notice.
+    ///
+    /// "Would otherwise be listed" is [`Self::is_listed`]'s own rule with the scope test
+    /// removed, which since v1.9 includes an **empty** repo while `hide_empty` is off
+    /// (verifier (a) F1): the notice promises what `w` will reveal, so counting by the
+    /// pre-v1.9 "has rows or has a flag" left it short by every empty out-of-scope repo —
+    /// `0 repos hidden` on a frame where `w` adds one.
     pub fn scoped_out(&self) -> usize {
         if self.herdr.active_scope().is_none() {
             return 0;
@@ -1150,7 +1156,11 @@ impl App {
         self.roots
             .values()
             .filter(|v| !self.herdr.in_scope(&v.meta.path))
-            .filter(|v| v.listed() || self.herdr.flag(&v.meta.path).is_some_and(|f| f.attention()))
+            .filter(|v| {
+                !self.hide_empty
+                    || v.listed()
+                    || self.herdr.flag(&v.meta.path).is_some_and(|f| f.attention())
+            })
             .count()
     }
 
@@ -5422,6 +5432,45 @@ mod tests {
             Some("scope: w1 · 1 repo hidden (w shows all)"),
             "the notice counts what the scope hides, never what `t` does"
         );
+    }
+
+    /// Verifier (a) F1: the notice promises what `w` will reveal. Since v1.9 an **empty**
+    /// out-of-scope repo is one of them while `hide_empty` is off, so the count has to be
+    /// `is_listed`'s rule minus the scope test — not the pre-v1.9 "has rows or has a flag".
+    #[test]
+    fn app_scope_notice_counts_an_empty_out_of_scope_repo() {
+        let names = |app: &App| {
+            app.listed_roots()
+                .map(|v| v.meta.name.clone())
+                .collect::<Vec<_>>()
+        };
+        let mut app = three_roots();
+        // notes is the out-of-scope one, and it is empty.
+        app.apply(pile_event_seq("notes", 1, Pile::default()));
+        app.herdr.scoped = true;
+        app.handle(Action::Herdr(HerdrUpdate::Scope(Some(Scope {
+            label: "w1".to_owned(),
+            roots: [root("alpha"), root("beta")].into_iter().collect(),
+        }))));
+        assert_eq!(names(&app), ["alpha", "beta"]);
+        assert_eq!(
+            app.scope_notice().as_deref(),
+            Some("scope: w1 · 1 repo hidden (w shows all)"),
+            "the empty out-of-scope repo is what `w` reveals"
+        );
+        // …and `w` does reveal exactly it.
+        app.handle(Action::ScopeToggle);
+        assert_eq!(names(&app), ["alpha", "beta", "notes"]);
+
+        // With `t` on it would not be revealed, so the notice must not promise it.
+        app.handle(Action::ScopeToggle);
+        app.handle(Action::HideEmpty);
+        assert_eq!(
+            app.scope_notice().as_deref(),
+            Some("scope: w1 · 0 repos hidden (w shows all)")
+        );
+        app.handle(Action::ScopeToggle);
+        assert_eq!(names(&app), ["alpha", "beta"], "`t` still hides notes");
     }
 
     #[test]
