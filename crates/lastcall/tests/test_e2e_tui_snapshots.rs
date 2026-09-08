@@ -624,6 +624,38 @@ fn tui_help_overlay_tall() {
     snapshot("tui_help_overlay_tall", &app, W, 45);
 }
 
+/// The same overlay with room for neither form: 80 columns is the standard width and this
+/// keymap needs 100 for two columns, so the body is one column and it clips.
+///
+/// Design pass D12 (ruling R12): the clip **says so**. The last body row above the pinned
+/// `quit` is a dim `… N more keys (100 columns shows all)` — the count is the rows that are
+/// not on the frame, the column figure is computed from the width two columns would need,
+/// and the footer (the newline note, the mouse note, `any key closes`) is never what the
+/// clip spends.
+#[test]
+fn tui_help_overlay_80x24() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    app.handle(Action::NavDown);
+    app.handle(Action::NavDown);
+    app.handle(Action::Help);
+    assert!(app.help);
+    let (frame, _) = draw(&app, 80, 24);
+    let lines: Vec<&str> = frame.lines().collect();
+    let at = lines
+        .iter()
+        .position(|l| l.contains("more key"))
+        .unwrap_or_else(|| panic!("a clip notice:\n{frame}"));
+    assert!(lines[at].contains("columns shows all"), "{}", lines[at]);
+    assert!(
+        lines[at + 1].contains("quit"),
+        "the notice sits directly above the pinned quit:\n{frame}"
+    );
+    assert!(frame.contains("any key closes"), "{frame}");
+    snapshot("tui_help_overlay_80x24", &app, 80, 24);
+}
+
 #[test]
 fn tui_narrow_60x20() {
     let scene = Scene::build();

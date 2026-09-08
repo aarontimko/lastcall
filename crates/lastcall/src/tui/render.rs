@@ -1816,6 +1816,16 @@ fn help_columns(keys: &[String], area: Rect) -> Vec<String> {
         .collect()
 }
 
+/// The frame width at which the two-column overlay holds this keymap whole — the figure
+/// the clip notice quotes (Design pass D12, ruling R12). It mirrors [`help_columns`]'s own
+/// test rather than restating a number, so it follows the keymap instead of going stale.
+fn help_two_column_width(keys: &[String]) -> usize {
+    let split = keys.len().div_ceil(2);
+    let (left, right) = keys.split_at(split);
+    let width_of = |rows: &[String]| rows.iter().map(|r| r.width()).max().unwrap_or(0);
+    width_of(left) + HELP_GUTTER + width_of(right) + 4
+}
+
 fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
     let named: Vec<(&str, String)> = app
         .keymap
@@ -1829,7 +1839,8 @@ fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
         .map(|(name, keys)| (name, format!("{keys:<14} {}", Action::describe(name))))
         .collect();
     let keys: Vec<String> = named.iter().map(|(_, row)| row.clone()).collect();
-    let mut rows = help_columns(&keys, area);
+    let body = help_columns(&keys, area);
+    let mut rows = body.clone();
     rows.push(String::new());
     rows.push(newline_note(app.enhanced).to_owned());
     rows.push(SELECT_NOTE.to_owned());
@@ -1848,6 +1859,7 @@ fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
     let inner = block.inner(rect);
     block.render(rect, buf);
     let cap = inner.height as usize;
+    let mut clip_notice = None;
     if rows.len() > cap {
         // Too narrow for two columns *and* too short for one (80×30 with this keymap): the
         // overlay clips, and what it clips is key rows — never the footer. A reader who
@@ -1859,18 +1871,45 @@ fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
         // was the thing the clip dropped (verifier (b) F4).
         //
         // The blank separator is *not* reserved — it is the first thing the clip spends.
-        // Reserving it too costs a key row, and at 80×30 the key row it costs is `quit`.
-        rows.truncate(cap.saturating_sub(3));
-        // …and `quit` is pinned to the end of what survives. The keymap grows — Phase 8
-        // alone adds four rows — and a clip that simply takes the first N pushes the last
-        // row off first, which in this keymap is the one row a reader who opened the overlay
-        // by accident most needs. `any key closes` gets them out of the overlay; this gets
-        // them out of lastcall. It costs the row above it, never the footer.
-        if let Some((_, quit)) = named.iter().find(|(name, _)| *name == "quit")
-            && !rows.iter().any(|r| r.contains(quit.as_str()))
-        {
-            rows.truncate(cap.saturating_sub(4));
-            rows.push(quit.clone());
+        //
+        // Design pass D12 / ruling R12: a fourth row goes to **saying so**. The overlay
+        // clipped in silence, which is the failure two columns were meant to end; the last
+        // body row is now a dim `… N more keys (100 columns shows all)`, so a reader who
+        // cannot see a key knows there are more of them and what to do about it.
+        let quit = named
+            .iter()
+            .find(|(name, _)| *name == "quit")
+            .map(|(_, row)| row.clone());
+        let mut keep = cap.saturating_sub(4);
+        // …and `quit` is pinned to the end of what survives, when what survives does not
+        // already carry it. The keymap grows — Phase 8 alone adds four rows — and a clip
+        // that simply takes the first N pushes the last row off first, which in this keymap
+        // is the one row a reader who opened the overlay by accident most needs.
+        // `any key closes` gets them out of the overlay; this gets them out of lastcall.
+        let pin_quit = quit.as_ref().is_some_and(|q| {
+            !body[..keep.min(body.len())]
+                .iter()
+                .any(|r| r.contains(q.as_str()))
+        });
+        if pin_quit {
+            keep = keep.saturating_sub(1);
+        }
+        let keep = keep.min(body.len());
+        let hidden = body.len() - keep - usize::from(pin_quit);
+        // The figure is the two-column width the keymap needs, computed rather than
+        // written down. Where the frame is already that wide the clip is the *height*, and
+        // saying "100 columns shows all" at 120 columns would be a lie — so that case names
+        // the other dimension instead.
+        let remedy = if area.width as usize >= help_two_column_width(&keys) {
+            "a taller window shows all".to_owned()
+        } else {
+            format!("{} columns shows all", help_two_column_width(&keys))
+        };
+        rows = body[..keep].to_vec();
+        clip_notice = Some(rows.len());
+        rows.push(format!("… {} ({remedy})", plural(hidden, "more key")));
+        if let Some(q) = quit.filter(|_| pin_quit) {
+            rows.push(q);
         }
         rows.push(newline_note(app.enhanced).to_owned());
         rows.push(SELECT_NOTE.to_owned());
@@ -1882,7 +1921,12 @@ fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
             inner.y + i as u16,
             row,
             inner.width.saturating_sub(1) as usize,
-            Style::new(),
+            // The clip notice is dim: it is the overlay talking about itself, not a key.
+            if clip_notice == Some(i) {
+                dim()
+            } else {
+                Style::new()
+            },
         );
     }
     if inner.height as usize > rows.len() {
@@ -2759,6 +2803,59 @@ mod tests {
         // overlay by accident needs most.
         let (frame, _) = frame_of(&narrow, 80, 30);
         assert!(frame.contains("q / Ctrl-C     quit"), "{frame}");
+
+        // Design pass D12 / ruling R12: the clip says so. The last body row above the
+        // pinned `quit` is a dim `… N more keys (100 columns shows all)`, where N is the
+        // rows that are not on the frame and the column figure is computed from the width
+        // the two-column form needs — not a literal, so it follows the keymap.
+        let all: Vec<String> = narrow
+            .keymap
+            .iter()
+            .map(|(name, specs)| (name.as_str(), keys_label(specs)))
+            .chain(
+                MODAL_KEYS
+                    .iter()
+                    .map(|(name, specs)| (*name, keys_label(specs))),
+            )
+            .map(|(name, keys)| format!("{keys:<14} {}", Action::describe(name)))
+            .collect();
+        for (w, h) in [(80u16, 30u16), (80, 24)] {
+            let (frame, styles) = frame_of(&narrow, w, h);
+            let lines: Vec<&str> = frame.lines().collect();
+            let at = lines
+                .iter()
+                .position(|l| l.contains("more key"))
+                .unwrap_or_else(|| panic!("{w}x{h}: a clip notice:\n{frame}"));
+            let notice = lines[at];
+            assert!(
+                notice.contains(&format!(
+                    "({} columns shows all)",
+                    help_two_column_width(&all)
+                )),
+                "{w}x{h}: {notice}"
+            );
+            assert!(
+                lines[at + 1].contains("q / Ctrl-C     quit"),
+                "{w}x{h}: the notice sits directly above the pinned quit:\n{frame}"
+            );
+            let hidden: usize = notice
+                .split_whitespace()
+                .find_map(|w| w.parse().ok())
+                .unwrap_or_else(|| panic!("{w}x{h}: a count in {notice:?}"));
+            let shown = all.iter().filter(|r| frame.contains(r.as_str())).count();
+            assert_eq!(
+                shown + hidden,
+                all.len(),
+                "{w}x{h}: every key row is on the frame or counted:\n{frame}"
+            );
+            // Dim: it is the overlay talking about itself, not a key.
+            assert!(
+                styles
+                    .lines()
+                    .any(|l| l.starts_with(&format!("{at} ")) && l.contains("DIM")),
+                "{w}x{h}: the notice on row {at} is dim:\n{styles}"
+            );
+        }
     }
 
     /// Under the modal the hint line names only the keys that work there: the modal's
