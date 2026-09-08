@@ -119,13 +119,22 @@ impl RootMeta {
 /// of each root that has reported (Design pass D4) — a single slow repo is then visible as
 /// the one gap in that column. A
 /// report is a `Scanned` tick, the root's pile, or a scan-failed notice; a global notice
-/// (`watching …`) ends the hold outright, whatever has reported.
+/// (`watching …`) ends the hold outright, whatever has reported. The one thing that
+/// outlives the scans is the herdr scope verdict: while `HerdrView::scope_pending` the
+/// hold's frame continues (Design pass D5, ruling R7) with `scanned` set, and
+/// `App::scope_settled` ends it — rather than the root list vanishing for one more
+/// waiting screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Loading {
     /// When the hold began, on the app clock (`App::now`).
     pub started: Instant,
     /// Roots that have reported → their pending rows.
     pub checked: BTreeMap<PathBuf, usize>,
+    /// The scans are accounted for — every root reported, or a global notice said the
+    /// rest never will — and the hold is only still on because the herdr scope verdict
+    /// has not arrived (Design pass D5, ruling R7). The counter line then swaps
+    /// `so far · Ss` for `waiting for herdr scope…`.
+    pub scanned: bool,
 }
 
 impl Loading {
@@ -1108,6 +1117,7 @@ impl App {
         self.loading = (!self.roots.is_empty()).then(|| Loading {
             started: self.now,
             checked: BTreeMap::new(),
+            scanned: false,
         });
     }
 
@@ -1124,11 +1134,22 @@ impl App {
         Changed::Yes
     }
 
-    /// End the launch hold: list the roots.
+    /// The scans are accounted for. Design pass D5 / ruling R7: when the herdr scope
+    /// verdict is still outstanding the hold's **frame** continues rather than being
+    /// replaced by a second waiting screen, so the `Loading` value is kept (flagged
+    /// `scanned`, which is what makes the counter line read `waiting for herdr scope…`)
+    /// and `scope_settled` ends it. `is_listed` already gates on both, so nothing is
+    /// listed a moment early either way.
     fn end_loading(&mut self) {
-        if self.loading.take().is_some() {
-            self.reconcile_selection();
+        let Some(loading) = &mut self.loading else {
+            return;
+        };
+        if self.herdr.scope_pending {
+            loading.scanned = true;
+            return;
         }
+        self.loading = None;
+        self.reconcile_selection();
     }
 
     /// The scope verdict is in (any verdict — see `HerdrView::scope_pending`): list the
@@ -1138,6 +1159,12 @@ impl App {
             return Changed::No;
         }
         self.herdr.scope_pending = false;
+        // The other half of D5 / R7: the hold's value was kept across the scope wait, and
+        // with the verdict in the scans being accounted for is enough to end it. A hold
+        // whose scans are still running ends the ordinary way, in `end_loading`.
+        if self.loading.as_ref().is_some_and(|l| l.scanned) {
+            self.loading = None;
+        }
         self.reconcile_selection();
         Changed::Yes
     }
@@ -6110,6 +6137,8 @@ mod tests {
     /// The launch hold (Gate 8 sponsor run ruling): nothing is listed until every root has
     /// reported — by a `Scanned` tick, its pile, or a scan-failed notice; a global notice
     /// ends the hold outright; no roots means no hold; the clock redraws while it is on.
+    /// Design pass D5 (ruling R7): an outstanding herdr scope verdict holds the frame open
+    /// past the last report, and `scope_settled` ends it.
     #[test]
     fn app_loading_holds_the_listing_until_every_root_reports() {
         let launched = || {
@@ -6180,6 +6209,27 @@ mod tests {
         let mut app = App::new();
         app.start_loading();
         assert!(app.loading.is_none());
+
+        // Design pass D5 / ruling R7: with the herdr scope verdict still outstanding the
+        // hold's value survives the last report — flagged `scanned`, which is what makes
+        // the pane keep the hold's frame instead of showing a second waiting screen — and
+        // `scope_settled` is what ends it.
+        let mut app = launched();
+        app.herdr.scoped = true;
+        app.herdr.scope_pending = true;
+        app.apply(pile_event("alpha", pile("alpha")));
+        app.apply(EngineEvent::Scanned {
+            root: root("beta"),
+            rows: 0,
+        });
+        assert!(
+            app.loading.as_ref().is_some_and(|l| l.scanned),
+            "every root reported, and the hold is held open for the verdict"
+        );
+        assert!(listed(&app).is_empty());
+        assert_eq!(app.scope_settled(), Changed::Yes);
+        assert!(app.loading.is_none(), "the verdict ends the hold");
+        assert_eq!(listed(&app), vec!["alpha".to_owned(), "beta".to_owned()]);
     }
 
     /// The Gate 8 sponsor run's launch flash: the first pile landed before the first scope

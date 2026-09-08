@@ -1010,7 +1010,7 @@ rule adds a row. Nothing here is a promise about the final design.
 | Copy cue (Phase 8) | a centered one-line reverse-video `copied to clipboard` over the diff pane for 2 s; **not** the status line, so it cannot evict an engine notice, and the two can be on screen together | `tui_copy_cue`, `render_selection_is_reverse_video_and_the_cue_sits_over_the_diff` |
 | Diff selection (Phase 8) | selected lines are full-width reverse video; the pane scrolls only enough to keep the selection's moving end visible, never a line per keystroke | `tui_diff_selection`, `app_select_extends_with_the_cursor_and_y_copies_the_range` |
 | Nav listing (Phase 9a, §6.7 Amendment v1.9) | every repo under the parent is a nav row, pending or not: `is_listed` = not loading, no scope pending, in scope, **and** (`hide_empty` off, or the repo has rows, or a herdr attention flag). A repo with no rows is a dim name-and-branch row with no file rows under it, selectable like any other; its right pane reads `nothing pending in <name>` over the branch line. `nothing pending across N repos` is what the right pane says whenever **no listed repo has a pending row** — the ordinary all-clean launch included, where every repo is a nav row and none is selected; `select a file (↑↓ or click)` there invited choosing a file that is not on the frame (Phase 9a verifier (a) F5). Under an active scope that pane is the scope's own form (`nothing pending in <ws>` + the repos it covers + `N repos hidden (w shows all)`) whatever the hidden count, so a scope that hides only empty repos can no longer fall through to the global text and list the repos it is hiding (Phase 9a F6). The scope notice's `N` is `is_listed`'s rule minus the scope test, so it counts an empty out-of-scope repo while `t` is off — what `w` will actually reveal (Phase 9a F1). `t` (`hide_empty`) flips the filter; the header's `N repos` counts the repos on the nav, as it already did under a `w` scope. Accepting a repo's last file lands the cursor on that repo's own name row — the neighbour is the nearest surviving entry below **within the same repo**, else the nearest above (the name row is the last "above"), and only when the repo itself has left the nav the entry at its former nav index; never a wrap, never a jump into another repo while this one is listed | `tui_nav_empty_repo_row`, `tui_hide_empty_toggle`, `tui_accept_last_file_lands_on_the_repo_row`, `tui_empty_state`, `app_empty_root_is_listed_and_selectable`, `app_accept_last_file_selects_the_repo_row`, `app_reconcile_uses_the_same_neighbour_rule_as_advance`, `render_all_clean_frame_is_the_empty_state_not_a_prompt`, `app_scope_notice_counts_an_empty_out_of_scope_repo`, PTY `pty_accept_last_file_lands_on_the_repo_row_then_t_hides_it` |
-| Launch hold (Gate 8 sponsor run) | nothing listed until every root reports; right pane `discovered N roots, checking status…` + one line per root; from 1 s a dim `K of N repos checked · F files pending so far · Ss` and a `✓` per reported root; the herdr `waiting for herdr scope…` hold (same section) can follow it on a scoped launch — two different holding texts in a row is a pass item, as is the `✓` column's placement | `render_loading_pane_counts_only_after_one_second`, `app_loading_holds_the_listing_until_every_root_reports`, PTY `wait_first_piles` |
+| Launch hold (Gate 8 sponsor run; **rulings R5–R7**, Phase 9a deliverable 5) | nothing listed until every root reports; right pane `discovered N repos, checking status…` + one line per root; from 1 s a dim `K of N checked · F files pending so far · Ss` and a `✓` in the **leading column** of each reported root (D4 — the ticks line up, and the slow repo is the gap in the column); the header agrees with the pane (`lastcall  N repos · checking status…`, `[Accept All]` dim) and the status line carries the hints, not a second sentence about the same wait (D3); **repos** is the user-facing noun throughout, `root` stays the config and CLI word. The herdr scope wait no longer follows it as a second screen: the same frame continues with `… · F files pending · waiting for herdr scope…` on the counter line (D5, see "Herdr scope" below) | `render_loading_pane_counts_only_after_one_second`, `render_scope_pending_after_the_hold_keeps_the_root_list`, `app_loading_holds_the_listing_until_every_root_reports`, PTY `wait_first_piles` |
 
 Open design questions the pass should take, in the order they have come up: whether the
 hint line should carry `u`/`m` (or go to a second tier) once the width allows; whether a
@@ -1108,13 +1108,22 @@ Three rules from the Gate 8 sponsor run's launch flash (spec §10 2026-09-06 (ii
   (`herdr_fold`); the shell `cwd` still places the pane.
 - **Nothing is listed before the first verdict.** `HerdrView::scope_pending` is set at
   launch when a scope is configured and a workspace id is known, and `App::is_listed` is
-  false while it holds; the right pane reads `waiting for herdr scope…`. Any verdict clears
-  it (`App::scope_settled`): a `Scope` update — even the `None` the view started with — a
-  standalone start, a failed connect, a link that dropped before its snapshot. Without the
-  hold the first pile was listed for one frame and hidden by the scope on the next.
+  false while it holds. Any verdict clears it (`App::scope_settled`): a `Scope` update —
+  even the `None` the view started with — a standalone start, a failed connect, a link that
+  dropped before its snapshot. Without the hold the first pile was listed for one frame and
+  hidden by the scope on the next.
+- **The scope wait is the launch hold continuing, not a second screen** (Design pass D5,
+  ruling R7). The `Loading` value is **kept** past the last report while `scope_pending`
+  holds — `App::end_loading` flags it `scanned` instead of clearing it, and
+  `scope_settled` is what drops it — so below `COUNTER_AFTER` the frame does not change at
+  all, and from one second the same counter line carries the holding clause where
+  `so far · Ss` was: `3 of 3 checked · 7 files pending · waiting for herdr scope…`, with
+  every root ticked because every root has reported. The header keeps
+  `N repos · checking status…` throughout. `render::SCOPE_PENDING` as a **standalone** dim
+  line is what is left for a launch with no roots at all to hold.
 - **The empty state under a scope names it.** With a scope active and nothing listed the
   pane reads `nothing pending in <label>`, the in-scope roots, and
-  `N repos hidden (w shows all)`; `nothing pending across N roots` is only ever true with
+  `N repos hidden (w shows all)`; `nothing pending across N repos` is only ever true with
   no scope hiding anything.
 
 ### Configuration

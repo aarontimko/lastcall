@@ -1010,13 +1010,27 @@ fn render_main(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
                 )));
                 let counting = loading.counting(app.now);
                 if counting {
-                    lines.push(Line::from(Span::styled(
+                    // Design pass D5 / ruling R7: with every root reported and only the
+                    // herdr scope verdict outstanding, the same counter carries the
+                    // holding clause where `so far · Ss` was. The clock is the scans', so
+                    // it stops when they do — the sentence is what is being waited on now.
+                    let tail = if loading.scanned {
                         format!(
-                            "{} of {} checked · {} pending so far · {}s",
-                            with_thousands(loading.checked.len()),
-                            with_thousands(app.roots.len()),
+                            "{} pending · {SCOPE_PENDING}",
+                            plural(loading.files(), "file")
+                        )
+                    } else {
+                        format!(
+                            "{} pending so far · {}s",
                             plural(loading.files(), "file"),
                             app.now.duration_since(loading.started).as_secs()
+                        )
+                    };
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "{} of {} checked · {tail}",
+                            with_thousands(loading.checked.len()),
+                            with_thousands(app.roots.len()),
                         ),
                         dim(),
                     )));
@@ -1041,6 +1055,8 @@ fn render_main(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
                 }
             } else if app.herdr.scope_pending {
                 // Deliberately not "nothing pending": the piles may be in and held back.
+                // With roots this is the hold's frame above (D5 / R7); the standalone line
+                // is what is left for a launch with no roots at all to hold.
                 lines.push(Line::from(Span::styled(SCOPE_PENDING, dim())));
             } else if app.listed_roots().all(|v| v.rows().is_empty()) {
                 // Nothing on the nav has a file row — including the case where the nav is
@@ -3280,6 +3296,85 @@ mod tests {
         let (frame, _) = frame_of(&app, 100, 12);
         assert!(!frame.contains("checking status"), "{frame}");
         assert!(frame.contains(NO_SELECTION), "{frame}");
+    }
+
+    /// Design pass D5 (ruling R7): the scope wait used to replace the hold with a second
+    /// waiting screen — the root list and its ticks vanished, the header dropped back to
+    /// `0 repos · 0 files · 0 hunks`, and a moment later the listing landed. It is now the
+    /// hold's own frame continuing: below `COUNTER_AFTER` nothing changes at all, and from
+    /// one second the counter carries the holding clause where `so far · Ss` was, with
+    /// every root ticked because every root has reported.
+    #[test]
+    fn render_scope_pending_after_the_hold_keeps_the_root_list() {
+        use crate::tui::herdr::{HerdrUpdate, Scope};
+        let mut app = App::new();
+        app.herdr.scoped = true;
+        app.herdr.scope_pending = true;
+        app.sync_roots(vec![meta("alpha"), meta("beta"), meta("notes")]);
+        app.start_loading();
+        for (name, rows) in [("alpha", 4), ("beta", 3), ("notes", 0)] {
+            app.apply(lastcall_engine::watcher::EngineEvent::Scanned {
+                root: root(name),
+                rows,
+            });
+        }
+        assert!(
+            app.loading.as_ref().is_some_and(|l| l.scanned),
+            "the scans are done; only the scope verdict is outstanding"
+        );
+        assert_eq!(app.listed_roots().count(), 0, "still held back");
+
+        // Below one second: exactly the hold's static frame, so a fast launch that has to
+        // wait for the verdict still shows one calm frame.
+        let (frame, _) = frame_of(&app, 100, 12);
+        assert!(
+            frame.contains("discovered 3 repos, checking status…"),
+            "{frame}"
+        );
+        assert!(frame.contains("  alpha  main"), "{frame}");
+        assert!(!frame.contains("checked"), "no digits yet: {frame}");
+        assert!(
+            !frame.contains(SCOPE_PENDING),
+            "nor a second screen: {frame}"
+        );
+
+        // From one second: the same counter with the holding clause, and every root ticked.
+        app.handle(Action::Tick);
+        let (frame, _) = frame_of(&app, 100, 12);
+        assert!(
+            frame.contains(&format!(
+                "3 of 3 checked · 7 files pending · {SCOPE_PENDING}"
+            )),
+            "{frame}"
+        );
+        assert!(
+            !frame.contains("so far"),
+            "the scans are not still running: {frame}"
+        );
+        for row in ["✓ alpha  main", "✓ beta  main", "✓ notes  draft"] {
+            assert!(frame.contains(row), "{row}: {frame}");
+        }
+        assert!(
+            frame.contains("lastcall  3 repos · checking status…"),
+            "the header keeps the hold's own left half (D3): {frame}"
+        );
+
+        // The verdict lists: the hold is over in the same step.
+        app.handle(Action::Herdr(HerdrUpdate::Scope(Some(Scope {
+            label: "w1".to_owned(),
+            roots: [root("alpha"), root("beta"), root("notes")]
+                .into_iter()
+                .collect(),
+        }))));
+        assert!(app.loading.is_none(), "{:?}", app.loading);
+        let (frame, _) = frame_of(&app, 100, 12);
+        assert!(!frame.contains("checking status"), "{frame}");
+        // `Scanned` is a tick, not a pile, so the listing's own counts are zero here; the
+        // point is that the header is back to counting what is listed.
+        assert!(
+            frame.contains("lastcall  3 repos · 0 files · 0 hunks"),
+            "{frame}"
+        );
     }
 
     /// Verifier (a) F5 and F6. F5: the sponsor's most common launch is "everything is
