@@ -1242,7 +1242,9 @@ fn render_editor_header(ed: &Editor, buf: &mut Buffer, area: Rect) {
     // position is the part that changes as you type and `unsaved` is the part that says
     // the file on disk is not what is on screen. `· unsaved` is reserved at every width
     // whether or not the buffer is dirty, so the header does not shift under the reader on
-    // the first keystroke.
+    // the first keystroke. The path's budget is what is left after all of that, and
+    // `ellipsize_head` cuts inside the basename rather than overflow it, so the outer
+    // `ellipsize` below is a last resort for frames narrower than the fixed parts.
     let position = ed.buf.position_label();
     let path = String::from_utf8_lossy(&ed.rendered.path);
     const UNSAVED: &str = " · unsaved";
@@ -1895,7 +1897,20 @@ fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
             keep = keep.saturating_sub(1);
         }
         let keep = keep.min(body.len());
-        let hidden = body.len() - keep - usize::from(pin_quit);
+        // The count is of **keys**, not rows: in two columns a body row carries two of
+        // them, and counting rows said `2 more keys` over four hidden ones at 100×20
+        // (verifier (b) F1). `help_columns` splits the table at `keys.len().div_ceil(2)`,
+        // so the rows past the right column's length carry one key each.
+        let keys_in_row = |i: usize| -> usize {
+            let right_len = keys.len() - keys.len().div_ceil(2);
+            if body.len() < keys.len() && i < right_len {
+                2
+            } else {
+                1
+            }
+        };
+        let shown: usize = (0..keep).map(keys_in_row).sum::<usize>() + usize::from(pin_quit);
+        let hidden = keys.len().saturating_sub(shown);
         // The figure is the two-column width the keymap needs, computed rather than
         // written down. Where the frame is already that wide the clip is the *height*, and
         // saying "100 columns shows all" at 120 columns would be a lie — so that case names
@@ -2225,29 +2240,45 @@ pub fn ellipsize(s: &str, max: usize) -> String {
 /// left still reads as a path: `…lastcall/src/tui/render.rs` (Design pass D9, ruling R10).
 ///
 /// The `/` chosen is the leftmost one whose remainder fits, so the longest path tail that
-/// fits is what is shown. The **basename is the floor**: a width with no room even for
-/// `…<basename>` keeps the whole basename and lets the row's own clip take the overflow,
-/// because half a file name answers nothing. A string with no `/` at all has no path
-/// structure to preserve and falls back to [`ellipsize`].
+/// fits is what is shown. When not even `…<basename>` fits, the **basename itself gives
+/// from the head** (`…_for_a_file.rs`), so the extension survives and — in the editor
+/// header — the position and `· unsaved` do too: a basename floor let the row's tail clip
+/// take exactly the parts R10 said were the wrong ones to lose (verifier (b) F2). A string
+/// with no `/` at all is head-cut the same way.
 pub fn ellipsize_head(s: &str, max: usize) -> String {
     if s.width() <= max {
         return s.to_owned();
     }
-    let mut basename = None;
+    let mut basename = s;
     for (i, c) in s.char_indices() {
         if c != '/' {
             continue;
         }
         let tail = &s[i + 1..];
-        basename = Some(tail);
+        basename = tail;
         if tail.width() < max {
             return format!("…{tail}");
         }
     }
-    match basename {
-        Some(base) => format!("…{base}"),
-        None => ellipsize(s, max),
+    head_cut(basename, max)
+}
+
+/// `…` plus the longest tail of `s` that fits in `max` columns; empty at `max == 0`.
+fn head_cut(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
     }
+    let mut kept = String::new();
+    let mut used = 0;
+    for c in s.chars().rev() {
+        let w = c.width().unwrap_or(0);
+        if used + w > max - 1 {
+            break;
+        }
+        kept.insert(0, c);
+        used += w;
+    }
+    format!("…{kept}")
 }
 
 /// One line per run of non-default cells: `y x0..x1 fg bg modifiers` (`x1` exclusive,
@@ -2506,9 +2537,10 @@ mod tests {
     }
 
     /// Design pass D9 (ruling R10): the editor header's path gives from the head and cuts
-    /// at a `/`, so what is left still reads as a path — and never below the basename.
+    /// at a `/`, so what is left still reads as a path — and inside the basename, from the
+    /// head, when not even that fits (verifier (b) F2).
     #[test]
-    fn render_ellipsize_head_cuts_at_a_slash_and_floors_at_the_basename() {
+    fn render_ellipsize_head_cuts_at_a_slash_then_inside_the_basename() {
         let p = "home/aaron/dev/git/lastcall/src/tui/render.rs";
         assert_eq!(ellipsize_head(p, 60), p, "it fits: untouched");
         assert_eq!(ellipsize_head(p, p.len()), p, "exactly: untouched");
@@ -2530,15 +2562,20 @@ mod tests {
         assert_eq!(ellipsize_head(p, 30), "…lastcall/src/tui/render.rs");
         assert_eq!(ellipsize_head(p, 20), "…src/tui/render.rs");
         assert_eq!(ellipsize_head(p, 14), "…tui/render.rs");
-        // The floor: the basename stays whole and the row's own clip takes the overflow —
-        // half a file name answers nothing.
         assert_eq!(ellipsize_head(p, 13), "…render.rs");
-        assert_eq!(ellipsize_head(p, 4), "…render.rs");
-        assert_eq!(ellipsize_head(p, 0), "…render.rs");
-        // No `/`: no path structure to keep, so the ordinary tail cut.
-        assert_eq!(ellipsize_head("render.rs", 5), "rend…");
+        assert_eq!(ellipsize_head(p, 10), "…render.rs");
+        // Below `…<basename>` the basename itself gives from the head, so the extension
+        // survives and nothing to the right of the path has to (verifier (b) F2).
+        assert_eq!(ellipsize_head(p, 9), "…ender.rs");
+        assert_eq!(ellipsize_head(p, 4), "….rs");
+        assert_eq!(ellipsize_head(p, 1), "…");
+        assert_eq!(ellipsize_head(p, 0), "");
+        // No `/`: still from the head.
+        assert_eq!(ellipsize_head("render.rs", 5), "…r.rs");
         // Columns, not bytes.
-        assert_eq!(ellipsize_head("a/日本語.md", 8), "…日本語.md");
+        assert_eq!(ellipsize_head("a/日本語.md", 10), "…日本語.md");
+        assert_eq!(ellipsize_head("a/日本語.md", 8), "…本語.md");
+        assert_eq!(ellipsize_head("a/日本語.md", 6), "…語.md");
     }
 
     /// The other half of D9: `· unsaved` is reserved at every width, so the header does
@@ -2578,6 +2615,54 @@ mod tests {
             dirty_header.starts_with(header.split(" · line").next().expect("a path")),
             "the path did not move when `· unsaved` appeared:\n{header}\n{dirty_header}"
         );
+
+        // Verifier (b) F2: a basename wider than the budget used to overflow into the
+        // row's tail clip, which took `unsaved` and then the position — at 60 and 80
+        // columns with this name, and at `MIN_SIZE` for a four-digit line count. The
+        // basename gives instead.
+        let long = b"src/a_basename_that_is_really_quite_long_indeed_for_a_file.rs".to_vec();
+        for (w, path) in [
+            (60u16, long.clone()),
+            (80, long.clone()),
+            (40, b"src/tui/render.rs".to_vec()),
+        ] {
+            let mut app = three_roots();
+            app.handle(Action::Resize(w, 20));
+            let mut wide = self::pile("alpha");
+            wide.rows[0].path = path.clone();
+            app.apply(pile_event("alpha", wide));
+            app.select(Some(Selection::Row(root("alpha"), path.clone())));
+            app.handle(Action::Open);
+            let open = match app.handle(Action::Edit).1 {
+                Some(crate::tui::app::Effect::EditInline(open)) => open,
+                other => panic!("an inline-edit effect, got {other:?}"),
+            };
+            app.edit_read(open, Ok("x\n".repeat(1200).into_bytes()));
+            let header = frame_of(&app, w, 20).0.lines().next().unwrap().to_owned();
+            assert!(
+                header.contains(" · line 1/1200"),
+                "{w} columns: the position survives a wide basename: {header}"
+            );
+            assert!(
+                header.contains(".rs · line"),
+                "{w} columns: the extension survives: {header}"
+            );
+            app.handle(Action::Editor(crate::tui::input::EditorKey::Edit(
+                crate::tui::input::EditKey::Insert("x".to_owned()),
+            )));
+            let dirty = frame_of(&app, w, 20).0.lines().next().unwrap().to_owned();
+            // `TestBackend` wraps each line in quotes.
+            assert!(
+                dirty
+                    .trim_end_matches('"')
+                    .ends_with(" · line 1/1200 · unsaved"),
+                "{w} columns: `· unsaved` survives a wide basename: {dirty}"
+            );
+            assert!(
+                dirty.starts_with(header.split(" · line").next().expect("a path")),
+                "{w} columns: the path did not move:\n{header}\n{dirty}"
+            );
+        }
     }
 
     #[test]
@@ -2855,6 +2940,33 @@ mod tests {
                     .any(|l| l.starts_with(&format!("{at} ")) && l.contains("DIM")),
                 "{w}x{h}: the notice on row {at} is dim:\n{styles}"
             );
+        }
+
+        // Verifier (b) F1: in two columns a body row carries two keys, and the count was
+        // of rows — `2 more keys` over four hidden ones at 100×20. The identity holds in
+        // both forms, and at the two-column width the remedy names the other dimension.
+        for (w, h) in [(100u16, 20u16), (100, 14), (120, 12)] {
+            let (frame, _) = frame_of(&narrow, w, h);
+            let lines: Vec<&str> = frame.lines().collect();
+            let notice = lines
+                .iter()
+                .find(|l| l.contains("more key"))
+                .unwrap_or_else(|| panic!("{w}x{h}: a clip notice:\n{frame}"));
+            assert!(
+                notice.contains("(a taller window shows all)"),
+                "{w}x{h}: already as wide as two columns need: {notice}"
+            );
+            let hidden: usize = notice
+                .split_whitespace()
+                .find_map(|w| w.parse().ok())
+                .unwrap_or_else(|| panic!("{w}x{h}: a count in {notice:?}"));
+            let shown = all.iter().filter(|r| frame.contains(r.as_str())).count();
+            assert_eq!(
+                shown + hidden,
+                all.len(),
+                "{w}x{h}: every key is on the frame or counted:\n{frame}"
+            );
+            assert!(frame.contains("quit"), "{w}x{h}: quit stays:\n{frame}");
         }
     }
 
