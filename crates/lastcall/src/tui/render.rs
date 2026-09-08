@@ -507,7 +507,9 @@ const HINT_NAV_ONLY: &[&str] = &["scope", "focus_toggle", "refresh", "select", "
 /// pane, `a/A accept file` on a hunkless file row (binary, collapsed, deleted, unreadable),
 /// `a accept group` on a group entry, `a accept all in <root>` on a **non-empty** root entry
 /// (how the per-repo fold is told from the header's global one; on an empty repo row `a`
-/// does nothing, so the line does not offer it — verifier (a) F2).
+/// does nothing, so the line does not offer it — verifier (a) F2). With the **diff** focused
+/// the first two hints are `↑↓ scroll  ← back` instead, because that is what those keys do
+/// there (Design pass D2, ruling R3); the two forms are the same width.
 ///
 /// Ruling R4, the sponsor's own rule: build every applicable hint, try the whole line, and
 /// while it does not fit remove one hint at a time from [`HINT_DROP_ORDER`] — no width
@@ -614,12 +616,37 @@ pub fn hints(app: &App, width: u16) -> String {
     // Reading order — what the line says when everything fits. It is not the drop order:
     // that is `HINT_DROP_ORDER`, keyed by the same action names, so the two can be read
     // (and changed) independently. `help`/`quit` are last here and absent there.
+    // Design pass D2 / ruling R3: tier 0 tells the truth about the **focused** pane. In the
+    // diff `↑`/`↓` scroll a line and `⏎` does nothing (`tui.md` Keys), so `↑↓ select
+    // ⏎ open` there named one key for what it does not do and another for what it does not
+    // do at all — and Phase 8's `v select` put a true `select` beside the untrue one. With
+    // the diff focused the line opens `↑↓ scroll  ← back` instead. `back` is the keymap's
+    // own action and `←` its arrow spelling, chosen over its first spec (`Esc`) so the two
+    // hints read as the pair of arrows they are; a keymap that binds no arrow to `back`
+    // falls back to whatever its first key is. The widths are identical to the nav's
+    // (`↑↓ scroll` = `↑↓ select` = 9, `← back` = `⏎ open` = 6), so no drop step moves.
+    let arrowed = |action: &str| {
+        let specs = app.keys_for(action);
+        specs
+            .iter()
+            .map(|s| hint_label(s))
+            .find(|l| matches!(l.as_str(), "←" | "→" | "↑" | "↓"))
+            .or_else(|| specs.first().map(|s| hint_label(s)))
+    };
     let items: Vec<(&str, String)> = [
         (
             "nav",
-            pair("nav_up", "nav_down").map(|k| format!("{k} select")),
+            pair("nav_up", "nav_down")
+                .map(|k| format!("{k} {}", if diff { "scroll" } else { "select" })),
         ),
-        ("open", first("open").map(|k| format!("{k} open"))),
+        (
+            "open",
+            if diff {
+                arrowed("back").map(|k| format!("{k} back"))
+            } else {
+                first("open").map(|k| format!("{k} open"))
+            },
+        ),
         (
             "hunk_next",
             pair("hunk_next", "hunk_prev").map(|k| format!("{k} hunk")),
@@ -2653,18 +2680,37 @@ mod tests {
         // and everything under it — no narrower frame loses a hint it used to have.
         assert_eq!(
             hints(&app, 142),
-            "↑↓ select  ⏎ open  n/p hunk  a accept hunk  A accept file  ^A accept all  t hide empty  Tab focus  r refresh  v select  y copy  ? help  q quit"
+            "↑↓ scroll  ← back  n/p hunk  a accept hunk  A accept file  ^A accept all  t hide empty  Tab focus  r refresh  v select  y copy  ? help  q quit"
         );
         assert_eq!(hints(&app, 142), hints(&app, 200), "142 is the whole line");
         assert_eq!(
             hints(&app, 141),
-            "↑↓ select  ⏎ open  n/p hunk  a accept hunk  A accept file  ^A accept all  t hide empty  Tab focus  r refresh  v select  ? help  q quit",
+            "↑↓ scroll  ← back  n/p hunk  a accept hunk  A accept file  ^A accept all  t hide empty  Tab focus  r refresh  v select  ? help  q quit",
             "`y copy` is the first hint off the line"
         );
         assert_eq!(
             hints(&app, 133),
-            nav_line,
-            "then `v select`, and the nav's own line is what is left"
+            nav_line.replace("↑↓ select  ⏎ open", "↑↓ scroll  ← back"),
+            "then `v select`, and the nav's own line with the diff's opening is what is left"
+        );
+        assert_eq!(
+            hints(&app, 133).width(),
+            nav_line.width(),
+            "`↑↓ scroll` and `← back` are exactly as wide as `↑↓ select` and `⏎ open`, so no step moved"
+        );
+        // Deliverable 3 (D2 / ruling R3): `←` is `back`'s own arrow spelling, chosen over
+        // its first spec (`Esc`) so tier 0 reads as the pair of arrows it is; a keymap that
+        // binds no arrow to `back` falls back to whatever its first key is.
+        let mut rebound = app.clone();
+        for (name, specs) in &mut rebound.keymap {
+            if name == "back" {
+                *specs = vec!["esc".to_owned()];
+            }
+        }
+        assert!(
+            hints(&rebound, 200).starts_with("↑↓ scroll  Esc back"),
+            "{}",
+            hints(&rebound, 200)
         );
         // What the line says depends on the selection, so the width it needs does too: a
         // root row trades `a accept hunk  A accept file` for `a accept all in <root>`,
@@ -2748,7 +2794,7 @@ mod tests {
             }
             previous = now;
         }
-        assert_eq!(previous, parts("↑↓ select  ⏎ open  ? help  q quit"));
+        assert_eq!(previous, parts("↑↓ scroll  ← back  ? help  q quit"));
     }
 
     /// Which hint a rendered fragment is, by the key its action is bound to — the drop
@@ -2811,7 +2857,11 @@ mod tests {
         assert!(line.ends_with("? help  q quit"), "{line}");
         assert!(line.width() <= 80, "{line}");
         app.handle(Action::Open);
-        assert_eq!(hints(&app, 80), line, "the diff pane says the same at 80");
+        assert_eq!(
+            hints(&app, 80),
+            line.replace("↑↓ select  ⏎ open", "↑↓ scroll  ← back"),
+            "the diff pane says the same at 80 but for its own tier 0 (deliverable 3)"
+        );
     }
 
     #[test]

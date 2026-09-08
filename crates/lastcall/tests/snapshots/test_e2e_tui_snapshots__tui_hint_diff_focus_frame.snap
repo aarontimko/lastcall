@@ -21,4 +21,4 @@ expression: frame
 "│  M n2.md  +2 −0          │     }                                                                                                           │"
 "│                          │+                                                                                                                │"
 "└──────────────────────────┴─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
-"↑↓ select  ⏎ open  n/p hunk  a accept hunk  A accept file  ^A accept all  t hide empty  Tab focus  r refresh  v select  y copy  ? help  q quit"
+"↑↓ scroll  ← back  n/p hunk  a accept hunk  A accept file  ^A accept all  t hide empty  Tab focus  r refresh  v select  y copy  ? help  q quit"
