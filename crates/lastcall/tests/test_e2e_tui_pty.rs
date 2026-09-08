@@ -311,10 +311,12 @@ fn rows_listed(s: &vt100::Screen) -> bool {
 }
 
 /// Wait for the first piles; returns how long they took. Also proves the first frame was
-/// the launch hold (`discovered 3 roots, checking status…`) with the `scanning` status:
-/// in the raw transcript that text precedes the first file row — and the empty state
-/// (`nothing pending across 3 repos`) never does, since every root here has rows (the
-/// Gate 8 sponsor run's ruling: no repo is listed until every root has reported).
+/// the launch hold: `discovered 3 repos, checking status…` precedes the first file row in
+/// the raw transcript — and the empty state (`nothing pending across 3 repos`) never does,
+/// since every root here has rows (the Gate 8 sponsor run's ruling: no repo is listed until
+/// every root has reported). Design pass D3 (ruling R5): the pane is the hold's only home,
+/// so the harness anchors on the pane text; `run.rs` no longer writes `scanning N roots…`
+/// to the status line, which this also pins.
 /// The status row reads `watching <parent> (3 roots)`: the FSEvents watch is installed and
 /// its gap-closing rescans are done, so from here a file change is found by the live watch
 /// and its debounce rather than by a startup rescan. The temp path is long, so only the
@@ -334,17 +336,16 @@ fn wait_first_piles(pty: &mut PtyTui) -> Duration {
         .wait_for(LONG, rows_listed)
         .unwrap_or_else(|e| panic!("first piles: {e}"));
     let raw = pty.raw();
-    let scanning =
-        find_words(&raw, &["scanning", "3", "roots…"]).expect("first frame: scanning status");
+    let hold = find_words(&raw, &["discovered", "3", "repos,", "checking", "status…"])
+        .expect("first frame: the launch hold");
     let first_row = find(&raw, b"f1").expect("a file row");
     assert!(
-        scanning < first_row,
-        "the scanning status ({scanning}) precedes the first row ({first_row})"
+        hold < first_row,
+        "the launch hold ({hold}) precedes the first row ({first_row})"
     );
     assert!(
-        find_words(&raw, &["discovered", "3", "roots,", "checking", "status…"])
-            .is_some_and(|i| i < first_row),
-        "the first frame is the launch hold"
+        find_words(&raw, &["scanning", "3", "roots…"]).is_none(),
+        "D3: the status line does not carry a second sentence about the same wait"
     );
     assert!(
         find_words(&raw, &["nothing", "pending", "across", "3", "repos"])
@@ -368,8 +369,8 @@ fn wait_first_piles(pty: &mut PtyTui) -> Duration {
         "the discovering line ({discovering}) precedes alternate-screen-on ({alt_on})"
     );
     assert!(
-        alt_on < scanning,
-        "the first frame ({scanning}) comes after it ({alt_on})"
+        alt_on < hold,
+        "the first frame ({hold}) comes after it ({alt_on})"
     );
     assert!(pty.screen(|s| s.alternate_screen()));
     assert!(pty.screen(|s| s.mouse_protocol_mode() != vt100::MouseProtocolMode::None));
@@ -925,17 +926,22 @@ fn pty_accept_loop_and_restart() {
         .expect("git commit -a");
     assert_ne!(alpha.head().expect("HEAD"), f3_commit);
 
-    // (5) a second process on the same state dir: three empty repo rows, after scanning
-    // (the `watching <parent> (3 roots)` status replaces `scanning 3 roots…` once the
-    // post-install rescans are done; the temp path is long, so only its head fits).
+    // (5) a second process on the same state dir: three empty repo rows, after the launch
+    // hold (`discovered 3 repos, checking status…` in the pane; the `watching <parent>
+    // (3 roots)` status lands on the bottom row once the post-install rescans are done —
+    // the temp path is long, so only its head fits).
     let Some(mut pty) = fx.spawn_tui(&bin()) else {
         return;
     };
     let t = Instant::now();
     wait_watching(&mut pty);
     assert!(
-        find_words(&pty.raw(), &["scanning", "3", "roots…"]).is_some(),
-        "the relaunch scanned first"
+        find_words(
+            &pty.raw(),
+            &["discovered", "3", "repos,", "checking", "status…"]
+        )
+        .is_some(),
+        "the relaunch held while it scanned"
     );
     note(&format!("PTY relaunch: scanned after {:.3?}", t.elapsed()));
     let text = pty.screen_text();
@@ -1138,7 +1144,7 @@ fn pty_draft_root_hunk_accept_and_restart() {
         .unwrap_or_else(|e| panic!("the draft row: {e}"));
     let raw = pty.raw();
     assert!(
-        find_words(&raw, &["scanning", "4", "roots…"]).is_some(),
+        find_words(&raw, &["discovered", "4", "repos,", "checking", "status…"]).is_some(),
         "the child discovered the scene's fourth root"
     );
     let text = pty.screen_text();
@@ -1495,7 +1501,7 @@ fn pty_herdr_a_stalled_socket_does_not_hold_the_keys() {
         return;
     };
     // The frame drawn *before* the link is opened; the guard is hanging from here on.
-    pty.wait_for_text("scanning", LONG)
+    pty.wait_for_text("checking status…", LONG)
         .unwrap_or_else(|e| panic!("the first frame: {e}"));
 
     let since = pty.raw().len();

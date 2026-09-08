@@ -294,7 +294,8 @@ pub fn render(app: &App, frame: &mut Frame<'_>) -> HitMap {
 }
 
 /// `lastcall  <repos> · <files> · <hunks>  <herdr badge>  [Accept All]` …
-/// `watching <parents>`. The file count carries `+` when any listed root's pile stopped at
+/// `watching <parents>`, or `lastcall  <repos> · checking status…` while the launch hold
+/// is on (Design pass D3). The file count carries `+` when any listed root's pile stopped at
 /// the row cap; the control is dim when nothing is listed and is the `HeaderAcceptAll`
 /// target either way; the badge is the `HeaderHerdr` target.
 ///
@@ -310,12 +311,23 @@ fn render_header(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
         .flat_map(|v| v.rows().iter())
         .map(|r| r.hunks.len())
         .sum();
-    let left = format!(
-        "lastcall  {} · {} · {}",
-        plural(listed.len(), "repo"),
-        count_plus(files, app.any_truncated(), "file"),
-        plural(hunks, "hunk")
-    );
+    // Design pass D3 / ruling R5: during the launch hold the header says the one count it
+    // knows and none of the ones it does not — `0 files · 0 hunks` above a pane reading
+    // `discovered 3 repos, checking status…` was the header disagreeing with the pane.
+    // `[Accept All]` is dim throughout, as it already is whenever nothing is listed.
+    let left = if app.loading.is_some() {
+        format!(
+            "lastcall  {} · checking status…",
+            plural(app.roots.len(), "repo")
+        )
+    } else {
+        format!(
+            "lastcall  {} · {} · {}",
+            plural(listed.len(), "repo"),
+            count_plus(files, app.any_truncated(), "file"),
+            plural(hunks, "hunk")
+        )
+    };
     let control = "[Accept All]";
     let (badge, badge_style) = herdr_badge(app);
     let parents: BTreeSet<String> = app
@@ -986,17 +998,23 @@ fn render_main(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
             if let Some(loading) = &app.loading {
                 // The launch hold (`Loading`): a static line, then after a second the
                 // counter and a ✓ per reported root — the slow one is the one without.
+                // Design pass D3 / ruling R5: **repos** is the noun wherever a count is
+                // shown here and in the empty states (`root` stays the config and CLI
+                // word), the counter line does not repeat it (`1 of 3 checked`), and the
+                // header agrees with the pane instead of reading `0 repos · 0 files ·
+                // 0 hunks` above `discovered 3 repos`. The pane is also the hold's only
+                // clock: `run.rs` no longer puts `scanning N roots…` on the status line.
                 lines.push(Line::from(format!(
                     "discovered {}, checking status…",
-                    plural(app.roots.len(), "root")
+                    plural(app.roots.len(), "repo")
                 )));
                 let counting = loading.counting(app.now);
                 if counting {
                     lines.push(Line::from(Span::styled(
                         format!(
                             "{} of {} checked · {} pending so far · {}s",
-                            loading.checked.len(),
-                            plural(app.roots.len(), "repo"),
+                            with_thousands(loading.checked.len()),
+                            with_thousands(app.roots.len()),
                             plural(loading.files(), "file"),
                             app.now.duration_since(loading.started).as_secs()
                         ),
@@ -3196,7 +3214,9 @@ mod tests {
     }
 
     /// The loading pane (Gate 8 sponsor run ruling): a static line in the first second, no
-    /// digits; from one second the counter line and a ✓ per reported root.
+    /// digits; from one second the counter line and a ✓ per reported root. Design pass D3
+    /// (ruling R5): **repos** is the noun, the counter line does not repeat it, and the
+    /// header says `3 repos · checking status…` rather than three counts it does not know.
     #[test]
     fn render_loading_pane_counts_only_after_one_second() {
         let mut app = App::new();
@@ -3208,7 +3228,7 @@ mod tests {
         });
         let (frame, _) = frame_of(&app, 100, 12);
         assert!(
-            frame.contains("discovered 3 roots, checking status…"),
+            frame.contains("discovered 3 repos, checking status…"),
             "{frame}"
         );
         assert!(
@@ -3218,14 +3238,18 @@ mod tests {
         assert!(!frame.contains('✓'), "{frame}");
         assert!(!frame.contains("nothing pending"), "{frame}");
         assert!(
-            frame.contains("lastcall  0 repos"),
-            "nothing is listed: {frame}"
+            frame.contains("lastcall  3 repos · checking status…"),
+            "D3: the header says the count it knows and no counts it does not: {frame}"
+        );
+        assert!(
+            !frame.contains("0 files · 0 hunks"),
+            "and not the counts it does not: {frame}"
         );
 
         app.handle(Action::Tick);
         let (frame, _) = frame_of(&app, 100, 12);
         assert!(
-            frame.contains("1 of 3 repos checked · 1,200 files pending so far · 1s"),
+            frame.contains("1 of 3 checked · 1,200 files pending so far · 1s"),
             "{frame}"
         );
         let line = |name: &str| {

@@ -2,7 +2,7 @@
 //!
 //! `run` builds the tokio runtime exactly as `commands/watch.rs` does, starts the engine's
 //! watcher, seeds the app with the engine's roots (no scan has run yet, so the first frame
-//! is the empty state with `scanning N roots…` until piles arrive), and then loops over one
+//! is the launch hold's pane until piles arrive — see `App::start_loading`), and then loops over one
 //! `select!`: watcher events → `App::apply`; terminal events (a detached reader thread) →
 //! `to_action` → `App::handle`; the loop's own finished engine work (`Local`) → the app;
 //! a 1 s tick; Ctrl-C (dead under raw mode, kept for `kill -INT`) and SIGTERM.
@@ -1449,13 +1449,12 @@ pub fn run(
     let (outcome, watcher) = runtime.block_on(async {
         let mut watcher = engine.run(timings);
         let outcome: io::Result<ExitCode> = async {
-            let n = metas.len();
             ui.app.sync_roots(metas);
+            // Design pass D3 / ruling R5: the pane is the hold's home and its only clock —
+            // the status line is not set to `scanning N roots…` here. It shows the hints,
+            // exactly as the empty state does, and the engine's own `watching …` notice
+            // lands on it when the hold ends.
             ui.app.start_loading();
-            ui.app.set_status(format!(
-                "scanning {n} root{}…",
-                if n == 1 { "" } else { "s" }
-            ));
             if let Ok((w, h)) = crossterm::terminal::size() {
                 ui.app.handle(Action::Resize(w, h));
             }

@@ -186,7 +186,8 @@ fn first_checked(s: &vt100::Screen) -> bool {
 }
 
 /// The status bar reads `watching …`: the watch is installed and the post-install
-/// rescans are done (before that it reads `scanning N roots…`).
+/// rescans are done (before that it carries the hint line — the launch hold lives in the
+/// pane, Design pass D3).
 fn watching(s: &vt100::Screen) -> bool {
     let (_, cols) = s.size();
     s.rows(0, cols)
