@@ -607,8 +607,15 @@ The engine's refusals arrive as `App::edit_read`:
 - everything else is the CAS speaking, in the vocabulary every other refused op uses.
 
 **Layout** (`render::render_editor`). The editor replaces the diff pane; the nav stays.
-Header: `editing <path> · line N/M[ · unsaved]`, ellipsized, **bold — or red while
-`ed.alarm`**, which is set by a refused save and cleared by the next key. Body: a
+Header: `editing <path> · line N/M[ · unsaved]`, **bold — or red while `ed.alarm`**, which
+is set by a refused save and cleared by the next key. Only the **path** gives, and it gives
+from the head (`render::ellipsize_head`, Design pass D9 / ruling R10): the budget is the
+width less `editing `, ` · line N/M` and ` · unsaved` — the last reserved whether or not the
+buffer is dirty, so the header does not shift under the reader on the first keystroke — and
+the cut lands on the leftmost `/` whose remainder fits, so what is left still reads as a
+path (`editing …lastcall/src/tui/render.rs · line 21/62 · unsaved`). The **basename is the
+floor**: a width with no room even for `…<basename>` keeps the whole basename and lets the
+row's own clip take the overflow, because half a file name answers nothing. Body: a
 five-column gutter (`EDITOR_GUTTER`), then the file, no wrapping. The gutter carries the
 line number, and `▎` (`EDITOR_MARK`) on **every line inside any pending hunk of the row** —
 so the reader can see the rest of the agent's work while they type in one part of it. The
@@ -1005,7 +1012,7 @@ rule adds a row. Nothing here is a promise about the final design.
 | Note modal | centered, `NOTE_WIDTH` = 60 columns (clamped to the frame minus 4, floor 8), a fixed `NOTE_ROWS` = 5-line text area that scrolls to keep the caret visible, plus the title — which **names the target**, ` flag hunk 2 of 3 ` or ` flag whole file ` (agenda (d)) — the target line and the key row, `⏎ send   ^J newline   Esc cancel` or its `⇧⏎` form; bracketed paste is on only while it is open | `tui_note_modal`, `tui_note_modal_scrolled`, `tui_note_modal_whole_file`, PTY `pty_flag_note_exports_when_standalone` |
 | Agent picker | centered, width = widest row + 4, height = rows + 2, both clamped to the frame; first row says the flag is already saved and `Esc` costs only the send; key row `↑↓ choose   ⏎ send   Esc cancel` | `tui_agent_picker` |
 | Collapsed rows | `collapsed (binary) · +a −d · not expandable` / `collapsed (size)` with `[e expand]`; expansion capped at 2,000 lines with `… N lines omitted` | `tui_nav_collapsed_*`, `tui_diff_view_collapsed*` |
-| Editor header (Phase 8) | `editing <path> · line N/M[ · unsaved]`, bold, or red while a save stands refused, and **truncated from the tail** by `render::ellipsize` — so a long path eats the `line N/M` and then the `· unsaved` before it loses any of itself. That is the wrong end to lose on a narrow frame (the position is the part that changes as you type) and it is the header's entry for the pass; at 60 columns with the fixture's `src/parse.rs` everything still fits | `tui_editor_narrow_60x20`, `tui_editor_save_refused` (the red header) |
+| Editor header (Phase 8; **ruling R10**, Phase 9a deliverable 6) | `editing <path> · line N/M[ · unsaved]`, bold, or red while a save stands refused. Only the path gives, and it gives from the **head**, cut at the leftmost `/` whose remainder fits (`render::ellipsize_head`) with the basename as the floor; ` · unsaved` is reserved at every width so the header does not shift on the first keystroke, and `line N/M` — the part that changes as you type — is never what is cut. At 60 columns with the fixture's `src/parse.rs` everything still fits, so `tui_editor_narrow_60x20` is unchanged | `render_ellipsize_head_cuts_at_a_slash_and_floors_at_the_basename`, `render_editor_header_keeps_the_position_and_reserves_unsaved`, `tui_editor_long_path_60x20`, `tui_editor_narrow_60x20`, `tui_editor_save_refused` (the red header) |
 | Editor body (Phase 8) | five-column gutter, then the file with **no wrap**; a clipped row ends in a dim `→` and `End` is the way to the rest. The caret line is tinted (indexed 238) and the entered hunk banded (236), so the editor needs a 256-colour terminal to look right and degrades to "no tint" rather than to noise. Hint line becomes exactly `^S save   Esc close` | `tui_editor_open`, `tui_editor_narrow_60x20` (which asserts the `→` is on the frame) |
 | Copy cue (Phase 8) | a centered one-line reverse-video `copied to clipboard` over the diff pane for 2 s; **not** the status line, so it cannot evict an engine notice, and the two can be on screen together | `tui_copy_cue`, `render_selection_is_reverse_video_and_the_cue_sits_over_the_diff` |
 | Diff selection (Phase 8) | selected lines are full-width reverse video; the pane scrolls only enough to keep the selection's moving end visible, never a line per keystroke | `tui_diff_selection`, `app_select_extends_with_the_cursor_and_y_copies_the_range` |
@@ -1016,8 +1023,9 @@ Open design questions the pass should take, in the order they have come up: whet
 hint line should carry `u`/`m` (or go to a second tier) once the width allows; whether a
 two-column overlay is the right answer for a keymap that keeps growing; the 60-column
 header crowding; the scope notice at 100 columns; the select-to-copy cue's placement and
-duration; the two senses of "select" on the tier-3 hint line; and whether the editor header
-should keep the path or the position when the frame will not hold both.
+duration; and the two senses of "select" on the tier-3 hint line. (The editor header's own
+question — path or position when the frame will not hold both — was answered by ruling R10:
+the position always, the path head-ellipsized.)
 
 ## herdr in the UI (Phase 5)
 

@@ -1815,3 +1815,45 @@ fn tui_editor_narrow_60x20() {
     assert!(frame.contains('→'), "a clipped line says so: {frame}");
     snapshot("tui_editor_narrow_60x20", &app, 60, 20);
 }
+
+/// Design pass D9 (ruling R10): the editor header at 60 columns with a path too long for
+/// it. Only the **path** gives, and it gives from the head at a `/`, so what is left still
+/// reads as a path; `line N/M` — the part that changes as you type — is never the thing
+/// cut, and `· unsaved` is reserved at every width so the header does not shift under the
+/// reader on the first keystroke. The scene is `tui_editor_narrow_60x20` with the row's
+/// path rewritten and one character typed: the body is the same fixture, the header is the
+/// whole point.
+#[test]
+fn tui_editor_long_path_60x20() {
+    const LONG: &[u8] = b"crates/lastcall/src/tui/render.rs";
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    let alpha = root_named(&engine, "alpha");
+    at_parse_rs_middle_hunk(&mut app, &engine, &alpha);
+    app.handle(Action::Resize(60, 20));
+    open_editor(&mut app, &engine);
+    app.editor.as_mut().expect("open").rendered.path = LONG.to_vec();
+
+    let position = format!("line {}/62", fixture_parent::parse_rs_edit2_line());
+    let (clean, _) = draw(&app, 60, 20);
+    let header = clean.lines().next().expect("a header").to_owned();
+    let head = format!("editing …lastcall/src/tui/render.rs · {position}");
+    assert!(
+        header.contains(&head),
+        "the head gives, cut at a `/`, and the position survives: {header}"
+    );
+    assert!(!header.contains("unsaved"), "a clean buffer: {header}");
+
+    app.handle(Action::Editor(EditorKey::Edit(EditKey::Insert(
+        "x".to_owned(),
+    ))));
+    let (dirty, _) = draw(&app, 60, 20);
+    let dirty_header = dirty.lines().next().expect("a header").to_owned();
+    assert!(dirty_header.contains(" · unsaved"), "{dirty_header}");
+    assert!(
+        dirty_header.contains(&head),
+        "the path and the position did not move to make room for it: {dirty_header}"
+    );
+    snapshot("tui_editor_long_path_60x20", &app, 60, 20);
+}

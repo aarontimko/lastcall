@@ -1236,17 +1236,22 @@ fn render_main(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
 /// not what is on screen, and that is worth more than one line of status.
 fn render_editor_header(ed: &Editor, buf: &mut Buffer, area: Rect) {
     // The keys live in the hint line, where every other key hint in the TUI lives; the
-    // header is the answer to "what am I in, and where in it?" — short enough that at the
-    // 60-column floor the fixture's paths keep the whole line. Past that `ellipsize` cuts
-    // from the **tail**, so a long enough path costs the `· unsaved` and then the
-    // `line N/M` — the wrong end to lose, since the position is the part that changes as
-    // you type. A head-ellipsis of the path would be strictly better and is the header's
-    // entry for the design pass (verifier (b) on decision 10); `tui.md` records it too.
+    // header is the answer to "what am I in, and where in it?". Design pass D9 / ruling
+    // R10: only the **path** gives, and it gives from the head. A tail cut took the
+    // `· unsaved` first and then the `line N/M` — the wrong end to lose, since the
+    // position is the part that changes as you type and `unsaved` is the part that says
+    // the file on disk is not what is on screen. `· unsaved` is reserved at every width
+    // whether or not the buffer is dirty, so the header does not shift under the reader on
+    // the first keystroke.
+    let position = ed.buf.position_label();
+    let path = String::from_utf8_lossy(&ed.rendered.path);
+    const UNSAVED: &str = " · unsaved";
+    let budget = (area.width as usize)
+        .saturating_sub("editing ".width() + " · ".width() + position.width() + UNSAVED.width());
     let text = format!(
-        "editing {} · {}{}",
-        String::from_utf8_lossy(&ed.rendered.path),
-        ed.buf.position_label(),
-        if ed.buf.dirty() { " · unsaved" } else { "" },
+        "editing {} · {position}{}",
+        ellipsize_head(&path, budget),
+        if ed.buf.dirty() { UNSAVED } else { "" },
     );
     let style = if ed.alarm { red() } else { bold() };
     buf.set_stringn(
@@ -2172,6 +2177,35 @@ pub fn ellipsize(s: &str, max: usize) -> String {
     out
 }
 
+/// Truncate `s` to at most `max` columns from the **head**, cutting at a `/` so what is
+/// left still reads as a path: `…lastcall/src/tui/render.rs` (Design pass D9, ruling R10).
+///
+/// The `/` chosen is the leftmost one whose remainder fits, so the longest path tail that
+/// fits is what is shown. The **basename is the floor**: a width with no room even for
+/// `…<basename>` keeps the whole basename and lets the row's own clip take the overflow,
+/// because half a file name answers nothing. A string with no `/` at all has no path
+/// structure to preserve and falls back to [`ellipsize`].
+pub fn ellipsize_head(s: &str, max: usize) -> String {
+    if s.width() <= max {
+        return s.to_owned();
+    }
+    let mut basename = None;
+    for (i, c) in s.char_indices() {
+        if c != '/' {
+            continue;
+        }
+        let tail = &s[i + 1..];
+        basename = Some(tail);
+        if tail.width() < max {
+            return format!("…{tail}");
+        }
+    }
+    match basename {
+        Some(base) => format!("…{base}"),
+        None => ellipsize(s, max),
+    }
+}
+
 /// One line per run of non-default cells: `y x0..x1 fg bg modifiers` (`x1` exclusive,
 /// modifiers `|`-joined or `-`). `TestBackend`'s `Display` shows symbols only, so
 /// snapshots pair it with this.
@@ -2425,6 +2459,81 @@ mod tests {
         assert_eq!(ellipsize("日本語", 6), "日本語");
         assert_eq!(ellipsize("abc", 0), "");
         assert_eq!(ellipsize("abc", 1), "…");
+    }
+
+    /// Design pass D9 (ruling R10): the editor header's path gives from the head and cuts
+    /// at a `/`, so what is left still reads as a path — and never below the basename.
+    #[test]
+    fn render_ellipsize_head_cuts_at_a_slash_and_floors_at_the_basename() {
+        let p = "home/aaron/dev/git/lastcall/src/tui/render.rs";
+        assert_eq!(ellipsize_head(p, 60), p, "it fits: untouched");
+        assert_eq!(ellipsize_head(p, p.len()), p, "exactly: untouched");
+        // The leftmost `/` whose remainder fits, so the longest path tail is what shows —
+        // and every cut lands on a segment boundary, never mid-segment.
+        assert_eq!(
+            ellipsize_head(p, 43),
+            "…aaron/dev/git/lastcall/src/tui/render.rs",
+            "one column short of the whole drops the first segment, not one character"
+        );
+        assert_eq!(
+            ellipsize_head(p, 41),
+            "…aaron/dev/git/lastcall/src/tui/render.rs"
+        );
+        assert_eq!(ellipsize_head(p, 40), "…dev/git/lastcall/src/tui/render.rs");
+        assert_eq!(ellipsize_head(p, 35), "…dev/git/lastcall/src/tui/render.rs");
+        assert_eq!(ellipsize_head(p, 34), "…git/lastcall/src/tui/render.rs");
+        assert_eq!(ellipsize_head(p, 31), "…git/lastcall/src/tui/render.rs");
+        assert_eq!(ellipsize_head(p, 30), "…lastcall/src/tui/render.rs");
+        assert_eq!(ellipsize_head(p, 20), "…src/tui/render.rs");
+        assert_eq!(ellipsize_head(p, 14), "…tui/render.rs");
+        // The floor: the basename stays whole and the row's own clip takes the overflow —
+        // half a file name answers nothing.
+        assert_eq!(ellipsize_head(p, 13), "…render.rs");
+        assert_eq!(ellipsize_head(p, 4), "…render.rs");
+        assert_eq!(ellipsize_head(p, 0), "…render.rs");
+        // No `/`: no path structure to keep, so the ordinary tail cut.
+        assert_eq!(ellipsize_head("render.rs", 5), "rend…");
+        // Columns, not bytes.
+        assert_eq!(ellipsize_head("a/日本語.md", 8), "…日本語.md");
+    }
+
+    /// The other half of D9: `· unsaved` is reserved at every width, so the header does
+    /// not shift under the reader on the first keystroke, and the position never gives.
+    #[test]
+    fn render_editor_header_keeps_the_position_and_reserves_unsaved() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(60, 20));
+        let mut pile = pile("alpha");
+        pile.rows[0].path = b"crates/lastcall/src/tui/render.rs".to_vec();
+        app.apply(pile_event("alpha", pile));
+        app.select(Some(Selection::Row(
+            root("alpha"),
+            b"crates/lastcall/src/tui/render.rs".to_vec(),
+        )));
+        app.handle(Action::Open);
+        let open = match app.handle(Action::Edit).1 {
+            Some(crate::tui::app::Effect::EditInline(open)) => open,
+            other => panic!("an inline-edit effect, got {other:?}"),
+        };
+        app.edit_read(open, Ok(b"one\ntwo\nthree\n".to_vec()));
+        let clean = frame_of(&app, 60, 20).0;
+        let header = clean.lines().next().expect("a header").to_owned();
+        assert!(
+            header.contains("…lastcall/src/tui/render.rs · line 1/"),
+            "the head gives, the position never does: {header}"
+        );
+        assert!(!header.contains("unsaved"), "not dirty yet: {header}");
+
+        app.handle(Action::Editor(crate::tui::input::EditorKey::Edit(
+            crate::tui::input::EditKey::Insert("x".to_owned()),
+        )));
+        let dirty = frame_of(&app, 60, 20).0;
+        let dirty_header = dirty.lines().next().expect("a header").to_owned();
+        assert!(dirty_header.contains(" · unsaved"), "{dirty_header}");
+        assert!(
+            dirty_header.starts_with(header.split(" · line").next().expect("a path")),
+            "the path did not move when `· unsaved` appeared:\n{header}\n{dirty_header}"
+        );
     }
 
     #[test]
