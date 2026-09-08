@@ -287,9 +287,18 @@ pub fn config_path(env: &Env) -> Result<(Option<PathBuf>, Vec<PathBuf>), ConfigE
 }
 
 /// Resolve the state directory per §6.1.
+///
+/// A relative `$LASTCALL_STATE_DIR` is joined onto the launch cwd (verifier (a) F3). The
+/// store already landed at `<cwd>/<value>` — every open goes through the process's own cwd
+/// — but the path was *printed* verbatim by `lastcall config` and, since Amendment v1.9,
+/// by `status --json`'s `state_dir`, whose whole job is to tell two runs apart. A bare
+/// `relstate` cannot do that. Joined, never canonicalised: no symlink is resolved and no
+/// existence is required, so a store that does not exist yet still names itself.
+/// The `xdg_state_home` fallback is absolute already (`Env::xdg_dir` ignores a relative
+/// `XDG_STATE_HOME` per the XDG spec and falls back to `$HOME`).
 pub fn state_dir(env: &Env) -> Result<PathBuf, ConfigError> {
     if let Some(explicit) = env.var("LASTCALL_STATE_DIR") {
-        return Ok(PathBuf::from(explicit));
+        return Ok(env.cwd().join(explicit));
     }
     env.xdg_state_home()
         .map(|dir| dir.join("lastcall"))
@@ -737,6 +746,24 @@ nav_down = ["down", "j", "ctrl-n"]
             load(&env).unwrap().state_dir,
             PathBuf::from("/explicit/state")
         );
+    }
+
+    /// Verifier (a) F3: a relative `$LASTCALL_STATE_DIR` names the same store it always
+    /// did — `<cwd>/relstate` — but it now *says* so, because `status --json`'s
+    /// `state_dir` exists to tell two runs apart. Joined, not canonicalised: the directory
+    /// need not exist.
+    #[test]
+    fn config_relative_state_dir_is_absolutised_against_the_cwd() {
+        let dir = TempDir::new("lc-config");
+        let home = dir.mkdir("home");
+        let env = Env::empty(dir.path())
+            .with_home(&home)
+            .with_var("LASTCALL_STATE_DIR", "relstate");
+        let resolved = state_dir(&env).unwrap();
+        assert_eq!(resolved, dir.path().join("relstate"));
+        assert!(resolved.is_absolute(), "{resolved:?}");
+        assert!(!resolved.exists(), "no directory is created or required");
+        assert_eq!(load(&env).unwrap().state_dir, resolved);
     }
 
     #[test]

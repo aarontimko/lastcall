@@ -713,7 +713,11 @@ Readers that predate the field ignore it; `Pile::omitted` deserializes as `0` wh
 `state_dir`, `store` and `ledger_written_at` (additive, Phase 9a / Amendment v1.9;
 `status_version` stays 1) name **which store this run read**. `state_dir` is the resolved
 state dir (`LASTCALL_STATE_DIR` → `$XDG_STATE_HOME/lastcall` → `~/.local/state/lastcall`,
-`Layout::state_dir`); `store` is the root's `<repo-hash>` directory name under
+`config::state_dir`), always absolute: a relative `LASTCALL_STATE_DIR` is joined onto the
+launch cwd — where the store already lands — and never canonicalised, so no symlink is
+resolved and a store that does not exist yet still names itself (verifier (a) F3;
+`config_relative_state_dir_is_absolutised_against_the_cwd`); `store` is the root's
+`<repo-hash>` directory name under
 `<state_dir>/roots/<parent-hash>/repos/`, so `jq -r '.roots[] | "\(.store) \(.root)"'`
 gives the `cd` target for the walkthrough above; `ledger_written_at` is `ledger.json`'s
 mtime as ISO-8601 UTC with second precision, `null` when no ledger has been written yet
