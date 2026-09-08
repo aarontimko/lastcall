@@ -468,15 +468,52 @@ fn render_status(app: &App, buf: &mut Buffer, area: Rect) {
     buf.set_line(area.x, area.y, &line, area.width);
 }
 
+/// The order hints leave the line when it will not fit, **first to go first** (ruling R4;
+/// Phase 9a deliverable 4, and the orchestrator's post-checkpoint note for `hide_empty`'s
+/// place). Names are keymap action names, so a rebind moves the key and never the order.
+///
+/// The shape of it: the diff pane's two extras go first (they are named in the overlay and
+/// in `SELECT_NOTE`), then the three whose surface says the same thing another way (`r`
+/// refreshes what the watcher does anyway, `Tab` and `w` are visible in the pane layout and
+/// the scope notice), then `^A` — which the header's `[Accept All]` duplicates at every
+/// width that still draws it — then the toggle, then the herdr jumps, then the accept folds
+/// narrowing from the widest to the narrowest, and last the selection's own accept phrase.
+/// `help` and `quit` are not in the list at all: they are pinned, so a cut line always says
+/// where the rest of the keys are.
+const HINT_DROP_ORDER: &[&str] = &[
+    "copy",
+    "select",
+    "refresh",
+    "focus_toggle",
+    "scope",
+    "accept_all",
+    "hide_empty",
+    "jump",
+    "ack",
+    "accept_file",
+    "hunk_next",
+    "accept",
+];
+
+/// Hints that are **untrue** without a nav pane, and so are never offered below
+/// [`NAV_MIN_COLS`] whatever the width arithmetic says: below 70 columns the diff takes the
+/// whole body and holds focus, so `Tab focus` toggles nothing, and `v`/`y`/`w`/`r` belong to
+/// the same wide-frame set the tiers used to gate together.
+const HINT_NAV_ONLY: &[&str] = &["scope", "focus_toggle", "refresh", "select", "copy"];
+
 /// The hint line from the app's own keymap: `↑↓ select  ⏎ open  n/p hunk  <accept>  ^A
-/// accept all  Tab focus  r refresh  ? help  q quit`, where `<accept>` follows the
-/// selection — `a accept hunk  A accept file` on a file row with hunks in **either** pane,
-/// `a/A accept file` on a hunkless file row (binary, collapsed, deleted, unreadable),
-/// `a accept group` on a group entry, `a accept all in <root>` on a root entry (how the
-/// per-repo fold is told from the header's global one).
-/// Below `NAV_MIN_COLS`, or when the line would not fit, the `focus` and `refresh` hints
-/// are dropped. While the confirm modal is open the line is `y confirm  n cancel  q quit`:
-/// exactly the keys that work there (the modal's own, fixed, and the keymap's `quit`).
+/// accept all  t hide empty  Tab focus  r refresh  ? help  q quit`, where `<accept>` follows
+/// the selection — `a accept hunk  A accept file` on a file row with hunks in **either**
+/// pane, `a/A accept file` on a hunkless file row (binary, collapsed, deleted, unreadable),
+/// `a accept group` on a group entry, `a accept all in <root>` on a **non-empty** root entry
+/// (how the per-repo fold is told from the header's global one; on an empty repo row `a`
+/// does nothing, so the line does not offer it — verifier (a) F2).
+///
+/// Ruling R4, the sponsor's own rule: build every applicable hint, try the whole line, and
+/// while it does not fit remove one hint at a time from [`HINT_DROP_ORDER`] — no width
+/// constants, no all-or-nothing tiers, and `? help  q quit` always the last two on the line.
+/// While the confirm modal is open the line is `y confirm  n cancel  q quit`: exactly the
+/// keys that work there (the modal's own, fixed, and the keymap's `quit`).
 pub fn hints(app: &App, width: u16) -> String {
     let first = |action: &str| app.keys_for(action).first().map(|s| hint_label(s));
     // The editor swallows the keymap, so naming the keymap's keys here would name keys that
@@ -520,8 +557,12 @@ pub fn hints(app: &App, width: u16) -> String {
             (None, None) => None,
         },
         Some(AcceptScope::Group { .. }) => accept.as_ref().map(|k| format!("{k} accept group")),
+        // Verifier (a) F2: since v1.9 a repo with nothing pending is a selectable nav row,
+        // and `a` on it lands on `nothing to accept`. A hint the line promises has to do
+        // something, so the phrase is offered only while the repo has rows.
         Some(AcceptScope::Root(root)) => accept
             .as_ref()
+            .filter(|_| app.roots.get(root).is_some_and(|v| !v.rows().is_empty()))
             .map(|k| format!("{k} accept all in {}", app.root_name(root))),
         // `Bless` is never what the *selection* covers — it is built by the editor-return
         // path and lives only inside a confirm — so the hint line has nothing to say for it.
@@ -570,55 +611,75 @@ pub fn hints(app: &App, width: u16) -> String {
         let verb = if app.hide_empty { "show" } else { "hide" };
         format!("{k} {verb} empty")
     });
-    let items = [
-        (pair("nav_up", "nav_down").map(|k| format!("{k} select")), 0),
-        (first("open").map(|k| format!("{k} open")), 0),
+    // Reading order — what the line says when everything fits. It is not the drop order:
+    // that is `HINT_DROP_ORDER`, keyed by the same action names, so the two can be read
+    // (and changed) independently. `help`/`quit` are last here and absent there.
+    let items: Vec<(&str, String)> = [
         (
-            pair("hunk_next", "hunk_prev").map(|k| format!("{k} hunk")),
-            0,
+            "nav",
+            pair("nav_up", "nav_down").map(|k| format!("{k} select")),
         ),
-        (context, 0),
-        (file, 1),
-        (first("accept_all").map(|k| format!("{k} accept all")), 1),
-        (ack, 1),
-        (jump, 1),
-        // Its own tier above every other, not the tier 1 the kickoff sketches, and only
-        // while the tiers are all-or-nothing. At tier 1 the 100-column line every
-        // snapshot is drawn at would be 102 columns and the **whole** of tier 1 would
-        // fall off it: 26 frames this deliverable does not name would regenerate with
-        // *fewer* hints than they carry today. Tier 4 is dropped first, so a line only
-        // ever gains this hint — deliverable 4 replaces the tiers with one explicit drop
-        // order and gives it the place the kickoff wants. Decision (1) in the report.
-        (hide_empty, 4),
-        (scope, 2),
-        (first("focus_toggle").map(|k| format!("{k} focus")), 2),
-        (first("refresh").map(|k| format!("{k} refresh")), 2),
-        // Deliverable 9: the diff pane's own two keys, on the widest line only. Their own
-        // tier, dropped before anything that was on the line before them, so no narrower
-        // frame loses a hint it used to have — and the help overlay and its mouse note name
-        // them at every width.
-        (select_hint, 3),
-        (copy_hint, 3),
-        (first("help").map(|k| format!("{k} help")), 0),
-        (first("quit").map(|k| format!("{k} quit")), 0),
-    ];
-    let join = |max_tier: u8| -> String {
+        ("open", first("open").map(|k| format!("{k} open"))),
+        (
+            "hunk_next",
+            pair("hunk_next", "hunk_prev").map(|k| format!("{k} hunk")),
+        ),
+        ("accept", context),
+        ("accept_file", file),
+        (
+            "accept_all",
+            first("accept_all").map(|k| format!("{k} accept all")),
+        ),
+        ("ack", ack),
+        ("jump", jump),
+        ("hide_empty", hide_empty),
+        ("scope", scope),
+        (
+            "focus_toggle",
+            first("focus_toggle").map(|k| format!("{k} focus")),
+        ),
+        ("refresh", first("refresh").map(|k| format!("{k} refresh"))),
+        // Phase 8 deliverable 9: the diff pane's own two keys. They are still the first two
+        // off the line (`HINT_DROP_ORDER`), so no narrower frame loses a hint it used to
+        // have — and the help overlay and its mouse note name them at every width.
+        ("select", select_hint),
+        ("copy", copy_hint),
+        ("help", first("help").map(|k| format!("{k} help"))),
+        ("quit", first("quit").map(|k| format!("{k} quit"))),
+    ]
+    .into_iter()
+    .filter_map(|(name, hint)| hint.map(|h| (name, h)))
+    .collect();
+
+    let mut dropped: Vec<&str> = if width >= NAV_MIN_COLS {
+        Vec::new()
+    } else {
+        HINT_NAV_ONLY.to_vec()
+    };
+    let join = |dropped: &[&str]| -> String {
         items
             .iter()
-            .filter(|(_, tier)| *tier <= max_tier)
-            .filter_map(|(hint, _)| hint.clone())
+            .filter(|(name, _)| !dropped.contains(name))
+            .map(|(_, hint)| hint.as_str())
             .collect::<Vec<_>>()
             .join("  ")
     };
-    let fits = |s: &str| s.width() <= width as usize;
-    for tier in [4, 3, 2] {
-        let line = join(tier);
-        if width >= NAV_MIN_COLS && fits(&line) {
-            return line;
+    let mut line = join(&dropped);
+    // One hint at a time, in the fixed order, until it fits. When even the last of them is
+    // gone the line is the four that are never dropped (`↑↓ select  ⏎ open  ? help  q quit`,
+    // 33 columns) — inside `MIN_SIZE`'s 40, so the promise that `? help` is on every legal
+    // frame is arithmetic, not luck.
+    for name in HINT_DROP_ORDER {
+        if line.width() <= width as usize {
+            break;
         }
+        if dropped.contains(name) {
+            continue;
+        }
+        dropped.push(name);
+        line = join(&dropped);
     }
-    let mid = join(1);
-    if fits(&mid) { mid } else { join(0) }
+    line
 }
 
 /// `key_label` with control keys as `^X`, the hint line's compact spelling.
@@ -2342,8 +2403,8 @@ mod tests {
         );
         assert_eq!(
             hints(&app, 60),
-            "↑↓ select  ⏎ open  n/p hunk  ^A accept all  ? help  q quit",
-            "narrow drops the toggle with focus and refresh"
+            "↑↓ select  ⏎ open  n/p hunk  t hide empty  ? help  q quit",
+            "below `NAV_MIN_COLS` the wide-frame five are gone, then `^A` is the next to go"
         );
         for (name, specs) in &mut app.keymap {
             if name == "quit" {
@@ -2564,49 +2625,54 @@ mod tests {
             nav_line,
             "↑↓ select  ⏎ open  n/p hunk  a accept hunk  A accept file  ^A accept all  t hide empty  Tab focus  r refresh  ? help  q quit"
         );
-        // §6.7 (Amendment v1.9): `t hide empty` is the first hint off the line, so one
-        // column short of it the nav says exactly what it said before this deliverable.
-        let nav_tier2 = hints(&app, 123);
+        assert_eq!(hints(&app, 200), nav_line, "124 is the whole nav line");
+        // Ruling R4: one hint at a time, from the right end of `HINT_DROP_ORDER` — so a
+        // column short of the whole line the nav keeps everything but `r refresh`.
         assert_eq!(
-            nav_tier2,
-            "↑↓ select  ⏎ open  n/p hunk  a accept hunk  A accept file  ^A accept all  Tab focus  r refresh  ? help  q quit"
+            hints(&app, 123),
+            "↑↓ select  ⏎ open  n/p hunk  a accept hunk  A accept file  ^A accept all  t hide empty  Tab focus  ? help  q quit"
         );
         assert_eq!(
             hints(&app, 100),
-            "↑↓ select  ⏎ open  n/p hunk  a accept hunk  A accept file  ^A accept all  ? help  q quit",
-            "the toggle goes with focus/refresh when the line would not fit"
+            "↑↓ select  ⏎ open  n/p hunk  a accept hunk  A accept file  t hide empty  ? help  q quit",
+            "`Tab focus` then `^A accept all`; the toggle outlives both"
+        );
+        assert_eq!(
+            hints(&app, 80),
+            "↑↓ select  ⏎ open  n/p hunk  a accept hunk  A accept file  ? help  q quit",
+            "then the toggle"
         );
         assert_eq!(
             hints(&app, 60),
             "↑↓ select  ⏎ open  n/p hunk  a accept hunk  ? help  q quit",
-            "then the file and global accept hints"
+            "then the file accept — and below 70 the wide-frame five were never offered"
         );
         app.handle(Action::Open);
-        assert_eq!(hints(&app, 123), nav_tier2, "the diff pane says the same");
-        // Deliverable 9: `v select  y copy` are the diff pane's own keys on their own tier
-        // (3), dropped before every hint that was on the line before them — so a frame that
-        // loses them keeps `Tab focus`/`r refresh` and everything under it.
+        // Phase 8 deliverable 9: `v select  y copy` are the diff pane's own keys and the
+        // first two off `HINT_DROP_ORDER`, so a frame that loses them keeps `r refresh`
+        // and everything under it — no narrower frame loses a hint it used to have.
         assert_eq!(
             hints(&app, 142),
             "↑↓ select  ⏎ open  n/p hunk  a accept hunk  A accept file  ^A accept all  t hide empty  Tab focus  r refresh  v select  y copy  ? help  q quit"
         );
-        // The threshold `tui.md` quotes, pinned (verifier (b) F7): the widest line for a
-        // file row is 142 columns (128 through tier 3, plus `t hide empty` at tier 4), so
-        // 142 shows all of it and 127 falls back to the tier-2 line — the one the nav gets.
-        assert_eq!(hints(&app, 142), hints(&app, 200));
+        assert_eq!(hints(&app, 142), hints(&app, 200), "142 is the whole line");
         assert_eq!(
             hints(&app, 141),
-            "↑↓ select  ⏎ open  n/p hunk  a accept hunk  A accept file  ^A accept all  Tab focus  r refresh  v select  y copy  ? help  q quit",
-            "the toggle is the first hint off the line, so the diff pane keeps its own two"
+            "↑↓ select  ⏎ open  n/p hunk  a accept hunk  A accept file  ^A accept all  t hide empty  Tab focus  r refresh  v select  ? help  q quit",
+            "`y copy` is the first hint off the line"
         );
-        assert_eq!(hints(&app, 127), nav_tier2, "one column short of tier 3");
-        // What the line says depends on the selection, so the threshold does too: a root
-        // row trades `a accept hunk  A accept file` for `a accept all in <root>`, which is
-        // seven columns shorter with this fixture's names.
+        assert_eq!(
+            hints(&app, 133),
+            nav_line,
+            "then `v select`, and the nav's own line is what is left"
+        );
+        // What the line says depends on the selection, so the width it needs does too: a
+        // root row trades `a accept hunk  A accept file` for `a accept all in <root>`,
+        // which is seven columns shorter with this fixture's names.
         let mut at_root = app.clone();
         at_root.select(Some(Selection::Root(root("alpha"))));
-        assert!(hints(&at_root, 121).contains("y copy"));
-        assert!(!hints(&at_root, 120).contains("y copy"));
+        assert!(hints(&at_root, 135).contains("y copy"));
+        assert!(!hints(&at_root, 134).contains("y copy"));
         assert!(!nav_line.contains("y copy"), "the nav has no copy key");
         app.handle(Action::Back);
         assert!(
@@ -2629,6 +2695,123 @@ mod tests {
             "{}",
             hints(&app, 100)
         );
+    }
+
+    /// Ruling R4 (the sponsor: "trying our best to fit everything but once it gets beyond
+    /// N columns, cut it back and add `? help`"): the line loses **one** hint per column
+    /// step, in `HINT_DROP_ORDER`, and never a fixed tier at once. Walking one column at a
+    /// time from the whole line to the floor, every step either changes nothing or removes
+    /// exactly one hint, and the hint it removes is the next one still on the line.
+    #[test]
+    fn render_hints_drop_one_at_a_time_from_the_right() {
+        use crate::tui::herdr::{HerdrUpdate, Scope};
+        let mut app = three_roots();
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Open);
+        app.herdr.scoped = true;
+        app.handle(Action::Herdr(HerdrUpdate::Scope(Some(Scope {
+            label: "w1".to_owned(),
+            roots: [root("alpha"), root("beta"), root("notes")]
+                .into_iter()
+                .collect(),
+        }))));
+        let whole = hints(&app, 400);
+        assert!(
+            whole.contains("w scope") && whole.contains("y copy"),
+            "{whole}"
+        );
+        let parts = |line: &str| line.split("  ").map(|s| s.to_owned()).collect::<Vec<_>>();
+        let mut previous = parts(&whole);
+        // From the whole line down to `MIN_SIZE`'s floor. `NAV_MIN_COLS` is the one step
+        // that may take several at once (the five hints a nav-less frame cannot promise).
+        for width in (40..=whole.width() as u16).rev() {
+            let now = parts(&hints(&app, width));
+            assert!(
+                now.iter().all(|h| previous.contains(h)),
+                "no hint returns as the line narrows: {now:?} after {previous:?}"
+            );
+            if width + 1 != NAV_MIN_COLS {
+                assert!(
+                    previous.len() - now.len() <= 1,
+                    "one at a time at {width}: {now:?} after {previous:?}"
+                );
+            }
+            if previous.len() != now.len() {
+                let gone: Vec<&String> = previous.iter().filter(|h| !now.contains(h)).collect();
+                let expected = HINT_DROP_ORDER
+                    .iter()
+                    .find(|name| previous.iter().any(|h| hint_is(h, name, &app)));
+                assert!(
+                    expected.is_some_and(|name| gone.iter().any(|h| hint_is(h, name, &app))),
+                    "the next one in the drop order goes at {width}: {gone:?}"
+                );
+            }
+            previous = now;
+        }
+        assert_eq!(previous, parts("↑↓ select  ⏎ open  ? help  q quit"));
+    }
+
+    /// Which hint a rendered fragment is, by the key its action is bound to — the drop
+    /// order is action names and the line is labels.
+    fn hint_is(rendered: &str, action: &str, app: &App) -> bool {
+        let key = match action {
+            "hunk_next" => "n/p".to_owned(),
+            other => app
+                .keys_for(other)
+                .first()
+                .map(|s| hint_label(s))
+                .unwrap_or_default(),
+        };
+        !key.is_empty() && rendered.starts_with(&format!("{key} "))
+    }
+
+    /// Ruling R4's own sentence: `? help  q quit` are always the last two hints on the
+    /// line, so a cut line still says where the rest of the keys are. Every width from
+    /// `MIN_SIZE`'s 40 to 70 — the widths D1's constants would have left with a line that
+    /// simply did not fit.
+    #[test]
+    fn render_hints_keep_help_and_quit_at_every_width() {
+        use crate::tui::herdr::{HerdrUpdate, Scope};
+        let mut app = three_roots();
+        app.herdr.scoped = true;
+        app.handle(Action::Herdr(HerdrUpdate::Scope(Some(Scope {
+            label: "w1".to_owned(),
+            roots: [root("alpha")].into_iter().collect(),
+        }))));
+        for selection in [
+            None,
+            Some(row("alpha", "f1")),
+            Some(Selection::Root(root("alpha"))),
+        ] {
+            app.select(selection.clone());
+            for width in 40..=70u16 {
+                let line = hints(&app, width);
+                assert!(
+                    line.ends_with("? help  q quit"),
+                    "{width} ({selection:?}): {line}"
+                );
+                assert!(
+                    line.width() <= width as usize,
+                    "{width} ({selection:?}) is {} wide: {line}",
+                    line.width()
+                );
+            }
+        }
+    }
+
+    /// The 80-column frame is the one the release's readers are likeliest to have, and
+    /// `A accept file` is the hint that tells a file row from a hunk. The drop order is
+    /// built so it survives there: `y`, `v`, `r`, `Tab`, `w`, `^A` and `t` all go first.
+    #[test]
+    fn render_hints_at_80_keep_accept_file() {
+        let mut app = three_roots();
+        app.select(Some(row("alpha", "f1")));
+        let line = hints(&app, 80);
+        assert!(line.contains("a accept hunk  A accept file"), "{line}");
+        assert!(line.ends_with("? help  q quit"), "{line}");
+        assert!(line.width() <= 80, "{line}");
+        app.handle(Action::Open);
+        assert_eq!(hints(&app, 80), line, "the diff pane says the same at 80");
     }
 
     #[test]

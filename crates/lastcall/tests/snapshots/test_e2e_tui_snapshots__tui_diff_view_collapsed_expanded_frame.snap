@@ -31,4 +31,4 @@ expression: frame
 "│                          │-    "pkg-21": { "version": "1.0.21" },                                │"
 "│                          │… 800 lines omitted (cap 2,000)                                        │"
 "└──────────────────────────┴───────────────────────────────────────────────────────────────────────┘"
-"↑↓ select  ⏎ open  n/p hunk  a/A accept file  ^A accept all  Tab focus  r refresh  ? help  q quit   "
+"↑↓ select  ⏎ open  n/p hunk  a/A accept file  ^A accept all  t hide empty  Tab focus  ? help  q quit"

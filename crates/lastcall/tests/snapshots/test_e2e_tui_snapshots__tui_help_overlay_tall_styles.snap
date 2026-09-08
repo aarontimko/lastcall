@@ -152,4 +152,4 @@ expression: style
 42 0..1 Cyan Reset -
 42 27..28 Cyan Reset -
 43 0..28 Cyan Reset -
-44 0..88 Reset Reset DIM
+44 0..87 Reset Reset DIM

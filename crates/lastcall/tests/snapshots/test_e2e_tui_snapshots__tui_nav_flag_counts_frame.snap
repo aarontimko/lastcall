@@ -31,4 +31,4 @@ expression: frame
 "│                          │                                                                       │"
 "│                          │                                                                       │"
 "└──────────────────────────┴───────────────────────────────────────────────────────────────────────┘"
-"↑↓ select  ⏎ open  n/p hunk  a accept all in alpha  ^A accept all  ? help  q quit                   "
+"↑↓ select  ⏎ open  n/p hunk  a accept all in alpha  ^A accept all  t hide empty  ? help  q quit     "

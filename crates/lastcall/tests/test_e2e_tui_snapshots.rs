@@ -742,8 +742,10 @@ fn tui_accept_controls() {
     assert!(frame.contains("[Accept All]"), "{frame}");
     assert!(frame.contains("[A accept file]"), "{frame}");
     assert_eq!(frame.matches("[a accept]").count(), 2, "{frame}");
+    // Deliverable 4: at 100 columns `^A accept all` has already gone — the header's
+    // `[Accept All]` on the same frame says it, and `t hide empty` outlives it.
     assert!(
-        frame.contains("a accept hunk  A accept file  ^A accept all"),
+        frame.contains("a accept hunk  A accept file  t hide empty"),
         "{frame}"
     );
     snapshot("tui_accept_controls", &app, W, H);
@@ -883,16 +885,11 @@ fn tui_nav_empty_repo_row() {
     );
     let (frame, _) = draw(&app, W, H);
     assert!(!frame.contains("beta"), "{frame}");
-    // §6.7: the label follows the state. Decision (1): while the tiers are all-or-nothing
-    // the toggle sits on the widest one, so the 100-column frame does not carry it — the
-    // help overlay names the key at every width, and deliverable 4's drop order puts it
-    // back on the line the kickoff asks for.
-    assert!(!frame.contains("empty"), "{frame}");
-    assert!(
-        lastcall::tui::render::hints(&app, 200).contains("t show empty"),
-        "{}",
-        lastcall::tui::render::hints(&app, 200)
-    );
+    // §6.7: the label follows the state, and deliverable 4's drop order keeps the toggle
+    // on the 100-column line (the orchestrator's post-checkpoint note: it goes after
+    // `^A accept all`, which the header's `[Accept All]` duplicates at this width).
+    assert!(frame.contains("t show empty"), "{frame}");
+    assert!(!frame.contains("t hide empty"), "{frame}");
     assert!(
         frame.contains("lastcall  2 repos ·"),
         "the header counts the repos on the nav, as it does under a `w` scope: {frame}"
@@ -1687,8 +1684,13 @@ fn tui_copy_cue() {
     snapshot("tui_copy_cue", &app, W, H);
 }
 
-/// The hint line with the diff focused on a wide frame: `v select` and `y copy` are the
-/// last two hints on it, and the first to go when the line has to shrink.
+/// The hint line with the diff focused on a frame wide enough for the whole of it:
+/// `v select` and `y copy` are the last two hints on it, and the first two off it.
+///
+/// 142 columns, not the 140 this scene used before deliverable 4: `t hide empty` is on the
+/// line now (it used to sit on a tier of its own, above every other, so the widest frame
+/// was the only one without it), and the whole line for a file row is fourteen columns
+/// longer for it. One column narrower is the same frame without `y copy`.
 #[test]
 fn tui_hint_diff_focus() {
     let scene = Scene::build();
@@ -1696,12 +1698,15 @@ fn tui_hint_diff_focus() {
     let mut app = app_of(&mut engine);
     let alpha = root_named(&engine, "alpha");
     at_parse_rs_middle_hunk(&mut app, &engine, &alpha);
-    app.handle(Action::Resize(140, 20));
-    let (frame, _) = draw(&app, 140, 20);
+    app.handle(Action::Resize(142, 20));
+    let (frame, _) = draw(&app, 142, 20);
     assert!(frame.contains("v select  y copy"), "{frame}");
+    let (one_less, _) = draw(&app, 141, 20);
+    assert!(one_less.contains("v select"), "{one_less}");
+    assert!(!one_less.contains("y copy"), "{one_less}");
     let (narrow, _) = draw(&app, W, H);
     assert!(!narrow.contains("y copy"), "{narrow}");
-    snapshot("tui_hint_diff_focus", &app, 140, 20);
+    snapshot("tui_hint_diff_focus", &app, 142, 20);
 }
 
 /// Esc on a buffer that has been typed in asks before throwing the text away, and the
