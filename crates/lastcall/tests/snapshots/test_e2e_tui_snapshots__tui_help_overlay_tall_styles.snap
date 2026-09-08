@@ -142,12 +142,13 @@ expression: style
 38 83..84 Cyan Reset -
 39 0..1 Cyan Reset -
 39 16..17 Cyan Reset -
-39 18..32 Reset Reset DIM
 39 83..84 Cyan Reset -
 40 0..1 Cyan Reset -
-40 16..84 Cyan Reset -
+40 16..17 Cyan Reset -
+40 18..32 Reset Reset DIM
+40 83..84 Cyan Reset -
 41 0..1 Cyan Reset -
-41 27..28 Cyan Reset -
+41 16..84 Cyan Reset -
 42 0..1 Cyan Reset -
 42 27..28 Cyan Reset -
 43 0..28 Cyan Reset -

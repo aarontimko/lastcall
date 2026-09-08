@@ -60,6 +60,11 @@ pub struct Config {
     pub collapse_size_bytes: u64,
     /// Watch-set noise filters; scope the watcher only, never pending computation (§6.5).
     pub ignore_globs: Vec<String>,
+    /// The TUI's opening answer to `t` (Amendment v1.9, §6.1): `false` — the default the
+    /// sponsor ruled — lists **every** repo under the parent dirs, the ones with nothing
+    /// pending included; `true` starts with those hidden. Engine-side only as a value the
+    /// binary reads; nothing here changes what a scan or `status` reports.
+    pub hide_empty_repos: bool,
     /// The `[herdr]` table.
     pub herdr: HerdrConfig,
     /// The `[keys]` table (Amendment v1.3): `<action> = "<key>"` or `["<key>", …]`, each
@@ -84,6 +89,7 @@ impl Default for Config {
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect(),
+            hide_empty_repos: false,
             herdr: HerdrConfig::default(),
             keys: BTreeMap::new(),
         }
@@ -454,6 +460,7 @@ draft_initial = "pending"
 collapsed_globs = ["*.lock"]
 collapse_size_bytes = 1024
 ignore_globs = [".git/**"]
+hide_empty_repos = true
 
 [herdr]
 mode = "on"
@@ -488,6 +495,7 @@ nav_down = ["down", "j", "ctrl-n"]
         assert_eq!(c.collapsed_globs, vec!["*.lock"]);
         assert_eq!(c.collapse_size_bytes, 1024);
         assert_eq!(c.ignore_globs, vec![".git/**"]);
+        assert!(c.hide_empty_repos);
         assert_eq!(c.herdr.mode, HerdrMode::On);
         assert_eq!(c.herdr.session.as_deref(), Some("work"));
         assert_eq!(c.keys.len(), 2);
@@ -837,6 +845,32 @@ nav_down = ["down", "j", "ctrl-n"]
         assert!(c.validate(path).is_err());
         let c: Config = toml::from_str("[herdr]\nsession = \"  \"\n").unwrap();
         assert!(c.validate(path).is_err());
+    }
+
+    /// Amendment v1.9 (§6.1): `hide_empty_repos` is a top-level bool, default `false`
+    /// — a 1.0 config file that has never heard of it loads, `lastcall config` prints it,
+    /// and it round-trips through TOML. A wrong type is a load error like every other key.
+    #[test]
+    fn config_hide_empty_repos_defaults_false_and_round_trips() {
+        assert!(!Config::default().hide_empty_repos, "the sponsor's default");
+        // A v1.0 file with none of this phase’s keys still loads.
+        let old: Config = toml::from_str("parent_dirs = []\ncollapse_size_bytes = 4096\n").unwrap();
+        assert!(!old.hide_empty_repos);
+
+        let on: Config = toml::from_str("hide_empty_repos = true\n").unwrap();
+        assert!(on.hide_empty_repos);
+        let text = toml::to_string_pretty(&on).unwrap();
+        assert!(text.contains("hide_empty_repos = true"), "{text}");
+        assert_eq!(toml::from_str::<Config>(&text).unwrap(), on);
+        // `lastcall config` prints every key with its default, this one included.
+        let printed = toml::to_string_pretty(&Config::default()).unwrap();
+        assert!(printed.contains("hide_empty_repos = false"), "{printed}");
+
+        let dir = TempDir::new("lc-config");
+        let (env, _) = env_with_config(&dir, "hide_empty_repos = \"yes\"\n");
+        let err = load(&env).unwrap_err();
+        assert!(matches!(err, ConfigError::Parse { .. }), "{err}");
+        assert!(err.to_string().contains("expected a boolean"), "{err}");
     }
 
     #[test]

@@ -173,8 +173,10 @@ impl RootView {
         &self.pile.notices
     }
 
-    /// Listed in the nav iff the pile has rows (kickoff ruling 2). An in-progress operation
-    /// is a tag shown on a listed root, never a reason to list or unlist one.
+    /// Whether the pile has pending rows. Since Amendment v1.9 this is no longer what puts
+    /// a root on the nav — every repo in scope is listed — but what `hide_empty` and the
+    /// scope notice's count mean by "empty". An in-progress operation is a tag shown on a
+    /// listed root, never a reason to list or unlist one.
     pub fn listed(&self) -> bool {
         !self.pile.rows.is_empty()
     }
@@ -201,6 +203,26 @@ impl Selection {
         match self {
             Selection::Root(r) | Selection::Row(r, _) | Selection::Group(r, _) => r,
         }
+    }
+}
+
+/// Where an entry sits **inside its own repo's** nav block, which `nav_entries` builds as
+/// `[Root, rows by path, groups]`. Ordering by this key rather than by nav index is what
+/// makes "the entry below" mean the same thing before and after the pile that removed the
+/// selected one: a pile that added files sorting *above* the vanished row shifts every
+/// index and none of these keys (design review F7).
+fn nav_key(sel: &Selection) -> (u8, &[u8], u8) {
+    match sel {
+        Selection::Root(_) => (0, b"", 0),
+        Selection::Row(_, path) => (1, path.as_slice(), 0),
+        Selection::Group(_, kind) => (
+            2,
+            b"",
+            match kind {
+                Annotation::Upstream => 0,
+                Annotation::Mixed => 1,
+            },
+        ),
     }
 }
 
@@ -927,6 +949,17 @@ pub struct App {
     pub cue: Option<Cue>,
     pub full_paths: bool,
     pub show_remote: bool,
+    /// `t` (§6.7, Amendment v1.9 item 4): while `false` — the default, and what
+    /// `hide_empty_repos` seeds — every repo the scope allows is on the nav, the ones with
+    /// nothing pending as a name-and-branch row. While `true` those rows go, except a repo
+    /// whose agent wants attention. Independent of the herdr scope (`w`).
+    pub hide_empty: bool,
+    /// The nav index the current selection had when it was last **found** on the nav —
+    /// written by `select` and refreshed by `reconcile_selection` whenever the selection
+    /// survives a pile (design review F7). It is the only thing left to go on when the
+    /// selection's whole repo has left the nav, so it is read exactly there:
+    /// [`App::neighbour_after`]'s last rule.
+    pub nav_anchor: Option<usize>,
     pub help: bool,
     pub status: Option<StatusLine>,
     /// Advanced by `Tick`; render computes ages from it, never from `Instant::now()`.
@@ -1014,6 +1047,8 @@ impl App {
             cue: None,
             full_paths: false,
             show_remote: false,
+            hide_empty: false,
+            nav_anchor: None,
             help: false,
             status: None,
             now: Instant::now(),
@@ -1048,15 +1083,18 @@ impl App {
 
     // ---- derived views -------------------------------------------------------------------
 
-    /// Whether `view` is listed in the nav (§6.7 plus deliverable 5): it has pending rows
-    /// **or** an attention flag (a ready episode, acked or not, or a blocked agent) — and
-    /// it survives the active workspace scope (deliverable 8). `working`/`idle`/`unknown`
-    /// never list a root by themselves; they annotate one already listed.
+    /// Whether `view` is listed in the nav. §6.7 as amended by v1.9 (ruling R2): **every**
+    /// repo the active workspace scope allows is listed, once the launch hold and the scope
+    /// verdict are past — a repo with nothing pending is a name-and-branch row, not an
+    /// absence. `hide_empty` (`t`) is the only thing that takes one off, and even then an
+    /// attention flag (a ready episode, acked or not, or a blocked agent) keeps it;
+    /// `working`/`idle`/`unknown` annotate a root, they never decide one.
     pub fn is_listed(&self, view: &RootView) -> bool {
         self.loading.is_none()
             && !self.herdr.scope_pending
             && self.herdr.in_scope(&view.meta.path)
-            && (view.listed()
+            && (!self.hide_empty
+                || view.listed()
                 || self
                     .herdr
                     .flag(&view.meta.path)
@@ -2663,21 +2701,25 @@ impl App {
         }
     }
 
-    /// §6.7 after the piles came back: the selection the accept was asked from is gone →
-    /// [`App::advance`] from it; a hunk accept that was `taken` (no refusal, no error) and
-    /// left hunks in the row keeps the cursor index (clamped) and scrolls to it. A refused
-    /// one moves nothing — the scroll stays where the user had it, not at the hunk header.
+    /// §6.7 after the piles came back. There is one neighbour rule this phase
+    /// ([`App::neighbour_after`]) and `apply_pile`'s `reconcile_selection` has already run
+    /// it, so a vanished selection needs nothing more here — the second, differently
+    /// ordered `advance` this method used to own is gone (kickoff deliverable 2.3). The
+    /// `reconcile_selection` below is the same rule again, for the one caller that reaches
+    /// here without a pile having landed for the selection's root.
+    ///
+    /// What is still this method's own: a hunk accept that was `taken` (no refusal, no
+    /// error) and left hunks in the row keeps the cursor index (clamped) and scrolls to it.
+    /// A refused one moves nothing — the scroll stays where the user had it, not at the
+    /// hunk header.
     fn advance_after(&mut self, scope: &AcceptScope, before: Option<Selection>, taken: bool) {
         let Some(before) = before else {
             return;
         };
         if !self.nav_entries().contains(&before) {
-            let after = match &before {
-                Selection::Row(_, p) => Some(p.clone()),
-                _ => None,
-            };
-            let root = before.root().to_path_buf();
-            self.advance(&root, after.as_deref());
+            if self.selection.as_ref() == Some(&before) {
+                self.reconcile_selection();
+            }
             return;
         }
         if taken
@@ -2687,31 +2729,6 @@ impl App {
         {
             self.follow_hunk();
         }
-    }
-
-    /// Select the next row by path after `after` in `root`'s current pile, else the first
-    /// remaining row of that root (wrap), else the next listed root's first row (never its
-    /// `Root` entry), else nothing. Focus stays.
-    fn advance(&mut self, root: &Path, after: Option<&[u8]>) {
-        let entries = self.nav_entries();
-        let next = entries
-            .iter()
-            .find(|e| match e {
-                Selection::Row(r, p) => r == root && after.is_none_or(|a| p.as_slice() > a),
-                _ => false,
-            })
-            .or_else(|| {
-                entries
-                    .iter()
-                    .find(|e| matches!(e, Selection::Row(r, _) if r == root))
-            })
-            .or_else(|| {
-                entries
-                    .iter()
-                    .find(|e| matches!(e, Selection::Row(r, _) if r.as_path() > root))
-            })
-            .cloned();
-        self.select(next);
     }
 
     /// Scroll so the current hunk's header is the first visible line.
@@ -2745,7 +2762,14 @@ impl App {
     // ---- selection -----------------------------------------------------------------------
 
     /// Select `next`; a different selection resets the diff cursor, the same one keeps it.
+    /// Either way the nav index is snapshotted (design review F7): the neighbour rule needs
+    /// the order **as it was while this entry was selected**, and by the time it runs
+    /// `apply_pile` has already replaced the pile the order came from.
     pub fn select(&mut self, next: Option<Selection>) -> Changed {
+        let anchor = next
+            .as_ref()
+            .and_then(|s| self.nav_entries().iter().position(|e| e == s));
+        self.nav_anchor = anchor;
         if self.selection == next {
             return Changed::No;
         }
@@ -2759,32 +2783,54 @@ impl App {
     }
 
     /// After roots or piles changed: keep the selection if it still exists (clamping the
-    /// diff cursor), else fall through to the next entry by path in the same root, else that
-    /// root's `Root` entry, else the next listed root's first entry, else nothing.
+    /// diff cursor and re-anchoring it in the new order), else move to
+    /// [`App::neighbour_after`]. Every path that can lose the selected entry — a pile, an
+    /// accept, a restore, `t`, `w`, a herdr scope or roots update, the end of the launch
+    /// hold — comes through here, so the rule is stated once.
     pub fn reconcile_selection(&mut self) {
         let Some(sel) = self.selection.clone() else {
             return;
         };
         let entries = self.nav_entries();
-        if entries.contains(&sel) {
+        if let Some(at) = entries.iter().position(|e| *e == sel) {
+            self.nav_anchor = Some(at);
             self.clamp_cursor();
             return;
         }
-        let root = sel.root().to_path_buf();
-        let same_root_next = entries.iter().find(|e| match (&sel, e) {
-            (Selection::Row(_, p), Selection::Row(r, q)) => *r == root && q > p,
-            (Selection::Row(_, _), Selection::Group(r, _)) => *r == root,
-            _ => false,
-        });
-        let fallback = same_root_next
-            .or_else(|| {
-                entries
-                    .iter()
-                    .find(|e| **e == Selection::Root(root.clone()))
-            })
-            .or_else(|| entries.iter().find(|e| e.root() > root.as_path()))
-            .cloned();
-        self.select(fallback);
+        let next = self.neighbour_after(&sel, &entries);
+        self.select(next);
+    }
+
+    /// Where the cursor goes when `gone` has left the nav (§6.7, Amendment v1.9 item 4;
+    /// ruling R2), against the nav order `entries`:
+    ///
+    /// 1. the nearest surviving entry **below** it **within the same repo**;
+    /// 2. else the nearest **above** within the same repo — the repo's own name row is the
+    ///    last "above", so **accepting the last file lands on the repo row**;
+    /// 3. else — only once the repo itself has left the nav, which `hide_empty` or the
+    ///    scope is the only way to arrange — the entry now standing at `gone`'s former nav
+    ///    index ([`App::nav_anchor`]), else the previous one, else nothing.
+    ///
+    /// Never a wrap back to the repo's first row, and never a jump into another repo while
+    /// this one is still listed. "Below" and "above" are read from [`nav_key`], not from
+    /// index arithmetic, because a pile that *added* rows above the vanished one moves
+    /// every index while changing nothing about what is below it.
+    fn neighbour_after(&self, gone: &Selection, entries: &[Selection]) -> Option<Selection> {
+        let root = gone.root();
+        let key = nav_key(gone);
+        let mine: Vec<&Selection> = entries.iter().filter(|e| e.root() == root).collect();
+        if !mine.is_empty() {
+            return mine
+                .iter()
+                .find(|e| nav_key(e) > key)
+                .or_else(|| mine.iter().rev().find(|e| nav_key(e) < key))
+                .map(|e| (*e).clone());
+        }
+        let at = self.nav_anchor.unwrap_or(0);
+        entries
+            .get(at)
+            .or_else(|| entries.get(at.min(entries.len()).saturating_sub(1)))
+            .cloned()
     }
 
     fn clamp_cursor(&mut self) {
@@ -3088,6 +3134,14 @@ impl App {
             }
             ToggleRemote => {
                 self.show_remote = !self.show_remote;
+                Changed::Yes
+            }
+            // `t` (§6.7, Amendment v1.9 item 4). Independent of `w`: this hides the repos
+            // with nothing pending among the ones the scope allows, and never brings a
+            // scoped-out repo back.
+            HideEmpty => {
+                self.hide_empty = !self.hide_empty;
+                self.reconcile_selection();
                 Changed::Yes
             }
             Refresh => {
@@ -4291,10 +4345,11 @@ mod tests {
         assert_eq!(status(&app), "accepted 2 files in alpha");
         assert_eq!(
             app.selection,
-            Some(row("beta", "u1")),
-            "an emptied root advances to the next listed root's first row"
+            Some(Selection::Root(root("alpha"))),
+            "the repo stays on the nav and keeps the cursor (§6.7, Amendment v1.9)"
         );
-        assert!(!app.roots[&root("alpha")].listed());
+        assert!(!app.roots[&root("alpha")].listed(), "no rows left");
+        assert!(app.nav_entries().contains(&Selection::Root(root("alpha"))));
 
         app.select(Some(Selection::Group(root("beta"), Annotation::Upstream)));
         let beta = pile("beta");
@@ -4883,8 +4938,11 @@ mod tests {
         );
     }
 
+    /// The sponsor's sentence, in one assertion: "when I accept the last file, the cursor
+    /// goes to highlight the repo name" (§6.7, Amendment v1.9 item 1). Never beta's first
+    /// row — the cursor does not leave a repo that is still listed.
     #[test]
-    fn app_advance_to_next_root_first_row_when_root_empties() {
+    fn app_accept_last_file_selects_the_repo_row() {
         let mut app = three_roots();
         app.apply(pile_event("alpha", without(pile("alpha"), &["f2"])));
         app.select(Some(row("alpha", "f1")));
@@ -4892,13 +4950,16 @@ mod tests {
         app.accepted(vec![accepted_ok("alpha", 2, Pile::default())]);
         assert_eq!(
             app.selection,
-            Some(row("beta", "u1")),
-            "the row, not beta's Root entry"
+            Some(Selection::Root(root("alpha"))),
+            "the repo row, not beta's first row"
         );
     }
 
+    /// The same when every other repo is empty too: the cursor still lands on alpha's own
+    /// name row rather than on nothing (what the pre-v1.9 rule did, because an emptied
+    /// root left the nav and there was nowhere left to go).
     #[test]
-    fn app_advance_to_nothing_when_the_only_root_empties() {
+    fn app_accept_last_file_lands_on_the_repo_row_with_every_repo_empty() {
         let mut app = three_roots();
         app.apply(pile_event("beta", Pile::default()));
         app.apply(pile_event("notes", Pile::default()));
@@ -4912,8 +4973,9 @@ mod tests {
         assert_eq!(app.selection, Some(row("alpha", "f1")));
         app.handle(Action::AcceptFile);
         app.accepted(vec![accepted_ok("alpha", 3, Pile::default())]);
-        assert_eq!(app.selection, None);
+        assert_eq!(app.selection, Some(Selection::Root(root("alpha"))));
         assert_eq!(status(&app), "accepted f1");
+        assert_eq!(app.nav_entries().len(), 3, "three empty repos, three rows");
     }
 
     #[test]
@@ -4995,8 +5057,9 @@ mod tests {
         assert_eq!(status(&app), "accepted 3 files in 2 repos · alpha: boom");
         assert_eq!(app.accepting, None);
         assert_eq!(
-            app.selection, None,
-            "beta emptied with no listed root after it → nothing"
+            app.selection,
+            Some(Selection::Root(root("beta"))),
+            "beta emptied but stayed listed → its own name row"
         );
 
         // All three fine: one repo count, or the root's name when it is one.
@@ -5123,8 +5186,8 @@ mod tests {
         app.apply(pile_event("alpha", Pile::default()));
         assert_eq!(
             app.selection,
-            Some(Selection::Root(root("beta"))),
-            "root unlisted → next listed root's first entry"
+            Some(Selection::Root(root("alpha"))),
+            "the repo is still listed, so the cursor stays in it — its name row"
         );
 
         app.select(Some(Selection::Group(root("beta"), Annotation::Upstream)));
@@ -5135,23 +5198,230 @@ mod tests {
         app.apply(pile_event("beta", p));
         assert_eq!(
             app.selection,
-            Some(Selection::Root(root("beta"))),
-            "vanished group → its root entry"
+            Some(row("beta", "u2")),
+            "a group sits below the rows, so the nearest above it is the last row"
         );
 
         app.select(Some(row("notes", "n2.md")));
         app.apply(pile_event("notes", Pile::default()));
-        assert_eq!(app.selection, None, "no root after the last one → nothing");
+        assert_eq!(
+            app.selection,
+            Some(Selection::Root(root("notes"))),
+            "the last repo keeps the cursor too"
+        );
     }
 
+    /// "Below, else above" in one repo: the last row falls to the row **above** it, and
+    /// only when there is no row left at all does the repo's own name row take the cursor
+    /// (§6.7, Amendment v1.9 item 4). The pre-v1.9 rule skipped straight to the root entry.
     #[test]
-    fn app_last_row_falls_to_root_entry() {
+    fn app_last_row_falls_to_the_row_above_then_to_the_repo_row() {
         let mut app = three_roots();
         app.select(Some(row("alpha", "f2")));
         let mut p = pile("alpha");
         p.rows.retain(|r| r.path != b"f2");
         app.apply(pile_event("alpha", p));
+        assert_eq!(app.selection, Some(row("alpha", "f1")), "the row above");
+        app.apply(pile_event("alpha", Pile::default()));
         assert_eq!(app.selection, Some(Selection::Root(root("alpha"))));
+    }
+
+    /// "Below" wins over "above": a row accepted out of the middle of a repo hands the
+    /// cursor to the row **under** it (§6.7, Amendment v1.9 item 4).
+    #[test]
+    fn app_accept_middle_file_selects_the_row_below() {
+        let mut app = three_roots();
+        app.apply(pile_event("alpha", rows_n(3, 0, 0)));
+        app.select(Some(row("alpha", "p01")));
+        app.handle(Action::AcceptFile);
+        app.accepted(vec![accepted_ok(
+            "alpha",
+            2,
+            without(rows_n(3, 0, 0), &["p01"]),
+        )]);
+        assert_eq!(app.selection, Some(row("alpha", "p02")), "below, not above");
+    }
+
+    /// The first row has the repo's own name row above it and a file row below it, so the
+    /// rule has to pick the file: landing on the name row here would read as the whole
+    /// repo emptying when it did not.
+    #[test]
+    fn app_accept_first_file_selects_the_row_below_not_above() {
+        let mut app = three_roots();
+        app.apply(pile_event("alpha", rows_n(3, 0, 0)));
+        app.select(Some(row("alpha", "p00")));
+        app.handle(Action::AcceptFile);
+        app.accepted(vec![accepted_ok(
+            "alpha",
+            2,
+            without(rows_n(3, 0, 0), &["p00"]),
+        )]);
+        assert_eq!(app.selection, Some(row("alpha", "p01")));
+        assert_ne!(app.selection, Some(Selection::Root(root("alpha"))));
+    }
+
+    /// A pile that adds rows sorting **above** the accepted one moves every nav index and
+    /// none of the keys `neighbour_after` compares (design review F7). The cursor still
+    /// goes to the row that was below.
+    #[test]
+    fn app_accept_with_rows_added_above_still_selects_the_row_below() {
+        let mut app = three_roots();
+        app.apply(pile_event("alpha", rows_n(3, 0, 0)));
+        app.select(Some(row("alpha", "p01")));
+        app.handle(Action::AcceptFile);
+        // The rescan lost `p01` and gained `p000`/`p001`, both sorting before `p01`.
+        let mut after = without(rows_n(3, 0, 0), &["p01"]);
+        for name in ["p000", "p001"] {
+            let mut extra = after.rows[0].clone();
+            extra.path = name.as_bytes().to_vec();
+            after.rows.push(extra);
+        }
+        after.rows.sort_by(|a, b| a.path.cmp(&b.path));
+        app.accepted(vec![accepted_ok("alpha", 2, after)]);
+        assert_eq!(app.selection, Some(row("alpha", "p02")));
+    }
+
+    /// `t` (§6.7, Amendment v1.9 item 4): the repos with nothing pending go, except one
+    /// whose agent wants attention — and pressing it again brings them back.
+    #[test]
+    fn app_hide_empty_unlists_a_root_with_no_rows_but_keeps_a_flagged_one() {
+        let names = |app: &App| {
+            app.listed_roots()
+                .map(|v| v.meta.name.clone())
+                .collect::<Vec<_>>()
+        };
+        let mut app = three_roots();
+        app.apply(pile_event_seq("beta", 1, Pile::default()));
+        app.apply(pile_event_seq("notes", 1, Pile::default()));
+        app.handle(Action::Herdr(HerdrUpdate::Connected {
+            version: "0.8.2".to_owned(),
+            protocol: 21,
+        }));
+        app.handle(Action::Herdr(HerdrUpdate::Roots(BTreeMap::from([(
+            root("notes"),
+            hfix::agents(Attention::Blocked, 1, "w1:p1", "claude"),
+        )]))));
+        assert_eq!(names(&app), ["alpha", "beta", "notes"], "the default");
+
+        assert_eq!(app.handle(Action::HideEmpty).0, Changed::Yes);
+        assert!(app.hide_empty);
+        assert_eq!(
+            names(&app),
+            ["alpha", "notes"],
+            "beta goes; the blocked agent keeps notes"
+        );
+        assert_eq!(app.handle(Action::HideEmpty).0, Changed::Yes);
+        assert!(!app.hide_empty);
+        assert_eq!(names(&app), ["alpha", "beta", "notes"]);
+    }
+
+    /// With `t` on there is no repo row to land on, so the third rule runs: the entry now
+    /// standing where the accepted row stood.
+    #[test]
+    fn app_hide_empty_accept_last_file_selects_the_entry_that_takes_its_place() {
+        let mut app = three_roots();
+        app.hide_empty = true;
+        app.apply(pile_event("alpha", without(pile("alpha"), &["f2"])));
+        // Nav: [Root(alpha), f1, Root(beta), u1, u2, Group(beta), Root(notes), n2.md].
+        app.select(Some(row("alpha", "f1")));
+        assert_eq!(app.nav_anchor, Some(1));
+        app.handle(Action::AcceptFile);
+        app.accepted(vec![accepted_ok("alpha", 2, Pile::default())]);
+        assert_eq!(
+            app.selection,
+            Some(row("beta", "u1")),
+            "alpha left the nav, so index 1 is beta's first row now"
+        );
+
+        // Nothing left at all: nothing selected.
+        let mut app = three_roots();
+        app.hide_empty = true;
+        app.apply(pile_event("beta", Pile::default()));
+        app.apply(pile_event("notes", Pile::default()));
+        app.select(Some(row("alpha", "f2")));
+        app.apply(pile_event_seq("alpha", 1, Pile::default()));
+        assert_eq!(app.selection, None);
+    }
+
+    /// One rule, two entry points: a pile that arrives on its own (the watcher saw an
+    /// external commit take several rows) moves the cursor exactly where an accept of the
+    /// same rows would have — `advance_after` no longer owns a second, differently
+    /// ordered fallback (kickoff deliverable 2.3).
+    #[test]
+    fn app_reconcile_uses_the_same_neighbour_rule_as_advance() {
+        let external = {
+            let mut app = three_roots();
+            app.apply(pile_event("alpha", rows_n(4, 0, 0)));
+            app.select(Some(row("alpha", "p01")));
+            // Someone committed p00, p01 and p02 outside lastcall.
+            app.apply(pile_event_seq(
+                "alpha",
+                1,
+                without(rows_n(4, 0, 0), &["p00", "p01", "p02"]),
+            ));
+            app.selection.clone()
+        };
+        let accepted = {
+            let mut app = three_roots();
+            app.apply(pile_event("alpha", rows_n(4, 0, 0)));
+            app.select(Some(row("alpha", "p01")));
+            app.handle(Action::AcceptFile);
+            app.accepted(vec![accepted_ok(
+                "alpha",
+                1,
+                without(rows_n(4, 0, 0), &["p00", "p01", "p02"]),
+            )]);
+            app.selection.clone()
+        };
+        assert_eq!(external, Some(row("alpha", "p03")));
+        assert_eq!(external, accepted, "one rule, both paths");
+
+        // And when the whole repo empties, both land on its name row.
+        let mut app = three_roots();
+        app.select(Some(row("alpha", "f1")));
+        app.apply(pile_event_seq("alpha", 1, Pile::default()));
+        assert_eq!(app.selection, Some(Selection::Root(root("alpha"))));
+    }
+
+    /// `w` and `t` are independent filters (§6.7, Amendment v1.9): the scope decides which
+    /// repos are in play, `t` decides whether the empty ones among those show. Neither
+    /// undoes the other, in any order.
+    #[test]
+    fn app_scope_and_hide_empty_are_independent() {
+        let names = |app: &App| {
+            app.listed_roots()
+                .map(|v| v.meta.name.clone())
+                .collect::<Vec<_>>()
+        };
+        let mut app = three_roots();
+        app.apply(pile_event_seq("beta", 1, Pile::default()));
+        app.herdr.scoped = true;
+        app.handle(Action::Herdr(HerdrUpdate::Scope(Some(Scope {
+            label: "w1".to_owned(),
+            roots: [root("alpha"), root("beta")].into_iter().collect(),
+        }))));
+        assert_eq!(names(&app), ["alpha", "beta"], "notes is out of scope");
+
+        // `t`: beta is empty and in scope → it goes. notes is still out of scope.
+        app.handle(Action::HideEmpty);
+        assert_eq!(names(&app), ["alpha"]);
+
+        // `w` with `t` still on: the scope lifts, and `t` keeps hiding the empty ones —
+        // notes has rows, so it comes back.
+        app.handle(Action::ScopeToggle);
+        assert_eq!(names(&app), ["alpha", "notes"]);
+        assert_eq!(app.scope_notice(), None, "no scope in force");
+
+        // `w` back on, then `t` off: the scope is unchanged by the round trip.
+        app.handle(Action::ScopeToggle);
+        assert_eq!(names(&app), ["alpha"]);
+        app.handle(Action::HideEmpty);
+        assert_eq!(names(&app), ["alpha", "beta"]);
+        assert_eq!(
+            app.scope_notice().as_deref(),
+            Some("scope: w1 · 1 repo hidden (w shows all)"),
+            "the notice counts what the scope hides, never what `t` does"
+        );
     }
 
     #[test]
@@ -5175,19 +5445,45 @@ mod tests {
         assert!(app.diff.scroll < diff_len(&pile("alpha").rows[0]));
     }
 
+    /// Ruling R2, the sponsor verbatim: "always display the git repo … even if there's no
+    /// changes staged within it". An emptied repo keeps exactly one nav entry — its own
+    /// name row — and that row is selectable by key and by click.
     #[test]
-    fn app_root_hidden_when_pile_empty() {
+    fn app_empty_root_is_listed_and_selectable() {
         let mut app = three_roots();
         assert!(app.nav_entries().iter().any(|e| e.root() == root("beta")));
         app.apply(pile_event("beta", Pile::default()));
-        assert!(app.nav_entries().iter().all(|e| e.root() != root("beta")));
         assert!(app.roots.contains_key(&root("beta")), "the view stays");
+        assert!(!app.roots[&root("beta")].listed(), "no rows");
+        let entries = app.nav_entries();
+        let beta: Vec<&Selection> = entries
+            .iter()
+            .filter(|e| e.root() == root("beta"))
+            .collect();
+        assert_eq!(
+            beta,
+            vec![&Selection::Root(root("beta"))],
+            "one entry: the name row"
+        );
+        assert_eq!(
+            app.select(Some(Selection::Root(root("beta")))),
+            Changed::Yes,
+            "selectable by key"
+        );
+        assert_eq!(
+            app.hit(Target::NavRoot(root("beta"))).0,
+            Changed::No,
+            "already there; the click resolves to the same entry"
+        );
+        assert_eq!(app.selection, Some(Selection::Root(root("beta"))));
     }
 
     #[test]
     fn app_in_progress_tag_never_lists_or_unlists_a_root() {
         let mut app = three_roots();
-        // beta's pile is empty → hidden; the tag alone must not list it.
+        // Under `t` an empty pile hides the repo; the tag alone must not bring it back
+        // (only an attention flag does — Amendment v1.9 item 4).
+        app.hide_empty = true;
         app.apply(pile_event("beta", Pile::default()));
         let mut alpha = meta("alpha");
         alpha.in_progress = Some(InProgress::Merge);
@@ -5335,7 +5631,12 @@ mod tests {
         }));
         assert_eq!((changed, effect), (Changed::Yes, Some(Effect::SyncRoots)));
         assert!(!app.roots.contains_key(&root("beta")));
-        assert_eq!(app.selection, Some(Selection::Root(root("notes"))));
+        assert_eq!(
+            app.selection,
+            Some(row("notes", "n2.md")),
+            "beta left the nav entirely, so the cursor takes the entry now standing at its \
+             former nav index (§6.7, Amendment v1.9 item 4, the third rule)"
+        );
 
         // gamma's pile arrives before its meta: held, not shown.
         assert_eq!(app.apply(pile_event("gamma", pile("alpha"))).0, Changed::No);
@@ -5587,6 +5888,13 @@ mod tests {
     /// working agent stays off the list; `blocked` puts it back on.
     #[test]
     fn app_herdr_working_annotates_but_blocked_lists() {
+        // Since Amendment v1.9 every repo is listed by default, so this rule is what `t`
+        // keeps: `blocked` (and `done`) survive `hide_empty`, `working`/`idle` do not.
+        let with_herdr = |m| {
+            let mut app = with_herdr(m);
+            app.hide_empty = true;
+            app
+        };
         let app = with_herdr(one("alpha", Attention::Working));
         assert!(
             !app.listed_roots().any(|v| v.meta.path == root("alpha")),
@@ -5788,7 +6096,11 @@ mod tests {
             Changed::Yes
         );
         assert!(app.loading.is_none(), "every root reported");
-        assert_eq!(listed(&app), vec!["alpha".to_owned()]);
+        assert_eq!(
+            listed(&app),
+            vec!["alpha".to_owned(), "beta".to_owned()],
+            "Amendment v1.9: beta reported nothing pending and is listed all the same"
+        );
         assert_eq!(
             app.apply(EngineEvent::Scanned {
                 root: root("beta"),
@@ -5849,7 +6161,11 @@ mod tests {
             "the first verdict redraws even when it is the `None` the view started with"
         );
         assert!(!app.herdr.scope_pending);
-        assert_eq!(listed(&app), vec!["alpha".to_owned()]);
+        assert_eq!(
+            listed(&app),
+            vec!["alpha".to_owned(), "beta".to_owned()],
+            "Amendment v1.9: beta has no pile yet and is listed all the same"
+        );
         assert_eq!(
             app.handle(Action::Herdr(HerdrUpdate::Scope(None))),
             (Changed::No, None),
@@ -5867,8 +6183,12 @@ mod tests {
             app.handle(Action::Herdr(HerdrUpdate::Scope(Some(beta)))).0,
             Changed::Yes
         );
-        assert!(listed(&app).is_empty());
-        assert_eq!(app.scoped_out(), 1);
+        assert_eq!(
+            listed(&app),
+            vec!["beta".to_owned()],
+            "the scope keeps beta — listed though it has nothing pending — and drops alpha"
+        );
+        assert_eq!(app.scoped_out(), 1, "alpha has rows and the scope hides it");
 
         // No verdict is ever coming.
         for update in [
@@ -5880,7 +6200,11 @@ mod tests {
             let mut app = launched();
             app.handle(Action::Herdr(update.clone()));
             assert!(!app.herdr.scope_pending, "{update:?}");
-            assert_eq!(listed(&app), vec!["alpha".to_owned()], "{update:?}");
+            assert_eq!(
+                listed(&app),
+                vec!["alpha".to_owned(), "beta".to_owned()],
+                "{update:?}"
+            );
         }
     }
 

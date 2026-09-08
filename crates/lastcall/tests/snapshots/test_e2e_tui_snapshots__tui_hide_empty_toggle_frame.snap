@@ -2,13 +2,13 @@
 source: crates/lastcall/tests/test_e2e_tui_snapshots.rs
 expression: frame
 ---
-"lastcall  2 repos · 3 files · 3 hunks  standalone  [Accept All]                           watching W"
+"lastcall  2 repos · 4 files · 6 hunks  standalone  [Accept All]                           watching W"
 "┌──────────────────────────┬───────────────────────────────────────────────────────────────────────┐"
-"│beta                      │u1  A  +1 −0  [upstream]               [A accept file] [U restore file]│"
-"│  main · 2 files          │@@ -0,0 +1 @@                           [a accept] [u restore] [m flag]│"
-"│  A u1  +1 −0  [upstream] │+up1                                                                   │"
-"│  A u2  +2 −0  [mixed]    │                                                                       │"
-"│  upstream · 1 file       │                                                                       │"
+"│alpha                     │notes  draft · 1 file                                                  │"
+"│  main · 3 files          │  M n2.md  +2 −0                                                       │"
+"│  M f1  +1 −1             │                                                                       │"
+"│  M f2  +1 −0             │                                                                       │"
+"│  M parse.rs  +10 −2      │                                                                       │"
 "│──────────────────────────│                                                                       │"
 "│notes                     │                                                                       │"
 "│  draft · 1 file          │                                                                       │"
@@ -31,4 +31,4 @@ expression: frame
 "│                          │                                                                       │"
 "│                          │                                                                       │"
 "└──────────────────────────┴───────────────────────────────────────────────────────────────────────┘"
-"accepted src/parse.rs · 0s                                                                          "
+"↑↓ select  ⏎ open  n/p hunk  a accept all in notes  ^A accept all  ? help  q quit                   "

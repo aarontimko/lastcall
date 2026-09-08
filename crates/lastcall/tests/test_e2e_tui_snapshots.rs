@@ -181,13 +181,23 @@ fn snapshot(name: &str, app: &App, w: u16, h: u16) {
     insta::assert_snapshot!(format!("{name}_styles"), style);
 }
 
+/// §6.7 (Amendment v1.9): a repo with nothing pending is a nav row, not an absence — the
+/// one clean repo here is a dim name-and-branch row with no file rows under it. The
+/// `None` arm's `nothing pending across N` is now the zero-repos-listed case, which `t`
+/// reaches by hiding the only repo there is.
 #[test]
 fn tui_empty_state() {
     let scene = Scene::clean();
     let mut engine = scene.engine();
-    let app = app_of(&mut engine);
-    assert!(app.nav_entries().is_empty());
+    let mut app = app_of(&mut engine);
+    assert_eq!(app.nav_entries().len(), 1, "the repo row is the nav");
+    assert!(app.roots.values().all(|v| !v.listed()), "nothing pending");
     snapshot("tui_empty_state", &app, W, H);
+
+    app.handle(Action::HideEmpty);
+    assert!(app.nav_entries().is_empty());
+    let (frame, _) = draw(&app, W, H);
+    assert!(frame.contains("nothing pending across"), "{frame}");
 }
 
 #[test]
@@ -776,17 +786,18 @@ fn tui_accept_last_hunk_advances() {
     snapshot("tui_accept_last_hunk_advances", &app, W, H);
 }
 
-/// §6.7: accepting a repo's last file collapses the repo out of the nav. alpha's `f1`,
-/// `f2` then `src/parse.rs` accepted whole; alpha unlists and the selection moves to
-/// beta's first row. (`src/parse.rs` is deliverable 10's addition: alpha has three
-/// pending files, and it sorts last, so it is the last file here.)
+/// §6.7 (Amendment v1.9): accepting a repo's last file lands on the repo's own name row.
+/// alpha's `f1`, `f2` then `src/parse.rs` accepted whole; alpha stays on the nav as a
+/// name-and-branch row with nothing under it, the cursor sits on that row and the right
+/// pane reads `nothing pending in alpha`. Never a jump into beta while alpha is listed.
+/// (`src/parse.rs` is deliverable 10's addition: alpha has three pending files, and it
+/// sorts last, so it is the last file here.)
 #[test]
-fn tui_accept_last_file_collapses_repo() {
+fn tui_accept_last_file_lands_on_the_repo_row() {
     let scene = Scene::build();
     let mut engine = scene.engine();
     let mut app = app_of(&mut engine);
     let alpha = root_named(&engine, "alpha");
-    let beta = root_named(&engine, "beta");
     select_row(&mut app, &alpha, "f1");
 
     let (_, effect) = app.handle(Action::AcceptFile);
@@ -818,18 +829,80 @@ fn tui_accept_last_file_collapses_repo() {
     assert_eq!(status_text(&app), "accepted src/parse.rs");
     assert!(
         !app.roots[&alpha].listed(),
-        "alpha collapsed out of the nav"
+        "alpha has nothing pending any more"
+    );
+    assert!(
+        app.listed_roots().any(|v| v.meta.path == alpha),
+        "and is on the nav all the same"
     );
     assert_eq!(
         app.selection,
-        Some(Selection::Row(beta.clone(), b"u1".to_vec())),
-        "the next listed root's first row"
+        Some(Selection::Root(alpha.clone())),
+        "the repo's own name row is the last entry above the file that went"
     );
     assert!(engine.scan(&alpha).expect("scan").is_empty());
     let (frame, _) = draw(&app, W, H);
-    assert!(frame.contains("lastcall  2 repos · 3 files"), "{frame}");
-    assert!(!frame.contains("alpha"), "{frame}");
-    snapshot("tui_accept_last_file_collapses_repo", &app, W, H);
+    assert!(frame.contains("lastcall  3 repos · 3 files"), "{frame}");
+    assert!(frame.contains("nothing pending in alpha"), "{frame}");
+    snapshot("tui_accept_last_file_lands_on_the_repo_row", &app, W, H);
+}
+
+/// §6.7 (Amendment v1.9), deliverable 2: three repos, one of them with nothing pending,
+/// and the cursor on it. beta is a dim name-and-branch row with no file rows under it,
+/// selectable like any other root row, and the right pane reads `nothing pending in beta`
+/// over its branch line. Pressing `t` hides it; the cursor takes the entry now standing at
+/// beta's old nav index, and the hint line flips to `t show empty`.
+#[test]
+fn tui_nav_empty_repo_row() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let beta = root_named(&engine, "beta");
+    mark_seen(&mut engine, &beta);
+    let mut app = app_of(&mut engine);
+    assert!(!app.hide_empty, "§6.1: the default shows every repo");
+    app.select(Some(Selection::Root(beta.clone())));
+    assert!(app.roots[&beta].rows().is_empty(), "beta has no rows");
+    assert!(
+        app.listed_roots().any(|v| v.meta.path == beta),
+        "and is on the nav"
+    );
+    let (frame, _) = draw(&app, W, H);
+    assert!(frame.contains("nothing pending in beta"), "{frame}");
+    assert!(frame.contains("lastcall  3 repos ·"), "{frame}");
+    snapshot("tui_nav_empty_repo_row", &app, W, H);
+
+    assert_eq!(app.handle(Action::HideEmpty).0, Changed::Yes);
+    assert!(app.hide_empty);
+    assert!(
+        !app.listed_roots().any(|v| v.meta.path == beta),
+        "`t` hides the repo with nothing pending"
+    );
+    let (frame, _) = draw(&app, W, H);
+    assert!(!frame.contains("beta"), "{frame}");
+    // §6.7: the label follows the state. Decision (1): while the tiers are all-or-nothing
+    // the toggle sits on the widest one, so the 100-column frame does not carry it — the
+    // help overlay names the key at every width, and deliverable 4's drop order puts it
+    // back on the line the kickoff asks for.
+    assert!(!frame.contains("empty"), "{frame}");
+    assert!(
+        lastcall::tui::render::hints(&app, 200).contains("t show empty"),
+        "{}",
+        lastcall::tui::render::hints(&app, 200)
+    );
+    assert!(
+        frame.contains("lastcall  2 repos ·"),
+        "the header counts the repos on the nav, as it does under a `w` scope: {frame}"
+    );
+    assert_eq!(
+        app.selection,
+        Some(Selection::Root(root_named(&engine, "notes"))),
+        "the repo left the nav, so the cursor takes the entry at its former index"
+    );
+    snapshot("tui_hide_empty_toggle", &app, W, H);
+
+    // Independent filters, and the toggle is its own inverse.
+    app.handle(Action::HideEmpty);
+    assert!(app.listed_roots().any(|v| v.meta.path == beta));
 }
 
 /// §7.2 CAS refusal on screen: the request is built from the held row, the file changes
@@ -1000,18 +1073,31 @@ fn tui_accept_all_no_confirm_at_10() {
         mark_seen(&mut engine, &root);
     }
     let mut app = app_of(&mut engine);
-    assert_eq!(app.listed_roots().count(), 1);
+    assert_eq!(
+        app.roots.values().filter(|v| v.listed()).count(),
+        1,
+        "only alpha is pending"
+    );
+    // Amendment v1.9: the other two are on the nav all the same, as empty repo rows.
+    assert_eq!(app.listed_roots().count(), 3);
     assert_eq!(app.roots[&alpha].rows().len(), 10);
     let (_, effect) = app.handle(Action::AcceptAll);
     assert!(app.confirm.is_none(), "ten files ask nothing");
     assert!(app.accepting.is_some());
     run_accept(&mut app, &mut engine, effect);
     assert_eq!(status_text(&app), "accepted 10 files in alpha");
-    assert!(app.listed_roots().next().is_none());
-    assert_eq!(app.selection, None);
+    assert!(app.roots.values().all(|v| !v.listed()), "nothing pending");
+    assert_eq!(app.listed_roots().count(), 3, "three empty repo rows");
+    assert_eq!(
+        app.selection, None,
+        "the scene never moved the cursor, and the fold does not invent one"
+    );
     assert!(engine.scan(&alpha).expect("scan").is_empty());
     let (frame, _) = draw(&app, W, H);
-    assert!(frame.contains("nothing pending across 3 roots"), "{frame}");
+    // Not the `None` arm's `nothing pending across N` any more — three repos are listed,
+    // so the pane is the no-selection prompt over three empty repo rows (v1.9).
+    assert!(!frame.contains("nothing pending across"), "{frame}");
+    assert!(frame.contains("alpha"), "{frame}");
     snapshot("tui_accept_all_no_confirm_at_10", &app, W, H);
 }
 
@@ -1136,6 +1222,10 @@ fn tui_herdr_ready_ack_dims() {
 
 /// Ruling 4: alpha has nothing pending, and herdr's `done` lists it anyway with a line
 /// that says why. beta's `working` is not a reason to list it, so it stays off.
+///
+/// Since Amendment v1.9 the gate the flag has to beat is `hide_empty`, not the pile — with
+/// the toggle off every repo is listed and there is nothing for the flag to rescue — so
+/// the scene turns it on.
 #[test]
 fn tui_herdr_flag_only_root_listed() {
     let scene = Scene::build();
@@ -1144,6 +1234,7 @@ fn tui_herdr_flag_only_root_listed() {
     mark_seen(&mut engine, &alpha);
     mark_seen(&mut engine, &beta);
     let mut app = app_of(&mut engine);
+    app.hide_empty = true;
     assert!(
         !app.listed_roots().any(|v| v.meta.path == alpha),
         "nothing pending, nothing listed"
@@ -1163,8 +1254,13 @@ fn tui_herdr_flag_only_root_listed() {
     );
     app.select(Some(Selection::Root(alpha)));
     let (frame, _) = draw(&app, W, H);
+    // §6.7 (Amendment v1.9): the pane names the repo and keeps the status word; the nav
+    // row's own `nothing pending · agent done` line is unchanged behind it.
     assert!(
-        frame.contains(&lastcall::tui::render::nothing_pending("done")),
+        frame.contains(&lastcall::tui::render::nothing_pending_in(
+            "alpha",
+            Some("done")
+        )),
         "{frame}"
     );
     snapshot("tui_herdr_flag_only_root_listed", &app, W, H);

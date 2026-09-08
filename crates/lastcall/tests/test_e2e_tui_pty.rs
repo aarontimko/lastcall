@@ -826,16 +826,19 @@ fn pty_accept_loop_and_restart() {
     .unwrap_or_else(|e| panic!("confirm modal: {e}"));
     let t = Instant::now();
     pty.send(b"y").expect("y");
+    // Amendment v1.9: the three repos stay on the nav with nothing under them, and the
+    // cursor is on alpha's own name row, so the pane names the repo instead of counting
+    // roots. The header keeps counting every repo it is watching.
     pty.wait_for(OVERLOADED, |s| {
         status_is(s, "accepted 12 files in 3 repos")
-            && s.contents().contains("nothing pending across 3 roots")
+            && s.contents().contains("nothing pending in alpha")
     })
     .unwrap_or_else(|e| panic!("accept all: {e}"));
     note(&format!(
         "PTY accept all: nothing pending after {:.3?}",
         t.elapsed()
     ));
-    pty.wait_for_text("0 repos · 0 files · 0 hunks", Duration::from_secs(5))
+    pty.wait_for_text("3 repos · 0 files · 0 hunks", Duration::from_secs(5))
         .unwrap_or_else(|e| panic!("empty header: {e}"));
 
     // The fold persisted: what the next process will load.
@@ -922,8 +925,8 @@ fn pty_accept_loop_and_restart() {
         .expect("git commit -a");
     assert_ne!(alpha.head().expect("HEAD"), f3_commit);
 
-    // (5) a second process on the same state dir: the empty state, after scanning (the
-    // `watching <parent> (3 roots)` status replaces `scanning 3 roots…` once the
+    // (5) a second process on the same state dir: three empty repo rows, after scanning
+    // (the `watching <parent> (3 roots)` status replaces `scanning 3 roots…` once the
     // post-install rescans are done; the temp path is long, so only its head fits).
     let Some(mut pty) = fx.spawn_tui(&bin()) else {
         return;
@@ -936,8 +939,10 @@ fn pty_accept_loop_and_restart() {
     );
     note(&format!("PTY relaunch: scanned after {:.3?}", t.elapsed()));
     let text = pty.screen_text();
-    assert!(text.contains("nothing pending across 3 roots"), "{text}");
-    assert!(text.contains("0 repos · 0 files · 0 hunks"), "{text}");
+    // Amendment v1.9: every repo stays on the nav, so this is three name-and-branch rows
+    // and the no-selection prompt — `nothing pending across N` is the zero-listed case now.
+    assert!(!text.contains("nothing pending across"), "{text}");
+    assert!(text.contains("3 repos · 0 files · 0 hunks"), "{text}");
     let raw = pty.raw();
     for row in ["M f1", "M f2", "M f3", "A g01", "A u1", "M n2.md"] {
         assert!(find(&raw, row.as_bytes()).is_none(), "{row} never drawn");
@@ -953,9 +958,100 @@ fn pty_accept_loop_and_restart() {
     let took = pty
         .wait_for_text("M f2  +1 −0", OVERLOADED)
         .unwrap_or_else(|e| panic!("the re-edit: {e}"));
-    pty.wait_for_text("1 repo · 1 file · 1 hunk", Duration::from_secs(5))
+    // Amendment v1.9: the header counts every repo on the nav, and the other two are
+    // still there with nothing pending.
+    pty.wait_for_text("3 repos · 1 file · 1 hunk", Duration::from_secs(5))
         .unwrap_or_else(|e| panic!("header after the re-edit: {e}"));
     note(&format!("PTY relaunch edit-to-screen {took:.3?}"));
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}
+
+/// §6.7 (Amendment v1.9), deliverable 2, through the real binary: `t` names its own
+/// inverse on the hint line; accepting a repo's last file lands the cursor on the repo's
+/// **own name row** — the repo is still on the nav, now a name-and-branch row with nothing
+/// under it, and the pane reads `nothing pending in notes`; `t` then hides it and `t`
+/// brings it back.
+///
+/// Two things shape the order. The bottom row is the **status** line while a status is
+/// live, and launch sets one (`watching <parent> (3 roots)`), so the hint-line half waits
+/// out `app::STATUS_TTL` (30s) once — which also puts it before the accept, while every
+/// repo still has rows and `t` therefore hides nothing but the label. And the scene widens
+/// the terminal for it: while the hint tiers are all-or-nothing (decision (1);
+/// deliverable 4 replaces them with a drop order) the toggle sits on the widest tier, so
+/// the 100-column default does not carry it.
+#[test]
+fn pty_accept_last_file_lands_on_the_repo_row_then_t_hides_it() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let Some(mut pty) = fx.spawn_tui(&bin()) else {
+        return;
+    };
+    wait_first_piles(&mut pty);
+
+    // (1) the label follows the state, and with nothing empty `t` hides nothing. The
+    // 40s bound is `STATUS_TTL` plus room: the launch status has to age out before the
+    // hint line is what the bottom row shows.
+    pty.resize(240, 30).expect("resize");
+    pty.wait_for(Duration::from_secs(40), |s| {
+        s.contents().contains("t hide empty")
+    })
+    .unwrap_or_else(|e| panic!("the toggle is on the hint line: {e}"));
+    pty.send(b"t").expect("t");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        let t = s.contents();
+        t.contains("t show empty") && t.contains("M n2.md")
+    })
+    .unwrap_or_else(|e| panic!("`t` flips the label: {e}\n{}", pty.screen_text()));
+    pty.send(b"t").expect("t back");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        s.contents().contains("t hide empty")
+    })
+    .unwrap_or_else(|e| panic!("`t` is its own inverse: {e}\n{}", pty.screen_text()));
+
+    // (2) notes has exactly one pending file, so `A` on it is the repo's last file.
+    select_until(&mut pty, "n2.md  M ");
+    pty.send(b"A").expect("A");
+    pty.wait_for(OVERLOADED, |s| {
+        let t = s.contents();
+        status_is(s, "accepted n2.md") && t.contains("nothing pending in notes")
+    })
+    .unwrap_or_else(|e| {
+        panic!(
+            "the repo row, not the next repo: {e}\n{}",
+            pty.screen_text()
+        )
+    });
+
+    let text = pty.screen_text();
+    assert!(!text.contains("M n2.md"), "the file row is gone: {text}");
+    assert!(text.contains("3 repos · 5 files"), "{text}");
+    let row = pty
+        .find_row(|r| r.starts_with("\u{2502}notes"))
+        .unwrap_or_else(|| panic!("notes is still on the nav:\n{text}"));
+    assert!(
+        pty.inverse_at(row, 1),
+        "the repo row carries the cursor:\n{text}"
+    );
+
+    // (3) and now `t` has something to hide.
+    pty.send(b"t").expect("t");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        let t = s.contents();
+        !t.contains("notes") && t.contains("2 repos · 5 files")
+    })
+    .unwrap_or_else(|e| panic!("`t` hides the empty repo: {e}\n{}", pty.screen_text()));
+
+    pty.send(b"t").expect("t again");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        let t = s.contents();
+        t.contains("notes") && t.contains("3 repos · 5 files")
+    })
+    .unwrap_or_else(|e| panic!("`t` brings it back: {e}\n{}", pty.screen_text()));
+
     let since = pty.raw().len();
     pty.send(b"q").expect("q");
     let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
@@ -979,12 +1075,34 @@ fn draft_edited() -> String {
         .collect()
 }
 
-/// Move the nav selection down until the diff pane shows `header`. The number of steps
-/// depends on `alpha`'s own pending rows, which this scene deliberately does not pin (the
-/// `.gitignore` it writes is one of them); the diff pane follows the selection without
-/// `⏎`, so this needs the nav focus only.
+/// Move the nav selection to `header`'s row. The number of steps depends on `alpha`'s own
+/// pending rows, which these scenes deliberately do not pin (the `.gitignore` one of them
+/// writes is one); the diff pane follows the selection without `⏎`, so this needs the nav
+/// focus only.
+///
+/// It walks to the **top** of the nav first and only then downward: since Amendment v1.9
+/// the cursor never wraps inside a repo, so an accept can leave it *below* the row a scene
+/// wants next (`pty_editor_save_pends_nothing` blesses `src/parse.rs` and lands on `f2`,
+/// with `f1` above it).
 fn select_until(pty: &mut PtyTui, header: &str) {
-    for _ in 0..16 {
+    // The walk needs the **nav** focused: in the diff pane `k`/`j` scroll the pane and the
+    // selection never moves. `Esc` (`back`) puts the focus there from either pane and does
+    // nothing else once it is there, so it is safe to send unconditionally. The wait after
+    // it is not cosmetic — a bare `\x1b` is an ambiguous prefix, and a key that lands in
+    // the same read makes it `Alt-<key>`, which swallows the Esc.
+    pty.send(b"\x1b").expect("esc to the nav");
+    if pty
+        .wait_for(Duration::from_millis(400), |s| {
+            s.contents().contains(header)
+        })
+        .is_ok()
+    {
+        return;
+    }
+    for _ in 0..24 {
+        pty.send(b"k").expect("k");
+    }
+    for _ in 0..24 {
         if pty
             .wait_for(Duration::from_millis(400), |s| {
                 s.contents().contains(header)
@@ -2497,9 +2615,8 @@ fn pty_edit_inline_save_pends_nothing() {
         pty.screen_text()
     );
 
-    // (2) the draft note with no trailing newline. `Esc` first: the save left the focus in
-    // the diff pane, where `j` scrolls the diff instead of walking the nav.
-    pty.send(b"\x1b").expect("esc back to the nav");
+    // (2) the draft note with no trailing newline. `select_until` takes the focus back to
+    // the nav itself: the save left it in the diff pane, where `j` scrolls.
     select_until(&mut pty, "n2.md  M");
     pty.send(b"\r").expect("open n2.md");
     pty.wait_for_text("@@ -", Duration::from_secs(5))

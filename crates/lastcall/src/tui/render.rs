@@ -62,6 +62,17 @@ pub fn nothing_pending(status: &str) -> String {
     format!("nothing pending · agent {status}")
 }
 
+/// The right pane's opening line for a **selected repo with nothing pending** (§6.7,
+/// Amendment v1.9): the reader chose this row, so the pane names the repo rather than
+/// repeating the nav's header, and herdr's own status word folds in when there is an agent
+/// on it. Its branch line goes beneath, as the root summary's does.
+pub fn nothing_pending_in(name: &str, status: Option<&str>) -> String {
+    match status {
+        Some(s) => format!("nothing pending in {name} · agent {s}"),
+        None => format!("nothing pending in {name}"),
+    }
+}
+
 /// The same line for a nav column too narrow for it: the `nothing pending · ` half is
 /// already implied by the branch line's `0 files` above it, while the status word is the
 /// only thing on screen that says *why* the root is listed — so that half is what
@@ -520,8 +531,9 @@ pub fn hints(app: &App, width: u16) -> String {
         Some(AcceptScope::Hunk { .. }) => accept_file.map(|k| format!("{k} accept file")),
         _ => None,
     };
-    // (hint, tier): when the line must shrink, tier 2 goes first (`focus`, `refresh`;
-    // always below `NAV_MIN_COLS`), then tier 1 (the file and global accept hints).
+    // (hint, tier): when the line must shrink, tier 4 goes first (`t hide empty`), then
+    // tier 3 (the diff pane's two), then tier 2 (`focus`, `refresh`; always below
+    // `NAV_MIN_COLS`), then tier 1 (the file and global accept hints).
     // The herdr hints are conditional: `d`/`g` only while the selected root carries a
     // flag, `w` only while a scope is active (deliverable 5's hint ladder).
     // `d` acks a **ready episode** and nothing else, so a blocked root — which is listed,
@@ -551,6 +563,13 @@ pub fn hints(app: &App, width: u16) -> String {
         .is_some()
         .then(|| first("scope").map(|k| format!("{k} scope")))
         .flatten();
+    // §6.7 (Amendment v1.9): the label follows the state, so the line promises what the
+    // key will do rather than naming the setting it flips. The help overlay names the key
+    // at every width, which is what a line too narrow to carry it falls back on.
+    let hide_empty = first("hide_empty").map(|k| {
+        let verb = if app.hide_empty { "show" } else { "hide" };
+        format!("{k} {verb} empty")
+    });
     let items = [
         (pair("nav_up", "nav_down").map(|k| format!("{k} select")), 0),
         (first("open").map(|k| format!("{k} open")), 0),
@@ -563,6 +582,14 @@ pub fn hints(app: &App, width: u16) -> String {
         (first("accept_all").map(|k| format!("{k} accept all")), 1),
         (ack, 1),
         (jump, 1),
+        // Its own tier above every other, not the tier 1 the kickoff sketches, and only
+        // while the tiers are all-or-nothing. At tier 1 the 100-column line every
+        // snapshot is drawn at would be 102 columns and the **whole** of tier 1 would
+        // fall off it: 26 frames this deliverable does not name would regenerate with
+        // *fewer* hints than they carry today. Tier 4 is dropped first, so a line only
+        // ever gains this hint — deliverable 4 replaces the tiers with one explicit drop
+        // order and gives it the place the kickoff wants. Decision (1) in the report.
+        (hide_empty, 4),
         (scope, 2),
         (first("focus_toggle").map(|k| format!("{k} focus")), 2),
         (first("refresh").map(|k| format!("{k} refresh")), 2),
@@ -584,7 +611,7 @@ pub fn hints(app: &App, width: u16) -> String {
             .join("  ")
     };
     let fits = |s: &str| s.width() <= width as usize;
-    for tier in [3, 2] {
+    for tier in [4, 3, 2] {
         let line = join(tier);
         if width >= NAV_MIN_COLS && fits(&line) {
             return line;
@@ -647,7 +674,16 @@ fn render_nav(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
             dots.push((lines.len(), text.width() as u16, path.clone()));
             spans.push(Span::styled(text, dot_style(dot)));
         }
-        spans.push(Span::styled(view.meta.name.clone(), bold()));
+        // §6.7 (Amendment v1.9): a repo with nothing pending is on the nav like any other,
+        // told apart by being dim from the name down — bold-dim, so it still reads as a
+        // repo heading and not as a file row.
+        let empty = view.rows().is_empty();
+        let name_style = if empty {
+            bold().add_modifier(Modifier::DIM)
+        } else {
+            bold()
+        };
+        spans.push(Span::styled(view.meta.name.clone(), name_style));
         let remote = view.meta.remote.as_deref().filter(|_| app.show_remote);
         if let Some(remote) = remote {
             let budget = width.saturating_sub(view.meta.name.width() + 2);
@@ -670,23 +706,27 @@ fn render_nav(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
             target: Some(Target::NavRoot(path.clone())),
             selected: is_sel,
         });
+        let branch = format!(
+            "  {} · {}",
+            view.meta.branch_label(),
+            count_plus(view.rows().len(), view.pile.omitted > 0, "file")
+        );
         lines.push(NavLine {
-            line: Line::from(format!(
-                "  {} · {}",
-                view.meta.branch_label(),
-                count_plus(view.rows().len(), view.pile.omitted > 0, "file")
-            )),
+            line: Line::from(if empty {
+                Span::styled(branch, dim())
+            } else {
+                Span::raw(branch)
+            }),
             target: None,
             selected: false,
         });
-        if view.rows().is_empty() {
-            // A flag-only root (deliverable 5): listed on its agent alone, so it needs a
-            // line under the branch for `Enter` to have somewhere to land.
-            let status = app
-                .herdr
-                .flag(path)
-                .map(|f| f.status.as_str())
-                .unwrap_or("done");
+        if let Some(status) = empty
+            .then(|| app.herdr.flag(path).map(|f| f.status.as_str()))
+            .flatten()
+        {
+            // A flagged repo with nothing pending keeps its third line: herdr's status word
+            // is the only thing on the nav that says what the agent is doing. A plain empty
+            // repo is the name-and-branch row the sponsor asked for and nothing more.
             let full = format!("  {}", nothing_pending(status));
             let text = if full.width() <= width {
                 full
@@ -931,14 +971,28 @@ fn render_main(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
         }
         Some(Selection::Root(root)) => {
             if let Some(view) = app.roots.get(root) {
-                let mut spans = vec![
-                    Span::styled(view.meta.name.clone(), bold()),
-                    Span::raw(format!(
-                        "  {} · {}",
-                        view.meta.branch_label(),
-                        count_plus(view.rows().len(), view.pile.omitted > 0, "file")
-                    )),
-                ];
+                let branch = format!(
+                    "  {} · {}",
+                    view.meta.branch_label(),
+                    count_plus(view.rows().len(), view.pile.omitted > 0, "file")
+                );
+                // §6.7 (Amendment v1.9): an empty repo is a selectable nav row now, so its
+                // pane answers "which repo, and why is it empty?" on the first line and
+                // carries the branch beneath — the same two facts the summary shows, said
+                // the other way round.
+                let mut spans = if view.rows().is_empty() {
+                    let status = app.herdr.flag(root).map(|f| f.status.as_str());
+                    lines.push(Line::from(Span::styled(
+                        nothing_pending_in(&view.meta.name, status),
+                        bold(),
+                    )));
+                    vec![Span::styled(branch, dim())]
+                } else {
+                    vec![
+                        Span::styled(view.meta.name.clone(), bold()),
+                        Span::raw(branch),
+                    ]
+                };
                 for label in [view.meta.badge_label(), view.meta.in_progress_label()]
                     .into_iter()
                     .flatten()
@@ -947,14 +1001,6 @@ fn render_main(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
                 }
                 lines.push(Line::from(spans));
                 push_notices(&mut lines, view.notices());
-                if view.rows().is_empty() {
-                    let status = app
-                        .herdr
-                        .flag(root)
-                        .map(|f| f.status.as_str())
-                        .unwrap_or("done");
-                    lines.push(Line::from(Span::styled(nothing_pending(status), dim())));
-                }
                 for row in view.rows() {
                     lines.push(nav_row_line(row, true, usize::MAX));
                 }
@@ -2285,12 +2331,12 @@ mod tests {
         let mut app = App::new();
         assert_eq!(
             hints(&app, 100),
-            "↑↓ select  ⏎ open  n/p hunk  ^A accept all  Tab focus  r refresh  ? help  q quit"
+            "↑↓ select  ⏎ open  n/p hunk  ^A accept all  t hide empty  Tab focus  r refresh  ? help  q quit"
         );
         assert_eq!(
             hints(&app, 60),
             "↑↓ select  ⏎ open  n/p hunk  ^A accept all  ? help  q quit",
-            "narrow drops focus and refresh"
+            "narrow drops the toggle with focus and refresh"
         );
         for (name, specs) in &mut app.keymap {
             if name == "quit" {
@@ -2506,15 +2552,22 @@ mod tests {
         app.select(Some(row("alpha", "f1")));
         // The ruling: `a accept hunk` on a file row in BOTH panes — this one is the nav.
         assert_eq!(app.effective_focus(), super::super::app::Focus::Nav);
-        let nav_line = hints(&app, 120);
+        let nav_line = hints(&app, 124);
         assert_eq!(
             nav_line,
+            "↑↓ select  ⏎ open  n/p hunk  a accept hunk  A accept file  ^A accept all  t hide empty  Tab focus  r refresh  ? help  q quit"
+        );
+        // §6.7 (Amendment v1.9): `t hide empty` is the first hint off the line, so one
+        // column short of it the nav says exactly what it said before this deliverable.
+        let nav_tier2 = hints(&app, 123);
+        assert_eq!(
+            nav_tier2,
             "↑↓ select  ⏎ open  n/p hunk  a accept hunk  A accept file  ^A accept all  Tab focus  r refresh  ? help  q quit"
         );
         assert_eq!(
             hints(&app, 100),
             "↑↓ select  ⏎ open  n/p hunk  a accept hunk  A accept file  ^A accept all  ? help  q quit",
-            "focus/refresh go when the line would not fit"
+            "the toggle goes with focus/refresh when the line would not fit"
         );
         assert_eq!(
             hints(&app, 60),
@@ -2522,19 +2575,24 @@ mod tests {
             "then the file and global accept hints"
         );
         app.handle(Action::Open);
-        assert_eq!(hints(&app, 120), nav_line, "the diff pane says the same");
+        assert_eq!(hints(&app, 123), nav_tier2, "the diff pane says the same");
         // Deliverable 9: `v select  y copy` are the diff pane's own keys on their own tier
         // (3), dropped before every hint that was on the line before them — so a frame that
         // loses them keeps `Tab focus`/`r refresh` and everything under it.
         assert_eq!(
-            hints(&app, 140),
-            "↑↓ select  ⏎ open  n/p hunk  a accept hunk  A accept file  ^A accept all  Tab focus  r refresh  v select  y copy  ? help  q quit"
+            hints(&app, 142),
+            "↑↓ select  ⏎ open  n/p hunk  a accept hunk  A accept file  ^A accept all  t hide empty  Tab focus  r refresh  v select  y copy  ? help  q quit"
         );
-        // The threshold `tui.md` quotes, pinned (verifier (b) F7): the tier-3 line for a
-        // file row is exactly 128 columns wide, so 128 shows it and 127 falls back to the
-        // tier-2 line — which is the same one the nav gets.
-        assert_eq!(hints(&app, 128), hints(&app, 140));
-        assert_eq!(hints(&app, 127), nav_line, "one column short of tier 3");
+        // The threshold `tui.md` quotes, pinned (verifier (b) F7): the widest line for a
+        // file row is 142 columns (128 through tier 3, plus `t hide empty` at tier 4), so
+        // 142 shows all of it and 127 falls back to the tier-2 line — the one the nav gets.
+        assert_eq!(hints(&app, 142), hints(&app, 200));
+        assert_eq!(
+            hints(&app, 141),
+            "↑↓ select  ⏎ open  n/p hunk  a accept hunk  A accept file  ^A accept all  Tab focus  r refresh  v select  y copy  ? help  q quit",
+            "the toggle is the first hint off the line, so the diff pane keeps its own two"
+        );
+        assert_eq!(hints(&app, 127), nav_tier2, "one column short of tier 3");
         // What the line says depends on the selection, so the threshold does too: a root
         // row trades `a accept hunk  A accept file` for `a accept all in <root>`, which is
         // seven columns shorter with this fixture's names.
@@ -2545,7 +2603,7 @@ mod tests {
         assert!(!nav_line.contains("y copy"), "the nav has no copy key");
         app.handle(Action::Back);
         assert!(
-            !hints(&app, 140).contains("y copy"),
+            !hints(&app, 200).contains("y copy"),
             "and the nav still has none at any width"
         );
         app.handle(Action::Open);
@@ -2965,6 +3023,10 @@ mod tests {
             meta("notes"),
             meta("quiet"),
         ]);
+        // Since Amendment v1.9 every repo in scope is listed, so the empty state under a
+        // scope is reached only once `t` has taken the empty ones off too — the two
+        // filters stacking, which is exactly the frame this test is about.
+        app.hide_empty = true;
         app.herdr.scoped = true;
         app.handle(Action::Herdr(HerdrUpdate::Scope(Some(Scope {
             label: "w2".to_owned(),
@@ -3127,8 +3189,12 @@ mod tests {
             !frame.contains("│  nothing pending · agent"),
             "never the half that says nothing: {frame}"
         );
-        // The diff pane is wide enough for the full sentence, and still shows it.
-        assert!(frame.contains(&nothing_pending("done")), "{frame}");
+        // The right pane names the repo now (§6.7, Amendment v1.9) and folds herdr's word
+        // into the same sentence, so the status survives there too.
+        assert!(
+            frame.contains(&nothing_pending_in("alpha", Some("done"))),
+            "{frame}"
+        );
 
         // A nav column dragged wide enough keeps the full line.
         app.nav_width = 40;
@@ -3136,6 +3202,101 @@ mod tests {
         assert!(
             wide.contains(&format!("│  {}", nothing_pending("done"))),
             "{wide}"
+        );
+    }
+
+    /// Ruling R2: a repo with nothing pending is a name-and-branch row on the nav — dim
+    /// from the name down, no file rows under it — and its pane names it rather than
+    /// repeating the header (§6.7, Amendment v1.9 items 1 and 4).
+    #[test]
+    fn render_empty_root_row_is_dim_and_has_no_file_rows() {
+        let mut app = three_roots();
+        app.apply(pile_event_seq(
+            "beta",
+            1,
+            lastcall_engine::scan::Pile::default(),
+        ));
+        app.select(Some(Selection::Root(root("beta"))));
+        let (frame, styles) = frame_of(&app, 100, 30);
+
+        // The nav block for beta is exactly two lines: the name and the branch.
+        let nav: Vec<&str> = frame
+            .lines()
+            .filter(|l| l.starts_with("\"\u{2502}"))
+            .map(|l| l["\"\u{2502}".len()..].trim_end_matches(['"', ' ']))
+            .collect();
+        let at = nav
+            .iter()
+            .position(|l| l.starts_with("beta"))
+            .unwrap_or_else(|| panic!("beta on the nav: {frame}"));
+        assert!(nav[at].starts_with("beta"), "{frame}");
+        assert!(nav[at + 1].starts_with("  main · 0 files"), "{frame}");
+        assert!(
+            nav[at + 2].starts_with('\u{2500}') || nav[at + 2].starts_with("notes"),
+            "no file rows under an empty repo: {:?}",
+            &nav[at..at + 3]
+        );
+        assert!(
+            !frame.contains("nothing pending · agent"),
+            "no agent line without an agent: {frame}"
+        );
+
+        // beta's name row is bold-dim and its branch line dim; alpha's name row, which has
+        // rows under it, is plain bold. The nav's first line is frame row 2 (header, then
+        // the pane's top border).
+        let mods = |y: usize| -> Vec<String> {
+            styles
+                .lines()
+                .filter(|l| l.starts_with(&format!("{y} ")))
+                .map(|l| l.rsplit(' ').next().unwrap_or_default().to_owned())
+                .collect()
+        };
+        let beta_y = 2 + at;
+        assert!(
+            mods(beta_y)
+                .iter()
+                .any(|m| m.contains("BOLD") && m.contains("DIM")),
+            "beta's name row is bold-dim: {styles}"
+        );
+        assert!(
+            mods(beta_y + 1).iter().any(|m| m.contains("DIM")),
+            "its branch line is dim: {styles}"
+        );
+        assert!(
+            mods(2).iter().any(|m| m == "BOLD") && !mods(2).iter().any(|m| m.contains("DIM")),
+            "alpha still has rows, so its name row is plain bold: {styles}"
+        );
+
+        // The right pane.
+        assert!(frame.contains("nothing pending in beta"), "{frame}");
+        assert!(
+            frame
+                .lines()
+                .any(|l| l.contains("nothing pending in beta") && !l.contains("· agent")),
+            "no agent clause without an agent: {frame}"
+        );
+    }
+
+    /// The `t` hint says what the key will do, not what the setting is called
+    /// (§6.7, Amendment v1.9 item 4; the sponsor's "a simple little show/hide repos").
+    #[test]
+    fn render_hint_line_names_the_toggle_by_state() {
+        let mut app = three_roots();
+        app.select(Some(row("alpha", "f1")));
+        assert!(hints(&app, 200).contains("t hide empty"), "showing all");
+        app.handle(Action::HideEmpty);
+        assert!(hints(&app, 200).contains("t show empty"), "hiding");
+        assert!(!hints(&app, 200).contains("t hide empty"));
+        // A rebound key is named by its own spec, like every other hint.
+        for (name, specs) in &mut app.keymap {
+            if name == "hide_empty" {
+                *specs = vec!["ctrl-t".to_owned()];
+            }
+        }
+        assert!(
+            hints(&app, 200).contains("^T show empty"),
+            "{}",
+            hints(&app, 200)
         );
     }
 
