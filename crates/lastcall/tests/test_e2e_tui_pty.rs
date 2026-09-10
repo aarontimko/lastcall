@@ -316,7 +316,9 @@ fn rows_listed(s: &vt100::Screen) -> bool {
 /// since every root here has rows (the Gate 8 sponsor run's ruling: no repo is listed until
 /// every root has reported). Design pass D3 (ruling R5): the pane is the hold's only home,
 /// so the harness anchors on the pane text; `run.rs` no longer writes `scanning N roots…`
-/// to the status line, which this also pins.
+/// to the status line, which this also pins. Returns only once the watch is live (the
+/// `watching …` status is on the bottom row), so the scene's first key never races the
+/// notice that would otherwise cover what it waits for.
 /// The status row reads `watching <parent> (3 roots)`: the FSEvents watch is installed and
 /// its gap-closing rescans are done, so from here a file change is found by the live watch
 /// and its debounce rather than by a startup rescan. The temp path is long, so only the
@@ -374,6 +376,15 @@ fn wait_first_piles(pty: &mut PtyTui) -> Duration {
     );
     assert!(pty.screen(|s| s.alternate_screen()));
     assert!(pty.screen(|s| s.mouse_protocol_mode() != vt100::MouseProtocolMode::None));
+    // The scene starts once the watch is live, not once the rows are up. The engine says
+    // `watching <parent> (N roots)` only after the watcher is installed and its gap-closing
+    // rescans are done, which on a CI runner is seconds after the first piles (here it is
+    // milliseconds). Without this a scene that pressed a key in that gap saw the notice
+    // land on the status row moments later — over the hint line it was waiting for, or
+    // over the verdict a key had just posted (PR #9's first CI run: `t show empty` and
+    // `focused demo in herdr` both lost to `watching …`). From here the status row holds
+    // the notice for `STATUS_TTL`, the same start every scene has on a fast machine.
+    wait_watching(pty);
     took
 }
 

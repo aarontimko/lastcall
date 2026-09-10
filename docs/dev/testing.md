@@ -194,7 +194,7 @@ and accepts a hunk in the gitignored `_drafts/` root, then relaunches on the sam
 to show it stayed accepted; `wait_first_piles` additionally pins the startup order
 (`lastcall: discovering roots under …` on stderr, then the alternate-screen sequence, then
 the hold's own pane text `discovered N repos, checking status…` — Phase 9a deliverable 5 took
-`scanning N roots…` off the status line, and `wait_first_piles` pins that it stays off). The four Phase 7 scenes are `pty_restore_hunk_then_file_bytes_match_baseline` (restore one
+`scanning N roots…` off the status line, and `wait_first_piles` pins that it stays off; it also returns only once the engine's `watching …` notice is on the status row, because on a CI runner that notice lands seconds after the first piles and a scene that pressed a key in the gap saw it cover the hint line or the key's verdict — PR #9's first CI run). The four Phase 7 scenes are `pty_restore_hunk_then_file_bytes_match_baseline` (restore one
 hunk, then the file, comparing the bytes on disk with the baseline blob),
 `pty_restore_refused_when_the_file_moved` (the file is renamed under the running loop and
 the refusal is read off the status line), `pty_restore_deletion_recreates_the_file`, and
