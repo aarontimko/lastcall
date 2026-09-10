@@ -2034,10 +2034,15 @@ fn pty_flag_note_exports_when_standalone() {
     // diff focus first, so the second `m` has no hunk under it. The header says `whole
     // file` where the first one said `hunk 2 of 2`, a summary line follows it, and there is
     // no diff block — the export below is the golden that pins all three.
-    // Two writes: `\x1b` and `m` in one would reach the reader as `alt-m`, not two keys.
-    pty.send(b"\x1b").expect("esc");
-    pty.wait_for(Duration::from_secs(5), |s| !s.contents().contains("⏎ send"))
-        .unwrap_or_else(|e| panic!("esc leaves the diff focus: {e}"));
+    // `h` is `back` too (`esc`, `h`, `left`), and it is the one of the three that cannot
+    // merge with the key after it: two writes of `\x1b` then `m` still reach a reader
+    // that is behind as one buffer, which crossterm parses as `alt-m` — no key at all.
+    // That is what PR #9's second macOS CI run saw (the whole-file modal never opened);
+    // the wait that stood here checked the note modal's keys line, which the `⏎` above
+    // had already closed, so it proved nothing about the Esc. Focus itself shows only
+    // as a border colour, so there is nothing textual to wait for between the two keys;
+    // none is needed, the app takes them in order.
+    pty.send(b"h").expect("h back to the nav");
     pty.send(b"m").expect("m");
     pty.wait_for(Duration::from_secs(5), |s| {
         let t = s.contents();
