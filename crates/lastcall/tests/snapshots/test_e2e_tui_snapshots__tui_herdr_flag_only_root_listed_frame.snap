@@ -4,8 +4,8 @@ expression: frame
 ---
 "lastcall  2 repos · 1 file · 1 hunk  herdr 0.8.2  [Accept All]                            watching W"
 "┌──────────────────────────┬───────────────────────────────────────────────────────────────────────┐"
-"│⚑ alpha                   │alpha  main · 0 files                                                  │"
-"│  main · 0 files          │nothing pending · agent done                                           │"
+"│⚑ alpha                   │nothing pending in alpha · agent done                                  │"
+"│  main · 0 files          │  main · 0 files                                                       │"
 "│  agent done              │                                                                       │"
 "│──────────────────────────│                                                                       │"
 "│notes                     │                                                                       │"
@@ -31,4 +31,4 @@ expression: frame
 "│                          │                                                                       │"
 "│                          │                                                                       │"
 "└──────────────────────────┴───────────────────────────────────────────────────────────────────────┘"
-"↑↓ select  ⏎ open  n/p hunk  a accept all in alpha  ^A accept all  d ack  g jump  ? help  q quit    "
+"↑↓ select  ⏎ open  n/p hunk  ^A accept all  d ack  g jump  t show empty  Tab focus  ? help  q quit  "

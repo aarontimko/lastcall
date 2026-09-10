@@ -1,11 +1,14 @@
 {
   "status_version": 1,
+  "state_dir": "<S>",
   "notices": [],
   "roots": [
     {
       "root": "<W>/alpha",
       "kind": "git",
       "parent": "<W>",
+      "store": "<H>",
+      "ledger_written_at": "<T>",
       "badge": null,
       "head": "6f9759284abdb2ffb2ea6424e9b69b2fe08b7dfd",
       "branch": "main",
@@ -86,6 +89,8 @@
       "root": "<W>/beta",
       "kind": "git",
       "parent": "<W>",
+      "store": "<H>",
+      "ledger_written_at": "<T>",
       "badge": null,
       "head": "44348065daa941064a11b6e73af4f6ae8ec125b6",
       "branch": "main",
@@ -146,6 +151,8 @@
       "root": "<W>/notes",
       "kind": "draft",
       "parent": "<W>",
+      "store": "<H>",
+      "ledger_written_at": "<T>",
       "badge": null,
       "head": null,
       "branch": null,

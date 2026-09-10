@@ -2012,9 +2012,75 @@ pub(crate) mod tests {
         let human = StatusReport::build(&mut engine, None)
             .unwrap()
             .render_human();
-        assert!(human.starts_with("eng (main)  2 pending\n"), "{human}");
+        assert!(
+            human.starts_with(&format!("state dir: {}\n\n", state.path().display())),
+            "{human}"
+        );
+        assert!(human.contains("\neng (main)  2 pending\n"), "{human}");
         assert!(human.contains("  M f1  +1 −"), "{human}");
         assert!(human.contains("  A new.txt  +1 −0"), "{human}");
+    }
+
+    /// Amendment v1.9: the report names the store it read — the state dir once at the top,
+    /// each root's `<repo-hash>` directory and the ledger's write time — so two runs over
+    /// two state dirs can be told apart from their output alone (the Gate 8 discrepancy).
+    #[test]
+    fn status_json_names_the_state_dir_and_each_roots_store() {
+        let repo = FixtureRepo::new("eng-store").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let root = only_root(&engine);
+        let repo_dir = engine.root(&root).unwrap().paths.repo_dir.clone();
+        let ledger_path = engine.root(&root).unwrap().paths.ledger.clone();
+
+        let report = StatusReport::build(&mut engine, None).unwrap();
+        assert_eq!(report.state_dir, state.path().to_string_lossy());
+        assert_eq!(report.roots.len(), 1);
+        let r = &report.roots[0];
+        assert_eq!(r.store, repo_dir.file_name().unwrap().to_string_lossy());
+        assert_eq!(
+            r.store.len(),
+            16,
+            "the repo hash is sixteen hex: {}",
+            r.store
+        );
+        assert!(
+            r.store.bytes().all(|b| b.is_ascii_hexdigit()),
+            "{}",
+            r.store
+        );
+        assert!(
+            repo_dir.ends_with(&r.store) && ledger_path.starts_with(&repo_dir),
+            "the named store is the directory this root's ledger lives in"
+        );
+
+        let written = r.ledger_written_at.clone().expect("first sight wrote one");
+        let mtime = std::fs::metadata(&ledger_path).unwrap().modified().unwrap();
+        assert_eq!(written, crate::ledger::iso8601(mtime));
+        assert!(
+            written.len() == 20 && written.ends_with('Z') && written.starts_with("20"),
+            "ISO-8601 UTC, second precision: {written}"
+        );
+
+        // The JSON carries all three, and the human form leads with the state dir.
+        let v: serde_json::Value =
+            serde_json::from_str(&StatusReport::build(&mut engine, None).unwrap().to_json())
+                .unwrap();
+        assert_eq!(v["state_dir"], report.state_dir);
+        assert_eq!(v["roots"][0]["store"], r.store);
+        assert_eq!(v["roots"][0]["ledger_written_at"], written);
+        assert!(
+            StatusReport::build(&mut engine, None)
+                .unwrap()
+                .render_human()
+                .starts_with(&format!("state dir: {}\n", report.state_dir))
+        );
+
+        // A root whose ledger is gone reports `null`, never a guess.
+        std::fs::remove_file(&ledger_path).unwrap();
+        let gone = StatusReport::build(&mut engine, None).unwrap();
+        assert_eq!(gone.roots[0].ledger_written_at, None);
+        assert_eq!(gone.roots[0].store, r.store);
     }
 
     #[test]

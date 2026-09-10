@@ -186,7 +186,8 @@ fn first_checked(s: &vt100::Screen) -> bool {
 }
 
 /// The status bar reads `watching …`: the watch is installed and the post-install
-/// rescans are done (before that it reads `scanning N roots…`).
+/// rescans are done (before that it carries the hint line — the launch hold lives in the
+/// pane, Design pass D3).
 fn watching(s: &vt100::Screen) -> bool {
     let (_, cols) = s.size();
     s.rows(0, cols)
@@ -510,7 +511,7 @@ fn bench_s3_burst_1000_under_watch() {
         let mut pty = b.tui(args);
         pty.wait_for(LONG, watching)
             .unwrap_or_else(|e| panic!("watching: {e}"));
-        assert!(pty.screen_text().contains("nothing pending across 1 root"));
+        assert!(pty.screen_text().contains("nothing pending across 1 repo"));
         let last_write = drop_files(repo.path(), S3_FILES, 100);
         match pty.wait_for(bound, |s| s.contents().contains("1 repo · 1,000 files")) {
             Ok(_) => {
@@ -548,7 +549,7 @@ fn bench_s4_drop_50000_cutoff() {
     let mut pty = b.tui(&["tui", "--poll", "1"]);
     pty.wait_for(LONG, watching)
         .unwrap_or_else(|e| panic!("watching: {e}"));
-    assert!(pty.screen_text().contains("nothing pending across 1 root"));
+    assert!(pty.screen_text().contains("nothing pending across 1 repo"));
     let built = Instant::now();
     let last_write = drop_files(repo.path(), S4_FILES, 1_000);
     note(&format!(

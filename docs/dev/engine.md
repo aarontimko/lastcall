@@ -661,10 +661,12 @@ $EDITOR admits of.
 ```json
 {
   "status_version": 1,
+  "state_dir": "/abs/state-dir",
   "notices": ["engine-level notices (config resolution, ad-hoc cwd, moved roots)"],
   "roots": [
     {
       "root": "/abs/path", "kind": "git | draft", "parent": "/abs/parent-dir",
+      "store": "<repo-hash>", "ledger_written_at": "2026-09-07T19:21:35Z | null",
       "badge": null | {"worktree_of": "/abs/main"} | {"nested_in": "/abs/outer"},
       "head": "<oid> | null", "branch": "main | null",
       "remote": "org/repo | null",
@@ -707,6 +709,23 @@ the number of changed paths beyond the row cap that this scan did not hash (see 
 the pipeline); `0` whenever everything changed is in `pending`, and the root's `notices`
 name the cap when it is not. `pending` never holds more than `row_cap` non-override rows.
 Readers that predate the field ignore it; `Pile::omitted` deserializes as `0` when absent.
+
+`state_dir`, `store` and `ledger_written_at` (additive, Phase 9a / Amendment v1.9;
+`status_version` stays 1) name **which store this run read**. `state_dir` is the resolved
+state dir (`LASTCALL_STATE_DIR` → `$XDG_STATE_HOME/lastcall` → `~/.local/state/lastcall`,
+`config::state_dir`), always absolute: a relative `LASTCALL_STATE_DIR` is joined onto the
+launch cwd — where the store already lands — and never canonicalised, so no symlink is
+resolved and a store that does not exist yet still names itself (verifier (a) F3;
+`config_relative_state_dir_is_absolutised_against_the_cwd`); `store` is the root's
+`<repo-hash>` directory name under
+`<state_dir>/roots/<parent-hash>/repos/`, so `jq -r '.roots[] | "\(.store) \(.root)"'`
+gives the `cd` target for the walkthrough above; `ledger_written_at` is `ledger.json`'s
+mtime as ISO-8601 UTC with second precision, `null` when no ledger has been written yet
+(the file was removed, or the root has not had its first sight). They exist because two
+runs that disagree about a repo are almost always two runs over two state dirs, and until
+v1.9 the report said nothing about which one it read (§10 2026-09-07; the closed §11
+entry). `lastcall status`'s human form prints `state dir: <path>` as its first line for the
+same reason; `lastcall config`'s `state_dir:` line is unchanged.
 
 `lastcall status [--root <path>]...` scans only the roots the given paths resolve to (a path
 inside a root selects that root) and nothing else; a path that is not inside any watched root

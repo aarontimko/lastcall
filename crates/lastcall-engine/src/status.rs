@@ -18,6 +18,10 @@ pub const STATUS_VERSION: u32 = 1;
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct StatusReport {
     pub status_version: u32,
+    /// The state dir this run resolved (`LASTCALL_STATE_DIR` → `$XDG_STATE_HOME/lastcall`
+    /// → `~/.local/state/lastcall`), so two runs can be told apart by the store they read.
+    /// Additive in v1.9 (`status_version` stays 1).
+    pub state_dir: String,
     pub notices: Vec<String>,
     pub roots: Vec<RootStatus>,
 }
@@ -34,6 +38,13 @@ pub struct RootStatus {
     pub root: String,
     pub kind: RootKind,
     pub parent: String,
+    /// The `<repo-hash>` directory name under
+    /// `<state_dir>/roots/<parent-hash>/repos/` — this root's store, by name.
+    /// Additive in v1.9 (`status_version` stays 1).
+    pub store: String,
+    /// `ledger.json`'s mtime as ISO-8601 UTC; `null` when no ledger has been written yet.
+    /// Additive in v1.9 (`status_version` stays 1).
+    pub ledger_written_at: Option<String>,
     pub badge: Option<BadgeStatus>,
     pub head: Option<Oid>,
     pub branch: Option<String>,
@@ -111,6 +122,13 @@ fn path_string(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }
 
+/// `ledger.json`'s mtime as ISO-8601 UTC — `None` when the file is absent (a root whose
+/// first sight has not been written yet) or its metadata is unreadable.
+fn ledger_written_at(ledger: &Path) -> Option<String> {
+    let m = std::fs::metadata(ledger).ok()?;
+    Some(crate::ledger::iso8601(m.modified().ok()?))
+}
+
 impl RowStatus {
     pub fn of(row: &Row) -> Self {
         Self {
@@ -181,6 +199,13 @@ impl RootStatus {
             root: path_string(&root.path),
             kind: root.kind,
             parent: path_string(&root.parent),
+            store: root
+                .paths
+                .repo_dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            ledger_written_at: ledger_written_at(&root.paths.ledger),
             badge: root.badge.as_ref().map(|b| match b {
                 Badge::WorktreeOf(p) => BadgeStatus::WorktreeOf(path_string(p)),
                 Badge::NestedIn(p) => BadgeStatus::NestedIn(path_string(p)),
@@ -256,6 +281,7 @@ impl StatusReport {
         roots.sort_by(|a, b| a.root.as_bytes().cmp(b.root.as_bytes()));
         Ok(StatusReport {
             status_version: STATUS_VERSION,
+            state_dir: path_string(engine.layout().state_dir()),
             notices: engine.notices().to_vec(),
             roots,
         })
@@ -265,16 +291,17 @@ impl StatusReport {
         serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".to_owned())
     }
 
-    /// The human rendering: one header per root, one line per row, group lines last.
+    /// The human rendering: the state dir first (so two runs can be told apart by the
+    /// store they read — Amendment v1.9), then one header per root, one line per row,
+    /// group lines last.
     pub fn render_human(&self) -> String {
         let mut out = String::new();
+        out.push_str(&format!("state dir: {}\n", self.state_dir));
         for n in &self.notices {
             out.push_str(&format!("notice: {n}\n"));
         }
-        for (i, root) in self.roots.iter().enumerate() {
-            if i > 0 || !self.notices.is_empty() {
-                out.push('\n');
-            }
+        for root in &self.roots {
+            out.push('\n');
             let branch = root
                 .branch
                 .clone()

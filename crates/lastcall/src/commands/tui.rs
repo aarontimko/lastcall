@@ -67,7 +67,14 @@ pub fn run(poll: Option<u64>) -> Result<ExitCode, Box<dyn std::error::Error>> {
     // What `[herdr]` asks for, resolved before the terminal is taken; the link itself is
     // opened inside the loop's runtime, after the first frame (kickoff deliverable 4).
     let plan = HerdrPlan::of(&loaded.config.herdr, &env);
-    run::run(engine, super::poll_timings(poll), keymap, env, plan)
+    run::run(
+        engine,
+        super::poll_timings(poll),
+        keymap,
+        env,
+        plan,
+        loaded.config.hide_empty_repos,
+    )
 }
 
 #[cfg(test)]

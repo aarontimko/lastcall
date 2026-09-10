@@ -2,10 +2,10 @@
 source: crates/lastcall/tests/test_e2e_tui_snapshots.rs
 expression: frame
 ---
-"lastcall  0 repos · 0 files · 0 hunks  standalone  [Accept All]                           watching W"
+"lastcall  1 repo · 0 files · 0 hunks  standalone  [Accept All]                            watching W"
 "┌──────────────────────────┬───────────────────────────────────────────────────────────────────────┐"
-"│                          │nothing pending across 1 root                                          │"
-"│                          │  solo  main                                                           │"
+"│solo                      │nothing pending across 1 repo                                          │"
+"│  main · 0 files          │  solo  main                                                           │"
 "│                          │                                                                       │"
 "│                          │                                                                       │"
 "│                          │                                                                       │"
@@ -31,4 +31,4 @@ expression: frame
 "│                          │                                                                       │"
 "│                          │                                                                       │"
 "└──────────────────────────┴───────────────────────────────────────────────────────────────────────┘"
-"↑↓ select  ⏎ open  n/p hunk  ^A accept all  Tab focus  r refresh  ? help  q quit                    "
+"↑↓ select  ⏎ open  n/p hunk  ^A accept all  t hide empty  Tab focus  r refresh  ? help  q quit      "

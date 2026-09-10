@@ -2,8 +2,13 @@
 # (docs/spec/90-phase1-kickoff.md, deliverable 3).
 name: ci
 
+# Runs on pushes to main and on demand only (2026-09-10, sponsor): the repo is private for
+# now, macOS minutes count 10x against the monthly allotment, and three runs in one evening
+# exhausted it. Trigger a run for a branch by hand once it is ready:
+#   gh workflow run ci.yml --ref <branch>
+# Restore `pull_request:` here when the repo goes public (9b, P13) and minutes are free.
 on:
-  pull_request:
+  workflow_dispatch:
   push:
     branches: [main]
 

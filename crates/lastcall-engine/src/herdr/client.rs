@@ -1196,12 +1196,22 @@ impl<T: Transport> Actor<T> {
                     .copied()
                     .unwrap_or(0);
                 if stamp != current {
+                    // The resync wins the tie for the cache (its answer is whole; the event is
+                    // a hint), but the hint is not thrown away: herdr may have moved the pane on
+                    // *after* computing the resync's answer and *before* the answer was
+                    // installed, and once `pane.agent_detected` has fired a status change
+                    // reaches us on this stream alone (the lifecycle set carries no
+                    // `pane.agent_status_changed`). Dropped outright, the cache would sit on the
+                    // resync's answer until the fallback timer — PR #9's third CI run held
+                    // `working` for 5 s after herdr had said `done`. A coalesced pane.get on
+                    // this pane costs one request and reads the truth as of now.
                     tracing::debug!(
                         pane_id,
                         stamp,
                         current,
-                        "status event older than the last resync; dropped"
+                        "status event older than the last resync; scheduling a pane.get"
                     );
+                    self.schedule_pane_get(&pane_id);
                     return Ok(true);
                 }
                 let Some(cache) = &mut self.cache else {
@@ -2449,7 +2459,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn client_status_event_received_during_resync_is_dropped() {
+    async fn client_status_event_received_during_resync_schedules_a_pane_get() {
         let mock = builder().delay(Duration::from_millis(10)).in_memory();
         let (handle, mut rx) =
             Client::spawn(Mem(mock.clone()), timings(), ClientOptions::default());
@@ -2459,21 +2469,58 @@ mod tests {
         // The snapshot request starts at the coalesce edge and sleeps 10 ms in the mock.
         tokio::time::sleep(timings().coalesce + Duration::from_millis(2)).await;
         assert_eq!(mock.count("session.snapshot"), 2, "resync in flight");
+        // The per-pane stream says done mid-flight; the snapshot's answer (working) lands
+        // after it. The mock reads its snapshot at answer time, so the truth flips to done
+        // only once that answer is out — the same order herdr produced on PR #9's third CI run.
         mock.push_status(P1, status_line(P1, "done"));
         advance(Duration::from_millis(20)).await;
-        // The resync (which says working) wins the tie; the event was received before it completed.
+        // The resync wins the tie for the cache; the event writes nothing itself.
         assert_eq!(
             handle.snapshot().unwrap().status_of(P1),
             Some(&AgentStatus::Working)
         );
         let events = drain(&mut rx);
         assert!(status_changes(&events).is_empty(), "{events:?}");
-        // A status event after the resync completed is applied.
-        mock.push_status(P1, status_line(P1, "done"));
-        settle().await;
+        assert_eq!(
+            mock.count("pane.get"),
+            0,
+            "the pane.get is coalesced, not immediate"
+        );
+        // ... but it is not lost: one coalesced pane.get on that pane reads the truth. Without
+        // it the cache would hold `working` until the fallback timer (PR #9's third CI run).
+        mock.set_snapshot(snapshot_with_pane_status(P1, "done"));
+        advance(timings().coalesce).await;
+        assert_eq!(mock.count("pane.get"), 1);
+        assert_eq!(
+            mock.count("session.snapshot"),
+            2,
+            "a pane.get, not a whole snapshot"
+        );
+        let events = drain(&mut rx);
+        assert_eq!(
+            resyncs(&events),
+            vec![ResyncTarget::PaneGet(P1.to_string())]
+        );
+        assert_eq!(
+            status_changes(&events),
+            vec![(
+                P1.to_string(),
+                Some(AgentStatus::Working),
+                AgentStatus::Done
+            )]
+        );
         assert_eq!(
             handle.snapshot().unwrap().status_of(P1),
             Some(&AgentStatus::Done)
+        );
+        // A status event after the resync completed is applied directly, no pane.get.
+        mock.set_snapshot(snapshot_with_pane_status(P1, "idle"));
+        mock.push_status(P1, status_line(P1, "idle"));
+        advance(timings().coalesce).await;
+        assert_eq!(mock.count("pane.get"), 1);
+        assert_eq!(
+            handle.snapshot().unwrap().status_of(P1),
+            Some(&AgentStatus::Idle)
         );
         handle.shutdown().await;
     }

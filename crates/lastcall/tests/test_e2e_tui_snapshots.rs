@@ -181,13 +181,27 @@ fn snapshot(name: &str, app: &App, w: u16, h: u16) {
     insta::assert_snapshot!(format!("{name}_styles"), style);
 }
 
+/// §6.7 (Amendment v1.9): a repo with nothing pending is a nav row, not an absence — the
+/// one clean repo here is a dim name-and-branch row with no file rows under it. The
+/// `None` arm's `nothing pending across N repos` is what a frame with no *pending* row
+/// says — the one repo here is empty, so it says it whether or not `t` has taken the row
+/// off the nav (verifier (a) F5).
 #[test]
 fn tui_empty_state() {
     let scene = Scene::clean();
     let mut engine = scene.engine();
-    let app = app_of(&mut engine);
-    assert!(app.nav_entries().is_empty());
+    let mut app = app_of(&mut engine);
+    assert_eq!(app.nav_entries().len(), 1, "the repo row is the nav");
+    assert!(app.roots.values().all(|v| !v.listed()), "nothing pending");
     snapshot("tui_empty_state", &app, W, H);
+
+    let (frame, _) = draw(&app, W, H);
+    assert!(frame.contains("nothing pending across 1 repo"), "{frame}");
+
+    app.handle(Action::HideEmpty);
+    assert!(app.nav_entries().is_empty());
+    let (frame, _) = draw(&app, W, H);
+    assert!(frame.contains("nothing pending across 1 repo"), "{frame}");
 }
 
 #[test]
@@ -610,6 +624,38 @@ fn tui_help_overlay_tall() {
     snapshot("tui_help_overlay_tall", &app, W, 45);
 }
 
+/// The same overlay with room for neither form: 80 columns is the standard width and this
+/// keymap needs 100 for two columns, so the body is one column and it clips.
+///
+/// Design pass D12 (ruling R12): the clip **says so**. The last body row above the pinned
+/// `quit` is a dim `… N more keys (100 columns shows all)` — the count is the rows that are
+/// not on the frame, the column figure is computed from the width two columns would need,
+/// and the footer (the newline note, the mouse note, `any key closes`) is never what the
+/// clip spends.
+#[test]
+fn tui_help_overlay_80x24() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    app.handle(Action::NavDown);
+    app.handle(Action::NavDown);
+    app.handle(Action::Help);
+    assert!(app.help);
+    let (frame, _) = draw(&app, 80, 24);
+    let lines: Vec<&str> = frame.lines().collect();
+    let at = lines
+        .iter()
+        .position(|l| l.contains("more key"))
+        .unwrap_or_else(|| panic!("a clip notice:\n{frame}"));
+    assert!(lines[at].contains("columns shows all"), "{}", lines[at]);
+    assert!(
+        lines[at + 1].contains("quit"),
+        "the notice sits directly above the pinned quit:\n{frame}"
+    );
+    assert!(frame.contains("any key closes"), "{frame}");
+    snapshot("tui_help_overlay_80x24", &app, 80, 24);
+}
+
 #[test]
 fn tui_narrow_60x20() {
     let scene = Scene::build();
@@ -728,8 +774,10 @@ fn tui_accept_controls() {
     assert!(frame.contains("[Accept All]"), "{frame}");
     assert!(frame.contains("[A accept file]"), "{frame}");
     assert_eq!(frame.matches("[a accept]").count(), 2, "{frame}");
+    // Deliverable 4: at 100 columns `^A accept all` has already gone — the header's
+    // `[Accept All]` on the same frame says it, and `t hide empty` outlives it.
     assert!(
-        frame.contains("a accept hunk  A accept file  ^A accept all"),
+        frame.contains("a accept hunk  A accept file  t hide empty"),
         "{frame}"
     );
     snapshot("tui_accept_controls", &app, W, H);
@@ -776,17 +824,18 @@ fn tui_accept_last_hunk_advances() {
     snapshot("tui_accept_last_hunk_advances", &app, W, H);
 }
 
-/// §6.7: accepting a repo's last file collapses the repo out of the nav. alpha's `f1`,
-/// `f2` then `src/parse.rs` accepted whole; alpha unlists and the selection moves to
-/// beta's first row. (`src/parse.rs` is deliverable 10's addition: alpha has three
-/// pending files, and it sorts last, so it is the last file here.)
+/// §6.7 (Amendment v1.9): accepting a repo's last file lands on the repo's own name row.
+/// alpha's `f1`, `f2` then `src/parse.rs` accepted whole; alpha stays on the nav as a
+/// name-and-branch row with nothing under it, the cursor sits on that row and the right
+/// pane reads `nothing pending in alpha`. Never a jump into beta while alpha is listed.
+/// (`src/parse.rs` is deliverable 10's addition: alpha has three pending files, and it
+/// sorts last, so it is the last file here.)
 #[test]
-fn tui_accept_last_file_collapses_repo() {
+fn tui_accept_last_file_lands_on_the_repo_row() {
     let scene = Scene::build();
     let mut engine = scene.engine();
     let mut app = app_of(&mut engine);
     let alpha = root_named(&engine, "alpha");
-    let beta = root_named(&engine, "beta");
     select_row(&mut app, &alpha, "f1");
 
     let (_, effect) = app.handle(Action::AcceptFile);
@@ -818,18 +867,75 @@ fn tui_accept_last_file_collapses_repo() {
     assert_eq!(status_text(&app), "accepted src/parse.rs");
     assert!(
         !app.roots[&alpha].listed(),
-        "alpha collapsed out of the nav"
+        "alpha has nothing pending any more"
+    );
+    assert!(
+        app.listed_roots().any(|v| v.meta.path == alpha),
+        "and is on the nav all the same"
     );
     assert_eq!(
         app.selection,
-        Some(Selection::Row(beta.clone(), b"u1".to_vec())),
-        "the next listed root's first row"
+        Some(Selection::Root(alpha.clone())),
+        "the repo's own name row is the last entry above the file that went"
     );
     assert!(engine.scan(&alpha).expect("scan").is_empty());
     let (frame, _) = draw(&app, W, H);
-    assert!(frame.contains("lastcall  2 repos · 3 files"), "{frame}");
-    assert!(!frame.contains("alpha"), "{frame}");
-    snapshot("tui_accept_last_file_collapses_repo", &app, W, H);
+    assert!(frame.contains("lastcall  3 repos · 3 files"), "{frame}");
+    assert!(frame.contains("nothing pending in alpha"), "{frame}");
+    snapshot("tui_accept_last_file_lands_on_the_repo_row", &app, W, H);
+}
+
+/// §6.7 (Amendment v1.9), deliverable 2: three repos, one of them with nothing pending,
+/// and the cursor on it. beta is a dim name-and-branch row with no file rows under it,
+/// selectable like any other root row, and the right pane reads `nothing pending in beta`
+/// over its branch line. Pressing `t` hides it; the cursor takes the entry now standing at
+/// beta's old nav index, and the hint line flips to `t show empty`.
+#[test]
+fn tui_nav_empty_repo_row() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let beta = root_named(&engine, "beta");
+    mark_seen(&mut engine, &beta);
+    let mut app = app_of(&mut engine);
+    assert!(!app.hide_empty, "§6.1: the default shows every repo");
+    app.select(Some(Selection::Root(beta.clone())));
+    assert!(app.roots[&beta].rows().is_empty(), "beta has no rows");
+    assert!(
+        app.listed_roots().any(|v| v.meta.path == beta),
+        "and is on the nav"
+    );
+    let (frame, _) = draw(&app, W, H);
+    assert!(frame.contains("nothing pending in beta"), "{frame}");
+    assert!(frame.contains("lastcall  3 repos ·"), "{frame}");
+    snapshot("tui_nav_empty_repo_row", &app, W, H);
+
+    assert_eq!(app.handle(Action::HideEmpty).0, Changed::Yes);
+    assert!(app.hide_empty);
+    assert!(
+        !app.listed_roots().any(|v| v.meta.path == beta),
+        "`t` hides the repo with nothing pending"
+    );
+    let (frame, _) = draw(&app, W, H);
+    assert!(!frame.contains("beta"), "{frame}");
+    // §6.7: the label follows the state, and deliverable 4's drop order keeps the toggle
+    // on the 100-column line (the orchestrator's post-checkpoint note: it goes after
+    // `^A accept all`, which the header's `[Accept All]` duplicates at this width).
+    assert!(frame.contains("t show empty"), "{frame}");
+    assert!(!frame.contains("t hide empty"), "{frame}");
+    assert!(
+        frame.contains("lastcall  2 repos ·"),
+        "the header counts the repos on the nav, as it does under a `w` scope: {frame}"
+    );
+    assert_eq!(
+        app.selection,
+        Some(Selection::Root(root_named(&engine, "notes"))),
+        "the repo left the nav, so the cursor takes the entry at its former index"
+    );
+    snapshot("tui_hide_empty_toggle", &app, W, H);
+
+    // Independent filters, and the toggle is its own inverse.
+    app.handle(Action::HideEmpty);
+    assert!(app.listed_roots().any(|v| v.meta.path == beta));
 }
 
 /// §7.2 CAS refusal on screen: the request is built from the held row, the file changes
@@ -1000,18 +1106,31 @@ fn tui_accept_all_no_confirm_at_10() {
         mark_seen(&mut engine, &root);
     }
     let mut app = app_of(&mut engine);
-    assert_eq!(app.listed_roots().count(), 1);
+    assert_eq!(
+        app.roots.values().filter(|v| v.listed()).count(),
+        1,
+        "only alpha is pending"
+    );
+    // Amendment v1.9: the other two are on the nav all the same, as empty repo rows.
+    assert_eq!(app.listed_roots().count(), 3);
     assert_eq!(app.roots[&alpha].rows().len(), 10);
     let (_, effect) = app.handle(Action::AcceptAll);
     assert!(app.confirm.is_none(), "ten files ask nothing");
     assert!(app.accepting.is_some());
     run_accept(&mut app, &mut engine, effect);
     assert_eq!(status_text(&app), "accepted 10 files in alpha");
-    assert!(app.listed_roots().next().is_none());
-    assert_eq!(app.selection, None);
+    assert!(app.roots.values().all(|v| !v.listed()), "nothing pending");
+    assert_eq!(app.listed_roots().count(), 3, "three empty repo rows");
+    assert_eq!(
+        app.selection, None,
+        "the scene never moved the cursor, and the fold does not invent one"
+    );
     assert!(engine.scan(&alpha).expect("scan").is_empty());
     let (frame, _) = draw(&app, W, H);
-    assert!(frame.contains("nothing pending across 3 roots"), "{frame}");
+    // Three repos are listed and every one of them is empty, so the pane is the empty
+    // state over three empty repo rows — not `select a file` (v1.9; verifier (a) F5).
+    assert!(frame.contains("nothing pending across 3 repos"), "{frame}");
+    assert!(frame.contains("alpha"), "{frame}");
     snapshot("tui_accept_all_no_confirm_at_10", &app, W, H);
 }
 
@@ -1136,6 +1255,10 @@ fn tui_herdr_ready_ack_dims() {
 
 /// Ruling 4: alpha has nothing pending, and herdr's `done` lists it anyway with a line
 /// that says why. beta's `working` is not a reason to list it, so it stays off.
+///
+/// Since Amendment v1.9 the gate the flag has to beat is `hide_empty`, not the pile — with
+/// the toggle off every repo is listed and there is nothing for the flag to rescue — so
+/// the scene turns it on.
 #[test]
 fn tui_herdr_flag_only_root_listed() {
     let scene = Scene::build();
@@ -1144,6 +1267,7 @@ fn tui_herdr_flag_only_root_listed() {
     mark_seen(&mut engine, &alpha);
     mark_seen(&mut engine, &beta);
     let mut app = app_of(&mut engine);
+    app.hide_empty = true;
     assert!(
         !app.listed_roots().any(|v| v.meta.path == alpha),
         "nothing pending, nothing listed"
@@ -1163,8 +1287,13 @@ fn tui_herdr_flag_only_root_listed() {
     );
     app.select(Some(Selection::Root(alpha)));
     let (frame, _) = draw(&app, W, H);
+    // §6.7 (Amendment v1.9): the pane names the repo and keeps the status word; the nav
+    // row's own `nothing pending · agent done` line is unchanged behind it.
     assert!(
-        frame.contains(&lastcall::tui::render::nothing_pending("done")),
+        frame.contains(&lastcall::tui::render::nothing_pending_in(
+            "alpha",
+            Some("done")
+        )),
         "{frame}"
     );
     snapshot("tui_herdr_flag_only_root_listed", &app, W, H);
@@ -1587,8 +1716,13 @@ fn tui_copy_cue() {
     snapshot("tui_copy_cue", &app, W, H);
 }
 
-/// The hint line with the diff focused on a wide frame: `v select` and `y copy` are the
-/// last two hints on it, and the first to go when the line has to shrink.
+/// The hint line with the diff focused on a frame wide enough for the whole of it:
+/// `v select` and `y copy` are the last two hints on it, and the first two off it.
+///
+/// 142 columns, not the 140 this scene used before deliverable 4: `t hide empty` is on the
+/// line now (it used to sit on a tier of its own, above every other, so the widest frame
+/// was the only one without it), and the whole line for a file row is fourteen columns
+/// longer for it. One column narrower is the same frame without `y copy`.
 #[test]
 fn tui_hint_diff_focus() {
     let scene = Scene::build();
@@ -1596,12 +1730,15 @@ fn tui_hint_diff_focus() {
     let mut app = app_of(&mut engine);
     let alpha = root_named(&engine, "alpha");
     at_parse_rs_middle_hunk(&mut app, &engine, &alpha);
-    app.handle(Action::Resize(140, 20));
-    let (frame, _) = draw(&app, 140, 20);
+    app.handle(Action::Resize(142, 20));
+    let (frame, _) = draw(&app, 142, 20);
     assert!(frame.contains("v select  y copy"), "{frame}");
+    let (one_less, _) = draw(&app, 141, 20);
+    assert!(one_less.contains("v select"), "{one_less}");
+    assert!(!one_less.contains("y copy"), "{one_less}");
     let (narrow, _) = draw(&app, W, H);
     assert!(!narrow.contains("y copy"), "{narrow}");
-    snapshot("tui_hint_diff_focus", &app, 140, 20);
+    snapshot("tui_hint_diff_focus", &app, 142, 20);
 }
 
 /// Esc on a buffer that has been typed in asks before throwing the text away, and the
@@ -1709,4 +1846,46 @@ fn tui_editor_narrow_60x20() {
     let (frame, _) = draw(&app, 60, 20);
     assert!(frame.contains('→'), "a clipped line says so: {frame}");
     snapshot("tui_editor_narrow_60x20", &app, 60, 20);
+}
+
+/// Design pass D9 (ruling R10): the editor header at 60 columns with a path too long for
+/// it. Only the **path** gives, and it gives from the head at a `/`, so what is left still
+/// reads as a path; `line N/M` — the part that changes as you type — is never the thing
+/// cut, and `· unsaved` is reserved at every width so the header does not shift under the
+/// reader on the first keystroke. The scene is `tui_editor_narrow_60x20` with the row's
+/// path rewritten and one character typed: the body is the same fixture, the header is the
+/// whole point.
+#[test]
+fn tui_editor_long_path_60x20() {
+    const LONG: &[u8] = b"crates/lastcall/src/tui/render.rs";
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    let alpha = root_named(&engine, "alpha");
+    at_parse_rs_middle_hunk(&mut app, &engine, &alpha);
+    app.handle(Action::Resize(60, 20));
+    open_editor(&mut app, &engine);
+    app.editor.as_mut().expect("open").rendered.path = LONG.to_vec();
+
+    let position = format!("line {}/62", fixture_parent::parse_rs_edit2_line());
+    let (clean, _) = draw(&app, 60, 20);
+    let header = clean.lines().next().expect("a header").to_owned();
+    let head = format!("editing …lastcall/src/tui/render.rs · {position}");
+    assert!(
+        header.contains(&head),
+        "the head gives, cut at a `/`, and the position survives: {header}"
+    );
+    assert!(!header.contains("unsaved"), "a clean buffer: {header}");
+
+    app.handle(Action::Editor(EditorKey::Edit(EditKey::Insert(
+        "x".to_owned(),
+    ))));
+    let (dirty, _) = draw(&app, 60, 20);
+    let dirty_header = dirty.lines().next().expect("a header").to_owned();
+    assert!(dirty_header.contains(" · unsaved"), "{dirty_header}");
+    assert!(
+        dirty_header.contains(&head),
+        "the path and the position did not move to make room for it: {dirty_header}"
+    );
+    snapshot("tui_editor_long_path_60x20", &app, 60, 20);
 }

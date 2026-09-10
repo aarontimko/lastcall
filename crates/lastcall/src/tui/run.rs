@@ -2,7 +2,7 @@
 //!
 //! `run` builds the tokio runtime exactly as `commands/watch.rs` does, starts the engine's
 //! watcher, seeds the app with the engine's roots (no scan has run yet, so the first frame
-//! is the empty state with `scanning N roots…` until piles arrive), and then loops over one
+//! is the launch hold's pane until piles arrive — see `App::start_loading`), and then loops over one
 //! `select!`: watcher events → `App::apply`; terminal events (a detached reader thread) →
 //! `to_action` → `App::handle`; the loop's own finished engine work (`Local`) → the app;
 //! a 1 s tick; Ctrl-C (dead under raw mode, kept for `kill -INT`) and SIGTERM.
@@ -1409,6 +1409,9 @@ pub fn run(
     keymap: Keymap,
     env: Env,
     plan: HerdrPlan,
+    // `hide_empty_repos` from the config file (§6.1, Amendment v1.9): the app's opening
+    // answer to `t`. The key flips it for the session; nothing writes it back.
+    hide_empty: bool,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -1423,6 +1426,7 @@ pub fn run(
     // Asked once, inside `enter`, before the input thread exists; the app reads the cached
     // answer so the note modal promises `⇧⏎` only where it works (ruling P9).
     ui.app.enhanced = term::keyboard_enhanced();
+    ui.app.hide_empty = hide_empty;
     let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Event>();
     // Both are replaced wholesale by an `$EDITOR` suspend, which joins the thread and opens
     // a fresh channel; `reader` is `None` only while that handover is in flight.
@@ -1445,13 +1449,12 @@ pub fn run(
     let (outcome, watcher) = runtime.block_on(async {
         let mut watcher = engine.run(timings);
         let outcome: io::Result<ExitCode> = async {
-            let n = metas.len();
             ui.app.sync_roots(metas);
+            // Design pass D3 / ruling R5: the pane is the hold's home and its only clock —
+            // the status line is not set to `scanning N roots…` here. It shows the hints,
+            // exactly as the empty state does, and the engine's own `watching …` notice
+            // lands on it when the hold ends.
             ui.app.start_loading();
-            ui.app.set_status(format!(
-                "scanning {n} root{}…",
-                if n == 1 { "" } else { "s" }
-            ));
             if let Ok((w, h)) = crossterm::terminal::size() {
                 ui.app.handle(Action::Resize(w, h));
             }
@@ -2623,7 +2626,8 @@ mod tests {
     #[test]
     fn run_local_results_feed_the_app() {
         let mut ui = Ui::new(App::new(), Keymap::defaults());
-        // Roots arrive (the seed, or a SyncRoots): nothing listed yet.
+        // Roots arrive (the seed, or a SyncRoots): every one of them is on the nav at once
+        // (Amendment v1.9), each as a name-and-branch row until its pile lands.
         assert_eq!(
             ui.local(Local::Roots(vec![
                 meta("alpha"),
@@ -2633,7 +2637,8 @@ mod tests {
             (Changed::Yes, None)
         );
         assert_eq!(ui.app.roots.len(), 3);
-        assert!(ui.app.listed_roots().next().is_none());
+        assert_eq!(ui.app.listed_roots().count(), 3);
+        assert!(ui.app.roots.values().all(|v| !v.listed()), "no piles yet");
         // A refresh: piles, a failed root, then done.
         assert_eq!(ui.event(&key(KeyCode::Char('r'))).1, Some(Effect::Refresh));
         assert!(ui.app.refreshing);

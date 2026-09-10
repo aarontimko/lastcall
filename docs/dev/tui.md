@@ -38,8 +38,10 @@ gate greps at the end of this page are how that is enforced).
   frame's own area: no clock, no engine, no files. Layout: a one-line header (`lastcall  N
   repos · N files · N hunks  [Accept All]` plus the watch notice on the right; the file
   count reads `N+` when any root's pile stopped at the engine's row cap; when the control
-  and the notice do not both fit — 60 columns — the control is dropped and the notice
-  kept, since `^A` duplicates the control and nothing else says what is watched), the body — a nav pane
+  and the notice do not both fit — 60 columns — the control is dropped, then the herdr
+  badge, since `^A` duplicates the control and nothing else says what is watched or
+  whether herdr is answering; a notice that cannot fit beside the counts at all is
+  dropped instead, and the badge and the control return), the body — a nav pane
   (outer width `App.nav_width`, 16..=60, default 28; hidden below `NAV_MIN_COLS` = 70
   columns, when the diff takes the whole body and has focus) sharing its right border with a
   bordered main pane — and a one-line status bar (the latest engine notice with its age for
@@ -165,9 +167,17 @@ numbers only once a load has run longer than a second. The rules as built (`App:
 `render_main`'s `None` arm, `Loading::COUNTER_AFTER` = 1 s):
 
 - **From `sync_roots` until every root has reported, `App::is_listed` is false** for every
-  root, the header counts `0 repos`, and the right pane reads
-  `discovered N roots, checking status…` with one line per root (`  <name>  <branch>`) —
-  the same lines as the empty state, so the frame does not jump when the hold ends.
+  root, and the right pane reads `discovered N repos, checking status…` with one line per
+  root (`  <name>  <branch>`) — the same lines as the empty state, so the frame does not
+  jump when the hold ends. **repos** is the user-facing noun wherever a count is shown
+  here and in the empty states; `root` stays the config and CLI word (Design pass D3,
+  ruling R5). The header agrees with the pane rather than contradicting it: while the hold
+  is on it reads `lastcall  N repos · checking status…` — the one count it knows and none
+  of the ones it does not — with `[Accept All]` dim, as it is whenever nothing is listed.
+  The **status line is not** set to a second sentence about the same wait: `run.rs` writes
+  no `scanning N roots…`, the pane is the hold's home and its only clock, and the bottom
+  row shows the hints exactly as the empty state does until the engine's own `watching …`
+  notice lands.
 - **A root "reports" three ways:** the watcher's `EngineEvent::Scanned { root, rows }`
   (sent from the pool thread the moment that root's scan returns, before the batch's
   piles land — `Engine::scan_all_with`'s hook, `try_send` from under the engine lock so a
@@ -180,15 +190,17 @@ numbers only once a load has run longer than a second. The rules as built (`App:
   fast launch shows one calm frame, not a flash of `loading… 23423423432`. From one
   second on (`Loading::counting`, measured on the app clock, so the `Tick` action redraws
   while the hold is on) the pane adds a dim
-  `K of N repos checked · F files pending so far · Ss` and a `✓` beside each root that
-  has reported — a single slow repo is then the one without a `✓`. `F` is the sum of the
-  reported roots' pending rows; there is no intra-repo progress (the time is inside
+  `K of N checked · F files pending so far · Ss` and a `✓` in the **leading column** of
+  each root that has reported (Design pass D4, ruling R6: the tick takes the row's own
+  two-space indent — `✓ alpha  main` / `  beta  main` — so the ticks line up whatever the
+  branch labels are and the slow repo is the one gap in the column, a glance rather than a
+  read). `F` is the sum of the reported roots' pending rows; there is no intra-repo progress (the time is inside
   `git`), and the seconds counter is the liveness signal.
 - **The solo first-root scan is gone** from `watcher::run_loop`: every root goes through
   the one `scan_all` on the pool, and the piles land together in path order with
   `scan_seq` numbered that way. `bench.md` S1's `first_pile_ms` changed meaning with it
-  (see the note there). The PTY harness pins the order: `discovered 3 roots, checking
-  status…` before the first row, and `nothing pending across 3 roots` never before it
+  (see the note there). The PTY harness pins the order: `discovered 3 repos, checking
+  status…` before the first row, and `nothing pending across 3 repos` never before it
   (`wait_first_piles`); `watch --json` prints the tick as
   `{"event":"scanned","root":…,"rows":N}` and is otherwise unchanged.
 
@@ -200,7 +212,7 @@ disk, and the way to look at it as they will is `just probe-tui-slow`, or
 (`diff-files`, `ls-files` — `SLOWGIT_MS` per call, default 800 ms, four calls per root)
 and then execs the real one, so discovery still runs at full speed and only the
 "checking status" phase stretches; one root named by `SLOWGIT_SLOW_REPO` gets
-`SLOWGIT_SLOW_MS` (default 2,500 ms) per call and is the last without its ✓. The sponsor
+`SLOWGIT_SLOW_MS` (default 2,500 ms) per call and is the last gap in the ✓ column. The sponsor
 approved the hold on exactly this view (§10 2026-09-07 (v)): a 20-root workspace held for
 ~11 s with the counter ticking, the ✓s filling in, and the slow repo visibly the one
 holding things up. Any UX change to the hold should be looked at both ways — fast, where
@@ -597,8 +609,15 @@ The engine's refusals arrive as `App::edit_read`:
 - everything else is the CAS speaking, in the vocabulary every other refused op uses.
 
 **Layout** (`render::render_editor`). The editor replaces the diff pane; the nav stays.
-Header: `editing <path> · line N/M[ · unsaved]`, ellipsized, **bold — or red while
-`ed.alarm`**, which is set by a refused save and cleared by the next key. Body: a
+Header: `editing <path> · line N/M[ · unsaved]`, **bold — or red while `ed.alarm`**, which
+is set by a refused save and cleared by the next key. Only the **path** gives, and it gives
+from the head (`render::ellipsize_head`, Design pass D9 / ruling R10): the budget is the
+width less `editing `, ` · line N/M` and ` · unsaved` — the last reserved whether or not the
+buffer is dirty, so the header does not shift under the reader on the first keystroke — and
+the cut lands on the leftmost `/` whose remainder fits, so what is left still reads as a
+path (`editing …lastcall/src/tui/render.rs · line 21/62 · unsaved`). The **basename is the
+floor**: a width with no room even for `…<basename>` keeps the whole basename and lets the
+row's own clip take the overflow, because half a file name answers nothing. Body: a
 five-column gutter (`EDITOR_GUTTER`), then the file, no wrapping. The gutter carries the
 line number, and `▎` (`EDITOR_MARK`) on **every line inside any pending hunk of the row** —
 so the reader can see the rest of the agent's work while they type in one part of it. The
@@ -813,6 +832,7 @@ Defaults (`input::DEFAULT_KEYMAP`, in help-overlay order):
 | `hunk_next` / `hunk_prev` | `n` `]` / `p` `[` | next / previous hunk (the current hunk's header is a full-width inverted band) | |
 | `toggle_full_paths` | `f` | root-relative paths instead of basenames | |
 | `toggle_remote` | `o` | show each repo's `org/repo` slug | |
+| `hide_empty` | `t` | hide / show repos with nothing pending (§6.7 Amendment v1.9); default from `hide_empty_repos`, and independent of the `w` scope | |
 | `accept` | `a` | on a file row: the one hunk under the diff cursor (a hunkless row — binary, collapsed, deleted, unreadable — whole); on a group: the group; on a root: every row of it (asks above 10 files) | the same hunk |
 | `accept_file` | `shift-a` | accept the selected file whole — the only key that does | |
 | `accept_all` | `ctrl-a` | accept everything listed, every root (asks above 10 files) | |
@@ -858,6 +878,9 @@ the truncation — the blank, the shift-drag note (`render::SELECT_NOTE`) and th
 `any key closes` line — so both survive at any size the overlay is drawn at. At 80 columns,
 the standard width, the pair does not fit and the overlay clips: at 30 lines it reaches the
 `quit` row, at 24 it stops earlier, and the footer is there either way (verifier (b) F4).
+A clipped overlay now **says** it is clipped (**ruling R12**): the row above the pinned
+`quit` is a dim `… N more keys (100 columns shows all)`, so `q / Ctrl-C  quit` as the last
+key row can no longer be read as the whole table.
 
 Mouse: a left press on a nav entry selects it; on a hunk header it selects that hunk; on a
 hunk header's `[a accept]` it accepts that hunk, on `[u restore]` it restores it and on
@@ -981,32 +1004,35 @@ rule adds a row. Nothing here is a promise about the final design.
 | Surface | Rule as built (Phase ≤ 7) | Pinned by |
 |---|---|---|
 | Whole frame | below `MIN_SIZE` = 40×10 the frame is only `too small: 40×10 min` and the hit map is empty | `tui_too_small_30x8`, `render_too_small_is_one_line` |
-| Header | `lastcall  N repos · N files · N hunks  [Accept All]` + the watch notice right-aligned; when both do not fit (about 60 columns) the `[Accept All]` control is dropped and the notice kept (`^A` duplicates the control; nothing else says what is watched) | `tui_narrow_60x20` |
+| Header (**Design pass D14**, confirmed as built) | `lastcall  N repos · N files · N hunks  [Accept All]` + the watch notice right-aligned; when the control and the notice do not both fit (about 60 columns) the control is dropped, **then the badge** (`^A` duplicates the control; nothing else says what is watched or whether herdr is answering); a notice that cannot fit beside the counts at all is dropped and the badge and control return, rather than leaving the right half empty. At 60 columns with the fixture's counts the ladder lands on counts + notice only — badge and control both gone (D14's earlier doc row said only the control was dropped) | `tui_narrow_60x20`, `render_narrow_header_keeps_the_notice_and_drops_the_control`, `render_header_drops_the_accept_control_before_the_herdr_badge` |
 | Nav pane | outer width `App.nav_width`, 16..=60 (default 28), draggable; hidden below `NAV_MIN_COLS` = 70 columns, when the diff takes the whole body and has focus; keeps its scroll offset across selection changes | `tui_narrow_60x20`, `tui_nav_*` |
-| Hint line (status bar) | built from the keymap in two tiers: tier 2 (`Tab focus`, `r refresh`) is dropped below 70 columns or whenever the line would not fit, then tier 1 (the file and global accept hints, `d ack`/`g jump`/`w scope` when applicable); the accept hint follows the selection (`a accept hunk  A accept file` / `a/A accept file` / `a accept group` / `a accept all in <root>`); while a confirm modal is open the line is exactly `y confirm  n cancel  q quit`; the Phase 7 keys (`u`, `U`, `m`, `M`) are **not** on the hint line — they live on the hunk controls, the `?` overlay and the modal's own key row | `tui_status_line_head_notice`, `render_hints_and_help_follow_the_app_keymap` |
+| Hint line (status bar) | built from the keymap, **ruling R4** (Phase 9a deliverable 4): every applicable hint is built, the whole line is tried, and while it does not fit **one hint at a time** is removed from a fixed drop order — `y copy`, `v select`, `r refresh`, `Tab focus`, `w scope`, `^A accept all`, `t hide/show empty`, `g jump`, `d ack`, `A accept file`, `n/p hunk`, the accept phrase (`HINT_DROP_ORDER`, keyed by **action name**, so a rebind moves the key and never the order). There are no width constants (D1's 110/128 were not built) and no all-or-nothing tiers. **The first two hints follow the focus** (Design pass D2, **ruling R3**, Phase 9a deliverable 3): with the nav focused the line opens `↑↓ select  ⏎ open`; with the diff focused `↑`/`↓` scroll a line and `⏎` does nothing (see Keys), so it opens `↑↓ scroll  ← back` — `back` is the keymap's own action and `←` its arrow spelling, so a rebind renames the hint (a keymap binding no arrow to `back` falls back to its first key). The two forms are exactly the same width, so no drop step moves; the 19 diff-focused frames say `↑↓ scroll  ← back`. **`? help  q quit` are never dropped and are always the last two hints on the line**, so a cut line still says where the rest of the keys are; the floor is `↑↓ select  ⏎ open  ? help  q quit` at 33 columns, inside `MIN_SIZE`'s 40. Below `NAV_MIN_COLS` = 70 the five that a nav-less frame cannot promise (`w scope`, `Tab focus`, `r refresh`, `v select`, `y copy`) are not offered whatever the arithmetic says. What is on the line follows the state: the accept phrase follows the selection (`a accept hunk  A accept file` / `a/A accept file` on a hunkless row / `a accept group` / `a accept all in <root>` on a **non-empty** repo row only — `a` on an empty one does nothing, verifier (a) F2); `t`'s label follows the toggle (`t hide empty` while showing all, `t show empty` while hiding); `v select  y copy` only with the diff focused; `d ack` only for a ready episode and `g jump` for either flag; `w scope` only under a scope. While a confirm modal is open the line is exactly `y confirm  n cancel  q quit`. The Phase 7 keys (`u`, `U`, `m`, `M`) are **not** on the hint line — they live on the hunk controls, the `?` overlay and the modal's own key row. | `render_hints_drop_one_at_a_time_from_the_right`, `render_hints_keep_help_and_quit_at_every_width` (40–70), `render_hints_at_80_keep_accept_file`, `render_hints_follow_the_selection` (the 124-column nav line, the 142-column diff line with its focus-true opening, the rebound-`back` case, and every step below them), `render_hint_line_names_the_toggle_by_state`, `render_hints_and_help_follow_the_app_keymap`, `tui_hint_diff_focus` (142×20), `tui_narrow_60x20`, `tui_nav_empty_repo_row`, `tui_status_line_head_notice` |
 | Status bar vs hints | the latest engine notice with its age replaces the hints for `STATUS_TTL` = 30 s, then the hints return | `tui_status_line_head_notice` |
 | Scope notice | `scope: <ws> · N repos hidden (w shows all)` (43 columns) crowds the header at 100 columns — carried to the pass since Phase 5 | `tui_herdr_scope_notice`, `tui_herdr_scope_notice_with_status` |
 | File header controls | `[A accept file] [U restore file]` right-aligned as one run; a run that does not fit is retried without its last label, so a narrow pane loses the newest control first and `[A accept file]` goes last | `tui_accept_controls`, `tui_narrow_60x20` |
-| Hunk header controls | `[a accept] [u restore] [m flag]` with the same drop-from-the-right rule; on an expansion hunk of a collapsed row only `[m flag]` is offered (restore of such a row stays whole-file); at 60 columns all three still fit but crowd the header — the worker flagged this for the pass | `tui_narrow_60x20`, `tui_diff_view_collapsed_expanded` |
+| Hunk header controls (**Design pass D14**, confirmed as built) | `[a accept] [u restore] [m flag]` with the same drop-from-the-right rule; on an expansion hunk of a collapsed row only `[m flag]` is offered (restore of such a row stays whole-file); at 60 columns all three still fit with 12 spare columns and every label whole — the pass took the crowding the worker flagged and kept it: `[a] [u] [m]` would be roomier and would stop saying what the keys do | `tui_narrow_60x20`, `tui_diff_view_collapsed_expanded` |
 | Flag marker | `  ⚑ <first line of the note>` on the file and hunk header in whatever columns remain after the path and the control run (`marker_budget`); nothing is drawn when fewer than the prefix fits | `tui_diff_view_flagged_hunk`, `tui_nav_flag_counts` |
-| Help overlay (`?`) | one column while the rows fit the height; two columns when they do not **and** the width allows (about 100 columns with these descriptions), gutter 3; when neither fits (80×30 and below with this keymap) it clips key rows from the bottom, never the `newline_note`/`SELECT_NOTE`/`any key closes` footer (three rows reserved — the blank separator above them is not, and is the first row the clip spends); at 80×24 the quit rows are among the clipped | `tui_help_overlay` (100×30), `tui_help_overlay_tall` (100×45), `render_help_uses_two_columns_only_when_one_does_not_fit`, `render_help_promises_shift_enter_only_with_enhancement` |
+| Help overlay (`?`; **ruling R12**, Phase 9a deliverable 7) | one column while the rows fit the height; two columns when they do not **and** the width allows (about 100 columns with these descriptions), gutter 3 — the pass confirmed two columns as the right answer for this keymap, and left *sections* as the v0.2 answer if it outgrows the pair; when neither fits (80×30 and below with this keymap) it clips key rows from the bottom, never the `newline_note`/`SELECT_NOTE`/`any key closes` footer (three rows reserved — the blank separator above them is not, and is the first row the clip spends). **A clipped overlay says so**: the last body row above the pinned `quit` becomes a dim `… N more keys (100 columns shows all)`, where N is exactly the **keys** not drawn — a two-column row carries two, which a row count got wrong (Phase 9a verifier (b) F1) — so `shown + hidden` is the whole table in either form and the column figure is `render::help_two_column_width` — the width the two-column form would need with this keymap, computed, not a literal. When the frame is already that wide the constraint is the height, so the remedy reads `a taller window shows all` instead. `quit` stays pinned under the notice, so a clipped overlay still ends with the two rows a reader needs (how to get out, and that there is more) | `tui_help_overlay` (100×30), `tui_help_overlay_tall` (100×45), `tui_help_overlay_80x24`, `render_help_uses_two_columns_only_when_one_does_not_fit`, `render_help_promises_shift_enter_only_with_enhancement` |
 | Confirm modal | centered box, one question row from the scope; an accept shows live counts, a restore shows the one row; hint line switches to the modal's keys | `tui_restore_confirm`, `render_confirm_modal_shows_live_counts` |
 | Note modal | centered, `NOTE_WIDTH` = 60 columns (clamped to the frame minus 4, floor 8), a fixed `NOTE_ROWS` = 5-line text area that scrolls to keep the caret visible, plus the title — which **names the target**, ` flag hunk 2 of 3 ` or ` flag whole file ` (agenda (d)) — the target line and the key row, `⏎ send   ^J newline   Esc cancel` or its `⇧⏎` form; bracketed paste is on only while it is open | `tui_note_modal`, `tui_note_modal_scrolled`, `tui_note_modal_whole_file`, PTY `pty_flag_note_exports_when_standalone` |
 | Agent picker | centered, width = widest row + 4, height = rows + 2, both clamped to the frame; first row says the flag is already saved and `Esc` costs only the send; key row `↑↓ choose   ⏎ send   Esc cancel` | `tui_agent_picker` |
 | Collapsed rows | `collapsed (binary) · +a −d · not expandable` / `collapsed (size)` with `[e expand]`; expansion capped at 2,000 lines with `… N lines omitted` | `tui_nav_collapsed_*`, `tui_diff_view_collapsed*` |
-| Hint line, tier 3 (Phase 8) | `v select  y copy` are added **only** when the diff has focus and only on a frame wide enough for a third tier — the threshold is the width of the whole line, so with the default keymap it is **128 columns** on a file row (`a accept hunk  A accept file`) and **121** on a root row (`a accept all in alpha`), and wider again while a herdr hint (`d ack`, `g jump`, `w scope`) is on the line — because they are dropped *before* every pre-existing hint, so no narrower frame loses a hint it used to have. Below that the two keys are named only in the `?` overlay and in `SELECT_NOTE`. The line then reads `↑↓ select … v select  y copy`: two senses of "select" on one line, kept because the kickoff wrote the label — the wording is a pass item | `render_hints_follow_the_selection` (the 140-column assertion, the 128/127 and 121/120 thresholds, and that the nav at 140 has no `y copy`), `tui_hint_diff_focus` (140×20) |
-| Editor header (Phase 8) | `editing <path> · line N/M[ · unsaved]`, bold, or red while a save stands refused, and **truncated from the tail** by `render::ellipsize` — so a long path eats the `line N/M` and then the `· unsaved` before it loses any of itself. That is the wrong end to lose on a narrow frame (the position is the part that changes as you type) and it is the header's entry for the pass; at 60 columns with the fixture's `src/parse.rs` everything still fits | `tui_editor_narrow_60x20`, `tui_editor_save_refused` (the red header) |
+| Editor header (Phase 8; **ruling R10**, Phase 9a deliverable 6) | `editing <path> · line N/M[ · unsaved]`, bold, or red while a save stands refused. Only the path gives, and it gives from the **head**, cut at the leftmost `/` whose remainder fits (`render::ellipsize_head`); when not even `…<basename>` fits, the basename itself gives from the head (`…_for_a_file.rs` — the extension survives), because a basename floor overflowed into the row's tail clip and lost exactly the wrong parts (Phase 9a verifier (b) F2); ` · unsaved` is reserved at every width so the header does not shift on the first keystroke, and `line N/M` — the part that changes as you type — is never what is cut. At 60 columns with the fixture's `src/parse.rs` everything still fits, so `tui_editor_narrow_60x20` is unchanged | `render_ellipsize_head_cuts_at_a_slash_then_inside_the_basename`, `render_editor_header_keeps_the_position_and_reserves_unsaved`, `tui_editor_long_path_60x20`, `tui_editor_narrow_60x20`, `tui_editor_save_refused` (the red header) |
 | Editor body (Phase 8) | five-column gutter, then the file with **no wrap**; a clipped row ends in a dim `→` and `End` is the way to the rest. The caret line is tinted (indexed 238) and the entered hunk banded (236), so the editor needs a 256-colour terminal to look right and degrades to "no tint" rather than to noise. Hint line becomes exactly `^S save   Esc close` | `tui_editor_open`, `tui_editor_narrow_60x20` (which asserts the `→` is on the frame) |
 | Copy cue (Phase 8) | a centered one-line reverse-video `copied to clipboard` over the diff pane for 2 s; **not** the status line, so it cannot evict an engine notice, and the two can be on screen together | `tui_copy_cue`, `render_selection_is_reverse_video_and_the_cue_sits_over_the_diff` |
 | Diff selection (Phase 8) | selected lines are full-width reverse video; the pane scrolls only enough to keep the selection's moving end visible, never a line per keystroke | `tui_diff_selection`, `app_select_extends_with_the_cursor_and_y_copies_the_range` |
-| Launch hold (Gate 8 sponsor run) | nothing listed until every root reports; right pane `discovered N roots, checking status…` + one line per root; from 1 s a dim `K of N repos checked · F files pending so far · Ss` and a `✓` per reported root; the herdr `waiting for herdr scope…` hold (same section) can follow it on a scoped launch — two different holding texts in a row is a pass item, as is the `✓` column's placement | `render_loading_pane_counts_only_after_one_second`, `app_loading_holds_the_listing_until_every_root_reports`, PTY `wait_first_piles` |
+| Nav listing (Phase 9a, §6.7 Amendment v1.9) | every repo under the parent is a nav row, pending or not: `is_listed` = not loading, no scope pending, in scope, **and** (`hide_empty` off, or the repo has rows, or a herdr attention flag). A repo with no rows is a dim name-and-branch row with no file rows under it, selectable like any other; its right pane reads `nothing pending in <name>` over the branch line. `nothing pending across N repos` is what the right pane says whenever **no listed repo has a pending row** — the ordinary all-clean launch included, where every repo is a nav row and none is selected; `select a file (↑↓ or click)` there invited choosing a file that is not on the frame (Phase 9a verifier (a) F5). Under an active scope that pane is the scope's own form (`nothing pending in <ws>` + the repos it covers + `N repos hidden (w shows all)`) whatever the hidden count, so a scope that hides only empty repos can no longer fall through to the global text and list the repos it is hiding (Phase 9a F6). The scope notice's `N` is `is_listed`'s rule minus the scope test, so it counts an empty out-of-scope repo while `t` is off — what `w` will actually reveal (Phase 9a F1). `t` (`hide_empty`) flips the filter; the header's `N repos` counts the repos on the nav, as it already did under a `w` scope. Accepting a repo's last file lands the cursor on that repo's own name row — the neighbour is the nearest surviving entry below **within the same repo**, else the nearest above (the name row is the last "above"), and only when the repo itself has left the nav the entry at its former nav index; never a wrap, never a jump into another repo while this one is listed | `tui_nav_empty_repo_row`, `tui_hide_empty_toggle`, `tui_accept_last_file_lands_on_the_repo_row`, `tui_empty_state`, `app_empty_root_is_listed_and_selectable`, `app_accept_last_file_selects_the_repo_row`, `app_reconcile_uses_the_same_neighbour_rule_as_advance`, `render_all_clean_frame_is_the_empty_state_not_a_prompt`, `app_scope_notice_counts_an_empty_out_of_scope_repo`, PTY `pty_accept_last_file_lands_on_the_repo_row_then_t_hides_it` |
+| Launch hold (Gate 8 sponsor run; **rulings R5–R7**, Phase 9a deliverable 5) | nothing listed until every root reports; right pane `discovered N repos, checking status…` + one line per root; from 1 s a dim `K of N checked · F files pending so far · Ss` and a `✓` in the **leading column** of each reported root (D4 — the ticks line up, and the slow repo is the gap in the column); the header agrees with the pane (`lastcall  N repos · checking status…`, `[Accept All]` dim) and the status line carries the hints, not a second sentence about the same wait (D3); **repos** is the user-facing noun throughout, `root` stays the config and CLI word. The herdr scope wait no longer follows it as a second screen: the same frame continues with `… · F files pending · waiting for herdr scope…` on the counter line (D5, see "Herdr scope" below) | `render_loading_pane_counts_only_after_one_second`, `render_scope_pending_after_the_hold_keeps_the_root_list`, `app_loading_holds_the_listing_until_every_root_reports`, PTY `wait_first_piles` |
 
 Open design questions the pass should take, in the order they have come up: whether the
-hint line should carry `u`/`m` (or go to a second tier) once the width allows; whether a
-two-column overlay is the right answer for a keymap that keeps growing; the 60-column
-header crowding; the scope notice at 100 columns; the select-to-copy cue's placement and
-duration; the two senses of "select" on the tier-3 hint line; and whether the editor header
-should keep the path or the position when the frame will not hold both.
+hint line should carry `u`/`m` (or go to a second tier) once the width allows; the scope
+notice at 100 columns; the select-to-copy cue's placement and
+duration; and the two senses of "select" on the tier-3 hint line. (The editor header's own
+question — path or position when the frame will not hold both — was answered by ruling R10:
+the position always, the path head-ellipsized. The overlay question was answered by
+**ruling R12** — two columns stay, and a clip says so; sections are the v0.2 answer, not a
+third column. The 60-column crowding was answered by **D14**: both the header ladder and
+the hunk band are confirmed as built, doc row corrected.)
 
 ## herdr in the UI (Phase 5)
 
@@ -1097,13 +1123,22 @@ Three rules from the Gate 8 sponsor run's launch flash (spec §10 2026-09-06 (ii
   (`herdr_fold`); the shell `cwd` still places the pane.
 - **Nothing is listed before the first verdict.** `HerdrView::scope_pending` is set at
   launch when a scope is configured and a workspace id is known, and `App::is_listed` is
-  false while it holds; the right pane reads `waiting for herdr scope…`. Any verdict clears
-  it (`App::scope_settled`): a `Scope` update — even the `None` the view started with — a
-  standalone start, a failed connect, a link that dropped before its snapshot. Without the
-  hold the first pile was listed for one frame and hidden by the scope on the next.
+  false while it holds. Any verdict clears it (`App::scope_settled`): a `Scope` update —
+  even the `None` the view started with — a standalone start, a failed connect, a link that
+  dropped before its snapshot. Without the hold the first pile was listed for one frame and
+  hidden by the scope on the next.
+- **The scope wait is the launch hold continuing, not a second screen** (Design pass D5,
+  ruling R7). The `Loading` value is **kept** past the last report while `scope_pending`
+  holds — `App::end_loading` flags it `scanned` instead of clearing it, and
+  `scope_settled` is what drops it — so below `COUNTER_AFTER` the frame does not change at
+  all, and from one second the same counter line carries the holding clause where
+  `so far · Ss` was: `3 of 3 checked · 7 files pending · waiting for herdr scope…`, with
+  every root ticked because every root has reported. The header keeps
+  `N repos · checking status…` throughout. `render::SCOPE_PENDING` as a **standalone** dim
+  line is what is left for a launch with no roots at all to hold.
 - **The empty state under a scope names it.** With a scope active and nothing listed the
   pane reads `nothing pending in <label>`, the in-scope roots, and
-  `N repos hidden (w shows all)`; `nothing pending across N roots` is only ever true with
+  `N repos hidden (w shows all)`; `nothing pending across N repos` is only ever true with
   no scope hiding anything.
 
 ### Configuration

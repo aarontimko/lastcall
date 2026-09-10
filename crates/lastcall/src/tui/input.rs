@@ -57,6 +57,10 @@ pub enum Action {
     ScrollDown(u16),
     ToggleFullPaths,
     ToggleRemote,
+    /// `t`: flip [`crate::tui::app::App::hide_empty`] — the nav either lists every repo in
+    /// scope (the default) or drops the ones with nothing pending and no agent flag
+    /// (§6.7, Amendment v1.9 item 4).
+    HideEmpty,
     /// Ask the loop for a rescan (`Effect::Refresh`); ignored while one is running.
     Refresh,
     Help,
@@ -376,6 +380,7 @@ pub const DEFAULT_KEYMAP: &[(&str, &[&str])] = &[
     ("expand", &["e"]),
     ("toggle_full_paths", &["f"]),
     ("toggle_remote", &["o"]),
+    ("hide_empty", &["t"]),
     ("accept", &["a"]),
     ("accept_file", &["shift-a"]),
     ("accept_all", &["ctrl-a"]),
@@ -436,6 +441,7 @@ impl Action {
             "expand" => Action::Expand,
             "toggle_full_paths" => Action::ToggleFullPaths,
             "toggle_remote" => Action::ToggleRemote,
+            "hide_empty" => Action::HideEmpty,
             "accept" => Action::Accept,
             "accept_file" => Action::AcceptFile,
             "accept_all" => Action::AcceptAll,
@@ -472,6 +478,8 @@ impl Action {
             "expand" => "expand a collapsed file",
             "toggle_full_paths" => "full paths",
             "toggle_remote" => "show org/repo",
+            // 23 columns: the overlay caps a description at 30 (design review F15).
+            "hide_empty" => "hide / show empty repos",
             "accept" => "accept the hunk or the selected entry",
             "accept_file" => "accept the whole file",
             "accept_all" => "accept everything listed",
@@ -1565,6 +1573,7 @@ mod tests {
             (Action::ScrollDown(3), "wheel"),
             (Action::ToggleFullPaths, "key"),
             (Action::ToggleRemote, "key"),
+            (Action::HideEmpty, "key"),
             (Action::Refresh, "key"),
             (Action::Help, "key"),
             (Action::Quit, "key"),
@@ -1626,6 +1635,7 @@ mod tests {
             | Action::ScrollDown(_)
             | Action::ToggleFullPaths
             | Action::ToggleRemote
+            | Action::HideEmpty
             | Action::Refresh
             | Action::Help
             | Action::Quit
@@ -1654,9 +1664,9 @@ mod tests {
             | Action::Ack
             | Action::Jump
             | Action::ScopeToggle
-            | Action::Herdr(_) => 43,
+            | Action::Herdr(_) => 44,
         };
-        assert_eq!(table.len(), 43);
+        assert_eq!(table.len(), 44);
     }
 
     #[test]

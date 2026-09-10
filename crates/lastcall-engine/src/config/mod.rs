@@ -60,6 +60,11 @@ pub struct Config {
     pub collapse_size_bytes: u64,
     /// Watch-set noise filters; scope the watcher only, never pending computation (§6.5).
     pub ignore_globs: Vec<String>,
+    /// The TUI's opening answer to `t` (Amendment v1.9, §6.1): `false` — the default the
+    /// sponsor ruled — lists **every** repo under the parent dirs, the ones with nothing
+    /// pending included; `true` starts with those hidden. Engine-side only as a value the
+    /// binary reads; nothing here changes what a scan or `status` reports.
+    pub hide_empty_repos: bool,
     /// The `[herdr]` table.
     pub herdr: HerdrConfig,
     /// The `[keys]` table (Amendment v1.3): `<action> = "<key>"` or `["<key>", …]`, each
@@ -84,6 +89,7 @@ impl Default for Config {
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect(),
+            hide_empty_repos: false,
             herdr: HerdrConfig::default(),
             keys: BTreeMap::new(),
         }
@@ -281,9 +287,18 @@ pub fn config_path(env: &Env) -> Result<(Option<PathBuf>, Vec<PathBuf>), ConfigE
 }
 
 /// Resolve the state directory per §6.1.
+///
+/// A relative `$LASTCALL_STATE_DIR` is joined onto the launch cwd (verifier (a) F3). The
+/// store already landed at `<cwd>/<value>` — every open goes through the process's own cwd
+/// — but the path was *printed* verbatim by `lastcall config` and, since Amendment v1.9,
+/// by `status --json`'s `state_dir`, whose whole job is to tell two runs apart. A bare
+/// `relstate` cannot do that. Joined, never canonicalised: no symlink is resolved and no
+/// existence is required, so a store that does not exist yet still names itself.
+/// The `xdg_state_home` fallback is absolute already (`Env::xdg_dir` ignores a relative
+/// `XDG_STATE_HOME` per the XDG spec and falls back to `$HOME`).
 pub fn state_dir(env: &Env) -> Result<PathBuf, ConfigError> {
     if let Some(explicit) = env.var("LASTCALL_STATE_DIR") {
-        return Ok(PathBuf::from(explicit));
+        return Ok(env.cwd().join(explicit));
     }
     env.xdg_state_home()
         .map(|dir| dir.join("lastcall"))
@@ -454,6 +469,7 @@ draft_initial = "pending"
 collapsed_globs = ["*.lock"]
 collapse_size_bytes = 1024
 ignore_globs = [".git/**"]
+hide_empty_repos = true
 
 [herdr]
 mode = "on"
@@ -488,6 +504,7 @@ nav_down = ["down", "j", "ctrl-n"]
         assert_eq!(c.collapsed_globs, vec!["*.lock"]);
         assert_eq!(c.collapse_size_bytes, 1024);
         assert_eq!(c.ignore_globs, vec![".git/**"]);
+        assert!(c.hide_empty_repos);
         assert_eq!(c.herdr.mode, HerdrMode::On);
         assert_eq!(c.herdr.session.as_deref(), Some("work"));
         assert_eq!(c.keys.len(), 2);
@@ -731,6 +748,24 @@ nav_down = ["down", "j", "ctrl-n"]
         );
     }
 
+    /// Verifier (a) F3: a relative `$LASTCALL_STATE_DIR` names the same store it always
+    /// did — `<cwd>/relstate` — but it now *says* so, because `status --json`'s
+    /// `state_dir` exists to tell two runs apart. Joined, not canonicalised: the directory
+    /// need not exist.
+    #[test]
+    fn config_relative_state_dir_is_absolutised_against_the_cwd() {
+        let dir = TempDir::new("lc-config");
+        let home = dir.mkdir("home");
+        let env = Env::empty(dir.path())
+            .with_home(&home)
+            .with_var("LASTCALL_STATE_DIR", "relstate");
+        let resolved = state_dir(&env).unwrap();
+        assert_eq!(resolved, dir.path().join("relstate"));
+        assert!(resolved.is_absolute(), "{resolved:?}");
+        assert!(!resolved.exists(), "no directory is created or required");
+        assert_eq!(load(&env).unwrap().state_dir, resolved);
+    }
+
     #[test]
     fn config_missing_explicit_file_is_error() {
         let dir = TempDir::new("lc-config");
@@ -837,6 +872,32 @@ nav_down = ["down", "j", "ctrl-n"]
         assert!(c.validate(path).is_err());
         let c: Config = toml::from_str("[herdr]\nsession = \"  \"\n").unwrap();
         assert!(c.validate(path).is_err());
+    }
+
+    /// Amendment v1.9 (§6.1): `hide_empty_repos` is a top-level bool, default `false`
+    /// — a 1.0 config file that has never heard of it loads, `lastcall config` prints it,
+    /// and it round-trips through TOML. A wrong type is a load error like every other key.
+    #[test]
+    fn config_hide_empty_repos_defaults_false_and_round_trips() {
+        assert!(!Config::default().hide_empty_repos, "the sponsor's default");
+        // A v1.0 file with none of this phase’s keys still loads.
+        let old: Config = toml::from_str("parent_dirs = []\ncollapse_size_bytes = 4096\n").unwrap();
+        assert!(!old.hide_empty_repos);
+
+        let on: Config = toml::from_str("hide_empty_repos = true\n").unwrap();
+        assert!(on.hide_empty_repos);
+        let text = toml::to_string_pretty(&on).unwrap();
+        assert!(text.contains("hide_empty_repos = true"), "{text}");
+        assert_eq!(toml::from_str::<Config>(&text).unwrap(), on);
+        // `lastcall config` prints every key with its default, this one included.
+        let printed = toml::to_string_pretty(&Config::default()).unwrap();
+        assert!(printed.contains("hide_empty_repos = false"), "{printed}");
+
+        let dir = TempDir::new("lc-config");
+        let (env, _) = env_with_config(&dir, "hide_empty_repos = \"yes\"\n");
+        let err = load(&env).unwrap_err();
+        assert!(matches!(err, ConfigError::Parse { .. }), "{err}");
+        assert!(err.to_string().contains("expected a boolean"), "{err}");
     }
 
     #[test]

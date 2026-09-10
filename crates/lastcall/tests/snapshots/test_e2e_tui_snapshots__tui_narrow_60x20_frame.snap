@@ -21,4 +21,4 @@ expression: frame
 "│                                                          │"
 "│                                                          │"
 "└──────────────────────────────────────────────────────────┘"
-"↑↓ select  ⏎ open  n/p hunk  a accept hunk  ? help  q quit  "
+"↑↓ scroll  ← back  n/p hunk  a accept hunk  ? help  q quit  "

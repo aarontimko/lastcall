@@ -62,6 +62,17 @@ pub fn nothing_pending(status: &str) -> String {
     format!("nothing pending · agent {status}")
 }
 
+/// The right pane's opening line for a **selected repo with nothing pending** (§6.7,
+/// Amendment v1.9): the reader chose this row, so the pane names the repo rather than
+/// repeating the nav's header, and herdr's own status word folds in when there is an agent
+/// on it. Its branch line goes beneath, as the root summary's does.
+pub fn nothing_pending_in(name: &str, status: Option<&str>) -> String {
+    match status {
+        Some(s) => format!("nothing pending in {name} · agent {s}"),
+        None => format!("nothing pending in {name}"),
+    }
+}
+
 /// The same line for a nav column too narrow for it: the `nothing pending · ` half is
 /// already implied by the branch line's `0 files` above it, while the status word is the
 /// only thing on screen that says *why* the root is listed — so that half is what
@@ -283,7 +294,8 @@ pub fn render(app: &App, frame: &mut Frame<'_>) -> HitMap {
 }
 
 /// `lastcall  <repos> · <files> · <hunks>  <herdr badge>  [Accept All]` …
-/// `watching <parents>`. The file count carries `+` when any listed root's pile stopped at
+/// `watching <parents>`, or `lastcall  <repos> · checking status…` while the launch hold
+/// is on (Design pass D3). The file count carries `+` when any listed root's pile stopped at
 /// the row cap; the control is dim when nothing is listed and is the `HeaderAcceptAll`
 /// target either way; the badge is the `HeaderHerdr` target.
 ///
@@ -299,12 +311,23 @@ fn render_header(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
         .flat_map(|v| v.rows().iter())
         .map(|r| r.hunks.len())
         .sum();
-    let left = format!(
-        "lastcall  {} · {} · {}",
-        plural(listed.len(), "repo"),
-        count_plus(files, app.any_truncated(), "file"),
-        plural(hunks, "hunk")
-    );
+    // Design pass D3 / ruling R5: during the launch hold the header says the one count it
+    // knows and none of the ones it does not — `0 files · 0 hunks` above a pane reading
+    // `discovered 3 repos, checking status…` was the header disagreeing with the pane.
+    // `[Accept All]` is dim throughout, as it already is whenever nothing is listed.
+    let left = if app.loading.is_some() {
+        format!(
+            "lastcall  {} · checking status…",
+            plural(app.roots.len(), "repo")
+        )
+    } else {
+        format!(
+            "lastcall  {} · {} · {}",
+            plural(listed.len(), "repo"),
+            count_plus(files, app.any_truncated(), "file"),
+            plural(hunks, "hunk")
+        )
+    };
     let control = "[Accept All]";
     let (badge, badge_style) = herdr_badge(app);
     let parents: BTreeSet<String> = app
@@ -457,15 +480,54 @@ fn render_status(app: &App, buf: &mut Buffer, area: Rect) {
     buf.set_line(area.x, area.y, &line, area.width);
 }
 
+/// The order hints leave the line when it will not fit, **first to go first** (ruling R4;
+/// Phase 9a deliverable 4, and the orchestrator's post-checkpoint note for `hide_empty`'s
+/// place). Names are keymap action names, so a rebind moves the key and never the order.
+///
+/// The shape of it: the diff pane's two extras go first (they are named in the overlay and
+/// in `SELECT_NOTE`), then the three whose surface says the same thing another way (`r`
+/// refreshes what the watcher does anyway, `Tab` and `w` are visible in the pane layout and
+/// the scope notice), then `^A` — which the header's `[Accept All]` duplicates at every
+/// width that still draws it — then the toggle, then the herdr jumps, then the accept folds
+/// narrowing from the widest to the narrowest, and last the selection's own accept phrase.
+/// `help` and `quit` are not in the list at all: they are pinned, so a cut line always says
+/// where the rest of the keys are.
+const HINT_DROP_ORDER: &[&str] = &[
+    "copy",
+    "select",
+    "refresh",
+    "focus_toggle",
+    "scope",
+    "accept_all",
+    "hide_empty",
+    "jump",
+    "ack",
+    "accept_file",
+    "hunk_next",
+    "accept",
+];
+
+/// Hints that are **untrue** without a nav pane, and so are never offered below
+/// [`NAV_MIN_COLS`] whatever the width arithmetic says: below 70 columns the diff takes the
+/// whole body and holds focus, so `Tab focus` toggles nothing, and `v`/`y`/`w`/`r` belong to
+/// the same wide-frame set the tiers used to gate together.
+const HINT_NAV_ONLY: &[&str] = &["scope", "focus_toggle", "refresh", "select", "copy"];
+
 /// The hint line from the app's own keymap: `↑↓ select  ⏎ open  n/p hunk  <accept>  ^A
-/// accept all  Tab focus  r refresh  ? help  q quit`, where `<accept>` follows the
-/// selection — `a accept hunk  A accept file` on a file row with hunks in **either** pane,
-/// `a/A accept file` on a hunkless file row (binary, collapsed, deleted, unreadable),
-/// `a accept group` on a group entry, `a accept all in <root>` on a root entry (how the
-/// per-repo fold is told from the header's global one).
-/// Below `NAV_MIN_COLS`, or when the line would not fit, the `focus` and `refresh` hints
-/// are dropped. While the confirm modal is open the line is `y confirm  n cancel  q quit`:
-/// exactly the keys that work there (the modal's own, fixed, and the keymap's `quit`).
+/// accept all  t hide empty  Tab focus  r refresh  ? help  q quit`, where `<accept>` follows
+/// the selection — `a accept hunk  A accept file` on a file row with hunks in **either**
+/// pane, `a/A accept file` on a hunkless file row (binary, collapsed, deleted, unreadable),
+/// `a accept group` on a group entry, `a accept all in <root>` on a **non-empty** root entry
+/// (how the per-repo fold is told from the header's global one; on an empty repo row `a`
+/// does nothing, so the line does not offer it — verifier (a) F2). With the **diff** focused
+/// the first two hints are `↑↓ scroll  ← back` instead, because that is what those keys do
+/// there (Design pass D2, ruling R3); the two forms are the same width.
+///
+/// Ruling R4, the sponsor's own rule: build every applicable hint, try the whole line, and
+/// while it does not fit remove one hint at a time from [`HINT_DROP_ORDER`] — no width
+/// constants, no all-or-nothing tiers, and `? help  q quit` always the last two on the line.
+/// While the confirm modal is open the line is `y confirm  n cancel  q quit`: exactly the
+/// keys that work there (the modal's own, fixed, and the keymap's `quit`).
 pub fn hints(app: &App, width: u16) -> String {
     let first = |action: &str| app.keys_for(action).first().map(|s| hint_label(s));
     // The editor swallows the keymap, so naming the keymap's keys here would name keys that
@@ -509,8 +571,12 @@ pub fn hints(app: &App, width: u16) -> String {
             (None, None) => None,
         },
         Some(AcceptScope::Group { .. }) => accept.as_ref().map(|k| format!("{k} accept group")),
+        // Verifier (a) F2: since v1.9 a repo with nothing pending is a selectable nav row,
+        // and `a` on it lands on `nothing to accept`. A hint the line promises has to do
+        // something, so the phrase is offered only while the repo has rows.
         Some(AcceptScope::Root(root)) => accept
             .as_ref()
+            .filter(|_| app.roots.get(root).is_some_and(|v| !v.rows().is_empty()))
             .map(|k| format!("{k} accept all in {}", app.root_name(root))),
         // `Bless` is never what the *selection* covers — it is built by the editor-return
         // path and lives only inside a confirm — so the hint line has nothing to say for it.
@@ -520,8 +586,9 @@ pub fn hints(app: &App, width: u16) -> String {
         Some(AcceptScope::Hunk { .. }) => accept_file.map(|k| format!("{k} accept file")),
         _ => None,
     };
-    // (hint, tier): when the line must shrink, tier 2 goes first (`focus`, `refresh`;
-    // always below `NAV_MIN_COLS`), then tier 1 (the file and global accept hints).
+    // (hint, tier): when the line must shrink, tier 4 goes first (`t hide empty`), then
+    // tier 3 (the diff pane's two), then tier 2 (`focus`, `refresh`; always below
+    // `NAV_MIN_COLS`), then tier 1 (the file and global accept hints).
     // The herdr hints are conditional: `d`/`g` only while the selected root carries a
     // flag, `w` only while a scope is active (deliverable 5's hint ladder).
     // `d` acks a **ready episode** and nothing else, so a blocked root — which is listed,
@@ -551,47 +618,107 @@ pub fn hints(app: &App, width: u16) -> String {
         .is_some()
         .then(|| first("scope").map(|k| format!("{k} scope")))
         .flatten();
-    let items = [
-        (pair("nav_up", "nav_down").map(|k| format!("{k} select")), 0),
-        (first("open").map(|k| format!("{k} open")), 0),
+    // §6.7 (Amendment v1.9): the label follows the state, so the line promises what the
+    // key will do rather than naming the setting it flips. The help overlay names the key
+    // at every width, which is what a line too narrow to carry it falls back on.
+    let hide_empty = first("hide_empty").map(|k| {
+        let verb = if app.hide_empty { "show" } else { "hide" };
+        format!("{k} {verb} empty")
+    });
+    // Reading order — what the line says when everything fits. It is not the drop order:
+    // that is `HINT_DROP_ORDER`, keyed by the same action names, so the two can be read
+    // (and changed) independently. `help`/`quit` are last here and absent there.
+    // Design pass D2 / ruling R3: tier 0 tells the truth about the **focused** pane. In the
+    // diff `↑`/`↓` scroll a line and `⏎` does nothing (`tui.md` Keys), so `↑↓ select
+    // ⏎ open` there named one key for what it does not do and another for what it does not
+    // do at all — and Phase 8's `v select` put a true `select` beside the untrue one. With
+    // the diff focused the line opens `↑↓ scroll  ← back` instead. `back` is the keymap's
+    // own action and `←` its arrow spelling, chosen over its first spec (`Esc`) so the two
+    // hints read as the pair of arrows they are; a keymap that binds no arrow to `back`
+    // falls back to whatever its first key is. The widths are identical to the nav's
+    // (`↑↓ scroll` = `↑↓ select` = 9, `← back` = `⏎ open` = 6), so no drop step moves.
+    let arrowed = |action: &str| {
+        let specs = app.keys_for(action);
+        specs
+            .iter()
+            .map(|s| hint_label(s))
+            .find(|l| matches!(l.as_str(), "←" | "→" | "↑" | "↓"))
+            .or_else(|| specs.first().map(|s| hint_label(s)))
+    };
+    let items: Vec<(&str, String)> = [
         (
-            pair("hunk_next", "hunk_prev").map(|k| format!("{k} hunk")),
-            0,
+            "nav",
+            pair("nav_up", "nav_down")
+                .map(|k| format!("{k} {}", if diff { "scroll" } else { "select" })),
         ),
-        (context, 0),
-        (file, 1),
-        (first("accept_all").map(|k| format!("{k} accept all")), 1),
-        (ack, 1),
-        (jump, 1),
-        (scope, 2),
-        (first("focus_toggle").map(|k| format!("{k} focus")), 2),
-        (first("refresh").map(|k| format!("{k} refresh")), 2),
-        // Deliverable 9: the diff pane's own two keys, on the widest line only. Their own
-        // tier, dropped before anything that was on the line before them, so no narrower
-        // frame loses a hint it used to have — and the help overlay and its mouse note name
-        // them at every width.
-        (select_hint, 3),
-        (copy_hint, 3),
-        (first("help").map(|k| format!("{k} help")), 0),
-        (first("quit").map(|k| format!("{k} quit")), 0),
-    ];
-    let join = |max_tier: u8| -> String {
+        (
+            "open",
+            if diff {
+                arrowed("back").map(|k| format!("{k} back"))
+            } else {
+                first("open").map(|k| format!("{k} open"))
+            },
+        ),
+        (
+            "hunk_next",
+            pair("hunk_next", "hunk_prev").map(|k| format!("{k} hunk")),
+        ),
+        ("accept", context),
+        ("accept_file", file),
+        (
+            "accept_all",
+            first("accept_all").map(|k| format!("{k} accept all")),
+        ),
+        ("ack", ack),
+        ("jump", jump),
+        ("hide_empty", hide_empty),
+        ("scope", scope),
+        (
+            "focus_toggle",
+            first("focus_toggle").map(|k| format!("{k} focus")),
+        ),
+        ("refresh", first("refresh").map(|k| format!("{k} refresh"))),
+        // Phase 8 deliverable 9: the diff pane's own two keys. They are still the first two
+        // off the line (`HINT_DROP_ORDER`), so no narrower frame loses a hint it used to
+        // have — and the help overlay and its mouse note name them at every width.
+        ("select", select_hint),
+        ("copy", copy_hint),
+        ("help", first("help").map(|k| format!("{k} help"))),
+        ("quit", first("quit").map(|k| format!("{k} quit"))),
+    ]
+    .into_iter()
+    .filter_map(|(name, hint)| hint.map(|h| (name, h)))
+    .collect();
+
+    let mut dropped: Vec<&str> = if width >= NAV_MIN_COLS {
+        Vec::new()
+    } else {
+        HINT_NAV_ONLY.to_vec()
+    };
+    let join = |dropped: &[&str]| -> String {
         items
             .iter()
-            .filter(|(_, tier)| *tier <= max_tier)
-            .filter_map(|(hint, _)| hint.clone())
+            .filter(|(name, _)| !dropped.contains(name))
+            .map(|(_, hint)| hint.as_str())
             .collect::<Vec<_>>()
             .join("  ")
     };
-    let fits = |s: &str| s.width() <= width as usize;
-    for tier in [3, 2] {
-        let line = join(tier);
-        if width >= NAV_MIN_COLS && fits(&line) {
-            return line;
+    let mut line = join(&dropped);
+    // One hint at a time, in the fixed order, until it fits. When even the last of them is
+    // gone the line is the four that are never dropped (`↑↓ select  ⏎ open  ? help  q quit`,
+    // 33 columns) — inside `MIN_SIZE`'s 40, so the promise that `? help` is on every legal
+    // frame is arithmetic, not luck.
+    for name in HINT_DROP_ORDER {
+        if line.width() <= width as usize {
+            break;
         }
+        if dropped.contains(name) {
+            continue;
+        }
+        dropped.push(name);
+        line = join(&dropped);
     }
-    let mid = join(1);
-    if fits(&mid) { mid } else { join(0) }
+    line
 }
 
 /// `key_label` with control keys as `^X`, the hint line's compact spelling.
@@ -647,7 +774,16 @@ fn render_nav(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
             dots.push((lines.len(), text.width() as u16, path.clone()));
             spans.push(Span::styled(text, dot_style(dot)));
         }
-        spans.push(Span::styled(view.meta.name.clone(), bold()));
+        // §6.7 (Amendment v1.9): a repo with nothing pending is on the nav like any other,
+        // told apart by being dim from the name down — bold-dim, so it still reads as a
+        // repo heading and not as a file row.
+        let empty = view.rows().is_empty();
+        let name_style = if empty {
+            bold().add_modifier(Modifier::DIM)
+        } else {
+            bold()
+        };
+        spans.push(Span::styled(view.meta.name.clone(), name_style));
         let remote = view.meta.remote.as_deref().filter(|_| app.show_remote);
         if let Some(remote) = remote {
             let budget = width.saturating_sub(view.meta.name.width() + 2);
@@ -670,23 +806,27 @@ fn render_nav(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
             target: Some(Target::NavRoot(path.clone())),
             selected: is_sel,
         });
+        let branch = format!(
+            "  {} · {}",
+            view.meta.branch_label(),
+            count_plus(view.rows().len(), view.pile.omitted > 0, "file")
+        );
         lines.push(NavLine {
-            line: Line::from(format!(
-                "  {} · {}",
-                view.meta.branch_label(),
-                count_plus(view.rows().len(), view.pile.omitted > 0, "file")
-            )),
+            line: Line::from(if empty {
+                Span::styled(branch, dim())
+            } else {
+                Span::raw(branch)
+            }),
             target: None,
             selected: false,
         });
-        if view.rows().is_empty() {
-            // A flag-only root (deliverable 5): listed on its agent alone, so it needs a
-            // line under the branch for `Enter` to have somewhere to land.
-            let status = app
-                .herdr
-                .flag(path)
-                .map(|f| f.status.as_str())
-                .unwrap_or("done");
+        if let Some(status) = empty
+            .then(|| app.herdr.flag(path).map(|f| f.status.as_str()))
+            .flatten()
+        {
+            // A flagged repo with nothing pending keeps its third line: herdr's status word
+            // is the only thing on the nav that says what the agent is doing. A plain empty
+            // repo is the name-and-branch row the sponsor asked for and nothing more.
             let full = format!("  {}", nothing_pending(status));
             let text = if full.width() <= width {
                 full
@@ -858,72 +998,112 @@ fn render_main(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
             if let Some(loading) = &app.loading {
                 // The launch hold (`Loading`): a static line, then after a second the
                 // counter and a ✓ per reported root — the slow one is the one without.
+                // Design pass D3 / ruling R5: **repos** is the noun wherever a count is
+                // shown here and in the empty states (`root` stays the config and CLI
+                // word), the counter line does not repeat it (`1 of 3 checked`), and the
+                // header agrees with the pane instead of reading `0 repos · 0 files ·
+                // 0 hunks` above `discovered 3 repos`. The pane is also the hold's only
+                // clock: `run.rs` no longer puts `scanning N roots…` on the status line.
                 lines.push(Line::from(format!(
                     "discovered {}, checking status…",
-                    plural(app.roots.len(), "root")
+                    plural(app.roots.len(), "repo")
                 )));
                 let counting = loading.counting(app.now);
                 if counting {
-                    lines.push(Line::from(Span::styled(
+                    // Design pass D5 / ruling R7: with every root reported and only the
+                    // herdr scope verdict outstanding, the same counter carries the
+                    // holding clause where `so far · Ss` was. The clock is the scans', so
+                    // it stops when they do — the sentence is what is being waited on now.
+                    let tail = if loading.scanned {
                         format!(
-                            "{} of {} checked · {} pending so far · {}s",
-                            loading.checked.len(),
-                            plural(app.roots.len(), "repo"),
+                            "{} pending · {SCOPE_PENDING}",
+                            plural(loading.files(), "file")
+                        )
+                    } else {
+                        format!(
+                            "{} pending so far · {}s",
                             plural(loading.files(), "file"),
                             app.now.duration_since(loading.started).as_secs()
+                        )
+                    };
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "{} of {} checked · {tail}",
+                            with_thousands(loading.checked.len()),
+                            with_thousands(app.roots.len()),
                         ),
                         dim(),
                     )));
                 }
                 for view in app.roots.values() {
-                    let mut text = format!("  {}  {}", view.meta.name, view.meta.branch_label());
-                    if counting && loading.checked.contains_key(&view.meta.path) {
-                        text.push_str("  ✓");
-                    }
-                    lines.push(Line::from(text));
-                }
-            } else if app.herdr.scope_pending {
-                // Deliberately not "nothing pending": the piles may be in and held back.
-                lines.push(Line::from(Span::styled(SCOPE_PENDING, dim())));
-            } else if let (Some(scope), hidden @ 1..) = (
-                app.herdr
-                    .active_scope()
-                    .filter(|_| app.listed_roots().next().is_none()),
-                app.scoped_out(),
-            ) {
-                // Under a scope, the roots it hides are not "nothing pending": name the
-                // scope, list what it covers, and say how many it hides.
-                lines.push(Line::from(format!("nothing pending in {}", scope.label)));
-                for view in app
-                    .roots
-                    .values()
-                    .filter(|v| scope.roots.contains(&v.meta.path))
-                {
+                    // Design pass D4 / ruling R6: the tick takes the row's own two-space
+                    // indent instead of following the branch label, so every tick lands in
+                    // the same column and the root still being scanned is the one gap in
+                    // it — a glance, not a read down a ragged edge. Nothing moves when the
+                    // ticks appear (the indent is already there), so the one-calm-frame
+                    // rule for a fast launch still holds.
+                    let tick = if counting && loading.checked.contains_key(&view.meta.path) {
+                        "✓ "
+                    } else {
+                        "  "
+                    };
                     lines.push(Line::from(format!(
-                        "  {}  {}",
+                        "{tick}{}  {}",
                         view.meta.name,
                         view.meta.branch_label()
                     )));
                 }
-                lines.push(Line::from(Span::styled(
-                    format!("{} hidden (w shows all)", plural(hidden, "repo")),
-                    dim(),
-                )));
-            } else if app.listed_roots().next().is_none() {
-                lines.push(Line::from(format!(
-                    "nothing pending across {}",
-                    plural(app.roots.len(), "root")
-                )));
-                for view in app.roots.values() {
-                    let mut text = format!("  {}  {}", view.meta.name, view.meta.branch_label());
-                    for label in [view.meta.badge_label(), view.meta.in_progress_label()]
-                        .into_iter()
-                        .flatten()
+            } else if app.herdr.scope_pending {
+                // Deliberately not "nothing pending": the piles may be in and held back.
+                // With roots this is the hold's frame above (D5 / R7); the standalone line
+                // is what is left for a launch with no roots at all to hold.
+                lines.push(Line::from(Span::styled(SCOPE_PENDING, dim())));
+            } else if app.listed_roots().all(|v| v.rows().is_empty()) {
+                // Nothing on the nav has a file row — including the case where the nav is
+                // empty. This pane is then the **empty state**, not a prompt: since
+                // Amendment v1.9 the ordinary all-clean launch lists three empty repo
+                // rows and selects none of them, and `select a file (↑↓ or click)` over
+                // three `0 files` rows invites choosing a file that does not exist
+                // (verifier (a) F5).
+                if let Some(scope) = app.herdr.active_scope() {
+                    // Under a scope, the roots it hides are not "nothing pending": name the
+                    // scope, list what it covers, and say how many it hides. Gated on the
+                    // scope alone — while it was gated on `scoped_out() >= 1` a scope that
+                    // hid only empty repos fell through to the global text, which then
+                    // listed the very repos the scope was hiding (verifier (a) F6).
+                    lines.push(Line::from(format!("nothing pending in {}", scope.label)));
+                    for view in app
+                        .roots
+                        .values()
+                        .filter(|v| scope.roots.contains(&v.meta.path))
                     {
-                        text.push_str("  ");
-                        text.push_str(&label);
+                        lines.push(Line::from(format!(
+                            "  {}  {}",
+                            view.meta.name,
+                            view.meta.branch_label()
+                        )));
                     }
-                    lines.push(Line::from(text));
+                    lines.push(Line::from(Span::styled(
+                        format!("{} hidden (w shows all)", plural(app.scoped_out(), "repo")),
+                        dim(),
+                    )));
+                } else {
+                    lines.push(Line::from(format!(
+                        "nothing pending across {}",
+                        plural(app.roots.len(), "repo")
+                    )));
+                    for view in app.roots.values() {
+                        let mut text =
+                            format!("  {}  {}", view.meta.name, view.meta.branch_label());
+                        for label in [view.meta.badge_label(), view.meta.in_progress_label()]
+                            .into_iter()
+                            .flatten()
+                        {
+                            text.push_str("  ");
+                            text.push_str(&label);
+                        }
+                        lines.push(Line::from(text));
+                    }
                 }
             } else {
                 lines.push(Line::from(Span::styled(NO_SELECTION, dim())));
@@ -931,14 +1111,28 @@ fn render_main(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
         }
         Some(Selection::Root(root)) => {
             if let Some(view) = app.roots.get(root) {
-                let mut spans = vec![
-                    Span::styled(view.meta.name.clone(), bold()),
-                    Span::raw(format!(
-                        "  {} · {}",
-                        view.meta.branch_label(),
-                        count_plus(view.rows().len(), view.pile.omitted > 0, "file")
-                    )),
-                ];
+                let branch = format!(
+                    "  {} · {}",
+                    view.meta.branch_label(),
+                    count_plus(view.rows().len(), view.pile.omitted > 0, "file")
+                );
+                // §6.7 (Amendment v1.9): an empty repo is a selectable nav row now, so its
+                // pane answers "which repo, and why is it empty?" on the first line and
+                // carries the branch beneath — the same two facts the summary shows, said
+                // the other way round.
+                let mut spans = if view.rows().is_empty() {
+                    let status = app.herdr.flag(root).map(|f| f.status.as_str());
+                    lines.push(Line::from(Span::styled(
+                        nothing_pending_in(&view.meta.name, status),
+                        bold(),
+                    )));
+                    vec![Span::styled(branch, dim())]
+                } else {
+                    vec![
+                        Span::styled(view.meta.name.clone(), bold()),
+                        Span::raw(branch),
+                    ]
+                };
                 for label in [view.meta.badge_label(), view.meta.in_progress_label()]
                     .into_iter()
                     .flatten()
@@ -947,14 +1141,6 @@ fn render_main(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
                 }
                 lines.push(Line::from(spans));
                 push_notices(&mut lines, view.notices());
-                if view.rows().is_empty() {
-                    let status = app
-                        .herdr
-                        .flag(root)
-                        .map(|f| f.status.as_str())
-                        .unwrap_or("done");
-                    lines.push(Line::from(Span::styled(nothing_pending(status), dim())));
-                }
                 for row in view.rows() {
                     lines.push(nav_row_line(row, true, usize::MAX));
                 }
@@ -1050,17 +1236,24 @@ fn render_main(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
 /// not what is on screen, and that is worth more than one line of status.
 fn render_editor_header(ed: &Editor, buf: &mut Buffer, area: Rect) {
     // The keys live in the hint line, where every other key hint in the TUI lives; the
-    // header is the answer to "what am I in, and where in it?" — short enough that at the
-    // 60-column floor the fixture's paths keep the whole line. Past that `ellipsize` cuts
-    // from the **tail**, so a long enough path costs the `· unsaved` and then the
-    // `line N/M` — the wrong end to lose, since the position is the part that changes as
-    // you type. A head-ellipsis of the path would be strictly better and is the header's
-    // entry for the design pass (verifier (b) on decision 10); `tui.md` records it too.
+    // header is the answer to "what am I in, and where in it?". Design pass D9 / ruling
+    // R10: only the **path** gives, and it gives from the head. A tail cut took the
+    // `· unsaved` first and then the `line N/M` — the wrong end to lose, since the
+    // position is the part that changes as you type and `unsaved` is the part that says
+    // the file on disk is not what is on screen. `· unsaved` is reserved at every width
+    // whether or not the buffer is dirty, so the header does not shift under the reader on
+    // the first keystroke. The path's budget is what is left after all of that, and
+    // `ellipsize_head` cuts inside the basename rather than overflow it, so the outer
+    // `ellipsize` below is a last resort for frames narrower than the fixed parts.
+    let position = ed.buf.position_label();
+    let path = String::from_utf8_lossy(&ed.rendered.path);
+    const UNSAVED: &str = " · unsaved";
+    let budget = (area.width as usize)
+        .saturating_sub("editing ".width() + " · ".width() + position.width() + UNSAVED.width());
     let text = format!(
-        "editing {} · {}{}",
-        String::from_utf8_lossy(&ed.rendered.path),
-        ed.buf.position_label(),
-        if ed.buf.dirty() { " · unsaved" } else { "" },
+        "editing {} · {position}{}",
+        ellipsize_head(&path, budget),
+        if ed.buf.dirty() { UNSAVED } else { "" },
     );
     let style = if ed.alarm { red() } else { bold() };
     buf.set_stringn(
@@ -1625,6 +1818,16 @@ fn help_columns(keys: &[String], area: Rect) -> Vec<String> {
         .collect()
 }
 
+/// The frame width at which the two-column overlay holds this keymap whole — the figure
+/// the clip notice quotes (Design pass D12, ruling R12). It mirrors [`help_columns`]'s own
+/// test rather than restating a number, so it follows the keymap instead of going stale.
+fn help_two_column_width(keys: &[String]) -> usize {
+    let split = keys.len().div_ceil(2);
+    let (left, right) = keys.split_at(split);
+    let width_of = |rows: &[String]| rows.iter().map(|r| r.width()).max().unwrap_or(0);
+    width_of(left) + HELP_GUTTER + width_of(right) + 4
+}
+
 fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
     let named: Vec<(&str, String)> = app
         .keymap
@@ -1638,7 +1841,8 @@ fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
         .map(|(name, keys)| (name, format!("{keys:<14} {}", Action::describe(name))))
         .collect();
     let keys: Vec<String> = named.iter().map(|(_, row)| row.clone()).collect();
-    let mut rows = help_columns(&keys, area);
+    let body = help_columns(&keys, area);
+    let mut rows = body.clone();
     rows.push(String::new());
     rows.push(newline_note(app.enhanced).to_owned());
     rows.push(SELECT_NOTE.to_owned());
@@ -1657,6 +1861,7 @@ fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
     let inner = block.inner(rect);
     block.render(rect, buf);
     let cap = inner.height as usize;
+    let mut clip_notice = None;
     if rows.len() > cap {
         // Too narrow for two columns *and* too short for one (80×30 with this keymap): the
         // overlay clips, and what it clips is key rows — never the footer. A reader who
@@ -1668,18 +1873,58 @@ fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
         // was the thing the clip dropped (verifier (b) F4).
         //
         // The blank separator is *not* reserved — it is the first thing the clip spends.
-        // Reserving it too costs a key row, and at 80×30 the key row it costs is `quit`.
-        rows.truncate(cap.saturating_sub(3));
-        // …and `quit` is pinned to the end of what survives. The keymap grows — Phase 8
-        // alone adds four rows — and a clip that simply takes the first N pushes the last
-        // row off first, which in this keymap is the one row a reader who opened the overlay
-        // by accident most needs. `any key closes` gets them out of the overlay; this gets
-        // them out of lastcall. It costs the row above it, never the footer.
-        if let Some((_, quit)) = named.iter().find(|(name, _)| *name == "quit")
-            && !rows.iter().any(|r| r.contains(quit.as_str()))
-        {
-            rows.truncate(cap.saturating_sub(4));
-            rows.push(quit.clone());
+        //
+        // Design pass D12 / ruling R12: a fourth row goes to **saying so**. The overlay
+        // clipped in silence, which is the failure two columns were meant to end; the last
+        // body row is now a dim `… N more keys (100 columns shows all)`, so a reader who
+        // cannot see a key knows there are more of them and what to do about it.
+        let quit = named
+            .iter()
+            .find(|(name, _)| *name == "quit")
+            .map(|(_, row)| row.clone());
+        let mut keep = cap.saturating_sub(4);
+        // …and `quit` is pinned to the end of what survives, when what survives does not
+        // already carry it. The keymap grows — Phase 8 alone adds four rows — and a clip
+        // that simply takes the first N pushes the last row off first, which in this keymap
+        // is the one row a reader who opened the overlay by accident most needs.
+        // `any key closes` gets them out of the overlay; this gets them out of lastcall.
+        let pin_quit = quit.as_ref().is_some_and(|q| {
+            !body[..keep.min(body.len())]
+                .iter()
+                .any(|r| r.contains(q.as_str()))
+        });
+        if pin_quit {
+            keep = keep.saturating_sub(1);
+        }
+        let keep = keep.min(body.len());
+        // The count is of **keys**, not rows: in two columns a body row carries two of
+        // them, and counting rows said `2 more keys` over four hidden ones at 100×20
+        // (verifier (b) F1). `help_columns` splits the table at `keys.len().div_ceil(2)`,
+        // so the rows past the right column's length carry one key each.
+        let keys_in_row = |i: usize| -> usize {
+            let right_len = keys.len() - keys.len().div_ceil(2);
+            if body.len() < keys.len() && i < right_len {
+                2
+            } else {
+                1
+            }
+        };
+        let shown: usize = (0..keep).map(keys_in_row).sum::<usize>() + usize::from(pin_quit);
+        let hidden = keys.len().saturating_sub(shown);
+        // The figure is the two-column width the keymap needs, computed rather than
+        // written down. Where the frame is already that wide the clip is the *height*, and
+        // saying "100 columns shows all" at 120 columns would be a lie — so that case names
+        // the other dimension instead.
+        let remedy = if area.width as usize >= help_two_column_width(&keys) {
+            "a taller window shows all".to_owned()
+        } else {
+            format!("{} columns shows all", help_two_column_width(&keys))
+        };
+        rows = body[..keep].to_vec();
+        clip_notice = Some(rows.len());
+        rows.push(format!("… {} ({remedy})", plural(hidden, "more key")));
+        if let Some(q) = quit.filter(|_| pin_quit) {
+            rows.push(q);
         }
         rows.push(newline_note(app.enhanced).to_owned());
         rows.push(SELECT_NOTE.to_owned());
@@ -1691,7 +1936,12 @@ fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
             inner.y + i as u16,
             row,
             inner.width.saturating_sub(1) as usize,
-            Style::new(),
+            // The clip notice is dim: it is the overlay talking about itself, not a key.
+            if clip_notice == Some(i) {
+                dim()
+            } else {
+                Style::new()
+            },
         );
     }
     if inner.height as usize > rows.len() {
@@ -1986,6 +2236,51 @@ pub fn ellipsize(s: &str, max: usize) -> String {
     out
 }
 
+/// Truncate `s` to at most `max` columns from the **head**, cutting at a `/` so what is
+/// left still reads as a path: `…lastcall/src/tui/render.rs` (Design pass D9, ruling R10).
+///
+/// The `/` chosen is the leftmost one whose remainder fits, so the longest path tail that
+/// fits is what is shown. When not even `…<basename>` fits, the **basename itself gives
+/// from the head** (`…_for_a_file.rs`), so the extension survives and — in the editor
+/// header — the position and `· unsaved` do too: a basename floor let the row's tail clip
+/// take exactly the parts R10 said were the wrong ones to lose (verifier (b) F2). A string
+/// with no `/` at all is head-cut the same way.
+pub fn ellipsize_head(s: &str, max: usize) -> String {
+    if s.width() <= max {
+        return s.to_owned();
+    }
+    let mut basename = s;
+    for (i, c) in s.char_indices() {
+        if c != '/' {
+            continue;
+        }
+        let tail = &s[i + 1..];
+        basename = tail;
+        if tail.width() < max {
+            return format!("…{tail}");
+        }
+    }
+    head_cut(basename, max)
+}
+
+/// `…` plus the longest tail of `s` that fits in `max` columns; empty at `max == 0`.
+fn head_cut(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let mut kept = String::new();
+    let mut used = 0;
+    for c in s.chars().rev() {
+        let w = c.width().unwrap_or(0);
+        if used + w > max - 1 {
+            break;
+        }
+        kept.insert(0, c);
+        used += w;
+    }
+    format!("…{kept}")
+}
+
 /// One line per run of non-default cells: `y x0..x1 fg bg modifiers` (`x1` exclusive,
 /// modifiers `|`-joined or `-`). `TestBackend`'s `Display` shows symbols only, so
 /// snapshots pair it with this.
@@ -2241,6 +2536,135 @@ mod tests {
         assert_eq!(ellipsize("abc", 1), "…");
     }
 
+    /// Design pass D9 (ruling R10): the editor header's path gives from the head and cuts
+    /// at a `/`, so what is left still reads as a path — and inside the basename, from the
+    /// head, when not even that fits (verifier (b) F2).
+    #[test]
+    fn render_ellipsize_head_cuts_at_a_slash_then_inside_the_basename() {
+        let p = "home/aaron/dev/git/lastcall/src/tui/render.rs";
+        assert_eq!(ellipsize_head(p, 60), p, "it fits: untouched");
+        assert_eq!(ellipsize_head(p, p.len()), p, "exactly: untouched");
+        // The leftmost `/` whose remainder fits, so the longest path tail is what shows —
+        // and every cut lands on a segment boundary, never mid-segment.
+        assert_eq!(
+            ellipsize_head(p, 43),
+            "…aaron/dev/git/lastcall/src/tui/render.rs",
+            "one column short of the whole drops the first segment, not one character"
+        );
+        assert_eq!(
+            ellipsize_head(p, 41),
+            "…aaron/dev/git/lastcall/src/tui/render.rs"
+        );
+        assert_eq!(ellipsize_head(p, 40), "…dev/git/lastcall/src/tui/render.rs");
+        assert_eq!(ellipsize_head(p, 35), "…dev/git/lastcall/src/tui/render.rs");
+        assert_eq!(ellipsize_head(p, 34), "…git/lastcall/src/tui/render.rs");
+        assert_eq!(ellipsize_head(p, 31), "…git/lastcall/src/tui/render.rs");
+        assert_eq!(ellipsize_head(p, 30), "…lastcall/src/tui/render.rs");
+        assert_eq!(ellipsize_head(p, 20), "…src/tui/render.rs");
+        assert_eq!(ellipsize_head(p, 14), "…tui/render.rs");
+        assert_eq!(ellipsize_head(p, 13), "…render.rs");
+        assert_eq!(ellipsize_head(p, 10), "…render.rs");
+        // Below `…<basename>` the basename itself gives from the head, so the extension
+        // survives and nothing to the right of the path has to (verifier (b) F2).
+        assert_eq!(ellipsize_head(p, 9), "…ender.rs");
+        assert_eq!(ellipsize_head(p, 4), "….rs");
+        assert_eq!(ellipsize_head(p, 1), "…");
+        assert_eq!(ellipsize_head(p, 0), "");
+        // No `/`: still from the head.
+        assert_eq!(ellipsize_head("render.rs", 5), "…r.rs");
+        // Columns, not bytes.
+        assert_eq!(ellipsize_head("a/日本語.md", 10), "…日本語.md");
+        assert_eq!(ellipsize_head("a/日本語.md", 8), "…本語.md");
+        assert_eq!(ellipsize_head("a/日本語.md", 6), "…語.md");
+    }
+
+    /// The other half of D9: `· unsaved` is reserved at every width, so the header does
+    /// not shift under the reader on the first keystroke, and the position never gives.
+    #[test]
+    fn render_editor_header_keeps_the_position_and_reserves_unsaved() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(60, 20));
+        let mut pile = pile("alpha");
+        pile.rows[0].path = b"crates/lastcall/src/tui/render.rs".to_vec();
+        app.apply(pile_event("alpha", pile));
+        app.select(Some(Selection::Row(
+            root("alpha"),
+            b"crates/lastcall/src/tui/render.rs".to_vec(),
+        )));
+        app.handle(Action::Open);
+        let open = match app.handle(Action::Edit).1 {
+            Some(crate::tui::app::Effect::EditInline(open)) => open,
+            other => panic!("an inline-edit effect, got {other:?}"),
+        };
+        app.edit_read(open, Ok(b"one\ntwo\nthree\n".to_vec()));
+        let clean = frame_of(&app, 60, 20).0;
+        let header = clean.lines().next().expect("a header").to_owned();
+        assert!(
+            header.contains("…lastcall/src/tui/render.rs · line 1/"),
+            "the head gives, the position never does: {header}"
+        );
+        assert!(!header.contains("unsaved"), "not dirty yet: {header}");
+
+        app.handle(Action::Editor(crate::tui::input::EditorKey::Edit(
+            crate::tui::input::EditKey::Insert("x".to_owned()),
+        )));
+        let dirty = frame_of(&app, 60, 20).0;
+        let dirty_header = dirty.lines().next().expect("a header").to_owned();
+        assert!(dirty_header.contains(" · unsaved"), "{dirty_header}");
+        assert!(
+            dirty_header.starts_with(header.split(" · line").next().expect("a path")),
+            "the path did not move when `· unsaved` appeared:\n{header}\n{dirty_header}"
+        );
+
+        // Verifier (b) F2: a basename wider than the budget used to overflow into the
+        // row's tail clip, which took `unsaved` and then the position — at 60 and 80
+        // columns with this name, and at `MIN_SIZE` for a four-digit line count. The
+        // basename gives instead.
+        let long = b"src/a_basename_that_is_really_quite_long_indeed_for_a_file.rs".to_vec();
+        for (w, path) in [
+            (60u16, long.clone()),
+            (80, long.clone()),
+            (40, b"src/tui/render.rs".to_vec()),
+        ] {
+            let mut app = three_roots();
+            app.handle(Action::Resize(w, 20));
+            let mut wide = self::pile("alpha");
+            wide.rows[0].path = path.clone();
+            app.apply(pile_event("alpha", wide));
+            app.select(Some(Selection::Row(root("alpha"), path.clone())));
+            app.handle(Action::Open);
+            let open = match app.handle(Action::Edit).1 {
+                Some(crate::tui::app::Effect::EditInline(open)) => open,
+                other => panic!("an inline-edit effect, got {other:?}"),
+            };
+            app.edit_read(open, Ok("x\n".repeat(1200).into_bytes()));
+            let header = frame_of(&app, w, 20).0.lines().next().unwrap().to_owned();
+            assert!(
+                header.contains(" · line 1/1200"),
+                "{w} columns: the position survives a wide basename: {header}"
+            );
+            assert!(
+                header.contains(".rs · line"),
+                "{w} columns: the extension survives: {header}"
+            );
+            app.handle(Action::Editor(crate::tui::input::EditorKey::Edit(
+                crate::tui::input::EditKey::Insert("x".to_owned()),
+            )));
+            let dirty = frame_of(&app, w, 20).0.lines().next().unwrap().to_owned();
+            // `TestBackend` wraps each line in quotes.
+            assert!(
+                dirty
+                    .trim_end_matches('"')
+                    .ends_with(" · line 1/1200 · unsaved"),
+                "{w} columns: `· unsaved` survives a wide basename: {dirty}"
+            );
+            assert!(
+                dirty.starts_with(header.split(" · line").next().expect("a path")),
+                "{w} columns: the path did not move:\n{header}\n{dirty}"
+            );
+        }
+    }
+
     #[test]
     fn render_plural() {
         assert_eq!(plural(0, "file"), "0 files");
@@ -2285,12 +2709,12 @@ mod tests {
         let mut app = App::new();
         assert_eq!(
             hints(&app, 100),
-            "↑↓ select  ⏎ open  n/p hunk  ^A accept all  Tab focus  r refresh  ? help  q quit"
+            "↑↓ select  ⏎ open  n/p hunk  ^A accept all  t hide empty  Tab focus  r refresh  ? help  q quit"
         );
         assert_eq!(
             hints(&app, 60),
-            "↑↓ select  ⏎ open  n/p hunk  ^A accept all  ? help  q quit",
-            "narrow drops focus and refresh"
+            "↑↓ select  ⏎ open  n/p hunk  t hide empty  ? help  q quit",
+            "below `NAV_MIN_COLS` the wide-frame five are gone, then `^A` is the next to go"
         );
         for (name, specs) in &mut app.keymap {
             if name == "quit" {
@@ -2464,6 +2888,86 @@ mod tests {
         // overlay by accident needs most.
         let (frame, _) = frame_of(&narrow, 80, 30);
         assert!(frame.contains("q / Ctrl-C     quit"), "{frame}");
+
+        // Design pass D12 / ruling R12: the clip says so. The last body row above the
+        // pinned `quit` is a dim `… N more keys (100 columns shows all)`, where N is the
+        // rows that are not on the frame and the column figure is computed from the width
+        // the two-column form needs — not a literal, so it follows the keymap.
+        let all: Vec<String> = narrow
+            .keymap
+            .iter()
+            .map(|(name, specs)| (name.as_str(), keys_label(specs)))
+            .chain(
+                MODAL_KEYS
+                    .iter()
+                    .map(|(name, specs)| (*name, keys_label(specs))),
+            )
+            .map(|(name, keys)| format!("{keys:<14} {}", Action::describe(name)))
+            .collect();
+        for (w, h) in [(80u16, 30u16), (80, 24)] {
+            let (frame, styles) = frame_of(&narrow, w, h);
+            let lines: Vec<&str> = frame.lines().collect();
+            let at = lines
+                .iter()
+                .position(|l| l.contains("more key"))
+                .unwrap_or_else(|| panic!("{w}x{h}: a clip notice:\n{frame}"));
+            let notice = lines[at];
+            assert!(
+                notice.contains(&format!(
+                    "({} columns shows all)",
+                    help_two_column_width(&all)
+                )),
+                "{w}x{h}: {notice}"
+            );
+            assert!(
+                lines[at + 1].contains("q / Ctrl-C     quit"),
+                "{w}x{h}: the notice sits directly above the pinned quit:\n{frame}"
+            );
+            let hidden: usize = notice
+                .split_whitespace()
+                .find_map(|w| w.parse().ok())
+                .unwrap_or_else(|| panic!("{w}x{h}: a count in {notice:?}"));
+            let shown = all.iter().filter(|r| frame.contains(r.as_str())).count();
+            assert_eq!(
+                shown + hidden,
+                all.len(),
+                "{w}x{h}: every key row is on the frame or counted:\n{frame}"
+            );
+            // Dim: it is the overlay talking about itself, not a key.
+            assert!(
+                styles
+                    .lines()
+                    .any(|l| l.starts_with(&format!("{at} ")) && l.contains("DIM")),
+                "{w}x{h}: the notice on row {at} is dim:\n{styles}"
+            );
+        }
+
+        // Verifier (b) F1: in two columns a body row carries two keys, and the count was
+        // of rows — `2 more keys` over four hidden ones at 100×20. The identity holds in
+        // both forms, and at the two-column width the remedy names the other dimension.
+        for (w, h) in [(100u16, 20u16), (100, 14), (120, 12)] {
+            let (frame, _) = frame_of(&narrow, w, h);
+            let lines: Vec<&str> = frame.lines().collect();
+            let notice = lines
+                .iter()
+                .find(|l| l.contains("more key"))
+                .unwrap_or_else(|| panic!("{w}x{h}: a clip notice:\n{frame}"));
+            assert!(
+                notice.contains("(a taller window shows all)"),
+                "{w}x{h}: already as wide as two columns need: {notice}"
+            );
+            let hidden: usize = notice
+                .split_whitespace()
+                .find_map(|w| w.parse().ok())
+                .unwrap_or_else(|| panic!("{w}x{h}: a count in {notice:?}"));
+            let shown = all.iter().filter(|r| frame.contains(r.as_str())).count();
+            assert_eq!(
+                shown + hidden,
+                all.len(),
+                "{w}x{h}: every key is on the frame or counted:\n{frame}"
+            );
+            assert!(frame.contains("quit"), "{w}x{h}: quit stays:\n{frame}");
+        }
     }
 
     /// Under the modal the hint line names only the keys that work there: the modal's
@@ -2506,46 +3010,82 @@ mod tests {
         app.select(Some(row("alpha", "f1")));
         // The ruling: `a accept hunk` on a file row in BOTH panes — this one is the nav.
         assert_eq!(app.effective_focus(), super::super::app::Focus::Nav);
-        let nav_line = hints(&app, 120);
+        let nav_line = hints(&app, 124);
         assert_eq!(
             nav_line,
-            "↑↓ select  ⏎ open  n/p hunk  a accept hunk  A accept file  ^A accept all  Tab focus  r refresh  ? help  q quit"
+            "↑↓ select  ⏎ open  n/p hunk  a accept hunk  A accept file  ^A accept all  t hide empty  Tab focus  r refresh  ? help  q quit"
+        );
+        assert_eq!(hints(&app, 200), nav_line, "124 is the whole nav line");
+        // Ruling R4: one hint at a time, from the right end of `HINT_DROP_ORDER` — so a
+        // column short of the whole line the nav keeps everything but `r refresh`.
+        assert_eq!(
+            hints(&app, 123),
+            "↑↓ select  ⏎ open  n/p hunk  a accept hunk  A accept file  ^A accept all  t hide empty  Tab focus  ? help  q quit"
         );
         assert_eq!(
             hints(&app, 100),
-            "↑↓ select  ⏎ open  n/p hunk  a accept hunk  A accept file  ^A accept all  ? help  q quit",
-            "focus/refresh go when the line would not fit"
+            "↑↓ select  ⏎ open  n/p hunk  a accept hunk  A accept file  t hide empty  ? help  q quit",
+            "`Tab focus` then `^A accept all`; the toggle outlives both"
+        );
+        assert_eq!(
+            hints(&app, 80),
+            "↑↓ select  ⏎ open  n/p hunk  a accept hunk  A accept file  ? help  q quit",
+            "then the toggle"
         );
         assert_eq!(
             hints(&app, 60),
             "↑↓ select  ⏎ open  n/p hunk  a accept hunk  ? help  q quit",
-            "then the file and global accept hints"
+            "then the file accept — and below 70 the wide-frame five were never offered"
         );
         app.handle(Action::Open);
-        assert_eq!(hints(&app, 120), nav_line, "the diff pane says the same");
-        // Deliverable 9: `v select  y copy` are the diff pane's own keys on their own tier
-        // (3), dropped before every hint that was on the line before them — so a frame that
-        // loses them keeps `Tab focus`/`r refresh` and everything under it.
+        // Phase 8 deliverable 9: `v select  y copy` are the diff pane's own keys and the
+        // first two off `HINT_DROP_ORDER`, so a frame that loses them keeps `r refresh`
+        // and everything under it — no narrower frame loses a hint it used to have.
         assert_eq!(
-            hints(&app, 140),
-            "↑↓ select  ⏎ open  n/p hunk  a accept hunk  A accept file  ^A accept all  Tab focus  r refresh  v select  y copy  ? help  q quit"
+            hints(&app, 142),
+            "↑↓ scroll  ← back  n/p hunk  a accept hunk  A accept file  ^A accept all  t hide empty  Tab focus  r refresh  v select  y copy  ? help  q quit"
         );
-        // The threshold `tui.md` quotes, pinned (verifier (b) F7): the tier-3 line for a
-        // file row is exactly 128 columns wide, so 128 shows it and 127 falls back to the
-        // tier-2 line — which is the same one the nav gets.
-        assert_eq!(hints(&app, 128), hints(&app, 140));
-        assert_eq!(hints(&app, 127), nav_line, "one column short of tier 3");
-        // What the line says depends on the selection, so the threshold does too: a root
-        // row trades `a accept hunk  A accept file` for `a accept all in <root>`, which is
-        // seven columns shorter with this fixture's names.
+        assert_eq!(hints(&app, 142), hints(&app, 200), "142 is the whole line");
+        assert_eq!(
+            hints(&app, 141),
+            "↑↓ scroll  ← back  n/p hunk  a accept hunk  A accept file  ^A accept all  t hide empty  Tab focus  r refresh  v select  ? help  q quit",
+            "`y copy` is the first hint off the line"
+        );
+        assert_eq!(
+            hints(&app, 133),
+            nav_line.replace("↑↓ select  ⏎ open", "↑↓ scroll  ← back"),
+            "then `v select`, and the nav's own line with the diff's opening is what is left"
+        );
+        assert_eq!(
+            hints(&app, 133).width(),
+            nav_line.width(),
+            "`↑↓ scroll` and `← back` are exactly as wide as `↑↓ select` and `⏎ open`, so no step moved"
+        );
+        // Deliverable 3 (D2 / ruling R3): `←` is `back`'s own arrow spelling, chosen over
+        // its first spec (`Esc`) so tier 0 reads as the pair of arrows it is; a keymap that
+        // binds no arrow to `back` falls back to whatever its first key is.
+        let mut rebound = app.clone();
+        for (name, specs) in &mut rebound.keymap {
+            if name == "back" {
+                *specs = vec!["esc".to_owned()];
+            }
+        }
+        assert!(
+            hints(&rebound, 200).starts_with("↑↓ scroll  Esc back"),
+            "{}",
+            hints(&rebound, 200)
+        );
+        // What the line says depends on the selection, so the width it needs does too: a
+        // root row trades `a accept hunk  A accept file` for `a accept all in <root>`,
+        // which is seven columns shorter with this fixture's names.
         let mut at_root = app.clone();
         at_root.select(Some(Selection::Root(root("alpha"))));
-        assert!(hints(&at_root, 121).contains("y copy"));
-        assert!(!hints(&at_root, 120).contains("y copy"));
+        assert!(hints(&at_root, 135).contains("y copy"));
+        assert!(!hints(&at_root, 134).contains("y copy"));
         assert!(!nav_line.contains("y copy"), "the nav has no copy key");
         app.handle(Action::Back);
         assert!(
-            !hints(&app, 140).contains("y copy"),
+            !hints(&app, 200).contains("y copy"),
             "and the nav still has none at any width"
         );
         app.handle(Action::Open);
@@ -2563,6 +3103,127 @@ mod tests {
             hints(&app, 100).contains("n/p hunk  a accept group  ^A accept all"),
             "{}",
             hints(&app, 100)
+        );
+    }
+
+    /// Ruling R4 (the sponsor: "trying our best to fit everything but once it gets beyond
+    /// N columns, cut it back and add `? help`"): the line loses **one** hint per column
+    /// step, in `HINT_DROP_ORDER`, and never a fixed tier at once. Walking one column at a
+    /// time from the whole line to the floor, every step either changes nothing or removes
+    /// exactly one hint, and the hint it removes is the next one still on the line.
+    #[test]
+    fn render_hints_drop_one_at_a_time_from_the_right() {
+        use crate::tui::herdr::{HerdrUpdate, Scope};
+        let mut app = three_roots();
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Open);
+        app.herdr.scoped = true;
+        app.handle(Action::Herdr(HerdrUpdate::Scope(Some(Scope {
+            label: "w1".to_owned(),
+            roots: [root("alpha"), root("beta"), root("notes")]
+                .into_iter()
+                .collect(),
+        }))));
+        let whole = hints(&app, 400);
+        assert!(
+            whole.contains("w scope") && whole.contains("y copy"),
+            "{whole}"
+        );
+        let parts = |line: &str| line.split("  ").map(|s| s.to_owned()).collect::<Vec<_>>();
+        let mut previous = parts(&whole);
+        // From the whole line down to `MIN_SIZE`'s floor. `NAV_MIN_COLS` is the one step
+        // that may take several at once (the five hints a nav-less frame cannot promise).
+        for width in (40..=whole.width() as u16).rev() {
+            let now = parts(&hints(&app, width));
+            assert!(
+                now.iter().all(|h| previous.contains(h)),
+                "no hint returns as the line narrows: {now:?} after {previous:?}"
+            );
+            if width + 1 != NAV_MIN_COLS {
+                assert!(
+                    previous.len() - now.len() <= 1,
+                    "one at a time at {width}: {now:?} after {previous:?}"
+                );
+            }
+            if previous.len() != now.len() {
+                let gone: Vec<&String> = previous.iter().filter(|h| !now.contains(h)).collect();
+                let expected = HINT_DROP_ORDER
+                    .iter()
+                    .find(|name| previous.iter().any(|h| hint_is(h, name, &app)));
+                assert!(
+                    expected.is_some_and(|name| gone.iter().any(|h| hint_is(h, name, &app))),
+                    "the next one in the drop order goes at {width}: {gone:?}"
+                );
+            }
+            previous = now;
+        }
+        assert_eq!(previous, parts("↑↓ scroll  ← back  ? help  q quit"));
+    }
+
+    /// Which hint a rendered fragment is, by the key its action is bound to — the drop
+    /// order is action names and the line is labels.
+    fn hint_is(rendered: &str, action: &str, app: &App) -> bool {
+        let key = match action {
+            "hunk_next" => "n/p".to_owned(),
+            other => app
+                .keys_for(other)
+                .first()
+                .map(|s| hint_label(s))
+                .unwrap_or_default(),
+        };
+        !key.is_empty() && rendered.starts_with(&format!("{key} "))
+    }
+
+    /// Ruling R4's own sentence: `? help  q quit` are always the last two hints on the
+    /// line, so a cut line still says where the rest of the keys are. Every width from
+    /// `MIN_SIZE`'s 40 to 70 — the widths D1's constants would have left with a line that
+    /// simply did not fit.
+    #[test]
+    fn render_hints_keep_help_and_quit_at_every_width() {
+        use crate::tui::herdr::{HerdrUpdate, Scope};
+        let mut app = three_roots();
+        app.herdr.scoped = true;
+        app.handle(Action::Herdr(HerdrUpdate::Scope(Some(Scope {
+            label: "w1".to_owned(),
+            roots: [root("alpha")].into_iter().collect(),
+        }))));
+        for selection in [
+            None,
+            Some(row("alpha", "f1")),
+            Some(Selection::Root(root("alpha"))),
+        ] {
+            app.select(selection.clone());
+            for width in 40..=70u16 {
+                let line = hints(&app, width);
+                assert!(
+                    line.ends_with("? help  q quit"),
+                    "{width} ({selection:?}): {line}"
+                );
+                assert!(
+                    line.width() <= width as usize,
+                    "{width} ({selection:?}) is {} wide: {line}",
+                    line.width()
+                );
+            }
+        }
+    }
+
+    /// The 80-column frame is the one the release's readers are likeliest to have, and
+    /// `A accept file` is the hint that tells a file row from a hunk. The drop order is
+    /// built so it survives there: `y`, `v`, `r`, `Tab`, `w`, `^A` and `t` all go first.
+    #[test]
+    fn render_hints_at_80_keep_accept_file() {
+        let mut app = three_roots();
+        app.select(Some(row("alpha", "f1")));
+        let line = hints(&app, 80);
+        assert!(line.contains("a accept hunk  A accept file"), "{line}");
+        assert!(line.ends_with("? help  q quit"), "{line}");
+        assert!(line.width() <= 80, "{line}");
+        app.handle(Action::Open);
+        assert_eq!(
+            hints(&app, 80),
+            line.replace("↑↓ select  ⏎ open", "↑↓ scroll  ← back"),
+            "the diff pane says the same at 80 but for its own tier 0 (deliverable 3)"
         );
     }
 
@@ -2863,7 +3524,7 @@ mod tests {
     fn render_empty_app_shows_empty_state_and_hints() {
         let app = App::new();
         let (frame, styles) = frame_of(&app, 100, 12);
-        assert!(frame.contains("nothing pending across 0 roots"), "{frame}");
+        assert!(frame.contains("nothing pending across 0 repos"), "{frame}");
         assert!(
             frame.contains("lastcall  0 repos · 0 files · 0 hunks"),
             "{frame}"
@@ -2898,7 +3559,10 @@ mod tests {
     }
 
     /// The loading pane (Gate 8 sponsor run ruling): a static line in the first second, no
-    /// digits; from one second the counter line and a ✓ per reported root.
+    /// digits; from one second the counter line and a ✓ in the leading column of each
+    /// reported root (Design pass D4, ruling R6). Design pass D3
+    /// (ruling R5): **repos** is the noun, the counter line does not repeat it, and the
+    /// header says `3 repos · checking status…` rather than three counts it does not know.
     #[test]
     fn render_loading_pane_counts_only_after_one_second() {
         let mut app = App::new();
@@ -2910,7 +3574,7 @@ mod tests {
         });
         let (frame, _) = frame_of(&app, 100, 12);
         assert!(
-            frame.contains("discovered 3 roots, checking status…"),
+            frame.contains("discovered 3 repos, checking status…"),
             "{frame}"
         );
         assert!(
@@ -2920,25 +3584,26 @@ mod tests {
         assert!(!frame.contains('✓'), "{frame}");
         assert!(!frame.contains("nothing pending"), "{frame}");
         assert!(
-            frame.contains("lastcall  0 repos"),
-            "nothing is listed: {frame}"
+            frame.contains("lastcall  3 repos · checking status…"),
+            "D3: the header says the count it knows and no counts it does not: {frame}"
+        );
+        assert!(
+            !frame.contains("0 files · 0 hunks"),
+            "and not the counts it does not: {frame}"
         );
 
         app.handle(Action::Tick);
         let (frame, _) = frame_of(&app, 100, 12);
         assert!(
-            frame.contains("1 of 3 repos checked · 1,200 files pending so far · 1s"),
+            frame.contains("1 of 3 checked · 1,200 files pending so far · 1s"),
             "{frame}"
         );
-        let line = |name: &str| {
-            frame
-                .lines()
-                .find(|l| l.contains(&format!("  {name}  ")))
-                .unwrap_or_else(|| panic!("{name} listed: {frame}"))
-                .to_owned()
-        };
-        assert!(line("alpha").contains('✓'), "{frame}");
-        assert!(!line("beta").contains('✓'), "{frame}");
+        // Design pass D4 (ruling R6): the tick is a leading column in the row's own
+        // indent, so the ticks line up whatever the branch labels are and the root still
+        // being scanned is the gap in the column.
+        assert!(frame.contains("✓ alpha  main"), "{frame}");
+        assert!(frame.contains("  beta  main"), "{frame}");
+        assert!(!frame.contains("main  ✓"), "not a suffix: {frame}");
 
         // The last report ends the hold: the ordinary listing.
         app.apply(lastcall_engine::watcher::EngineEvent::Scanned {
@@ -2949,6 +3614,126 @@ mod tests {
         let (frame, _) = frame_of(&app, 100, 12);
         assert!(!frame.contains("checking status"), "{frame}");
         assert!(frame.contains(NO_SELECTION), "{frame}");
+    }
+
+    /// Design pass D5 (ruling R7): the scope wait used to replace the hold with a second
+    /// waiting screen — the root list and its ticks vanished, the header dropped back to
+    /// `0 repos · 0 files · 0 hunks`, and a moment later the listing landed. It is now the
+    /// hold's own frame continuing: below `COUNTER_AFTER` nothing changes at all, and from
+    /// one second the counter carries the holding clause where `so far · Ss` was, with
+    /// every root ticked because every root has reported.
+    #[test]
+    fn render_scope_pending_after_the_hold_keeps_the_root_list() {
+        use crate::tui::herdr::{HerdrUpdate, Scope};
+        let mut app = App::new();
+        app.herdr.scoped = true;
+        app.herdr.scope_pending = true;
+        app.sync_roots(vec![meta("alpha"), meta("beta"), meta("notes")]);
+        app.start_loading();
+        for (name, rows) in [("alpha", 4), ("beta", 3), ("notes", 0)] {
+            app.apply(lastcall_engine::watcher::EngineEvent::Scanned {
+                root: root(name),
+                rows,
+            });
+        }
+        assert!(
+            app.loading.as_ref().is_some_and(|l| l.scanned),
+            "the scans are done; only the scope verdict is outstanding"
+        );
+        assert_eq!(app.listed_roots().count(), 0, "still held back");
+
+        // Below one second: exactly the hold's static frame, so a fast launch that has to
+        // wait for the verdict still shows one calm frame.
+        let (frame, _) = frame_of(&app, 100, 12);
+        assert!(
+            frame.contains("discovered 3 repos, checking status…"),
+            "{frame}"
+        );
+        assert!(frame.contains("  alpha  main"), "{frame}");
+        assert!(!frame.contains("checked"), "no digits yet: {frame}");
+        assert!(
+            !frame.contains(SCOPE_PENDING),
+            "nor a second screen: {frame}"
+        );
+
+        // From one second: the same counter with the holding clause, and every root ticked.
+        app.handle(Action::Tick);
+        let (frame, _) = frame_of(&app, 100, 12);
+        assert!(
+            frame.contains(&format!(
+                "3 of 3 checked · 7 files pending · {SCOPE_PENDING}"
+            )),
+            "{frame}"
+        );
+        assert!(
+            !frame.contains("so far"),
+            "the scans are not still running: {frame}"
+        );
+        for row in ["✓ alpha  main", "✓ beta  main", "✓ notes  draft"] {
+            assert!(frame.contains(row), "{row}: {frame}");
+        }
+        assert!(
+            frame.contains("lastcall  3 repos · checking status…"),
+            "the header keeps the hold's own left half (D3): {frame}"
+        );
+
+        // The verdict lists: the hold is over in the same step.
+        app.handle(Action::Herdr(HerdrUpdate::Scope(Some(Scope {
+            label: "w1".to_owned(),
+            roots: [root("alpha"), root("beta"), root("notes")]
+                .into_iter()
+                .collect(),
+        }))));
+        assert!(app.loading.is_none(), "{:?}", app.loading);
+        let (frame, _) = frame_of(&app, 100, 12);
+        assert!(!frame.contains("checking status"), "{frame}");
+        // `Scanned` is a tick, not a pile, so the listing's own counts are zero here; the
+        // point is that the header is back to counting what is listed.
+        assert!(
+            frame.contains("lastcall  3 repos · 0 files · 0 hunks"),
+            "{frame}"
+        );
+    }
+
+    /// Verifier (a) F5 and F6. F5: the sponsor's most common launch is "everything is
+    /// clean", and since v1.9 that frame lists three empty repo rows with nothing selected
+    /// — where `select a file (↑↓ or click)` invited choosing a file that does not exist.
+    /// F6: a scope that hides only *empty* repos used to fall through the scoped arm's
+    /// `scoped_out() >= 1` gate to the global text, which then listed the very repos the
+    /// scope was hiding.
+    #[test]
+    fn render_all_clean_frame_is_the_empty_state_not_a_prompt() {
+        use crate::tui::herdr::{HerdrUpdate, Scope};
+        let mut app = three_roots();
+        for name in ["alpha", "beta", "notes"] {
+            app.apply(pile_event_seq(
+                name,
+                1,
+                lastcall_engine::scan::Pile::default(),
+            ));
+        }
+        assert_eq!(app.listed_roots().count(), 3, "every repo stays listed");
+        assert_eq!(app.selection, None, "and none of them is selected");
+        let (frame, _) = frame_of(&app, 100, 12);
+        assert!(frame.contains("nothing pending across 3 repos"), "{frame}");
+        assert!(!frame.contains(NO_SELECTION), "{frame}");
+
+        app.herdr.scoped = true;
+        app.handle(Action::Herdr(HerdrUpdate::Scope(Some(Scope {
+            label: "w1".to_owned(),
+            roots: [root("beta")].into_iter().collect(),
+        }))));
+        let (frame, _) = frame_of(&app, 100, 12);
+        assert!(frame.contains("nothing pending in w1"), "{frame}");
+        assert!(frame.contains("2 repos hidden (w shows all)"), "{frame}");
+        assert!(
+            !frame.contains("nothing pending across"),
+            "never the global text under a scope: {frame}"
+        );
+        assert!(
+            !frame.contains("  alpha  ") && !frame.contains("  notes  "),
+            "the repos the scope hides are not listed: {frame}"
+        );
     }
 
     /// Gate 8 sponsor run: under a scope whose roots have nothing pending, "nothing pending
@@ -2965,6 +3750,10 @@ mod tests {
             meta("notes"),
             meta("quiet"),
         ]);
+        // Since Amendment v1.9 every repo in scope is listed, so the empty state under a
+        // scope is reached only once `t` has taken the empty ones off too — the two
+        // filters stacking, which is exactly the frame this test is about.
+        app.hide_empty = true;
         app.herdr.scoped = true;
         app.handle(Action::Herdr(HerdrUpdate::Scope(Some(Scope {
             label: "w2".to_owned(),
@@ -3127,8 +3916,12 @@ mod tests {
             !frame.contains("│  nothing pending · agent"),
             "never the half that says nothing: {frame}"
         );
-        // The diff pane is wide enough for the full sentence, and still shows it.
-        assert!(frame.contains(&nothing_pending("done")), "{frame}");
+        // The right pane names the repo now (§6.7, Amendment v1.9) and folds herdr's word
+        // into the same sentence, so the status survives there too.
+        assert!(
+            frame.contains(&nothing_pending_in("alpha", Some("done"))),
+            "{frame}"
+        );
 
         // A nav column dragged wide enough keeps the full line.
         app.nav_width = 40;
@@ -3136,6 +3929,101 @@ mod tests {
         assert!(
             wide.contains(&format!("│  {}", nothing_pending("done"))),
             "{wide}"
+        );
+    }
+
+    /// Ruling R2: a repo with nothing pending is a name-and-branch row on the nav — dim
+    /// from the name down, no file rows under it — and its pane names it rather than
+    /// repeating the header (§6.7, Amendment v1.9 items 1 and 4).
+    #[test]
+    fn render_empty_root_row_is_dim_and_has_no_file_rows() {
+        let mut app = three_roots();
+        app.apply(pile_event_seq(
+            "beta",
+            1,
+            lastcall_engine::scan::Pile::default(),
+        ));
+        app.select(Some(Selection::Root(root("beta"))));
+        let (frame, styles) = frame_of(&app, 100, 30);
+
+        // The nav block for beta is exactly two lines: the name and the branch.
+        let nav: Vec<&str> = frame
+            .lines()
+            .filter(|l| l.starts_with("\"\u{2502}"))
+            .map(|l| l["\"\u{2502}".len()..].trim_end_matches(['"', ' ']))
+            .collect();
+        let at = nav
+            .iter()
+            .position(|l| l.starts_with("beta"))
+            .unwrap_or_else(|| panic!("beta on the nav: {frame}"));
+        assert!(nav[at].starts_with("beta"), "{frame}");
+        assert!(nav[at + 1].starts_with("  main · 0 files"), "{frame}");
+        assert!(
+            nav[at + 2].starts_with('\u{2500}') || nav[at + 2].starts_with("notes"),
+            "no file rows under an empty repo: {:?}",
+            &nav[at..at + 3]
+        );
+        assert!(
+            !frame.contains("nothing pending · agent"),
+            "no agent line without an agent: {frame}"
+        );
+
+        // beta's name row is bold-dim and its branch line dim; alpha's name row, which has
+        // rows under it, is plain bold. The nav's first line is frame row 2 (header, then
+        // the pane's top border).
+        let mods = |y: usize| -> Vec<String> {
+            styles
+                .lines()
+                .filter(|l| l.starts_with(&format!("{y} ")))
+                .map(|l| l.rsplit(' ').next().unwrap_or_default().to_owned())
+                .collect()
+        };
+        let beta_y = 2 + at;
+        assert!(
+            mods(beta_y)
+                .iter()
+                .any(|m| m.contains("BOLD") && m.contains("DIM")),
+            "beta's name row is bold-dim: {styles}"
+        );
+        assert!(
+            mods(beta_y + 1).iter().any(|m| m.contains("DIM")),
+            "its branch line is dim: {styles}"
+        );
+        assert!(
+            mods(2).iter().any(|m| m == "BOLD") && !mods(2).iter().any(|m| m.contains("DIM")),
+            "alpha still has rows, so its name row is plain bold: {styles}"
+        );
+
+        // The right pane.
+        assert!(frame.contains("nothing pending in beta"), "{frame}");
+        assert!(
+            frame
+                .lines()
+                .any(|l| l.contains("nothing pending in beta") && !l.contains("· agent")),
+            "no agent clause without an agent: {frame}"
+        );
+    }
+
+    /// The `t` hint says what the key will do, not what the setting is called
+    /// (§6.7, Amendment v1.9 item 4; the sponsor's "a simple little show/hide repos").
+    #[test]
+    fn render_hint_line_names_the_toggle_by_state() {
+        let mut app = three_roots();
+        app.select(Some(row("alpha", "f1")));
+        assert!(hints(&app, 200).contains("t hide empty"), "showing all");
+        app.handle(Action::HideEmpty);
+        assert!(hints(&app, 200).contains("t show empty"), "hiding");
+        assert!(!hints(&app, 200).contains("t hide empty"));
+        // A rebound key is named by its own spec, like every other hint.
+        for (name, specs) in &mut app.keymap {
+            if name == "hide_empty" {
+                *specs = vec!["ctrl-t".to_owned()];
+            }
+        }
+        assert!(
+            hints(&app, 200).contains("^T show empty"),
+            "{}",
+            hints(&app, 200)
         );
     }
 

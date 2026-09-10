@@ -59,11 +59,50 @@ fn status_json(parallelism: usize) -> String {
         actual.contains("\"status_version\": 1"),
         "not a status report:\n{actual}"
     );
+
+    // Amendment v1.9: the state dir is *named* now, so the rule is no longer "it never
+    // appears" but "it appears only as `state_dir`" — a leak anywhere else is still a leak.
+    let state_str = state.path().to_string_lossy().to_string();
+    let carriers: Vec<&str> = actual.lines().filter(|l| l.contains(&state_str)).collect();
     assert!(
-        !actual.contains(&state.path().to_string_lossy().to_string()),
-        "the state dir leaked into the report:\n{actual}"
+        carriers.len() == 1 && carriers[0].trim_start().starts_with("\"state_dir\": "),
+        "the state dir appears outside `state_dir`:\n{carriers:?}"
     );
-    actual
+
+    // The three v1.9 fields are per-run values (a temp state dir, the hash of a temp root
+    // path, a wall-clock mtime), so the golden pins their shape, not their content.
+    let normalised: Vec<String> = actual
+        .lines()
+        .map(|line| {
+            redact(line, "state_dir", "<S>")
+                .or_else(|| redact(line, "store", "<H>"))
+                .or_else(|| redact(line, "ledger_written_at", "<T>"))
+                .unwrap_or_else(|| line.to_owned())
+        })
+        .collect();
+    let mut out = normalised.join("\n");
+    out.push('\n');
+    for token in ["\"<S>\"", "\"<H>\"", "\"<T>\""] {
+        assert!(out.contains(token), "{token} was never produced:\n{out}");
+    }
+    out
+}
+
+/// Replace a `"<key>": "<string>"` line's value with `token`, keeping the indent and any
+/// trailing comma. `None` when the line is not that key, or when its value is not a
+/// string — a `null` `ledger_written_at` stays `null` and is visible in the golden.
+fn redact(line: &str, key: &str, token: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let indent = &line[..line.len() - trimmed.len()];
+    let head = format!("\"{key}\": ");
+    let value = trimmed.strip_prefix(&head)?;
+    let (value, comma) = match value.strip_suffix(',') {
+        Some(v) => (v, ","),
+        None => (value, ""),
+    };
+    value
+        .starts_with('"')
+        .then(|| format!("{indent}{head}\"{token}\"{comma}"))
 }
 
 #[test]
