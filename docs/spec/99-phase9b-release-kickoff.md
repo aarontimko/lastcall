@@ -82,15 +82,63 @@ Ship **v0.1.0** per [`00-spec.md`](00-spec.md) §8 "Phase 9 — Hardening and re
 
 | scenario | metric | Phase 4 baseline (run A) | latest (run F) | **target** | run G (quiet ×2) |
 |---|---|---|---|---|---|
-| S1 | `open_ms` | 33,050 | 4,724 | ≤ 6,000 | |
-| S1 | `scan_all_ms` | 25,553 | 4,402 | ≤ 6,000 | |
-| S1 | `first_frame_ms` | 56,568 | 9,150 | ≤ 12,000 | |
-| S1h | `first_frame_ms` | — (no Phase 4 row; Phase 5 run C 4,782) | 4,877 | ≤ 6,500 | |
-| S2 | `scan_ms` | 270 | 262 | ≤ 350 | |
-| S3 | `settle_ms` | 1,553 | 1,546 | ≤ 2,000 | |
-| S3_events | `settle_ms` | 1,553 | 1,567 | ≤ 2,000 | |
-| S4 | `capped_count_ms` | 3,617 | 4,106 | ≤ 5,500 | |
-| S4 | `settle_ms` | 5,342 | 5,930 | ≤ 7,000 | |
+| S1 | `open_ms` | 33,050 | 4,724 | ≤ 6,000 | **3,704 / 3,641** ✓ |
+| S1 | `scan_all_ms` | 25,553 | 4,402 | ≤ 6,000 | **4,085 / 4,018** ✓ |
+| S1 | `first_frame_ms` | 56,568 | 9,150 | ≤ 12,000 | **7,339 / 7,308** ✓ |
+| S1h | `first_frame_ms` | — (no Phase 4 row; Phase 5 run C 4,782) | 4,877 | ≤ 6,500 | **3,930 / 4,064** ✓ |
+| S2 | `scan_ms` | 270 | 262 | ≤ 350 | **211 / 209** ✓ |
+| S3 | `settle_ms` | 1,553 | 1,546 | ≤ 2,000 | **1,522 / 1,508** ✓ |
+| S3_events | `settle_ms` | 1,553 | 1,567 | ≤ 2,000 | **1,513 / 1,543** ✓ |
+| S4 | `capped_count_ms` | 3,617 | 4,106 | ≤ 5,500 | **3,690 / 3,795** ✓ |
+| S4 | `settle_ms` | 5,342 | 5,930 | ≤ 7,000 | **5,314 / 5,461** ✓ |
+
+**Run G column filled by the worker, run G, 2026-09-11** (deliverable 10; `bench.md` "Phase 9b
+(run G): the quiet-machine two-run" carries the raw lines of both runs). Two `just bench` runs
+back to back on an idle machine, 102.31 s and 102.85 s, `5 passed; 0 failed` each. **Every row
+is under its target in both runs**, and every spawn, row and file count is bit-identical to
+runs D, E and F (S1 1,102 / 1,600; S1h 552 / 800; S2 16; S4 15; rows 4,000; `rows_shown` /
+`omitted` 10,000 / 40,000). The run also re-establishes the wall-time baseline runs E and F
+could not: every metric they reported as up by 10–28 % is back at run D's level, which is what
+both of them predicted. Two caveats, recorded on the page rather than smoothed here: S1h
+`scan_all_ms` is 3,728 vs 3,143 between the two runs (±16 %, the noisiest number on the page,
+and not a gate row), and S2 `peak_rss_kb` moved 32.8 % between them because the peak is
+sampled on a timer. One harness fix was needed before the run could complete: the
+`first_checked_ms` wait, written with the launch hold at `9d2fd4a` and never exercised by a
+bench (run F predates it by a day), waited only for the hold's one-second counter line, which
+a quiet machine's warm scan never reaches; it now accepts the hold being over as the same
+fact, and the two numbers coincide on a quiet run.
+
+### §10 entry, drafted by the worker for the close-out (Amendment v1.10 item 4)
+
+> - **2026-09-11 — the perf gate's targets, per scenario, and run G** `[DECIDED]`. Gate 9's
+>   perf clause is discharged by a **target per scenario**, set here against the Phase 4
+>   baseline (run A) and the phase runs since, and evidenced by **run G**: two `just bench`
+>   runs back to back on one quiet machine, 2026-09-11, `5 passed; 0 failed` each
+>   (`docs/dev/bench.md`, "Phase 9b (run G)"). Baseline → target → run G, by scenario:
+>   **S1** (100 roots, 4,000 rows) `open_ms` 33,050 → ≤ 6,000 → 3,704 / 3,641;
+>   `scan_all_ms` 25,553 → ≤ 6,000 → 4,085 / 4,018; `first_frame_ms` 56,568 → ≤ 12,000 →
+>   7,339 / 7,308. **S1h** (50 roots, 80 files each) `first_frame_ms` no Phase 4 row, Phase 5
+>   run C 4,782 → ≤ 6,500 → 3,930 / 4,064. **S2** (one 100,000-line file) `scan_ms` 270 →
+>   ≤ 350 → 211 / 209. **S3** (1,000 files under watch) `settle_ms` 1,553 → ≤ 2,000 →
+>   1,522 / 1,508, and **S3_events** 1,553 → ≤ 2,000 → 1,513 / 1,543. **S4** (50,000 files,
+>   the row cap) `capped_count_ms` 3,617 → ≤ 5,500 → 3,690 / 3,795; `settle_ms` 5,342 →
+>   ≤ 7,000 → 5,314 / 5,461. Every row is under its target in both runs. The targets are the
+>   busy-machine runs D–F plus 20–35 % headroom, not run A × 0.8: after Phase 5's pool the
+>   literal reading of "no scenario regresses more than 20 % against its Phase 4 baseline"
+>   would be met by a build six times slower than this one, so the gate becomes a ratchet
+>   against the numbers we actually ship (ruling P7; the Alt, a floor against catastrophe, was
+>   not taken). Spawn counts are asserted **equal**, not bounded: S1 1,102 / 1,600, S1h 552 /
+>   800, S2 16, S4 15, and run G reproduced every one of them bit-identically, as runs D, E and
+>   F did. Run G also settles what runs E and F could only predict: every wall time they
+>   reported as up by 10–28 % is back at run D's level, so that drift was machine load, not
+>   code. Two numbers are recorded as noisy rather than averaged: S1h `scan_all_ms` (3,728 vs
+>   3,143 between the two runs; not a gate row) and S2 `peak_rss_kb` (32.8 %; the peak is
+>   sampled on a timer). One harness fix was needed to complete the run — the
+>   `first_checked_ms` wait (renamed from `first_pile_ms` here, forward only) waited for the
+>   launch hold's one-second counter, which a quiet machine's warm scan never reaches; it now
+>   also accepts the hold being over, which is the same fact stated more strongly, and on a
+>   quiet run `first_checked_ms` equals `first_frame_ms`. That wait was written with the hold
+>   at `9d2fd4a` (2026-09-07) and no bench had run it: run F was taken the day before.
 
 Targets are run D–F's busy-machine numbers plus ~20–35 % headroom (S4 settle 18 %, S4 capped_count 34 %), all far under the Phase 4 baseline; the gate's "no scenario regresses more than 20 % against its Phase 4 baseline" is met by every row by construction (S1h has no Phase 4 row and is read against run C), and the target column is the number a later phase must stay under. The gate's three clauses — targets from the Phase 4 baselines in a §10 entry, a scenario test for the row cap, the same machine — are reworded by Amendment v1.10 item 4 to what this table delivers: targets from runs D–F recorded in a §10 entry, the row cap pinned by unit tests plus a snapshot, run G on one quiet machine. Spawn counts (S1 1,102 / 1,600; S2 16; S4 15) are asserted equal, not bounded.
 

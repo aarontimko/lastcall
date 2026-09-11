@@ -174,8 +174,8 @@ impl Bench {
 }
 
 /// The launch hold's counter line shows at least one root reported: `K of N repos
-/// checked` with `K` ≥ 1. The counter appears one second into the hold, so the earliest
-/// this can be true is ~1,000 ms after spawn (`Loading::COUNTER_AFTER`).
+/// checked` with `K` ≥ 1. The counter appears one second into the hold
+/// (`Loading::COUNTER_AFTER`), so this form cannot be true earlier than that.
 fn first_checked(s: &vt100::Screen) -> bool {
     let text = s.contents();
     text.lines().any(|l| {
@@ -183,6 +183,21 @@ fn first_checked(s: &vt100::Screen) -> bool {
             .split_once(" of ")
             .is_some_and(|(k, rest)| rest.contains("repos checked") && k != "0")
     })
+}
+
+/// A first root is checked: the counter line says so, **or** the hold is already over and
+/// `header` (every root, with its counts) is on screen — every root checked means the first
+/// one was.
+///
+/// Both forms are needed because the hold can be shorter than the counter's one second. The
+/// TUI is spawned after the scenario has already opened and scanned the same roots in
+/// process, so its own scan runs warm; on a quiet machine that scan finishes before
+/// `Loading::COUNTER_AFTER` and the counter line is never drawn at all (run G, 2026-09-11 —
+/// the counter-only wait, written at `9d2fd4a` and never run under a bench until then, timed
+/// out with the full listing on screen). On a loaded machine the counter appears first and
+/// the number floors at ~1,000 ms; on a quiet one it equals `first_frame_ms`.
+fn first_checked_or_listed(header: &'static str) -> impl Fn(&vt100::Screen) -> bool {
+    move |s: &vt100::Screen| first_checked(s) || s.contents().contains(header)
 }
 
 /// The status bar reads `watching …`: the watch is installed and the post-install
@@ -301,12 +316,12 @@ fn bench_s1_clones_100_rows_4000() {
     bench(S, "scan_all_ms", wall.as_millis());
     bench(S, "scan_all_spawns", spawns);
 
-    // Spawn → the first root reported on the launch hold's counter (`N of 100 repos
-    // checked`, which the pane shows from one second in — so this floors at ~1,000 ms),
-    // then → every root in the header (the hold ends, the listing lands as one frame).
+    // Spawn → a first root checked (the launch hold's counter from one second in, or the
+    // hold ending sooner than that), then → every root in the header (the listing lands as
+    // one frame).
     let t = Instant::now();
     let mut pty = b.tui(&["tui", "--poll", "1"]);
-    pty.wait_for(LONG, first_checked)
+    pty.wait_for(LONG, first_checked_or_listed("100 repos · 4,000 files"))
         .unwrap_or_else(|e| panic!("first root checked: {e}"));
     bench(S, "first_checked_ms", t.elapsed().as_millis());
     pty.wait_for_text("100 repos · 4,000 files", LONG)
@@ -383,7 +398,7 @@ fn bench_s1h_clones_50_files_80_rows_4000() {
 
     let t = Instant::now();
     let mut pty = b.tui(&["tui", "--poll", "1"]);
-    pty.wait_for(LONG, first_checked)
+    pty.wait_for(LONG, first_checked_or_listed("50 repos · 4,000 files"))
         .unwrap_or_else(|e| panic!("first root checked: {e}"));
     bench(S, "first_checked_ms", t.elapsed().as_millis());
     pty.wait_for_text("50 repos · 4,000 files", LONG)
