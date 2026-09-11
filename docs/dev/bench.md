@@ -68,6 +68,14 @@ first root's pile (`1 repo · 40 files`) and to the header showing every root
 > done by then", not "the first root was listed then". `first_frame_ms` keeps its meaning
 > (every root in the header) and is the number to compare across runs. Runs A–F below were
 > measured under the old meaning.
+>
+> **Renamed `first_checked_ms` in the harness, forward only (2026-09-11, Phase 9b
+> deliverable 10, ruling P7).** The name now says what the number has measured since
+> `9d2fd4a`: the first root was *checked* by then. The rename is forward only — runs A–F's
+> tables and raw `BENCH` lines below keep the name they were printed under, because
+> rewriting them would claim measurements that were never taken. Run G and every run after
+> it print `first_checked_ms`; the same clock, the same wait, a truthful name. The gate
+> targets for it live in the Phase 9b kickoff's perf table, not on this page.
 
 | metric | value |
 |---|---|
@@ -700,6 +708,21 @@ round trip, no timeout — at the price of missing iTerm2 and tmux `extended-key
 report the protocol but do not say so in `TERM`. Two-way door; the measurement the sponsor
 takes at the gate is what decides it. **Not measured here**, because the bench harness answers
 no queries and would only ever report the worst case.
+
+### Editing, saving and copying — not measured
+
+The Phase 9 editor, the `$EDITOR` round trip and the OSC 52 copy get a row here rather than
+a scenario (Phase 9b deliverable 10, ruling P7). They are **not measured**, deliberately:
+each one is a human-paced operation over a single file, costing a handful of syscalls and at
+most one `git` spawn, so a `BENCH` line would report the harness's own pty latency rather
+than anything a user waits for. What each one actually does is short enough to write down.
+
+| | |
+|---|---|
+| an inline save (`i`, then `^S`) | **one `hash-object` and one rename.** `ops::save_file` hashes the buffer once (`hash-object -w --path=<rel> --stdin`, one `git` spawn) *before* touching the working tree, then `restore::write_bytes` writes a temp file beside the target, `fsync`s it, `fchmod`s it and `renameat`s it into place. The ledger is written the same way afterwards (tmp, `fsync`, rename), so a save is one spawn and two renames, over one file |
+| the `$EDITOR` round trip (`I`) | lastcall is suspended for the whole of it: `term::leave()`, the editor's own `status()`, `term::enter()` on return. The keyboard-enhancement answer is a `OnceLock`, so the re-entry re-pushes the flags without re-asking and pays none of the 2 s above (F8, F18). The cost is the editor's, and the confirm on return is one comparison of the bytes |
+| a copy (`v`, then `y`) | **one OSC 52 write**, through the same `execute!` path as every other escape sequence the loop writes: `ESC ] 52 ; c ; <base64> BEL`, encoded in-process by `tui::clipboard::base64`. There is no reply to wait for, so there is nothing to time; a selection over `clipboard::CAP` (32 KiB raw, ≈ 43 KiB encoded) is **refused** rather than truncated |
+| where it could still get slow | hashing a very large buffer (the one spawn takes the whole file through stdin) and a terminal that is slow to swallow a 43 KiB OSC 52 payload. Neither has been measured, and neither is a scan cost |
 
 ## What the first run found
 

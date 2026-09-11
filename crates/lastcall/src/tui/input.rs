@@ -1362,7 +1362,7 @@ mod tests {
         let mut by_key = base.clone();
         let mut by_mouse = base;
 
-        for _ in 0..4 {
+        for _ in 0..5 {
             press_key(
                 &mut by_key,
                 &km,

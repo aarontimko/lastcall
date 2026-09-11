@@ -308,7 +308,7 @@ fn bench_s1_clones_100_rows_4000() {
     let mut pty = b.tui(&["tui", "--poll", "1"]);
     pty.wait_for(LONG, first_checked)
         .unwrap_or_else(|e| panic!("first root checked: {e}"));
-    bench(S, "first_pile_ms", t.elapsed().as_millis());
+    bench(S, "first_checked_ms", t.elapsed().as_millis());
     pty.wait_for_text("100 repos · 4,000 files", LONG)
         .unwrap_or_else(|e| panic!("header: {e}"));
     bench(S, "first_frame_ms", t.elapsed().as_millis());
@@ -385,7 +385,7 @@ fn bench_s1h_clones_50_files_80_rows_4000() {
     let mut pty = b.tui(&["tui", "--poll", "1"]);
     pty.wait_for(LONG, first_checked)
         .unwrap_or_else(|e| panic!("first root checked: {e}"));
-    bench(S, "first_pile_ms", t.elapsed().as_millis());
+    bench(S, "first_checked_ms", t.elapsed().as_millis());
     pty.wait_for_text("50 repos · 4,000 files", LONG)
         .unwrap_or_else(|e| panic!("header: {e}"));
     bench(S, "first_frame_ms", t.elapsed().as_millis());

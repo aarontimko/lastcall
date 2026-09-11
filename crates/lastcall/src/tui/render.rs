@@ -3200,7 +3200,7 @@ mod tests {
         // `^A` with nothing pending anywhere: the key answers `nothing to accept`.
         let mut clean = three_roots();
         for (name, paths) in [
-            ("alpha", &["f1", "f2"][..]),
+            ("alpha", &["f1", "f2", "src/parse.rs"][..]),
             ("beta", &["u1", "u2"][..]),
             ("notes", &["n2.md"][..]),
         ] {
@@ -3640,18 +3640,18 @@ mod tests {
         let mut pile = pile("alpha");
         pile.omitted = 7;
         pile.notices
-            .push("2 files shown · 7 more changed paths not scanned".to_owned());
+            .push("3 files shown · 7 more changed paths not scanned".to_owned());
         app.apply(pile_event("alpha", pile));
         let (frame, _) = frame_of(&app, 100, 30);
-        assert!(frame.contains("lastcall  3 repos · 5+ files"), "{frame}");
-        assert!(frame.contains("main · 2+ files"), "{frame}");
+        assert!(frame.contains("lastcall  3 repos · 6+ files"), "{frame}");
+        assert!(frame.contains("main · 3+ files"), "{frame}");
         assert!(
             frame.contains("main · 2 files"),
             "beta stays plain: {frame}"
         );
         app.select(Some(Selection::Root(root("alpha"))));
         let (frame, _) = frame_of(&app, 100, 30);
-        assert!(frame.contains("alpha  main · 2+ files"), "{frame}");
+        assert!(frame.contains("alpha  main · 3+ files"), "{frame}");
         assert!(frame.contains("7 more changed paths"), "{frame}");
     }
 
@@ -4105,7 +4105,7 @@ mod tests {
         app.apply(pile_event_seq(
             "alpha",
             1,
-            without(pile("alpha"), &["f1", "f2"]),
+            without(pile("alpha"), &["f1", "f2", "src/parse.rs"]),
         ));
         app.handle(Action::Herdr(HerdrUpdate::Connected {
             version: "0.8.2".to_owned(),

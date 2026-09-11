@@ -4381,7 +4381,7 @@ mod tests {
         );
         assert_eq!(
             by_key.accepting.as_ref().unwrap().files,
-            vec![(root("alpha"), 2), (root("beta"), 2), (root("notes"), 1)]
+            vec![(root("alpha"), 3), (root("beta"), 2), (root("notes"), 1)]
         );
     }
 
@@ -4413,7 +4413,7 @@ mod tests {
             app.accepted(vec![accepted_ok("alpha", 2, Pile::default())]),
             Changed::Yes
         );
-        assert_eq!(status(&app), "accepted 2 files in alpha");
+        assert_eq!(status(&app), "accepted 3 files in alpha");
         assert_eq!(
             app.selection,
             Some(Selection::Root(root("alpha"))),
@@ -4992,20 +4992,20 @@ mod tests {
     }
 
     #[test]
-    fn app_advance_wraps_to_first_remaining_row_when_last_by_path() {
+    fn app_advance_falls_to_the_row_above_when_last_by_path() {
         let mut app = three_roots();
-        app.select(Some(row("alpha", "f2")));
+        app.select(Some(row("alpha", "src/parse.rs")));
         app.handle(Action::AcceptFile);
         app.accepted(vec![accepted_ok(
             "alpha",
             2,
-            without(pile("alpha"), &["f2"]),
+            without(pile("alpha"), &["src/parse.rs"]),
         )]);
-        assert_eq!(status(&app), "accepted f2");
+        assert_eq!(status(&app), "accepted src/parse.rs");
         assert_eq!(
             app.selection,
-            Some(row("alpha", "f1")),
-            "wraps, not the Root entry"
+            Some(row("alpha", "f2")),
+            "the row above, not the Root entry"
         );
     }
 
@@ -5041,11 +5041,11 @@ mod tests {
             2,
             without(pile("alpha"), &["f2"]),
         )]);
-        assert_eq!(app.selection, Some(row("alpha", "f1")));
+        assert_eq!(app.selection, Some(row("alpha", "src/parse.rs")));
         app.handle(Action::AcceptFile);
         app.accepted(vec![accepted_ok("alpha", 3, Pile::default())]);
         assert_eq!(app.selection, Some(Selection::Root(root("alpha"))));
-        assert_eq!(status(&app), "accepted f1");
+        assert_eq!(status(&app), "accepted src/parse.rs");
         assert_eq!(app.nav_entries().len(), 3, "three empty repos, three rows");
     }
 
@@ -5141,7 +5141,7 @@ mod tests {
             accepted_ok("beta", 2, Pile::default()),
             accepted_ok("notes", 2, Pile::default()),
         ]);
-        assert_eq!(status(&app), "accepted 5 files in 3 repos");
+        assert_eq!(status(&app), "accepted 6 files in 3 repos");
     }
 
     #[test]
@@ -5224,6 +5224,7 @@ mod tests {
                 Selection::Root(root("alpha")),
                 row("alpha", "f1"),
                 row("alpha", "f2"),
+                row("alpha", "src/parse.rs"),
                 Selection::Root(root("beta")),
                 row("beta", "u1"),
                 row("beta", "u2"),
@@ -5288,11 +5289,11 @@ mod tests {
     #[test]
     fn app_last_row_falls_to_the_row_above_then_to_the_repo_row() {
         let mut app = three_roots();
-        app.select(Some(row("alpha", "f2")));
+        app.select(Some(row("alpha", "src/parse.rs")));
         let mut p = pile("alpha");
-        p.rows.retain(|r| r.path != b"f2");
+        p.rows.retain(|r| r.path != b"src/parse.rs");
         app.apply(pile_event("alpha", p));
-        assert_eq!(app.selection, Some(row("alpha", "f1")), "the row above");
+        assert_eq!(app.selection, Some(row("alpha", "f2")), "the row above");
         app.apply(pile_event("alpha", Pile::default()));
         assert_eq!(app.selection, Some(Selection::Root(root("alpha"))));
     }
@@ -5960,7 +5961,7 @@ mod tests {
             app.apply(pile_event_seq(
                 "alpha",
                 1,
-                without(pile("alpha"), &["f1", "f2"])
+                without(pile("alpha"), &["f1", "f2", "src/parse.rs"])
             ))
             .0,
             Changed::Yes,
@@ -6402,11 +6403,11 @@ mod tests {
             vec![root("alpha")],
             "a hidden root is not accepted behind the user's back"
         );
-        // And so do the confirm modal's numbers: alpha's two rows, alpha's name.
+        // And so do the confirm modal's numbers: alpha's three rows, alpha's name.
         let counts = app.counts_of(&AcceptScope::All);
         assert_eq!(counts.roots, vec!["alpha".to_owned()]);
         assert_eq!(
-            counts.files, 2,
+            counts.files, 3,
             "beta's two and notes' one are out of scope"
         );
 

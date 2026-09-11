@@ -2348,7 +2348,7 @@ mod tests {
             }),
             (Changed::Yes, None)
         );
-        assert_eq!(ui.app.roots[&root("alpha")].rows().len(), 2);
+        assert_eq!(ui.app.roots[&root("alpha")].rows().len(), 3);
         assert_eq!(ui.app.seq[&root("alpha")], 6);
     }
 
