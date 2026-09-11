@@ -411,3 +411,7 @@ bench:
     cargo build --release -p lastcall
     cargo test --release -p lastcall --test test_bench -- --ignored --nocapture --test-threads=1
     echo "--- bench done: paste the BENCH lines above into docs/dev/bench.md with the machine block, date and commit ---" >&2
+
+# cargo-deny against deny.toml: advisories, licences, bans (install: cargo install cargo-deny).
+audit:
+    cargo deny check advisories licenses bans

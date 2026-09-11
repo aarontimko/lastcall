@@ -1,0 +1,52 @@
+# Supply-chain and code scanning. While the repository is private this runs on a schedule
+# and on demand only: GitHub's code-scanning features are not available on a private repo
+# without Advanced Security, and macOS/Linux minutes are counted. When the repository goes
+# public (docs/dev/publishing.md), add `pull_request:` to this workflow and to ci.yml so
+# both run on every PR, and drop the `if:` guard on the CodeQL job.
+name: scans
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Mondays at 06:00 UTC.
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  # Advisories, licences and bans against deny.toml. Same three checks as `just audit`.
+  cargo-deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses bans
+
+  # CodeQL needs Advanced Security on a private repository, so it is skipped until the
+  # repository is public. Note that a payload without `repository` leaves the expression
+  # null, which reads as false and lets the job run: that is the harmless direction, the
+  # job fails fast with "code scanning is not enabled" rather than hiding a finding.
+  codeql:
+    if: ${{ !github.event.repository.private }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read the toolchain pin
+        id: pin
+        run: echo "channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.pin.outputs.channel }}
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: rust
+          build-mode: none
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:rust"
