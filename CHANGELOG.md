@@ -63,6 +63,22 @@ is a one-line notice, never a failure.
 - `lastcall watch` prints one line per event.
 - `lastcall config` prints the effective configuration and any notices.
 
+### Configuration
+
+- `~/.config/lastcall/config.toml` (`LASTCALL_CONFIG` and `XDG_CONFIG_HOME` honoured), and
+  no configuration at all is a supported way to run: the directory you launch in becomes the
+  directory that is watched.
+- What to watch (`parent_dirs`, `draft_dirs`, `draft_initial`), what to collapse
+  (`collapsed_globs`, `collapse_size_bytes`), what the watcher ignores (`ignore_globs`), and
+  what the `t` toggle starts as (`hide_empty_repos`).
+- Every key is rebindable in `[keys]`, one spec or a list per action, with `ctrl-`, `alt-`
+  and `shift-` prefixes. An entry replaces that action's defaults rather than adding to them.
+- Every key is optional and **an unknown key is an error**, naming the key and the line, so
+  a typo never silently does nothing. So are an unknown action, an unparsable key spec and
+  two actions bound to the same key, all reported by `lastcall config` before you are in a
+  full screen.
+- The whole surface: [`docs/config.md`](docs/config.md).
+
 ### Keeping it current
 
 - `lastcall update` replaces the binary with the newest release after checking its SHA-256
@@ -77,3 +93,28 @@ is a one-line notice, never a failure.
 macOS on Apple silicon and Intel, Linux on arm64 and x86_64. The Linux binaries need glibc
 2.35 or newer. Installation, checksums and attestation:
 [`docs/install.md`](docs/install.md).
+
+### Documentation
+
+[`docs/install.md`](docs/install.md) for getting the binary,
+[`docs/review-loop.md`](docs/review-loop.md) for the walkthrough,
+[`docs/config.md`](docs/config.md) for every key and environment variable, and
+[`docs/herdr.md`](docs/herdr.md) for the overlay.
+
+### Worth knowing in this release
+
+- **The state directory only grows.** Nothing collects old baselines yet. It is safe to
+  delete, whole or per repository; what you lose is the memory of what you have already
+  seen. Deleting it never touches a watched repository.
+- **Filesystem events are not available everywhere.** On some network filesystems and inside
+  some containers they do not arrive, and `lastcall tui --poll <seconds>` is the fallback.
+- **A restore replaces the file.** An editor holding that file open elsewhere is now looking
+  at stale contents and will overwrite the restore if you save from it; reload the buffer.
+- **A restore can refuse**, and says which file and why: one that changed since the screen
+  drew it, one git is holding open in a merge conflict, and one whose bytes git's own filters
+  do not reproduce exactly (a line-ending conversion or a clean filter that is not round trip
+  safe).
+- **`shift-i` blesses what is on disk.** Answering its confirmation accepts the file as it
+  stands when your editor exits, which is not necessarily only what you typed.
+- **Per-branch history is not kept.** What you have seen is recorded per repository, not per
+  branch, so switching branches re-presents work the other branch already had.

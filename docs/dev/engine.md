@@ -27,6 +27,12 @@ State lives under `LASTCALL_STATE_DIR` → `$XDG_STATE_HOME/lastcall` → `~/.lo
 Ids are the first 16 hex chars of SHA-256 over the canonicalized path.
 
 ```text
+<state>/update-check.json                            # the TUI's once-a-day update stamp: {checked_at,
+                                                     # latest, seen_version}. Written by the binary, not
+                                                     # the engine; tmp + rename, the ledger's idiom, so
+                                                     # two TUIs racing are last-writer-wins on the same
+                                                     # content (Amendment v1.10 item 2)
+<state>/exports/<root basename>/<YYYY-MM-DD>.md      # flags with nowhere to send them (§6.7, ruling P9)
 <state>/roots/<parent-id>/meta.json                  # the parent dir this group was discovered under
 <state>/roots/<parent-id>/repos/<root-id>/
     ledger.json      # schema 1.0 (§6.2): seen_tree, seen_at, overrides

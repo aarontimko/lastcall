@@ -26,6 +26,7 @@ just bench                  # the performance baseline on the release build (doc
 just snapshots-update       # rewrite the TUI snapshots, then prove they pass; read every diff
 just test-prepush           # what the pre-push hook runs: integration tier + 64-case proptests
 just hooks-install          # pre-commit = just lint && just test-unit; pre-push = just test-prepush
+just install-smoke          # docs/install.md's steps, executed in a container (Docker; exits 2 without it)
 ```
 
 Probes against the built binary: `just probe-config`, `just probe-hello`, `just probe-status`,
@@ -84,6 +85,27 @@ before touching `crates/lastcall/src/tui/` or either e2e test.
 
 Tiers, file naming, how skips are reported, and the isolation rules — including the sacred
 one: tests never touch the real herdr config or socket.
+
+### The user documentation: `docs/install.md`, `docs/config.md`, `docs/review-loop.md`, `docs/herdr.md`
+
+The public surface the README links to: installing, updating and uninstalling
+(`install.md`); every config key, `[keys]` action, `[herdr]` and `[update]` key and
+`LASTCALL_*` variable with its default (`config.md`); the launch-to-copy walkthrough with
+one screen per step from the `just probe-tui` fixture (`review-loop.md`); what the overlay
+adds, session discovery and the agent picker (`herdr.md`). Read the relevant page before
+changing anything a user can see, and update it in the same commit. **House style for all
+four, plus the README and `CHANGELOG.md`:** no em-dashes (commas, colons or a new sentence),
+no email addresses, no home paths, and none of the program's own process vocabulary — that
+stays in `docs/spec` and `docs/dev`.
+
+### The install smoke check: `just install-smoke`
+
+`docs/install.md`'s own steps, executed rather than trusted: `scripts/install-smoke.sh`
+downloads the release asset, checks it against `SHA256SUMS` and runs a real `lastcall
+update` inside a fresh container, on both Linux architectures by default so x86_64 never
+ships untested. It takes two real release tags, or `--from-dir ./dist` for a rehearsal's
+artifacts with no release needed. `--self-test` runs the version-arithmetic cases only, with
+no Docker and no network; without Docker the recipe exits 2.
 
 ### Going public: `docs/dev/publishing.md`
 
