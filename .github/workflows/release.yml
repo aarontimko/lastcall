@@ -38,9 +38,12 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Which legs to build, and the version the asset names carry. On a tag that version is the
-  # tag's own (so `v0.1.0-rc.1` and `v0.1.0` never collide inside SHA256SUMS); on a dispatch it
-  # is the crate's, which is what makes a rehearsal possible before any tag exists.
+  # Which legs to build, and the version the asset names carry. That version is always the
+  # crate's own, read out of `[workspace.package]`: a tag release and a rehearsal then name
+  # their assets identically, and `verify` below refuses any tag that is not `v<that version>`,
+  # so the asset name and the binary's `--version` can never drift apart. A release candidate
+  # carries its own crate version (`0.1.0-rc.1`), which is what keeps `v0.1.0-rc.1` and
+  # `v0.1.0` from colliding inside SHA256SUMS.
   plan:
     runs-on: ubuntu-latest
     outputs:
@@ -56,15 +59,16 @@ jobs:
       - id: plan
         run: |
           set -euo pipefail
+          # The crate takes its version from [workspace.package], so read it there. The dots
+          # in the section name are escaped: unescaped they are "any character", and a
+          # `[workspace_package]` section would match.
+          version="$(awk '/^\[workspace\.package\]/ { p = 1; next }
+                          p && /^\[/ { exit }
+                          p && /^version = / { gsub(/["[:space:]]/, "", $3); print $3; exit }' Cargo.toml)"
+          if [ -z "$version" ]; then echo "::error::no [workspace.package] version"; exit 1; fi
           if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
-            version="${GITHUB_REF_NAME#v}"
             legs=all
           else
-            # The crate takes its version from [workspace.package], so read it there.
-            version="$(awk '/^\[workspace\.package\]/ { p = 1; next }
-                            p && /^\[/ { exit }
-                            p && /^version = / { gsub(/["[:space:]]/, "", $3); print $3; exit }' Cargo.toml)"
-            if [ -z "$version" ]; then echo "::error::no [workspace.package] version"; exit 1; fi
             legs="${{ inputs.targets }}"
           fi
           linux='{"target":"x86_64-unknown-linux-gnu","os":"ubuntu-22.04"}'
@@ -77,8 +81,12 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "building $legs as version $version"
 
-  # Tag pushes only: the tag must be this crate's version, or a release candidate of it.
-  # Nothing else may produce a release, and no version-bump commit on main is needed for an rc.
+  # Tag pushes only: the tag must be exactly this crate's version, `v<version>` and nothing
+  # else. A release candidate is a crate version too (`0.1.0-rc.1`), so it needs its own
+  # version-bump commit and then matches this rule like any other release. The looser
+  # `v<version>-rc.*` form is gone on purpose: it accepted `v0.1.0-rc.`, `v0.1.0-rc.x` and
+  # `v0.1.0-rc.1-rc.2`, and, worse, it let an rc tag ship a binary whose `--version` said
+  # `0.1.0`, which no `lastcall update` would ever consider out of date.
   verify:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
@@ -90,17 +98,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master, 2026-09-03
         with:
           toolchain: ${{ steps.pin.outputs.channel }}
-      - name: The tag is v<crate version> or v<crate version>-rc.N
+      - name: The tag is exactly v<crate version>
         run: |
           set -euo pipefail
           version="$(cargo metadata --no-deps --format-version 1 \
             | jq -r '.packages[] | select(.name == "lastcall") | .version')"
           tag="${GITHUB_REF_NAME}"
-          case "$tag" in
-            "v$version") echo "$tag is the release of $version" ;;
-            "v$version"-rc.*) echo "$tag is a release candidate of $version" ;;
-            *) echo "::error::tag $tag is neither v$version nor v$version-rc.N"; exit 1 ;;
-          esac
+          if [ "$tag" != "v$version" ]; then
+            echo "::error::tag $tag is not v$version; bump [workspace.package].version first"
+            exit 1
+          fi
+          echo "$tag is the release of $version"
 
   # Once, on the cheapest runner: CI already gated the merge, and macOS minutes bill at 10x.
   checks:
@@ -186,10 +194,17 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           # A release candidate has no section of its own: it ships the notes of the version
           # it is a candidate for.
+          #
+          # The heading is matched literally, never as a regex: `want` is a version string
+          # full of dots, and `$0 ~ "^## " want` would read each one as "any character", so
+          # `## 0x1x0` would answer for `0.1.0`. `index` and `substr` compare bytes.
           for want in "$version" "${version%%-*}"; do
             awk -v want="$want" '
-              $0 ~ "^## " want "([ ]|$)" { inside = 1; next }
-              inside && /^## / { exit }
+              index($0, "## " want) == 1 &&
+                (length($0) == length(want) + 3 || substr($0, length(want) + 4, 1) == " ") {
+                inside = 1; next
+              }
+              inside && index($0, "## ") == 1 { exit }
               inside { print }
             ' CHANGELOG.md > body.md
             if [ -s body.md ]; then break; fi

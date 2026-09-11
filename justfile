@@ -424,5 +424,6 @@ audit:
 #   just install-smoke                      # the latest release, updating to the next patch
 #   just install-smoke v0.1.0 v0.1.1        # two real releases
 #   just install-smoke --from-dir ./dist    # a rehearsal's artifacts, no release needed
+#   just install-smoke --self-test          # next_version's cases only: no docker, no network
 install-smoke *ARGS:
     scripts/install-smoke.sh {{ARGS}}

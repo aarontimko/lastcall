@@ -518,8 +518,13 @@ Apple-silicon host: without it, x86_64 Linux would ship untested. `--from-dir <d
 the assets from disk instead of the network, which is how the pipeline is exercised before
 any release exists. With no second release named, the smoke serves the installed binary back
 under the next patch version, so the update path is still driven end to end; naming a second
-real release additionally proves `--version` changes. No Docker, or no daemon: the recipe
-says so and exits 2. It is a recipe, never a test: nothing in any tier reaches the network.
+real release additionally proves `--version` changes. The version it serves back is
+`next_version`'s: the next patch for a release, and for a release candidate the release it is
+a candidate for, since `0.1.0-rc.1` sorts below `0.1.0`. That is the one piece of arithmetic
+in the script that could be wrong quietly, so `scripts/install-smoke.sh --self-test` checks it
+against a table of cases and exits, with no Docker and nothing downloaded. No Docker, or no
+daemon: the recipe says so and exits 2. It is a recipe, never a test: nothing in any tier
+reaches the network.
 
 ## Not a gate: `test_perf_scan`
 

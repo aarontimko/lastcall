@@ -27,6 +27,9 @@
 #   --platform    run one platform instead of both. Both is the point: without the amd64 leg
 #                 on an Apple-silicon host (Rosetta or QEMU), x86_64 Linux ships untested.
 #   --keep        keep the scratch directory and print its path.
+#   --self-test   check `next_version` against its table of cases and exit. No docker, no
+#                 network, nothing downloaded: it is the one piece of arithmetic in here that
+#                 can be wrong quietly, so it has its own cases.
 #
 # Two environment overrides, for a machine that cannot reach Docker Hub or a fork:
 # `LASTCALL_SMOKE_IMAGE` (default `ubuntu:24.04`) and `LASTCALL_SMOKE_REPO`
@@ -40,6 +43,7 @@ port=8099
 platforms=(linux/amd64 linux/arm64)
 from_dir=""
 keep=0
+self_test=0
 args=()
 
 die() { echo "install-smoke: $*" >&2; exit 1; }
@@ -49,7 +53,8 @@ while [ $# -gt 0 ]; do
         --from-dir) [ $# -ge 2 ] || die "--from-dir needs a directory"; from_dir="$2"; shift 2 ;;
         --platform) [ $# -ge 2 ] || die "--platform needs a value"; platforms=("$2"); shift 2 ;;
         --keep) keep=1; shift ;;
-        -h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --self-test) self_test=1; shift ;;
+        -h|--help) sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         --*) die "unknown option $1" ;;
         *) args+=("$1"); shift ;;
     esac
@@ -57,6 +62,45 @@ done
 
 tag="${args[0]:-}"
 newer_tag="${args[1]:-}"
+
+# The next version after this one: a prerelease is followed by the version it is a candidate
+# for, anything else by the next patch. A release candidate carries its own crate version now
+# (`0.1.0-rc.1` really reports `0.1.0-rc.1`), so the release it is a candidate for, `0.1.0`, is
+# the newer one to serve it: `update` compares them by SemVer precedence, where a prerelease
+# sorts below the release it precedes.
+next_version() {
+    local v="$1"
+    case "$v" in
+        *-*) echo "${v%%-*}"; return ;;
+    esac
+    local major="${v%%.*}" rest="${v#*.}" minor patch
+    minor="${rest%%.*}"; patch="${rest#*.}"
+    echo "${major}.${minor}.$((patch + 1))"
+}
+
+if [ "$self_test" = 1 ]; then
+    fails=0
+    while read -r given want; do
+        [ -n "$given" ] || continue
+        got="$(next_version "$given")"
+        if [ "$got" = "$want" ]; then
+            echo "ok   next_version $given -> $got"
+        else
+            echo "FAIL next_version $given -> $got, wanted $want"
+            fails=$((fails + 1))
+        fi
+    done <<'CASES'
+0.1.0-rc.1 0.1.0
+0.1.0-rc.10 0.1.0
+1.4.2-beta.3 1.4.2
+0.1.0 0.1.1
+1.2.9 1.2.10
+0.9.99 0.9.100
+CASES
+    [ "$fails" = 0 ] || die "$fails next_version case(s) failed"
+    echo "install-smoke: next_version self-test passed"
+    exit 0
+fi
 
 command -v docker >/dev/null 2>&1 || { echo "install-smoke: docker is not installed; the container legs cannot run" >&2; exit 2; }
 docker info >/dev/null 2>&1 || { echo "install-smoke: the docker daemon is not running; start it and try again" >&2; exit 2; }
@@ -67,18 +111,6 @@ cleanup() {
     [ -n "${work:-}" ] && [ -d "$work" ] && rm -r -- "$work"
 }
 trap cleanup EXIT
-
-# The next version after this one: a prerelease is followed by the version it is a candidate
-# for, anything else by the next patch.
-next_version() {
-    local v="$1"
-    case "$v" in
-        *-*) echo "${v%%-*}"; return ;;
-    esac
-    local major="${v%%.*}" rest="${v#*.}" minor patch
-    minor="${rest%%.*}"; patch="${rest#*.}"
-    echo "${major}.${minor}.$((patch + 1))"
-}
 
 target_for() {
     case "$1" in
