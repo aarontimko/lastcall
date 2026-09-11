@@ -484,6 +484,32 @@ To adopt a new herdr: bump `herdr_version` in the `justfile`, run `just herdr-sc
 read the fixture diff and update `consumed-surface.json.provenance.md`, then
 `just test-integration-herdr`.
 
+## Not a tier: the install smoke (`just install-smoke`)
+
+`scripts/install-smoke.sh` is the proxy for the one thing no tier can cover: a machine that
+has never seen this project installing a published binary. Every tier runs against the built
+tree with the toolchain already on the box, so nothing else would notice an asset that was
+never uploaded, a `SHA256SUMS` whose names do not match the assets, a binary that needs a
+glibc the target does not have, or an update path that works only where it was compiled.
+
+Each leg starts an empty `ubuntu:24.04` container, installs `curl` and `ca-certificates`,
+downloads the asset and `SHA256SUMS`, verifies the checksum, runs `--version`, then serves a
+newer release from `python3 -m http.server` **inside** the container (the update path's test
+base URL is loopback-only, which is why the server has to be in there) and drives
+`lastcall update --check` and `lastcall update` against it. The layout it serves is the one
+`commands/update.rs` asks for: `repos/<owner>/<repo>/releases/latest` for the API answer and
+`<owner>/<repo>/releases/download/<tag>/<asset>` for the bytes, the same shape as the probe
+`curl` above. The updated binary's digest is compared with the served asset's, so the run
+proves the replacement really is what was downloaded and verified.
+
+Both `linux/amd64` and `linux/arm64` run by default, the first under emulation on an
+Apple-silicon host: without it, x86_64 Linux would ship untested. `--from-dir <dir>` takes
+the assets from disk instead of the network, which is how the pipeline is exercised before
+any release exists. With no second release named, the smoke serves the installed binary back
+under the next patch version, so the update path is still driven end to end; naming a second
+real release additionally proves `--version` changes. No Docker, or no daemon: the recipe
+says so and exits 2. It is a recipe, never a test: nothing in any tier reaches the network.
+
 ## Not a gate: `test_perf_scan`
 
 `crates/lastcall-engine/tests/test_perf_scan.rs` is `#[ignore]`d evidence, not a tier: 2,000

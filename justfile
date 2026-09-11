@@ -415,3 +415,14 @@ bench:
 # cargo-deny against deny.toml: advisories, licences, bans (install: cargo install cargo-deny).
 audit:
     cargo deny check advisories licenses bans
+
+# The fresh-container install smoke: `ubuntu:24.04` with nothing on it installs a published
+# asset, verifies its checksum, runs it, and takes an update from a release served inside the
+# container (scripts/install-smoke.sh has the detail). Both platforms by default, because
+# without the amd64 leg on an Apple-silicon host x86_64 Linux would ship untested. Exits 2
+# when Docker is not there or not running.
+#   just install-smoke                      # the latest release, updating to the next patch
+#   just install-smoke v0.1.0 v0.1.1        # two real releases
+#   just install-smoke --from-dir ./dist    # a rehearsal's artifacts, no release needed
+install-smoke *ARGS:
+    scripts/install-smoke.sh {{ARGS}}
