@@ -155,8 +155,38 @@ impl Ord for Version {
                 // Semver's one counter-intuitive rule: 0.1.0 is newer than 0.1.0-rc.1.
                 (None, Some(_)) => Ordering::Greater,
                 (Some(_), None) => Ordering::Less,
-                (Some(a), Some(b)) => a.cmp(b),
+                (Some(a), Some(b)) => cmp_prerelease(a, b),
             })
+    }
+}
+
+/// Compare two prerelease tags the way SemVer §11.4 says, not the way strings sort.
+///
+/// Dot-separated identifiers, left to right: two numbers compare as numbers (`rc.10` is
+/// after `rc.9`, which a string comparison gets backwards), a number is always lower than
+/// an alphanumeric identifier, and a tag that runs out of identifiers first is the lower
+/// one. Equal-by-precedence tags that are not the same text (`rc.01` and `rc.1`) fall back
+/// to the text so that this order stays consistent with `Eq`.
+fn cmp_prerelease(a: &str, b: &str) -> Ordering {
+    let mut left = a.split('.');
+    let mut right = b.split('.');
+    loop {
+        let ord = match (left.next(), right.next()) {
+            (None, None) => return a.cmp(b),
+            // "A larger set of pre-release fields has a higher precedence."
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(x), Some(y)) => match (x.parse::<u64>(), y.parse::<u64>()) {
+                (Ok(x), Ok(y)) => x.cmp(&y),
+                // "Numeric identifiers always have lower precedence than alphanumeric."
+                (Ok(_), Err(_)) => Ordering::Less,
+                (Err(_), Ok(_)) => Ordering::Greater,
+                (Err(_), Err(_)) => x.cmp(y),
+            },
+        };
+        if ord != Ordering::Equal {
+            return ord;
+        }
     }
 }
 
@@ -293,19 +323,46 @@ fn sha256_file(path: &Path) -> io::Result<String> {
 // Refusals
 // ---------------------------------------------------------------------------------------
 
+/// The refusal a package-manager-owned path earns, or `None`. Reads `CARGO_HOME` and
+/// `HOME`; [`refusal_under`] is the same rule with both handed in.
+pub fn refusal_for(path: &Path) -> Option<String> {
+    refusal_under(
+        path,
+        std::env::var_os("HOME").map(PathBuf::from).as_deref(),
+        std::env::var_os("CARGO_HOME").map(PathBuf::from).as_deref(),
+    )
+}
+
 /// The refusal a package-manager-owned path earns, or `None`.
 ///
 /// Nothing on disk records how a binary was installed, so the path is the only evidence
 /// there is. Both the `current_exe` path and its `canonicalize`d form are checked by the
 /// caller: `/usr/local/bin/lastcall` is a symlink into the Cellar on an Intel Mac.
-pub fn refusal_for(path: &Path) -> Option<String> {
+///
+/// cargo's bin directory is `$CARGO_HOME/bin/` and `$HOME/.cargo/bin/`: both, because a
+/// `CARGO_HOME` set today says nothing about where `cargo install` put a binary last year,
+/// and anchored to one of the two because `.cargo/bin` further down somebody's tree is a
+/// directory they keep their own tools in, not an installation to refuse to update.
+pub fn refusal_under(
+    path: &Path,
+    home: Option<&Path>,
+    cargo_home: Option<&Path>,
+) -> Option<String> {
     let text = path.to_string_lossy();
     let text = text.as_ref();
     let under = |prefix: &str| text == prefix.trim_end_matches('/') || text.starts_with(prefix);
     if under("/opt/homebrew/") || under("/usr/local/Cellar/") || under("/home/linuxbrew/") {
         return Some("installed by Homebrew — run: brew upgrade lastcall".to_owned());
     }
-    if text.contains("/.cargo/bin/") {
+    let cargo_bins = [
+        cargo_home.map(|dir| dir.join("bin")),
+        home.map(|dir| dir.join(".cargo").join("bin")),
+    ];
+    if cargo_bins
+        .into_iter()
+        .flatten()
+        .any(|dir| under(&format!("{}/", dir.display())))
+    {
         return Some(
             "installed by cargo — run: cargo install --git https://github.com/aarontimko/lastcall --force"
                 .to_owned(),
@@ -336,12 +393,19 @@ pub enum Base {
 /// An environment variable that can point a self-updater at an arbitrary host is a remote
 /// code path whose checksum "verifies" (the checksum comes from the same host), and a herdr
 /// layout can put environment into a pane. Loopback cannot be another machine.
+///
+/// The path has to be exactly `/`: the server the smoke and the tests run answers at the
+/// root, and a value carrying a path tail (`/../`, `/x/y`) is a shape nobody needs and one
+/// more thing for a reader of this function to have to reason about.
 pub fn loopback_base(raw: &str) -> Option<String> {
     let rest = raw.strip_prefix("http://")?;
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, ""),
     };
+    if !path.is_empty() && path != "/" {
+        return None;
+    }
     let (host, port) = authority.rsplit_once(':')?;
     if host != "127.0.0.1" && host != "localhost" {
         return None;
@@ -349,11 +413,7 @@ pub fn loopback_base(raw: &str) -> Option<String> {
     if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    let mut url = format!("http://{host}:{port}{path}");
-    if !url.ends_with('/') {
-        url.push('/');
-    }
-    Some(url)
+    Some(format!("http://{host}:{port}/"))
 }
 
 impl Base {
@@ -477,6 +537,20 @@ pub fn split_headers(raw: &str) -> (Vec<String>, String) {
     (last, rest.to_owned())
 }
 
+/// Split what curl wrote on stdout into the status `-w '%{http_code}'` appended and the
+/// response that came before it, or `None` when the last three bytes are not a status.
+///
+/// Takes bytes, not a `String`: curl is a program on `PATH`, whatever is answering to that
+/// name may print anything, and slicing three bytes off the end of a `String` panics the
+/// moment the output ends inside a multi-byte character. The response is made lossy only
+/// after the split, where a replacement character can do no harm.
+pub fn parse_curl_output(stdout: &[u8]) -> Option<(u16, Vec<String>, String)> {
+    let cut = stdout.len().saturating_sub(3);
+    let status: u16 = std::str::from_utf8(&stdout[cut..]).ok()?.parse().ok()?;
+    let (headers, body) = split_headers(&String::from_utf8_lossy(&stdout[..cut]));
+    Some((status, headers, body))
+}
+
 /// The one network call in the program. `dest` writes the body to a file instead of
 /// returning it.
 pub fn fetch(url: &str, dest: Option<&Path>) -> Result<Fetched, Fail> {
@@ -488,18 +562,25 @@ pub fn fetch(url: &str, dest: Option<&Path>) -> Result<Fetched, Fail> {
         }
         Err(e) => return Err(Fail::stop(format!("could not run curl: {e}"))),
     };
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    // `-w '%{http_code}'` puts exactly three digits last, whatever else happened.
-    let cut = stdout.len().saturating_sub(3);
-    let status: u16 = stdout[cut..].parse().map_err(|_| {
-        let why = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    let why = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    let because = |what: String| {
         Fail::stop(if why.is_empty() {
-            format!("could not reach {url}")
+            what
         } else {
-            format!("could not reach {url}: {why}")
+            format!("{what}: {why}")
         })
-    })?;
-    let (headers, body) = split_headers(&stdout[..cut]);
+    };
+    // Curl's own verdict comes first. A stalled or truncated download exits non-zero with
+    // whatever it managed to write: reading that as a response turns "the transfer died" into
+    // "checksum mismatch", which tells a user on a bad link that the release is corrupt.
+    if !output.status.success() {
+        return Err(because(match output.status.code() {
+            Some(code) => format!("curl exited {code} fetching {url}"),
+            None => format!("curl was killed fetching {url}"),
+        }));
+    }
+    let (status, headers, body) = parse_curl_output(&output.stdout)
+        .ok_or_else(|| because(format!("could not reach {url}")))?;
     Ok(Fetched {
         status,
         headers,
@@ -566,9 +647,11 @@ fn probe_writable(dir: &Path) -> Result<(), Fail> {
         .truncate(true)
         .open(&probe);
     let _ = std::fs::remove_file(&probe);
+    // The io error verbatim: a read-only directory, a full disk and a name already taken by
+    // a directory are three different problems, and only one of them is a permission.
     opened
         .map(|_| ())
-        .map_err(|_| Fail::stop(format!("cannot write {}: permission denied", dir.display())))
+        .map_err(|e| Fail::stop(format!("cannot write {}: {e}", dir.display())))
 }
 
 /// Claim a temp name with `O_EXCL`, so two `lastcall update`s cannot write one file.
@@ -601,9 +684,13 @@ fn download_and_replace(base: &Base, release: &Release, canonical: &Path) -> Res
     let pid = std::process::id();
     let tmp_asset = dir.join(format!(".lastcall-update-{pid}"));
     let tmp_sums = dir.join(format!(".lastcall-update-{pid}.sums"));
-    let _guard = TempFiles(vec![tmp_asset.clone(), tmp_sums.clone()]);
+    // A file joins the guard only once this process has created it. Built any earlier, an
+    // `already exists (another update, or a crashed one: delete it)` refusal would delete
+    // the very file it just told the reader to look at.
     claim(&tmp_asset)?;
+    let mut guard = TempFiles(vec![tmp_asset.clone()]);
     claim(&tmp_sums)?;
+    guard.0.push(tmp_sums.clone());
 
     let asset_url = base.download_url(&release.tag, &asset);
     let got = fetch(&asset_url, Some(&tmp_asset))?;
@@ -724,6 +811,41 @@ fn write_stamp(path: &Path, stamp: &Stamp) -> io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+/// What the stamp on disk says about today's check: either it still answers, or a lookup is
+/// due. Returned by [`stamp_verdict`], which is the whole throttle and is therefore the part
+/// worth testing without a network or a clock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    /// Inside the day and written by this binary: this is the answer, spend no request.
+    Answered(Option<String>),
+    /// Older than a day, absent, unreadable, or written by a different binary.
+    Due,
+}
+
+/// Whether `stamp` still answers for `current` at `now`.
+///
+/// Two things make a lookup due. The stamp being older than [`CHECK_INTERVAL`] is the
+/// once-a-day rule. `seen_version` differing from the running binary is the other: after
+/// `lastcall update` has replaced the binary, the stamp it inherits still names the release
+/// this process now **is**, and answering from it would announce an update to the version
+/// already running.
+pub fn stamp_verdict(stamp: Option<&Stamp>, now: u64, current: &Version) -> Verdict {
+    let Some(stamp) = stamp else {
+        return Verdict::Due;
+    };
+    if now.saturating_sub(stamp.checked_at) >= CHECK_INTERVAL.as_secs() {
+        return Verdict::Due;
+    }
+    if stamp.seen_version != current.to_string() {
+        return Verdict::Due;
+    }
+    Verdict::Answered(
+        Version::parse(stamp.latest.as_deref().unwrap_or_default())
+            .filter(|version| version > current)
+            .map(|version| version.to_string()),
+    )
+}
+
 /// The background check (rule 2.6). Returns the newer version to announce, or `None`.
 ///
 /// Never called on the launch path: the TUI spawns it on a detached thread once the launch
@@ -735,17 +857,10 @@ pub fn daily_check(state_dir: &Path, quitting: &dyn Fn() -> bool) -> Option<Stri
     let current = Version::parse(CURRENT)?;
     let path = state_dir.join(STAMP_FILE);
     let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
-    let newer = |latest: &Option<String>| -> Option<String> {
-        let version = Version::parse(latest.as_deref()?)?;
-        (version > current).then(|| version.to_string())
-    };
-    if let Some(stamp) = read_stamp(&path) {
-        let fresh = now.saturating_sub(stamp.checked_at) < CHECK_INTERVAL.as_secs();
-        if fresh && stamp.seen_version == CURRENT {
-            // Inside the day: the answer is whatever the last lookup wrote, so a restart
-            // keeps showing the notice without spending a request.
-            return newer(&stamp.latest);
-        }
+    if let Verdict::Answered(latest) = stamp_verdict(read_stamp(&path).as_ref(), now, &current) {
+        // Inside the day: the answer is whatever the last lookup wrote, so a restart keeps
+        // showing the notice without spending a request.
+        return latest;
     }
     // Deliberately `Base::Default`: the daily check never reads LASTCALL_UPDATE_BASE_URL
     // (rule 2.9). A test reaches it by putting the probe `curl` on PATH, not by redirecting
@@ -824,6 +939,27 @@ mod tests {
         // The rule that catches everyone: the release beats its own candidates.
         assert!(v("0.1.0") > v("0.1.0-rc.2"));
         assert!(v("0.1.0-rc.2") > v("0.1.0-rc.1"));
+        // SemVer 11.4: a numeric identifier compares as a number, which a string comparison
+        // gets backwards the moment there are ten of anything.
+        assert!(v("0.1.0-rc.10") > v("0.1.0-rc.9"), "rc.10 follows rc.9");
+        // The spec's own ladder, in order.
+        let ladder = [
+            "1.0.0-alpha",
+            "1.0.0-alpha.1",
+            "1.0.0-alpha.beta",
+            "1.0.0-beta",
+            "1.0.0-beta.2",
+            "1.0.0-beta.11",
+            "1.0.0-rc.1",
+            "1.0.0",
+        ];
+        for pair in ladder.windows(2) {
+            assert!(v(pair[0]) < v(pair[1]), "{} < {}", pair[0], pair[1]);
+        }
+        // A number is always lower than a word, and a shorter tag is lower than the longer
+        // one it prefixes.
+        assert!(v("1.0.0-1") < v("1.0.0-alpha"));
+        assert!(v("1.0.0-alpha") < v("1.0.0-alpha.0"));
         assert_eq!(v("0.1.0"), v("0.1.0"));
         assert_eq!(v("0.1.0-rc.1").to_string(), "0.1.0-rc.1");
         assert_eq!(v("0.1.0").to_string(), "0.1.0");
@@ -852,6 +988,13 @@ mod tests {
         );
         // …but not an rc of a *different* triple.
         assert_eq!(choose(&rc, &[release("v0.3.0-rc.1", true)]), None);
+        // The tenth candidate really is offered to the ninth (verifier (a) F3).
+        assert_eq!(
+            choose(&v("0.1.0-rc.9"), &[release("v0.1.0-rc.10", true)])
+                .unwrap()
+                .tag,
+            "v0.1.0-rc.10"
+        );
         // Never a downgrade, never a sideways move.
         assert_eq!(choose(&v("0.1.1"), &[release("v0.1.0", false)]), None);
         assert_eq!(choose(&v("0.1.1"), &[release("v0.1.1", false)]), None);
@@ -934,27 +1077,53 @@ ef lastcall-0.1.0-x86_64-unknown-linux-gnu
 
     #[test]
     fn update_refuses_package_manager_paths_on_the_path_strings() {
+        let home = Path::new("/home/a");
+        let refuse = |path: &str| refusal_under(Path::new(path), Some(home), None);
         for path in [
             "/opt/homebrew/bin/lastcall",
             "/usr/local/Cellar/lastcall/0.1.0/bin/lastcall",
             "/home/linuxbrew/.linuxbrew/bin/lastcall",
         ] {
-            let refusal = refusal_for(Path::new(path)).expect(path);
+            let refusal = refuse(path).expect(path);
             assert!(refusal.contains("brew upgrade lastcall"), "{refusal}");
         }
-        let cargo = refusal_for(Path::new("/home/a/.cargo/bin/lastcall")).expect("cargo");
+        let cargo = refuse("/home/a/.cargo/bin/lastcall").expect("cargo");
         assert!(cargo.contains("cargo install --git"), "{cargo}");
         assert!(cargo.contains("--force"), "{cargo}");
-        let nix =
-            refusal_for(Path::new("/nix/store/abc-lastcall-0.1.0/bin/lastcall")).expect("nix");
+        let nix = refuse("/nix/store/abc-lastcall-0.1.0/bin/lastcall").expect("nix");
         assert!(nix.contains("nix"), "{nix}");
         // Everything else updates itself.
-        assert_eq!(refusal_for(Path::new("/usr/local/bin/lastcall")), None);
-        assert_eq!(refusal_for(Path::new("/home/a/bin/lastcall")), None);
-        assert_eq!(refusal_for(Path::new("/home/a/.local/bin/lastcall")), None);
+        assert_eq!(refuse("/usr/local/bin/lastcall"), None);
+        assert_eq!(refuse("/home/a/bin/lastcall"), None);
+        assert_eq!(refuse("/home/a/.local/bin/lastcall"), None);
         // Not a prefix match on a lookalike directory.
-        assert_eq!(refusal_for(Path::new("/opt/homebrewery/lastcall")), None);
-        assert_eq!(refusal_for(Path::new("/nix/storage/lastcall")), None);
+        assert_eq!(refuse("/opt/homebrewery/lastcall"), None);
+        assert_eq!(refuse("/nix/storage/lastcall"), None);
+        // Verifier (a) F13. cargo's bin directory is anchored: `.cargo/bin` further down
+        // somebody's tree is a directory they keep their own tools in, not an installation
+        // this program may refuse to update.
+        assert_eq!(refuse("/home/a/work/vendor/.cargo/bin/lastcall"), None);
+        assert_eq!(
+            refusal_under(Path::new("/home/a/.cargo/bin/lastcall"), None, None),
+            None,
+            "with neither HOME nor CARGO_HOME there is no cargo prefix to anchor to"
+        );
+        // …and `CARGO_HOME` somewhere else is a cargo installation too. Both count: where
+        // `CARGO_HOME` points today says nothing about where `cargo install` put a binary
+        // last year.
+        let elsewhere = Path::new("/opt/ci/cargo");
+        for path in ["/opt/ci/cargo/bin/lastcall", "/home/a/.cargo/bin/lastcall"] {
+            let moved = refusal_under(Path::new(path), Some(home), Some(elsewhere)).expect(path);
+            assert!(moved.contains("cargo install --git"), "{moved}");
+        }
+        assert_eq!(
+            refusal_under(
+                Path::new("/opt/ci/cargo/bin/lastcall"),
+                Some(home),
+                Some(Path::new("/opt/other"))
+            ),
+            None
+        );
     }
 
     #[test]
@@ -968,11 +1137,8 @@ ef lastcall-0.1.0-x86_64-unknown-linux-gnu
             Some("http://localhost:9/"),
             "a missing trailing slash is added, not rejected"
         );
-        assert_eq!(
-            loopback_base("http://127.0.0.1:8080/serve").as_deref(),
-            Some("http://127.0.0.1:8080/serve/")
-        );
-        // Everything that could be another machine.
+        // Everything that could be another machine, and (verifier (a) F14) everything that
+        // carries a path: the served layout starts at the root and nothing needs a tail.
         for raw in [
             "https://127.0.0.1:8080/",
             "http://127.0.0.2:8080/",
@@ -983,6 +1149,9 @@ ef lastcall-0.1.0-x86_64-unknown-linux-gnu
             "http://user@127.0.0.1:8080/",
             "127.0.0.1:8080",
             "",
+            "http://127.0.0.1:8080/serve",
+            "http://127.0.0.1:8080/serve/",
+            "http://127.0.0.1:8080/../",
         ] {
             assert_eq!(loopback_base(raw), None, "{raw} must not be honoured");
         }
@@ -1092,5 +1261,101 @@ ef lastcall-0.1.0-x86_64-unknown-linux-gnu
             );
             assert_eq!(host_target_label(), target);
         }
+    }
+
+    /// Verifier (a) F5: whatever answers to the name `curl` on `PATH` can print anything,
+    /// and taking three bytes off the end of a `String` panics the moment the output ends
+    /// inside a multi-byte character.
+    #[test]
+    fn update_curl_output_is_parsed_as_bytes_not_as_a_string() {
+        assert_eq!(
+            parse_curl_output("HTTP/1.1 200 OK\r\n\r\n{}200".as_bytes()),
+            Some((200, vec!["HTTP/1.1 200 OK".to_owned()], "{}".to_owned()))
+        );
+        // Two accented characters and nothing else: the old byte slice landed inside one.
+        assert_eq!(parse_curl_output("éé".as_bytes()), None);
+        assert_eq!(
+            parse_curl_output("é404".as_bytes()),
+            Some((404, vec![], "é".to_owned()))
+        );
+        // Invalid UTF-8 in the body is replaced, not fatal.
+        let (status, _, body) = parse_curl_output(b"\xff\xfe200").expect("a status is a status");
+        assert_eq!(status, 200);
+        assert_eq!(body.chars().filter(|c| *c == '\u{fffd}').count(), 2);
+        // Nothing, or nothing that ends in three digits.
+        assert_eq!(parse_curl_output(b""), None);
+        assert_eq!(parse_curl_output(b"ok"), None);
+        assert_eq!(parse_curl_output(b"no status here"), None);
+    }
+
+    /// Verifier (a) F6: three different problems were all reported as a permission.
+    #[test]
+    fn update_write_probe_reports_the_io_error_it_got() {
+        let missing = Path::new("/nonexistent-lastcall-update-probe-dir");
+        let fail = probe_writable(missing).expect_err("a directory that is not there");
+        assert_eq!(fail.code, 2);
+        assert!(fail.message.starts_with("cannot write "), "{fail}");
+        assert!(
+            fail.message.contains(&missing.display().to_string()),
+            "{fail}"
+        );
+        assert!(
+            !fail.message.ends_with("permission denied"),
+            "a missing directory is not a permission: {fail}"
+        );
+    }
+
+    /// Verifier (a) F9: the throttle, and the branch that makes a replaced binary look
+    /// again instead of offering the release it now is.
+    #[test]
+    fn update_daily_stamp_answers_for_a_day_and_only_for_this_binary() {
+        let current = v("0.1.0");
+        let day = CHECK_INTERVAL.as_secs();
+        let now = 1_757_600_000;
+        let stamp = |age: u64, latest: Option<&str>, seen: &str| Stamp {
+            checked_at: now - age,
+            latest: latest.map(str::to_owned),
+            seen_version: seen.to_owned(),
+        };
+
+        // No stamp at all, and a stamp older than a day.
+        assert_eq!(stamp_verdict(None, now, &current), Verdict::Due);
+        assert_eq!(
+            stamp_verdict(Some(&stamp(day, Some("0.1.1"), "0.1.0")), now, &current),
+            Verdict::Due,
+            "a day old to the second is due"
+        );
+        assert_eq!(
+            stamp_verdict(
+                Some(&stamp(25 * 3600, Some("0.1.1"), "0.1.0")),
+                now,
+                &current
+            ),
+            Verdict::Due
+        );
+        // Inside the day: the answer comes off the disk, and no request is spent.
+        assert_eq!(
+            stamp_verdict(Some(&stamp(3600, Some("0.1.1"), "0.1.0")), now, &current),
+            Verdict::Answered(Some("0.1.1".to_owned()))
+        );
+        // …including when what it saw is not newer, or is not a version at all.
+        for latest in [None, Some("0.1.0"), Some("0.0.9"), Some("nightly")] {
+            assert_eq!(
+                stamp_verdict(Some(&stamp(3600, latest, "0.1.0")), now, &current),
+                Verdict::Answered(None),
+                "{latest:?}"
+            );
+        }
+        // The branch `lastcall update` creates: the stamp is fresh, but it was written by
+        // the binary this one replaced, so it still names the version now running.
+        assert_eq!(
+            stamp_verdict(Some(&stamp(60, Some("0.1.0"), "0.0.9")), now, &current),
+            Verdict::Due,
+            "a stamp from another binary never answers"
+        );
+        assert_eq!(
+            stamp_verdict(Some(&stamp(60, Some("0.2.0"), "0.1.0-rc.1")), now, &current),
+            Verdict::Due
+        );
     }
 }

@@ -1397,7 +1397,7 @@ sibling lib test scanning on a subscriber-free thread would poison it.
 
 ```sh
 rg -n 'Command::new\("git"\)' crates                       # engine git.rs, plus the testkit's fixture builder; nothing under tui/
-rg -n 'std::env::var|home_dir\(' crates/lastcall/src        # tui/term.rs: the two LASTCALL_LOG* reads and LASTCALL_KEYBOARD; tui/run.rs: the $VISUAL/$EDITOR closure it hands EditorCommand::resolve; commands/mod.rs: LASTCALL_PARALLELISM (test-only override, never under tui/); tui/textbuf.rs: PROPTEST_CASES, inside #[cfg(test)]; commands/update.rs: LASTCALL_UPDATE_BASE_URL, honoured only for loopback and only by the explicit command
+rg -n 'std::env::var|home_dir\(' crates/lastcall/src        # tui/term.rs: the two LASTCALL_LOG* reads and LASTCALL_KEYBOARD; tui/run.rs: the $VISUAL/$EDITOR closure it hands EditorCommand::resolve; commands/mod.rs: LASTCALL_PARALLELISM (test-only override, never under tui/); tui/textbuf.rs: PROPTEST_CASES, inside #[cfg(test)]; commands/update.rs: LASTCALL_UPDATE_BASE_URL, honoured only for loopback and only by the explicit command, plus HOME and CARGO_HOME for the package-manager refusals
 rg -n 'lock\(' crates/lastcall/src/tui                      # nothing
 rg -n 'Rendered::of' crates/lastcall/src                    # only tui/app.rs (requests come from the held rows)
 rg -n 'last_pile|scan_all\(|\.scan\(' crates/lastcall/src/tui/app.rs   # nothing (the reducer never scans)

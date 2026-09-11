@@ -111,6 +111,17 @@ impl Scene {
         self.dir.path().join("probe")
     }
 
+    /// Put a stand-in of our own where the probe `curl` is, for the failures the probe does
+    /// not model. The tracked probe is reached through a **symlink** here, so it is removed
+    /// first: writing through the link would rewrite the repository's own file.
+    fn install_curl(&self, script: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let path = self.probe_dir().join("curl");
+        std::fs::remove_file(&path).expect("the probe symlink");
+        std::fs::write(&path, script).expect("the stand-in curl");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("mode");
+    }
+
     /// Run the copied binary. `release_dir` false leaves `LASTCALL_TEST_RELEASE_DIR` unset,
     /// which is how the probe's exit 99 is reached.
     fn run(&self, args: &[&str], release_dir: bool) -> Output {
@@ -362,14 +373,71 @@ fn update_base_url_is_announced_for_loopback_and_ignored_otherwise() {
         scene.urls()
     );
 
-    let out = run("https://releases.example.com/");
-    assert!(out.status.success(), "{}", stderr(&out));
-    assert!(stderr(&out).contains("ignoring"), "{}", stderr(&out));
-    assert!(
-        scene.urls()[0].starts_with("https://api.github.com/"),
-        "the ignored value falls back to GitHub, not to the attacker: {:?}",
-        scene.urls()
+    // Not another host, and (verifier (a) F14) not a path tail either: the served layout
+    // starts at the root.
+    for value in [
+        "https://releases.example.com/",
+        "http://127.0.0.1:8099/serve/",
+        "http://127.0.0.1:8099/../",
+    ] {
+        let out = run(value);
+        assert!(out.status.success(), "{}: {}", value, stderr(&out));
+        assert!(
+            stderr(&out).contains("ignoring"),
+            "{}: {}",
+            value,
+            stderr(&out)
+        );
+        assert!(
+            scene.urls()[0].starts_with("https://api.github.com/"),
+            "the ignored value falls back to GitHub, not to the attacker: {:?}",
+            scene.urls()
+        );
+    }
+}
+
+/// Verifier (a) F4: curl's own verdict comes before its output. A transfer that stalls
+/// under `--speed-time` exits 28 having written a partial file; reading that as a response
+/// made the program say `checksum mismatch`, which tells a user on a slow link that the
+/// release they are downloading is corrupt.
+#[test]
+fn update_reports_a_failed_curl_rather_than_a_checksum_mismatch() {
+    let scene = Scene::new("v9.9.9");
+    let before = scene.bin_bytes();
+    scene.install_curl(
+        r#"#!/bin/sh
+# The release list answers normally; the asset download dies half way through.
+dest=""
+url=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -o) dest="$2"; shift 2 ;;
+        *) url="$1"; shift ;;
+    esac
+done
+case "$url" in
+    */releases/latest)
+        printf 'HTTP/1.1 200 probe\r\n\r\n{"tag_name":"v9.9.9","prerelease":false}200'
+        exit 0
+        ;;
+esac
+[ -n "$dest" ] && printf '#!/bin/' >"$dest"
+printf '200'
+exit 28
+"#,
     );
+    let out = scene.run(&["update"], true);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    let said = stderr(&out);
+    assert!(said.contains("curl exited 28"), "{said}");
+    assert!(!said.contains("checksum mismatch"), "{said}");
+    assert_eq!(scene.bin_bytes(), before, "not one byte moved");
+    let leftovers: Vec<String> = std::fs::read_dir(scene.bin.parent().expect("a directory"))
+        .expect("the binary's directory")
+        .filter_map(|e| Some(e.ok()?.file_name().to_string_lossy().into_owned()))
+        .filter(|name| name.starts_with(".lastcall-update-"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
 }
 
 /// The isolation's own test: with no served directory the probe exits 99, so a scene that
@@ -380,7 +448,7 @@ fn update_without_a_served_directory_fails_loudly() {
     let out = scene.run(&["update", "--check"], false);
     assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
     let said = stderr(&out);
-    assert!(said.contains("could not reach"), "{said}");
+    assert!(said.contains("curl exited 99"), "{said}");
     assert!(
         said.contains("LASTCALL_TEST_RELEASE_DIR is unset"),
         "{said}"

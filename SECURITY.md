@@ -70,13 +70,17 @@ What lastcall touches, so you can judge whether something is in scope:
   replaces its own binary; a mismatch stops it and leaves the running binary untouched, and
   it refuses outright when the binary was installed by a package manager. The TUI also asks
   the releases API once a day, in the background after the first frame, whether a newer
-  version exists; that request carries the lastcall version as its user agent and nothing
-  else, and `check = false` under `[update]` in `config.toml` turns it off. Both requests
-  are `curl` subprocesses: the shipped binary links no HTTP stack of its own.
-  `LASTCALL_UPDATE_BASE_URL` can point the explicit command at a local test server; it is
-  ignored unless it names `127.0.0.1` or `localhost`, it says on stderr when it is used, and
-  the once-a-day check never reads it. Nothing else in the shipped binary makes a network
-  call. (`just herdr-fetch` downloads a pinned herdr release, but that is a developer and
+  version exists; that request carries the lastcall version as its user agent, sends no
+  credential of any kind, and `check = false` under `[update]` in `config.toml` turns it
+  off. Both requests are `curl` subprocesses (so they also carry curl's own defaults, such
+  as `Accept: */*`, and they follow redirects, which is how a `github.com` asset URL reaches
+  GitHub's asset host): the shipped binary links no HTTP stack of its own.
+  `LASTCALL_UPDATE_BASE_URL` exists for the tests and the install smoke, which serve a
+  release layout from a local server: it points the explicit command at that server, it is
+  ignored unless it names `127.0.0.1` or `localhost` at the root, it says on stderr when it
+  is used, and the once-a-day check never reads it. Under it a redirect is followed like any
+  other, so point it only at a server you are running. Nothing else in the shipped binary
+  makes a network call. (`just herdr-fetch` downloads a pinned herdr release, but that is a developer and
   CI command, not something the binary does.)
 
 Out of scope: anything that needs an attacker to already have arbitrary code execution as
