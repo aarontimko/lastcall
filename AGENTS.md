@@ -85,6 +85,14 @@ before touching `crates/lastcall/src/tui/` or either e2e test.
 Tiers, file naming, how skips are reported, and the isolation rules — including the sacred
 one: tests never touch the real herdr config or socket.
 
+### Going public: `docs/dev/publishing.md`
+
+The maintainer's one-day checklist for flipping the repository public: the settings and
+branch protection to set (with the `gh` command for each), the labels the issue forms
+need, putting `pull_request:` back into `ci.yml` and `scans.yml`, and the disclosure grep
+that must return zero hits over both the tree and the history. Read it only when doing
+that; nothing in it is needed to build or test.
+
 ### The performance baseline: `docs/dev/bench.md`
 
 The `just bench` numbers (four scenarios at the ruled sizes: 100 clones / 4,000 rows, a
