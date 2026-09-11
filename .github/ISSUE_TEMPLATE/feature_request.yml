@@ -1,0 +1,42 @@
+name: Feature request
+description: Propose a behaviour lastcall does not have yet.
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Features need an issue before a pull request. Describe the problem first; the
+        shape of the answer is worth agreeing on before anyone writes it.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you were trying to do, and where lastcall got in the way.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: The proposed behaviour
+      description: >
+        What lastcall should do instead. If it is a key or a config value, name it and say
+        what it does on every row it could land on.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other ways to solve the same problem, and why you did not pick them.
+    validations:
+      required: false
+  - type: dropdown
+    id: pr
+    attributes:
+      label: Would you open a pull request for this?
+      options:
+        - "Yes, if the proposal is accepted"
+        - "Maybe, with guidance"
+        - "No"
+    validations:
+      required: true

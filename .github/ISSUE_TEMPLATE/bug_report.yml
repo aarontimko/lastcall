@@ -1,0 +1,64 @@
+name: Bug report
+description: Something lastcall did that it should not have done.
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not report a security problem here. Use the Security tab and
+        "Report a vulnerability" instead (see SECURITY.md).
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you saw, in as few words as it takes.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Numbered steps from a fresh start, including the keys you pressed.
+      placeholder: |
+        1. cd into a directory holding two git repos
+        2. run lastcall
+        3. press a on the first hunk
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The output of `lastcall --version`, or the commit SHA if you built from source.
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: OS and terminal
+      placeholder: macOS 15.6 (arm64), Ghostty 1.1; or Ubuntu 24.04, tmux 3.4 inside Alacritty
+    validations:
+      required: true
+  - type: input
+    id: herdr
+    attributes:
+      label: herdr
+      description: Was herdr running, and which version (`herdr --version`)? Write "not running" if it was not.
+    validations:
+      required: true
+  - type: textarea
+    id: status-json
+    attributes:
+      label: Relevant lines from `lastcall status --json`
+      description: >
+        Only the lines that bear on the bug. Redact paths and repository names before you
+        paste. Leave this empty if the bug is not about what the pile shows.
+      render: json
+    validations:
+      required: false
