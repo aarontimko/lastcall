@@ -2874,7 +2874,11 @@ fn spawn_update_tui(fx: &Fixture, check: bool, serve: &Path, log: &Path) -> Opti
         .update_check(check)
         .args(["tui", "--poll", "1"])
         .env("LASTCALL_TEST_RELEASE_DIR", serve)
-        .env("LASTCALL_PROBE_CURL_LOG", log);
+        .env("LASTCALL_PROBE_CURL_LOG", log)
+        // Set so the "the daily check never reads LASTCALL_UPDATE_BASE_URL" assertion below
+        // has something to be true about: a loopback port that answers nothing, so a check
+        // that did read it would fail to connect instead of quietly passing (verifier (a) F8).
+        .env("LASTCALL_UPDATE_BASE_URL", "http://127.0.0.1:1/");
     match cmd.spawn() {
         Ok(p) => Some(p),
         Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {

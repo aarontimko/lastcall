@@ -394,6 +394,17 @@ test cannot do its job — no socket, a protocol the guard refuses, a spawn that
 up — is a failure, because a subset that quietly turns into no subset is worse than no
 subset at all.
 
+**The spawned herdr stays off the network**, which takes saying because two of its own
+defaults are on: `version_check` and `manifest_check` both default to true, and a server
+started with them asks `herdr.dev` for the latest version and for the agent-detection
+catalogue in the background, twice per spawn. `HERDR_TEST_CONFIG` writes both as `false`
+under `[update]`, which is where herdr keeps them (written flat at the top level they are
+unknown keys and herdr ignores them without a word), beside `onboarding = false`, and the
+spawn environment points
+`HERDR_AGENT_DETECTION_MANIFEST_CATALOG_URL` at a closed loopback port as well, so a build
+that ever ignored the config line fails to connect rather than leaving the machine. To check
+it, put a logging shim named `curl` first on `PATH` and run the subset: the log stays empty.
+
 | test | what it proves |
 |---|---|
 | `herdr_real_ping_bootstrap_events_and_done_derivation` | the ping, the guard, the bootstrap snapshot, live events, and §5.7's `done` derivation from a real server |
@@ -553,8 +564,11 @@ already running`. The base is created with `create_dir`, so any future collision
 error rather than a shared socket, and the drain thread keeps the last 8 KiB the server wrote
 so a start that fails quotes herdr's own words. Inside that base: private
 `XDG_CONFIG_HOME`, `XDG_RUNTIME_DIR`, `HOME`, `XDG_STATE_HOME`, `XDG_DATA_HOME`,
-`XDG_CACHE_HOME`, an explicit `HERDR_SOCKET_PATH`, `SHELL=/bin/sh`, `onboarding = false`
-written before spawning, and every inherited `HERDR_*` removed. Socket readiness is polled (`exists && connect`) every 25 ms
+`XDG_CACHE_HOME`, an explicit `HERDR_SOCKET_PATH`, `SHELL=/bin/sh`, `HERDR_TEST_CONFIG`
+written before spawning (`onboarding = false`, then `version_check = false` and
+`manifest_check = false` under `[update]`),
+`HERDR_AGENT_DETECTION_MANIFEST_CATALOG_URL` pointed at a closed loopback port, and every
+inherited `HERDR_*` removed. Socket readiness is polled (`exists && connect`) every 25 ms
 up to 5 s. Kill-on-drop and kill-on-panic through a PID registry with a matcher
 (`ps -o comm= -p`) that refuses to kill anything it did not spawn. Safe wrappers only
 (`unsafe_code = "forbid"`, no `libc`).
