@@ -1,8 +1,21 @@
 # lastcall
 
+[![ci](https://github.com/aarontimko/lastcall/actions/workflows/ci.yml/badge.svg)](https://github.com/aarontimko/lastcall/actions/workflows/ci.yml)
+[![license: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue)](#license)
+
 The last call before code ships: an agent-agnostic review ledger for the terminal. It watches every repo under your working directory, shows exactly what changed since you last looked, and lets you accept, flag, or restore it hunk by hunk, whichever agent or human made the edit.
 
-Status: pre-release, under construction as a phased program. The design corpus and roadmap live in [`docs/spec/00-spec.md`](docs/spec/00-spec.md); the scenario test plan in [`docs/spec/01-scenarios.md`](docs/spec/01-scenarios.md). Contributor orientation: [`AGENTS.md`](AGENTS.md).
+## Status
+
+Pre-release, under construction as a phased program, working towards v0.1.0. There is no
+published release yet: build it from source with the steps below. Expect keys, config keys
+and on-disk state to move before v0.1.0.
+
+Bug reports and small fixes are welcome now. A feature wants an issue before a pull
+request, so the shape can be agreed before anyone writes it. The design corpus and roadmap
+live in [`docs/spec/00-spec.md`](docs/spec/00-spec.md); the scenario test plan in
+[`docs/spec/01-scenarios.md`](docs/spec/01-scenarios.md). Contributor orientation:
+[`AGENTS.md`](AGENTS.md) and [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## Build
 
@@ -188,4 +201,15 @@ to the repository itself. How it works and how to look at its state:
 [`docs/dev/engine.md`](docs/dev/engine.md). `just probe-status`, `just probe-watch` and
 `just probe-tui` run the same against a generated three-root fixture.
 
-License: MIT OR Apache-2.0.
+## Contributing, security, issues
+
+Setup, the test tiers, the commit convention and what a pull request is expected to carry:
+[`CONTRIBUTING.md`](CONTRIBUTING.md). How to report a vulnerability (privately, never in a
+public issue) and what the tool touches: [`SECURITY.md`](SECURITY.md). Bugs and feature
+proposals go through the [issue chooser](https://github.com/aarontimko/lastcall/issues/new/choose);
+questions and half-formed ideas belong in
+[Discussions](https://github.com/aarontimko/lastcall/discussions).
+
+## License
+
+MIT OR Apache-2.0: [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
