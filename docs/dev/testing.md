@@ -41,7 +41,7 @@ the export renderer and the ledger's 1.1 schema; then the TUI half: the two-colu
 restore, the note modal, the picker and the export fallback, whose reducer tests are the last
 13 of the binary lib's count): 255 engine + 34 testkit + 187 binary lib + 6 binary main =
 **482**; then the verifier (b) review-fix pass, which added seven reducer and render tests
-for F1–F5: 255 engine + 34 testkit + 194 binary lib + 6 binary main = **489**; Phase 8 (save under CAS, the `$EDITOR` handover, the inline editor, select-to-copy, the launch hold): 271 engine + 35 testkit + 250 binary lib + 6 binary main = **562**, the Phase 9 floor; Phase 9a (the `status` store fields, every repo listed and `t`, the neighbour rule, the hint line's drop order, the focus-true opening, the launch hold's one vocabulary and scope fold, the editor header, the help overlay's clip row, and the verifier (a) folds): 274 engine + 35 testkit + 267 binary lib + 6 binary main = **582**, the Phase 9b floor; Phase 9b so far (herdr v0.9.0's protocol set, the `[update]` config key, the header's update notice, and `commands/update.rs`'s own tests, which land in the binary main count because `commands/` is binary-only): 277 engine + 35 testkit + 268 binary lib + 16 binary main = **596**).
+for F1–F5: 255 engine + 34 testkit + 194 binary lib + 6 binary main = **489**; Phase 8 (save under CAS, the `$EDITOR` handover, the inline editor, select-to-copy, the launch hold): 271 engine + 35 testkit + 250 binary lib + 6 binary main = **562**, the Phase 9 floor; Phase 9a (the `status` store fields, every repo listed and `t`, the neighbour rule, the hint line's drop order, the focus-true opening, the launch hold's one vocabulary and scope fold, the editor header, the help overlay's clip row, and the verifier (a) folds): 274 engine + 35 testkit + 267 binary lib + 6 binary main = **582**, the Phase 9b floor; Phase 9b so far (herdr v0.9.0's protocol set, the `[update]` config key, the header's update notice, and `commands/update.rs`'s own tests, which land in the binary main count because `commands/` is binary-only): 277 engine + 35 testkit + 268 binary lib + 16 binary main = **596**; the verifier (a) fold and the PTY suite's drag helpers: 277 engine + 37 testkit + 270 binary lib + 19 binary main = **603**).
 The suite never shrinks across commits. One recorded exception: at the Phase 2 code review
 the three filesystem-live watcher tests (up to 30 s waits, real FSEvents) left the unit tier
 for `crates/lastcall-engine/tests/test_integration_watcher.rs` because they contradicted the
@@ -220,7 +220,38 @@ renders the notice from disk and spends no request; one 25 h old looks again and
 `checked_at` forward), and `pty_update_check_is_off_for_every_other_scene` (the default
 isolation: no notice, no request, no stamp, and `[update]` / `check = false` in the config the
 harness wrote). Every negative assertion in the three is made **after** `wait_exit`, so no
-detached check thread can race it. No PTY
+detached check thread can race it.
+
+**What "complete" means for this tier** (Phase 9b, ruling P10): every action in
+`tui::input::DEFAULT_KEYMAP`, every answer in `MODAL_KEYS`, and every modal is reached by at
+least one scene **through the terminal**. The list is derived by grepping each keymap name
+against the scenes, and it is what the eight Phase 9b scenes close:
+`pty_help_overlay_says_how_to_leave_and_any_key_closes` (`?`; the exact-fit height measured
+off the frame rather than written down, the 80×24 clip naming the width that shows
+everything with all three footer rows intact, a key spent on closing the overlay and not
+also on the selection, and `q` from inside it still leaving lastcall),
+`pty_page_keys_focus_toggle_and_hunk_prev` (`PgUp`/`b`, `PgDn`/`Space`, `Tab`, `p`/`[`: the
+page clamps at either end at 30 rows, and at 14 rows the scene **counts** the `j` presses
+back from where the page landed, so `page_rows` is measured rather than asserted against a
+row number), `pty_full_paths_remote_and_expand` (`f`, `o`, `e`), `pty_refresh_rescans_on_r`
+(`r` with both backstops parked at `--poll 300`), `pty_poll_finds_a_root_the_watcher_cannot_see`
+(a sibling checkout created after startup, which only the `rescan` backstop can find, since
+`Engine::scan_all` re-runs discovery for nested repos alone),
+`pty_accept_all_confirm_n_accepts_nothing` (the confirm modal's `n` and `Esc`: nothing on the
+frame moves and no ledger is written), `pty_nav_divider_drag_widens_the_nav` (press, motion
+with the button held, release, through `PtyTui::press`/`drag_to`/`release`; the nav follows
+the pointer, stops at `NAV_WIDTH_MAX`, and ignores a motion after the release) and
+`pty_herdr_scope_toggle_and_the_agent_picker` (`w` both ways under a `HERDR_WORKSPACE_ID`
+scope, then a flag with two candidate agents opening the picker, and `Esc` dropping the send
+while the flag stays on disk). `M` (`unflag`) is the tail of
+`pty_flag_note_exports_when_standalone`, where the two flags it wrote are cleared together
+and the export file is **not** rewound. That leaves the file at 37 tests: 35 `pty_*` scenes,
+`find_words_needs_one_line_not_a_csi_parameter`, and the ignored `probe_tui_screen` (so 36
+run, one ignored). The one
+key that is deliberately unreachable here is `shift-i`'s real `$EDITOR`, which runs against
+the probe script below; `F6` is closed by design and has no scene.
+
+No PTY
 scene talks to herdr: only `just test-integration-herdr` proves the real pane. The staged
 send is covered in three places, and it takes all three — verifier (b) F1 found that the two
 end tests both passed while the middle was missing, because nothing in the loop built
@@ -233,7 +264,7 @@ client over the mock socket, the loop's own `run::herdr_fold`, `Ui::event` for t
 keystrokes, and `run::spawn_flag` / `run::spawn_stage` for the effects, asserting the
 bracketed-paste `pane.send_text` that lands on the socket. A send test that injects its own
 candidates proves the reducer, never the wiring. The scenes are serialized (one
-mutex); the whole file is about 105 s. Timing lines go to `stderr().write_all` so they survive libtest's
+mutex); the whole file is about 120 s. Timing lines go to `stderr().write_all` so they survive libtest's
 capture — run it with `-- --nocapture` to see them. If the live-update assertion fails on a
 loaded host, report the measured numbers; do not loosen the budget.
 

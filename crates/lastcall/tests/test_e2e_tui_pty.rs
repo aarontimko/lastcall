@@ -2094,6 +2094,33 @@ fn pty_flag_note_exports_when_standalone() {
         );
     }
 
+    // `M` (deliverable 9): the file's flags go away together. The cursor is still on f1
+    // from the whole-file flag above, so the key needs nothing else, and the two flags this
+    // scene wrote are the only thing it can clear. The **export is not** rewound: the file
+    // the reviewer pastes from is an append-only record of what was said, and an unflag is
+    // a note about the ledger, not about the conversation.
+    let exported = std::fs::read_to_string(&path).expect("the export file");
+    pty.send(b"M").expect("M");
+    pty.wait_for(Duration::from_secs(5), |s| status_is(s, "flags cleared"))
+        .unwrap_or_else(|e| panic!("`M` clears the flags: {e}\n{}", pty.screen_text()));
+    pty.wait_for(Duration::from_secs(5), |s| {
+        let t = s.contents();
+        t.contains("M f1") && !t.contains("M f1 ⚑")
+    })
+    .unwrap_or_else(|e| panic!("the row keeps its hunks and loses the mark: {e}"));
+    let ledger = fx.ledger("alpha");
+    assert_eq!(
+        ledger["overrides"],
+        serde_json::json!({}),
+        "both flags are gone, and with them the override entry that held them (the 1.0 \
+         mirror included): {ledger}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("the export file"),
+        exported,
+        "the export file is not rewound by an unflag"
+    );
+
     let since = pty.raw().len();
     pty.send(b"q").expect("q");
     let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
@@ -3062,4 +3089,843 @@ fn pty_update_check_is_off_for_every_other_scene() {
     let config = std::fs::read_to_string(&fx.config).expect("the isolated config");
     assert!(config.contains("[update]"), "{config}");
     assert!(config.contains("check = false"), "{config}");
+}
+
+// --- Phase 9b deliverable 9: the keys the terminal had not yet reached -------------------
+//
+// What "complete" means for this tier (`docs/dev/testing.md`, "The e2e tier"): every action
+// in `input::DEFAULT_KEYMAP`, every `MODAL_KEYS` answer and every modal is reached by at
+// least one scene **through the terminal**. The scenes below close the list Phase 9b
+// derived by grepping the keymap against the scenes above: the help overlay, the page keys,
+// `Tab`, `p`/`[`, `e`, `f`, `o`, `M`, `w`, `r`, the confirm's `n`, the agent picker, the nav
+// divider drag, and a new root only the `--poll` backstop can find. Like every scene here
+// they wait on a rendered marker, never on time.
+
+/// The nav row carrying the cursor, trimmed: the selected entry is drawn edge to edge in
+/// reverse video, so the first column inside the nav's left border finds it. `None` when
+/// nothing is selected, which is how every scene starts.
+fn nav_cursor(s: &vt100::Screen) -> Option<String> {
+    let (rows, cols) = s.size();
+    let divider = divider_col(s)? as usize;
+    // The panes' body only: the header (row 0), the borders and the hint line are not nav
+    // rows, and the header's `[Accept All]` is drawn inverted.
+    let row =
+        (2..rows.saturating_sub(2)).find(|r| s.cell(*r, 1).is_some_and(vt100::Cell::inverse))?;
+    let text = s.rows(0, cols).nth(row as usize)?;
+    Some(
+        text.chars()
+            .take(divider)
+            .skip(1)
+            .collect::<String>()
+            .trim()
+            .to_owned(),
+    )
+}
+
+/// The column the nav/diff divider is drawn in: the `┬` junction on the panes' top border
+/// row. It is one less than `App::nav_width`, which is what a divider drag moves.
+fn divider_col(s: &vt100::Screen) -> Option<u16> {
+    let (_, cols) = s.size();
+    col_of(&s.rows(0, cols).nth(1)?, "┬")
+}
+
+/// Whether a cell is drawn in the focused-border colour (`render::focused_border`, cyan):
+/// on the frame that is the only thing that says which pane has the keys.
+fn cyan(s: &vt100::Screen, row: u16, col: u16) -> bool {
+    s.cell(row, col)
+        .is_some_and(|c| c.fgcolor() == vt100::Color::Idx(6))
+}
+
+/// The help overlay's box as `(top border row, bottom border row)`, found by its title and
+/// then by the column that title starts in, so the app's own frame cannot answer for it.
+fn help_box_of(s: &vt100::Screen) -> Option<(usize, usize)> {
+    let (_, cols) = s.size();
+    let rows: Vec<String> = s.rows(0, cols).collect();
+    let top = rows.iter().position(|r| r.contains("┌ keys "))?;
+    let x = rows[top].chars().position(|c| c == '┌')?;
+    let bottom = rows
+        .iter()
+        .enumerate()
+        .skip(top + 1)
+        .find(|(_, r)| r.chars().nth(x) == Some('└'))?
+        .0;
+    Some((top, bottom))
+}
+
+/// `?` through the terminal, and verifier (b) F4/F5 on a real frame: **any** key closes the
+/// overlay (`q` included — inside it that is not the quit key), the way out is on the frame
+/// at the exact-fit height as well as one row below it, and at 80×24 the clip notice names
+/// the width that would show everything while all three footer rows survive.
+///
+/// The exact fit is measured rather than written down, so it moves with the keymap: at a
+/// height that holds the whole box the box is `rows + 4` tall (`render::render_help`), and
+/// the exact fit is one row less — the height at which the body fills the box and the draw
+/// used to spend the footer's row on a key. Every resize waits on a marker only the **new**
+/// frame can satisfy: at the exact fit the box's top border is on row 0 (at 30 rows it is
+/// not), and one row below that the clip notice appears.
+#[test]
+fn pty_help_overlay_says_how_to_leave_and_any_key_closes() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let Some(mut pty) = fx.spawn_tui(&bin()) else {
+        return;
+    };
+    wait_first_piles(&mut pty);
+
+    pty.send(b"?").expect("?");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        s.contents().contains("any key closes")
+    })
+    .unwrap_or_else(|e| panic!("the help overlay: {e}"));
+
+    // 100 columns is the width two columns need and 30 rows hold them: every row of the
+    // keymap is on the frame, the modal keys included, and nothing is clipped.
+    let text = pty.screen_text();
+    for row in [
+        "page up",
+        "page down",
+        "toggle focus",
+        "previous hunk",
+        "expand a collapsed file",
+        "full paths",
+        "show org/repo",
+        "clear the file's flags",
+        "workspace scope on/off",
+        "rescan now",
+        "this help",
+        "quit",
+        "confirm",
+        "cancel",
+    ] {
+        assert!(text.contains(row), "the overlay lists `{row}`:\n{text}");
+    }
+    assert!(!text.contains("more key"), "nothing is clipped:\n{text}");
+    let (top, bottom) = pty
+        .screen(help_box_of)
+        .unwrap_or_else(|| panic!("the overlay's box:\n{text}"));
+    let natural = (bottom - top + 1) as u16;
+    assert!(top > 0, "at 30 rows the box is centred, not flush:\n{text}");
+
+    // The exact fit: one row less than the box's natural height. The body fills the box and
+    // the way out is still the last thing in it.
+    let exact = natural - 1;
+    pty.resize(100, exact).expect("resize");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        help_box_of(s).is_some_and(|(top, _)| top == 0)
+    })
+    .unwrap_or_else(|e| panic!("the box fills a {exact}-row frame: {e}"));
+    let rows = pty.rows();
+    assert!(
+        !rows.iter().any(|r| r.contains("more key")),
+        "the exact fit shows every key:\n{}",
+        pty.screen_text()
+    );
+    let (_, bottom) = pty.screen(help_box_of).expect("the overlay's box");
+    assert!(
+        rows[bottom - 1].contains("any key closes"),
+        "the last inner row says how to leave:\n{}",
+        pty.screen_text()
+    );
+    note(&format!(
+        "PTY help: natural box {natural} rows, exact fit {exact}"
+    ));
+
+    // One row shorter it clips — which is what makes the height above it the exact fit —
+    // and the clip is spent on keys, never on the way out.
+    pty.resize(100, exact - 1).expect("resize");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        s.contents().contains("more key")
+    })
+    .unwrap_or_else(|e| panic!("one row shorter clips: {e}"));
+    assert!(
+        pty.screen_text().contains("any key closes"),
+        "the clip drops keys, never the way out:\n{}",
+        pty.screen_text()
+    );
+
+    // 80×24: too narrow for two columns and too short for one. The notice names the width
+    // that would show everything, it sits directly above the pinned `quit`, and all three
+    // footer rows are on the frame (ruling R12, verifier (b) F4).
+    pty.resize(80, 24).expect("resize");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        s.contents().contains("columns shows all")
+    })
+    .unwrap_or_else(|e| panic!("the 80-column clip notice: {e}"));
+    let rows = pty.rows();
+    let at = rows
+        .iter()
+        .position(|r| r.contains("more key"))
+        .expect("the clip notice");
+    assert!(rows[at].contains("100 columns shows all"), "{}", rows[at]);
+    assert!(
+        rows[at + 1].contains("quit"),
+        "the notice sits directly above the pinned quit:\n{}",
+        pty.screen_text()
+    );
+    for footer in [
+        "^J is a newline in the note",
+        "shift+drag selects text",
+        "any key closes",
+    ] {
+        assert!(
+            rows.iter().any(|r| r.contains(footer)),
+            "the footer row `{footer}` is on the 80×24 frame:\n{}",
+            pty.screen_text()
+        );
+    }
+
+    // A key that means something elsewhere closes the overlay and is **spent** on it: `j`
+    // does not also move the selection (`app_help_opens_and_any_key_closes_it`). The next
+    // `j` does, which is how the scene knows the loop kept the keys rather than the overlay.
+    pty.resize(100, 30).expect("resize");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        help_box_of(s).is_some_and(|(top, _)| top > 0)
+    })
+    .unwrap_or_else(|e| panic!("the overlay is centred again at 30 rows: {e}"));
+    pty.send(b"j").expect("j closes the overlay");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        !s.contents().contains("any key closes") && rows_listed(s)
+    })
+    .unwrap_or_else(|e| panic!("a key closes the overlay: {e}"));
+    assert!(
+        pty.screen(nav_cursor).is_none(),
+        "and selects nothing: the key was spent on the overlay:\n{}",
+        pty.screen_text()
+    );
+    pty.send(b"j").expect("j");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        nav_cursor(s).as_deref() == Some("alpha")
+    })
+    .unwrap_or_else(|e| panic!("the loop is still taking keys: {e}"));
+
+    // `q` is the one key the overlay does not merely swallow: it is the way out of lastcall
+    // from inside the help, which is why the clip pins its row (`render_help`'s `pin_quit`)
+    // and why `any key closes` is not a promise that `q` closes only the overlay.
+    pty.send(b"?").expect("? again");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        s.contents().contains("any key closes")
+    })
+    .unwrap_or_else(|e| panic!("the overlay reopens: {e}"));
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty
+        .wait_exit(QUIT_BUDGET)
+        .expect("exits after q from the overlay");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}
+
+/// `nav_page_up` / `nav_page_down` (both bindings each), `focus_toggle` and `hunk_prev`
+/// (both bindings) through the terminal.
+///
+/// The page is read twice: at 100×30, where a page is longer than the whole nav and the
+/// move is the clamp at either end, and at 100×14, where `App::page_rows` is ten and the
+/// page lands in the middle of the fifteen entries the six extra files make — the scene
+/// then **counts** the `j` presses back to the top, which is what tells a page from a jump
+/// to the end and from a single step, without writing down which entry it should be.
+#[test]
+fn pty_page_keys_focus_toggle_and_hunk_prev() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let alpha = fx.repo("alpha");
+    // Two separated hunks in f1 for `p`, and six added files so the nav is longer than a
+    // page at the height below (nine entries otherwise, and a page of ten would clamp).
+    alpha.write("f1", F1_TWO_HUNKS);
+    for name in ADDED {
+        alpha.write(name, format!("{name}\n"));
+    }
+    let Some(mut pty) = fx.spawn_tui(&bin()) else {
+        return;
+    };
+    wait_first_piles(&mut pty);
+    pty.wait_for(LONG, |s| s.contents().contains("A g06"))
+        .unwrap_or_else(|e| panic!("the six added rows: {e}"));
+
+    // (1) the clamp, both ends and both bindings.
+    pty.send(b"j").expect("j");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        nav_cursor(s).as_deref() == Some("alpha")
+    })
+    .unwrap_or_else(|e| panic!("`j` selects the first entry: {e}"));
+    let last = |s: &vt100::Screen| nav_cursor(s).is_some_and(|r| r.starts_with("M n2.md"));
+    let first = |s: &vt100::Screen| nav_cursor(s).as_deref() == Some("alpha");
+    for (keys, name, down) in [
+        (&b" "[..], "Space", true),
+        (&b"b"[..], "b", false),
+        (&b"\x1b[6~"[..], "PgDn", true),
+        (&b"\x1b[5~"[..], "PgUp", false),
+    ] {
+        pty.send(keys).expect("a page key");
+        let reached = if down {
+            pty.wait_for(Duration::from_secs(5), last)
+        } else {
+            pty.wait_for(Duration::from_secs(5), first)
+        };
+        reached.unwrap_or_else(|e| {
+            panic!(
+                "{name} reaches the {} entry: {e}\n{}",
+                if down { "last" } else { "first" },
+                pty.screen_text()
+            )
+        });
+    }
+
+    // (2) a page is `App::page_rows` entries — the frame's height less its four chrome
+    // rows — not the whole list. At 14 rows that is ten, and the nav has fifteen entries.
+    pty.resize(100, 14).expect("resize");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        let (_, cols) = s.size();
+        s.rows(0, cols).nth(12).is_some_and(|r| r.starts_with('└'))
+    })
+    .unwrap_or_else(|e| panic!("the 14-row frame: {e}"));
+    assert!(
+        pty.screen(first),
+        "the resize kept the cursor on the first entry:\n{}",
+        pty.screen_text()
+    );
+    pty.send(b"\x1b[6~").expect("PgDn");
+    pty.wait_for(Duration::from_secs(5), |s| !first(s))
+        .unwrap_or_else(|e| panic!("the page moves the cursor: {e}"));
+    let landed = pty.screen(nav_cursor).expect("a nav cursor");
+    assert!(
+        !landed.starts_with("M n2.md"),
+        "a page is not a jump to the end: it landed on `{landed}`\n{}",
+        pty.screen_text()
+    );
+    pty.send(b"\x1b[5~").expect("PgUp");
+    pty.wait_for(Duration::from_secs(5), first)
+        .unwrap_or_else(|e| panic!("the page back reaches the first entry: {e}"));
+    let mut steps = 0;
+    loop {
+        let here = pty.screen(nav_cursor).expect("a nav cursor");
+        if here == landed {
+            break;
+        }
+        assert!(steps < 20, "never walked to `{landed}` (at `{here}`)");
+        pty.send(b"j").expect("j");
+        pty.wait_for(Duration::from_secs(5), |s| {
+            nav_cursor(s).as_ref() != Some(&here)
+        })
+        .unwrap_or_else(|e| panic!("`j` moves off `{here}`: {e}"));
+        steps += 1;
+    }
+    assert_eq!(
+        steps, 10,
+        "one page down at 14 rows is `page_rows` = 14 − 4 entries (landed on `{landed}`)"
+    );
+    note(&format!(
+        "PTY page: {steps} entries at 14 rows, on `{landed}`"
+    ));
+    pty.resize(100, 30).expect("resize");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        let (_, cols) = s.size();
+        s.rows(0, cols).nth(12).is_some_and(|r| r.starts_with('│'))
+    })
+    .unwrap_or_else(|e| panic!("the 30-row frame is back: {e}"));
+
+    // (3) `n` then `p`, and `n` then `[`: the inverted hunk header walks forward and back.
+    select_until(&mut pty, "f1  M  +2 −2");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        s.contents().matches("@@ -").count() == 2
+    })
+    .unwrap_or_else(|e| panic!("f1's two hunks: {e}"));
+    let headers = hunk_headers(&pty);
+    assert_eq!(headers.len(), 2, "{headers:?}");
+    let one = header_text(&headers[0].1);
+    let two = header_text(&headers[1].1);
+    assert_ne!(one, two);
+    let current = |s: &vt100::Screen, want: &str| {
+        let (_, cols) = s.size();
+        s.rows(0, cols).enumerate().any(|(i, r)| {
+            r.contains(want)
+                && col_of(&r, "@@ -")
+                    .and_then(|c| s.cell(i as u16, c))
+                    .is_some_and(vt100::Cell::inverse)
+        })
+    };
+    assert!(
+        pty.screen(|s| current(s, &one)),
+        "hunk 1 is current before `n`"
+    );
+    for (back, name) in [(&b"p"[..], "p"), (&b"["[..], "[")] {
+        pty.send(b"n").expect("n");
+        pty.wait_for(Duration::from_secs(5), |s| current(s, &two))
+            .unwrap_or_else(|e| panic!("`n` moves to hunk 2 (before `{name}`): {e}"));
+        pty.send(back).expect("hunk_prev");
+        pty.wait_for(Duration::from_secs(5), |s| current(s, &one))
+            .unwrap_or_else(|e| panic!("`{name}` walks back to hunk 1: {e}"));
+    }
+
+    // (4) `Tab`: the focused pane is the one with the coloured border, the hint line says
+    // what the arrows now do, and while the diff has the keys `j` leaves the nav cursor
+    // where it was.
+    let (_, cols) = pty.screen(|s| s.size());
+    let right = cols - 1;
+    let nav_focused = move |s: &vt100::Screen| cyan(s, 1, 0) && !cyan(s, 1, right);
+    let diff_focused = move |s: &vt100::Screen| cyan(s, 1, right) && !cyan(s, 1, 0);
+    pty.wait_for(Duration::from_secs(5), nav_focused)
+        .unwrap_or_else(|e| panic!("the nav's border is the coloured one: {e}"));
+    let on_f1 = pty.screen(nav_cursor).expect("a nav cursor");
+    assert!(on_f1.starts_with("M f1"), "{on_f1}");
+    let rows_before = hunk_headers(&pty);
+    pty.send(b"\t").expect("tab");
+    pty.wait_for(Duration::from_secs(5), diff_focused)
+        .unwrap_or_else(|e| panic!("`Tab` moves the focus to the diff: {e}"));
+    pty.send(b"j").expect("j in the diff");
+    pty.send(b"\t").expect("tab back");
+    pty.wait_for(Duration::from_secs(5), nav_focused)
+        .unwrap_or_else(|e| panic!("`Tab` is its own inverse: {e}"));
+    // The frame that answered the second `Tab` has certainly answered the `j` before it: it
+    // scrolled the diff by a line and left the nav cursor alone.
+    // (hunk 1's header starts on the pane's first content row, so the line it loses is that
+    // header itself: what is left is hunk 2's, one row higher than it was.)
+    assert_eq!(
+        hunk_headers(&pty).last().map(|(r, _)| *r),
+        rows_before.last().map(|(r, _)| r - 1),
+        "the `j` in the diff scrolled it by one line:\n{}",
+        pty.screen_text()
+    );
+    assert_eq!(
+        pty.screen(nav_cursor).as_deref(),
+        Some(on_f1.as_str()),
+        "and left the nav cursor where it was"
+    );
+    pty.send(b"j").expect("j in the nav");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        nav_cursor(s).as_deref() != Some(on_f1.as_str())
+    })
+    .unwrap_or_else(|e| panic!("the nav has the keys back: {e}"));
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}
+
+/// `f` (full paths), `o` (the remote) and `e` (expand a collapsed row) through the terminal,
+/// each its own inverse where it has one.
+#[test]
+fn pty_full_paths_remote_and_expand() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let alpha = fx.repo("alpha");
+    // A lockfile: collapsed by the default `collapsed_globs`, so its diff view is a summary
+    // and the `[e expand]` control rather than hunks. Twelve lines fit the pane once they
+    // are asked for, so the expansion can be read to its last line.
+    let lock: String = (1..=12)
+        .map(|i| format!("\"pkg-{i}\" = \"1.0.{i}\"\n"))
+        .collect();
+    alpha.write("Cargo.lock", &lock);
+    alpha
+        .git(&[
+            "remote",
+            "set-url",
+            "origin",
+            "git@github.com:acme/alpha.git",
+        ])
+        .expect("set-url");
+
+    let Some(mut pty) = fx.spawn_tui(&bin()) else {
+        return;
+    };
+    wait_first_piles(&mut pty);
+    pty.wait_for(LONG, |s| s.contents().contains("A Cargo.lock"))
+        .unwrap_or_else(|e| panic!("the lockfile row: {e}"));
+
+    // (1) `f`: the nav rows carry the path inside the repo, not the basename.
+    assert!(
+        pty.screen_text().contains("M parse.rs"),
+        "the basename to begin with:\n{}",
+        pty.screen_text()
+    );
+    pty.send(b"f").expect("f");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        s.contents().contains("M src/parse.rs")
+    })
+    .unwrap_or_else(|e| panic!("`f` shows the full path: {e}"));
+    pty.send(b"f").expect("f back");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        let t = s.contents();
+        t.contains("M parse.rs") && !t.contains("M src/parse.rs")
+    })
+    .unwrap_or_else(|e| panic!("`f` is its own inverse: {e}"));
+
+    // (2) `o`: the repo row gains `org/repo`, read from the remote's URL.
+    pty.send(b"o").expect("o");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        s.contents().contains("alpha  acme/alpha")
+    })
+    .unwrap_or_else(|e| panic!("`o` shows the remote: {e}"));
+    pty.send(b"o").expect("o back");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        !s.contents().contains("acme/alpha")
+    })
+    .unwrap_or_else(|e| panic!("`o` is its own inverse: {e}"));
+
+    // (3) `e`: a collapsed row's hunks are computed on demand and drawn under the summary,
+    // which keeps its place.
+    select_until(&mut pty, "Cargo.lock  A  +12 −0");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        let t = s.contents();
+        t.contains("collapsed (glob) · +12 −0") && t.contains("[e expand]")
+    })
+    .unwrap_or_else(|e| panic!("the collapsed summary: {e}\n{}", pty.screen_text()));
+    assert!(
+        !pty.screen_text().contains("@@ -"),
+        "a collapsed row carries no hunks until it is asked:\n{}",
+        pty.screen_text()
+    );
+    let t = Instant::now();
+    pty.send(b"e").expect("e");
+    pty.wait_for(OVERLOADED, |s| {
+        let t = s.contents();
+        t.contains("@@ -0,0 +1,12 @@") && t.contains("+\"pkg-12\" = \"1.0.12\"")
+    })
+    .unwrap_or_else(|e| panic!("`e` expands the row: {e}\n{}", pty.screen_text()));
+    note(&format!(
+        "PTY expand: hunks on the frame after {:.3?}",
+        t.elapsed()
+    ));
+    assert!(
+        pty.screen_text().contains("collapsed (glob) · +12 −0"),
+        "the summary stays above the expansion:\n{}",
+        pty.screen_text()
+    );
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}
+
+/// `r` through the terminal: the rescan is asked for by hand and what it found is on the
+/// frame, with `refreshed` on the status line to say the scan is over.
+///
+/// Both backstops are parked (`--poll 300`), so nothing else was going to look; where the
+/// filesystem watcher delivers, the same row could also have arrived without the key (on
+/// the development Mac, where fseventsd reports nothing under these temp dirs, it could
+/// not). `refreshing…` is the in-flight half of the pair and is deliberately **not** waited
+/// for here: over a three-root fixture the scan can be over before a poll of the screen
+/// sees it, and a wait that sometimes passes for the wrong reason is worse than none. The
+/// unit tier pins that half (`run.rs::run_local_results_feed_the_app`).
+#[test]
+fn pty_refresh_rescans_on_r() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let Ok(mut pty) = fx.command(&bin()).args(["tui", "--poll", "300"]).spawn() else {
+        note("SKIP: this host cannot open a pty");
+        return;
+    };
+    pty.wait_for(LONG, rows_listed)
+        .unwrap_or_else(|e| panic!("first piles: {e}"));
+    wait_watching(&mut pty);
+
+    fx.append("alpha/f1", "appended between the scans\n");
+    let t = Instant::now();
+    pty.send(b"r").expect("r");
+    pty.wait_for(OVERLOADED, |s| status_is(s, "refreshed"))
+        .unwrap_or_else(|e| panic!("the refresh says it finished: {e}"));
+    note(&format!("PTY refresh: refreshed in {:.3?}", t.elapsed()));
+    pty.wait_for(OVERLOADED, |s| s.contents().contains("M f1  +2 −1"))
+        .unwrap_or_else(|e| panic!("the rescan's own row: {e}\n{}", pty.screen_text()));
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}
+
+/// `tui --poll` earning its keep: a **new root** under the watched parent reaches the nav
+/// with no key pressed and nothing a filesystem event could carry.
+///
+/// The engine watches roots, not the parent they sit in, and `Engine::scan_all` re-runs
+/// discovery only for repos nested inside a root it already has — so a sibling checkout can
+/// arrive by exactly one route, the `rescan` backstop `--poll` moves. This is the fallback
+/// the docs promise where the watcher does not deliver, measured through the binary.
+#[test]
+fn pty_poll_finds_a_root_the_watcher_cannot_see() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let Some(mut pty) = fx.spawn_tui(&bin()) else {
+        return;
+    };
+    wait_first_piles(&mut pty);
+    pty.wait_for_text("3 repos · ", Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("three roots to begin with: {e}"));
+    let before = pty.raw().len();
+
+    FixtureRepo::new_in(TempDir::adopt(&fx.parent), "gamma").expect("a fourth checkout");
+    let t = Instant::now();
+    pty.wait_for(LONG, |s| {
+        let text = s.contents();
+        text.contains("4 repos · ") && text.contains("gamma")
+    })
+    .unwrap_or_else(|e| panic!("the poll finds the new root: {e}\n{}", pty.screen_text()));
+    note(&format!(
+        "PTY poll: a new root on the nav after {:.3?}",
+        t.elapsed()
+    ));
+    let raw = pty.raw();
+    assert!(
+        find(&raw[..before], b"gamma").is_none(),
+        "and not before it existed"
+    );
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}
+
+/// The other half of the `ctrl-a` confirm (`y` is `pty_accept_loop_and_restart`): above ten
+/// files the modal asks, and `n` closes it having accepted nothing — not on the frame, and
+/// not in the ledger the next process would load. `Esc` is the same answer by the other
+/// binding, and the modal really closed rather than merely stopped being drawn: `ctrl-a`
+/// opens it again in between.
+#[test]
+fn pty_accept_all_confirm_n_accepts_nothing() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let alpha = fx.repo("alpha");
+    // Six added files takes the total to twelve, above `CONFIRM_ABOVE`.
+    for name in ADDED {
+        alpha.write(name, format!("{name}\n"));
+    }
+    let before = fx.ledger("alpha");
+
+    let Some(mut pty) = fx.spawn_tui(&bin()) else {
+        return;
+    };
+    wait_first_piles(&mut pty);
+    pty.wait_for(LONG, |s| {
+        let t = s.contents();
+        t.contains("A g06") && t.contains("3 repos · 12 files")
+    })
+    .unwrap_or_else(|e| panic!("all twelve rows: {e}\n{}", pty.screen_text()));
+
+    for (key, name) in [(&b"n"[..], "n"), (&b"\x1b"[..], "Esc")] {
+        pty.send(b"\x01").expect("ctrl-a");
+        pty.wait_for(Duration::from_secs(5), |s| {
+            s.contents().contains("Accept all 12 files across 3 repos?")
+        })
+        .unwrap_or_else(|e| panic!("the confirm modal (before `{name}`): {e}"));
+        pty.send(key).expect("cancel");
+        pty.wait_for(Duration::from_secs(5), |s| {
+            !s.contents().contains("Accept all 12 files")
+        })
+        .unwrap_or_else(|e| panic!("`{name}` closes the modal: {e}"));
+        // Everything is still pending: the rows, the header's counts, and the ledger.
+        let text = pty.screen_text();
+        assert!(text.contains("3 repos · 12 files"), "{text}");
+        for row in ["M f1", "M f2", "A g01", "A g06", "M n2.md"] {
+            assert!(text.contains(row), "{row} is still pending:\n{text}");
+        }
+        assert_eq!(fx.ledger("alpha"), before, "no ledger write after `{name}`");
+    }
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}
+
+/// The nav divider is dragged with the mouse and has no key at all: press on it, move with
+/// the button held, release. The nav follows the pointer, stops at `NAV_WIDTH_MAX`, and
+/// holds its width once the button is up.
+#[test]
+fn pty_nav_divider_drag_widens_the_nav() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let Some(mut pty) = fx.spawn_tui(&bin()) else {
+        return;
+    };
+    wait_first_piles(&mut pty);
+    let start = pty.screen(divider_col).expect("the divider");
+    assert_eq!(start, 27, "`NAV_WIDTH_DEFAULT` (28) less its own column");
+
+    // Press on the divider and move right: the nav widens to the pointer, live.
+    let row = 10;
+    pty.press(start, row).expect("press the divider");
+    pty.drag_to(start + 12, row).expect("drag right");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        divider_col(s) == Some(start + 12)
+    })
+    .unwrap_or_else(|e| panic!("the nav follows the pointer: {e}\n{}", pty.screen_text()));
+
+    // Past `NAV_WIDTH_MAX` (60) it stops rather than eating the diff pane.
+    pty.drag_to(90, row).expect("drag past the maximum");
+    pty.wait_for(Duration::from_secs(5), |s| divider_col(s) == Some(59))
+        .unwrap_or_else(|e| panic!("the nav stops at its maximum: {e}"));
+    pty.release(90, row).expect("release");
+
+    // Once the button is up a motion is nobody's business: the divider stays where the drag
+    // left it. The `j` after it is the marker — a frame that answered the key has certainly
+    // seen the motion that preceded it.
+    pty.drag_to(20, row).expect("a motion after the release");
+    pty.send(b"j").expect("j");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        nav_cursor(s).as_deref() == Some("alpha")
+    })
+    .unwrap_or_else(|e| panic!("the key after the motion is answered: {e}"));
+    assert_eq!(
+        pty.screen(divider_col),
+        Some(59),
+        "the release ended the drag:\n{}",
+        pty.screen_text()
+    );
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}
+
+/// [`herdr_snapshot`] with the bare shell beside the agent made an agent too, and the
+/// workspace given a short label: two candidates under one root, which is what opens the
+/// picker instead of staging to the only agent there is.
+fn herdr_snapshot_two_agents(root: &Path) -> serde_json::Value {
+    let mut v = herdr_snapshot(root);
+    v["snapshot"]["workspaces"][0]["label"] = serde_json::json!("ws1");
+    let second = v["snapshot"]["panes"]
+        .as_array_mut()
+        .expect("the snapshot's panes")
+        .iter_mut()
+        .find(|p| p["pane_id"] == serde_json::json!("w1:p2"))
+        .expect("the bare shell beside the agent");
+    second["agent"] = serde_json::json!("codex");
+    second["agent_status"] = serde_json::json!("ready");
+    v
+}
+
+/// `w` and the agent picker in one herdr session (§6.6, deliverable 10).
+///
+/// The mock puts both of the workspace's panes in `alpha` and the child is started with
+/// `HERDR_WORKSPACE_ID`, so the scope is `{alpha}` and the other two repos are hidden: the
+/// header counts one repo, the hint line says so, `w` shows all three and `w` hides them
+/// again. Then a flag on a file in `alpha` has two agents it could go to, so the picker
+/// asks which — and `Esc` drops the send while the flag itself stays on disk.
+#[test]
+fn pty_herdr_scope_toggle_and_the_agent_picker() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let alpha = std::fs::canonicalize(fx.parent.join("alpha")).expect("alpha exists");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime for the mock");
+    let sock = fx.state.join("herdr.sock");
+    let mock = rt.block_on(async {
+        MockHerdr::builder()
+            .snapshot(herdr_snapshot_two_agents(&alpha))
+            .canned(
+                "notification.show",
+                serde_json::json!({"type": "notification_shown", "shown": true, "reason": ""}),
+            )
+            .serve(&sock)
+            .await
+            .expect("bind the mock socket")
+    });
+
+    let Ok(mut pty) = fx
+        .command(&bin())
+        .args(["tui", "--poll", "1"])
+        .env("HERDR_SOCKET_PATH", &sock)
+        .env("HERDR_WORKSPACE_ID", "w1")
+        .spawn()
+    else {
+        note("SKIP: this host cannot open a pty");
+        return;
+    };
+    let t = pty
+        .wait_for(LONG, |s| {
+            let text = s.contents();
+            text.contains("1 repo · ") && text.contains("M f1") && !text.contains("beta")
+        })
+        .unwrap_or_else(|e| panic!("the workspace scope: {e}\n{}", pty.screen_text()));
+    note(&format!("PTY scope: alpha alone after {t:.3?}"));
+    pty.wait_for(Duration::from_secs(5), |s| {
+        s.contents()
+            .contains("scope: ws1 · 2 repos hidden (w shows all)")
+    })
+    .unwrap_or_else(|e| panic!("the scope notice: {e}\n{}", pty.screen_text()));
+
+    pty.send(b"w").expect("w");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        let text = s.contents();
+        text.contains("3 repos · ") && text.contains("beta") && text.contains("notes")
+    })
+    .unwrap_or_else(|e| panic!("`w` shows every repo: {e}\n{}", pty.screen_text()));
+    pty.send(b"w").expect("w back");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        let text = s.contents();
+        text.contains("1 repo · ") && !text.contains("beta")
+    })
+    .unwrap_or_else(|e| panic!("`w` is its own inverse: {e}\n{}", pty.screen_text()));
+
+    // The picker: two agents in this root, so the flag asks where it should go.
+    select_until(&mut pty, "f1  M  +1 −1");
+    pty.send(b"m").expect("m");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        s.contents().contains("f1 · whole file")
+    })
+    .unwrap_or_else(|e| panic!("the note modal: {e}\n{}", pty.screen_text()));
+    pty.send("which of you wrote this?".as_bytes())
+        .expect("the note");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        s.contents().contains("which of you wrote this?")
+    })
+    .unwrap_or_else(|e| panic!("the note is echoed: {e}"));
+    pty.send(b"\r").expect("enter");
+    pty.wait_for(OVERLOADED, |s| {
+        let text = s.contents();
+        text.contains("send to")
+            && text.contains("demo · ws1")
+            && text.contains("codex · ws1")
+            && text.contains("Esc cancel")
+    })
+    .unwrap_or_else(|e| panic!("the agent picker: {e}\n{}", pty.screen_text()));
+
+    // (`status_is` cannot be used here: under a scope the bottom row carries the mandatory
+    // notice on its right, so the status does not own the line.)
+    pty.send(b"\x1b").expect("esc");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        let (_, cols) = s.size();
+        s.rows(0, cols)
+            .last()
+            .is_some_and(|r| r.starts_with("flagged f1 · not sent · "))
+    })
+    .unwrap_or_else(|e| panic!("`Esc` drops the send: {e}\n{}", pty.screen_text()));
+    assert!(
+        !pty.screen_text().contains("send to"),
+        "the picker is gone:\n{}",
+        pty.screen_text()
+    );
+    // The flag itself was written before the picker ever opened, and nothing was staged.
+    pty.wait_for_text("M f1 ⚑", Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("the nav flag marker: {e}"));
+    let ledger = fx.ledger("alpha");
+    assert_eq!(
+        ledger["overrides"]["f1"]["flags"].as_array().map(Vec::len),
+        Some(1),
+        "{ledger}"
+    );
+    assert_eq!(
+        mock.control().count("pane.send_text"),
+        0,
+        "a cancelled picker sends nothing: {:?}",
+        mock.control().methods()
+    );
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+    rt.block_on(mock.shutdown());
 }

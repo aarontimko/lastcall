@@ -639,6 +639,23 @@ impl PtyTui {
         self.send(&sgr_click(col, row))
     }
 
+    /// Press the left button at `(col, row)` and hold it: the first half of a drag.
+    pub fn press(&mut self, col: u16, row: u16) -> io::Result<()> {
+        self.send(&sgr_press(col, row))
+    }
+
+    /// Move the pointer to `(col, row)` **with the left button held** — the motion report
+    /// a terminal sends between a press and its release, which crossterm reads as
+    /// `MouseEventKind::Drag`. A plain [`PtyTui::click`] can never produce one.
+    pub fn drag_to(&mut self, col: u16, row: u16) -> io::Result<()> {
+        self.send(&sgr_drag(col, row))
+    }
+
+    /// Release the left button at `(col, row)`: the end of a drag.
+    pub fn release(&mut self, col: u16, row: u16) -> io::Result<()> {
+        self.send(&sgr_release(col, row))
+    }
+
     /// Change the terminal size (`(cols, rows)`); the child receives `SIGWINCH` and the
     /// parsed screen is resized to match.
     pub fn resize(&mut self, cols: u16, rows: u16) -> io::Result<()> {
@@ -691,14 +708,32 @@ impl Drop for PtyTui {
 /// The SGR (`?1006`) left-button press and release for `(col, row)`, 0-based: what a
 /// terminal sends for a click once crossterm has enabled mouse capture.
 pub fn sgr_click(col: u16, row: u16) -> Vec<u8> {
-    format!(
-        "\x1b[<0;{};{}M\x1b[<0;{};{}m",
-        col + 1,
-        row + 1,
-        col + 1,
-        row + 1
-    )
-    .into_bytes()
+    let mut bytes = sgr_press(col, row);
+    bytes.extend(sgr_release(col, row));
+    bytes
+}
+
+/// The SGR left-button **press** for `(col, row)`, 0-based.
+pub fn sgr_press(col: u16, row: u16) -> Vec<u8> {
+    sgr_mouse(0, col, row, 'M')
+}
+
+/// The SGR left-button **release** for `(col, row)`, 0-based.
+pub fn sgr_release(col: u16, row: u16) -> Vec<u8> {
+    sgr_mouse(0, col, row, 'm')
+}
+
+/// The SGR **motion while the left button is held** for `(col, row)`, 0-based: button 0
+/// plus the 32 motion bit, which is how a terminal reports a drag and the only report
+/// crossterm turns into `MouseEventKind::Drag`.
+pub fn sgr_drag(col: u16, row: u16) -> Vec<u8> {
+    sgr_mouse(32, col, row, 'M')
+}
+
+/// One SGR mouse report: `CSI < button ; col ; row (M|m)`, with the 1-based coordinates
+/// the protocol uses.
+fn sgr_mouse(button: u16, col: u16, row: u16, final_byte: char) -> Vec<u8> {
+    format!("\x1b[<{button};{};{}{final_byte}", col + 1, row + 1).into_bytes()
 }
 
 /// The column (0-based, in cells) at which `needle` starts in a screen row, counting
@@ -722,6 +757,22 @@ mod tests {
         } else {
             false
         }
+    }
+
+    /// A drag is the one mouse gesture whose report a click cannot stand in for: the
+    /// motion carries button 32, and without it crossterm reports `Moved`, which the app
+    /// drops. The nav divider has no keyboard equivalent, so the PTY tier reaches it only
+    /// through these bytes.
+    #[test]
+    fn pty_tui_sgr_drag_is_a_press_a_motion_with_the_32_bit_and_a_release() {
+        assert_eq!(sgr_press(0, 0), b"\x1b[<0;1;1M");
+        assert_eq!(sgr_drag(0, 0), b"\x1b[<32;1;1M");
+        assert_eq!(sgr_release(0, 0), b"\x1b[<0;1;1m");
+        assert_eq!(sgr_drag(39, 12), b"\x1b[<32;40;13M");
+        let mut whole = sgr_press(27, 5);
+        whole.extend(sgr_drag(40, 5));
+        whole.extend(sgr_release(40, 5));
+        assert_eq!(whole, b"\x1b[<0;28;6M\x1b[<32;41;6M\x1b[<0;41;6m");
     }
 
     #[test]
