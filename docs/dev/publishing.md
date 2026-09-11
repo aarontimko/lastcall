@@ -130,6 +130,9 @@ git log --all -S<term> --oneline
   handles, anything that identifies a person) lives **outside the repository**, in the
   maintainer's own notes. It is not committed here, because committing the list publishes
   the list.
+- Project names count. A private repository's name quoted as an example in a design note,
+  a fixture path or a source comment (a ledger row named after the repository it tracked)
+  belongs on the list: it tells a reader the project exists and what it is called.
 - Run both commands for every term. The first catches the working tree, the second catches
   a string that was added and later removed.
 - `z_ignore/` is gitignored and untracked, so `git grep` would skip it anyway; the
