@@ -7,7 +7,7 @@ The last call before code ships: an agent-agnostic review ledger for the termina
 
 ## Status
 
-Pre-release, under construction as a phased program, working towards v0.1.0. There is no
+Pre-release, under construction, working towards v0.1.0. There is no
 published release yet: build it from source with the steps below. Expect keys, config keys
 and on-disk state to move before v0.1.0.
 
