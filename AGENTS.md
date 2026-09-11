@@ -14,7 +14,7 @@ just build                  # cargo build --workspace --all-targets
 just lint                   # fmt --check, clippy -D warnings, engine without the herdr feature
 just test-unit              # THE canonical suite: cargo test --workspace --lib --bins
 just test-integration       # real git; real herdr only when LASTCALL_TEST_HERDR_BIN is set
-just test-integration-herdr # just herdr-fetch (pinned v0.8.2) then the integration tier
+just test-integration-herdr # just herdr-fetch (pinned v0.9.0) then the integration tier
 just test-e2e               # the TUI: TestBackend snapshots + PTY scenes on the built binary
 just test                   # the three tiers in order
 just test-scenarios         # the docs/spec/01-scenarios.md suites (real git, temp fixtures)

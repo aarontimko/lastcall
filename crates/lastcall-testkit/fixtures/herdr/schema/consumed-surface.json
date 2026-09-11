@@ -930,6 +930,9 @@
             "null"
           ]
         },
+        "trust_repository": {
+          "type": "boolean"
+        },
         "workspace_id": {
           "type": [
             "string",
@@ -1396,7 +1399,26 @@
           "default": false,
           "type": "boolean"
         },
+        "endpoint_protocol_generation": {
+          "description": "Stable client-owned endpoint generation supported by this server.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "health_check": {
+          "default": false,
+          "description": "Whether this server supports endpoint health probes.",
+          "type": "boolean"
+        },
         "live_handoff": {
+          "type": "boolean"
+        },
+        "surface_interest": {
+          "default": false,
+          "description": "Whether this server supports explicit client-shell surface interest.",
           "type": "boolean"
         }
       },
@@ -2222,7 +2244,7 @@
       "request"
     ]
   },
-  "protocol": 20,
+  "protocol": 22,
   "results": {
     "agent_info": {
       "properties": {

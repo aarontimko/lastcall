@@ -363,6 +363,25 @@ subset at all.
 | `herdr_real_disconnect_reconnect_converges` (G6) | the cache converges after the server is really stopped and started again |
 | `herdr_real_schema_consumed_surface_unchanged` | the API surface we consume is byte-identical to the pinned fixture |
 
+**The pin is `herdr_version := "v0.9.0"`** (`justfile`), whose asset answers `ping` with
+**protocol 22**. The guard accepts `[20, 21, 22]`: 20 is what the v0.8.2 asset answers, 21 is
+the protocol §5 was hand-checked against (herdr master `5158ada`), 22 is the pin. When the pin
+moves, the three behavioural tests are re-run by hand against the **previous** asset as well,
+so the widened guard is proven on both wires rather than asserted:
+
+```sh
+LASTCALL_TEST_HERDR_BIN=target/herdr/v0.8.2/herdr \
+  cargo test -p lastcall-engine --test test_integration_herdr_real -- --test-threads=1
+```
+
+`herdr_real_schema_consumed_surface_unchanged` is **not** part of that second run and cannot
+be: it compares the binary under test against the fixture generated from the *pinned* asset,
+so any other asset is a diff by construction. That is the point of the test, and its printed
+diff is the evidence — at the v0.8.2 -> v0.9.0 move it listed exactly the four additive fields
+in both directions (`WorktreeListParams.trust_repository`,
+`ServerCapabilities.{endpoint_protocol_generation, health_check, surface_interest}`) plus the
+protocol number, and nothing lastcall reads.
+
 **G3 is the one that is easy to make vacuous**, and two things keep it honest. The client is
 wrapped in a `FilteringTransport<T: Transport>` that drops the events the flip might
 otherwise be announced through and re-serves the rest — `EventStream::new` takes a
@@ -375,7 +394,10 @@ within `fallback + 1 s` (3 s + 1 s in this test; the interval timer is mid-perio
 tab is focused, so a run heals in about 2 s) and came through a full `Resync(Snapshot)`, that
 no reconnect happened, and that herdr forwarded **nothing** in between: if it ever does, the
 filter list is incomplete or herdr found another way to announce the flip, and the assertion
-message says to report it rather than to widen the filter.
+message says to report it rather than to widen the filter. A third guard asserts the filter
+forwarded *something* overall, so a pipe that swallowed every line could not pass as a clean
+run; the scene creates one extra tab after connecting to satisfy it, because until v0.9.0 it
+was satisfied by herdr's lifecycle replay burst on connect and that burst is now fixed.
 
 G6 stops the server through `SpawnedHerdr::stop_server` (`herdr server stop` over the
 isolated socket, never a signal and never the user's herdr), waits for the process to go, and

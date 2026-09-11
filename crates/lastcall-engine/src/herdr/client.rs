@@ -1739,7 +1739,8 @@ mod tests {
     async fn client_protocol_mismatch_with_reconnect_announces_once_then_connects_when_fixed() {
         // Finding 4: with reconnect on, a mismatch is one notice and a slow re-probe; when the
         // server comes back with a supported protocol the client connects.
-        let mock = builder().protocol(22).in_memory();
+        // 23 is one past the accepted set (guard::SUPPORTED_PROTOCOLS = [20, 21, 22]).
+        let mock = builder().protocol(23).in_memory();
         let (handle, mut rx) =
             Client::spawn(Mem(mock.clone()), timings(), ClientOptions::default());
         advance(Duration::from_secs(45)).await;
@@ -2403,7 +2404,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn client_protocol_mismatch_emits_standalone_notice() {
-        let mock = builder().protocol(22).in_memory();
+        // 23 is one past the accepted set (guard::SUPPORTED_PROTOCOLS = [20, 21, 22]).
+        let mock = builder().protocol(23).in_memory();
         let (handle, mut rx) = Client::spawn(
             Mem(mock.clone()),
             timings(),
@@ -2414,7 +2416,7 @@ mod tests {
         assert_eq!(events.len(), 1, "{events:?}");
         match &events[0] {
             HerdrEvent::Standalone { notice } => {
-                assert!(notice.contains("protocol 22"), "{notice}");
+                assert!(notice.contains("protocol 23"), "{notice}");
                 assert!(notice.contains("standalone"), "{notice}");
             }
             other => panic!("{other:?}"),

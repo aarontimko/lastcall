@@ -10,7 +10,7 @@ export PATH := (if path_exists("/opt/homebrew/opt/rustup/bin") == "true" { "/opt
 
 # The pinned herdr release used by the real-herdr integration tests (docs/spec/00-spec.md §4.4).
 # The only sanctioned network fetch in the repo besides cargo's registry and rustup.
-herdr_version := "v0.8.2"
+herdr_version := "v0.9.0"
 herdr_bin := "target/herdr" / herdr_version / "herdr"
 
 # Run any cargo command with the pinned toolchain on PATH: `just cargo add serde`

@@ -29,9 +29,9 @@ first lines:
 ```
 lastcall hello-herdr (events are hints; snapshots are truth)
 session: /Users/you/.config/herdr/herdr.sock (EnvSocketPath)
-ping: herdr 0.8.2 protocol 20 (supported: 20/21)
+ping: herdr 0.9.0 protocol 22 (supported: 20/21/22)
 compat: ok
-connected: herdr 0.8.2 protocol 20
+connected: herdr 0.9.0 protocol 22
 workspaces (1): ...
 panes (2): ...
 agents (0):
@@ -79,7 +79,8 @@ Paste the transcript into the PR; that is the `[sponsor]` gate item. Ctrl-C to s
 - `herdr api` has only `snapshot` and `schema` subcommands; `pane.report_agent` is reached
   through `herdr pane report-agent`, never `herdr api pane.report_agent`.
 - The published v0.8.2 asset answers **protocol 20**; the spec's "protocol 21" is herdr master
-  after the release. Both are supported (`guard::SUPPORTED_PROTOCOLS`).
+  after the release; the pinned v0.9.0 asset answers **22**. All three are supported
+  (`guard::SUPPORTED_PROTOCOLS`).
 - Standalone outcomes print a notice and exit 1: no session found, several live sessions with
   no `herdr.session` pin in `config.toml`, or a protocol mismatch.
 
