@@ -205,14 +205,27 @@ pub struct Built {
 pub fn config() -> Config {
     Config {
         draft_dirs: vec![DRAFT_DIR.to_owned()],
+        update: no_update_check(),
         ..Config::default()
     }
 }
 
+/// `[update] check = false` (Phase 9b deliverable 2.8). Every fixture config carries it:
+/// nothing in the suite may start a background lookup, and a config that says so plainly
+/// is one less thing a new scene has to remember. It is belt and braces — the probe `curl`
+/// on `PATH` already makes the network unreachable — but the two failures it guards against
+/// are different: a config that forgot, and a `PATH` that forgot.
+fn no_update_check() -> lastcall_engine::config::UpdateConfig {
+    lastcall_engine::config::UpdateConfig { check: false }
+}
+
+/// The `[update]` table every fixture `config.toml` ends with.
+pub const NO_UPDATE_CHECK_TOML: &str = "\n[update]\ncheck = false\n";
+
 /// The `config.toml` text for [`config`] with `parent_dirs = [parent]`.
 pub fn config_toml(parent: &Path) -> String {
     format!(
-        "parent_dirs = [\"{}\"]\ndraft_dirs = [\"{DRAFT_DIR}\"]\n",
+        "parent_dirs = [\"{}\"]\ndraft_dirs = [\"{DRAFT_DIR}\"]\n{NO_UPDATE_CHECK_TOML}",
         parent.display()
     )
 }
@@ -227,6 +240,7 @@ pub fn write_config(path: &Path, parent: &Path) -> std::io::Result<()> {
 pub fn draft_config() -> Config {
     Config {
         draft_dirs: vec![DRAFT_DIR.to_owned(), DRAFT_SUBDIR.to_owned()],
+        update: no_update_check(),
         ..Config::default()
     }
 }
@@ -234,7 +248,7 @@ pub fn draft_config() -> Config {
 /// The `config.toml` text for [`draft_config`] with `parent_dirs = [parent]`.
 pub fn draft_config_toml(parent: &Path) -> String {
     format!(
-        "parent_dirs = [\"{}\"]\ndraft_dirs = [\"{DRAFT_DIR}\", \"{DRAFT_SUBDIR}\"]\n",
+        "parent_dirs = [\"{}\"]\ndraft_dirs = [\"{DRAFT_DIR}\", \"{DRAFT_SUBDIR}\"]\n{NO_UPDATE_CHECK_TOML}",
         parent.display()
     )
 }

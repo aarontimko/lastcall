@@ -265,6 +265,9 @@ pub enum Target {
     RootDot(PathBuf),
     /// The header's herdr badge: a click shows the full standalone reason.
     HeaderHerdr,
+    /// The header's update notice (`↑ 0.1.1`): a click puts the whole sentence on the
+    /// status line, exactly as a click on the badge does (Design pass D6).
+    HeaderUpdate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1033,6 +1036,11 @@ pub struct App {
     /// modal's key line says so. `false` — the default, and what every terminal that does
     /// not answer gets — promises `Ctrl-J` alone, which always works.
     pub enhanced: bool,
+    /// The newer release the once-a-day check found, if any (kickoff deliverable 2.6):
+    /// the version alone (`0.1.1`), set once per session by `Local::UpdateAvailable` and
+    /// never cleared. `None` is every other session, including every session the config
+    /// turned the check off in.
+    pub update: Option<String>,
 }
 
 impl Default for App {
@@ -1080,7 +1088,24 @@ impl App {
             // The canonical spellings (`shift-a` shows as `A`), as `Keymap::table` gives.
             keymap: Keymap::defaults().table(),
             enhanced: false,
+            update: None,
         }
+    }
+
+    /// The once-a-day check found `version`. Sets the header notice for the session and
+    /// nothing else: no status sentence, no hint, no modal. The reader is mid-review and
+    /// did not ask about releases (Design pass D6).
+    pub fn update_available(&mut self, version: String) -> Changed {
+        if self.update.as_deref() == Some(version.as_str()) {
+            return Changed::No;
+        }
+        self.update = Some(version);
+        Changed::Yes
+    }
+
+    /// The sentence [`Target::HeaderUpdate`] puts on the status line.
+    pub fn update_sentence(version: &str) -> String {
+        format!("lastcall {version} available — run: lastcall update")
     }
 
     /// The key specs bound to `action` (empty when unbound).
@@ -3497,6 +3522,14 @@ impl App {
                     Changed::Yes
                 }
                 _ => Changed::No,
+            },
+            Target::HeaderUpdate => match &self.update {
+                Some(version) => {
+                    let text = App::update_sentence(version);
+                    self.set_status(text);
+                    Changed::Yes
+                }
+                None => Changed::No,
             },
             Target::FileAccept => return self.handle(Action::AcceptFile),
             Target::FileRestore => return self.handle(Action::RestoreFile),

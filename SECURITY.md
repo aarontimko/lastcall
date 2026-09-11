@@ -63,14 +63,21 @@ What lastcall touches, so you can judge whether something is in scope:
   config directory. The herdr surface is treated as
   untrusted input (unknown fields are ignored, never rejected). With no socket, lastcall
   runs standalone.
-- **Reaches the network** in two places once it is released, both aimed at
-  `github.com` and nowhere else. `lastcall update` downloads a release asset over HTTPS
-  and verifies a SHA-256 checksum before it replaces its own binary. The TUI also asks the
-  GitHub releases API once a day, in the background after the first frame, whether a newer
+- **Reaches the network** in two places once it is released, both aimed at GitHub and
+  nowhere else: `api.github.com` for the releases API, and `github.com` for a release
+  asset, which GitHub itself redirects to its asset host. `lastcall update` downloads the
+  asset over HTTPS and checks its SHA-256 against the release's `SHA256SUMS` before it
+  replaces its own binary; a mismatch stops it and leaves the running binary untouched, and
+  it refuses outright when the binary was installed by a package manager. The TUI also asks
+  the releases API once a day, in the background after the first frame, whether a newer
   version exists; that request carries the lastcall version as its user agent and nothing
-  else, and `check = false` under `[update]` in `config.toml` turns it off. Nothing else in
-  the shipped binary makes a network call. (`just herdr-fetch` downloads a pinned herdr
-  release, but that is a developer and CI command, not something the binary does.)
+  else, and `check = false` under `[update]` in `config.toml` turns it off. Both requests
+  are `curl` subprocesses: the shipped binary links no HTTP stack of its own.
+  `LASTCALL_UPDATE_BASE_URL` can point the explicit command at a local test server; it is
+  ignored unless it names `127.0.0.1` or `localhost`, it says on stderr when it is used, and
+  the once-a-day check never reads it. Nothing else in the shipped binary makes a network
+  call. (`just herdr-fetch` downloads a pinned herdr release, but that is a developer and
+  CI command, not something the binary does.)
 
 Out of scope: anything that needs an attacker to already have arbitrary code execution as
 your user, and the security of the repositories or the agents lastcall is watching.

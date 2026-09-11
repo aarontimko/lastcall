@@ -30,6 +30,78 @@ pub const SIZE: (u16, u16) = (100, 30);
 /// How often [`PtyTui::wait_for`] and [`PtyTui::wait_exit`] look again.
 pub const POLL: Duration = Duration::from_millis(10);
 
+/// The probe `curl` (`crates/lastcall/tests/probe/curl.sh`), by absolute path.
+pub const PROBE_CURL: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../lastcall/tests/probe/curl.sh"
+);
+
+/// The probe directory this harness prepends to `PATH`, inside the scene's own `home`.
+pub fn probe_bin_dir(home: &Path) -> PathBuf {
+    home.join(".lastcall-probe-bin")
+}
+
+/// Build `<home>/.lastcall-probe-bin/curl` (a symlink to [`PROBE_CURL`]) and return the
+/// `PATH` the child should get: that directory, then whatever this process has.
+///
+/// `lastcall update` and the TUI's once-a-day check shell out to `curl` and nothing else,
+/// so shadowing the name is the whole isolation: no scene can reach the network even if
+/// its config forgot to turn the check off. Real `curl` stays reachable to anything that
+/// asks for it by absolute path, and `git` does not use the binary at all.
+pub fn prepend_probe_dir(home: &Path) -> OsString {
+    let dir = probe_bin_dir(home);
+    let _ = std::fs::create_dir_all(&dir);
+    let link = dir.join("curl");
+    if !link.exists() {
+        let _ = std::os::unix::fs::symlink(PROBE_CURL, &link);
+    }
+    let mut path = dir.into_os_string();
+    if let Some(existing) = std::env::var_os("PATH") {
+        path.push(":");
+        path.push(existing);
+    }
+    path
+}
+
+/// Append `[update]` / `check = <on>` to the isolated `config.toml`, unless the scene's own
+/// config already says something about the table. Done at spawn time so the scene may write
+/// its config in any order relative to [`PtyCommand::isolated_lastcall`].
+fn write_update_table(config: &Path, on: bool) -> io::Result<()> {
+    let text = std::fs::read_to_string(config).unwrap_or_default();
+    let want = format!("check = {on}");
+    let mut out: Vec<String> = Vec::new();
+    let mut in_table = false;
+    let mut wrote = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            if in_table && !wrote {
+                out.push(want.clone());
+                wrote = true;
+            }
+            in_table = trimmed == "[update]";
+        }
+        if in_table && trimmed.starts_with("check") && trimmed != "[update]" {
+            out.push(want.clone());
+            wrote = true;
+            continue;
+        }
+        out.push(line.to_owned());
+    }
+    if in_table && !wrote {
+        out.push(want.clone());
+        wrote = true;
+    }
+    if !wrote {
+        out.push(String::new());
+        out.push("[update]".to_owned());
+        out.push(want);
+    }
+    let mut text = out.join("\n");
+    text.push('\n');
+    std::fs::write(config, text)
+}
+
 /// What the reader thread fills: the parsed screen and the raw bytes, in order.
 struct Shared {
     parser: vt100::Parser,
@@ -48,6 +120,10 @@ pub struct PtyCommand {
     size: (u16, u16),
     sample_rss: bool,
     answer_dsr: bool,
+    /// The isolated `config.toml`, when [`PtyCommand::isolated_lastcall`] named one: the
+    /// `[update]` table is appended to it at spawn time.
+    update_config: Option<PathBuf>,
+    update_check: bool,
 }
 
 impl PtyCommand {
@@ -61,6 +137,8 @@ impl PtyCommand {
             size: SIZE,
             sample_rss: false,
             answer_dsr: false,
+            update_config: None,
+            update_check: false,
         }
     }
 
@@ -151,6 +229,7 @@ impl PtyCommand {
     /// deliverable 7): they name a program `shift-i` would *run*.
     pub fn isolated_lastcall(self, home: &Path, config: &Path, state_dir: &Path) -> Self {
         let mut cmd = self
+            .env("PATH", prepend_probe_dir(home))
             .env("HOME", home)
             .env("LASTCALL_KEYBOARD", "plain")
             .env("LASTCALL_CONFIG", config)
@@ -171,6 +250,7 @@ impl PtyCommand {
             // thought about editors cannot open one either.
             .env_remove("VISUAL")
             .env_remove("EDITOR");
+        cmd.update_config = Some(config.to_path_buf());
         for (key, _) in std::env::vars_os() {
             if key.to_string_lossy().starts_with("HERDR_") {
                 cmd = cmd.env_remove(key);
@@ -179,9 +259,28 @@ impl PtyCommand {
         cmd
     }
 
+    /// Let this scene's child run the TUI's once-a-day update check (Phase 9b deliverable
+    /// 2.8). Off by default: [`isolated_lastcall`](Self::isolated_lastcall) writes
+    /// `[update]` / `check = false` into the isolated config, so a scene that never thought
+    /// about releases cannot start a background lookup at all.
+    ///
+    /// Turning it on does **not** reach the network either: the probe `curl` on `PATH` is
+    /// the only `curl` the child can find, and with `LASTCALL_TEST_RELEASE_DIR` unset it
+    /// exits 99. A scene that wants an answer sets that variable to a served directory.
+    ///
+    /// Order-independent: the table is written when the child is spawned, not here, so this
+    /// may be called before or after `isolated_lastcall`.
+    pub fn update_check(mut self, on: bool) -> Self {
+        self.update_check = on;
+        self
+    }
+
     /// Open the PTY and start the child. `ErrorKind::Unsupported` means this host cannot
     /// open a PTY at all (the only reason a PTY test may skip); anything else is a failure.
     pub fn spawn(self) -> io::Result<PtyTui> {
+        if let Some(config) = &self.update_config {
+            write_update_table(config, self.update_check)?;
+        }
         let (cols, rows) = self.size;
         let pair = native_pty_system()
             .openpty(PtySize {

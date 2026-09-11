@@ -1397,7 +1397,7 @@ sibling lib test scanning on a subscriber-free thread would poison it.
 
 ```sh
 rg -n 'Command::new\("git"\)' crates                       # engine git.rs, plus the testkit's fixture builder; nothing under tui/
-rg -n 'std::env::var|home_dir\(' crates/lastcall/src        # tui/term.rs: the two LASTCALL_LOG* reads and LASTCALL_KEYBOARD; tui/run.rs: the $VISUAL/$EDITOR closure it hands EditorCommand::resolve; commands/mod.rs: LASTCALL_PARALLELISM (test-only override, never under tui/); tui/textbuf.rs: PROPTEST_CASES, inside #[cfg(test)]
+rg -n 'std::env::var|home_dir\(' crates/lastcall/src        # tui/term.rs: the two LASTCALL_LOG* reads and LASTCALL_KEYBOARD; tui/run.rs: the $VISUAL/$EDITOR closure it hands EditorCommand::resolve; commands/mod.rs: LASTCALL_PARALLELISM (test-only override, never under tui/); tui/textbuf.rs: PROPTEST_CASES, inside #[cfg(test)]; commands/update.rs: LASTCALL_UPDATE_BASE_URL, honoured only for loopback and only by the explicit command
 rg -n 'lock\(' crates/lastcall/src/tui                      # nothing
 rg -n 'Rendered::of' crates/lastcall/src                    # only tui/app.rs (requests come from the held rows)
 rg -n 'last_pile|scan_all\(|\.scan\(' crates/lastcall/src/tui/app.rs   # nothing (the reducer never scans)
@@ -1405,9 +1405,9 @@ rg -n 'println!|eprintln!|print!' crates/lastcall/src/tui   # nothing (the messa
 rg -n 'thread::sleep|tokio::time::sleep' crates/lastcall/src/tui   # nothing
 rg -n 'lastcall_engine::herdr' crates/lastcall/src/tui     # only tui/herdr.rs and tui/run.rs (the task side); never app.rs or render.rs
 rg -n 'e\.(restore|flag|unflag)\(' crates/lastcall/src     # only tui/run.rs (restore and flag reach the engine through one seam)
-rg -n 'OpenOptions|File::create|fs::write' crates/lastcall/src   # tui/term.rs (the log file) and tui/run.rs (the export fallback); no worktree file is ever opened for writing
+rg -n 'OpenOptions|File::create|fs::write' crates/lastcall/src   # tui/term.rs (the log file), tui/run.rs (the export fallback) and commands/update.rs (the O_EXCL temp beside the canonical `current_exe`, and the daily-check stamp under the state dir); no worktree file is ever opened for writing
 rg -n 'e\.save\(|e\.read_rendered\(' crates/lastcall/src        # only tui/run.rs (the inline editor reaches the engine through one seam, like restore and flag)
-rg -n 'Command::new' crates/lastcall/src/tui                # only tui/run.rs's `$EDITOR` spawn (Suspend::run); nothing else in the TUI starts a process
+rg -n 'Command::new' crates/lastcall/src/tui                # only tui/run.rs's `$EDITOR` spawn (Suspend::run); nothing else in the TUI starts a process (the update path's `curl` lives in commands/update.rs, outside tui/)
 rg -n 'openat|renameat|OpenOptions|File::create|fs::write' crates/lastcall-engine/src --glob '!*test*'   # restore.rs is the only file that opens a path under a root; every other hit writes under the state dir (ops.rs's two are in its own in-file `mod tests`)
 cargo tree -e normal -p lastcall -p lastcall-engine | grep -c testkit   # 0
 ```

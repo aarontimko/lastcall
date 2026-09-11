@@ -41,7 +41,7 @@ the export renderer and the ledger's 1.1 schema; then the TUI half: the two-colu
 restore, the note modal, the picker and the export fallback, whose reducer tests are the last
 13 of the binary lib's count): 255 engine + 34 testkit + 187 binary lib + 6 binary main =
 **482**; then the verifier (b) review-fix pass, which added seven reducer and render tests
-for F1–F5: 255 engine + 34 testkit + 194 binary lib + 6 binary main = **489**; Phase 8 (save under CAS, the `$EDITOR` handover, the inline editor, select-to-copy, the launch hold): 271 engine + 35 testkit + 250 binary lib + 6 binary main = **562**, the Phase 9 floor; Phase 9a (the `status` store fields, every repo listed and `t`, the neighbour rule, the hint line's drop order, the focus-true opening, the launch hold's one vocabulary and scope fold, the editor header, the help overlay's clip row, and the verifier (a) folds): 274 engine + 35 testkit + 267 binary lib + 6 binary main = **582**, the Phase 9b floor).
+for F1–F5: 255 engine + 34 testkit + 194 binary lib + 6 binary main = **489**; Phase 8 (save under CAS, the `$EDITOR` handover, the inline editor, select-to-copy, the launch hold): 271 engine + 35 testkit + 250 binary lib + 6 binary main = **562**, the Phase 9 floor; Phase 9a (the `status` store fields, every repo listed and `t`, the neighbour rule, the hint line's drop order, the focus-true opening, the launch hold's one vocabulary and scope fold, the editor header, the help overlay's clip row, and the verifier (a) folds): 274 engine + 35 testkit + 267 binary lib + 6 binary main = **582**, the Phase 9b floor; Phase 9b so far (herdr v0.9.0's protocol set, the `[update]` config key, the header's update notice, and `commands/update.rs`'s own tests, which land in the binary main count because `commands/` is binary-only): 277 engine + 35 testkit + 268 binary lib + 16 binary main = **596**).
 The suite never shrinks across commits. One recorded exception: at the Phase 2 code review
 the three filesystem-live watcher tests (up to 30 s waits, real FSEvents) left the unit tier
 for `crates/lastcall-engine/tests/test_integration_watcher.rs` because they contradicted the
@@ -210,7 +210,17 @@ the terminal and asserts the cursor on that repo's own name row with `nothing pe
 pane, then `t` hiding the repo and `t` bringing it back; it is the slow one — the bottom row is
 the status line while a status is live, and launch sets one, so the scene waits out
 `app::STATUS_TTL` (30 s) once before it can read the hint line (Phase 9a verifier (a) F8: about
-36 s of the file's time is that wait). No PTY
+36 s of the file's time is that wait). The three scenes for the update check are
+`pty_update_notice_after_hold` (a served `latest.json` naming a newer release: the raw
+transcript proves the notice never precedes the launch hold, the header then carries the
+seven-column `↑ 9.9.9`, a click reads the whole sentence onto the status line, and after a
+clean exit the probe log holds exactly one `releases/latest` URL against `api.github.com`,
+never the test base URL), `pty_update_check_is_throttled_by_the_daily_stamp` (a stamp 1 h old
+renders the notice from disk and spends no request; one 25 h old looks again and moves
+`checked_at` forward), and `pty_update_check_is_off_for_every_other_scene` (the default
+isolation: no notice, no request, no stamp, and `[update]` / `check = false` in the config the
+harness wrote). Every negative assertion in the three is made **after** `wait_exit`, so no
+detached check thread can race it. No PTY
 scene talks to herdr: only `just test-integration-herdr` proves the real pane. The staged
 send is covered in three places, and it takes all three — verifier (b) F1 found that the two
 end tests both passed while the middle was missing, because nothing in the loop built
@@ -223,7 +233,7 @@ client over the mock socket, the loop's own `run::herdr_fold`, `Ui::event` for t
 keystrokes, and `run::spawn_flag` / `run::spawn_stage` for the effects, asserting the
 bracketed-paste `pane.send_text` that lands on the socket. A send test that injects its own
 candidates proves the reducer, never the wiring. The scenes are serialized (one
-mutex); the whole file is about 45 s. Timing lines go to `stderr().write_all` so they survive libtest's
+mutex); the whole file is about 105 s. Timing lines go to `stderr().write_all` so they survive libtest's
 capture — run it with `-- --nocapture` to see them. If the live-update assertion fails on a
 loaded host, report the measured numbers; do not loosen the budget.
 
@@ -256,6 +266,34 @@ that uses it — one `shift-i` on `alpha/src/parse.rs`'s second hunk, asserting 
 `argv:` is `+<line> <absolute path>` and its `cwd:` is the root — and it lives in the
 integration tier because it is the argv proof, not the terminal-handover proof; the PTY
 scenes are the latter.
+
+### The probe curl (`tests/probe/curl.sh`)
+
+`lastcall update` and the TUI's daily check reach the network by spawning `curl`
+(`commands/update.rs`, rule 1: no HTTP crate). **No test may reach the network.** Two
+independent guards stop it. First, `isolated_lastcall` writes `[update]` with `check = false`
+into every isolated config, so a scene that never thought about releases starts no check at
+all; `.update_check(true)` is the opt-in the three update scenes use. Second, it prepends a
+probe directory to the child's `PATH` whose `curl` is a symlink to
+`crates/lastcall/tests/probe/curl.sh`, so even a bug that started a check unasked would reach
+the script and not the internet. (`PATH` is prepended only for the child, and only here; the
+editor scenes still never touch it.)
+
+The script serves the directory named by `LASTCALL_TEST_RELEASE_DIR` and **exits 99 if that
+variable is unset**, which is what makes an accidental request loud instead of silent. It maps
+a request path to a file: `*/releases/latest` to `latest.json`, `*/releases?per_page=*` to
+`list.json`, and `*/download/<tag>/<asset>` to `<asset>`. A `<name>.status` file beside it
+sets the HTTP status (the rate-limit scene), a `<name>.headers` file the response headers
+(`-D -`). It honours `-o <dest>`, appends the three status digits to stdout the way
+`-w '%{http_code}'` does, and logs `url: <url>` to `LASTCALL_PROBE_CURL_LOG`, which is how a
+scene proves how many requests were spent and against which host.
+
+The integration tier uses the same script directly
+(`crates/lastcall/tests/test_integration_update.rs`, eight scenes: the verified replacement, a
+checksum mismatch that leaves the binary alone, `--check`, the prerelease that is not offered,
+the package-manager refusal, the rate limit and its reset time, the loopback-only
+`LASTCALL_UPDATE_BASE_URL`, and the unset-directory failure). Those scenes copy the built
+binary into a temp dir first: nothing ever renames over the binary the test runner is using.
 
 ### The slow git (`scripts/slowgit/git`)
 

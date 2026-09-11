@@ -67,6 +67,8 @@ pub struct Config {
     pub hide_empty_repos: bool,
     /// The `[herdr]` table.
     pub herdr: HerdrConfig,
+    /// The `[update]` table (Amendment v1.10 item 2).
+    pub update: UpdateConfig,
     /// The `[keys]` table (Amendment v1.3): `<action> = "<key>"` or `["<key>", …]`, each
     /// entry replacing that action's default bindings. Opaque here — only the TUI knows the
     /// action names and key grammar, so `lastcall config` and `lastcall tui` validate it
@@ -91,6 +93,7 @@ impl Default for Config {
                 .collect(),
             hide_empty_repos: false,
             herdr: HerdrConfig::default(),
+            update: UpdateConfig::default(),
             keys: BTreeMap::new(),
         }
     }
@@ -169,6 +172,26 @@ impl Default for HerdrConfig {
             toast: true,
             scope: HerdrScope::default(),
         }
+    }
+}
+
+/// The `[update]` table (§6.1, Amendment v1.10 item 2).
+///
+/// No `derive(Default)`: `check` defaults to `true`, which a derive cannot express.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)] // required on config types; see `Config`
+pub struct UpdateConfig {
+    /// Ask the GitHub releases API, once a day in the background after the first frame,
+    /// whether a newer release exists. Default `true`. `false` is the only switch: there
+    /// is no environment override (ruling P2). It governs the TUI's background check only,
+    /// never the explicit `lastcall update` / `lastcall update --check`, which the user
+    /// asked for by typing it.
+    pub check: bool,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self { check: true }
     }
 }
 
@@ -475,6 +498,9 @@ hide_empty_repos = true
 mode = "on"
 session = "work"
 
+[update]
+check = false
+
 [keys]
 quit = "q"
 nav_down = ["down", "j", "ctrl-n"]
@@ -507,6 +533,7 @@ nav_down = ["down", "j", "ctrl-n"]
         assert!(c.hide_empty_repos);
         assert_eq!(c.herdr.mode, HerdrMode::On);
         assert_eq!(c.herdr.session.as_deref(), Some("work"));
+        assert!(!c.update.check);
         assert_eq!(c.keys.len(), 2);
         assert_eq!(c.keys["quit"], KeySpecs::One("q".into()));
         assert_eq!(c.keys["quit"].specs(), vec!["q"]);
@@ -898,6 +925,35 @@ nav_down = ["down", "j", "ctrl-n"]
         let err = load(&env).unwrap_err();
         assert!(matches!(err, ConfigError::Parse { .. }), "{err}");
         assert!(err.to_string().contains("expected a boolean"), "{err}");
+    }
+
+    /// Amendment v1.10 item 2 (§6.1): `[update] check` is a bool, default `true` — a
+    /// config file that has never heard of the table loads, `lastcall config` prints it,
+    /// it round-trips, and an unknown key under `[update]` is a load error like every
+    /// other table.
+    #[test]
+    fn config_update_check_defaults_true_and_round_trips() {
+        assert!(Config::default().update.check, "the daily check is opt-out");
+        let old: Config = toml::from_str("parent_dirs = []\n").unwrap();
+        assert!(old.update.check);
+
+        let off: Config = toml::from_str("[update]\ncheck = false\n").unwrap();
+        assert!(!off.update.check);
+        let text = toml::to_string_pretty(&off).unwrap();
+        assert!(text.contains("check = false"), "{text}");
+        assert_eq!(toml::from_str::<Config>(&text).unwrap(), off);
+        let printed = toml::to_string_pretty(&Config::default()).unwrap();
+        assert!(printed.contains("[update]"), "{printed}");
+        assert!(printed.contains("check = true"), "{printed}");
+
+        let dir = TempDir::new("lc-config");
+        let (env, _) = env_with_config(&dir, "[update]\ncheck = \"no\"\n");
+        let err = load(&env).unwrap_err();
+        assert!(matches!(err, ConfigError::Parse { .. }), "{err}");
+
+        let (env, _) = env_with_config(&dir, "[update]\nchek = true\n");
+        let err = load(&env).unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{err}");
     }
 
     #[test]

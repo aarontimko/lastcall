@@ -132,6 +132,10 @@ pub enum Local {
     Fatal(String),
     /// A herdr request the loop made off the UI task came back (`agent.focus`, a toast).
     Herdr(HerdrUpdate),
+    /// The once-a-day update check found a newer release (kickoff deliverable 2.6): the
+    /// version alone, `0.1.1`. Arrives at most once, from the detached thread [`run`]
+    /// starts when the launch hold ends.
+    UpdateAvailable(String),
     /// An `Effect::EditorReturned` finished: what the work tree holds at the path the
     /// `$EDITOR` session had open (Phase 8 deliverable 3). The row the editor was opened on
     /// travels back with the answer so the reducer compares against what the user saw.
@@ -368,6 +372,7 @@ impl Ui {
                 (Changed::No, Some(Effect::Quit))
             }
             Local::Herdr(update) => self.app.handle(Action::Herdr(update)),
+            Local::UpdateAvailable(version) => (self.app.update_available(version), None),
             Local::EditorReturned {
                 root,
                 rendered,
@@ -1400,6 +1405,38 @@ impl Signals {
     }
 }
 
+/// Where the once-a-day update check posts its answer, and how it asks whether the loop is
+/// already tearing down (kickoff deliverable 2.6).
+///
+/// The check runs on a **detached** thread, so a `curl` still in flight when the reader
+/// presses `q` neither delays the quit nor writes the state dir behind it.
+#[derive(Debug, Clone)]
+pub struct UpdateSink {
+    tx: mpsc::UnboundedSender<Local>,
+    quit: Arc<AtomicBool>,
+}
+
+impl UpdateSink {
+    /// Whether the loop has ended. Polled by the check before it writes its stamp.
+    pub fn quitting(&self) -> bool {
+        self.quit.load(Ordering::Relaxed)
+    }
+
+    /// Announce a newer release. A closed channel (the loop is gone) is not an error.
+    pub fn available(&self, version: String) {
+        let _ = self.tx.send(Local::UpdateAvailable(version));
+    }
+}
+
+/// The update check itself, passed in by the binary.
+///
+/// It is a closure rather than a call, because every network and filesystem detail of the
+/// update path lives in `commands/update.rs` and none of it belongs in the TUI: the gate
+/// greps for `Command::new`, `std::env::var` and `File::create` under `crates/lastcall/src/tui`
+/// stay exactly as they were. `None` means the config turned the check off, and then no
+/// thread is started at all.
+pub type DailyCheck = Box<dyn FnOnce(UpdateSink) + Send + 'static>;
+
 /// Take the terminal and run the TUI until `q`/Ctrl-C/SIGTERM (exit 0) or the watcher
 /// ends (status notice, exit 0). The caller has already checked that stdout is a terminal
 /// and that the keymap parsed; this enters raw mode and always restores it.
@@ -1412,6 +1449,10 @@ pub fn run(
     // `hide_empty_repos` from the config file (§6.1, Amendment v1.9): the app's opening
     // answer to `t`. The key flips it for the session; nothing writes it back.
     hide_empty: bool,
+    // The once-a-day update check, or `None` when `[update] check = false`. Started on a
+    // detached thread the moment the launch hold ends, never before the first frame and
+    // never on the launch path (kickoff deliverable 2.6).
+    daily_check: Option<DailyCheck>,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -1433,6 +1474,10 @@ pub fn run(
     let (mut input_stop, input_thread) = spawn_input(input_tx)?;
     let mut reader = Some(input_thread);
     let (local_tx, mut local_rx) = mpsc::unbounded_channel::<Local>();
+    // Raised the moment the loop ends, read by the detached update-check thread before it
+    // writes its stamp.
+    let update_quit = Arc::new(AtomicBool::new(false));
+    let mut daily_check = daily_check;
 
     // Copied out before the engine is moved into its watcher: both are immutable for the
     // life of the process, and the export path is resolved without taking the engine lock.
@@ -1812,6 +1857,19 @@ pub fn run(
                         crossterm::execute!(io::stdout(), DisableBracketedPaste)
                     };
                 }
+                // The once-a-day update check starts here and nowhere else: the launch
+                // hold has ended, so the first frame is long past and nothing this thread
+                // does can be on the launch path. It is detached and never joined, so quit
+                // does not wait for a `curl`, and `UpdateSink::quitting` is what keeps a
+                // late answer from writing the state dir behind a closing process.
+                if daily_check.is_some() && ui.app.loading.is_none() {
+                    let check = daily_check.take().expect("Some in this branch");
+                    let sink = UpdateSink {
+                        tx: local_tx.clone(),
+                        quit: update_quit.clone(),
+                    };
+                    std::thread::spawn(move || check(sink));
+                }
                 if redraw == Changed::Yes {
                     // Deliverable 8: one line per repaint, saying why and how long. A
                     // `draw` per pile in a burst is the symptom deliverable 6 removed, and
@@ -1843,6 +1901,7 @@ pub fn run(
     });
 
     input_stop.store(true, Ordering::Relaxed);
+    update_quit.store(true, Ordering::Relaxed);
     let mut real = RealShutdown {
         terminal: Some(terminal),
         guard: Some(guard),

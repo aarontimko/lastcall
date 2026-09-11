@@ -1340,6 +1340,35 @@ fn tui_herdr_header_states() {
     insta::assert_snapshot!("tui_herdr_header_states", lines);
 }
 
+/// Design pass D6 (kickoff deliverable 2.6): the once-a-day update check's whole visible
+/// surface is seven columns in the header, `↑ 0.1.1`, after `[Accept All]` and before the
+/// pad. Nothing is said on the status line, nothing is added to the hints, and no modal
+/// opens: a reader mid-review did not ask about releases. The click-to-read sentence and
+/// the drop order are unit-tested in `render.rs`; this pins the frame it makes at 100
+/// columns, which is where D6 says it fits.
+#[test]
+fn tui_update_notice() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    let before = draw(&app, W, H).0;
+    assert_eq!(app.update_available("0.1.1".to_owned()), Changed::Yes);
+    let (frame, _) = draw(&app, W, H);
+    let header = frame.lines().next().expect("a header");
+    assert!(header.contains("[Accept All]  ↑ 0.1.1"), "{header}");
+    assert_eq!(
+        frame.lines().skip(1).collect::<Vec<_>>(),
+        before.lines().skip(1).collect::<Vec<_>>(),
+        "the notice costs the rest of the screen nothing"
+    );
+    assert!(
+        app.status.is_none(),
+        "no automatic sentence: {:?}",
+        app.status
+    );
+    snapshot("tui_update_notice", &app, W, H);
+}
+
 /// Deliverable 8: the scope hides what is not in this workspace, and the notice that says
 /// so is mandatory — it is right-aligned beside the hint line, naming the count and the
 /// key that shows everything again.

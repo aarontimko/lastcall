@@ -293,7 +293,7 @@ pub fn render(app: &App, frame: &mut Frame<'_>) -> HitMap {
     hits
 }
 
-/// `lastcall  <repos> · <files> · <hunks>  <herdr badge>  [Accept All]` …
+/// `lastcall  <repos> · <files> · <hunks>  <herdr badge>  [Accept All]  ↑ 0.1.1` …
 /// `watching <parents>`, or `lastcall  <repos> · checking status…` while the launch hold
 /// is on (Design pass D3). The file count carries `+` when any listed root's pile stopped at
 /// the row cap; the control is dim when nothing is listed and is the `HeaderAcceptAll`
@@ -303,6 +303,13 @@ pub fn render(app: &App, frame: &mut Frame<'_>) -> HitMap {
 /// control — `^A` duplicates the control, nothing else says what is being watched or
 /// whether herdr is answering. A line with no room for the notice keeps the badge and the
 /// control instead of leaving the right half empty.
+///
+/// **The update notice (Design pass D6)** is the seven columns `↑ 0.1.1`, after the control
+/// and before the pad, and it is the **first** thing this ladder drops: a reader who has not
+/// asked about releases must not lose the badge or the control to a version number. It is
+/// the `HeaderUpdate` target, and a click puts the whole sentence on the status line — the
+/// badge's click-to-read pattern. Nothing else in the UI mentions it, so a session that
+/// never widens past 80 columns reaches it through `lastcall update --check`.
 fn render_header(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
     let listed: Vec<&RootView> = app.listed_roots().collect();
     let files: usize = listed.iter().map(|v| v.rows().len()).sum();
@@ -329,6 +336,7 @@ fn render_header(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
         )
     };
     let control = "[Accept All]";
+    let update = app.update.as_ref().map(|v| format!("↑ {v}"));
     let (badge, badge_style) = herdr_badge(app);
     let parents: BTreeSet<String> = app
         .roots
@@ -344,24 +352,31 @@ fn render_header(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
         )
     };
     let width = area.width as usize;
-    let cost = |badge_on: bool, control_on: bool, notice_on: bool| {
+    let update_width = update.as_ref().map_or(0, |u| u.width());
+    let cost = |update_on: bool, badge_on: bool, control_on: bool, notice_on: bool| {
         left.width()
             + if badge_on { 2 + badge.width() } else { 0 }
             + if control_on { 2 + control.width() } else { 0 }
+            + if update_on { 2 + update_width } else { 0 }
             + if notice_on { 2 + right.width() } else { 0 }
     };
-    // Preference order, first that fits (the last is the unconditional fallback).
-    let (show_badge, show_control, show_notice) = [
-        (true, true, true),
-        (true, false, true),
-        (false, false, true),
-        (true, true, false),
-        (true, false, false),
-        (false, false, false),
+    // Preference order, first that fits (the last is the unconditional fallback). The
+    // update notice is only ever on in the first row, which is what "first dropped" means:
+    // with no update to show, `update.is_none()` skips that row and the remaining six are
+    // the ladder this header has always had, unchanged.
+    let (show_update, show_badge, show_control, show_notice) = [
+        (true, true, true, true),
+        (false, true, true, true),
+        (false, true, false, true),
+        (false, false, false, true),
+        (false, true, true, false),
+        (false, true, false, false),
+        (false, false, false, false),
     ]
     .into_iter()
-    .find(|(b, c, n)| cost(*b, *c, *n) <= width)
-    .unwrap_or((false, false, false));
+    .filter(|(u, ..)| !u || update.is_some())
+    .find(|(u, b, c, n)| cost(*u, *b, *c, *n) <= width)
+    .unwrap_or((false, false, false, false));
 
     let mut used = left.width();
     let mut spans = vec![Span::styled(left, bold())];
@@ -386,11 +401,24 @@ fn render_header(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
             },
         ));
     }
+    let mut update_x = None;
+    if let (true, Some(update)) = (show_update, &update) {
+        spans.push(Span::raw("  "));
+        update_x = Some(area.x + (used + 2) as u16);
+        used += 2 + update.width();
+        spans.push(Span::styled(update.clone(), dim()));
+    }
     if show_notice {
         let pad = width.saturating_sub(used + right.width());
         spans.push(Span::raw(format!("{}{right}", " ".repeat(pad))));
     }
     buf.set_line(area.x, area.y, &Line::from(spans), area.width);
+    if let (Some(x), Some(update)) = (update_x, &update) {
+        hits.targets.push((
+            Rect::new(x, area.y, update.width() as u16, 1),
+            Target::HeaderUpdate,
+        ));
+    }
     if let Some(x) = badge_x {
         hits.targets.push((
             Rect::new(x, area.y, badge.width() as u16, 1),
@@ -3545,17 +3573,75 @@ mod tests {
 
     /// The header's four segments do not fit at 80 columns, and the ladder is
     /// counts → notice → badge → control: `^A` and the hint line duplicate the control,
-    /// nothing else says what is watched or whether herdr is answering.
+    /// nothing else says what is watched or whether herdr is answering. Design pass D6 adds
+    /// one step in front: the update notice goes **before** the control does, so a reader
+    /// who never asked about releases loses nothing that was there yesterday.
     #[test]
     fn render_header_drops_the_accept_control_before_the_herdr_badge() {
-        let app = App::new();
+        let mut app = App::new();
+        app.update_available("0.1.1".to_owned());
+        let (wide, _) = frame_of(&app, 100, 12);
+        assert!(wide.contains("↑ 0.1.1"), "{wide}");
+        assert!(wide.contains("[Accept All]"), "{wide}");
         let (frame, _) = frame_of(&app, 80, 12);
+        assert!(
+            !frame.contains("↑ 0.1.1"),
+            "the update notice is the first thing dropped: {frame}"
+        );
         assert!(frame.contains("standalone"), "{frame}");
         assert!(frame.contains("watching nothing"), "{frame}");
         assert!(!frame.contains("[Accept All]"), "{frame}");
         // Nothing under the width of the counts alone survives but the counts.
         let (narrow, _) = frame_of(&app, 40, 12);
         assert!(narrow.contains("lastcall  0 repos"), "{narrow}");
+        // With no update to show, every width draws exactly what it drew before.
+        let plain = App::new();
+        for width in [40, 80, 100, 120] {
+            assert_eq!(
+                frame_of(&plain, width, 12).0,
+                frame_of(&App::new(), width, 12).0
+            );
+        }
+    }
+
+    /// Design pass D6: the notice is seven dim columns after `[Accept All]`, it is a hit
+    /// target, and the click puts the sentence on the status line — the badge's
+    /// click-to-read pattern, so nothing is said automatically.
+    #[test]
+    fn render_update_notice_is_seven_columns_after_the_control_and_a_target() {
+        let mut app = App::new();
+        assert!(App::new().update.is_none(), "off until the check answers");
+        app.update_available("0.1.1".to_owned());
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        let mut hits = HitMap::default();
+        terminal
+            .draw(|f| {
+                hits = render(&app, f);
+            })
+            .unwrap();
+        let frame = terminal.backend().to_string();
+        assert!(frame.contains("[Accept All]  ↑ 0.1.1"), "{frame}");
+        let rect = hits
+            .targets
+            .iter()
+            .find(|(_, t)| *t == Target::HeaderUpdate)
+            .map(|(r, _)| *r)
+            .expect("the notice is a target");
+        assert_eq!(rect.width, 7, "`↑ 0.1.1` is seven columns");
+        assert_eq!(rect.y, 0);
+        assert_eq!(hits.at(rect.x, 0), Some(&Target::HeaderUpdate));
+        // Nothing on the status line until the reader asks for it.
+        assert!(app.status.is_none(), "{:?}", app.status);
+        let mut clicked = app.clone();
+        clicked.hit(Target::HeaderUpdate);
+        assert_eq!(
+            clicked.status.as_ref().map(|s| s.text.as_str()),
+            Some("lastcall 0.1.1 available — run: lastcall update")
+        );
+        // The same answer twice is not a repaint.
+        let mut again = app.clone();
+        assert_eq!(again.update_available("0.1.1".to_owned()), Changed::No);
+        assert_eq!(again.update_available("0.2.0".to_owned()), Changed::Yes);
     }
 
     /// The loading pane (Gate 8 sponsor run ruling): a static line in the first second, no

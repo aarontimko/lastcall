@@ -2849,3 +2849,213 @@ fn pty_copy_writes_osc52_with_the_selected_lines() {
     assert_eq!(status.exit_code(), 0, "{status:?}");
     assert_clean_exit(&pty, since);
 }
+
+// ---- Phase 9b deliverable 2.6: the once-a-day update check --------------------------------
+
+/// A served release directory holding only `latest.json` (the notice needs nothing else),
+/// plus the path the probe `curl` logs its URLs to.
+fn served_release(fx: &Fixture, tag: &str) -> (PathBuf, PathBuf) {
+    let serve = fx.state.join("serve");
+    std::fs::create_dir_all(&serve).expect("the served dir");
+    std::fs::write(
+        serve.join("latest.json"),
+        format!(r#"{{"tag_name":"{tag}","prerelease":false}}"#),
+    )
+    .expect("latest.json");
+    (serve, fx.state.join("curl.log"))
+}
+
+/// `lastcall tui --poll 1` with the background check turned on or off, pointed at a served
+/// release directory. The probe `curl` is already first on `PATH` for every scene
+/// (`isolated_lastcall`), so nothing here can reach the network whatever `check` says.
+fn spawn_update_tui(fx: &Fixture, check: bool, serve: &Path, log: &Path) -> Option<PtyTui> {
+    let cmd = fx
+        .command(&bin())
+        .update_check(check)
+        .args(["tui", "--poll", "1"])
+        .env("LASTCALL_TEST_RELEASE_DIR", serve)
+        .env("LASTCALL_PROBE_CURL_LOG", log);
+    match cmd.spawn() {
+        Ok(p) => Some(p),
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+            note(&format!("SKIP: this host cannot open a pty: {e}"));
+            None
+        }
+        Err(e) => panic!("spawn lastcall tui: {e}"),
+    }
+}
+
+fn lookups(log: &Path) -> Vec<String> {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.strip_prefix("url: ").map(str::to_owned))
+        .collect()
+}
+
+fn stamp_of(fx: &Fixture) -> Option<serde_json::Value> {
+    serde_json::from_str(&std::fs::read_to_string(fx.state.join("update-check.json")).ok()?).ok()
+}
+
+fn write_stamp(fx: &Fixture, age_hours: u64, latest: Option<&str>) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after 1970")
+        .as_secs();
+    let stamp = serde_json::json!({
+        "checked_at": now - age_hours * 3600,
+        "latest": latest,
+        "seen_version": env!("CARGO_PKG_VERSION"),
+    });
+    std::fs::write(
+        fx.state.join("update-check.json"),
+        serde_json::to_vec(&stamp).expect("json"),
+    )
+    .expect("the stamp");
+}
+
+/// The header's `↑ <version>` on the top row, with the column it starts at.
+fn update_notice(s: &vt100::Screen) -> Option<(String, u16)> {
+    let (_, cols) = s.size();
+    let row = s.rows(0, cols).next()?;
+    let at = row.find("↑ ")?;
+    // The pad that follows is two or more spaces; everything left of the arrow on this row is
+    // ASCII, so the byte offset is also the column.
+    let text = row[at..].split("  ").next()?.trim_end().to_owned();
+    Some((text, at as u16))
+}
+
+/// Design pass D6 and kickoff deliverable 2.6: a newer release puts seven columns in the
+/// header, **after the launch hold and never before the first frame**, and a click reads the
+/// whole sentence onto the status line. Nothing is said automatically, nothing is written to
+/// the working tree, and the check spends exactly one request.
+#[test]
+fn pty_update_notice_after_hold() {
+    let fx = Fixture::build();
+    let (serve, log) = served_release(&fx, "v9.9.9");
+    let Some(mut pty) = spawn_update_tui(&fx, true, &serve, &log) else {
+        return;
+    };
+    wait_first_piles(&mut pty);
+    // The hold is over before the check is even started, so the notice cannot be on the
+    // first frame; the raw transcript is the proof, not the timing.
+    let raw = pty.raw();
+    let hold = find_words(&raw, &["discovered", "3", "repos,", "checking", "status…"])
+        .expect("the launch hold");
+    assert!(
+        find(&raw, "↑ 9.9.9".as_bytes()).is_none_or(|i| i > hold),
+        "the notice never precedes the hold"
+    );
+
+    pty.wait_for(LONG, |s| update_notice(s).is_some())
+        .unwrap_or_else(|e| panic!("the update notice: {e}"));
+    let (text, col) = pty.screen(update_notice).expect("the notice");
+    assert_eq!(text, "↑ 9.9.9");
+    let header = pty.screen(|s| {
+        let (_, cols) = s.size();
+        s.rows(0, cols).next().unwrap_or_default()
+    });
+    assert!(header.contains("[Accept All]  ↑ 9.9.9"), "{header}");
+
+    // Click-to-read: the sentence lands on the status line only because the reader asked.
+    pty.click(col, 0).expect("click the notice");
+    pty.wait_for(LONG, |s| {
+        status_is(s, "lastcall 9.9.9 available — run: lastcall update")
+    })
+    .unwrap_or_else(|e| panic!("the sentence on the status line: {e}"));
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+
+    // One request, and the stamp that throttles the next one.
+    let urls = lookups(&log);
+    assert_eq!(urls.len(), 1, "{urls:?}");
+    assert!(urls[0].ends_with("/releases/latest"), "{urls:?}");
+    assert!(
+        urls[0].starts_with("https://api.github.com/"),
+        "the daily check never reads LASTCALL_UPDATE_BASE_URL: {urls:?}"
+    );
+    let stamp = stamp_of(&fx).expect("the stamp was written");
+    assert_eq!(stamp["latest"], serde_json::json!("9.9.9"), "{stamp}");
+    assert_eq!(
+        stamp["seen_version"],
+        serde_json::json!(env!("CARGO_PKG_VERSION")),
+        "{stamp}"
+    );
+}
+
+/// The stamp is what makes it once a **day**: an hour-old stamp answers from disk and spends
+/// no request, a twenty-five-hour-old one looks again. Both are asserted after the child has
+/// exited, so nothing is racing a detached thread.
+#[test]
+fn pty_update_check_is_throttled_by_the_daily_stamp() {
+    // 1 h old, and it already knows about 9.9.9: the notice shows, nothing is fetched.
+    let fresh = Fixture::build();
+    let (serve, log) = served_release(&fresh, "v9.9.9");
+    write_stamp(&fresh, 1, Some("9.9.9"));
+    let before = stamp_of(&fresh).expect("the stamp");
+    let Some(mut pty) = spawn_update_tui(&fresh, true, &serve, &log) else {
+        return;
+    };
+    wait_first_piles(&mut pty);
+    pty.wait_for(LONG, |s| update_notice(s).is_some())
+        .unwrap_or_else(|e| panic!("the notice comes from the stamp: {e}"));
+    pty.send(b"q").expect("q");
+    assert_eq!(pty.wait_exit(QUIT_BUDGET).expect("exits").exit_code(), 0);
+    assert_eq!(
+        lookups(&log),
+        Vec::<String>::new(),
+        "inside the day: no lookup"
+    );
+    assert_eq!(stamp_of(&fresh), Some(before), "the stamp is not rewritten");
+
+    // 25 h old: the lookup runs again and the stamp moves forward.
+    let stale = Fixture::build();
+    let (serve, log) = served_release(&stale, "v9.9.9");
+    write_stamp(&stale, 25, None);
+    let before = stamp_of(&stale).expect("the stamp");
+    let Some(mut pty) = spawn_update_tui(&stale, true, &serve, &log) else {
+        return;
+    };
+    wait_first_piles(&mut pty);
+    pty.wait_for(LONG, |s| update_notice(s).is_some())
+        .unwrap_or_else(|e| panic!("the stale stamp is looked past: {e}"));
+    pty.send(b"q").expect("q");
+    assert_eq!(pty.wait_exit(QUIT_BUDGET).expect("exits").exit_code(), 0);
+    assert_eq!(lookups(&log).len(), 1, "{:?}", lookups(&log));
+    let after = stamp_of(&stale).expect("the stamp");
+    assert!(
+        after["checked_at"].as_u64() > before["checked_at"].as_u64(),
+        "{before} → {after}"
+    );
+    assert_eq!(after["latest"], serde_json::json!("9.9.9"), "{after}");
+}
+
+/// The harness's own guard: every other scene runs with `[update] check = false` written
+/// into its isolated config, so a scene that never thought about releases starts no thread,
+/// spends no request and leaves no stamp. Asserted after the child exits.
+#[test]
+fn pty_update_check_is_off_for_every_other_scene() {
+    let fx = Fixture::build();
+    let (serve, log) = served_release(&fx, "v9.9.9");
+    let Some(mut pty) = spawn_update_tui(&fx, false, &serve, &log) else {
+        return;
+    };
+    wait_first_piles(&mut pty);
+    assert!(
+        pty.screen(update_notice).is_none(),
+        "no notice with the check off"
+    );
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    assert_eq!(pty.wait_exit(QUIT_BUDGET).expect("exits").exit_code(), 0);
+    assert_clean_exit(&pty, since);
+    assert_eq!(lookups(&log), Vec::<String>::new());
+    assert_eq!(stamp_of(&fx), None, "no stamp was written");
+    let config = std::fs::read_to_string(&fx.config).expect("the isolated config");
+    assert!(config.contains("[update]"), "{config}");
+    assert!(config.contains("check = false"), "{config}");
+}
