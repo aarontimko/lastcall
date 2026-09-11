@@ -38,6 +38,26 @@ const ASSET_BODY: &str = "#!/bin/sh\necho lastcall 9.9.9\n";
 
 const NEWER: &str = "9.9.9";
 
+/// Whether the crate this build came from is itself a prerelease.
+///
+/// It decides which API path `update` reads: `releases/latest` never answers with a
+/// prerelease, so a prerelease binary pages the list instead (`commands/update.rs::lookup`).
+/// The crate version crosses that line during a release (`0.1.0-rc.1`, then `0.1.0`), so
+/// every scene here serves **both** shapes and every assertion asks this rather than naming
+/// one of them.
+fn this_build_is_a_prerelease() -> bool {
+    env!("CARGO_PKG_VERSION").contains('-')
+}
+
+/// The API path this build's `update` will actually ask for.
+fn api_path() -> &'static str {
+    if this_build_is_a_prerelease() {
+        "/releases?per_page=10"
+    } else {
+        "/releases/latest"
+    }
+}
+
 fn probe_curl() -> PathBuf {
     PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/probe/curl.sh"))
 }
@@ -83,10 +103,7 @@ impl Scene {
             log: dir.path().join("curl.log"),
             dir,
         };
-        scene.write(
-            "latest.json",
-            format!(r#"{{"tag_name":"{tag}","prerelease":false}}"#),
-        );
+        scene.serve_release(tag, false);
         scene.write(scene.asset_name(), ASSET_BODY.to_owned());
         scene.write(
             "SHA256SUMS",
@@ -101,6 +118,26 @@ impl Scene {
 
     fn asset_name(&self) -> String {
         format!("lastcall-{NEWER}-{}", host_target())
+    }
+
+    /// Serve one release as **both** API shapes: the single object `releases/latest`
+    /// answers with, and the one-element array `releases?per_page=N` answers with. Which
+    /// one the binary asks for depends on whether this build is a prerelease, and the two
+    /// files say the same thing so no scene has to care.
+    fn serve_release(&self, tag: &str, prerelease: bool) {
+        let one = format!(r#"{{"tag_name":"{tag}","prerelease":{prerelease}}}"#);
+        self.write("latest.json", one.clone());
+        self.write("list.json", format!("[{one}]"));
+    }
+
+    /// The served file this build's `update` will read, for the `.status` / `.headers`
+    /// sidecars the probe looks for beside it.
+    fn api_file(&self) -> &'static str {
+        if this_build_is_a_prerelease() {
+            "list.json"
+        } else {
+            "latest.json"
+        }
     }
 
     fn write(&self, name: impl AsRef<Path>, body: String) {
@@ -191,7 +228,7 @@ fn update_replaces_the_binary_with_the_verified_asset() {
     // Three fetches and nothing else: the release, the asset, the checksums.
     let urls = scene.urls();
     assert_eq!(urls.len(), 3, "{urls:?}");
-    assert!(urls[0].ends_with("/releases/latest"), "{urls:?}");
+    assert!(urls[0].ends_with(api_path()), "{urls:?}");
     assert!(
         urls[1].ends_with(&format!("/download/v9.9.9/{}", scene.asset_name())),
         "{urls:?}"
@@ -271,15 +308,17 @@ fn update_check_reports_without_writing() {
     );
 }
 
-/// A prerelease is never offered to a stable binary (the unit tests cover the semver rule;
-/// this proves the served answer travels through the command the same way).
+/// A prerelease from another line is never offered, whatever this build is.
+///
+/// `choose` takes a prerelease only for a binary that is itself a prerelease **of the same
+/// `major.minor.patch`**, so a `9.9.9` prerelease is refused by a stable build (it is a
+/// prerelease) and by an rc build of `0.1.0` (it is a different line) alike. The unit tests
+/// cover the semver rule itself; this proves the served answer travels through the command
+/// the same way.
 #[test]
-fn update_does_not_offer_a_prerelease_to_this_stable_binary() {
+fn update_does_not_offer_a_prerelease_from_another_line() {
     let scene = Scene::new("v9.9.9");
-    scene.write(
-        "latest.json",
-        r#"{"tag_name":"v9.9.9","prerelease":true}"#.to_owned(),
-    );
+    scene.serve_release("v9.9.9", true);
     let out = scene.run(&["update", "--check"], true);
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(
@@ -325,9 +364,10 @@ fn update_refuses_a_cargo_installed_binary_before_any_fetch() {
 #[test]
 fn update_reports_the_github_rate_limit_with_its_reset() {
     let scene = Scene::new("v9.9.9");
-    std::fs::write(scene.serve.join("latest.json.status"), "403").expect("status");
+    let api = format!("{}.status", scene.api_file());
+    std::fs::write(scene.serve.join(api), "403").expect("status");
     std::fs::write(
-        scene.serve.join("latest.json.headers"),
+        scene.serve.join(format!("{}.headers", scene.api_file())),
         "X-RateLimit-Reset: 1757600000\n",
     )
     .expect("headers");

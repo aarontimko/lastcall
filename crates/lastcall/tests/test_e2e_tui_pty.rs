@@ -2879,16 +2879,20 @@ fn pty_copy_writes_osc52_with_the_selected_lines() {
 
 // ---- Phase 9b deliverable 2.6: the once-a-day update check --------------------------------
 
-/// A served release directory holding only `latest.json` (the notice needs nothing else),
-/// plus the path the probe `curl` logs its URLs to.
+/// A served release directory holding just the release answer (the notice needs nothing
+/// else), plus the path the probe `curl` logs its URLs to.
+///
+/// Both API shapes are written: `releases/latest` answers with the object and
+/// `releases?per_page=N` with a one-element array, and which one the binary asks for
+/// depends on whether this build's own version is a prerelease
+/// (`commands/update.rs::lookup`). The crate version crosses that line during a release, so
+/// serving both is what keeps this scene from depending on which side of it we are on.
 fn served_release(fx: &Fixture, tag: &str) -> (PathBuf, PathBuf) {
     let serve = fx.state.join("serve");
     std::fs::create_dir_all(&serve).expect("the served dir");
-    std::fs::write(
-        serve.join("latest.json"),
-        format!(r#"{{"tag_name":"{tag}","prerelease":false}}"#),
-    )
-    .expect("latest.json");
+    let one = format!(r#"{{"tag_name":"{tag}","prerelease":false}}"#);
+    std::fs::write(serve.join("latest.json"), &one).expect("latest.json");
+    std::fs::write(serve.join("list.json"), format!("[{one}]")).expect("list.json");
     (serve, fx.state.join("curl.log"))
 }
 
@@ -3004,7 +3008,14 @@ fn pty_update_notice_after_hold() {
     // One request, and the stamp that throttles the next one.
     let urls = lookups(&log);
     assert_eq!(urls.len(), 1, "{urls:?}");
-    assert!(urls[0].ends_with("/releases/latest"), "{urls:?}");
+    // `releases/latest` for a stable build, the paged list for a prerelease one: the crate
+    // version crosses that line during a release, and the scene serves both shapes.
+    let api_path = if env!("CARGO_PKG_VERSION").contains('-') {
+        "/releases?per_page=10"
+    } else {
+        "/releases/latest"
+    };
+    assert!(urls[0].ends_with(api_path), "{urls:?}");
     assert!(
         urls[0].starts_with("https://api.github.com/"),
         "the daily check never reads LASTCALL_UPDATE_BASE_URL: {urls:?}"
