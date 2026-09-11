@@ -460,7 +460,13 @@ case "$url" in
         printf 'HTTP/1.1 200 probe\r\n\r\n{"tag_name":"v9.9.9","prerelease":false}200'
         exit 0
         ;;
+    */releases'?'per_page=*)
+        printf 'HTTP/1.1 200 probe\r\n\r\n[{"tag_name":"v9.9.9","prerelease":false}]200'
+        exit 0
+        ;;
 esac
+# Only the asset download gets here: a stable binary asked `latest`, a prerelease binary
+# asked the list, and both were answered above.
 [ -n "$dest" ] && printf '#!/bin/' >"$dest"
 printf '200'
 exit 28

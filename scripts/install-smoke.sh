@@ -144,8 +144,9 @@ if [ -n "$from_dir" ]; then
     one="$(cd "$mount_dir" && ls lastcall-* | head -1)"
     rest="${one#lastcall-}"
     version="${rest%%-*}"
+    # A prerelease identifier (`rc.1`, `beta.2`) has a dot; no target triple does.
     case "$rest" in
-        "$version"-rc.*) version="$version-$(echo "${rest#"$version"-}" | cut -d- -f1)" ;;
+        "$version"-[a-z]*.[0-9]*-*) version="$version-$(echo "${rest#"$version"-}" | cut -d- -f1)" ;;
     esac
     tag="(none: --from-dir $from_dir)"
 else
@@ -219,6 +220,11 @@ else
 fi
 printf '{"tag_name":"%s","prerelease":false,"draft":false}\n' "$NEWER_TAG" \
     > "$d/repos/$REPO/releases/latest"
+# A stable binary asks `releases/latest`; a prerelease binary (`0.1.0-rc.1`) asks
+# `releases?per_page=N`, which http.server answers by redirecting to the directory and
+# serving its index.html, so the same tag is listed there as a one-element array.
+printf '[{"tag_name":"%s","prerelease":false,"draft":false}]\n' "$NEWER_TAG" \
+    > "$d/repos/$REPO/releases/index.html"
 python3 -m http.server "$PORT" -b 127.0.0.1 --directory "$d" > /srv/http.log 2>&1 &
 server=$!
 # Retries rather than a sleep: the server is ready when it answers, not after N seconds.
@@ -262,6 +268,30 @@ for platform in "${platforms[@]}"; do
     if [ -n "$from_dir" ] && [ ! -f "$mount_dir/lastcall-$version-$target" ]; then
         echo "SKIP $platform: $mount_dir has no lastcall-$version-$target"
         continue
+    fi
+    if [ -z "$from_dir" ]; then
+        # Provenance, on the host: the container has no gh. Every asset the leg installs or
+        # updates to must verify against the release workflow's attestation.
+        command -v gh >/dev/null 2>&1 || die "tag mode needs gh for attestation verify"
+        attest_dir="$work/attest/$target"
+        install -d "$attest_dir"
+        attest_ok=1
+        for pair in "$tag lastcall-$version-$target" \
+                    ${args[1]:+"$newer_tag lastcall-$newer_version-$target"}; do
+            set -- $pair
+            echo "attestation: $2 from $1"
+            if gh release download "$1" --repo "$repo" --pattern "$2" --dir "$attest_dir" --clobber \
+                && gh attestation verify "$attest_dir/$2" -R "$repo"; then
+                echo "attestation verified: $2"
+            else
+                echo "attestation FAILED: $2"
+                attest_ok=
+            fi
+        done
+        if [ -z "$attest_ok" ]; then
+            failed+=("$platform")
+            continue
+        fi
     fi
     mounts=(-v "$work/inner.sh:/smoke/inner.sh:ro")
     [ -n "$from_dir" ] && mounts+=(-v "$mount_dir:/assets:ro")

@@ -187,7 +187,9 @@ jobs:
       # then proves which workflow, commit and runner produced the bytes.
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
-          subject-path: dist/lastcall-*
+          subject-path: |
+            dist/lastcall-*
+            dist/SHA256SUMS
       - name: The release notes are this version's CHANGELOG section
         run: |
           set -euo pipefail

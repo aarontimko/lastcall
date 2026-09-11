@@ -855,6 +855,20 @@ pub fn stamp_verdict(stamp: Option<&Stamp>, now: u64, current: &Version) -> Verd
 /// shouts at a user who did not ask for it is a bug.
 pub fn daily_check(state_dir: &Path, quitting: &dyn Fn() -> bool) -> Option<String> {
     let current = Version::parse(CURRENT)?;
+    // Deliberately `Base::Default`: the daily check never reads LASTCALL_UPDATE_BASE_URL
+    // (rule 2.9). A test reaches it by putting the probe `curl` on PATH, not by redirecting
+    // the URL.
+    daily_check_with(state_dir, quitting, || lookup(&Base::Default, &current))
+}
+
+/// [`daily_check`] with the lookup injected, so the throttle's behaviour on a failed lookup
+/// is testable without a network.
+fn daily_check_with(
+    state_dir: &Path,
+    quitting: &dyn Fn() -> bool,
+    lookup: impl FnOnce() -> Result<Vec<Release>, Fail>,
+) -> Option<String> {
+    let current = Version::parse(CURRENT)?;
     let path = state_dir.join(STAMP_FILE);
     let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
     if let Verdict::Answered(latest) = stamp_verdict(read_stamp(&path).as_ref(), now, &current) {
@@ -862,17 +876,16 @@ pub fn daily_check(state_dir: &Path, quitting: &dyn Fn() -> bool) -> Option<Stri
         // showing the notice without spending a request.
         return latest;
     }
-    // Deliberately `Base::Default`: the daily check never reads LASTCALL_UPDATE_BASE_URL
-    // (rule 2.9). A test reaches it by putting the probe `curl` on PATH, not by redirecting
-    // the URL.
-    let releases = match lookup(&Base::Default, &current) {
-        Ok(releases) => releases,
+    let latest = match lookup() {
+        Ok(releases) => choose(&current, &releases).map(|r| r.version.to_string()),
         Err(fail) => {
+            // A failed lookup is still today's check: a machine without a network, or one
+            // that has spent the unauthenticated hour's quota, must not spend a request on
+            // every launch until tomorrow. The stamp says "nothing to announce".
             tracing::info!(reason = %fail, "update check failed");
-            return None;
+            None
         }
     };
-    let latest = choose(&current, &releases).map(|r| r.version.to_string());
     if quitting() {
         return None;
     }
@@ -1307,6 +1320,44 @@ ef lastcall-0.1.0-x86_64-unknown-linux-gnu
 
     /// Verifier (a) F9: the throttle, and the branch that makes a replaced binary look
     /// again instead of offering the release it now is.
+    #[test]
+    fn update_daily_check_stamps_a_failed_lookup_so_it_is_not_retried_until_tomorrow() {
+        let dir = lastcall_testkit::tmp::TempDir::new("lc-daily-fail");
+        let path = dir.path().join(STAMP_FILE);
+        let mut calls = 0;
+        let mut check = |ok: bool| {
+            calls += 1;
+            daily_check_with(dir.path(), &|| false, || {
+                if ok {
+                    Ok(vec![])
+                } else {
+                    Err(Fail::stop("curl exited 7"))
+                }
+            })
+        };
+        assert_eq!(check(false), None, "a failed lookup announces nothing");
+        let stamp = read_stamp(&path).expect("the failure was stamped");
+        assert_eq!(stamp.latest, None);
+        assert_eq!(stamp.seen_version, CURRENT);
+        // Inside the day the stamp answers and the lookup is not spent again.
+        let mut spent = false;
+        let again = daily_check_with(dir.path(), &|| false, || {
+            spent = true;
+            Ok(vec![])
+        });
+        assert_eq!(again, None);
+        assert!(!spent, "a second launch the same day spent a request");
+        assert_eq!(calls, 1);
+        // A quit during the lookup leaves the state dir alone.
+        let quit_dir = lastcall_testkit::tmp::TempDir::new("lc-daily-quit");
+        let none = daily_check_with(quit_dir.path(), &|| true, || Err(Fail::stop("offline")));
+        assert_eq!(none, None);
+        assert!(
+            !quit_dir.path().join(STAMP_FILE).exists(),
+            "quitting must not write"
+        );
+    }
+
     #[test]
     fn update_daily_stamp_answers_for_a_day_and_only_for_this_binary() {
         let current = v("0.1.0");
