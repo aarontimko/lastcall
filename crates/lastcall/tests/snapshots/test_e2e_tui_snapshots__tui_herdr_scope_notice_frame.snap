@@ -31,4 +31,4 @@ expression: frame
 "│                          │                                                                       │"
 "│                          │                                                                       │"
 "└──────────────────────────┴───────────────────────────────────────────────────────────────────────┘"
-"↑↓ select  ⏎ open  n/p hunk  ? help  q quit              scope: alpha · 2 repos hidden (w shows all)"
+"↑↓ select  ⏎ open  t hide empty  ? help  q quit          scope: alpha · 2 repos hidden (w shows all)"

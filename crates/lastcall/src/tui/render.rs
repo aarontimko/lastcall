@@ -634,10 +634,15 @@ pub fn hints(app: &App, width: u16) -> String {
         .then(|| first("jump").map(|k| format!("{k} jump")))
         .flatten();
     let diff = app.effective_focus() == Focus::Diff;
-    let select_hint = diff
+    // Verifier (b) F4, the same rule as `accept all in <root>` above: a hint the line
+    // promises has to do something. `v` and `y` work on diff *lines*, and a hunkless entry
+    // (binary, collapsed, deleted, unreadable, or a repo row) has none, so on one of those
+    // the pair is not offered even though the diff pane holds the focus.
+    let selectable = diff && !app.view_hunks().is_empty();
+    let select_hint = selectable
         .then(|| first("select").map(|k| format!("{k} select")))
         .flatten();
-    let copy_hint = diff
+    let copy_hint = selectable
         .then(|| first("copy").map(|k| format!("{k} copy")))
         .flatten();
     let scope = app
@@ -688,14 +693,24 @@ pub fn hints(app: &App, width: u16) -> String {
             },
         ),
         (
+            // Verifier (b) F4: `n`/`p` walk the hunks of the selected entry, so on a repo
+            // row, an empty repo row or a hunkless file they move nothing. Offered only
+            // while there is a hunk to move to.
             "hunk_next",
-            pair("hunk_next", "hunk_prev").map(|k| format!("{k} hunk")),
+            pair("hunk_next", "hunk_prev")
+                .filter(|_| !app.view_hunks().is_empty())
+                .map(|k| format!("{k} hunk")),
         ),
         ("accept", context),
         ("accept_file", file),
         (
+            // Verifier (b) F4: with nothing pending anywhere `^A` lands on `nothing to
+            // accept`. `counts_of` is what the accept itself would cover, so the hint and
+            // the key agree by construction.
             "accept_all",
-            first("accept_all").map(|k| format!("{k} accept all")),
+            first("accept_all")
+                .filter(|_| app.counts_of(&AcceptScope::All).files > 0)
+                .map(|k| format!("{k} accept all")),
         ),
         ("ack", ack),
         ("jump", jump),
@@ -1888,17 +1903,24 @@ fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
         .border_style(focused_border());
     let inner = block.inner(rect);
     block.render(rect, buf);
-    let cap = inner.height as usize;
+    // The last inner row belongs to `any key closes` at every height, so `cap` is the
+    // body's room: one row short of the box's. `help_columns`'s `+ 4` and the `height`
+    // arithmetic above both reserve that row already, but the draw wrote the line only
+    // where the body fell short of the box — so at the one height where the body fits
+    // exactly, the body took the row and the way out of the overlay went unsaid
+    // (verifier (b) F5). The clip path's own arithmetic is unchanged: it reserved the same
+    // row by counting four instead of three.
+    let cap = (inner.height as usize).saturating_sub(1);
     let mut clip_notice = None;
     if rows.len() > cap {
         // Too narrow for two columns *and* too short for one (80×30 with this keymap): the
         // overlay clips, and what it clips is key rows — never the footer. A reader who
         // cannot see every key can still see what the mouse does and how to leave.
         //
-        // Three rows are reserved: the newline note, `SELECT_NOTE`, **and** the
-        // `any key closes` line below them, which is drawn only where the body does not
-        // reach. Reserving two put the body's last row on the footer's row, so the footer
-        // was the thing the clip dropped (verifier (b) F4).
+        // Two rows are reserved out of `cap` here, the newline note and `SELECT_NOTE`;
+        // the `any key closes` line below them is already out of `cap` by construction.
+        // Reserving too few put the body's last row on the footer's row, so the footer was
+        // the thing the clip dropped (verifier (b) F4).
         //
         // The blank separator is *not* reserved — it is the first thing the clip spends.
         //
@@ -1910,7 +1932,7 @@ fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
             .iter()
             .find(|(name, _)| *name == "quit")
             .map(|(_, row)| row.clone());
-        let mut keep = cap.saturating_sub(4);
+        let mut keep = cap.saturating_sub(3);
         // …and `quit` is pinned to the end of what survives, when what survives does not
         // already carry it. The keymap grows — Phase 8 alone adds four rows — and a clip
         // that simply takes the first N pushes the last row off first, which in this keymap
@@ -1956,7 +1978,7 @@ fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
         }
         rows.push(newline_note(app.enhanced).to_owned());
         rows.push(SELECT_NOTE.to_owned());
-        rows.truncate(cap.saturating_sub(1));
+        rows.truncate(cap);
     }
     for (i, row) in rows.iter().take(cap).enumerate() {
         buf.set_stringn(
@@ -1972,15 +1994,13 @@ fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
             },
         );
     }
-    if inner.height as usize > rows.len() {
-        buf.set_stringn(
-            inner.x + 1,
-            inner.y + inner.height - 1,
-            "any key closes",
-            inner.width.saturating_sub(1) as usize,
-            dim(),
-        );
-    }
+    buf.set_stringn(
+        inner.x + 1,
+        inner.y + inner.height.saturating_sub(1),
+        "any key closes",
+        inner.width.saturating_sub(1) as usize,
+        dim(),
+    );
 }
 
 /// The confirm modal (§6.7), centered like the help overlay. One box, three operations: the
@@ -2735,14 +2755,17 @@ mod tests {
     #[test]
     fn render_hints_and_help_follow_the_app_keymap() {
         let mut app = App::new();
+        // Verifier (b) F4: an empty app has no hunk to walk to and nothing to accept, so
+        // neither `n/p hunk` nor `^A accept all` is offered. `render_hints_follow_the_selection`
+        // is where the full line is pinned.
         assert_eq!(
             hints(&app, 100),
-            "↑↓ select  ⏎ open  n/p hunk  ^A accept all  t hide empty  Tab focus  r refresh  ? help  q quit"
+            "↑↓ select  ⏎ open  t hide empty  Tab focus  r refresh  ? help  q quit"
         );
         assert_eq!(
             hints(&app, 60),
-            "↑↓ select  ⏎ open  n/p hunk  t hide empty  ? help  q quit",
-            "below `NAV_MIN_COLS` the wide-frame five are gone, then `^A` is the next to go"
+            "↑↓ select  ⏎ open  t hide empty  ? help  q quit",
+            "below `NAV_MIN_COLS` the wide-frame five are gone"
         );
         for (name, specs) in &mut app.keymap {
             if name == "quit" {
@@ -3103,13 +3126,25 @@ mod tests {
             "{}",
             hints(&rebound, 200)
         );
-        // What the line says depends on the selection, so the width it needs does too: a
-        // root row trades `a accept hunk  A accept file` for `a accept all in <root>`,
-        // which is seven columns shorter with this fixture's names.
+        // What the line says depends on the selection: a root row trades
+        // `a accept hunk  A accept file` for `a accept all in <root>`. Verifier (b) F4: it
+        // also carries no hunks, so with the diff focused it is offered neither `n/p hunk`
+        // nor the diff pane's `v select  y copy` — at any width, since a hint that answers
+        // nothing is not a hint the line is short of.
         let mut at_root = app.clone();
         at_root.select(Some(Selection::Root(root("alpha"))));
-        assert!(hints(&at_root, 135).contains("y copy"));
-        assert!(!hints(&at_root, 134).contains("y copy"));
+        for hint in ["n/p hunk", "v select", "y copy"] {
+            assert!(
+                !hints(&at_root, 200).contains(hint),
+                "`{hint}` on a root row: {}",
+                hints(&at_root, 200)
+            );
+        }
+        assert!(
+            hints(&at_root, 200).contains("a accept all in alpha"),
+            "{}",
+            hints(&at_root, 200)
+        );
         assert!(!nav_line.contains("y copy"), "the nav has no copy key");
         app.handle(Action::Back);
         assert!(
@@ -3119,7 +3154,7 @@ mod tests {
         app.handle(Action::Open);
         app.select(Some(Selection::Root(root("alpha"))));
         assert!(
-            hints(&app, 100).contains("n/p hunk  a accept all in alpha  ^A accept all"),
+            hints(&app, 100).contains("a accept all in alpha  ^A accept all"),
             "{}",
             hints(&app, 100)
         );
@@ -3128,10 +3163,108 @@ mod tests {
             lastcall_engine::scan::Annotation::Upstream,
         )));
         assert!(
-            hints(&app, 100).contains("n/p hunk  a accept group  ^A accept all"),
+            hints(&app, 100).contains("a accept group  ^A accept all"),
             "{}",
             hints(&app, 100)
         );
+    }
+
+    /// Verifier (b) F4: the line never promises a key that would do nothing.
+    ///
+    /// The three cases the review found, each checked against the key itself rather than
+    /// against a remembered string: press it and nothing changes, so the hint is gone.
+    #[test]
+    fn render_hints_never_promise_a_key_that_answers_nothing() {
+        // `n`/`p` on a repo row: no hunks to walk.
+        let mut at_root = three_roots();
+        at_root.select(Some(Selection::Root(root("alpha"))));
+        assert!(at_root.view_hunks().is_empty());
+        assert_eq!(at_root.clone().handle(Action::HunkNext).0, Changed::No);
+        assert!(
+            !hints(&at_root, 200).contains("hunk"),
+            "{}",
+            hints(&at_root, 200)
+        );
+        // …and a file row with hunks still has it, so the gate is the hunks and not the
+        // pane: every hint's converse holds.
+        let mut at_file = three_roots();
+        at_file.apply(pile_event_seq("alpha", 1, alpha_two_hunks()));
+        at_file.select(Some(row("alpha", "f1")));
+        assert_eq!(at_file.clone().handle(Action::HunkNext).0, Changed::Yes);
+        assert!(
+            hints(&at_file, 200).contains("n/p hunk"),
+            "{}",
+            hints(&at_file, 200)
+        );
+
+        // `^A` with nothing pending anywhere: the key answers `nothing to accept`.
+        let mut clean = three_roots();
+        for (name, paths) in [
+            ("alpha", &["f1", "f2"][..]),
+            ("beta", &["u1", "u2"][..]),
+            ("notes", &["n2.md"][..]),
+        ] {
+            clean.apply(pile_event_seq(name, 1, without(pile(name), paths)));
+        }
+        assert_eq!(clean.counts_of(&AcceptScope::All).files, 0);
+        assert!(
+            !hints(&clean, 200).contains("accept all"),
+            "{}",
+            hints(&clean, 200)
+        );
+        assert!(
+            hints(&at_file, 200).contains("^A accept all"),
+            "{}",
+            hints(&at_file, 200)
+        );
+
+        // `v`/`y` on a hunkless file with the diff focused: there is no line to select.
+        let mut collapsed = three_roots();
+        collapsed.handle(Action::Resize(100, 30));
+        collapsed.apply(pile_event_seq("alpha", 1, alpha_collapsed(Collapsed::Glob)));
+        collapsed.select(Some(row("alpha", "f1")));
+        collapsed.handle(Action::Open);
+        assert_eq!(collapsed.effective_focus(), Focus::Diff);
+        assert!(collapsed.view_hunks().is_empty());
+        assert_eq!(collapsed.clone().handle(Action::Select).0, Changed::No);
+        for hint in ["v select", "y copy"] {
+            assert!(
+                !hints(&collapsed, 200).contains(hint),
+                "`{hint}` on a hunkless row: {}",
+                hints(&collapsed, 200)
+            );
+        }
+        let mut with_hunks = three_roots();
+        with_hunks.handle(Action::Resize(100, 30));
+        with_hunks.select(Some(row("alpha", "f1")));
+        with_hunks.handle(Action::Open);
+        assert!(
+            hints(&with_hunks, 200).contains("v select  y copy"),
+            "{}",
+            hints(&with_hunks, 200)
+        );
+    }
+
+    /// Verifier (b) F5: `any key closes` is on the overlay at **every** height it draws at,
+    /// including the one where the table fits exactly.
+    ///
+    /// The old draw wrote the line only where the body fell short of the box, so at the
+    /// single height where `rows.len()` equalled the inner height the way out went unsaid —
+    /// one row shorter it came back, together with the clip notice. A sweep rather than the
+    /// two sizes the review named: the exact-fit height moves with the keymap.
+    #[test]
+    fn render_help_says_any_key_closes_at_every_height() {
+        let mut app = three_roots();
+        app.help = true;
+        for width in [60u16, 80, 100, 140] {
+            for height in MIN_SIZE.1..=48 {
+                let (frame, _) = frame_of(&app, width, height);
+                assert!(
+                    frame.contains("any key closes"),
+                    "{width}x{height}:\n{frame}"
+                );
+            }
+        }
     }
 
     /// Ruling R4 (the sponsor: "trying our best to fit everything but once it gets beyond

@@ -197,6 +197,9 @@ fn tui_empty_state() {
 
     let (frame, _) = draw(&app, W, H);
     assert!(frame.contains("nothing pending across 1 repo"), "{frame}");
+    // Verifier (b) F4, the all-clean case: `^A` here lands on `nothing to accept`, so the
+    // hint line does not offer it. The snapshot above is the frame that says so.
+    assert!(!frame.contains("accept all"), "{frame}");
 
     app.handle(Action::HideEmpty);
     assert!(app.nav_entries().is_empty());
@@ -395,6 +398,14 @@ fn tui_diff_view_collapsed() {
     select_row(&mut app, &alpha, "Cargo.lock");
     assert!(app.selected_row().unwrap().collapsed.is_some());
     app.handle(Action::Open);
+    // Verifier (b) F4, the hunkless-file case: the diff holds the focus, but a collapsed
+    // row has no lines, so `v select` and `y copy` are not offered and neither is
+    // `n/p hunk`. `e expand` is what this row answers, and the pane says so.
+    let (frame, _) = draw(&app, W, H);
+    for absent in ["v select", "y copy", "n/p hunk"] {
+        assert!(!frame.contains(absent), "{absent}:\n{frame}");
+    }
+    assert!(frame.contains("[e expand]"), "{frame}");
     snapshot("tui_diff_view_collapsed", &app, W, H);
 }
 
@@ -656,6 +667,32 @@ fn tui_help_overlay_80x24() {
     snapshot("tui_help_overlay_80x24", &app, 80, 24);
 }
 
+/// Verifier (b) F5: the height where the table fits **exactly** still says how to leave.
+///
+/// The overlay reserves a row for `any key closes` in its own height arithmetic, but the
+/// draw wrote the line only where the body fell short of the box — so at the one height
+/// where the body filled it the way out went unsaid, and a row shorter it came back
+/// together with the clip notice. The height is found rather than written down (it moves
+/// with the keymap): the shortest frame that still shows every key row is the exact fit.
+#[test]
+fn tui_help_overlay_exact_fit() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    app.handle(Action::Help);
+    assert!(app.help);
+    let height = (10u16..=48)
+        .find(|h| !draw(&app, W, *h).0.contains("more key"))
+        .expect("some height shows the whole table");
+    let (frame, _) = draw(&app, W, height);
+    assert!(frame.contains("any key closes"), "{height}:\n{frame}");
+    assert!(
+        draw(&app, W, height - 1).0.contains("more key"),
+        "one row shorter clips, which is what makes this the exact fit"
+    );
+    snapshot("tui_help_overlay_exact_fit", &app, W, height);
+}
+
 #[test]
 fn tui_narrow_60x20() {
     let scene = Scene::build();
@@ -907,6 +944,13 @@ fn tui_nav_empty_repo_row() {
     let (frame, _) = draw(&app, W, H);
     assert!(frame.contains("nothing pending in beta"), "{frame}");
     assert!(frame.contains("lastcall  3 repos ·"), "{frame}");
+    // Verifier (b) F4, the repo-row case: a repo row carries no hunks, so `n`/`p` move
+    // nothing and the hint line does not name them. `a accept all in beta` is absent for
+    // the same reason and by the older rule (verifier (a) F2), and `^A` stays because the
+    // other two repos do have rows.
+    assert!(!frame.contains("n/p hunk"), "{frame}");
+    assert!(!frame.contains("accept all in beta"), "{frame}");
+    assert!(frame.contains("^A accept all"), "{frame}");
     snapshot("tui_nav_empty_repo_row", &app, W, H);
 
     assert_eq!(app.handle(Action::HideEmpty).0, Changed::Yes);
