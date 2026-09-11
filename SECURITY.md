@@ -46,25 +46,31 @@ say nothing about the issue itself in that message.
 
 What lastcall touches, so you can judge whether something is in scope:
 
-- **Reads** git repositories under the parent directories named in `config.toml` (the
-  launch directory when there is no config). It runs git through a read-only allowlist of
-  subcommands.
+- **Reads** git repositories under the parent directories named in `config.toml`, the
+  launch directory when it lies outside them (or when there is no config), and any
+  `draft_dirs` (plain directories reviewed as if they were repositories). It runs git
+  through a read-only allowlist of subcommands.
 - **Writes** its own state directory, `~/.local/state/lastcall` by default and
   `LASTCALL_STATE_DIR` when set. Nothing is written to the repositories it watches during
   a scan.
 - **Writes the working tree** only on an explicit action you take: accepting does not touch
-  files, but restoring a hunk or a file, and saving from the built-in or external editor,
-  do. Each of those is a compare-and-swap against what was on screen and is refused if the
-  file changed underneath.
+  files, but restoring a hunk or a file, and saving from the built-in editor, do. Each of
+  those is a compare-and-swap against what was on screen and is refused if the file
+  changed underneath. Your external editor writes the file itself; lastcall re-reads it
+  when the editor exits and asks before treating the result as reviewed.
 - **Talks to a local herdr socket** when one is present: a Unix domain socket on the same
-  machine, discovered through herdr's own config. The herdr surface is treated as
+  machine, found through the `HERDR_*` environment a herdr pane sets or herdr's own
+  config directory. The herdr surface is treated as
   untrusted input (unknown fields are ignored, never rejected). With no socket, lastcall
   runs standalone.
-- **Reaches the network** in exactly one place once it is released: `lastcall update`
-  downloads a release asset over HTTPS and verifies a SHA-256 checksum before it replaces
-  its own binary. Nothing else in the shipped binary makes a network call. (`just
-  herdr-fetch` downloads a pinned herdr release, but that is a developer and CI command,
-  not something the binary does.)
+- **Reaches the network** in two places once it is released, both aimed at
+  `github.com` and nowhere else. `lastcall update` downloads a release asset over HTTPS
+  and verifies a SHA-256 checksum before it replaces its own binary. The TUI also asks the
+  GitHub releases API once a day, in the background after the first frame, whether a newer
+  version exists; that request carries the lastcall version as its user agent and nothing
+  else, and `check = false` under `[update]` in `config.toml` turns it off. Nothing else in
+  the shipped binary makes a network call. (`just herdr-fetch` downloads a pinned herdr
+  release, but that is a developer and CI command, not something the binary does.)
 
 Out of scope: anything that needs an attacker to already have arbitrary code execution as
 your user, and the security of the repositories or the agents lastcall is watching.

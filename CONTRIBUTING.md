@@ -37,7 +37,8 @@ them:
 | `just test-prepush` | the integration tier plus the proptests at 64 cases |
 | `just lint` | `cargo fmt --check`, `cargo clippy -D warnings`, the engine without the herdr feature, and the no-direct-`libc` greps |
 
-Before opening a PR, run `just lint` and `just test-prepush`. Both must be green.
+Before opening a PR, run `just lint`, `just test-prepush` and `just test-e2e`. All three
+must be green; the PR template asks for them.
 
 `just test-unit` is a ratchet: its count never shrinks across commits. If your change
 removes a test, say why in the PR.
@@ -50,8 +51,8 @@ removes a test, say why in the PR.
   aborts the commit, so check `git log` if a commit seems to have vanished.
 - **pre-push** runs `just test-prepush`.
 
-Install them. They are the same commands CI runs, so a green commit locally is a green
-commit in CI.
+Install them. CI runs the same lint and unit tiers, then the e2e tier and the real-herdr
+subset on top, so a green commit locally covers most of a green run in CI.
 
 ## Commits
 

@@ -9,8 +9,9 @@ repository owner (`gh auth status`).
 
 - Working tree clean, `main` up to date, `just lint` and `just test-prepush` green on `main`.
 - The disclosure grep below has zero hits. Do this first: it is the only irreversible one.
-- `gh release view v0.1.0` (or the tag of the day) exists, or accept that the README says
-  build from source.
+- The README says build from source: the first tag comes after the flip (attestation
+  needs a public repository), so there is no release to point at on the day.
+- `gh --version` is 2.60 or newer (`--accept-visibility-change-consequences` below needs it).
 - `LICENSE-MIT`, `LICENSE-APACHE`, `NOTICE`, `CONTRIBUTING.md`, `SECURITY.md`,
   `CODE_OF_CONDUCT.md` all present at the root.
 
@@ -20,9 +21,11 @@ repository owner (`gh auth status`).
 - Description and homepage: `gh repo edit aarontimko/lastcall --description "The last call before code ships: an agent-agnostic review ledger for the terminal" --homepage "https://github.com/aarontimko/lastcall"`
 - Topics: `gh repo edit aarontimko/lastcall --add-topic rust --add-topic tui --add-topic ratatui --add-topic code-review --add-topic git --add-topic ai-agents --add-topic developer-tools`
 - Delete branches on merge: `gh repo edit aarontimko/lastcall --delete-branch-on-merge`
-- Merge strategy: see the decision log. (Squash-only versus merge commits is not settled
-  here; set it with `gh repo edit --enable-squash-merge --enable-merge-commit=false` or in
-  Settings > General > Pull Requests once it is.)
+- Merge strategy: merge commits, per ruling P16 in
+  [`docs/spec/99-phase9b-release-kickoff.md`](../spec/99-phase9b-release-kickoff.md) (the
+  decision log cites branch commits by SHA):
+  `gh repo edit aarontimko/lastcall --enable-merge-commit --enable-squash-merge=false --enable-rebase-merge=false`.
+  If that ruling ever flips to squash-only, flip `required_linear_history` in step 3 with it.
 - Discussions on: `gh repo edit aarontimko/lastcall --enable-discussions`
 - Discussion categories: Settings > Discussions, or the Discussions tab's pencil icon. Keep
   **Q&A** and **Ideas**; the issue chooser links here for both.
@@ -34,7 +37,7 @@ repository owner (`gh auth status`).
 
 ## 3. Branch protection on `main`
 
-A pull request, the CI checks, linear history, no force push, no deletion. Take the check
+A pull request, the CI checks, no force push, no deletion. Take the check
 names from a real run first (`gh run view --json jobs --jq '.jobs[].name'`) so a rename in
 `ci.yml` does not leave a required check that never reports.
 
@@ -51,14 +54,14 @@ gh api -X PUT repos/aarontimko/lastcall/branches/main/protection --input - <<'JS
       "integration (ubuntu-latest)"
     ]
   },
-  "enforce_admins": false,
+  "enforce_admins": true,
   "required_pull_request_reviews": {
     "required_approving_review_count": 0,
     "dismiss_stale_reviews": true,
-    "require_code_owner_reviews": true
+    "require_code_owner_reviews": false
   },
   "restrictions": null,
-  "required_linear_history": true,
+  "required_linear_history": false,
   "allow_force_pushes": false,
   "allow_deletions": false,
   "required_conversation_resolution": true
@@ -66,18 +69,22 @@ gh api -X PUT repos/aarontimko/lastcall/branches/main/protection --input - <<'JS
 JSON
 ```
 
-`required_approving_review_count` is 0 on purpose while there is one maintainer: GitHub
-does not let anyone approve their own pull request, so any higher number would block every
-merge. Raise it to 1 the day a second maintainer exists. `enforce_admins` is false for the
-same reason, so the owner can merge a hotfix when a runner is down; everything else still
-applies.
+`required_approving_review_count` is 0 and `require_code_owner_reviews` is false on
+purpose while there is one maintainer: GitHub does not let anyone approve their own pull
+request, and the sole code owner authors every PR, so either setting would make every merge
+unsatisfiable. `CODEOWNERS` still auto-requests the review, which is the useful part. Raise
+the count to 1 and turn code-owner reviews on the day a second maintainer exists.
+`enforce_admins` is true so the rules bind the owner too: without it, everything except
+"no force push" and "no deletion" is advisory for an admin. When a runner is down, re-run
+the check (`gh workflow run ci.yml --ref <branch>`) rather than bypassing it.
+`required_linear_history` is false because `main` takes merge commits (step 2).
 
 ## 4. Labels
 
 ```sh
 gh label create bug                --color d73a4a --description "Something is broken" --force
 gh label create enhancement        --color a2eeef --description "A behaviour lastcall does not have yet" --force
-gh label create docs               --color 0075ca --description "README, AGENTS.md or docs/" --force
+gh label create documentation      --color 0075ca --description "README, AGENTS.md or docs/" --force
 gh label create "good first issue" --color 7057ff --description "Small, self-contained, well understood" --force
 gh label create "help wanted"      --color 008672 --description "The maintainer would welcome a PR here" --force
 gh label create needs-triage       --color ededed --description "Not yet labelled or reproduced" --force
@@ -85,8 +92,13 @@ gh label create security           --color b60205 --description "Handled private
 gh label create wontfix            --color ffffff --description "Closed with a reason, on purpose" --force
 ```
 
-The two issue forms already apply `needs-triage` plus `bug` or `enhancement`, so those
-three must exist before the repository is public or the forms fail to file.
+The two issue forms apply `needs-triage` plus `bug` or `enhancement`. A label that does not
+exist is silently dropped from the issue (the issue still files), so create those three
+before the forms are used. `documentation`, `bug`, `enhancement`, `good first issue`,
+`help wanted` and `wontfix` already exist as GitHub defaults; `--force` updates their
+descriptions. Delete the defaults that will not be used
+(`gh label delete duplicate invalid question accessibility --yes`, one per call), and leave
+`herdr-compat` alone: the compat workflow creates it on first drift.
 
 ## 5. Workflow edits
 
@@ -97,7 +109,10 @@ pull-request trigger back and open a PR with the change:
   and `push: branches: [main]`, and delete the comment that explains why it was removed.
 - `.github/workflows/scans.yml`: add `pull_request:` under `on:`, and drop the
   `if: ${{ !github.event.repository.private }}` guard on the `codeql` job now that code
-  scanning is available.
+  scanning is available. Leave CodeQL "default setup" off in Settings > Code security:
+  it conflicts with the workflow's advanced setup. Add a dependency-review job
+  (`actions/dependency-review-action`) to the same workflow; it only runs on
+  `pull_request` and only on a public repository, which is why it is not there yet.
 - Then confirm the required checks from step 3 actually report on that PR.
 
 ## 6. Before every push, once public
@@ -123,3 +138,10 @@ git log --all -S<term> --oneline
   is in the history whatever directory it sat in.
 - A hit in the history is not fixed by a commit. Either rewrite (`git filter-repo`) before
   the repository is public, or decide the term is harmless and record that decision.
+- The two commands read content, not commit headers. Check the author and committer
+  names separately: `git log --all --format='%an <%ae>%n%cn <%ce>' | sort -u`. Every
+  commit here carries the maintainer's name beside the noreply address; GitHub renders
+  that name on every commit page. Accept it (an attributed author is the norm) or rewrite
+  with `git filter-repo --mailmap` before the flip, and record which.
+- "No email address" means no real one: placeholder domains (`example.com`, `.invalid`)
+  in tests and docs are fine, so grep for real domains, not for a bare `@`.

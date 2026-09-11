@@ -22,7 +22,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          command: check advisories licenses bans
+          command: check
+          command-arguments: advisories licenses bans
 
   # CodeQL needs Advanced Security on a private repository, so it is skipped until the
   # repository is public. Note that a payload without `repository` leaves the expression

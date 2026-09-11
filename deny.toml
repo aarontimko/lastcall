@@ -1,6 +1,6 @@
 # cargo-deny policy. Run it with `just audit` (cargo deny check advisories licenses bans);
 # CI runs the same three checks weekly in .github/workflows/scans.yml. This is the v2
-# config schema (cargo-deny 0.17 and newer, which is what cargo-deny-action@v2 installs).
+# config schema (cargo-deny 0.20, which is what cargo-deny-action@v2 pins).
 
 [graph]
 # Judge every dependency the workspace can pull in, not just the default feature set:
@@ -10,7 +10,8 @@ all-features = true
 [advisories]
 # In the v2 schema a vulnerability advisory is always an error: there is no
 # `vulnerability = "deny"` knob any more, denying them is the behaviour. Same for
-# `unsound`. The two that are still configurable are set to their strictest values here.
+# `unsound`. The knobs that are still configurable are set to their strictest values here
+# (`unmaintained = "all"` is the default, kept explicit).
 unmaintained = "all"
 yanked = "deny"
 # Every ignore needs a one-line reason and a date. Empty is the goal.
@@ -31,6 +32,8 @@ allow = [
     "Unicode-DFS-2016",
     "Zlib",
     "MPL-2.0",
+    # `notify` (the filesystem watcher) is CC0-1.0: public domain, no obligations.
+    "CC0-1.0",
 ]
 confidence-threshold = 0.93
 # The workspace crates themselves are MIT OR Apache-2.0 and are never published as-is.
