@@ -3,7 +3,7 @@
 #
 # `ci.yml` pins herdr to the tag in the justfile and must stay green on its own. This job does
 # the opposite: it fetches herdr's *latest* release and runs the real-server subset plus the
-# consumed-surface schema check against it. A failure here is information, never a blocker —
+# consumed-surface schema check against it. A failure here is information, never a blocker:
 # it files one issue and stops.
 name: herdr-compat
 
@@ -108,12 +108,12 @@ jobs:
 
           What failed is one of:
 
-          - \`herdr_real_schema_consumed_surface_unchanged\` — the consumed API surface moved.
+          - \`herdr_real_schema_consumed_surface_unchanged\`: the consumed API surface moved.
             The failure message lists every path that differs against
             \`crates/lastcall-testkit/fixtures/herdr/schema/consumed-surface.json\`.
           - the protocol guard refusing \`${VERSION}\`'s protocol number
             (\`lastcall_engine::herdr::guard::SUPPORTED_PROTOCOLS\`).
-          - one of the \`herdr_real_*\` behaviour tests — herdr still answers the same shapes
+          - one of the \`herdr_real_*\` behaviour tests: herdr still answers the same shapes
             but behaves differently.
 
           To adopt the new release: bump \`herdr_version\` in the \`justfile\`, run

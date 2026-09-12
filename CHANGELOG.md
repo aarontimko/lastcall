@@ -5,7 +5,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html). A version's s
 exactly what its GitHub release notes carry, so it is written for the people installing the
 binary rather than for the commit log.
 
-## 0.1.0
+## 0.1.0 - 2026-09-12
 
 The first release. lastcall watches every git repository under your working directory and
 shows what changed since you last looked, whoever or whatever made the change, so that a
