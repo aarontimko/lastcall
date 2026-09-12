@@ -1,12 +1,11 @@
-# Supply-chain and code scanning. While the repository is private this runs on a schedule
-# and on demand only: GitHub's code-scanning features are not available on a private repo
-# without Advanced Security, and macOS/Linux minutes are counted. When the repository goes
-# public (docs/dev/publishing.md), add `pull_request:` to this workflow and to ci.yml so
-# both run on every PR, and drop the `if:` guard on the CodeQL job.
+# Supply-chain and code scanning: on every pull request, on a Monday schedule, and on demand.
+# CodeQL "default setup" stays off in Settings > Code security; it conflicts with the
+# advanced setup below (docs/dev/publishing.md, step 5).
 name: scans
 
 on:
   workflow_dispatch:
+  pull_request:
   schedule:
     # Mondays at 06:00 UTC.
     - cron: "0 6 * * 1"
@@ -25,12 +24,7 @@ jobs:
           command: check
           command-arguments: advisories licenses bans
 
-  # CodeQL needs Advanced Security on a private repository, so it is skipped until the
-  # repository is public. Note that a payload without `repository` leaves the expression
-  # null, which reads as false and lets the job run: that is the harmless direction, the
-  # job fails fast with "code scanning is not enabled" rather than hiding a finding.
   codeql:
-    if: ${{ !github.event.repository.private }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -51,3 +45,19 @@ jobs:
       - uses: github/codeql-action/analyze@v4
         with:
           category: "/language:rust"
+
+  # Fails a pull request that introduces a dependency with a known advisory, judged on the
+  # diff of the lockfile rather than the whole tree (cargo-deny above covers that). It only
+  # has a diff to read on pull_request, and GitHub only serves it on a public repository.
+  dependency-review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/dependency-review-action@v5
+        with:
+          fail-on-severity: moderate
+          comment-summary-in-pr: on-failure
