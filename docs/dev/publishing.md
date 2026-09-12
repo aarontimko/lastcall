@@ -14,6 +14,10 @@ repository owner (`gh auth status`).
 - `gh --version` is 2.60 or newer (`--accept-visibility-change-consequences` below needs it).
 - `LICENSE-MIT`, `LICENSE-APACHE`, `NOTICE`, `CONTRIBUTING.md`, `SECURITY.md`,
   `CODE_OF_CONDUCT.md` all present at the root.
+- The README's GIF is `docs/demo/lastcall.gif`, recorded with VHS from `docs/demo/`:
+  `stage.sh` builds the three demo repositories and the tape, `vhs` records, `render.sh`
+  encodes. Re-record after a change to the list, the diff pane, the flag modal or the
+  help overlay; the header comments in `stage.sh` say what to watch for.
 
 ## 2. Repository settings
 

@@ -1,0 +1,68 @@
+# VHS tape for the README demo. Generated from docs/demo/lastcall.tape.in by stage.sh,
+# which fills in the demo directory and the binary's directory for this machine.
+#
+# VHS 0.12.0 records the frames but never runs its own ffmpeg step (it hands the render
+# a context it has already cancelled), so the frames are kept and render.sh encodes them.
+Output lastcall.gif
+Output frames/
+
+Set Shell zsh
+Set FontSize 15
+Set Width 1180
+Set Height 620
+Set Padding 14
+Set Theme "Catppuccin Mocha"
+Set TypingSpeed 70ms
+
+Env LASTCALL_CONFIG "@DEMO@/config.toml"
+Env LASTCALL_STATE_DIR "@DEMO@/state"
+# The binary first, then wherever ttyd and ffmpeg live (Homebrew on macOS).
+Env PATH "@BIN_DIR@:/opt/homebrew/bin:/usr/bin:/bin"
+
+Hide
+Type "cd @DEMO@/repos && clear"
+Enter
+Show
+
+Type "lastcall"
+Sleep 600ms
+Enter
+
+# The startup notice names this machine's demo directory; rescan so the status line
+# shows something that reads the same everywhere.
+Hide
+Sleep 2000ms
+Type "r"
+Sleep 1500ms
+Show
+Sleep 2500ms
+
+# orders.py: the agent made an unknown coupon silently worth nothing. Flag it, with a
+# note the agent will read.
+Down
+Sleep 1500ms
+Enter
+Sleep 2200ms
+Type "m"
+Sleep 900ms
+Type "keep the KeyError: an unknown coupon should fail loudly"
+Sleep 700ms
+Enter
+Sleep 2000ms
+
+# test_orders.py: the new tests are fine. Accept the file; the cursor moves on to the
+# next repository, where a lockfile shows as one collapsed row.
+Escape
+Sleep 900ms
+Down
+Sleep 900ms
+Enter
+Sleep 1800ms
+Type "a"
+Sleep 2200ms
+
+# Every key is on the help overlay.
+Type "?"
+Sleep 2800ms
+Escape
+Sleep 2000ms
