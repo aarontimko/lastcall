@@ -43,8 +43,10 @@ gh attestation verify "lastcall-$version-$target" -R aarontimko/lastcall
 
 ### macOS: the first run
 
-The binaries are not notarized, so Gatekeeper stops a downloaded file the first time. Either
-clear the quarantine attribute:
+The binaries are not notarized, so Gatekeeper stops a file that carries the quarantine
+attribute the first time it runs. A browser download carries it; a `curl` download does not,
+and then the command below reports "No such xattr", which is fine. Either clear the
+attribute:
 
 ```sh
 xattr -d com.apple.quarantine "lastcall-$version-$target"
