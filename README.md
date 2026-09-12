@@ -1,6 +1,8 @@
 # lastcall
 
 [![ci](https://github.com/aarontimko/lastcall/actions/workflows/ci.yml/badge.svg)](https://github.com/aarontimko/lastcall/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/aarontimko/lastcall)](https://github.com/aarontimko/lastcall/releases/latest)
+[![downloads](https://img.shields.io/github/downloads/aarontimko/lastcall/total)](https://github.com/aarontimko/lastcall/releases)
 [![license: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue)](#license)
 
 ![lastcall in a terminal: three repositories in a list, a diff beside them, a hunk flagged with a note, a file accepted, then the help overlay](docs/demo/lastcall.gif)
@@ -113,10 +115,11 @@ just cargo build --release -p lastcall && ./target/release/lastcall --version
 
 ## Status
 
-Working towards v0.1.0. The first release is tagged after this lands, so until the tag
-exists the install line above has nothing to resolve and the build steps are the way in.
+v0.1.0 is the first release: four binaries built and attested by GitHub Actions from the
+tagged commit, on the [Releases](https://github.com/aarontimko/lastcall/releases) page.
 Expect keys, configuration keys and on-disk state to move between minor versions until 1.0,
-with everything that moves written down in [`CHANGELOG.md`](CHANGELOG.md).
+with everything that moves written down in [`CHANGELOG.md`](CHANGELOG.md), and
+`lastcall update` to carry an installed binary forward.
 
 Bug reports and small fixes are welcome. A feature wants an issue before a pull request, so
 the shape can be agreed before anyone writes it. The design record and roadmap live in

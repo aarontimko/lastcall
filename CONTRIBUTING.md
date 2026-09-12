@@ -1,7 +1,7 @@
 # Contributing to lastcall
 
 lastcall has one maintainer, [@aarontimko](https://github.com/aarontimko). The project is
-pre-release and working towards v0.1.0, so the surface still moves. Bug reports and small
+at 0.x, so the surface still moves between minor versions. Bug reports and small
 fixes are welcome now; a feature needs an issue first so we can agree on the shape before
 you write it.
 

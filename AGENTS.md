@@ -115,6 +115,14 @@ need, putting `pull_request:` back into `ci.yml` and `scans.yml`, and the disclo
 that must return zero hits over both the tree and the history. Read it only when doing
 that; nothing in it is needed to build or test.
 
+### Operating the released project: `docs/dev/operations.md`
+
+The standing handoff written when the last gate closed: how a release is cut (hand tags,
+the crate version equal to the tag), the weekly jobs and what to do when each goes red,
+the invariants that must not drift, what is deferred, and where the evidence for every
+gate lives. Read it before cutting a release or answering a Dependabot, compat or scan
+result.
+
 ### The performance baseline: `docs/dev/bench.md`
 
 The `just bench` numbers (four scenarios at the ruled sizes: 100 clones / 4,000 rows, a
