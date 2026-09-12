@@ -6,6 +6,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+# Distributed as GitHub Release binaries (docs/install.md), not on crates.io; the
+# workspace's path dependencies carry no version for that reason (deny.toml, [bans]).
+publish = false
 
 [[bin]]
 name = "lastcall"

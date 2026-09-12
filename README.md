@@ -3,6 +3,8 @@
 [![ci](https://github.com/aarontimko/lastcall/actions/workflows/ci.yml/badge.svg)](https://github.com/aarontimko/lastcall/actions/workflows/ci.yml)
 [![license: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue)](#license)
 
+![lastcall in a terminal: three repositories in a list, a diff beside them, a hunk flagged with a note, a file accepted, then the help overlay](docs/demo/lastcall.gif)
+
 The last call before code ships: an agent-agnostic review ledger for the terminal. It
 watches every repository under your working directory, shows exactly what changed since you
 last looked, and lets you accept, flag, restore or fix it hunk by hunk, whichever agent or
@@ -12,17 +14,49 @@ It is not a git client and it does not commit anything. It remembers what you ha
 seen, which is the thing git cannot tell you when an agent has been rewriting a file all
 morning.
 
+## Who it is for
+
+- **You read the agent's work while it happens, not only at the pull request.** An agent
+  has been editing one repository or a dozen. lastcall shows exactly what changed since
+  you last looked and you walk it hunk by hunk: accept, put back, flag with a note, or fix
+  it yourself. Accepting is what shrinks the list, so a long session stays reviewable.
+  This is for terminal agents, which have no review surface of their own, and for desktop
+  apps that show you a diff but cannot accept a hunk or remember what you have read.
+- **You run agents in [herdr](https://github.com/herdrdev/herdr).** lastcall was built as
+  herdr's companion. Beside a herdr agent, the note on a flagged hunk is typed into that
+  agent's pane, so "keep the KeyError" reaches the agent that wrote the change. Without
+  herdr you still get the whole review loop; the note goes to a file instead.
+- **An agent writes prose for you in a directory that is not a repository.** Notes, a
+  draft for a wiki page, a document you will paste somewhere else. Point `draft_dirs` at
+  the directory and lastcall reviews it the same way, with no git involved.
+
+## Who it is not for
+
+- **The pull request is the first place you read the agent's work.** lastcall is for the
+  hours before the PR and adds nothing after it.
+- **Your agent lives in an editor that shows each edit inline with accept and reject.**
+  You already have most of this, for that editor and that session. lastcall earns its
+  place only if agents also edit outside it, or you want the ledger to outlive the window.
+- **You commit after every review pass, and the agent never commits on its own.** Then
+  git is already your ledger: the working tree is exactly what you have not read.
+
+lastcall is also not a git client. It does not stage, commit or push, and it has no
+opinion about your branches.
+
 ## What it does
 
 - **Watches a whole directory of repositories at once.** One screen, every repository,
   updated live as files change. Branch groups, `+added −removed` counts per file, and the
   selected file's diff beside the list.
+- **Directories that are not repositories.** Notes, drafts, anything an agent writes
+  outside git: list them in `draft_dirs` and they get the same ledger, hunk by hunk.
 - **Four answers per hunk.** `a` accepts it, `u` puts it back, `m` flags it with a note,
   `i` opens the file for editing right there. Accepting is what shrinks the list, and it
   survives a restart.
 - **A pile that shrinks and stays shrunk.** What you accept is recorded outside your
   repositories, so a relaunch starts where you stopped, whatever the agent committed in
-  between.
+  between. The ledger lives in `~/.local/state/lastcall` (or under `$XDG_STATE_HOME`), and
+  nothing is ever written into a repository it watches.
 - **Notes that reach the agent.** A flag written next to a herdr agent is typed into that
   agent's pane, not into a file you will never open again.
 - **Generated files collapse.** A lockfile, a binary or anything very large is one row to
