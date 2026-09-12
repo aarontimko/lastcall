@@ -548,8 +548,8 @@ impl HerdrPlan {
 /// every `git` it spawns. During the initial scans herdr reported our pane as being in
 /// whichever root a `git` child was running in at that instant, `pane_updated` carried it
 /// over, and the pane-containment scope (deliverable 8) narrowed to that root: the Gate 8
-/// sponsor run's launch flashed `BMAD-METHOD` → empty → one stray repo → all, as the scope
-/// went `None` → `{user-memory-openwiki-test}` → `{drydock}` → `None` behind our own
+/// sponsor run's launch flashed one repo → empty → a different stray repo → all, as the
+/// scope went `None` → `{one root}` → `{another}` → `None` behind our own
 /// scans. Our own pane's foreground is never evidence about the workspace, so it is
 /// dropped before any derivation; the shell's `cwd` is still where the pane lives.
 ///

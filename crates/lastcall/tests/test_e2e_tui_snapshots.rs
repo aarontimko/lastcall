@@ -197,6 +197,9 @@ fn tui_empty_state() {
 
     let (frame, _) = draw(&app, W, H);
     assert!(frame.contains("nothing pending across 1 repo"), "{frame}");
+    // Verifier (b) F4, the all-clean case: `^A` here lands on `nothing to accept`, so the
+    // hint line does not offer it. The snapshot above is the frame that says so.
+    assert!(!frame.contains("accept all"), "{frame}");
 
     app.handle(Action::HideEmpty);
     assert!(app.nav_entries().is_empty());
@@ -395,6 +398,14 @@ fn tui_diff_view_collapsed() {
     select_row(&mut app, &alpha, "Cargo.lock");
     assert!(app.selected_row().unwrap().collapsed.is_some());
     app.handle(Action::Open);
+    // Verifier (b) F4, the hunkless-file case: the diff holds the focus, but a collapsed
+    // row has no lines, so `v select` and `y copy` are not offered and neither is
+    // `n/p hunk`. `e expand` is what this row answers, and the pane says so.
+    let (frame, _) = draw(&app, W, H);
+    for absent in ["v select", "y copy", "n/p hunk"] {
+        assert!(!frame.contains(absent), "{absent}:\n{frame}");
+    }
+    assert!(frame.contains("[e expand]"), "{frame}");
     snapshot("tui_diff_view_collapsed", &app, W, H);
 }
 
@@ -656,6 +667,32 @@ fn tui_help_overlay_80x24() {
     snapshot("tui_help_overlay_80x24", &app, 80, 24);
 }
 
+/// Verifier (b) F5: the height where the table fits **exactly** still says how to leave.
+///
+/// The overlay reserves a row for `any key closes` in its own height arithmetic, but the
+/// draw wrote the line only where the body fell short of the box — so at the one height
+/// where the body filled it the way out went unsaid, and a row shorter it came back
+/// together with the clip notice. The height is found rather than written down (it moves
+/// with the keymap): the shortest frame that still shows every key row is the exact fit.
+#[test]
+fn tui_help_overlay_exact_fit() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    app.handle(Action::Help);
+    assert!(app.help);
+    let height = (10u16..=48)
+        .find(|h| !draw(&app, W, *h).0.contains("more key"))
+        .expect("some height shows the whole table");
+    let (frame, _) = draw(&app, W, height);
+    assert!(frame.contains("any key closes"), "{height}:\n{frame}");
+    assert!(
+        draw(&app, W, height - 1).0.contains("more key"),
+        "one row shorter clips, which is what makes this the exact fit"
+    );
+    snapshot("tui_help_overlay_exact_fit", &app, W, height);
+}
+
 #[test]
 fn tui_narrow_60x20() {
     let scene = Scene::build();
@@ -907,6 +944,13 @@ fn tui_nav_empty_repo_row() {
     let (frame, _) = draw(&app, W, H);
     assert!(frame.contains("nothing pending in beta"), "{frame}");
     assert!(frame.contains("lastcall  3 repos ·"), "{frame}");
+    // Verifier (b) F4, the repo-row case: a repo row carries no hunks, so `n`/`p` move
+    // nothing and the hint line does not name them. `a accept all in beta` is absent for
+    // the same reason and by the older rule (verifier (a) F2), and `^A` stays because the
+    // other two repos do have rows.
+    assert!(!frame.contains("n/p hunk"), "{frame}");
+    assert!(!frame.contains("accept all in beta"), "{frame}");
+    assert!(frame.contains("^A accept all"), "{frame}");
     snapshot("tui_nav_empty_repo_row", &app, W, H);
 
     assert_eq!(app.handle(Action::HideEmpty).0, Changed::Yes);
@@ -1338,6 +1382,35 @@ fn tui_herdr_header_states() {
         lines.push_str(&format!("{name:<18} |{header}|\n"));
     }
     insta::assert_snapshot!("tui_herdr_header_states", lines);
+}
+
+/// Design pass D6 (kickoff deliverable 2.6): the once-a-day update check's whole visible
+/// surface is seven columns in the header, `↑ 0.1.1`, after `[Accept All]` and before the
+/// pad. Nothing is said on the status line, nothing is added to the hints, and no modal
+/// opens: a reader mid-review did not ask about releases. The click-to-read sentence and
+/// the drop order are unit-tested in `render.rs`; this pins the frame it makes at 100
+/// columns, which is where D6 says it fits.
+#[test]
+fn tui_update_notice() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    let before = draw(&app, W, H).0;
+    assert_eq!(app.update_available("0.1.1".to_owned()), Changed::Yes);
+    let (frame, _) = draw(&app, W, H);
+    let header = frame.lines().next().expect("a header");
+    assert!(header.contains("[Accept All]  ↑ 0.1.1"), "{header}");
+    assert_eq!(
+        frame.lines().skip(1).collect::<Vec<_>>(),
+        before.lines().skip(1).collect::<Vec<_>>(),
+        "the notice costs the rest of the screen nothing"
+    );
+    assert!(
+        app.status.is_none(),
+        "no automatic sentence: {:?}",
+        app.status
+    );
+    snapshot("tui_update_notice", &app, W, H);
 }
 
 /// Deliverable 8: the scope hides what is not in this workspace, and the notice that says

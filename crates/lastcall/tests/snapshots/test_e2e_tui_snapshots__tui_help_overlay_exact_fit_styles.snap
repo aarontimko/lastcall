@@ -1,0 +1,47 @@
+---
+source: crates/lastcall/tests/test_e2e_tui_snapshots.rs
+expression: style
+---
+0 0..100 Cyan Reset -
+1 0..1 Cyan Reset -
+1 99..100 Cyan Reset -
+2 0..1 Cyan Reset -
+2 99..100 Cyan Reset -
+3 0..1 Cyan Reset -
+3 99..100 Cyan Reset -
+4 0..1 Cyan Reset -
+4 99..100 Cyan Reset -
+5 0..1 Cyan Reset -
+5 99..100 Cyan Reset -
+6 0..1 Cyan Reset -
+6 99..100 Cyan Reset -
+7 0..1 Cyan Reset -
+7 99..100 Cyan Reset -
+8 0..1 Cyan Reset -
+8 99..100 Cyan Reset -
+9 0..1 Cyan Reset -
+9 99..100 Cyan Reset -
+10 0..1 Cyan Reset -
+10 99..100 Cyan Reset -
+11 0..1 Cyan Reset -
+11 99..100 Cyan Reset -
+12 0..1 Cyan Reset -
+12 99..100 Cyan Reset -
+13 0..1 Cyan Reset -
+13 99..100 Cyan Reset -
+14 0..1 Cyan Reset -
+14 99..100 Cyan Reset -
+15 0..1 Cyan Reset -
+15 99..100 Cyan Reset -
+16 0..1 Cyan Reset -
+16 99..100 Cyan Reset -
+17 0..1 Cyan Reset -
+17 99..100 Cyan Reset -
+18 0..1 Cyan Reset -
+18 99..100 Cyan Reset -
+19 0..1 Cyan Reset -
+19 99..100 Cyan Reset -
+20 0..1 Cyan Reset -
+20 2..16 Reset Reset DIM
+20 99..100 Cyan Reset -
+21 0..100 Cyan Reset -

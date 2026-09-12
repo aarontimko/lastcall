@@ -265,6 +265,9 @@ pub enum Target {
     RootDot(PathBuf),
     /// The header's herdr badge: a click shows the full standalone reason.
     HeaderHerdr,
+    /// The header's update notice (`↑ 0.1.1`): a click puts the whole sentence on the
+    /// status line, exactly as a click on the badge does (Design pass D6).
+    HeaderUpdate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1033,6 +1036,11 @@ pub struct App {
     /// modal's key line says so. `false` — the default, and what every terminal that does
     /// not answer gets — promises `Ctrl-J` alone, which always works.
     pub enhanced: bool,
+    /// The newer release the once-a-day check found, if any (kickoff deliverable 2.6):
+    /// the version alone (`0.1.1`), set once per session by `Local::UpdateAvailable` and
+    /// never cleared. `None` is every other session, including every session the config
+    /// turned the check off in.
+    pub update: Option<String>,
 }
 
 impl Default for App {
@@ -1080,7 +1088,24 @@ impl App {
             // The canonical spellings (`shift-a` shows as `A`), as `Keymap::table` gives.
             keymap: Keymap::defaults().table(),
             enhanced: false,
+            update: None,
         }
+    }
+
+    /// The once-a-day check found `version`. Sets the header notice for the session and
+    /// nothing else: no status sentence, no hint, no modal. The reader is mid-review and
+    /// did not ask about releases (Design pass D6).
+    pub fn update_available(&mut self, version: String) -> Changed {
+        if self.update.as_deref() == Some(version.as_str()) {
+            return Changed::No;
+        }
+        self.update = Some(version);
+        Changed::Yes
+    }
+
+    /// The sentence [`Target::HeaderUpdate`] puts on the status line.
+    pub fn update_sentence(version: &str) -> String {
+        format!("lastcall {version} available — run: lastcall update")
     }
 
     /// The key specs bound to `action` (empty when unbound).
@@ -3498,6 +3523,14 @@ impl App {
                 }
                 _ => Changed::No,
             },
+            Target::HeaderUpdate => match &self.update {
+                Some(version) => {
+                    let text = App::update_sentence(version);
+                    self.set_status(text);
+                    Changed::Yes
+                }
+                None => Changed::No,
+            },
             Target::FileAccept => return self.handle(Action::AcceptFile),
             Target::FileRestore => return self.handle(Action::RestoreFile),
             // The control is only drawn on an expandable row, so the click is the key.
@@ -4348,7 +4381,7 @@ mod tests {
         );
         assert_eq!(
             by_key.accepting.as_ref().unwrap().files,
-            vec![(root("alpha"), 2), (root("beta"), 2), (root("notes"), 1)]
+            vec![(root("alpha"), 3), (root("beta"), 2), (root("notes"), 1)]
         );
     }
 
@@ -4380,7 +4413,7 @@ mod tests {
             app.accepted(vec![accepted_ok("alpha", 2, Pile::default())]),
             Changed::Yes
         );
-        assert_eq!(status(&app), "accepted 2 files in alpha");
+        assert_eq!(status(&app), "accepted 3 files in alpha");
         assert_eq!(
             app.selection,
             Some(Selection::Root(root("alpha"))),
@@ -4959,20 +4992,20 @@ mod tests {
     }
 
     #[test]
-    fn app_advance_wraps_to_first_remaining_row_when_last_by_path() {
+    fn app_advance_falls_to_the_row_above_when_last_by_path() {
         let mut app = three_roots();
-        app.select(Some(row("alpha", "f2")));
+        app.select(Some(row("alpha", "src/parse.rs")));
         app.handle(Action::AcceptFile);
         app.accepted(vec![accepted_ok(
             "alpha",
             2,
-            without(pile("alpha"), &["f2"]),
+            without(pile("alpha"), &["src/parse.rs"]),
         )]);
-        assert_eq!(status(&app), "accepted f2");
+        assert_eq!(status(&app), "accepted src/parse.rs");
         assert_eq!(
             app.selection,
-            Some(row("alpha", "f1")),
-            "wraps, not the Root entry"
+            Some(row("alpha", "f2")),
+            "the row above, not the Root entry"
         );
     }
 
@@ -5008,11 +5041,11 @@ mod tests {
             2,
             without(pile("alpha"), &["f2"]),
         )]);
-        assert_eq!(app.selection, Some(row("alpha", "f1")));
+        assert_eq!(app.selection, Some(row("alpha", "src/parse.rs")));
         app.handle(Action::AcceptFile);
         app.accepted(vec![accepted_ok("alpha", 3, Pile::default())]);
         assert_eq!(app.selection, Some(Selection::Root(root("alpha"))));
-        assert_eq!(status(&app), "accepted f1");
+        assert_eq!(status(&app), "accepted src/parse.rs");
         assert_eq!(app.nav_entries().len(), 3, "three empty repos, three rows");
     }
 
@@ -5108,7 +5141,7 @@ mod tests {
             accepted_ok("beta", 2, Pile::default()),
             accepted_ok("notes", 2, Pile::default()),
         ]);
-        assert_eq!(status(&app), "accepted 5 files in 3 repos");
+        assert_eq!(status(&app), "accepted 6 files in 3 repos");
     }
 
     #[test]
@@ -5191,6 +5224,7 @@ mod tests {
                 Selection::Root(root("alpha")),
                 row("alpha", "f1"),
                 row("alpha", "f2"),
+                row("alpha", "src/parse.rs"),
                 Selection::Root(root("beta")),
                 row("beta", "u1"),
                 row("beta", "u2"),
@@ -5255,11 +5289,11 @@ mod tests {
     #[test]
     fn app_last_row_falls_to_the_row_above_then_to_the_repo_row() {
         let mut app = three_roots();
-        app.select(Some(row("alpha", "f2")));
+        app.select(Some(row("alpha", "src/parse.rs")));
         let mut p = pile("alpha");
-        p.rows.retain(|r| r.path != b"f2");
+        p.rows.retain(|r| r.path != b"src/parse.rs");
         app.apply(pile_event("alpha", p));
-        assert_eq!(app.selection, Some(row("alpha", "f1")), "the row above");
+        assert_eq!(app.selection, Some(row("alpha", "f2")), "the row above");
         app.apply(pile_event("alpha", Pile::default()));
         assert_eq!(app.selection, Some(Selection::Root(root("alpha"))));
     }
@@ -5927,7 +5961,7 @@ mod tests {
             app.apply(pile_event_seq(
                 "alpha",
                 1,
-                without(pile("alpha"), &["f1", "f2"])
+                without(pile("alpha"), &["f1", "f2", "src/parse.rs"])
             ))
             .0,
             Changed::Yes,
@@ -6369,11 +6403,11 @@ mod tests {
             vec![root("alpha")],
             "a hidden root is not accepted behind the user's back"
         );
-        // And so do the confirm modal's numbers: alpha's two rows, alpha's name.
+        // And so do the confirm modal's numbers: alpha's three rows, alpha's name.
         let counts = app.counts_of(&AcceptScope::All);
         assert_eq!(counts.roots, vec!["alpha".to_owned()]);
         assert_eq!(
-            counts.files, 2,
+            counts.files, 3,
             "beta's two and notes' one are out of scope"
         );
 

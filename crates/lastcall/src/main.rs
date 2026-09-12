@@ -47,6 +47,12 @@ enum Command {
         #[arg(long, value_name = "SECS")]
         poll: Option<u64>,
     },
+    /// Replace this binary with the newest release, after verifying its checksum.
+    Update {
+        /// Only say whether a newer release exists; never write the binary.
+        #[arg(long)]
+        check: bool,
+    },
     /// Run the watcher and print one line per engine event until Ctrl-C.
     Watch {
         /// One JSON object per line.
@@ -77,6 +83,7 @@ fn main() -> std::process::ExitCode {
         }
         Command::Status { json, roots } => commands::status::run(json, roots),
         Command::Tui { poll } => commands::tui::run(poll),
+        Command::Update { check } => commands::update::run(check),
         Command::Watch {
             json,
             exit_after,
@@ -139,6 +146,11 @@ mod tests {
                 json: false,
                 roots: vec![]
             }
+        );
+        assert_eq!(parse(&["update"]), Command::Update { check: false });
+        assert_eq!(
+            parse(&["update", "--check"]),
+            Command::Update { check: true }
         );
         assert!(Cli::try_parse_from(["lastcall", "nope"]).is_err());
         assert!(Cli::try_parse_from(["lastcall", "tui", "--json"]).is_err());

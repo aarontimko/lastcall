@@ -12,9 +12,13 @@
 //!   `SHELL=/bin/sh`, and **every inherited `HERDR_*` variable removed** (our own shell may be
 //!   inside herdr — a child that inherited `HERDR_SOCKET_PATH` would nest into the sponsor's
 //!   live session);
-//! - `<XDG_CONFIG_HOME>/herdr/config.toml` containing `onboarding = false` written before
-//!   spawning (herdr's default is onboarding-on and `ensure_default_workspace` returns early in
-//!   onboarding mode, `src/app/mod.rs:1248-1254`, so the snapshot would have zero workspaces).
+//! - `<XDG_CONFIG_HOME>/herdr/config.toml` containing [`HERDR_TEST_CONFIG`] written before
+//!   spawning: `onboarding = false` (herdr's default is onboarding-on and
+//!   `ensure_default_workspace` returns early in onboarding mode, `src/app/mod.rs:1248-1254`,
+//!   so the snapshot would have zero workspaces) plus `version_check` and `manifest_check`
+//!   off, which is what keeps this tier off the network;
+//! - [`HERDR_OFFLINE_ENV`] in the spawn environment, pointing the agent-detection manifest
+//!   catalogue at a closed loopback port.
 //!
 //! Process hygiene: kill-on-drop with a bounded `try_wait` poll, a registry of spawned PIDs
 //! with a kill-on-panic hook, and a matcher that refuses to kill any PID not in the registry
@@ -79,6 +83,31 @@ pub fn unique_test_dir() -> PathBuf {
     PathBuf::from(format!("/tmp/lc-{}-{nanos}-{n}", std::process::id()))
 }
 
+/// The config a spawned herdr is given, and the reason for each line.
+///
+/// `onboarding = false` skips the first-run wizard, which would otherwise hold the server.
+/// The other two are why nothing here reaches the network: herdr's `version_check` and
+/// `manifest_check` both default to **true**, and a server started with them on curls
+/// `herdr.dev/latest.json` and `herdr.dev/agent-detection/index.toml` in the background,
+/// twice per spawn, from a suite the boundaries say never reaches the network (verifier (a)
+/// F2, which counted sixteen such calls in one run of the real-herdr subset).
+///
+/// The section header is load-bearing: both switches live under `[update]` in herdr's own
+/// config (`UpdateConfig { channel, version_check, manifest_check }`, and the template the
+/// binary embeds prints them under `[update]`). Written flat at the top level they are
+/// unknown keys, which herdr ignores in silence: a first run of this fix with flat keys
+/// still logged `https://herdr.dev/latest.json` once per spawn.
+pub const HERDR_TEST_CONFIG: &str =
+    "onboarding = false\n\n[update]\nversion_check = false\nmanifest_check = false\n";
+
+/// Belt and braces beside [`HERDR_TEST_CONFIG`]: a manifest catalogue on a closed loopback
+/// port, so a herdr that ever ignores `manifest_check` fails to connect instead of leaving
+/// the machine. Port 1 answers nothing.
+pub const HERDR_OFFLINE_ENV: &[(&str, &str)] = &[(
+    "HERDR_AGENT_DETECTION_MANIFEST_CATALOG_URL",
+    "http://127.0.0.1:1/",
+)];
+
 /// The per-spawn directories and the explicit socket path.
 #[derive(Debug, Clone)]
 pub struct HerdrIsolation {
@@ -96,7 +125,7 @@ pub struct HerdrIsolation {
 }
 
 impl HerdrIsolation {
-    /// Create the directories and the `onboarding = false` config.
+    /// Create the directories and the [`HERDR_TEST_CONFIG`] config.
     pub fn create() -> std::io::Result<Self> {
         let base = unique_test_dir();
         let config_home = base.join("config");
@@ -124,10 +153,7 @@ impl HerdrIsolation {
         std::fs::create_dir_all(&state_home)?;
         std::fs::create_dir_all(&data_home)?;
         std::fs::create_dir_all(&cache_home)?;
-        std::fs::write(
-            config_home.join("herdr/config.toml"),
-            "onboarding = false\n",
-        )?;
+        std::fs::write(config_home.join("herdr/config.toml"), HERDR_TEST_CONFIG)?;
         Ok(Self {
             base,
             config_home,
@@ -238,6 +264,9 @@ impl SpawnedHerdr {
             }
         }
         for (key, value) in self.isolation.env_pairs() {
+            cmd.env(key, value);
+        }
+        for (key, value) in HERDR_OFFLINE_ENV {
             cmd.env(key, value);
         }
         cmd.env("SHELL", "/bin/sh");
@@ -401,6 +430,9 @@ fn spawn_server_child(bin: &Path, isolation: &HerdrIsolation) -> std::io::Result
         }
     }
     for (key, value) in isolation.env_pairs() {
+        cmd.env(key, value);
+    }
+    for (key, value) in HERDR_OFFLINE_ENV {
         cmd.env(key, value);
     }
     cmd.env("SHELL", "/bin/sh");
@@ -637,14 +669,55 @@ mod tests {
     }
 
     #[test]
-    fn herdr_spawn_isolation_dirs_are_short_and_carry_onboarding_off() {
+    fn herdr_spawn_isolation_dirs_are_short_and_carry_the_offline_config() {
         let iso = HerdrIsolation::create().unwrap();
         assert!(iso.socket_path.as_os_str().len() < 100);
         assert!(iso.socket_path.to_string_lossy().starts_with("/tmp/lc-"));
         let config = std::fs::read_to_string(iso.config_home.join("herdr/config.toml")).unwrap();
-        assert_eq!(config, "onboarding = false\n");
+        assert_eq!(config, HERDR_TEST_CONFIG);
+        // The lines by name: the wizard off, and the two background fetches off under the
+        // `[update]` header they belong to. A spawn missing either check line curls
+        // herdr.dev, which is the network this suite promises never to touch, and a spawn
+        // that writes them outside `[update]` is ignored just as quietly.
+        for line in [
+            "onboarding = false",
+            "[update]",
+            "version_check = false",
+            "manifest_check = false",
+        ] {
+            assert!(
+                config.lines().any(|written| written == line),
+                "the spawned herdr config is missing `{line}`: {config:?}"
+            );
+        }
+        let header = config.find("[update]").expect("the [update] header");
+        for key in ["version_check", "manifest_check"] {
+            assert!(
+                config.find(key).expect("the key") > header,
+                "`{key}` must sit under `[update]`, not above it: {config:?}"
+            );
+        }
         assert!(iso.home.is_dir());
         std::fs::remove_dir_all(&iso.base).unwrap();
+    }
+
+    #[test]
+    fn herdr_spawn_offline_env_points_the_manifest_catalogue_at_a_dead_port() {
+        // The belt beside the config's braces: whatever herdr does with `manifest_check`,
+        // the catalogue URL it would fetch is a closed loopback port, not herdr.dev.
+        assert_eq!(
+            HERDR_OFFLINE_ENV,
+            [(
+                "HERDR_AGENT_DETECTION_MANIFEST_CATALOG_URL",
+                "http://127.0.0.1:1/"
+            )]
+        );
+        for (_, value) in HERDR_OFFLINE_ENV {
+            assert!(
+                value.starts_with("http://127.0.0.1:"),
+                "the offline env must stay on loopback: {value}"
+            );
+        }
     }
 
     #[test]

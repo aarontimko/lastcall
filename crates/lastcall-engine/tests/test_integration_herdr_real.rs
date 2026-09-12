@@ -735,7 +735,7 @@ async fn herdr_real_done_flip_heals_within_fallback() {
 
     // 1. A pane herdr calls `done`, before the client ever connects: the bootstrap snapshot
     //    is the only thing that tells the client so.
-    let (_ws, root_pane, first_tab) = drive_pane_to_done(&raw, &herdr.isolation().base).await;
+    let (ws, root_pane, first_tab) = drive_pane_to_done(&raw, &herdr.isolation().base).await;
     say(&format!("G3: {root_pane} is done in tab {first_tab}"));
 
     // 2. Connect through the filter, with a 3 s fallback resync.
@@ -778,6 +778,20 @@ async fn herdr_real_done_flip_heals_within_fallback() {
         Some(&AgentStatus::Done),
         "the bootstrap snapshot must show the pane as done"
     );
+
+    // 2b. Give the filter one line it does **not** censor, so the black-hole guard below
+    //     ("the filter must still have forwarded the lines it does not censor") is satisfied
+    //     by this scene rather than by herdr's behaviour. On v0.8.2 it was satisfied by the
+    //     lifecycle replay burst on connect (§11, "v0.8.2 lifecycle-subscription replay"),
+    //     which v0.9.0 fixed: a server with no replay pushes only the four censored lines
+    //     here and the guard goes off on a healthy run. `tab.create` is subscribed through
+    //     `pane.created` (the new tab's root pane), and `focus: false` leaves the focus where
+    //     it is, so step 3's `tab.focus` is still the flip.
+    let extra_tab = raw
+        .request("tab.create", json!({ "workspace_id": ws, "focus": false }))
+        .await
+        .expect("tab.create for a forwarded pane_created");
+    assert!(extra_tab.get("type").is_some(), "{extra_tab}");
 
     // 3. Focus the agent's tab. herdr clears its seen flag and the pane becomes idle with no
     //    global event for the flip itself; the one line that *would* have driven a resync
@@ -887,7 +901,8 @@ async fn herdr_real_done_flip_heals_within_fallback() {
     let forwarded = stats.forwarded_names();
     assert!(
         !forwarded.is_empty(),
-        "the filter must still have forwarded the lines it does not censor"
+        "the filter must still have forwarded the lines it does not censor — step 2b's \
+         `tab.create` should have arrived as `pane_created`; dropped {dropped:?}"
     );
     let after_focus = &forwarded[forwarded_before_focus.min(forwarded.len())..];
     say(&format!(

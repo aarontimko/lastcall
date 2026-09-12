@@ -1,0 +1,54 @@
+# cargo-deny policy. Run it with `just audit` (cargo deny check advisories licenses bans);
+# CI runs the same three checks weekly in .github/workflows/scans.yml. This is the v2
+# config schema (cargo-deny 0.20, which is what cargo-deny-action@v2 pins).
+
+[graph]
+# Judge every dependency the workspace can pull in, not just the default feature set:
+# the engine's herdr client is behind a feature and must be covered too.
+all-features = true
+
+[advisories]
+# In the v2 schema a vulnerability advisory is always an error: there is no
+# `vulnerability = "deny"` knob any more, denying them is the behaviour. Same for
+# `unsound`. The knobs that are still configurable are set to their strictest values here
+# (`unmaintained = "all"` is the default, kept explicit).
+unmaintained = "all"
+yanked = "deny"
+# Every ignore needs a one-line reason and a date. Empty is the goal.
+ignore = []
+
+[licenses]
+# What a permissively licensed Rust tool may depend on. MPL-2.0 is file-level copyleft and
+# is accepted; anything reciprocal at the binary level is not on this list, so adding such
+# a dependency fails the check and has to be argued for in the PR.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "MPL-2.0",
+    # `notify` (the filesystem watcher) is CC0-1.0: public domain, no obligations.
+    "CC0-1.0",
+]
+confidence-threshold = 0.93
+# The workspace crates themselves are MIT OR Apache-2.0 and are never published as-is.
+private = { ignore = true }
+
+[bans]
+# Two copies of one crate is a warning, not a failure: the dependency tree is not ours to
+# flatten. A wildcard version requirement is ours, and is an error.
+multiple-versions = "warn"
+wildcards = "deny"
+# The workspace rule is "safe wrappers only: nix, never a direct libc call or dependency"
+# (docs/spec/00-spec.md). It cannot be expressed here: `libc` is a transitive dependency of
+# console, cpufeatures, errno and tokio, so banning the crate name would fail on other
+# people's code. `just lint` enforces the rule where it actually bites, with two greps over
+# crates/ for `libc::` and for a `libc` line in a Cargo.toml.
+deny = []
+skip = []
+skip-tree = []

@@ -1,8 +1,8 @@
 //! Write `fixtures/herdr/schema/consumed-surface.json` from a herdr binary (kickoff 11a).
 //!
-//! Run it through `just herdr-schema-fixture`, which passes the **pinned v0.8.2 release
-//! asset**: the fixture is generated from the release tag, never from master and never by
-//! hand. `herdr api schema --json` needs no running server, so this touches no socket.
+//! Run it through `just herdr-schema-fixture`, which passes the **pinned release asset**
+//! (`herdr_version` in the `justfile`, v0.9.0 at Phase 9b): the fixture is generated from the
+//! release tag, never from master and never by hand. `herdr api schema --json` needs no running server, so this touches no socket.
 //!
 //! ```text
 //! cargo run -p lastcall-testkit --example herdr_schema_fixture -- <herdr-bin> <out.json>

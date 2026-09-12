@@ -74,7 +74,25 @@ pub fn run(poll: Option<u64>) -> Result<ExitCode, Box<dyn std::error::Error>> {
         env,
         plan,
         loaded.config.hide_empty_repos,
+        daily_check(&loaded),
     )
+}
+
+/// The once-a-day update check the loop starts when the launch hold ends, or `None` when
+/// `[update] check = false` (§6.1, Amendment v1.10 item 2). Built here so `tui/run.rs`
+/// keeps knowing nothing about curl, GitHub or the state file: it is handed a closure and
+/// a place to post the answer.
+fn daily_check(loaded: &config::Loaded) -> Option<run::DailyCheck> {
+    if !loaded.config.update.check {
+        return None;
+    }
+    let state_dir = loaded.state_dir.clone();
+    Some(Box::new(move |sink: run::UpdateSink| {
+        if let Some(version) = crate::commands::update::daily_check(&state_dir, &|| sink.quitting())
+        {
+            sink.available(version);
+        }
+    }))
 }
 
 #[cfg(test)]

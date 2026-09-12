@@ -1,7 +1,7 @@
 # Provenance: consumed-surface.json
 
-**Generated from the pinned herdr release tag `v0.8.2`** (the release asset fetched by `just
-herdr-fetch`, which verifies `herdr --version` == `herdr 0.8.2`), never from `master` and never
+**Generated from the pinned herdr release tag `v0.9.0`** (the release asset fetched by `just
+herdr-fetch`, which verifies `herdr --version` == `herdr 0.9.0`), never from `master` and never
 by hand.
 
 Exact command:
@@ -14,17 +14,23 @@ which runs
 
 ```
 cargo run -q -p lastcall-testkit --example herdr_schema_fixture -- \
-    target/herdr/v0.8.2/herdr \
+    target/herdr/v0.9.0/herdr \
     crates/lastcall-testkit/fixtures/herdr/schema/consumed-surface.json
 ```
 
-Generated on **2026-09-05** (Phase 7 deliverable 6 added `pane.send_text`; the pin did not
-move). The generator reported:
+Generated on **2026-09-11** (Phase 9b deliverable 14 moved the pin v0.8.2 -> v0.9.0). The
+generator reported:
 
 ```
-herdr-schema-fixture: herdr 0.8.2, protocol 20, schema_version 1 -> …/consumed-surface.json
-  (51288 bytes, 11 methods, 15 events, 46 defs)
+herdr-schema-fixture: herdr 0.9.0, protocol 22, schema_version 1 -> …/consumed-surface.json
+  (52000 bytes, 11 methods, 15 events, 46 defs)
 ```
+
+The diff against the v0.8.2 projection is **additive only**, and none of the four additions is
+a field lastcall reads: `request/WorktreeListParams.trust_repository`,
+`request/ServerCapabilities.{endpoint_protocol_generation, health_check, surface_interest}`,
+and `protocol` 20 -> 22. Method, event, result and def counts are unchanged (11 / 15 / 11 /
+46), so no consumed type gained, lost or changed a member.
 
 `herdr api schema --json` reads no socket and starts no server, so generating this file touches
 nothing outside the repo.
@@ -38,7 +44,7 @@ unrelated herdr feature a drift alert, and an alert nobody trusts is not a check
 
 | key | contents |
 |---|---|
-| `protocol`, `schema_version` | `20`, `1` — a bump in either is drift by itself |
+| `protocol`, `schema_version` | `22`, `1` — a bump in either is drift by itself |
 | `methods` | the eleven methods we call: params schema, the request variant's `required`, and the `type` const of the result our code deserializes |
 | `results` | those eleven result variants |
 | `events` | the §5.4 lifecycle set (15), keyed by the dotted **subscription** name, each recording the snake_case `event` name herdr pushes and its payload schema |

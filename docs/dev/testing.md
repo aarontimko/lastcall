@@ -13,7 +13,7 @@ child and never falls back to a `herdr` on `PATH`.
 |---|---|---|---|
 | unit | `just test-unit` = `cargo test --workspace --lib --bins` | in-module `#[cfg(test)]` only | everywhere, incl. macOS CI |
 | integration | `just test-integration` = `cargo test --workspace --test 'test_integration_*'` | real git; the four-test real-herdr subset when `LASTCALL_TEST_HERDR_BIN` is set (`just test-integration-herdr` sets it from the pinned release; `just test-integration-herdr-latest` from herdr's newest) | CI via `just test-integration-herdr`; Linux blocking, macOS best-effort; the latest-release run is the weekly `herdr-compat` workflow, never a blocker |
-| e2e | `just test-e2e` = `cargo test --workspace --test 'test_e2e_*'` | the TUI: fifty-two `TestBackend` snapshot scenes and twenty-five PTY scenes against the built binary (`docs/dev/tui.md`) | everywhere; the PTY file skips with a visible reason only where no pseudo-terminal can be opened |
+| e2e | `just test-e2e` = `cargo test --workspace --test 'test_e2e_*'` | the TUI: fifty-two `TestBackend` snapshot scenes and twenty-four PTY scenes (plus one helper unit test in the same file) against the built binary (`docs/dev/tui.md`) | everywhere; the PTY file skips with a visible reason only where no pseudo-terminal can be opened |
 | bench | `just bench` = release build, then `cargo test --release -p lastcall --test test_bench -- --ignored --nocapture --test-threads=1` | the four `#[ignore]`d baseline scenarios (`docs/dev/bench.md`); **not a gate** in Phase 4 — targets are set at the Phase 9 kickoff | by hand, on the machine named in `bench.md` |
 | pre-push | `just test-prepush` = `just test-integration`, then `PROPTEST_CASES=64 cargo test -p lastcall-engine --lib proptests` | the integration tier plus the two store-backed proptests at 64 cases (the unit tier runs them at 8) | the pre-push hook; by hand before a push from a machine without the hook |
 
@@ -41,7 +41,7 @@ the export renderer and the ledger's 1.1 schema; then the TUI half: the two-colu
 restore, the note modal, the picker and the export fallback, whose reducer tests are the last
 13 of the binary lib's count): 255 engine + 34 testkit + 187 binary lib + 6 binary main =
 **482**; then the verifier (b) review-fix pass, which added seven reducer and render tests
-for F1–F5: 255 engine + 34 testkit + 194 binary lib + 6 binary main = **489**; Phase 8 (save under CAS, the `$EDITOR` handover, the inline editor, select-to-copy, the launch hold): 271 engine + 35 testkit + 250 binary lib + 6 binary main = **562**, the Phase 9 floor; Phase 9a (the `status` store fields, every repo listed and `t`, the neighbour rule, the hint line's drop order, the focus-true opening, the launch hold's one vocabulary and scope fold, the editor header, the help overlay's clip row, and the verifier (a) folds): 274 engine + 35 testkit + 267 binary lib + 6 binary main = **582**, the Phase 9b floor).
+for F1–F5: 255 engine + 34 testkit + 194 binary lib + 6 binary main = **489**; Phase 8 (save under CAS, the `$EDITOR` handover, the inline editor, select-to-copy, the launch hold): 271 engine + 35 testkit + 250 binary lib + 6 binary main = **562**, the Phase 9 floor; Phase 9a (the `status` store fields, every repo listed and `t`, the neighbour rule, the hint line's drop order, the focus-true opening, the launch hold's one vocabulary and scope fold, the editor header, the help overlay's clip row, and the verifier (a) folds): 274 engine + 35 testkit + 267 binary lib + 6 binary main = **582**, the Phase 9b floor; Phase 9b so far (herdr v0.9.0's protocol set, the `[update]` config key, the header's update notice, and `commands/update.rs`'s own tests, which land in the binary main count because `commands/` is binary-only): 277 engine + 35 testkit + 268 binary lib + 16 binary main = **596**; the verifier (a) fold and the PTY suite's drag helpers: 277 engine + 37 testkit + 270 binary lib + 19 binary main = **603**; the verifier (b) fold's failed-lookup stamp test: 277 engine + 37 testkit + 270 binary lib + 20 binary main = **604**).
 The suite never shrinks across commits. One recorded exception: at the Phase 2 code review
 the three filesystem-live watcher tests (up to 30 s waits, real FSEvents) left the unit tier
 for `crates/lastcall-engine/tests/test_integration_watcher.rs` because they contradicted the
@@ -210,7 +210,48 @@ the terminal and asserts the cursor on that repo's own name row with `nothing pe
 pane, then `t` hiding the repo and `t` bringing it back; it is the slow one — the bottom row is
 the status line while a status is live, and launch sets one, so the scene waits out
 `app::STATUS_TTL` (30 s) once before it can read the hint line (Phase 9a verifier (a) F8: about
-36 s of the file's time is that wait). No PTY
+36 s of the file's time is that wait). The three scenes for the update check are
+`pty_update_notice_after_hold` (a served `latest.json` naming a newer release: the raw
+transcript proves the notice never precedes the launch hold, the header then carries the
+seven-column `↑ 9.9.9`, a click reads the whole sentence onto the status line, and after a
+clean exit the probe log holds exactly one `releases/latest` URL against `api.github.com`,
+never the test base URL), `pty_update_check_is_throttled_by_the_daily_stamp` (a stamp 1 h old
+renders the notice from disk and spends no request; one 25 h old looks again and moves
+`checked_at` forward), and `pty_update_check_is_off_for_every_other_scene` (the default
+isolation: no notice, no request, no stamp, and `[update]` / `check = false` in the config the
+harness wrote). Every negative assertion in the three is made **after** `wait_exit`, so no
+detached check thread can race it.
+
+**What "complete" means for this tier** (Phase 9b, ruling P10): every action in
+`tui::input::DEFAULT_KEYMAP`, every answer in `MODAL_KEYS`, and every modal is reached by at
+least one scene **through the terminal**. The list is derived by grepping each keymap name
+against the scenes, and it is what the eight Phase 9b scenes close:
+`pty_help_overlay_says_how_to_leave_and_any_key_closes` (`?`; the exact-fit height measured
+off the frame rather than written down, the 80×24 clip naming the width that shows
+everything with all three footer rows intact, a key spent on closing the overlay and not
+also on the selection, and `q` from inside it still leaving lastcall),
+`pty_page_keys_focus_toggle_and_hunk_prev` (`PgUp`/`b`, `PgDn`/`Space`, `Tab`, `p`/`[`: the
+page clamps at either end at 30 rows, and at 14 rows the scene **counts** the `j` presses
+back from where the page landed, so `page_rows` is measured rather than asserted against a
+row number), `pty_full_paths_remote_and_expand` (`f`, `o`, `e`), `pty_refresh_rescans_on_r`
+(`r` with both backstops parked at `--poll 300`), `pty_poll_finds_a_root_the_watcher_cannot_see`
+(a sibling checkout created after startup, which only the `rescan` backstop can find, since
+`Engine::scan_all` re-runs discovery for nested repos alone),
+`pty_accept_all_confirm_n_accepts_nothing` (the confirm modal's `n` and `Esc`: nothing on the
+frame moves and no ledger is written), `pty_nav_divider_drag_widens_the_nav` (press, motion
+with the button held, release, through `PtyTui::press`/`drag_to`/`release`; the nav follows
+the pointer, stops at `NAV_WIDTH_MAX`, and ignores a motion after the release) and
+`pty_herdr_scope_toggle_and_the_agent_picker` (`w` both ways under a `HERDR_WORKSPACE_ID`
+scope, then a flag with two candidate agents opening the picker, and `Esc` dropping the send
+while the flag stays on disk). `M` (`unflag`) is the tail of
+`pty_flag_note_exports_when_standalone`, where the two flags it wrote are cleared together
+and the export file is **not** rewound. That leaves the file at 37 tests: 35 `pty_*` scenes,
+`find_words_needs_one_line_not_a_csi_parameter`, and the ignored `probe_tui_screen` (so 36
+run, one ignored). The one
+key that is deliberately unreachable here is `shift-i`'s real `$EDITOR`, which runs against
+the probe script below; `F6` is closed by design and has no scene.
+
+No PTY
 scene talks to herdr: only `just test-integration-herdr` proves the real pane. The staged
 send is covered in three places, and it takes all three — verifier (b) F1 found that the two
 end tests both passed while the middle was missing, because nothing in the loop built
@@ -223,7 +264,7 @@ client over the mock socket, the loop's own `run::herdr_fold`, `Ui::event` for t
 keystrokes, and `run::spawn_flag` / `run::spawn_stage` for the effects, asserting the
 bracketed-paste `pane.send_text` that lands on the socket. A send test that injects its own
 candidates proves the reducer, never the wiring. The scenes are serialized (one
-mutex); the whole file is about 45 s. Timing lines go to `stderr().write_all` so they survive libtest's
+mutex); the whole file is about 120 s. Timing lines go to `stderr().write_all` so they survive libtest's
 capture — run it with `-- --nocapture` to see them. If the live-update assertion fails on a
 loaded host, report the measured numbers; do not loosen the budget.
 
@@ -256,6 +297,34 @@ that uses it — one `shift-i` on `alpha/src/parse.rs`'s second hunk, asserting 
 `argv:` is `+<line> <absolute path>` and its `cwd:` is the root — and it lives in the
 integration tier because it is the argv proof, not the terminal-handover proof; the PTY
 scenes are the latter.
+
+### The probe curl (`tests/probe/curl.sh`)
+
+`lastcall update` and the TUI's daily check reach the network by spawning `curl`
+(`commands/update.rs`, rule 1: no HTTP crate). **No test may reach the network.** Two
+independent guards stop it. First, `isolated_lastcall` writes `[update]` with `check = false`
+into every isolated config, so a scene that never thought about releases starts no check at
+all; `.update_check(true)` is the opt-in the three update scenes use. Second, it prepends a
+probe directory to the child's `PATH` whose `curl` is a symlink to
+`crates/lastcall/tests/probe/curl.sh`, so even a bug that started a check unasked would reach
+the script and not the internet. (`PATH` is prepended only for the child, and only here; the
+editor scenes still never touch it.)
+
+The script serves the directory named by `LASTCALL_TEST_RELEASE_DIR` and **exits 99 if that
+variable is unset**, which is what makes an accidental request loud instead of silent. It maps
+a request path to a file: `*/releases/latest` to `latest.json`, `*/releases?per_page=*` to
+`list.json`, and `*/download/<tag>/<asset>` to `<asset>`. A `<name>.status` file beside it
+sets the HTTP status (the rate-limit scene), a `<name>.headers` file the response headers
+(`-D -`). It honours `-o <dest>`, appends the three status digits to stdout the way
+`-w '%{http_code}'` does, and logs `url: <url>` to `LASTCALL_PROBE_CURL_LOG`, which is how a
+scene proves how many requests were spent and against which host.
+
+The integration tier uses the same script directly
+(`crates/lastcall/tests/test_integration_update.rs`, eight scenes: the verified replacement, a
+checksum mismatch that leaves the binary alone, `--check`, the prerelease that is not offered,
+the package-manager refusal, the rate limit and its reset time, the loopback-only
+`LASTCALL_UPDATE_BASE_URL`, and the unset-directory failure). Those scenes copy the built
+binary into a temp dir first: nothing ever renames over the binary the test runner is using.
 
 ### The slow git (`scripts/slowgit/git`)
 
@@ -356,12 +425,42 @@ test cannot do its job — no socket, a protocol the guard refuses, a spawn that
 up — is a failure, because a subset that quietly turns into no subset is worse than no
 subset at all.
 
+**The spawned herdr stays off the network**, which takes saying because two of its own
+defaults are on: `version_check` and `manifest_check` both default to true, and a server
+started with them asks `herdr.dev` for the latest version and for the agent-detection
+catalogue in the background, twice per spawn. `HERDR_TEST_CONFIG` writes both as `false`
+under `[update]`, which is where herdr keeps them (written flat at the top level they are
+unknown keys and herdr ignores them without a word), beside `onboarding = false`, and the
+spawn environment points
+`HERDR_AGENT_DETECTION_MANIFEST_CATALOG_URL` at a closed loopback port as well, so a build
+that ever ignored the config line fails to connect rather than leaving the machine. To check
+it, put a logging shim named `curl` first on `PATH` and run the subset: the log stays empty.
+
 | test | what it proves |
 |---|---|
 | `herdr_real_ping_bootstrap_events_and_done_derivation` | the ping, the guard, the bootstrap snapshot, live events, and §5.7's `done` derivation from a real server |
 | `herdr_real_done_flip_heals_within_fallback` (G3) | the silent `done → idle` flip on focus, which herdr announces with **no** event, is healed by the periodic fallback resync |
 | `herdr_real_disconnect_reconnect_converges` (G6) | the cache converges after the server is really stopped and started again |
 | `herdr_real_schema_consumed_surface_unchanged` | the API surface we consume is byte-identical to the pinned fixture |
+
+**The pin is `herdr_version := "v0.9.0"`** (`justfile`), whose asset answers `ping` with
+**protocol 22**. The guard accepts `[20, 21, 22]`: 20 is what the v0.8.2 asset answers, 21 is
+the protocol §5 was hand-checked against (herdr master `5158ada`), 22 is the pin. When the pin
+moves, the three behavioural tests are re-run by hand against the **previous** asset as well,
+so the widened guard is proven on both wires rather than asserted:
+
+```sh
+LASTCALL_TEST_HERDR_BIN=target/herdr/v0.8.2/herdr \
+  cargo test -p lastcall-engine --test test_integration_herdr_real -- --test-threads=1
+```
+
+`herdr_real_schema_consumed_surface_unchanged` is **not** part of that second run and cannot
+be: it compares the binary under test against the fixture generated from the *pinned* asset,
+so any other asset is a diff by construction. That is the point of the test, and its printed
+diff is the evidence — at the v0.8.2 -> v0.9.0 move it listed exactly the four additive fields
+in both directions (`WorktreeListParams.trust_repository`,
+`ServerCapabilities.{endpoint_protocol_generation, health_check, surface_interest}`) plus the
+protocol number, and nothing lastcall reads.
 
 **G3 is the one that is easy to make vacuous**, and two things keep it honest. The client is
 wrapped in a `FilteringTransport<T: Transport>` that drops the events the flip might
@@ -375,7 +474,10 @@ within `fallback + 1 s` (3 s + 1 s in this test; the interval timer is mid-perio
 tab is focused, so a run heals in about 2 s) and came through a full `Resync(Snapshot)`, that
 no reconnect happened, and that herdr forwarded **nothing** in between: if it ever does, the
 filter list is incomplete or herdr found another way to announce the flip, and the assertion
-message says to report it rather than to widen the filter.
+message says to report it rather than to widen the filter. A third guard asserts the filter
+forwarded *something* overall, so a pipe that swallowed every line could not pass as a clean
+run; the scene creates one extra tab after connecting to satisfy it, because until v0.9.0 it
+was satisfied by herdr's lifecycle replay burst on connect and that burst is now fixed.
 
 G6 stops the server through `SpawnedHerdr::stop_server` (`herdr server stop` over the
 isolated socket, never a signal and never the user's herdr), waits for the process to go, and
@@ -424,6 +526,37 @@ To adopt a new herdr: bump `herdr_version` in the `justfile`, run `just herdr-sc
 read the fixture diff and update `consumed-surface.json.provenance.md`, then
 `just test-integration-herdr`.
 
+## Not a tier: the install smoke (`just install-smoke`)
+
+`scripts/install-smoke.sh` is the proxy for the one thing no tier can cover: a machine that
+has never seen this project installing a published binary. Every tier runs against the built
+tree with the toolchain already on the box, so nothing else would notice an asset that was
+never uploaded, a `SHA256SUMS` whose names do not match the assets, a binary that needs a
+glibc the target does not have, or an update path that works only where it was compiled.
+
+Each leg starts an empty `ubuntu:24.04` container, installs `curl` and `ca-certificates`,
+downloads the asset and `SHA256SUMS`, verifies the checksum, runs `--version`, then serves a
+newer release from `python3 -m http.server` **inside** the container (the update path's test
+base URL is loopback-only, which is why the server has to be in there) and drives
+`lastcall update --check` and `lastcall update` against it. The layout it serves is the one
+`commands/update.rs` asks for: `repos/<owner>/<repo>/releases/latest` for the API answer and
+`<owner>/<repo>/releases/download/<tag>/<asset>` for the bytes, the same shape as the probe
+`curl` above. The updated binary's digest is compared with the served asset's, so the run
+proves the replacement really is what was downloaded and verified.
+
+Both `linux/amd64` and `linux/arm64` run by default, the first under emulation on an
+Apple-silicon host: without it, x86_64 Linux would ship untested. `--from-dir <dir>` takes
+the assets from disk instead of the network, which is how the pipeline is exercised before
+any release exists. With no second release named, the smoke serves the installed binary back
+under the next patch version, so the update path is still driven end to end; naming a second
+real release additionally proves `--version` changes. The version it serves back is
+`next_version`'s: the next patch for a release, and for a release candidate the release it is
+a candidate for, since `0.1.0-rc.1` sorts below `0.1.0`. That is the one piece of arithmetic
+in the script that could be wrong quietly, so `scripts/install-smoke.sh --self-test` checks it
+against a table of cases and exits, with no Docker and nothing downloaded. No Docker, or no
+daemon: the recipe says so and exits 2. It is a recipe, never a test: nothing in any tier
+reaches the network.
+
 ## Not a gate: `test_perf_scan`
 
 `crates/lastcall-engine/tests/test_perf_scan.rs` is `#[ignore]`d evidence, not a tier: 2,000
@@ -467,8 +600,11 @@ already running`. The base is created with `create_dir`, so any future collision
 error rather than a shared socket, and the drain thread keeps the last 8 KiB the server wrote
 so a start that fails quotes herdr's own words. Inside that base: private
 `XDG_CONFIG_HOME`, `XDG_RUNTIME_DIR`, `HOME`, `XDG_STATE_HOME`, `XDG_DATA_HOME`,
-`XDG_CACHE_HOME`, an explicit `HERDR_SOCKET_PATH`, `SHELL=/bin/sh`, `onboarding = false`
-written before spawning, and every inherited `HERDR_*` removed. Socket readiness is polled (`exists && connect`) every 25 ms
+`XDG_CACHE_HOME`, an explicit `HERDR_SOCKET_PATH`, `SHELL=/bin/sh`, `HERDR_TEST_CONFIG`
+written before spawning (`onboarding = false`, then `version_check = false` and
+`manifest_check = false` under `[update]`),
+`HERDR_AGENT_DETECTION_MANIFEST_CATALOG_URL` pointed at a closed loopback port, and every
+inherited `HERDR_*` removed. Socket readiness is polled (`exists && connect`) every 25 ms
 up to 5 s. Kill-on-drop and kill-on-panic through a PID registry with a matcher
 (`ps -o comm= -p`) that refuses to kill anything it did not spawn. Safe wrappers only
 (`unsafe_code = "forbid"`, no `libc`).

@@ -10,7 +10,7 @@ export PATH := (if path_exists("/opt/homebrew/opt/rustup/bin") == "true" { "/opt
 
 # The pinned herdr release used by the real-herdr integration tests (docs/spec/00-spec.md §4.4).
 # The only sanctioned network fetch in the repo besides cargo's registry and rustup.
-herdr_version := "v0.8.2"
+herdr_version := "v0.9.0"
 herdr_bin := "target/herdr" / herdr_version / "herdr"
 
 # Run any cargo command with the pinned toolchain on PATH: `just cargo add serde`
@@ -411,3 +411,19 @@ bench:
     cargo build --release -p lastcall
     cargo test --release -p lastcall --test test_bench -- --ignored --nocapture --test-threads=1
     echo "--- bench done: paste the BENCH lines above into docs/dev/bench.md with the machine block, date and commit ---" >&2
+
+# cargo-deny against deny.toml: advisories, licences, bans (install: cargo install cargo-deny).
+audit:
+    cargo deny check advisories licenses bans
+
+# The fresh-container install smoke: `ubuntu:24.04` with nothing on it installs a published
+# asset, verifies its checksum, runs it, and takes an update from a release served inside the
+# container (scripts/install-smoke.sh has the detail). Both platforms by default, because
+# without the amd64 leg on an Apple-silicon host x86_64 Linux would ship untested. Exits 2
+# when Docker is not there or not running.
+#   just install-smoke                      # the latest release, updating to the next patch
+#   just install-smoke v0.1.0 v0.1.1        # two real releases
+#   just install-smoke --from-dir ./dist    # a rehearsal's artifacts, no release needed
+#   just install-smoke --self-test          # next_version's cases only: no docker, no network
+install-smoke *ARGS:
+    scripts/install-smoke.sh {{ARGS}}

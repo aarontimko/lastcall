@@ -26,6 +26,7 @@ pub mod config;
 pub mod hello_herdr;
 pub mod status;
 pub mod tui;
+pub mod update;
 pub mod watch;
 
 /// The `--poll <secs>` backstop shared by `watch` and `tui`: `None` keeps the engine's

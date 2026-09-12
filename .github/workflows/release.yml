@@ -1,0 +1,226 @@
+# The release pipeline: a `v*` tag builds the four assets, checksums and attests them, and
+# publishes the GitHub release whose notes are that version's CHANGELOG section
+# (docs/spec/99-phase9b-release-kickoff.md, deliverable 3; docs/spec/00-spec.md §4.5).
+#
+# Every action is pinned by commit SHA, because this workflow is the one that signs and
+# publishes bytes other people run. `ci.yml` and `herdr-compat.yml` keep their tag refs for
+# now. A moving tag would let an action's owner change what a release is built from.
+#
+# Rehearse it without a tag:
+#   gh workflow run release.yml --ref <branch>
+# which builds the assets and uploads them as workflow artifacts, creating no release. While
+# the repository is private the rehearsal builds **only** x86_64 Linux: the `ubuntu-22.04-arm`
+# runner label is not available to a private repository, and macOS minutes bill at 10x. The
+# arm64 and macOS legs are first proven by the first release candidate tag.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build the assets and upload them as workflow artifacts, without creating a release. A dispatch has no tag, so this is the only thing it can do."
+        type: boolean
+        default: true
+      targets:
+        description: "Which build legs to run. Keep linux-x86_64 while the repository is private."
+        type: choice
+        default: linux-x86_64
+        options:
+          - linux-x86_64
+          - all
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Which legs to build, and the version the asset names carry. That version is always the
+  # crate's own, read out of `[workspace.package]`: a tag release and a rehearsal then name
+  # their assets identically, and `verify` below refuses any tag that is not `v<that version>`,
+  # so the asset name and the binary's `--version` can never drift apart. A release candidate
+  # carries its own crate version (`0.1.0-rc.1`), which is what keeps `v0.1.0-rc.1` and
+  # `v0.1.0` from colliding inside SHA256SUMS.
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      version: ${{ steps.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: A dispatch can only be a rehearsal
+        if: github.event_name == 'workflow_dispatch' && inputs.dry_run == false
+        run: |
+          echo "::error::there is no tag to release; push a v* tag instead"
+          exit 1
+      - id: plan
+        run: |
+          set -euo pipefail
+          # The crate takes its version from [workspace.package], so read it there. The dots
+          # in the section name are escaped: unescaped they are "any character", and a
+          # `[workspace_package]` section would match.
+          version="$(awk '/^\[workspace\.package\]/ { p = 1; next }
+                          p && /^\[/ { exit }
+                          p && /^version = / { gsub(/["[:space:]]/, "", $3); print $3; exit }' Cargo.toml)"
+          if [ -z "$version" ]; then echo "::error::no [workspace.package] version"; exit 1; fi
+          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+            legs=all
+          else
+            legs="${{ inputs.targets }}"
+          fi
+          linux='{"target":"x86_64-unknown-linux-gnu","os":"ubuntu-22.04"}'
+          rest='{"target":"aarch64-unknown-linux-gnu","os":"ubuntu-22.04-arm"},{"target":"aarch64-apple-darwin","os":"macos-latest"},{"target":"x86_64-apple-darwin","os":"macos-latest"}'
+          if [ "$legs" = "all" ]; then
+            echo "matrix={\"include\":[$linux,$rest]}" >> "$GITHUB_OUTPUT"
+          else
+            echo "matrix={\"include\":[$linux]}" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "building $legs as version $version"
+
+  # Tag pushes only: the tag must be exactly this crate's version, `v<version>` and nothing
+  # else. A release candidate is a crate version too (`0.1.0-rc.1`), so it needs its own
+  # version-bump commit and then matches this rule like any other release. The looser
+  # `v<version>-rc.*` form is gone on purpose: it accepted `v0.1.0-rc.`, `v0.1.0-rc.x` and
+  # `v0.1.0-rc.1-rc.2`, and, worse, it let an rc tag ship a binary whose `--version` said
+  # `0.1.0`, which no `lastcall update` would ever consider out of date.
+  verify:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Read the toolchain pin
+        id: pin
+        run: echo "channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master, 2026-09-03
+        with:
+          toolchain: ${{ steps.pin.outputs.channel }}
+      - name: The tag is exactly v<crate version>
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "lastcall") | .version')"
+          tag="${GITHUB_REF_NAME}"
+          if [ "$tag" != "v$version" ]; then
+            echo "::error::tag $tag is not v$version; bump [workspace.package].version first"
+            exit 1
+          fi
+          echo "$tag is the release of $version"
+
+  # Once, on the cheapest runner: CI already gated the merge, and macOS minutes bill at 10x.
+  checks:
+    needs: [verify]
+    if: ${{ !failure() && !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Read the toolchain pin
+        id: pin
+        run: echo "channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master, 2026-09-03
+        with:
+          toolchain: ${{ steps.pin.outputs.channel }}
+          components: clippy, rustfmt
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+      - run: just lint
+      - run: just test-unit
+
+  build:
+    needs: [plan, verify, checks]
+    if: ${{ !failure() && !cancelled() }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Read the toolchain pin
+        id: pin
+        run: echo "channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      # `targets:` matters: rust-toolchain.toml lists none, and x86_64-apple-darwin is not
+      # installed by default on an arm64 macOS runner (`can't find crate for std`).
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master, 2026-09-03
+        with:
+          toolchain: ${{ steps.pin.outputs.channel }}
+          targets: ${{ matrix.target }}
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+      - name: Build the release binary
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin lastcall
+      - name: Name the asset
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/lastcall" \
+             "dist/lastcall-${{ needs.plan.outputs.version }}-${{ matrix.target }}"
+          ls -l dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: lastcall-${{ needs.plan.outputs.version }}-${{ matrix.target }}
+          path: dist/lastcall-${{ needs.plan.outputs.version }}-${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: [plan, build]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksum every asset
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum lastcall-* > SHA256SUMS
+          cat SHA256SUMS
+      # Provenance: `gh attestation verify lastcall-<version>-<target> -R <owner>/lastcall`
+      # then proves which workflow, commit and runner produced the bytes.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-path: |
+            dist/lastcall-*
+            dist/SHA256SUMS
+      - name: The release notes are this version's CHANGELOG section
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          # A release candidate has no section of its own: it ships the notes of the version
+          # it is a candidate for.
+          #
+          # The heading is matched literally, never as a regex: `want` is a version string
+          # full of dots, and `$0 ~ "^## " want` would read each one as "any character", so
+          # `## 0x1x0` would answer for `0.1.0`. `index` and `substr` compare bytes.
+          for want in "$version" "${version%%-*}"; do
+            awk -v want="$want" '
+              index($0, "## " want) == 1 &&
+                (length($0) == length(want) + 3 || substr($0, length(want) + 4, 1) == " ") {
+                inside = 1; next
+              }
+              inside && index($0, "## ") == 1 { exit }
+              inside { print }
+            ' CHANGELOG.md > body.md
+            if [ -s body.md ]; then break; fi
+          done
+          if [ ! -s body.md ]; then
+            echo "::error::CHANGELOG.md has no section for $version"
+            exit 1
+          fi
+          cat body.md
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: |
+            dist/lastcall-*
+            dist/SHA256SUMS
+          body_path: body.md
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true

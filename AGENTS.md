@@ -14,7 +14,7 @@ just build                  # cargo build --workspace --all-targets
 just lint                   # fmt --check, clippy -D warnings, engine without the herdr feature
 just test-unit              # THE canonical suite: cargo test --workspace --lib --bins
 just test-integration       # real git; real herdr only when LASTCALL_TEST_HERDR_BIN is set
-just test-integration-herdr # just herdr-fetch (pinned v0.8.2) then the integration tier
+just test-integration-herdr # just herdr-fetch (pinned v0.9.0) then the integration tier
 just test-e2e               # the TUI: TestBackend snapshots + PTY scenes on the built binary
 just test                   # the three tiers in order
 just test-scenarios         # the docs/spec/01-scenarios.md suites (real git, temp fixtures)
@@ -26,6 +26,7 @@ just bench                  # the performance baseline on the release build (doc
 just snapshots-update       # rewrite the TUI snapshots, then prove they pass; read every diff
 just test-prepush           # what the pre-push hook runs: integration tier + 64-case proptests
 just hooks-install          # pre-commit = just lint && just test-unit; pre-push = just test-prepush
+just install-smoke          # docs/install.md's steps, executed in a container (Docker; exits 2 without it)
 ```
 
 Probes against the built binary: `just probe-config`, `just probe-hello`, `just probe-status`,
@@ -84,6 +85,35 @@ before touching `crates/lastcall/src/tui/` or either e2e test.
 
 Tiers, file naming, how skips are reported, and the isolation rules — including the sacred
 one: tests never touch the real herdr config or socket.
+
+### The user documentation: `docs/install.md`, `docs/config.md`, `docs/review-loop.md`, `docs/herdr.md`
+
+The public surface the README links to: installing, updating and uninstalling
+(`install.md`); every config key, `[keys]` action, `[herdr]` and `[update]` key and
+`LASTCALL_*` variable with its default (`config.md`); the launch-to-copy walkthrough with
+one screen per step from the `just probe-tui` fixture (`review-loop.md`); what the overlay
+adds, session discovery and the agent picker (`herdr.md`). Read the relevant page before
+changing anything a user can see, and update it in the same commit. **House style for all
+four, plus the README and `CHANGELOG.md`:** no em-dashes (commas, colons or a new sentence),
+no email addresses, no home paths, and none of the program's own process vocabulary — that
+stays in `docs/spec` and `docs/dev`.
+
+### The install smoke check: `just install-smoke`
+
+`docs/install.md`'s own steps, executed rather than trusted: `scripts/install-smoke.sh`
+downloads the release asset, checks it against `SHA256SUMS` and runs a real `lastcall
+update` inside a fresh container, on both Linux architectures by default so x86_64 never
+ships untested. It takes two real release tags, or `--from-dir ./dist` for a rehearsal's
+artifacts with no release needed. `--self-test` runs the version-arithmetic cases only, with
+no Docker and no network; without Docker the recipe exits 2.
+
+### Going public: `docs/dev/publishing.md`
+
+The maintainer's one-day checklist for flipping the repository public: the settings and
+branch protection to set (with the `gh` command for each), the labels the issue forms
+need, putting `pull_request:` back into `ci.yml` and `scans.yml`, and the disclosure grep
+that must return zero hits over both the tree and the history. Read it only when doing
+that; nothing in it is needed to build or test.
 
 ### The performance baseline: `docs/dev/bench.md`
 

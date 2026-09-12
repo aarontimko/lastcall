@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 lastcall-engine.workspace = true
 clap.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 tokio.workspace = true
@@ -22,6 +23,9 @@ tracing-subscriber.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
 unicode-width = "0.2"
+# `lastcall update` verifies a release asset's SHA-256 before it renames it over the running
+# binary (kickoff deliverable 2.3). Already in the tree: the engine hashes root paths with it.
+sha2 = "0.11.0"
 
 [dev-dependencies]
 insta = "1.48"

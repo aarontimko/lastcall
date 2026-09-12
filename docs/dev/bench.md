@@ -68,6 +68,26 @@ first root's pile (`1 repo · 40 files`) and to the header showing every root
 > done by then", not "the first root was listed then". `first_frame_ms` keeps its meaning
 > (every root in the header) and is the number to compare across runs. Runs A–F below were
 > measured under the old meaning.
+>
+> **Renamed `first_checked_ms` in the harness, forward only (2026-09-11, Phase 9b
+> deliverable 10, ruling P7).** The name now says what the number has measured since
+> `9d2fd4a`: the first root was *checked* by then. The rename is forward only — runs A–F's
+> tables and raw `BENCH` lines below keep the name they were printed under, because
+> rewriting them would claim measurements that were never taken. Run G and every run after
+> it print `first_checked_ms`. The gate targets for it live in the Phase 9b kickoff's perf
+> table, not on this page.
+>
+> **The "floors at ~1,000 ms" sentence above was a prediction, and run G disproved it.**
+> Nothing had run the counter-only wait under a bench between `9d2fd4a` and run G: run F was
+> taken the day before that commit, under the old meaning. Run G's first attempt timed out
+> in S1 and S1h with the complete listing on screen. The TUI is spawned after the scenario
+> has already opened and scanned the same roots in process, so its own scan runs warm, and on
+> a quiet machine it finishes **before** the hold's one-second counter is ever drawn: the
+> line the harness was waiting for does not exist on a fast run. The wait now takes either
+> form — the counter line, or the hold already over with every root in the header, which is
+> the same fact stated more strongly. So `first_checked_ms` floors at ~1,000 ms only on a run
+> slow enough to show the counter; on a quiet warm run it equals `first_frame_ms`, and both
+> readings mean "the first root was checked by then".
 
 | metric | value |
 |---|---|
@@ -171,6 +191,14 @@ same commit) reproduced every count bit-identically and every headline number wi
 those bounds: S1 `open_ms` 32368 / `scan_all_ms` 25177 / `first_frame_ms` 55584; S2
 `scan_ms` 268; S3 `settle_ms` 1575; S4 `scan_ms` 1662, `settle_ms` 5444, `rows_shown`
 10000, `omitted` 40000.
+
+**Run G's spread (2026-09-11, the quiet-machine two-run below).** Two back-to-back runs on
+an idle machine: every count bit-identical; every wall metric over 100 ms within ±5.4 % run
+to run except **S1h `scan_all_ms`, 3728 vs 3143 (−15.7 %)**, which is wider than anything
+A/B saw and is the one number on this page that should not be read to ±2 %; the sub-20 ms
+screen metrics moved by one 10 ms tick as ever; `peak_rss_kb` held to ±1 % on S1/S1h and
+±9 % on S3/S4 but moved **32.8 % on S2** (45728 vs 60704), so its ±15 % band is a claim
+about the other scenarios, not about S2.
 
 Run B's raw lines:
 
@@ -664,6 +692,184 @@ BENCH S4 rows_shown=10000
 BENCH S4 omitted=40000
 ```
 
+## Phase 9b (run G): the quiet-machine two-run
+
+`docs/spec/99-phase9b-release-kickoff.md` deliverable 10, ruling P7. Runs E and F were each a
+single run on a workstation that was building and testing the phase at the same time, and
+both said the same thing about themselves: two runs on a quiet machine are still owed. This
+is that pair. Nothing else ran on the machine during either run, and the two ran back to
+back.
+
+Machine block: unchanged from above except the date (**2026-09-11**) and the commit (this
+branch at `df88495`, plus this commit's harness fix). Command: `just bench`, all five
+scenarios, `--test-threads=1`, twice. `5 passed; 0 failed` both times, **102.31 s** and
+**102.85 s** of measured time, against ~120 s for the busy-machine runs E and F.
+
+### The harness needed a fix before the run could finish
+
+Run G's first attempt failed in S1 and S1h, both on the same wait, with the complete listing
+already on screen. `first_checked_ms` waits for the launch hold's counter line (`K of 100
+repos checked`), which the pane draws from one second into the hold. The wait was written
+with the hold at `9d2fd4a` on 2026-09-07 and no bench had run it since: run F was taken on
+2026-09-06, under the metric's old meaning. On a quiet machine there is nothing to wait for.
+The scenario opens and scans all 100 roots in process before it spawns the TUI, so the TUI's
+own scan runs warm and the hold ends **before** its counter is ever drawn.
+
+The wait now takes either form: the counter line, or the hold already over with every root in
+the header. The second is the stronger statement of the same fact (every root checked means
+the first one was), so the metric's meaning is unchanged and the harness no longer depends on
+the run being slow. It shows in the numbers below as `first_checked_ms` **equal to**
+`first_frame_ms` in both runs, to the millisecond: one frame satisfied both waits.
+
+### The counts did not move
+
+| scenario | metric | run D | run F | run G ×2 |
+|---|---|---|---|---|
+| S1 | `open_spawns` | 1102 | 1102 | **1102 / 1102** |
+| S1 | `scan_all_spawns` | 1600 | 1600 | **1600 / 1600** |
+| S1 | `rows` / `roots` | 4000 / 100 | 4000 / 100 | **4000 / 100** (both) |
+| S1h | `open_spawns` / `scan_all_spawns` | 552 / 800 | 552 / 800 | **552 / 800** (both) |
+| S2 | `scan_spawns` / `hunks` | 16 / 2 | 16 / 2 | **16 / 2** (both) |
+| S3 | `files` | 1000 | 1000 | **1000** (both) |
+| S4 | `scan_spawns` | 15 | 15 | **15** (both) |
+| S4 | `rows_shown` / `omitted` | 10000 / 40000 | 10000 / 40000 | **10000 / 40000** (both) |
+
+Bit-identical to runs D, E and F, and to each other. Phase 9a and 9b are a TUI phase and a
+release phase: nothing they added is on a scan path, and the counts are the evidence.
+
+### Wall times
+
+Read against **run D**, the last run on a comparably unloaded machine and the reference runs
+E and F used. `Δ` is run G's two-run mean against run D.
+
+| scenario | metric | run D | run F | **run G #1** | **run G #2** | Δ vs D |
+|---|---|---|---|---|---|---|
+| S1 | `open_ms` | 3682 | 4724 | **3704** | **3641** | −0.3 % |
+| S1 | `scan_all_ms` | 3853 | 4402 | **4085** | **4018** | +5.2 % |
+| S1 | `first_checked_ms` | 4370 (old meaning) | 5173 (old meaning) | **7339** | **7308** | n/a |
+| S1 | `first_frame_ms` | 7533 | 9150 | **7339** | **7308** | −2.8 % |
+| S1h | `open_ms` | 2093 | 2335 | **1881** | **1903** | −9.6 % |
+| S1h | `scan_all_ms` | 2999 | 3384 | **3728** | **3143** | +14.6 % |
+| S1h | `first_frame_ms` | 3994 | 4877 | **3930** | **4064** | +0.1 % |
+| S2 | `scan_ms` | 206 | 262 | **211** | **209** | +1.9 % |
+| S3 | `settle_ms` | 1539 | 1546 | **1522** | **1508** | −1.6 % |
+| S3_events | `settle_ms` | 1528 | 1567 | **1513** | **1543** | ±0.0 % |
+| S4 | `capped_count_ms` | 3485 | 4106 | **3690** | **3795** | +7.4 % |
+| S4 | `scan_ms` | 1540 | 1746 | **1583** | **1664** | +5.4 % |
+| S4 | `settle_ms` | 5123 | 5930 | **5314** | **5461** | +5.2 % |
+
+**Run G re-establishes the wall-time baseline, and it lands on run D.** Every row that runs
+E and F reported as up by 10–28 % is back: S1 `first_frame_ms` 9150 → 7323 (mean), S2
+`scan_ms` 262 → 210, S4 `settle_ms` 5930 → 5388. That is the conclusion runs E and F both
+predicted and neither could prove — the drift was the machine, not the code.
+
+Two rows are worth naming rather than averaging away. **S1h `scan_all_ms`** is +14.6 % on the
+mean, but the two quiet runs are themselves 15.7 % apart (3728 vs 3143), so the mean is the
+weakest number in the table and the honest reading is "S1h's scan is noisy at ±16 %, and
+3143 is inside run D's neighbourhood". Nothing else in S1h moved: its `first_frame_ms` is
++0.1 % and its spawn counts are identical. **`first_checked_ms` has no Δ** because runs D and
+F printed it under the old meaning (the first root *listed*, before the launch hold existed);
+comparing 4370 with 7339 would be comparing two different measurements, and the note under S1
+says so.
+
+`peak_rss_kb`: S1 19472 / 19408 and S1h 19552 / 19744 are the lowest this page has recorded
+(run D: 21728 / 21280). S3 and S4 move ±9 % between the two runs. S2 moves 45728 → 60704,
+32.8 % — the peak is sampled on a timer by the harness's RSS poller, and the scenario it
+samples reads a 1.1 MB file and diffs 100,000 lines in one burst, so which tick catches the
+burst decides the number. Read S2's RSS as "tens of megabytes", not as a figure.
+
+### The raw `BENCH` lines
+
+Run G #1:
+
+```text
+BENCH S1 open_ms=3704
+BENCH S1 open_spawns=1102
+BENCH S1 roots=100
+BENCH S1 rows=4000
+BENCH S1 scan_all_ms=4085
+BENCH S1 scan_all_spawns=1600
+BENCH S1 first_checked_ms=7339
+BENCH S1 first_frame_ms=7339
+BENCH S1 peak_rss_kb=19472
+BENCH S1h open_ms=1881
+BENCH S1h open_spawns=552
+BENCH S1h roots=50
+BENCH S1h rows=4000
+BENCH S1h scan_all_ms=3728
+BENCH S1h scan_all_spawns=800
+BENCH S1h first_checked_ms=3930
+BENCH S1h first_frame_ms=3930
+BENCH S1h peak_rss_kb=19552
+BENCH S2 file_bytes=1100001
+BENCH S2 hunks=2
+BENCH S2 scan_ms=211
+BENCH S2 scan_spawns=16
+BENCH S2 open_ms=15
+BENCH S2 hunk_next_ms=15
+BENCH S2 page_down_ms=15
+BENCH S2 peak_rss_kb=45728
+BENCH S2_default_config open_ms=11
+BENCH S3 files=1000
+BENCH S3 settle_ms=1522
+BENCH S3 peak_rss_kb=10096
+BENCH S3_events files=1000
+BENCH S3_events settle_ms=1513
+BENCH S3_events peak_rss_kb=9456
+BENCH S4 capped_count_ms=3690
+BENCH S4 settle_ms=5314
+BENCH S4 peak_rss_kb=78480
+BENCH S4 scan_ms=1583
+BENCH S4 scan_spawns=15
+BENCH S4 rows_shown=10000
+BENCH S4 omitted=40000
+```
+
+Run G #2:
+
+```text
+BENCH S1 open_ms=3641
+BENCH S1 open_spawns=1102
+BENCH S1 roots=100
+BENCH S1 rows=4000
+BENCH S1 scan_all_ms=4018
+BENCH S1 scan_all_spawns=1600
+BENCH S1 first_checked_ms=7308
+BENCH S1 first_frame_ms=7308
+BENCH S1 peak_rss_kb=19408
+BENCH S1h open_ms=1903
+BENCH S1h open_spawns=552
+BENCH S1h roots=50
+BENCH S1h rows=4000
+BENCH S1h scan_all_ms=3143
+BENCH S1h scan_all_spawns=800
+BENCH S1h first_checked_ms=4064
+BENCH S1h first_frame_ms=4064
+BENCH S1h peak_rss_kb=19744
+BENCH S2 file_bytes=1100001
+BENCH S2 hunks=2
+BENCH S2 scan_ms=209
+BENCH S2 scan_spawns=16
+BENCH S2 open_ms=15
+BENCH S2 hunk_next_ms=10
+BENCH S2 page_down_ms=13
+BENCH S2 peak_rss_kb=60704
+BENCH S2_default_config open_ms=10
+BENCH S3 files=1000
+BENCH S3 settle_ms=1508
+BENCH S3 peak_rss_kb=11024
+BENCH S3_events files=1000
+BENCH S3_events settle_ms=1543
+BENCH S3_events peak_rss_kb=9472
+BENCH S4 capped_count_ms=3795
+BENCH S4 settle_ms=5461
+BENCH S4 peak_rss_kb=85296
+BENCH S4 scan_ms=1664
+BENCH S4 scan_spawns=15
+BENCH S4 rows_shown=10000
+BENCH S4 omitted=40000
+```
+
 ## Known costs
 
 Not scan costs and not scenarios: things a user can *wait* for that no `BENCH` line
@@ -700,6 +906,21 @@ round trip, no timeout — at the price of missing iTerm2 and tmux `extended-key
 report the protocol but do not say so in `TERM`. Two-way door; the measurement the sponsor
 takes at the gate is what decides it. **Not measured here**, because the bench harness answers
 no queries and would only ever report the worst case.
+
+### Editing, saving and copying — not measured
+
+The Phase 9 editor, the `$EDITOR` round trip and the OSC 52 copy get a row here rather than
+a scenario (Phase 9b deliverable 10, ruling P7). They are **not measured**, deliberately:
+each one is a human-paced operation over a single file, costing a handful of syscalls and at
+most one `git` spawn, so a `BENCH` line would report the harness's own pty latency rather
+than anything a user waits for. What each one actually does is short enough to write down.
+
+| | |
+|---|---|
+| an inline save (`i`, then `^S`) | **one `hash-object` and one rename.** `ops::save_file` hashes the buffer once (`hash-object -w --path=<rel> --stdin`, one `git` spawn) *before* touching the working tree, then `restore::write_bytes` writes a temp file beside the target, `fsync`s it, `fchmod`s it and `renameat`s it into place. The ledger is written the same way afterwards (tmp, `fsync`, rename), so a save is one spawn and two renames, over one file |
+| the `$EDITOR` round trip (`I`) | lastcall is suspended for the whole of it: `term::leave()`, the editor's own `status()`, `term::enter()` on return. The keyboard-enhancement answer is a `OnceLock`, so the re-entry re-pushes the flags without re-asking and pays none of the 2 s above (F8, F18). The cost is the editor's, and the confirm on return is one comparison of the bytes |
+| a copy (`v`, then `y`) | **one OSC 52 write**, through the same `execute!` path as every other escape sequence the loop writes: `ESC ] 52 ; c ; <base64> BEL`, encoded in-process by `tui::clipboard::base64`. There is no reply to wait for, so there is nothing to time; a selection over `clipboard::CAP` (32 KiB raw, ≈ 43 KiB encoded) is **refused** rather than truncated |
+| where it could still get slow | hashing a very large buffer (the one spawn takes the whole file through stdin) and a terminal that is slow to swallow a 43 KiB OSC 52 payload. Neither has been measured, and neither is a scan cost |
 
 ## What the first run found
 
