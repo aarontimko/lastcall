@@ -5,6 +5,13 @@ flips from private to public. Each line is one action with the `gh` command that
 the Settings path when there is no command. Run them from a shell authenticated as the
 repository owner (`gh auth status`).
 
+**Done 2026-09-12.** The flip, steps 2 to 5 and the two tags (`v0.1.0-rc.1`, `v0.1.0`) all
+happened that day; the record is the 2026-09-12 entry in `docs/spec/00-spec.md` §10. Two
+things differed from the text below. The maintainer's install transcript came from his own
+Mac in a fresh directory, with the container smoke standing in for the machine with nothing
+on it. And a `curl` download carries no quarantine attribute, which `docs/install.md` now
+says. What to do after the flip lives in [`operations.md`](operations.md).
+
 ## 1. Before the flip
 
 - Working tree clean, `main` up to date, `just lint` and `just test-prepush` green on `main`.

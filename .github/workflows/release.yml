@@ -3,15 +3,16 @@
 # (docs/spec/99-phase9b-release-kickoff.md, deliverable 3; docs/spec/00-spec.md §4.5).
 #
 # Every action is pinned by commit SHA, because this workflow is the one that signs and
-# publishes bytes other people run. `ci.yml` and `herdr-compat.yml` keep their tag refs for
-# now. A moving tag would let an action's owner change what a release is built from.
+# publishes bytes other people run. `ci.yml`, `scans.yml` and `herdr-compat.yml` keep their tag
+# refs for now. A moving tag would let an action's owner change what a release is built from.
 #
 # Rehearse it without a tag:
 #   gh workflow run release.yml --ref <branch>
-# which builds the assets and uploads them as workflow artifacts, creating no release. While
-# the repository is private the rehearsal builds **only** x86_64 Linux: the `ubuntu-22.04-arm`
-# runner label is not available to a private repository, and macOS minutes bill at 10x. The
-# arm64 and macOS legs are first proven by the first release candidate tag.
+# which builds the assets and uploads them as workflow artifacts, creating no release. The
+# `targets` input defaults to x86_64 Linux, the cheap leg; `all` rehearses the four. (While
+# the repository was private only that leg could run: the `ubuntu-22.04-arm` runner label was
+# not available and macOS minutes billed at 10x. The other three were first proven by the
+# v0.1.0-rc.1 tag, 2026-09-12.)
 name: release
 
 on:
@@ -24,7 +25,7 @@ on:
         type: boolean
         default: true
       targets:
-        description: "Which build legs to run. Keep linux-x86_64 while the repository is private."
+        description: "Which build legs to run. The default is the cheap leg; all builds the four."
         type: choice
         default: linux-x86_64
         options:

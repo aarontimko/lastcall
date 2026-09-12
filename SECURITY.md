@@ -8,8 +8,7 @@
 | any earlier release | no, upgrade to the latest minor |
 | pre-release builds from `main` | no |
 
-lastcall has not reached v0.1.0 yet. Until it does, `main` is the only thing there is, and
-it carries no support promise.
+v0.1.0 is the first supported release. `main` between releases carries no support promise.
 
 ## Reporting a vulnerability
 
