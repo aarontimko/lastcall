@@ -20,6 +20,8 @@ morning.
   has been editing one repository or a dozen. lastcall shows exactly what changed since
   you last looked and you walk it hunk by hunk: accept, put back, flag with a note, or fix
   it yourself. Accepting is what shrinks the list, so a long session stays reviewable.
+  This is for terminal agents, which have no review surface of their own, and for desktop
+  apps that show you a diff but cannot accept a hunk or remember what you have read.
 - **You run agents in [herdr](https://github.com/herdrdev/herdr).** lastcall was built as
   herdr's companion. Beside a herdr agent, the note on a flagged hunk is typed into that
   agent's pane, so "keep the KeyError" reaches the agent that wrote the change. Without
@@ -30,9 +32,16 @@ morning.
 
 ## Who it is not for
 
-If the pull request is the first place you read an agent's work, lastcall has nothing to
-add: it is for the hours before the PR. It is also not a git client. It does not stage,
-commit or push, and it has no opinion about your branches.
+- **The pull request is the first place you read the agent's work.** lastcall is for the
+  hours before the PR and adds nothing after it.
+- **Your agent lives in an editor that shows each edit inline with accept and reject.**
+  You already have most of this, for that editor and that session. lastcall earns its
+  place only if agents also edit outside it, or you want the ledger to outlive the window.
+- **You commit after every review pass, and the agent never commits on its own.** Then
+  git is already your ledger: the working tree is exactly what you have not read.
+
+lastcall is also not a git client. It does not stage, commit or push, and it has no
+opinion about your branches.
 
 ## What it does
 
