@@ -44,6 +44,10 @@ private = { ignore = true }
 # flatten. A wildcard version requirement is ours, and is an error.
 multiple-versions = "warn"
 wildcards = "deny"
+# The workspace's own path dependencies (`lastcall-engine`, `lastcall-testkit` in the root
+# Cargo.toml) carry no version: every crate here is `publish = false`, so a version on a path
+# dependency would pin nothing. cargo-deny counts them as wildcards unless told this.
+allow-wildcard-paths = true
 # The workspace rule is "safe wrappers only: nix, never a direct libc call or dependency"
 # (docs/spec/00-spec.md). It cannot be expressed here: `libc` is a transitive dependency of
 # console, cpufeatures, errno and tokio, so banning the crate name would fail on other
