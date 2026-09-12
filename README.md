@@ -3,6 +3,8 @@
 [![ci](https://github.com/aarontimko/lastcall/actions/workflows/ci.yml/badge.svg)](https://github.com/aarontimko/lastcall/actions/workflows/ci.yml)
 [![license: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue)](#license)
 
+![lastcall in a terminal: three repositories in a list, a diff beside them, a hunk flagged with a note, a file accepted, then the help overlay](docs/demo/lastcall.gif)
+
 The last call before code ships: an agent-agnostic review ledger for the terminal. It
 watches every repository under your working directory, shows exactly what changed since you
 last looked, and lets you accept, flag, restore or fix it hunk by hunk, whichever agent or
