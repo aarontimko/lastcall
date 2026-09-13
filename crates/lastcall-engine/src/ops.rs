@@ -25,7 +25,7 @@ use crate::hunks::{self, Hunk};
 use crate::index::{IndexError, PrivateIndex};
 use crate::ledger::{
     self, Baseline, BaselineResolver, Clock, Flag, FlagHunk, FlagSummary, Ledger, LedgerError,
-    LedgerLock, LoadResult, Override, SeenAt, TreeEntries,
+    LedgerLock, LoadResult, Override, SeenAt, TreeEntries, UndoEntry, UndoOp, UndoPath,
 };
 use crate::paths::RepoPaths;
 use crate::scan::{Entry, Pile, Row};
@@ -124,6 +124,9 @@ pub enum Refused {
     /// The path is in a merge conflict (`ls-files -u`): restoring it would write over one
     /// side of a merge git is still holding open (gate item 4; C4).
     Conflicted { path: Vec<u8> },
+    /// `z` on a root whose undo stack is empty (Amendment v1.11). The one refusal with no
+    /// path: nothing was rendered, so nothing can be named.
+    NothingToUndo,
     /// The row cannot be edited at all: it is a deletion, a symlink, or (deliverable 8)
     /// content the inline editor will not hold — binary, or over the collapse cap.
     ///
@@ -180,6 +183,9 @@ impl Refused {
             // raise it, so `Display` (which passes `"accepted"`) still reads correctly.
             Refused::NotEditable { path, why } => format!("{}: {why}; not saved", lossy(path)),
             Refused::NoSuchHunk { path, index } => format!("{}: no hunk {index}", lossy(path)),
+            // No path and no verb: the stack is empty, and neither word has anything to
+            // name. The TUI adds the root ("nothing to undo in alpha").
+            Refused::NothingToUndo => "nothing to undo".to_string(),
             Refused::Conflicted { path } => {
                 format!("{}: unresolved merge conflict; not {verb}", lossy(path))
             }
@@ -269,11 +275,36 @@ pub struct Ops<'a> {
     /// removed). Start empty: `commit` replays them onto the on-disk ledger under the lock
     /// and clears them, so two engines over one root never lose each other's writes.
     pub staged: BTreeMap<String, Option<Override>>,
+    /// The undo entry the next ledger write will push, if any (Amendment v1.11, design
+    /// review F2). Set by the staging functions, consumed by `merge_from_disk`; `fold`
+    /// builds its own `accept_all` entry instead.
+    ///
+    /// It cannot be pushed onto `self.ledger` before the write, because `merge_from_disk`
+    /// replaces the in-memory ledger wholesale and only `staged` survives that; and the
+    /// baseline cannot be read from the merged ledger afterwards, because the replay has
+    /// already put the new override there. So the op kind and the touched keys travel here
+    /// and the baselines are resolved under the lock, from the on-disk ledger, before the
+    /// replay.
+    pub pending_undo: Option<PendingUndo>,
     /// How long `commit` waits for the root's ledger lock: [`ledger::LOCK_RETRIES`] ×
     /// [`ledger::LOCK_BACKOFF`] = 2 s in the shipping engine (`Engine::ops` sets it).
     /// A test that wants the `LockBusy` path shortens it rather than sleeping for two
     /// seconds; nothing else has a reason to touch it.
     pub lock: (u32, Duration),
+}
+
+/// The undo entry a staging function has asked the next ledger write to push.
+///
+/// `prior` keys are the staged paths (so it doubles as the key list) and its values are the
+/// override each path carried in **this** engine's in-memory ledger immediately before the
+/// staging call. The on-disk ledger is the authority when it loads; `prior` is what the
+/// `Missing`/`Unreadable` branch of `merge_from_disk` resolves against, since `self.ledger`
+/// there already holds the new override and would otherwise record the accepted blob as its
+/// own baseline (an undo that undoes nothing).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingUndo {
+    pub op: UndoOp,
+    pub prior: BTreeMap<String, Option<Override>>,
 }
 
 /// Compare-and-swap one path's live content against the row that was rendered (A6): `Ok`
@@ -329,7 +360,29 @@ impl Ops<'_> {
     /// Set `{blob, mode}` on `path`'s override, or drop them when that equals the seen
     /// tree (§6.2 clean-up rule). A `flag` survives; an override left with nothing is
     /// removed.
+    /// Open (or widen) the undo entry the next ledger write will push.
+    ///
+    /// Called by every staging function before it touches an override. The op of the last
+    /// caller wins, which is what `accept_group` wants: it re-stamps `AcceptGroup` over the
+    /// per-row `AcceptFile`/`AcceptDeletion` once its loop is done.
+    fn begin_undo(&mut self, op: UndoOp) {
+        match &mut self.pending_undo {
+            Some(p) => p.op = op,
+            None => {
+                self.pending_undo = Some(PendingUndo {
+                    op,
+                    prior: BTreeMap::new(),
+                });
+            }
+        }
+    }
+
     fn set_override(&mut self, key: &str, blob: Option<Oid>, mode: Option<Mode>) {
+        let prior = self.ledger.overrides.get(key).cloned();
+        if let Some(p) = &mut self.pending_undo {
+            // First touch only: an op that sets the same path twice still has one baseline.
+            p.prior.entry(key.to_owned()).or_insert(prior);
+        }
         let path = key.as_bytes();
         let tree = self.tree_entry(path);
         let equals_tree = match (&blob, &tree) {
@@ -368,14 +421,103 @@ impl Ops<'_> {
     /// change to the same path by both sides is last-writer-wins; every other path keeps
     /// what the other side wrote. The seen-tree cache follows an on-disk seen tree that
     /// moved (the other side compacted).
+    /// Resolve one batch of keys' baselines against a given ledger and tree (§6.2 order,
+    /// verify-on-read included), as the undo record stores them.
+    ///
+    /// A baseline whose object has gone — a git root whose user ran `gc` after a rebase —
+    /// resolves like every other missing object, stepping to the tree or to `Empty` with a
+    /// notice, so an undo of it fails open rather than referencing a blob nobody has
+    /// (design review F13).
+    fn undo_paths(
+        &self,
+        ledger: &Ledger,
+        tree: &TreeEntries,
+        keys: impl Iterator<Item = String>,
+    ) -> BTreeMap<String, UndoPath> {
+        let keys: Vec<String> = keys.collect();
+        let mut resolver =
+            BaselineResolver::new(ledger, tree, self.store, keys.iter().map(|k| k.as_bytes()));
+        keys.iter()
+            .map(|k| {
+                let rec = match resolver.baseline(k.as_bytes()) {
+                    Baseline::Present { oid, mode } => UndoPath {
+                        baseline: Some(oid),
+                        mode: Some(mode),
+                    },
+                    Baseline::Absent | Baseline::Empty => UndoPath {
+                        baseline: None,
+                        mode: None,
+                    },
+                };
+                (k.clone(), rec)
+            })
+            .collect()
+    }
+
+    /// The undo entry `pending_undo` asks for, resolved against `ledger`/`tree`.
+    fn take_pending_undo(&mut self, ledger: &Ledger, tree: &TreeEntries) -> Option<UndoEntry> {
+        let pending = self.pending_undo.take()?;
+        if pending.prior.is_empty() {
+            return None;
+        }
+        let paths = self.undo_paths(ledger, tree, pending.prior.keys().cloned());
+        Some(UndoEntry {
+            op: pending.op,
+            at: self.clock.now_iso8601(),
+            paths,
+        })
+    }
+
     fn merge_from_disk(&mut self) -> Result<(), OpsError> {
         // `Missing` (the file was removed) and `Unreadable` (garbage, moved aside by
         // `load`) both mean the disk holds nothing worth merging: this engine's ledger is
-        // written as is.
+        // written as is. The undo entry still has to be pushed, and its baselines still
+        // have to be the *pre*-accept ones, so the staged overrides are rolled back on a
+        // scratch copy of this ledger first.
         let LoadResult::Loaded { ledger: disk, .. } = ledger::load(self.paths, self.clock)? else {
+            if let Some(pending) = self.pending_undo.take() {
+                let mut before = self.ledger.clone();
+                for (key, prior) in &pending.prior {
+                    match prior {
+                        Some(o) => {
+                            before.overrides.insert(key.clone(), o.clone());
+                        }
+                        None => {
+                            before.overrides.remove(key);
+                        }
+                    }
+                }
+                let tree = self.tree.clone();
+                let paths = self.undo_paths(&before, &tree, pending.prior.keys().cloned());
+                self.ledger.push_undo(UndoEntry {
+                    op: pending.op,
+                    at: self.clock.now_iso8601(),
+                    paths,
+                });
+            }
+            self.clear_expired_snooze();
             return Ok(());
         };
+        // The tree the *disk* ledger's baselines resolve against, which is this engine's
+        // cached tree unless the other side compacted since.
+        let disk_tree = if disk.seen_tree == self.ledger.seen_tree {
+            None
+        } else {
+            match &disk.seen_tree {
+                Some(t) if self.store.exists(t) => Some(self.store.ls_tree(t)?),
+                _ => Some(TreeEntries::new()),
+            }
+        };
+        let entry = {
+            let tree = disk_tree.as_ref().unwrap_or(self.tree);
+            // A clone so the resolver can borrow the tree while `self` stays free.
+            let tree = tree.clone();
+            self.take_pending_undo(&disk, &tree)
+        };
         let mut merged = disk;
+        if let Some(entry) = entry {
+            merged.push_undo(entry);
+        }
         for (key, o) in &self.staged {
             match o {
                 Some(o) => {
@@ -400,7 +542,19 @@ impl Ops<'_> {
             };
         }
         *self.ledger = merged;
+        self.clear_expired_snooze();
         Ok(())
+    }
+
+    /// A snooze deadline that has passed reads as `null` everywhere and is dropped by the
+    /// next ledger write, which is this one (Amendment v1.11).
+    fn clear_expired_snooze(&mut self) {
+        if self.ledger.snoozed_until.is_some()
+            && ledger::snooze_active(self.ledger.snoozed_until.as_deref(), self.clock.now())
+                .is_none()
+        {
+            self.ledger.snoozed_until = None;
+        }
     }
 
     /// Lock, merge with disk, tmp-write, (fault), rename; then compact when over the
@@ -434,6 +588,7 @@ impl Ops<'_> {
             return self.stage_deletion(rendered);
         }
         let live = self.cas_live(rendered)?;
+        self.begin_undo(UndoOp::AcceptFile);
         self.set_override(&key, Some(live.oid), Some(live.mode));
         Ok(())
     }
@@ -447,6 +602,7 @@ impl Ops<'_> {
                 collides_with: None,
             });
         }
+        self.begin_undo(UndoOp::AcceptDeletion);
         self.set_override(&key, None, None);
         Ok(())
     }
@@ -487,6 +643,11 @@ impl Ops<'_> {
                 Ok(()) => any = true,
                 Err(e) => refused.push(e),
             }
+        }
+        if any {
+            // Over the per-row `accept_file`/`accept_deletion` the loop stamped: one
+            // keystroke, one entry, and `z` puts the whole group back.
+            self.begin_undo(UndoOp::AcceptGroup);
         }
         let compacted = if any { self.commit(fault)? } else { false };
         Ok(Outcome {
@@ -611,6 +772,7 @@ impl Ops<'_> {
             };
             (Some(oid), mode)
         };
+        self.begin_undo(UndoOp::AcceptHunk);
         self.set_override(&key, blob, mode);
         let compacted = self.commit(fault)?;
         Ok(Outcome {
@@ -1221,6 +1383,7 @@ impl Ops<'_> {
             Ok(k) => k,
             Err(r) => return refuse(r),
         };
+        self.begin_undo(UndoOp::Save);
         self.set_override(&key, Some(oid), Some(live.mode));
         let compacted = self.commit(fault)?;
         Ok(Outcome {
@@ -1252,6 +1415,96 @@ impl Ops<'_> {
         self.fold(&Pile::empty(), None, fault)
     }
 
+    /// Reverse the most recent accept in this root (Amendment v1.11, deliverable 2).
+    ///
+    /// Never touches the working tree: it only makes paths pending again. Every path goes
+    /// back through [`Ops::set_override`] rather than being written into `overrides`
+    /// directly, and that is the whole correctness argument (design review F1):
+    ///
+    /// - a recorded oid equal to the seen tree's entry drops the override, which is §6.2's
+    ///   clean-up rule and stops the path counting toward compaction;
+    /// - a `null` on a path the tree has keeps `Some(None)` = `Absent`, correct after any
+    ///   fold;
+    /// - a `null` on a path the tree does **not** have drops the override, so the path
+    ///   resolves to `Empty` again and a later `shift-u` writes a zero-byte file instead of
+    ///   unlinking the user's first-sight draft (Phase 7's F17 rule).
+    ///
+    /// `flags` survive and `updated_at` is stamped by `set_override` itself. There is no
+    /// live CAS: a file that moved since the accept is exactly what the user wants back on
+    /// screen. An empty stack is a refusal, never an error.
+    pub fn undo(&mut self, fault: &dyn FaultInjector) -> Result<Outcome, OpsError> {
+        let written = {
+            let _lock = LedgerLock::acquire_with(self.paths, self.lock.0, self.lock.1)?;
+            self.merge_from_disk()?;
+            let Some(entry) = self.ledger.undo.pop() else {
+                return Ok(Outcome {
+                    refused: vec![Refused::NothingToUndo],
+                    ..Default::default()
+                });
+            };
+            for (key, rec) in &entry.paths {
+                self.set_override(key, rec.baseline.clone(), rec.mode);
+            }
+            let tmp = ledger::write_tmp(self.paths, self.ledger)?;
+            fault.at(FaultPoint::AfterLedgerTmpWrite);
+            ledger::commit_tmp(self.paths, &tmp)?;
+            true
+        };
+        self.staged.clear();
+        Ok(Outcome {
+            refused: Vec::new(),
+            compacted: false,
+            written,
+        })
+    }
+
+    /// The paths the next `undo` would put back, in path order (the UI moves the selection
+    /// to the first of them).
+    pub fn undo_preview(&self) -> Option<(UndoOp, Vec<String>)> {
+        let e = self.ledger.undo.last()?;
+        Some((e.op, e.paths.keys().cloned().collect()))
+    }
+
+    /// Hide this root from the nav until `until` (ISO-8601 UTC). A view, not a filter: the
+    /// root is still watched, still scanned, and the headless commands only report it.
+    pub fn snooze(&mut self, until: &str, fault: &dyn FaultInjector) -> Result<Outcome, OpsError> {
+        self.set_snooze(Some(until.to_owned()), fault)
+    }
+
+    /// Wake a snoozed root.
+    pub fn unsnooze(&mut self, fault: &dyn FaultInjector) -> Result<Outcome, OpsError> {
+        self.set_snooze(None, fault)
+    }
+
+    /// `snoozed_until` is set **after** the merge, never before: `merge_from_disk` replaces
+    /// the in-memory ledger wholesale, so a field set before the lock is lost (design
+    /// review F2).
+    fn set_snooze(
+        &mut self,
+        until: Option<String>,
+        fault: &dyn FaultInjector,
+    ) -> Result<Outcome, OpsError> {
+        {
+            let _lock = LedgerLock::acquire_with(self.paths, self.lock.0, self.lock.1)?;
+            self.merge_from_disk()?;
+            self.ledger.snoozed_until = until;
+            let tmp = ledger::write_tmp(self.paths, self.ledger)?;
+            fault.at(FaultPoint::AfterLedgerTmpWrite);
+            ledger::commit_tmp(self.paths, &tmp)?;
+        }
+        self.staged.clear();
+        Ok(Outcome {
+            refused: Vec::new(),
+            compacted: false,
+            written: true,
+        })
+    }
+
+    /// `now + days` as the ISO-8601 instant a snooze records, from the injected clock.
+    pub fn snooze_deadline(&self, days: u32) -> String {
+        ledger::iso8601(self.clock.now() + Duration::from_secs(u64::from(days) * 86_400))
+    }
+
     fn head_now(&self) -> SeenAt {
         let (head_commit, branch) = match self.repo {
             Some(rg) if self.ledger.kind == RootKind::Git => current_head(rg),
@@ -1274,6 +1527,33 @@ impl Ops<'_> {
         // overrides, so another process's accepts are folded in, never dropped.
         let _lock = LedgerLock::acquire(self.paths)?;
         self.merge_from_disk()?;
+        // The accept-all entry, taken *before* the fold rewrites anything: the overrides
+        // and the tree as they stand now are the pre-accept baselines. Every path the fold
+        // will take from the snapshot (the row cap already bounds that list) plus every
+        // path that already carried an override, since the fold moves those into the tree
+        // too. `compact` passes an empty snapshot and no `seen_at`, and pushes nothing.
+        let entry = if seen_at.is_some() && !snapshot.rows.is_empty() {
+            let mut keys: Vec<String> = Vec::new();
+            for row in &snapshot.rows {
+                if let Ok(k) = std::str::from_utf8(&row.path) {
+                    keys.push(k.to_owned());
+                }
+            }
+            keys.sort();
+            keys.dedup();
+            let tree = self.tree.clone();
+            let ledger = self.ledger.clone();
+            Some(UndoEntry {
+                op: UndoOp::AcceptAll,
+                at: self.clock.now_iso8601(),
+                paths: self.undo_paths(&ledger, &tree, keys.into_iter()),
+            })
+        } else {
+            None
+        };
+        if let Some(entry) = entry {
+            self.ledger.push_undo(entry);
+        }
         // Order matters: later writes win. Overrides first, then the snapshot's rows.
         let mut writes: BTreeMap<Vec<u8>, TreeWrite> = BTreeMap::new();
         for (key, o) in &self.ledger.overrides {
@@ -1429,6 +1709,7 @@ impl Ops<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ledger::UNDO_CAP;
     use crate::scan::fixture_tests::Harness;
     use crate::scan::{Change, Rename, pile_lines};
     use lastcall_testkit::fixture_repo::FixtureRepo;
@@ -2685,6 +2966,433 @@ mod tests {
         assert!(h.scan().pile.is_empty());
     }
 
+    // -----------------------------------------------------------------------------------
+    // Undo (Amendment v1.11, Phase 10 deliverable 2)
+    // -----------------------------------------------------------------------------------
+
+    fn top(h: &Harness) -> &UndoEntry {
+        h.ledger.undo.last().expect("an undo entry")
+    }
+
+    #[test]
+    fn ops_undo_record_has_the_shape_the_spec_names() {
+        let repo = FixtureRepo::new("ops-undo-shape").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        let before = std::fs::read(repo.path().join("f1")).unwrap();
+        let base = h.store.hash_bytes(&before).unwrap();
+        repo.write("f1", "changed\n");
+        let r = rendered(&h, b"f1");
+        assert!(h.ops().accept_file(&r, &NoFault).unwrap().ok());
+        let v: serde_json::Value = serde_json::from_str(&h.ledger.to_json()).unwrap();
+        let entry = &v["undo"][0];
+        assert_eq!(entry["op"], "accept_file");
+        assert_eq!(entry["at"], h.clock.now_iso8601());
+        assert_eq!(entry["paths"]["f1"]["baseline"], base.as_str());
+        assert_eq!(entry["paths"]["f1"]["mode"], "100644");
+        assert_eq!(
+            v["undo"].as_array().unwrap().len(),
+            1,
+            "one accept, one entry"
+        );
+    }
+
+    #[test]
+    fn ops_undo_pushes_one_entry_per_accept_family_with_the_op_it_staged() {
+        let mut repo = FixtureRepo::new("ops-undo-ops").unwrap();
+        repo.write("gone", "bye\n");
+        repo.write("grouped", "g\n");
+        repo.commit("more files").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+
+        repo.write("f1", "one\ntwo\nthree\n");
+        let row = h.scan().pile.row(b"f1").unwrap().clone();
+        let r = Rendered::of(&row);
+        assert!(
+            h.ops()
+                .accept_hunk(&r, &row.hunks, 0, &NoFault)
+                .unwrap()
+                .ok()
+        );
+        assert_eq!(top(&h).op, UndoOp::AcceptHunk);
+
+        repo.write("f2", "two\n");
+        let r = rendered(&h, b"f2");
+        assert!(h.ops().accept_file(&r, &NoFault).unwrap().ok());
+        assert_eq!(top(&h).op, UndoOp::AcceptFile);
+
+        repo.write("f3", "three\n");
+        repo.write("grouped", "g2\n");
+        let rows = vec![rendered(&h, b"f3"), rendered(&h, b"grouped")];
+        assert!(h.ops().accept_group(&rows, &NoFault).unwrap().ok());
+        assert_eq!(top(&h).op, UndoOp::AcceptGroup);
+        assert_eq!(
+            top(&h).paths.keys().cloned().collect::<Vec<_>>(),
+            vec!["f3".to_string(), "grouped".to_string()]
+        );
+
+        // A hunk accept on a **deletion** row records `accept_deletion` (design review F20):
+        // that route delegates to `accept_file` and so to `stage_deletion`.
+        repo.remove("gone");
+        let row = h.scan().pile.row(b"gone").unwrap().clone();
+        assert_eq!(row.change, Change::Deleted);
+        let r = Rendered::of(&row);
+        assert!(
+            h.ops()
+                .accept_hunk(&r, &row.hunks, 0, &NoFault)
+                .unwrap()
+                .ok()
+        );
+        assert_eq!(top(&h).op, UndoOp::AcceptDeletion);
+
+        repo.write("f4", "four\n");
+        let r = rendered(&h, b"f4");
+        assert!(h.ops().save_file(&r, b"edited\n", &NoFault).unwrap().ok());
+        assert_eq!(top(&h).op, UndoOp::Save);
+
+        repo.write("f5", "five\n");
+        let snapshot = h.scan().pile;
+        assert!(h.ops().accept_all(&snapshot, &NoFault).unwrap().ok());
+        assert_eq!(top(&h).op, UndoOp::AcceptAll);
+        assert!(top(&h).paths.contains_key("f5"));
+    }
+
+    #[test]
+    fn ops_undo_pushes_nothing_for_a_refusal_a_restore_a_flag_or_a_compaction() {
+        let repo = FixtureRepo::new("ops-undo-nopush").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+
+        // A refused accept: the live file moved under the rendered row.
+        repo.write("f1", "one\n");
+        let r = rendered(&h, b"f1");
+        repo.write("f1", "moved\n");
+        let out = h.ops().accept_file(&r, &NoFault).unwrap();
+        assert!(!out.ok() && !out.written);
+        assert!(h.ledger.undo.is_empty(), "a refusal pushes nothing");
+
+        // A flag.
+        assert!(
+            h.ops()
+                .flag(b"f1", "look", None, None, &NoFault)
+                .unwrap()
+                .ok()
+        );
+        assert!(h.ledger.undo.is_empty(), "a flag pushes nothing");
+
+        // A restore.
+        let r = rendered(&h, b"f1");
+        assert!(h.ops().restore_file(&r, &NoFault).unwrap().ok());
+        assert!(h.ledger.undo.is_empty(), "a restore pushes nothing");
+
+        // A compaction, with one real accept's entry already on the stack.
+        repo.write("f2", "two\n");
+        let r = rendered(&h, b"f2");
+        assert!(h.ops().accept_file(&r, &NoFault).unwrap().ok());
+        assert_eq!(h.ledger.undo.len(), 1);
+        h.ops().compact(&NoFault).unwrap();
+        assert_eq!(h.ledger.undo.len(), 1, "a compaction pushes nothing");
+    }
+
+    #[test]
+    fn ops_undo_stack_caps_at_twenty_and_drops_the_oldest() {
+        let mut repo = FixtureRepo::new("ops-undo-cap").unwrap();
+        for i in 0..25 {
+            repo.write(&format!("c{i:02}"), "seed\n");
+        }
+        repo.commit("seed the cap files").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        for i in 0..25 {
+            let name = format!("c{i:02}");
+            repo.write(&name, format!("edit {i}\n"));
+            let r = rendered(&h, name.as_bytes());
+            assert!(h.ops().accept_file(&r, &NoFault).unwrap().ok());
+        }
+        assert_eq!(h.ledger.undo.len(), UNDO_CAP);
+        assert_eq!(
+            h.ledger.undo.first().unwrap().paths.keys().next().unwrap(),
+            "c05",
+            "the five oldest were dropped"
+        );
+        assert_eq!(
+            h.ledger.undo.last().unwrap().paths.keys().next().unwrap(),
+            "c24"
+        );
+    }
+
+    #[test]
+    fn ops_undo_puts_the_file_back_and_keeps_its_flags() {
+        let repo = FixtureRepo::new("ops-undo-flags").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        assert!(
+            h.ops()
+                .flag(b"f1", "why this?", None, None, &NoFault)
+                .unwrap()
+                .ok()
+        );
+        repo.write("f1", "changed\n");
+        let before = pile_lines(&h.scan().pile);
+        let r = rendered(&h, b"f1");
+        assert!(h.ops().accept_file(&r, &NoFault).unwrap().ok());
+        assert!(h.scan().pile.is_empty());
+        let out = h.ops().undo(&NoFault).unwrap();
+        assert!(out.ok() && out.written);
+        assert_eq!(pile_lines(&h.scan().pile), before, "f1 is pending again");
+        assert_eq!(h.ledger.overrides["f1"].flags.len(), 1, "the flag survived");
+        assert_eq!(h.ledger.overrides["f1"].flags[0].note, "why this?");
+        assert!(h.ledger.undo.is_empty(), "the entry was popped");
+        // Nothing was written to the working tree.
+        assert_eq!(std::fs::read(repo.path().join("f1")).unwrap(), b"changed\n");
+    }
+
+    #[test]
+    fn ops_undo_on_an_empty_stack_is_a_refusal_not_an_error() {
+        let repo = FixtureRepo::new("ops-undo-empty").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        let out = h.ops().undo(&NoFault).unwrap();
+        assert_eq!(out.refused, vec![Refused::NothingToUndo]);
+        assert!(!out.written);
+        assert_eq!(out.refused[0].message("undone"), "nothing to undo");
+    }
+
+    #[test]
+    fn ops_undo_across_compactions_restores_the_pile_before_the_first_accept() {
+        let mut repo = FixtureRepo::new("ops-undo-compact").unwrap();
+        repo.write("a", "a0\n");
+        repo.write("b", "b0\n");
+        repo.write("c", "c0\n");
+        repo.commit("three files").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        repo.write("a", "a1\n");
+        repo.write("b", "b1\n");
+        repo.write("c", "c1\n");
+        let before = pile_lines(&h.scan().pile);
+        assert_eq!(before, vec!["a", "b", "c"]);
+        // Threshold 1: every accept past the first folds, so each undo has to cross a
+        // compaction that moved the accepted content into the seen tree.
+        let mut compactions = 0;
+        for name in ["a", "b", "c"] {
+            let r = rendered(&h, name.as_bytes());
+            let mut ops = h.ops();
+            ops.compaction_threshold = 1;
+            let out = ops.accept_file(&r, &NoFault).unwrap();
+            assert!(out.ok());
+            compactions += usize::from(out.compacted);
+        }
+        assert!(compactions >= 1, "the threshold forced a fold");
+        assert!(h.scan().pile.is_empty());
+        for _ in 0..3 {
+            assert!(h.ops().undo(&NoFault).unwrap().ok());
+        }
+        assert_eq!(
+            pile_lines(&h.scan().pile),
+            before,
+            "three undos across compactions restore the pile exactly"
+        );
+    }
+
+    #[test]
+    fn ops_undo_sees_an_entry_written_by_another_engine_over_the_same_state_dir() {
+        let repo = FixtureRepo::new("ops-undo-2eng").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut a = Harness::new(&repo, &state);
+        repo.write("f1", "one\n");
+        let r = rendered(&a, b"f1");
+        assert!(a.ops().accept_file(&r, &NoFault).unwrap().ok());
+        // A second engine, opened after the first's write. It starts with a fresh
+        // in-memory ledger (the harness never loads one), so the entry can only reach it
+        // through `merge_from_disk` under the lock — which is the point.
+        let mut b = Harness::new(&repo, &state);
+        assert!(b.ledger.undo.is_empty());
+        let disk = match ledger::load(&b.paths, &b.clock).unwrap() {
+            LoadResult::Loaded { ledger, .. } => ledger,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(disk.undo.len(), 1, "the entry is on disk");
+        assert_eq!(disk.undo[0].op, UndoOp::AcceptFile);
+        assert!(b.ops().undo(&NoFault).unwrap().ok());
+        assert_eq!(pile_lines(&b.scan().pile), vec!["f1"]);
+        // ... and the first engine picks the pop up from disk on its next merge.
+        repo.write("f2", "two\n");
+        let r = rendered(&a, b"f2");
+        assert!(a.ops().accept_file(&r, &NoFault).unwrap().ok());
+        assert_eq!(a.ledger.undo.len(), 1, "b's pop survived a's write");
+    }
+
+    #[test]
+    fn ops_undo_at_first_sight_leaves_empty_empty_so_restore_still_writes_zero_bytes() {
+        // Design review F1 / Phase 7's F17: on a root with no seen tree, an accepted
+        // first-sight file's baseline is `Empty`, not `Absent`. Undo must put back `Empty`
+        // — and it does, because `set_override`'s `equals_tree` rule drops the override
+        // for `(None, None)` on a tree-less path.
+        let repo = FixtureRepo::new("ops-undo-f17").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        h.ledger.seen_tree = None;
+        h.tree_entries = TreeEntries::new();
+        repo.write("notes.md", "draft\n");
+        let r = rendered(&h, b"notes.md");
+        assert!(h.ops().accept_file(&r, &NoFault).unwrap().ok());
+        assert_eq!(top(&h).paths["notes.md"].baseline, None);
+        assert!(h.ops().undo(&NoFault).unwrap().ok());
+        assert!(
+            !h.ledger.overrides.contains_key("notes.md"),
+            "the override is gone, so the path resolves to Empty again, not Absent"
+        );
+        let r = rendered(&h, b"notes.md");
+        assert!(h.ops().restore_file(&r, &NoFault).unwrap().ok());
+        assert!(
+            repo.path().join("notes.md").exists(),
+            "F17: a first-sight restore after an undo writes zero bytes, never removes"
+        );
+        assert_eq!(std::fs::read(repo.path().join("notes.md")).unwrap(), b"");
+    }
+
+    #[test]
+    fn ops_undo_fails_open_when_the_recorded_baseline_object_is_gone() {
+        // Design review F13: a git root whose user ran `gc` after a rebase can lose the
+        // blob an entry names. Resolution steps to the tree with a notice, like every
+        // other missing object; the undo still writes and nothing panics.
+        let repo = FixtureRepo::new("ops-undo-gone").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        repo.write("f1", "changed\n");
+        let r = rendered(&h, b"f1");
+        assert!(h.ops().accept_file(&r, &NoFault).unwrap().ok());
+        let base = top(&h).paths["f1"].baseline.clone().expect("a real oid");
+        // Rewrite the entry to name an object nobody has.
+        let missing = Oid::parse(&"9".repeat(40)).unwrap();
+        assert_ne!(base, missing);
+        h.ledger
+            .undo
+            .last_mut()
+            .unwrap()
+            .paths
+            .get_mut("f1")
+            .unwrap()
+            .baseline = Some(missing.clone());
+        ledger::save(&h.paths, &h.ledger).unwrap();
+        let out = h.ops().undo(&NoFault).unwrap();
+        assert!(out.ok() && out.written, "{out:?}");
+        // The override is written; it is *resolution* that fails open, exactly as it does
+        // for any other object the store has lost.
+        assert_eq!(
+            h.ledger.overrides["f1"].blob.as_ref().unwrap().as_ref(),
+            Some(&missing)
+        );
+        let pile = h.scan().pile;
+        assert_eq!(pile_lines(&pile), vec!["f1"], "the row came back");
+        assert!(
+            pile.notices
+                .iter()
+                .any(|n| n.contains("missing from the store")),
+            "a notice, not a panic: {:?}",
+            pile.notices
+        );
+    }
+
+    #[test]
+    fn ops_undo_loads_as_an_empty_stack_from_a_1_1_file_without_the_field() {
+        let repo = FixtureRepo::new("ops-undo-11").unwrap();
+        let state = TempDir::new("lc-ops");
+        let h = Harness::new(&repo, &state);
+        ledger::save(&h.paths, &h.ledger).unwrap();
+        let raw = std::fs::read_to_string(&h.paths.ledger).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let keys: Vec<&str> = doc
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            // `serde_json::Value` keys come back sorted, not in document order.
+            [
+                "kind",
+                "overrides",
+                "root",
+                "schema_version",
+                "seen_at",
+                "seen_tree"
+            ],
+            "a ledger with neither an undo stack nor a snooze writes neither field"
+        );
+        let (parsed, notices) = ledger::parse(raw.as_bytes()).unwrap();
+        assert!(notices.is_empty(), "{notices:?}");
+        assert_eq!(parsed.schema_version, "1.1");
+        assert!(parsed.undo.is_empty());
+        assert_eq!(parsed.snoozed_until, None);
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Snooze (Amendment v1.11, Phase 10 deliverable 3)
+    // -----------------------------------------------------------------------------------
+
+    #[test]
+    fn ops_snooze_round_trips_through_the_ledger_and_unsnooze_clears_it() {
+        let repo = FixtureRepo::new("ops-snooze").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        let until = h.ops().snooze_deadline(1);
+        assert!(h.ops().snooze(&until, &NoFault).unwrap().ok());
+        let disk = match ledger::load(&h.paths, &h.clock).unwrap() {
+            LoadResult::Loaded { ledger, .. } => ledger,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(disk.snoozed_until.as_deref(), Some(until.as_str()));
+        assert!(h.ledger.to_json().contains("snoozed_until"));
+        assert!(h.ops().unsnooze(&NoFault).unwrap().ok());
+        let disk = match ledger::load(&h.paths, &h.clock).unwrap() {
+            LoadResult::Loaded { ledger, .. } => ledger,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(disk.snoozed_until, None);
+    }
+
+    #[test]
+    fn ops_snooze_deadline_is_whole_days_from_the_injected_clock() {
+        let repo = FixtureRepo::new("ops-snooze-days").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        let now = h.clock.now_iso8601();
+        assert_eq!(h.ops().snooze_deadline(0), now);
+        let one = h.ops().snooze_deadline(1);
+        assert_eq!(
+            ledger::parse_iso8601(&one).unwrap(),
+            ledger::parse_iso8601(&now).unwrap() + Duration::from_secs(86_400)
+        );
+        let year = h.ops().snooze_deadline(365);
+        assert_eq!(
+            ledger::parse_iso8601(&year).unwrap(),
+            ledger::parse_iso8601(&now).unwrap() + Duration::from_secs(365 * 86_400)
+        );
+    }
+
+    #[test]
+    fn ops_an_expired_snooze_is_cleared_by_the_next_ledger_write() {
+        let repo = FixtureRepo::new("ops-snooze-expiry").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        // A deadline already in the past for the fixture's fixed clock.
+        h.ledger.snoozed_until = Some("2020-01-01T00:00:00Z".into());
+        ledger::save(&h.paths, &h.ledger).unwrap();
+        repo.write("f1", "changed\n");
+        let r = rendered(&h, b"f1");
+        assert!(h.ops().accept_file(&r, &NoFault).unwrap().ok());
+        assert_eq!(h.ledger.snoozed_until, None, "the write dropped it");
+        let disk = match ledger::load(&h.paths, &h.clock).unwrap() {
+            LoadResult::Loaded { ledger, .. } => ledger,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(disk.snoozed_until, None);
+    }
+
     /// Kickoff deliverable 8 (ii)/(iii): property tests over one draft root per test — a
     /// private store on a temp dir, no user repo, the `RootKind::Draft` plumbing exactly as
     /// the engine opens one. Each case rewrites the file set and resets the ledger to first
@@ -2824,6 +3532,7 @@ mod tests {
                     compaction_threshold: 500,
                     case_insensitive: false,
                     staged: BTreeMap::new(),
+                    pending_undo: None,
                     lock: DEFAULT_LOCK,
                 }
             }

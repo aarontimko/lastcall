@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 
@@ -24,7 +25,7 @@ use crate::hunks::{self, Hunk};
 use crate::index::{IndexError, PrivateIndex};
 use crate::ledger::{
     self, Clock, FlagHunk, FlagSummary, Ledger, LedgerError, LedgerLock, LoadResult, SeenAt,
-    SystemClock, TreeEntries,
+    SystemClock, TreeEntries, UndoOp,
 };
 use crate::ops::{self, FaultInjector, NoFault, Ops, OpsError, Outcome, Refused, Rendered};
 use crate::paths::{Layout, ParentId, ParentMeta, RepoPaths, RootId};
@@ -378,6 +379,32 @@ pub struct RenderedHunk {
 pub struct Flagged {
     pub outcome: Outcome,
     pub export: String,
+    /// [`Engine::scan_seq`] of `pile`.
+    pub seq: u64,
+    pub pile: Pile,
+}
+
+/// What [`Engine::undo`] produced (Amendment v1.11): the outcome, what the popped entry
+/// was, the paths it put back in path order, and the pile of the rescan that followed.
+///
+/// `op` and `paths` are empty when nothing was undone (`outcome` then carries
+/// [`Refused::NothingToUndo`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Undone {
+    pub outcome: Outcome,
+    pub op: Option<UndoOp>,
+    pub paths: Vec<String>,
+    /// [`Engine::scan_seq`] of `pile`.
+    pub seq: u64,
+    pub pile: Pile,
+}
+
+/// What [`Engine::snooze`] produced: the deadline it wrote (`None` for a wake) and the
+/// pile of the rescan that followed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Snoozed {
+    pub outcome: Outcome,
+    pub until: Option<String>,
     /// [`Engine::scan_seq`] of `pile`.
     pub seq: u64,
     pub pile: Pile,
@@ -866,6 +893,9 @@ struct ScanCtx {
     collapsed: GlobSet,
     collapse_size_bytes: u64,
     row_cap: usize,
+    /// The engine's injected wall clock, read once per `scan_all` so every root in one
+    /// sweep decides snooze expiry against the same instant (Amendment v1.11).
+    now: SystemTime,
 }
 
 /// Scan one root, start to finish, mutating **only** that root's state: its nested-repo
@@ -907,6 +937,11 @@ fn scan_root(state: &mut RootState, ctx: &ScanCtx) -> Result<Pile, EngineError> 
         row_cap: ctx.row_cap,
     })?;
     let mut pile = out.pile;
+    // The two per-root ledger facts the reducer may never read for itself (design review
+    // F8), stamped here rather than inside `scan` because the expiry needs a wall clock and
+    // the engine owns the injected one.
+    pile.undo = state.ledger.undo.len();
+    pile.snoozed_until = ledger::snooze_active(state.ledger.snoozed_until.as_deref(), ctx.now);
     if out.nested_repos != state.nested_repos {
         state.nested_repos = out.nested_repos;
         state.nested_changed = true;
@@ -947,6 +982,7 @@ impl Engine {
             collapsed: self.collapsed.clone(),
             collapse_size_bytes: self.config.collapse_size_bytes,
             row_cap: self.options.row_cap,
+            now: self.options.clock.now(),
         }
     }
 
@@ -1400,6 +1436,86 @@ impl Engine {
         })
     }
 
+    /// Reverse the most recent accept in `root` (Amendment v1.11, deliverable 2).
+    ///
+    /// Op-then-rescan like [`Engine::accept_with`], and for the same reason: the pile that
+    /// comes back is the one the UI should show next, with the undone paths pending again.
+    /// `paths` is what the entry put back, in path order, so the caller can move the
+    /// selection to the first of them; an empty stack comes back as
+    /// [`Refused::NothingToUndo`] in `outcome`, never as `Err`.
+    pub fn undo(&mut self, root: &Path) -> Result<Undone, EngineError> {
+        self.undo_with(root, &NoFault)
+    }
+
+    /// [`Engine::undo`] with a fault injector.
+    pub fn undo_with(
+        &mut self,
+        root: &Path,
+        fault: &dyn FaultInjector,
+    ) -> Result<Undone, EngineError> {
+        let (result, preview) = {
+            let mut ops = self.ops(root)?;
+            let preview = ops.undo_preview();
+            (ops.undo(fault), preview)
+        };
+        let outcome = match result {
+            Ok(o) => o,
+            Err(e) => {
+                if let Some(state) = self.roots.get_mut(root) {
+                    state.ledger_stamp = None;
+                    state.reload_ledger_if_changed();
+                }
+                return Err(EngineError::Ops(e));
+            }
+        };
+        let (op, paths) = match preview {
+            Some((op, paths)) if outcome.ok() => (Some(op), paths),
+            _ => (None, Vec::new()),
+        };
+        let pile = self.scan(root)?;
+        Ok(Undone {
+            outcome,
+            op,
+            paths,
+            seq: self.scan_seq,
+            pile,
+        })
+    }
+
+    /// Snooze `root` for `days` (1 to 365), or wake it when `days` is `None`.
+    ///
+    /// The deadline is computed from the engine's injected clock, so a `FixedClock` test
+    /// can name the date the status line will print.
+    pub fn snooze(&mut self, root: &Path, days: Option<u32>) -> Result<Snoozed, EngineError> {
+        let (result, until) = {
+            let mut ops = self.ops(root)?;
+            match days {
+                Some(d) => {
+                    let until = ops.snooze_deadline(d);
+                    (ops.snooze(&until, &NoFault), Some(until))
+                }
+                None => (ops.unsnooze(&NoFault), None),
+            }
+        };
+        let outcome = match result {
+            Ok(o) => o,
+            Err(e) => {
+                if let Some(state) = self.roots.get_mut(root) {
+                    state.ledger_stamp = None;
+                    state.reload_ledger_if_changed();
+                }
+                return Err(EngineError::Ops(e));
+            }
+        };
+        let pile = self.scan(root)?;
+        Ok(Snoozed {
+            outcome,
+            until,
+            seq: self.scan_seq,
+            pile,
+        })
+    }
+
     /// Flag `path` — optionally one hunk of it — with a note, and render the export.
     ///
     /// Op-then-rescan like [`Engine::accept_with`], though a flag never changes a baseline:
@@ -1534,6 +1650,7 @@ impl Engine {
             compaction_threshold: threshold,
             case_insensitive,
             staged: BTreeMap::new(),
+            pending_undo: None,
             lock: crate::ops::DEFAULT_LOCK,
         })
     }

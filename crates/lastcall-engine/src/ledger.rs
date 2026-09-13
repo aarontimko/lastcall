@@ -96,6 +96,57 @@ pub fn iso8601(t: SystemTime) -> String {
     )
 }
 
+/// The inverse of [`iso8601`], for the one value a reader has to compare against now: a
+/// snooze deadline (Amendment v1.11). Strict about the shape it writes itself —
+/// `YYYY-MM-DDTHH:MM:SSZ` — and `None` for anything else, which every caller treats as
+/// "not snoozed" rather than as an error.
+pub fn parse_iso8601(s: &str) -> Option<SystemTime> {
+    let b = s.as_bytes();
+    if b.len() != 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[19] != b'Z' {
+        return None;
+    }
+    if b[13] != b':' || b[16] != b':' {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| s.get(r).and_then(|p| p.parse::<i64>().ok());
+    let (y, mo, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (h, mi, sec) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || sec > 60 {
+        return None;
+    }
+    let days = days_from_civil(y, mo as u32, d as u32);
+    let secs = days * 86_400 + h * 3600 + mi * 60 + sec;
+    if secs < 0 {
+        return None;
+    }
+    Some(UNIX_EPOCH + Duration::from_secs(secs as u64))
+}
+
+/// `snoozed_until` as a reader must see it: `Some` only while the deadline is still in the
+/// future at `now`. An unparsable value reads as expired, so a hand-edited ledger can never
+/// hide a repository forever.
+pub fn snooze_active(snoozed_until: Option<&str>, now: SystemTime) -> Option<String> {
+    let raw = snoozed_until?;
+    let until = parse_iso8601(raw)?;
+    (until > now).then(|| raw.to_owned())
+}
+
+/// The `YYYY-MM-DD` half of an ISO-8601 instant, for the lines a user reads.
+pub fn iso8601_date(s: &str) -> &str {
+    s.get(..10).unwrap_or(s)
+}
+
+/// Howard Hinnant's `days_from_civil` (y/m/d → days since 1970-01-01).
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 } as i64;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
 /// Howard Hinnant's `civil_from_days` (days since 1970-01-01 → y/m/d).
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
@@ -190,6 +241,64 @@ impl Flag {
             ..Self::file(note, created_at)
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// Undo (Amendment v1.11, Phase 10 deliverable 2)
+// ---------------------------------------------------------------------------------------
+
+/// How deep a root's undo stack goes; the oldest entry is dropped past this.
+pub const UNDO_CAP: usize = 20;
+
+/// What one undo entry reverses. The wire spelling is the snake-case name.
+///
+/// `AcceptDeletion` rather than `AcceptHunk` for a hunk accept on a deletion row: that
+/// route delegates to `accept_file` and so to `stage_deletion`, and the record names what
+/// was staged, not which key was pressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UndoOp {
+    AcceptHunk,
+    AcceptFile,
+    AcceptGroup,
+    AcceptDeletion,
+    AcceptAll,
+    Save,
+}
+
+impl UndoOp {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UndoOp::AcceptHunk => "accept_hunk",
+            UndoOp::AcceptFile => "accept_file",
+            UndoOp::AcceptGroup => "accept_group",
+            UndoOp::AcceptDeletion => "accept_deletion",
+            UndoOp::AcceptAll => "accept_all",
+            UndoOp::Save => "save",
+        }
+    }
+}
+
+/// One path's baseline as §6.2 resolved it **immediately before** the op.
+///
+/// `Present` records the oid and the mode; `Absent` and `Empty` both record `null`. The two
+/// are not distinguished here on purpose: undo restores through
+/// [`crate::ops::Ops::set_override`], whose `equals_tree` rule sends `(None, None)` back to
+/// `Absent` on a path the seen tree has and back to `Empty` on a path it does not — which
+/// is exactly the distinction, recovered from the tree rather than stored (design review
+/// F1, Phase 7's F17 rule).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UndoPath {
+    pub baseline: Option<Oid>,
+    pub mode: Option<Mode>,
+}
+
+/// One reversible operation, newest last. Serialised last in the document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UndoEntry {
+    pub op: UndoOp,
+    pub at: String,
+    pub paths: BTreeMap<String, UndoPath>,
 }
 
 /// One override. `blob` distinguishes *field absent* (flag-only override: `None`) from
@@ -291,6 +400,13 @@ struct LedgerWire {
     seen_at: SeenAt,
     #[serde(default)]
     overrides: BTreeMap<String, serde_json::Value>,
+    /// Amendment v1.11, additive. Omitted when the root is not snoozed, so a ledger that
+    /// never met a Phase 10 binary is byte-identical after a rewrite.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    snoozed_until: Option<String>,
+    /// Amendment v1.11, additive and serialised last. Omitted when empty, same reason.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    undo: Vec<UndoEntry>,
 }
 
 /// `ledger.json`, one per root.
@@ -306,6 +422,11 @@ pub struct Ledger {
     /// Overrides whose shape we could not parse: retained verbatim, rewritten on save, and
     /// ignored by baseline resolution (the path resolves to the tree).
     pub unparsable: BTreeMap<String, serde_json::Value>,
+    /// When this root stops being hidden from the nav (Amendment v1.11). An expired value
+    /// reads as `None` through [`snooze_active`] and is cleared by the next ledger write.
+    pub snoozed_until: Option<String>,
+    /// The undo stack, oldest first, at most [`UNDO_CAP`] deep.
+    pub undo: Vec<UndoEntry>,
 }
 
 impl Ledger {
@@ -319,12 +440,22 @@ impl Ledger {
             seen_at,
             overrides: BTreeMap::new(),
             unparsable: BTreeMap::new(),
+            snoozed_until: None,
+            undo: Vec::new(),
         }
     }
 
     /// Overrides that carry a `blob` field (the compaction trigger counts these).
     pub fn blob_override_count(&self) -> usize {
         self.overrides.values().filter(|o| o.blob.is_some()).count()
+    }
+
+    /// Push one undo entry, dropping the oldest past [`UNDO_CAP`].
+    pub fn push_undo(&mut self, entry: UndoEntry) {
+        self.undo.push(entry);
+        while self.undo.len() > UNDO_CAP {
+            self.undo.remove(0);
+        }
     }
 
     fn to_wire(&self) -> LedgerWire {
@@ -355,6 +486,8 @@ impl Ledger {
             seen_tree: self.seen_tree.clone(),
             seen_at: self.seen_at.clone(),
             overrides,
+            snoozed_until: self.snoozed_until.clone(),
+            undo: self.undo.clone(),
         }
     }
 
@@ -382,6 +515,8 @@ impl Ledger {
             seen_at: wire.seen_at,
             overrides,
             unparsable,
+            snoozed_until: wire.snoozed_until,
+            undo: wire.undo,
         }
     }
 
@@ -416,6 +551,9 @@ fn io_err(path: &Path, source: std::io::Error) -> LedgerError {
     }
 }
 
+// `Loaded` is the common case and the ledger is moved out of it immediately; boxing it would
+// buy an allocation per load to shrink a value that is never held in a collection.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum LoadResult {
     /// No ledger file: the engine performs first sight.

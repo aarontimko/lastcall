@@ -59,6 +59,12 @@ pub struct RootStatus {
     /// cut. Additive in Phase 4 (`status_version` stays 1).
     pub omitted: usize,
     pub groups: Vec<GroupStatus>,
+    /// This root's undo stack depth (`Pile::undo`); `0` when there is nothing to undo.
+    /// Additive in v1.11 (`status_version` stays 1).
+    pub undo: usize,
+    /// When this root stops being snoozed; `null` when it is not snoozed, and `null` for a
+    /// deadline that has already passed. Additive in v1.11 (`status_version` stays 1).
+    pub snoozed_until: Option<String>,
     pub notices: Vec<String>,
 }
 
@@ -219,6 +225,10 @@ impl RootStatus {
             pending,
             omitted: pile.map(|p| p.omitted).unwrap_or(0),
             groups,
+            // Both from the pile, which the engine stamped from the ledger with the
+            // expiry already applied (Amendment v1.11).
+            undo: pile.map(|p| p.undo).unwrap_or(0),
+            snoozed_until: pile.and_then(|p| p.snoozed_until.clone()),
             notices,
         }
     }
@@ -319,8 +329,20 @@ impl StatusReport {
                 .in_progress
                 .map(|ip| format!("  [{} in progress]", ip.as_str()))
                 .unwrap_or_default();
+            // Amendment v1.11: the two facts a headless reader would otherwise have to
+            // open the ledger for, appended in the order the JSON lists them.
+            let undo = if root.undo > 0 {
+                format!(" · {} undo", root.undo)
+            } else {
+                String::new()
+            };
+            let snoozed = root
+                .snoozed_until
+                .as_deref()
+                .map(|u| format!(" · snoozed until {}", crate::ledger::iso8601_date(u)))
+                .unwrap_or_default();
             out.push_str(&format!(
-                "{} ({branch}){badge}{in_progress}  {} pending\n",
+                "{} ({branch}){badge}{in_progress}  {} pending{undo}{snoozed}\n",
                 root.name(),
                 root.pending.len()
             ));
