@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use lastcall::tui::app::{AcceptFailed, App, Changed, Effect, FlagKind, RootMeta, Selection};
 use lastcall::tui::herdr::{AgentCandidate, Attention, Dot, HerdrUpdate, RootAgents, Scope};
-use lastcall::tui::input::{Action, EditKey, EditorKey, NoteKey, PickKey};
+use lastcall::tui::input::{Action, EditKey, EditorKey, NoteKey, PickKey, SnoozeKey};
 use lastcall::tui::render::{render, styles};
 use lastcall_engine::engine::{Engine, EngineOptions, SaveRequest};
 use lastcall_engine::env::Env;
@@ -812,9 +812,11 @@ fn tui_accept_controls() {
     assert!(frame.contains("[A accept file]"), "{frame}");
     assert_eq!(frame.matches("[a accept]").count(), 2, "{frame}");
     // Deliverable 4: at 100 columns `^A accept all` has already gone — the header's
-    // `[Accept All]` on the same frame says it, and `t hide empty` outlives it.
+    // `[Accept All]` on the same frame says it, and `t hide empty` outlives it. Amendment
+    // v1.11 puts `z undo` between them (this fixture marked its pile seen, so `z` has
+    // something to undo); it drops before `t` and after the accept phrases.
     assert!(
-        frame.contains("a accept hunk  A accept file  t hide empty"),
+        frame.contains("a accept hunk  A accept file  z undo  t hide empty"),
         "{frame}"
     );
     snapshot("tui_accept_controls", &app, W, H);
@@ -1961,4 +1963,137 @@ fn tui_editor_long_path_60x20() {
         "the path and the position did not move to make room for it: {dirty_header}"
     );
     snapshot("tui_editor_long_path_60x20", &app, 60, 20);
+}
+
+// ---- Phase 10: undo and snooze (Amendment v1.11) -----------------------------------------
+
+/// The clock the snooze scenes run on: 2026-09-14T00:00:00Z, so every deadline they write
+/// is a fixed date and the frames are reproducible.
+const SNOOZE_CLOCK: u64 = 1_789_344_000;
+
+/// Run the reducer's undo effect against the engine the way the loop does.
+fn run_undo(app: &mut App, engine: &mut Engine, effect: Option<Effect>) {
+    let Some(Effect::Undo(root)) = effect else {
+        panic!("an undo effect, got {effect:?}");
+    };
+    let result = engine.undo(&root).map_err(|e| AcceptFailed::of(&e));
+    app.undone(root, result);
+}
+
+/// Run the reducer's snooze effect against the engine the way the loop does.
+fn run_snooze(app: &mut App, engine: &mut Engine, effect: Option<Effect>) {
+    let Some(Effect::Snooze { root, days }) = effect else {
+        panic!("a snooze effect, got {effect:?}");
+    };
+    let result = engine.snooze(&root, days).map_err(|e| AcceptFailed::of(&e));
+    app.snoozed_result(root, result);
+}
+
+/// Deliverable 2: `z undo` is on the hint line only where `z` would do something. The two
+/// frames are the same app before and after one accept — the only thing that moved is the
+/// root's undo depth, which is what puts the hint up.
+#[test]
+fn tui_undo_hint() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    let alpha = root_named(&engine, "alpha");
+    select_row(&mut app, &alpha, "f1");
+    assert_eq!(app.roots[&alpha].pile.undo, 0, "nothing accepted yet");
+    let (frame, _) = draw(&app, W, H);
+    assert!(!frame.contains("z undo"), "{frame}");
+    snapshot("tui_undo_hint_absent", &app, W, H);
+
+    // Accept `f1`: the stack is one deep and the hint is on the line.
+    let (_, effect) = app.handle(Action::AcceptFile);
+    run_accept(&mut app, &mut engine, effect);
+    assert_eq!(app.roots[&alpha].pile.undo, 1);
+    // The accept's transient status owns the bottom row for 30 s; this frame is of the
+    // hint line that comes back after it, which is where the new hint lives.
+    app.status = None;
+    let (frame, _) = draw(&app, W, H);
+    assert!(frame.contains("z undo"), "{frame}");
+    snapshot("tui_undo_hint_present", &app, W, H);
+
+    // And `z` puts the file back, with the cursor on it.
+    let (_, effect) = app.handle(Action::Undo);
+    run_undo(&mut app, &mut engine, effect);
+    assert_eq!(status_text(&app), "undid accept of f1");
+    assert_eq!(
+        app.selection,
+        Some(Selection::Row(alpha.clone(), b"f1".to_vec()))
+    );
+    assert_eq!(app.roots[&alpha].pile.undo, 0, "the stack is empty again");
+}
+
+/// Deliverable 3: the snooze modal over the nav, asking how long. The field shows the
+/// digits as typed, and the box's own keys are on its last row.
+#[test]
+fn tui_snooze_modal() {
+    let scene = Scene::build();
+    let mut engine = scene.engine_with(EngineOptions {
+        clock: std::sync::Arc::new(lastcall_engine::ledger::FixedClock::at_unix(SNOOZE_CLOCK)),
+        ..EngineOptions::default()
+    });
+    let mut app = app_of(&mut engine);
+    let beta = root_named(&engine, "beta");
+    app.select(Some(Selection::Root(beta.clone())));
+    assert_eq!(app.handle(Action::Snooze), (Changed::Yes, None));
+    // `1` backspaced away, then `14`.
+    app.handle(Action::SnoozeEdit(SnoozeKey::Backspace));
+    for c in ['1', '4'] {
+        app.handle(Action::SnoozeEdit(SnoozeKey::Digit(c)));
+    }
+    let (frame, _) = draw(&app, W, H);
+    assert!(frame.contains("snooze beta for [14"), "{frame}");
+    snapshot("tui_snooze_modal", &app, W, H);
+
+    // Enter writes it and the repo leaves the nav.
+    let (_, effect) = app.handle(Action::SnoozeEdit(SnoozeKey::Apply));
+    run_snooze(&mut app, &mut engine, effect);
+    assert_eq!(status_text(&app), "snoozed beta until 2026-09-28");
+    assert!(!app.listed_roots().any(|v| v.meta.path == beta));
+}
+
+/// Design review F6: a scope count and a snooze count on the same bottom line. At 100
+/// columns both are spelled out; at 80 the line takes the next form down rather than
+/// clipping either count away.
+#[test]
+fn tui_scope_and_snooze_notice() {
+    let scene = Scene::build();
+    let mut engine = scene.engine_with(EngineOptions {
+        clock: std::sync::Arc::new(lastcall_engine::ledger::FixedClock::at_unix(SNOOZE_CLOCK)),
+        ..EngineOptions::default()
+    });
+    let mut app = app_of(&mut engine);
+    let alpha = root_named(&engine, "alpha");
+    let beta = root_named(&engine, "beta");
+
+    // beta is snoozed…
+    app.select(Some(Selection::Root(beta.clone())));
+    app.handle(Action::Snooze);
+    let (_, effect) = app.handle(Action::SnoozeEdit(SnoozeKey::Apply));
+    run_snooze(&mut app, &mut engine, effect);
+
+    // …and the workspace scope covers alpha and beta, leaving notes out.
+    herdr_connected(&mut app);
+    app.handle(Action::Herdr(HerdrUpdate::Scope(Some(Scope {
+        label: "alpha".to_owned(),
+        roots: [alpha, beta].into_iter().collect(),
+    }))));
+    app.herdr.scoped = true;
+    assert_eq!(app.snoozed_out(), 1);
+    assert_eq!(
+        app.bottom_notice(W).as_deref(),
+        Some("scope: alpha · 1 repo hidden (w shows all) · 1 snoozed (S shows)")
+    );
+    snapshot("tui_scope_and_snooze_notice", &app, W, H);
+
+    assert_eq!(
+        app.bottom_notice(80).as_deref(),
+        Some("scope: alpha · 1 hidden · 1 snoozed"),
+        "one form down, both counts still on the line"
+    );
+    app.handle(Action::Resize(80, 24));
+    snapshot("tui_scope_and_snooze_notice_80x24", &app, 80, 24);
 }

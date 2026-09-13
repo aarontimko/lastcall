@@ -3940,3 +3940,219 @@ fn pty_herdr_scope_toggle_and_the_agent_picker() {
     assert_clean_exit(&pty, since);
     rt.block_on(mock.shutdown());
 }
+
+// ---- Phase 10: undo and snooze (Amendment v1.11) -----------------------------------------
+
+/// How deep the root's undo stack is on disk, from `ledger.json`.
+fn undo_depth(fx: &Fixture, name: &str) -> usize {
+    fx.ledger(name)["undo"]
+        .as_array()
+        .map(Vec::len)
+        .unwrap_or(0)
+}
+
+/// Deliverable 2 through the real binary: `A` accepts a file, `z` puts it back — the row
+/// returns to the nav with the cursor on it, and the ledger on disk is what a second
+/// process would load, entry and all.
+#[test]
+fn pty_undo_file() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let Some(mut pty) = fx.spawn_tui(&bin()) else {
+        return;
+    };
+    wait_first_piles(&mut pty);
+    assert_eq!(undo_depth(&fx, "notes"), 0, "nothing accepted yet");
+
+    // notes has exactly one pending file.
+    select_until(&mut pty, "n2.md  M ");
+    pty.send(b"A").expect("A");
+    pty.wait_for(OVERLOADED, |s| {
+        status_is(s, "accepted n2.md") && s.contents().contains("nothing pending in notes")
+    })
+    .unwrap_or_else(|e| panic!("the accept: {e}\n{}", pty.screen_text()));
+    assert_eq!(undo_depth(&fx, "notes"), 1, "one entry on disk");
+
+    // `z` puts it back: the status names the file, the row returns, and the header counts
+    // it again.
+    let t = Instant::now();
+    pty.send(b"z").expect("z");
+    pty.wait_for(OVERLOADED, |s| {
+        let text = s.contents();
+        status_is(s, "undid accept of n2.md")
+            && text.contains("M n2.md")
+            && text.contains("3 repos · 6 files")
+    })
+    .unwrap_or_else(|e| panic!("the undo: {e}\n{}", pty.screen_text()));
+    note(&format!(
+        "PTY undo: the row is back after {:.3?}",
+        t.elapsed()
+    ));
+
+    let text = pty.screen_text();
+    let row = pty
+        .find_row(|r| r.contains("M n2.md"))
+        .unwrap_or_else(|| panic!("the restored row:\n{text}"));
+    assert!(
+        pty.inverse_at(row, 1),
+        "the cursor is on the file that came back:\n{text}"
+    );
+    assert_eq!(undo_depth(&fx, "notes"), 0, "the entry was spent");
+
+    // A second `z` has nothing left, and says so rather than reaching further back.
+    pty.send(b"z").expect("z again");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        status_is(s, "nothing to undo in notes")
+    })
+    .unwrap_or_else(|e| panic!("the empty stack: {e}\n{}", pty.screen_text()));
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}
+
+/// Deliverable 2, the sweep: `ctrl-a` writes one entry per root, so `z` in one of them
+/// puts that repo back and says how many others are still accepted. The sentence is the
+/// whole point — without it `z` after a sweep reads as an undo of the sweep.
+#[test]
+fn pty_undo_accept_all() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let Some(mut pty) = fx.spawn_tui(&bin()) else {
+        return;
+    };
+    wait_first_piles(&mut pty);
+
+    // Six files across three repos is under the confirm threshold, so `^A` folds at once.
+    pty.send(b"\x01").expect("ctrl-a");
+    pty.wait_for(OVERLOADED, |s| {
+        status_is(s, "accepted 6 files in 3 repos")
+            && s.contents().contains("3 repos · 0 files · 0 hunks")
+    })
+    .unwrap_or_else(|e| panic!("the sweep: {e}\n{}", pty.screen_text()));
+    for name in ["alpha", "beta", "notes"] {
+        assert_eq!(undo_depth(&fx, name), 1, "{name} has its own entry");
+    }
+
+    // `z` on alpha: alpha's three files come back, the other two repos do not. The pane's
+    // own sentence is the unambiguous marker — with every repo empty the *unselected* pane
+    // lists all three names, so a walk that stopped at `alpha  main` would never move.
+    select_until(&mut pty, "nothing pending in alpha");
+    pty.send(b"z").expect("z");
+    pty.wait_for(OVERLOADED, |s| {
+        status_is(
+            s,
+            "undid accept of 3 files in alpha (2 other repos have their own undo)",
+        )
+    })
+    .unwrap_or_else(|e| panic!("the sweep-aware sentence: {e}\n{}", pty.screen_text()));
+    pty.wait_for(Duration::from_secs(5), |s| {
+        let text = s.contents();
+        text.contains("3 repos · 3 files") && text.contains("M f1") && !text.contains("M n2.md")
+    })
+    .unwrap_or_else(|e| panic!("only alpha came back: {e}\n{}", pty.screen_text()));
+    assert_eq!(undo_depth(&fx, "alpha"), 0);
+    assert_eq!(undo_depth(&fx, "beta"), 1, "beta is still accepted");
+    assert_eq!(undo_depth(&fx, "notes"), 1, "and so is notes");
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}
+
+/// Deliverable 3 through the real binary: `s` on a repository row asks how long, Enter
+/// writes the deadline, the repository leaves the nav with a notice saying how to get it
+/// back, `S` shows it, and `s` on a shown one wakes it. The deadline is on disk, so the
+/// next process starts where this one left off.
+#[test]
+fn pty_snooze_repo() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let Some(mut pty) = fx.spawn_tui(&bin()) else {
+        return;
+    };
+    wait_first_piles(&mut pty);
+    assert!(fx.ledger("beta")["snoozed_until"].is_null(), "awake");
+
+    // (1) `s` on beta's repo row opens the modal, seeded with one day.
+    select_until(&mut pty, "beta  main · 2 files");
+    pty.send(b"s").expect("s");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        let text = s.contents();
+        text.contains("snooze beta for [1") && text.contains("Esc cancel")
+    })
+    .unwrap_or_else(|e| panic!("the snooze modal: {e}\n{}", pty.screen_text()));
+
+    // Esc costs nothing.
+    pty.send(b"\x1b").expect("esc");
+    pty.wait_for(Duration::from_secs(5), |s| !s.contents().contains("day(s)"))
+        .unwrap_or_else(|e| panic!("Esc closes it: {e}\n{}", pty.screen_text()));
+    assert!(fx.ledger("beta")["snoozed_until"].is_null(), "still awake");
+
+    // (2) `s` again, `3`, Enter: three days, written and off the nav.
+    pty.send(b"s").expect("s");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        s.contents().contains("snooze beta for [1")
+    })
+    .unwrap_or_else(|e| panic!("the modal again: {e}\n{}", pty.screen_text()));
+    pty.send(b"\x7f3").expect("backspace then 3");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        s.contents().contains("snooze beta for [3")
+    })
+    .unwrap_or_else(|e| panic!("the field takes digits: {e}\n{}", pty.screen_text()));
+    let t = Instant::now();
+    pty.send(b"\r").expect("enter");
+    pty.wait_for(OVERLOADED, |s| {
+        let text = s.contents();
+        text.contains("snoozed beta until 20")
+            && text.contains("1 snoozed (S shows)")
+            && !text.contains("A u1")
+            && text.contains("2 repos · 4 files")
+    })
+    .unwrap_or_else(|e| panic!("beta leaves the nav: {e}\n{}", pty.screen_text()));
+    note(&format!(
+        "PTY snooze: off the nav after {:.3?}",
+        t.elapsed()
+    ));
+    let deadline = fx.ledger("beta")["snoozed_until"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a deadline on disk: {}", fx.ledger("beta")))
+        .to_owned();
+    assert!(
+        deadline.ends_with('Z') && deadline.len() == 20,
+        "{deadline}"
+    );
+
+    // (3) `S` shows it again, and says so on its branch line. The nav pane is 26 columns
+    // wide, so what fits there is the word; the date itself is pinned at a nav width that
+    // holds it by `render_nav_says_when_a_repo_is_snoozed`.
+    pty.send(b"S").expect("shift-s");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        let text = s.contents();
+        text.contains("3 repos · 6 files") && text.contains("A u1") && text.contains("· snoozed")
+    })
+    .unwrap_or_else(|e| panic!("`S` shows it: {e}\n{}", pty.screen_text()));
+
+    // (4) and `s` on a shown one wakes it, with no question to ask.
+    select_until(&mut pty, "beta  main · 2 files");
+    pty.send(b"s").expect("s");
+    pty.wait_for(OVERLOADED, |s| {
+        status_is(s, "woke beta") && !s.contents().contains("snoozed until")
+    })
+    .unwrap_or_else(|e| panic!("the wake: {e}\n{}", pty.screen_text()));
+    assert!(
+        fx.ledger("beta")["snoozed_until"].is_null(),
+        "the deadline is off the ledger: {}",
+        fx.ledger("beta")
+    );
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}

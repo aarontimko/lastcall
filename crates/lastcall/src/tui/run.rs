@@ -60,14 +60,14 @@ use tokio::sync::mpsc;
 
 use super::app::{
     AcceptFailed, AcceptResult, App, Changed, EditOpen, Effect, FlagKind, FlagResult,
-    RestoreResult, RootMeta, SaveResult,
+    RestoreResult, RootMeta, SaveResult, SnoozeResult, UndoResult,
 };
 use super::clipboard::Osc52;
 use super::editor::EditorCommand;
 use super::herdr::{self, HerdrLink, HerdrPlan, HerdrUpdate, Link, ToastMsg};
 use super::input::{
     Action, EditorKey, Key, Keymap, editor_action, modal_action, note_action, pick_action, pointer,
-    to_action,
+    snooze_action, to_action,
 };
 use super::render::{HitMap, Pane, render};
 use super::term;
@@ -99,6 +99,13 @@ pub enum Local {
     /// An `Effect::Restore` finished. Shaped like `Accepted` though a restore covers one
     /// root, so the two reducers read the same way.
     Restored(Vec<(PathBuf, RestoreResult)>),
+    /// An `Effect::Undo` finished (Amendment v1.11): the root it covered and the result.
+    /// One root, never a list — `z` reverses the last accept in the repository the cursor
+    /// is in.
+    Undone(PathBuf, UndoResult),
+    /// An `Effect::Snooze` finished: the root it covered and the result (a wake comes back
+    /// with `until: None`).
+    Snoozed(PathBuf, SnoozeResult),
     /// An `Effect::Flag` or `Effect::Unflag` finished: the root it covered, **which of the
     /// two it was** (with the flag's words), and the ledger write's answer. One root, never
     /// a list — a flag is always one path.
@@ -223,6 +230,21 @@ impl Ui {
             match event {
                 Event::Key(_) => {
                     return match pick_action(event, &self.keymap) {
+                        Some(action) => self.app.handle(action),
+                        None => (Changed::No, None),
+                    };
+                }
+                Event::Resize(..) => {}
+                _ => return (Changed::No, None),
+            }
+        }
+        // The snooze modal is a number field, on the note modal's terms: `snooze_action`
+        // is consulted before the keymap and swallows it whole, so `s` typed into it is
+        // nothing rather than a second snooze, and only a non-printable `quit` survives.
+        if self.app.snooze.is_some() {
+            match event {
+                Event::Key(_) => {
+                    return match snooze_action(event, &self.keymap) {
                         Some(action) => self.app.handle(action),
                         None => (Changed::No, None),
                     };
@@ -361,6 +383,8 @@ impl Ui {
             Local::Pile(root, seq, pile) => self.app.apply(EngineEvent::Pile { root, seq, pile }),
             Local::Accepted(results) => (self.app.accepted(results), None),
             Local::Restored(results) => (self.app.restored(results), None),
+            Local::Undone(root, result) => (self.app.undone(root, result), None),
+            Local::Snoozed(root, result) => (self.app.snoozed_result(root, result), None),
             Local::Flagged { root, kind, result } => self.app.flagged(root, kind, result),
             Local::Staged { flag, result } => (self.app.staged(flag, result), None),
             Local::Exported { label, result } => (self.app.exported(label, result), None),
@@ -730,6 +754,51 @@ fn spawn_restore(
         });
         if let Some(results) = joined(restore, &tx, "restore").await {
             let _ = tx.send(Local::Restored(results));
+        }
+    });
+}
+
+/// `Effect::Undo`: one root's `Engine::undo` (the op and its rescan) in one `blocking`
+/// closure, the same shape as `spawn_accept` (Amendment v1.11).
+fn spawn_undo(engine: &Arc<Mutex<Engine>>, tx: mpsc::UnboundedSender<Local>, root: PathBuf) {
+    let engine = engine.clone();
+    tokio::spawn(async move {
+        let undo = {
+            let root = root.clone();
+            tokio::spawn(async move {
+                blocking(&engine, move |e| {
+                    e.undo(&root).map_err(|e| AcceptFailed::of(&e))
+                })
+                .await
+            })
+        };
+        if let Some(result) = joined(undo, &tx, "undo").await {
+            let _ = tx.send(Local::Undone(root, result));
+        }
+    });
+}
+
+/// `Effect::Snooze`: one root's `Engine::snooze` (or wake) and its rescan, off the UI task.
+/// The deadline is the engine's to compute, from its own injected clock.
+fn spawn_snooze(
+    engine: &Arc<Mutex<Engine>>,
+    tx: mpsc::UnboundedSender<Local>,
+    root: PathBuf,
+    days: Option<u32>,
+) {
+    let engine = engine.clone();
+    tokio::spawn(async move {
+        let snooze = {
+            let root = root.clone();
+            tokio::spawn(async move {
+                blocking(&engine, move |e| {
+                    e.snooze(&root, days).map_err(|e| AcceptFailed::of(&e))
+                })
+                .await
+            })
+        };
+        if let Some(result) = joined(snooze, &tx, "snooze").await {
+            let _ = tx.send(Local::Snoozed(root, result));
         }
     });
 }
@@ -1620,7 +1689,13 @@ pub fn run(
                         rescan = true;
                         ("timer", (Changed::No, None))
                     }
-                    _ = tick.tick() => ("tick", ui.app.handle(Action::Tick)),
+                    _ = tick.tick() => ("tick", {
+                        // Design review F4: the TUI has no wall clock of its own, so the
+                        // loop reads the engine's injected one and hands the value to the
+                        // reducer, which is what decides a snooze has run out.
+                        ui.app.wall = Some(clock.now());
+                        ui.app.handle(Action::Tick)
+                    }),
                     },
                 };
                 // Everything else already queued joins this pass, so a burst of piles or a
@@ -1666,6 +1741,10 @@ pub fn run(
                         }
                         Effect::Restore(reqs) => {
                             spawn_restore(&watcher.engine, local_tx.clone(), reqs)
+                        }
+                        Effect::Undo(root) => spawn_undo(&watcher.engine, local_tx.clone(), root),
+                        Effect::Snooze { root, days } => {
+                            spawn_snooze(&watcher.engine, local_tx.clone(), root, days)
                         }
                         Effect::EditInline(open) => {
                             spawn_read_rendered(&watcher.engine, local_tx.clone(), open)

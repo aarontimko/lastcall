@@ -11,17 +11,17 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use lastcall_engine::count::with_thousands;
 use lastcall_engine::engine::{
     AcceptRequest, Accepted, EngineError, Flagged, RenderedHunk, RestoreRequest, Restored,
-    RootState, Saved,
+    RootState, Saved, Snoozed, Undone,
 };
 use lastcall_engine::git::{Mode, Oid};
 use lastcall_engine::headstate::InProgress;
 use lastcall_engine::hunks::{Expanded, Hunk, Tag};
-use lastcall_engine::ledger::{FlagHunk, FlagSummary, LedgerError};
+use lastcall_engine::ledger::{FlagHunk, FlagSummary, LedgerError, iso8601_date, parse_iso8601};
 use lastcall_engine::ops::{OpsError, Refused, Rendered};
 use lastcall_engine::roots::Badge;
 use lastcall_engine::scan::{Annotation, Change, Collapsed, Entry, Group, Pile, Row};
@@ -29,9 +29,13 @@ use lastcall_engine::store::{Current, RootKind};
 use lastcall_engine::watcher::EngineEvent;
 
 use super::herdr::{AgentCandidate, HerdrUpdate, HerdrView, Link, ToastRequest};
-use super::input::{Action, EditKey, EditorKey, Keymap, NoteKey, PickKey};
+use super::input::{Action, EditKey, EditorKey, Keymap, NoteKey, PickKey, SnoozeKey};
 use super::textbuf::{TextBuf, Wrap};
+use unicode_width::UnicodeWidthStr;
 
+/// The columns the bottom line keeps for the status text or the hints beside the notice
+/// (design review F6): below this the notice takes a shorter form.
+pub const NOTICE_MIN_TEXT: usize = 30;
 pub const NAV_WIDTH_DEFAULT: u16 = 28;
 pub const NAV_WIDTH_MIN: u16 = 16;
 pub const NAV_WIDTH_MAX: u16 = 60;
@@ -370,6 +374,18 @@ pub enum Effect {
         /// The flag this export is of, for the answer's status line (F2).
         label: String,
         export: String,
+    },
+    /// Run `Engine::undo` for one root and feed the result to [`App::undone`]
+    /// (Amendment v1.11). One root, never a list: `z` reverses the last accept in the
+    /// repository the cursor is in, and an accept-all that spanned several roots left one
+    /// entry on each of them.
+    Undo(PathBuf),
+    /// Run `Engine::snooze` for one root — `days` for a snooze, `None` to wake it — and
+    /// feed the result to [`App::snoozed_result`]. The deadline is computed engine-side
+    /// from its injected clock, so the TUI never reads a wall clock to build one.
+    Snooze {
+        root: PathBuf,
+        days: Option<u32>,
     },
     /// `agent.focus` on this pane id (herdr's own public id, never a name); the result
     /// comes back as `HerdrUpdate::Focused`.
@@ -755,6 +771,69 @@ impl NoteEntry {
     }
 }
 
+/// The snooze modal (Amendment v1.11): which repository, and for how many days.
+///
+/// `days` is the digits as typed rather than a number, so backspacing to nothing shows an
+/// empty field instead of jumping to `0`; [`SnoozeEntry::value`] is what Enter applies, and
+/// it is the one place the 1..=365 range lives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnoozeEntry {
+    pub root: PathBuf,
+    /// The repository's display name, captured when `s` was pressed: a pile landing while
+    /// the modal is open must not retitle it.
+    pub name: String,
+    /// The digits typed so far. Seeded with [`SNOOZE_DEFAULT_DAYS`].
+    pub days: String,
+}
+
+/// The snooze the modal offers before anything is typed (§6.7 as amended by v1.11).
+pub const SNOOZE_DEFAULT_DAYS: u32 = 1;
+/// The longest snooze the modal accepts. A year of not looking at a repository is already
+/// further than anyone means; past it the digit is refused rather than clamped, so the
+/// field never shows a number the write would not use.
+pub const SNOOZE_MAX_DAYS: u32 = 365;
+/// What `s` says when the selection is not a repository row.
+pub const SNOOZE_NEEDS_ROOT: &str = "select a repository row to snooze it";
+/// What `z` says when this root's undo stack is empty. The engine refuses with the same
+/// words; this is the reducer's own path, for a root whose pile already says `undo: 0`.
+pub const NOTHING_TO_UNDO: &str = "nothing to undo";
+pub const UNDO_IN_PROGRESS: &str = "undo in progress";
+pub const SNOOZE_IN_PROGRESS: &str = "snooze in progress";
+
+impl SnoozeEntry {
+    /// The number Enter applies: the digits as an integer, clamped into 1..=365, or the
+    /// default when the field has been emptied.
+    pub fn value(&self) -> u32 {
+        match self.days.parse::<u32>() {
+            Ok(0) | Err(_) => SNOOZE_DEFAULT_DAYS,
+            Ok(n) => n.min(SNOOZE_MAX_DAYS),
+        }
+    }
+
+    /// Type one digit, refusing anything that would take the field past
+    /// [`SNOOZE_MAX_DAYS`] — so the field only ever shows a number the write would use.
+    fn digit(&mut self, c: char) -> Changed {
+        let mut next = self.days.clone();
+        next.push(c);
+        // A leading run of zeros is not a number anyone typed on purpose.
+        let trimmed = next.trim_start_matches('0');
+        match trimmed.parse::<u32>() {
+            Ok(n) if (1..=SNOOZE_MAX_DAYS).contains(&n) => {
+                self.days = trimmed.to_owned();
+                Changed::Yes
+            }
+            _ => Changed::No,
+        }
+    }
+
+    fn backspace(&mut self) -> Changed {
+        match self.days.pop() {
+            Some(_) => Changed::Yes,
+            None => Changed::No,
+        }
+    }
+}
+
 /// The agent picker: which pane the export goes to when more than one is a candidate. The
 /// flag is already on disk by the time this opens, so `Esc` loses nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -869,6 +948,13 @@ pub type RestoreResult = Result<Restored, AcceptFailed>;
 /// One root's flag (or unflag) result, on the same terms.
 pub type FlagResult = Result<Flagged, AcceptFailed>;
 
+/// One root's undo result (Amendment v1.11), classified like an accept's: an undo is a
+/// ledger write on one root and fails for the same two reasons.
+pub type UndoResult = Result<Undone, AcceptFailed>;
+
+/// One root's snooze (or wake) result, on the same terms.
+pub type SnoozeResult = Result<Snoozed, AcceptFailed>;
+
 /// The inline editor's save result (deliverable 8), classified like an accept's: a save is
 /// an op on one root's ledger and fails for the same two reasons.
 pub type SaveResult = Result<Saved, AcceptFailed>;
@@ -967,6 +1053,10 @@ pub struct App {
     /// nothing pending as a name-and-branch row. While `true` those rows go, except a repo
     /// whose agent wants attention. Independent of the herdr scope (`w`).
     pub hide_empty: bool,
+    /// `shift-s` (Amendment v1.11): while `true` the snoozed repositories are listed too,
+    /// each with a `snoozed until <date>` suffix on its branch line, and `s` on one of them
+    /// wakes it. Session state like `hide_empty`, never written back.
+    pub show_snoozed: bool,
     /// The nav index the current selection had when it was last **found** on the nav —
     /// written by `select` and refreshed by `reconcile_selection` whenever the selection
     /// survives a pile (design review F7). It is the only thing left to go on when the
@@ -977,6 +1067,15 @@ pub struct App {
     pub status: Option<StatusLine>,
     /// Advanced by `Tick`; render computes ages from it, never from `Instant::now()`.
     pub now: Instant,
+    /// The wall clock at the last `Tick`, as the **engine's** injected clock reports it
+    /// (design review F4). The TUI has no clock of its own and never calls
+    /// `SystemTime::now()`: the loop reads `engine.options().clock` once and hands the
+    /// value down, so a `FixedClock` test and the snapshot tier decide what "now" is.
+    ///
+    /// `None` until the first tick, and in any test that does not set it — a snooze then
+    /// simply never expires under the cursor, which is the safe direction: the next scan's
+    /// pile carries the engine's own verdict.
+    pub wall: Option<SystemTime>,
     /// Terminal size from the last `Resize`, used for page sizes and the hidden-nav rule
     /// in `handle` (render uses the frame's own area).
     pub size: (u16, u16),
@@ -995,6 +1094,19 @@ pub struct App {
     pub restoring: Option<Restoring>,
     /// The note modal, if open. While it is, every key edits the note except `ctrl-c`.
     pub note: Option<NoteEntry>,
+    /// The snooze modal, if open (Amendment v1.11). While it is, every key goes to the day
+    /// count except the non-printable quit spellings — the note modal's rule, for the same
+    /// reason: a field that has the keyboard owns it.
+    pub snooze: Option<SnoozeEntry>,
+    /// The undo the loop is running, if any (the root it covers); a second `z` meanwhile is
+    /// refused, exactly as a second accept is.
+    pub undoing: Option<PathBuf>,
+    /// The roots the last `ctrl-a` actually folded, when it covered more than one. It is
+    /// what lets an undo's status line say how many other repositories are still holding an
+    /// entry from that same fold; cleared by the next accept-all.
+    pub accept_all_roots: Vec<PathBuf>,
+    /// The snooze or wake the loop is running, if any (the root it covers).
+    pub snoozing: Option<PathBuf>,
     /// The agent picker, if open (deliverable 10).
     pub picker: Option<Picker>,
     /// The inline editor, if open (deliverable 8). While it is, it replaces the diff pane
@@ -1066,10 +1178,12 @@ impl App {
             full_paths: false,
             show_remote: false,
             hide_empty: false,
+            show_snoozed: false,
             nav_anchor: None,
             help: false,
             status: None,
             now: Instant::now(),
+            wall: None,
             size: (80, 24),
             refreshing: false,
             orphan_piles: BTreeMap::new(),
@@ -1077,6 +1191,10 @@ impl App {
             accepting: None,
             restoring: None,
             note: None,
+            snooze: None,
+            undoing: None,
+            accept_all_roots: Vec::new(),
+            snoozing: None,
             picker: None,
             editor: None,
             edit_pending: None,
@@ -1125,15 +1243,157 @@ impl App {
     /// attention flag (a ready episode, acked or not, or a blocked agent) keeps it;
     /// `working`/`idle`/`unknown` annotate a root, they never decide one.
     pub fn is_listed(&self, view: &RootView) -> bool {
+        let attention = || {
+            self.herdr
+                .flag(&view.meta.path)
+                .is_some_and(|f| f.attention())
+        };
         self.loading.is_none()
             && !self.herdr.scope_pending
             && self.herdr.in_scope(&view.meta.path)
-            && (!self.hide_empty
-                || view.listed()
-                || self
-                    .herdr
-                    .flag(&view.meta.path)
-                    .is_some_and(|f| f.attention()))
+            && (!self.hide_empty || view.listed() || attention())
+            // Amendment v1.11: a snoozed repository is off the nav until its deadline
+            // passes, `shift-s` shows it, or its agent wants attention — the `hide_empty`
+            // exception exactly, and for the same reason: an agent that is blocked or done
+            // is news the reader asked for before they asked for quiet.
+            && (view.pile.snoozed_until.is_none() || self.show_snoozed || attention())
+    }
+
+    /// Whether `view` is snoozed as far as this frame is concerned.
+    ///
+    /// The pile's deadline is the engine's own verdict — it stamps `None` for a deadline
+    /// that has already passed under its injected clock — and [`App::handle`]'s `Tick` arm
+    /// drops one that expires while the TUI is open, so this is a field test and never a
+    /// clock read (design review F4).
+    pub fn snoozed<'a>(&self, view: &'a RootView) -> Option<&'a str> {
+        view.pile.snoozed_until.as_deref()
+    }
+
+    /// Snoozed repositories the nav is not showing: the `N` of the `· N snoozed (S shows)`
+    /// notice. Counted with [`Self::is_listed`]'s other rules in force, so the number
+    /// promises exactly what `shift-s` will reveal.
+    pub fn snoozed_out(&self) -> usize {
+        if self.show_snoozed {
+            return 0;
+        }
+        self.roots
+            .values()
+            .filter(|v| v.pile.snoozed_until.is_some())
+            .filter(|v| {
+                self.loading.is_none()
+                    && !self.herdr.scope_pending
+                    && self.herdr.in_scope(&v.meta.path)
+                    && (!self.hide_empty
+                        || v.listed()
+                        || self.herdr.flag(&v.meta.path).is_some_and(|f| f.attention()))
+                    && !self.herdr.flag(&v.meta.path).is_some_and(|f| f.attention())
+            })
+            .count()
+    }
+
+    /// The snooze half of the bottom-line notice, or `None` when nothing is snoozed away.
+    /// The key comes from the keymap (`Keymap::table` canonicalises `shift-s` to `S`), so a
+    /// rebound `show_snoozed` renames the notice with it.
+    pub fn snooze_notice(&self) -> Option<String> {
+        let n = self.snoozed_out();
+        let key = self
+            .keys_for("show_snoozed")
+            .first()
+            .cloned()
+            .unwrap_or_default();
+        (n > 0).then(|| format!("{n} snoozed ({key} shows)"))
+    }
+
+    /// The bottom line's right-hand notice at `width`, longest form that still leaves the
+    /// status text or the hints room to read (design review F6).
+    ///
+    /// `render_status` has no width tiers and gains none here: the notice offers three
+    /// forms and the line takes the first that fits.
+    ///
+    /// 1. `scope: alpha · 2 repos hidden (w shows all) · 1 snoozed (S shows)`
+    /// 2. `scope: alpha · 2 hidden · 1 snoozed` — the parentheticals go; the keys are in
+    ///    the help overlay, and the counts are the part that cannot be guessed.
+    /// 3. `2 hidden · 1 snoozed` — the scope's label goes too.
+    ///
+    /// A form is taken while it leaves at least [`NOTICE_MIN_TEXT`] columns beside it;
+    /// below that the shortest form stands and `render_status`'s own rule gives it the line
+    /// alone rather than clipping the status text to nothing.
+    pub fn bottom_notice(&self, width: u16) -> Option<String> {
+        let forms = self.notice_forms();
+        let first = forms.first()?;
+        let width = width as usize;
+        for form in &forms {
+            if width.saturating_sub(form.width() + 2) >= NOTICE_MIN_TEXT {
+                return Some(form.clone());
+            }
+        }
+        Some(forms.last().unwrap_or(first).clone())
+    }
+
+    /// The three forms of [`Self::bottom_notice`], longest first. Empty when there is
+    /// neither a scope nor a snooze to report.
+    ///
+    /// The ladder is the **combined** notice's rule (design review F6, whose two shortened
+    /// examples are both combinations). A scope count on its own keeps the mandatory
+    /// wording it has had since deliverable 8 — dropping its label would leave `2 hidden`
+    /// with nothing to say what hid them, which is the trap that made the notice mandatory
+    /// in the first place — and `render_status` gives it the line alone when the frame is
+    /// too narrow for both, exactly as before.
+    pub fn notice_forms(&self) -> Vec<String> {
+        let scope = self.herdr.active_scope();
+        let hidden = self.scoped_out();
+        let snoozed = self.snoozed_out();
+        if scope.is_none() && snoozed == 0 {
+            return Vec::new();
+        }
+        let key = self
+            .keys_for("show_snoozed")
+            .first()
+            .cloned()
+            .unwrap_or_default();
+        let join = |parts: Vec<String>| parts.join(" · ");
+        let full = join(
+            [
+                scope.map(|s| {
+                    format!(
+                        "scope: {} · {} hidden (w shows all)",
+                        s.label,
+                        plural(hidden, "repo")
+                    )
+                }),
+                (snoozed > 0).then(|| format!("{snoozed} snoozed ({key} shows)")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+        );
+        let medium = join(
+            [
+                scope.map(|s| format!("scope: {} · {hidden} hidden", s.label)),
+                (snoozed > 0).then(|| format!("{snoozed} snoozed")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+        );
+        let short = join(
+            [
+                scope.map(|_| format!("{hidden} hidden")),
+                (snoozed > 0).then(|| format!("{snoozed} snoozed")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+        );
+        let mut forms = vec![full];
+        if scope.is_some() && snoozed > 0 {
+            for form in [medium, short] {
+                if forms.last() != Some(&form) {
+                    forms.push(form);
+                }
+            }
+        }
+        forms
     }
 
     /// Begin the launch hold over the roots `sync_roots` just installed (see [`Loading`]).
@@ -2585,6 +2845,249 @@ impl App {
         (Changed::Yes, Some(Effect::Restore(reqs)))
     }
 
+    // ---- undo (Amendment v1.11) ----------------------------------------------------------
+
+    /// `z`: reverse the most recent accept in the selected root.
+    ///
+    /// The depth is read from the selected root's [`Pile::undo`] — the TUI never reads a
+    /// ledger (design review F8) — so a stack another lastcall filled is `z`-able here the
+    /// moment its pile lands, and an empty one is answered without a round trip.
+    fn request_undo(&mut self) -> (Changed, Option<Effect>) {
+        let Some(root) = self.flagged_root() else {
+            return (Changed::No, None);
+        };
+        if self.undoing.is_some() {
+            self.set_status(UNDO_IN_PROGRESS);
+            return (Changed::Yes, None);
+        }
+        if self.roots.get(&root).is_some_and(|v| v.pile.undo == 0) {
+            self.set_status(format!("{NOTHING_TO_UNDO} in {}", self.root_name(&root)));
+            return (Changed::Yes, None);
+        }
+        self.undoing = Some(root.clone());
+        self.set_status("undoing…");
+        (Changed::Yes, Some(Effect::Undo(root)))
+    }
+
+    /// The loop's answer to an [`Effect::Undo`]: the pile takes the watcher path, the
+    /// selection moves onto the first path the entry put back, `undoing` clears, and one
+    /// status line says what came back.
+    ///
+    /// The selection move is the point of the whole gesture: the file the reader accepted
+    /// by mistake has to be under the cursor again, not somewhere down the list. The focus
+    /// is left where it was, so `z` from the diff pane leaves them reading the diff.
+    pub fn undone(&mut self, root: PathBuf, result: UndoResult) -> Changed {
+        let inflight = self.undoing.take();
+        let mut changed = if inflight.is_some() {
+            Changed::Yes
+        } else {
+            Changed::No
+        };
+        let name = self.root_name(&root);
+        let mut parts: Vec<String> = Vec::new();
+        match result {
+            Ok(res) => {
+                let refusals: Vec<String> = res
+                    .outcome
+                    .refused
+                    .iter()
+                    .map(|r| r.message("undone"))
+                    .collect();
+                let paths = res.paths.clone();
+                changed = changed.or(self.apply_pile(root.clone(), res.seq, res.pile));
+                if refusals.is_empty() && !paths.is_empty() {
+                    parts.push(match paths.as_slice() {
+                        [one] => format!("undid accept of {one}"),
+                        many => format!("undid accept of {} in {name}", plural(many.len(), "file")),
+                    });
+                    if let Some(k) = self.other_undo_depth(&root) {
+                        parts.push(format!("({k} other repos have their own undo)"));
+                    }
+                    self.select_undone(&root, &paths);
+                } else if refusals.is_empty() {
+                    parts.push(format!("{NOTHING_TO_UNDO} in {name}"));
+                }
+                parts.extend(refusals);
+            }
+            Err(AcceptFailed::LedgerBusy) => {
+                parts.push(format!("ledger busy in {name} — try again"))
+            }
+            Err(AcceptFailed::Other(e)) => parts.push(format!("{name}: {e}")),
+        }
+        if inflight.is_none() && parts.is_empty() {
+            return changed;
+        }
+        self.set_status(parts.join(" "));
+        Changed::Yes
+    }
+
+    /// How many **other** repositories the last accept-all covered still have an undo entry
+    /// of their own, or `None` when that is not what this undo was part of.
+    ///
+    /// `ctrl-a` across several roots writes one entry per root, so undoing in one of them
+    /// leaves the rest accepted; the sentence says so rather than letting the reader
+    /// believe `z` reached all of them. The roots are the ones the accept-all actually
+    /// covered (recorded by [`App::accepted`]), filtered by what their piles report now, so
+    /// a stack another process emptied meanwhile is not counted.
+    fn other_undo_depth(&self, root: &Path) -> Option<usize> {
+        let k = self
+            .accept_all_roots
+            .iter()
+            .filter(|r| r.as_path() != root)
+            .filter(|r| self.roots.get(*r).is_some_and(|v| v.pile.undo > 0))
+            .count();
+        (k > 0).then_some(k)
+    }
+
+    /// Put the cursor on the first path the undo put back, if the pile has it as a row.
+    fn select_undone(&mut self, root: &Path, paths: &[String]) {
+        let Some(first) = paths.first() else {
+            return;
+        };
+        let bytes = first.as_bytes().to_vec();
+        if self
+            .roots
+            .get(root)
+            .is_some_and(|v| v.row(&bytes).is_some())
+        {
+            let focus = self.focus;
+            self.select(Some(Selection::Row(root.to_path_buf(), bytes)));
+            self.focus = focus;
+        }
+    }
+
+    // ---- snooze (Amendment v1.11) --------------------------------------------------------
+
+    /// `s`: open the snooze modal on the selected repository row, or wake a snoozed
+    /// repository that `shift-s` is showing.
+    ///
+    /// Only a **repository row** answers: `s` on a file would have to guess which repository
+    /// the reader meant, and guessing wrong hides work.
+    fn snooze_selected(&mut self) -> (Changed, Option<Effect>) {
+        let Some(Selection::Root(root)) = self.selection.clone() else {
+            self.set_status(SNOOZE_NEEDS_ROOT);
+            return (Changed::Yes, None);
+        };
+        if self.snoozing.is_some() {
+            self.set_status(SNOOZE_IN_PROGRESS);
+            return (Changed::Yes, None);
+        }
+        // Already snoozed (so `shift-s` is showing it): `s` wakes it, no modal. There is
+        // nothing to ask — the answer to "for how long?" is "not at all".
+        if self
+            .roots
+            .get(&root)
+            .is_some_and(|v| v.pile.snoozed_until.is_some())
+        {
+            self.snoozing = Some(root.clone());
+            return (Changed::Yes, Some(Effect::Snooze { root, days: None }));
+        }
+        self.snooze = Some(SnoozeEntry {
+            name: self.root_name(&root),
+            root,
+            days: SNOOZE_DEFAULT_DAYS.to_string(),
+        });
+        (Changed::Yes, None)
+    }
+
+    /// One keystroke inside the snooze modal.
+    fn snooze_key(&mut self, key: SnoozeKey) -> (Changed, Option<Effect>) {
+        let Some(entry) = &mut self.snooze else {
+            return (Changed::No, None);
+        };
+        match key {
+            SnoozeKey::Digit(c) => (entry.digit(c), None),
+            SnoozeKey::Backspace => (entry.backspace(), None),
+            SnoozeKey::Cancel => {
+                self.snooze = None;
+                (Changed::Yes, None)
+            }
+            SnoozeKey::Apply => {
+                let entry = self.snooze.take().expect("checked above");
+                let days = entry.value();
+                self.snoozing = Some(entry.root.clone());
+                (
+                    Changed::Yes,
+                    Some(Effect::Snooze {
+                        root: entry.root,
+                        days: Some(days),
+                    }),
+                )
+            }
+        }
+    }
+
+    /// The loop's answer to an [`Effect::Snooze`]: the pile takes the watcher path (which
+    /// takes the repository off the nav and moves the selection through
+    /// `reconcile_selection`), `snoozing` clears, and the status line names the deadline.
+    pub fn snoozed_result(&mut self, root: PathBuf, result: SnoozeResult) -> Changed {
+        let inflight = self.snoozing.take();
+        let mut changed = if inflight.is_some() {
+            Changed::Yes
+        } else {
+            Changed::No
+        };
+        let name = self.root_name(&root);
+        let mut parts: Vec<String> = Vec::new();
+        match result {
+            Ok(res) => {
+                parts.extend(res.outcome.refused.iter().map(|r| r.message("snoozed")));
+                let until = res.until.clone();
+                changed = changed.or(self.apply_pile(root, res.seq, res.pile));
+                if parts.is_empty() {
+                    parts.push(match &until {
+                        Some(u) => format!("snoozed {name} until {}", iso8601_date(u)),
+                        None => format!("woke {name}"),
+                    });
+                }
+            }
+            Err(AcceptFailed::LedgerBusy) => {
+                parts.push(format!("ledger busy in {name} — try again"))
+            }
+            Err(AcceptFailed::Other(e)) => parts.push(format!("{name}: {e}")),
+        }
+        if inflight.is_none() && parts.is_empty() {
+            return changed;
+        }
+        self.set_status(parts.join(" · "));
+        Changed::Yes
+    }
+
+    /// Drop every held deadline the wall clock has passed (design review F4). `Changed::Yes`
+    /// when at least one repository came back, which is also when the nav has to re-list.
+    ///
+    /// The engine clears the field on its own next ledger write and stamps an expired
+    /// deadline as `None` at every scan; this is the same verdict applied to the piles the
+    /// TUI is already holding, so a repository comes back within a second of its deadline
+    /// rather than at the next scan or the next restart.
+    fn drop_expired_snoozes(&mut self) -> Changed {
+        let Some(wall) = self.wall else {
+            return Changed::No;
+        };
+        let expired: Vec<PathBuf> = self
+            .roots
+            .iter()
+            .filter(|(_, v)| {
+                v.pile
+                    .snoozed_until
+                    .as_deref()
+                    .and_then(parse_iso8601)
+                    .is_some_and(|at| at <= wall)
+            })
+            .map(|(p, _)| p.clone())
+            .collect();
+        if expired.is_empty() {
+            return Changed::No;
+        }
+        for root in expired {
+            if let Some(view) = self.roots.get_mut(&root) {
+                view.pile.snoozed_until = None;
+            }
+        }
+        self.reconcile_selection();
+        Changed::Yes
+    }
+
     /// The loop's answer to an `Effect::Restore`: the pile goes through the same path as a
     /// watcher pile (seq included), the §6.7 advance rule runs for the selection the restore
     /// was asked from, `restoring` clears and one status line says what happened.
@@ -2708,6 +3211,15 @@ impl App {
             return changed;
         };
         let taken = refusals.is_empty() && errors.is_empty();
+        // Amendment v1.11: an accept-all that folded more than one repository left an undo
+        // entry on each of them, and the next `z` says so.
+        if matches!(scope, AcceptScope::All) {
+            self.accept_all_roots = if ok_roots.len() > 1 {
+                ok_roots.clone()
+            } else {
+                Vec::new()
+            };
+        }
         self.advance_after(&scope, before, taken);
         let accepted: usize = files
             .iter()
@@ -3088,6 +3600,14 @@ impl App {
         {
             return (Changed::No, None);
         }
+        // The snooze modal, on the note modal's terms: `Ui::event` resolves every key
+        // through `snooze_action` first, so only its own edits, a quit and the events that
+        // pass through every modal reach here.
+        if self.snooze.is_some()
+            && !matches!(action, Tick | Resize(..) | SnoozeEdit(_) | Quit | Herdr(_))
+        {
+            return (Changed::No, None);
+        }
         // `Herdr` passes both gates: news from the herdr task is not a keystroke, and it
         // must never close the confirm modal or the help overlay (deliverable 5).
         if self.confirm.is_some()
@@ -3238,6 +3758,14 @@ impl App {
             },
             Flag => return self.open_note(),
             Unflag => return self.unflag_selected(),
+            Undo => return self.request_undo(),
+            Snooze => return self.snooze_selected(),
+            ShowSnoozed => {
+                self.show_snoozed = !self.show_snoozed;
+                self.reconcile_selection();
+                Changed::Yes
+            }
+            SnoozeEdit(key) => return self.snooze_key(key),
             Edit => return self.edit_inline(),
             EditExternal => return self.edit_external(),
             Editor(key) => return self.editor_key(key),
@@ -3346,8 +3874,14 @@ impl App {
                     Some(_) => Changed::Yes,
                     None => Changed::No,
                 };
+                // Amendment v1.11 / design review F4: a snooze that runs out while the
+                // TUI is open comes back here rather than at the next scan, and the
+                // comparison is against the engine's clock as the loop last reported it —
+                // the reducer owns the decision, `render` never sees a deadline that is
+                // already past.
+                let woke = self.drop_expired_snoozes();
                 // The loading pane carries a seconds counter.
-                if cue_went || self.loading.is_some() {
+                if woke == Changed::Yes || cue_went || self.loading.is_some() {
                     Changed::Yes
                 } else {
                     status
@@ -3902,6 +4436,51 @@ pub(crate) mod testfix {
                 pile,
             }),
         )
+    }
+
+    /// An engine answer for an `Effect::Undo`: a clean outcome, the paths it put back, and
+    /// `pile` as the rescan.
+    pub fn undone_ok(name: &str, seq: u64, paths: &[&str], pile: Pile) -> (PathBuf, UndoResult) {
+        (
+            root(name),
+            Ok(Undone {
+                outcome: lastcall_engine::ops::Outcome::default(),
+                op: Some(lastcall_engine::ledger::UndoOp::AcceptFile),
+                paths: paths.iter().map(|p| (*p).to_owned()).collect(),
+                seq,
+                pile,
+            }),
+        )
+    }
+
+    /// An engine answer for an `Effect::Snooze`: `until` is `None` for a wake.
+    pub fn snoozed_ok(
+        name: &str,
+        seq: u64,
+        until: Option<&str>,
+        pile: Pile,
+    ) -> (PathBuf, SnoozeResult) {
+        (
+            root(name),
+            Ok(Snoozed {
+                outcome: lastcall_engine::ops::Outcome::default(),
+                until: until.map(str::to_owned),
+                seq,
+                pile,
+            }),
+        )
+    }
+
+    /// `pile` with a snooze deadline on it, as the engine stamps one at scan time.
+    pub fn snoozed_pile(mut pile: Pile, until: &str) -> Pile {
+        pile.snoozed_until = Some(until.to_owned());
+        pile
+    }
+
+    /// `pile` with an undo stack `n` deep, as the engine stamps one at scan time.
+    pub fn undo_pile(mut pile: Pile, n: usize) -> Pile {
+        pile.undo = n;
+        pile
     }
 
     /// `pile` without the rows named.
@@ -8653,5 +9232,419 @@ mod tests {
         let sel = app.sel;
         app.handle(Action::Copy);
         assert_eq!(app.sel, sel, "still there to shrink");
+    }
+
+    // ---- deliverable 2: undo ---------------------------------------------------------------
+
+    /// `z` asks the engine for this root's last entry and, when it comes back, puts the
+    /// cursor on the file that came with it — the whole point of the gesture is that the
+    /// row you accepted by mistake is under the cursor again.
+    #[test]
+    fn app_z_undoes_the_selected_root_and_puts_the_cursor_on_the_file() {
+        let mut app = three_roots();
+        // alpha with `f1` accepted and one entry on the stack.
+        app.apply(pile_event_seq(
+            "alpha",
+            1,
+            undo_pile(without(pile("alpha"), &["f1"]), 1),
+        ));
+        app.select(Some(row("alpha", "f2")));
+        let (changed, effect) = app.handle(Action::Undo);
+        assert_eq!(changed, Changed::Yes);
+        assert_eq!(effect, Some(Effect::Undo(root("alpha"))));
+        assert_eq!(status(&app), "undoing…");
+        assert_eq!(app.undoing.as_deref(), Some(root("alpha").as_path()));
+
+        let (r, res) = undone_ok("alpha", 2, &["f1"], undo_pile(pile("alpha"), 0));
+        assert_eq!(app.undone(r, res), Changed::Yes);
+        assert_eq!(status(&app), "undid accept of f1");
+        assert_eq!(app.selection, Some(row("alpha", "f1")));
+        assert_eq!(app.undoing, None, "the key works again");
+    }
+
+    /// A stack the pile already reports as empty is answered by the reducer: no effect, so
+    /// no engine work and no ledger lock for an answer that is already known.
+    #[test]
+    fn app_z_on_an_empty_stack_says_so_without_asking_the_engine() {
+        let mut app = three_roots();
+        app.select(Some(row("alpha", "f1")));
+        let (changed, effect) = app.handle(Action::Undo);
+        assert_eq!(changed, Changed::Yes);
+        assert_eq!(effect, None, "the pile already said `undo: 0`");
+        assert_eq!(status(&app), "nothing to undo in alpha");
+        assert_eq!(app.undoing, None);
+        // And a second `z` while one is in flight is refused rather than queued.
+        app.apply(pile_event_seq("alpha", 1, undo_pile(pile("alpha"), 1)));
+        assert!(app.handle(Action::Undo).1.is_some());
+        assert_eq!(app.handle(Action::Undo), (Changed::Yes, None));
+        assert_eq!(status(&app), "undo in progress");
+    }
+
+    /// `ctrl-a` writes one entry per root, so undoing in one of them leaves the others
+    /// accepted. The sentence says how many, rather than letting `z` read as a whole-sweep
+    /// undo (§6.7 as amended by v1.11).
+    #[test]
+    fn app_z_after_an_accept_all_names_the_other_repos() {
+        let mut app = three_roots();
+        app.select(Some(Selection::Root(root("alpha"))));
+        app.handle(Action::AcceptAll);
+        app.accepted(vec![
+            accepted_ok("alpha", 2, undo_pile(Pile::default(), 1)),
+            accepted_ok("beta", 2, undo_pile(Pile::default(), 1)),
+            accepted_ok("notes", 2, undo_pile(Pile::default(), 1)),
+        ]);
+        assert_eq!(app.accept_all_roots.len(), 3, "all three were swept");
+
+        app.select(Some(Selection::Root(root("alpha"))));
+        assert_eq!(
+            app.handle(Action::Undo).1,
+            Some(Effect::Undo(root("alpha")))
+        );
+        let (r, res) = undone_ok("alpha", 3, &["f1", "f2"], undo_pile(pile("alpha"), 0));
+        app.undone(r, res);
+        assert_eq!(
+            status(&app),
+            "undid accept of 2 files in alpha (2 other repos have their own undo)"
+        );
+
+        // Once the others' stacks are gone the clause goes with them.
+        app.apply(pile_event_seq("beta", 3, undo_pile(Pile::default(), 0)));
+        app.apply(pile_event_seq("notes", 3, undo_pile(Pile::default(), 0)));
+        app.select(Some(Selection::Root(root("alpha"))));
+        app.apply(pile_event_seq("alpha", 4, undo_pile(pile("alpha"), 1)));
+        app.handle(Action::Undo);
+        let (r, res) = undone_ok("alpha", 5, &["f1"], undo_pile(pile("alpha"), 0));
+        app.undone(r, res);
+        assert_eq!(status(&app), "undid accept of f1");
+    }
+
+    /// An engine that found nothing (a second process drained the stack between the pile
+    /// and the key) says so in the same words the reducer's own short circuit uses.
+    #[test]
+    fn app_z_against_a_stack_another_process_drained_says_nothing_to_undo() {
+        let mut app = three_roots();
+        app.apply(pile_event_seq("beta", 1, undo_pile(pile("beta"), 1)));
+        app.select(Some(Selection::Root(root("beta"))));
+        app.handle(Action::Undo);
+        let (r, res) = undone_ok("beta", 2, &[], undo_pile(pile("beta"), 0));
+        app.undone(r, res);
+        assert_eq!(status(&app), "nothing to undo in beta");
+        assert_eq!(app.selection, Some(Selection::Root(root("beta"))));
+    }
+
+    // ---- deliverable 3: snooze -------------------------------------------------------------
+
+    /// `s` on a file row would have to guess which repository the reader meant. It says so
+    /// instead, and opens nothing.
+    #[test]
+    fn app_s_needs_a_repository_row() {
+        let mut app = three_roots();
+        app.select(Some(row("alpha", "f1")));
+        let (changed, effect) = app.handle(Action::Snooze);
+        assert_eq!(changed, Changed::Yes);
+        assert_eq!(effect, None);
+        assert_eq!(status(&app), SNOOZE_NEEDS_ROOT);
+        assert_eq!(app.snooze, None, "no modal opened");
+    }
+
+    /// The modal's field is the digits as typed: it seeds with the default, takes digits,
+    /// refuses one that would leave the 1..=365 range, backspaces to empty, and an empty
+    /// field applies the default rather than zero.
+    #[test]
+    fn app_snooze_modal_edits_the_day_count_and_clamps_the_range() {
+        let mut app = three_roots();
+        app.select(Some(Selection::Root(root("alpha"))));
+        assert_eq!(app.handle(Action::Snooze), (Changed::Yes, None));
+        let entry = app.snooze.clone().expect("the modal is open");
+        assert_eq!(entry.days, SNOOZE_DEFAULT_DAYS.to_string());
+        assert_eq!(entry.name, "alpha");
+
+        let digit = |app: &mut App, c: char| app.handle(Action::SnoozeEdit(SnoozeKey::Digit(c)));
+        // `1` then `4` is 14 days.
+        assert_eq!(digit(&mut app, '4'), (Changed::Yes, None));
+        assert_eq!(app.snooze.as_ref().unwrap().days, "14");
+        assert_eq!(app.snooze.as_ref().unwrap().value(), 14);
+        // 145 still fits; 1450 does not, and the field is left showing 145.
+        assert_eq!(digit(&mut app, '5'), (Changed::Yes, None));
+        assert_eq!(digit(&mut app, '0'), (Changed::No, None));
+        assert_eq!(app.snooze.as_ref().unwrap().days, "145");
+
+        // Backspace to empty; the field shows nothing rather than jumping to 0.
+        for _ in 0..3 {
+            assert_eq!(
+                app.handle(Action::SnoozeEdit(SnoozeKey::Backspace)),
+                (Changed::Yes, None)
+            );
+        }
+        assert_eq!(app.snooze.as_ref().unwrap().days, "");
+        assert_eq!(
+            app.handle(Action::SnoozeEdit(SnoozeKey::Backspace)),
+            (Changed::No, None),
+            "nothing left to delete, nothing to redraw"
+        );
+        assert_eq!(app.snooze.as_ref().unwrap().value(), SNOOZE_DEFAULT_DAYS);
+        // A leading zero is not a number anyone typed on purpose.
+        digit(&mut app, '0');
+        assert_eq!(app.snooze.as_ref().unwrap().days, "");
+        digit(&mut app, '7');
+        assert_eq!(app.snooze.as_ref().unwrap().days, "7");
+
+        // Esc closes it and writes nothing.
+        assert_eq!(
+            app.handle(Action::SnoozeEdit(SnoozeKey::Cancel)),
+            (Changed::Yes, None)
+        );
+        assert_eq!(app.snooze, None);
+        assert_eq!(app.snoozing, None);
+
+        // Enter applies the number the field is showing.
+        app.handle(Action::Snooze);
+        digit(&mut app, '3');
+        let (changed, effect) = app.handle(Action::SnoozeEdit(SnoozeKey::Apply));
+        assert_eq!(changed, Changed::Yes);
+        assert_eq!(
+            effect,
+            Some(Effect::Snooze {
+                root: root("alpha"),
+                days: Some(13),
+            })
+        );
+        assert_eq!(app.snooze, None, "the modal closed with the key");
+    }
+
+    /// The deadline the engine wrote takes the repository off the nav; `shift-s` shows it
+    /// again, and `s` on a repository that is already snoozed wakes it without a modal.
+    #[test]
+    fn app_snooze_takes_the_repo_off_the_nav_and_shift_s_shows_it() {
+        let mut app = three_roots();
+        app.select(Some(Selection::Root(root("beta"))));
+        app.handle(Action::Snooze);
+        app.handle(Action::SnoozeEdit(SnoozeKey::Apply));
+        let (r, res) = snoozed_ok(
+            "beta",
+            2,
+            Some("2026-09-20T09:00:00Z"),
+            snoozed_pile(pile("beta"), "2026-09-20T09:00:00Z"),
+        );
+        assert_eq!(app.snoozed_result(r, res), Changed::Yes);
+        assert_eq!(status(&app), "snoozed beta until 2026-09-20");
+        assert_eq!(app.snoozing, None);
+
+        let listed = |app: &App| -> Vec<String> {
+            app.roots
+                .values()
+                .filter(|v| app.is_listed(v))
+                .map(|v| v.meta.name.clone())
+                .collect()
+        };
+        assert_eq!(listed(&app), vec!["alpha".to_owned(), "notes".to_owned()]);
+        assert_eq!(app.snoozed_out(), 1);
+        assert_eq!(
+            app.snooze_notice().as_deref(),
+            Some("1 snoozed (S shows)"),
+            "the keymap canonicalises shift-s to S"
+        );
+
+        // `shift-s` shows it again, and the notice goes with it.
+        assert_eq!(app.handle(Action::ShowSnoozed).0, Changed::Yes);
+        assert_eq!(
+            listed(&app),
+            vec!["alpha".to_owned(), "beta".to_owned(), "notes".to_owned()]
+        );
+        assert_eq!(app.snoozed_out(), 0);
+        assert_eq!(app.snooze_notice(), None);
+        assert_eq!(
+            app.snoozed(&app.roots[&root("beta")]),
+            Some("2026-09-20T09:00:00Z"),
+            "shown is not the same as awake"
+        );
+
+        // `s` on it now wakes it: no modal, no question.
+        app.select(Some(Selection::Root(root("beta"))));
+        let (changed, effect) = app.handle(Action::Snooze);
+        assert_eq!(changed, Changed::Yes);
+        assert_eq!(app.snooze, None, "nothing to ask");
+        assert_eq!(
+            effect,
+            Some(Effect::Snooze {
+                root: root("beta"),
+                days: None,
+            })
+        );
+        let (r, res) = snoozed_ok("beta", 3, None, pile("beta"));
+        app.snoozed_result(r, res);
+        assert_eq!(status(&app), "woke beta");
+        assert_eq!(app.snoozed(&app.roots[&root("beta")]), None);
+    }
+
+    /// A snoozed repository whose agent wants attention is listed anyway — the `hide_empty`
+    /// exception exactly, and for the same reason (Amendment v1.11).
+    #[test]
+    fn app_a_snoozed_repo_with_attention_is_listed_anyway() {
+        use crate::tui::herdr::{Attention, HerdrUpdate, RootAgents};
+        let mut app = three_roots();
+        app.apply(pile_event_seq(
+            "beta",
+            1,
+            snoozed_pile(pile("beta"), "2026-09-20T09:00:00Z"),
+        ));
+        assert!(!app.is_listed(&app.roots[&root("beta")]));
+        assert_eq!(app.snoozed_out(), 1);
+
+        app.handle(Action::Herdr(HerdrUpdate::Connected {
+            version: "0.8.2".to_owned(),
+            protocol: 21,
+        }));
+        app.handle(Action::Herdr(HerdrUpdate::Roots(
+            [(
+                root("beta"),
+                RootAgents {
+                    status: Attention::Blocked,
+                    agents: 1,
+                    pane: Some("w1:p1".to_owned()),
+                    agent: Some("claude".to_owned()),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        )));
+        assert!(
+            app.is_listed(&app.roots[&root("beta")]),
+            "a blocked agent is news the reader asked for"
+        );
+        assert_eq!(
+            app.snoozed_out(),
+            0,
+            "and the notice does not promise a row that is already on the nav"
+        );
+    }
+
+    /// Design review F4: the TUI has no wall clock, so the loop hands `Tick` the engine's.
+    /// A deadline the clock has passed is dropped and the repository comes back, without
+    /// waiting for a scan or a restart.
+    #[test]
+    fn app_a_snooze_that_expires_under_the_cursor_comes_back_on_the_next_tick() {
+        let mut app = three_roots();
+        let deadline = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_789_344_000);
+        let until = lastcall_engine::ledger::iso8601(deadline);
+        assert_eq!(until, "2026-09-14T00:00:00Z");
+        app.apply(pile_event_seq(
+            "beta",
+            1,
+            snoozed_pile(pile("beta"), &until),
+        ));
+        assert!(!app.is_listed(&app.roots[&root("beta")]));
+
+        // A tick a second short of the deadline leaves it alone.
+        app.wall = Some(deadline - std::time::Duration::from_secs(1));
+        app.handle(Action::Tick);
+        assert!(!app.is_listed(&app.roots[&root("beta")]));
+
+        // The deadline itself is the boundary: at it, the snooze is over.
+        app.wall = Some(deadline);
+        assert_eq!(app.handle(Action::Tick).0, Changed::Yes);
+        assert_eq!(app.roots[&root("beta")].pile.snoozed_until, None);
+        assert!(app.is_listed(&app.roots[&root("beta")]));
+        assert_eq!(app.snoozed_out(), 0);
+    }
+
+    /// A draft root has no git of its own, but the ledger and the nav treat it like any
+    /// other root, so `s` works on it (§5 draft roots, Amendment v1.11).
+    #[test]
+    fn app_a_draft_root_snoozes_like_a_git_root() {
+        let mut app = three_roots();
+        assert_eq!(app.roots[&root("notes")].meta.kind, RootKind::Draft);
+        app.select(Some(Selection::Root(root("notes"))));
+        app.handle(Action::Snooze);
+        assert_eq!(app.snooze.as_ref().map(|e| e.name.as_str()), Some("notes"));
+        let (_, effect) = app.handle(Action::SnoozeEdit(SnoozeKey::Apply));
+        assert_eq!(
+            effect,
+            Some(Effect::Snooze {
+                root: root("notes"),
+                days: Some(SNOOZE_DEFAULT_DAYS),
+            })
+        );
+        let (r, res) = snoozed_ok(
+            "notes",
+            2,
+            Some("2026-09-15T00:00:00Z"),
+            snoozed_pile(pile("notes"), "2026-09-15T00:00:00Z"),
+        );
+        app.snoozed_result(r, res);
+        assert_eq!(status(&app), "snoozed notes until 2026-09-15");
+        assert!(!app.is_listed(&app.roots[&root("notes")]));
+    }
+
+    /// Design review F6: the bottom-line notice shrinks a form at a time, and only when a
+    /// scope count and a snooze count are on the line together. A scope count on its own
+    /// keeps the mandatory wording it has had since Phase 9.
+    #[test]
+    fn app_bottom_notice_shrinks_only_when_both_counts_are_on_the_line() {
+        use crate::tui::herdr::{HerdrUpdate, Scope};
+        let mut app = three_roots();
+        app.herdr.scoped = true;
+        app.handle(Action::Herdr(HerdrUpdate::Scope(Some(Scope {
+            label: "alpha".to_owned(),
+            roots: [root("alpha"), root("beta")].into_iter().collect(),
+        }))));
+
+        // Scope alone: one form, at every width.
+        assert_eq!(
+            app.notice_forms(),
+            vec!["scope: alpha · 1 repo hidden (w shows all)".to_owned()]
+        );
+        assert_eq!(
+            app.bottom_notice(40).as_deref(),
+            Some("scope: alpha · 1 repo hidden (w shows all)"),
+            "a narrow frame gives it the row rather than shortening it"
+        );
+
+        // With a snooze as well there are three, longest first.
+        app.apply(pile_event_seq(
+            "beta",
+            1,
+            snoozed_pile(pile("beta"), "2026-09-20T09:00:00Z"),
+        ));
+        assert_eq!(
+            app.notice_forms(),
+            vec![
+                "scope: alpha · 1 repo hidden (w shows all) · 1 snoozed (S shows)".to_owned(),
+                "scope: alpha · 1 hidden · 1 snoozed".to_owned(),
+                "1 hidden · 1 snoozed".to_owned(),
+            ]
+        );
+        assert_eq!(
+            app.bottom_notice(100).as_deref(),
+            Some("scope: alpha · 1 repo hidden (w shows all) · 1 snoozed (S shows)")
+        );
+        assert_eq!(
+            app.bottom_notice(80).as_deref(),
+            Some("scope: alpha · 1 hidden · 1 snoozed")
+        );
+        assert_eq!(
+            app.bottom_notice(50).as_deref(),
+            Some("1 hidden · 1 snoozed")
+        );
+        assert_eq!(
+            app.bottom_notice(20).as_deref(),
+            Some("1 hidden · 1 snoozed"),
+            "below the shortest form it stands and takes the row"
+        );
+
+        // Nothing to report at all: no notice, and the hints keep the row.
+        let mut plain = three_roots();
+        assert_eq!(plain.notice_forms(), Vec::<String>::new());
+        assert_eq!(plain.bottom_notice(100), None);
+        plain.apply(pile_event_seq(
+            "beta",
+            1,
+            snoozed_pile(pile("beta"), "2026-09-20T09:00:00Z"),
+        ));
+        assert_eq!(
+            plain.notice_forms(),
+            vec!["1 snoozed (S shows)".to_owned()],
+            "a snooze count on its own has one form too"
+        );
     }
 }

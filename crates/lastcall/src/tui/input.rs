@@ -92,6 +92,20 @@ pub enum Action {
     Flag,
     /// Clear every flag on the selected file.
     Unflag,
+    /// `z`: reverse the most recent accept in the selected root (Amendment v1.11). The
+    /// ledger's undo stack is per root and shared by every lastcall over the same state
+    /// directory, so what `z` pops is whatever landed last, this process's or another's.
+    Undo,
+    /// `s`: open the snooze modal on the selected **repository row**, or wake a snoozed
+    /// repository that `shift-s` is showing. Anything else selected says so and does
+    /// nothing.
+    Snooze,
+    /// `shift-s`: list the snoozed repositories for this session. Session state, never
+    /// written back — the same shape as `t`.
+    ShowSnoozed,
+    /// One keystroke inside the snooze modal. Never key-bound: while the modal is open
+    /// [`snooze_action`] resolves every key before the keymap, so a digit is a digit.
+    SnoozeEdit(SnoozeKey),
     /// Open the selected file in the **inline** editor, at the line of the hunk under the
     /// cursor (deliverable 8; `Effect::EditInline`). The same rows `EditExternal` opens,
     /// and only when the engine will hand the bytes over: a binary or oversize file says
@@ -152,6 +166,23 @@ pub enum NoteKey {
     /// Enter: write the flag and close the modal.
     Send,
     /// Esc: close the modal, write nothing.
+    Cancel,
+}
+
+/// What one keystroke does to the snooze modal (Amendment v1.11).
+///
+/// The modal holds a number, not text, so it has its own tiny vocabulary rather than
+/// [`EditKey`]: digits and backspace edit it, Enter applies, Esc cancels. Everything else
+/// is swallowed, on the note modal's terms — including a printable `quit` binding, because
+/// `q` while a field has the keyboard is content, not a command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnoozeKey {
+    /// An ASCII digit typed into the day count.
+    Digit(char),
+    Backspace,
+    /// Enter: write the snooze and close.
+    Apply,
+    /// Esc: close, write nothing.
     Cancel,
 }
 
@@ -337,6 +368,29 @@ pub fn note_action(event: &Event, keymap: &Keymap, enhanced: bool) -> Option<Act
     quit_only(keymap, key)
 }
 
+/// The snooze modal's action for one key event, consulted before the keymap while
+/// `App.snooze` is open (Amendment v1.11).
+///
+/// A number field, so the vocabulary is small on purpose: an ASCII digit types, Backspace
+/// deletes, Enter applies, Esc cancels. Every other key is swallowed except a
+/// **non-printable** `quit` binding (`ctrl-c` by default), which quits as it does under the
+/// note modal — a printable one types nothing here, because a letter is not a digit, but it
+/// must not quit either while a field has the keyboard.
+pub fn snooze_action(event: &Event, keymap: &Keymap) -> Option<Action> {
+    let Event::Key(k) = event else {
+        return None;
+    };
+    let key = Key::of(k)?;
+    let snooze = match key.code {
+        KeyCode::Esc => SnoozeKey::Cancel,
+        KeyCode::Enter => SnoozeKey::Apply,
+        KeyCode::Backspace => SnoozeKey::Backspace,
+        KeyCode::Char(c) if c.is_ascii_digit() && !key.ctrl && !key.alt => SnoozeKey::Digit(c),
+        _ => return quit_only(keymap, key),
+    };
+    Some(Action::SnoozeEdit(snooze))
+}
+
 /// The picker's action for one key event, on the same terms as [`note_action`]. The picker
 /// shows a list, so `j`/`k` move it as they do in the nav.
 pub fn pick_action(event: &Event, keymap: &Keymap) -> Option<Action> {
@@ -381,11 +435,14 @@ pub const DEFAULT_KEYMAP: &[(&str, &[&str])] = &[
     ("toggle_full_paths", &["f"]),
     ("toggle_remote", &["o"]),
     ("hide_empty", &["t"]),
+    ("snooze", &["s"]),
+    ("show_snoozed", &["shift-s"]),
     ("accept", &["a"]),
     ("accept_file", &["shift-a"]),
     ("accept_all", &["ctrl-a"]),
     ("restore", &["u"]),
     ("restore_file", &["shift-u"]),
+    ("undo", &["z"]),
     ("flag", &["m"]),
     ("unflag", &["shift-m"]),
     ("select", &["v"]),
@@ -442,11 +499,14 @@ impl Action {
             "toggle_full_paths" => Action::ToggleFullPaths,
             "toggle_remote" => Action::ToggleRemote,
             "hide_empty" => Action::HideEmpty,
+            "snooze" => Action::Snooze,
+            "show_snoozed" => Action::ShowSnoozed,
             "accept" => Action::Accept,
             "accept_file" => Action::AcceptFile,
             "accept_all" => Action::AcceptAll,
             "restore" => Action::Restore,
             "restore_file" => Action::RestoreFile,
+            "undo" => Action::Undo,
             "flag" => Action::Flag,
             "unflag" => Action::Unflag,
             "select" => Action::Select,
@@ -480,11 +540,17 @@ impl Action {
             "toggle_remote" => "show org/repo",
             // 23 columns: the overlay caps a description at 30 (design review F15).
             "hide_empty" => "hide / show empty repos",
+            // Amendment v1.11. Every description is capped at 30 columns by the overlay
+            // (design review F15), which is why these say `this repo` and not `this
+            // repository`.
+            "snooze" => "snooze this repo for a while",
+            "show_snoozed" => "show / hide snoozed repos",
             "accept" => "accept the hunk or the selected entry",
             "accept_file" => "accept the whole file",
             "accept_all" => "accept everything listed",
             "restore" => "restore the hunk",
             "restore_file" => "restore the whole file",
+            "undo" => "undo the last accept",
             "flag" => "flag it with a note",
             "unflag" => "clear the file's flags",
             // Deliverable 7 wrote this description out in full ("open the file in $EDITOR at
@@ -1105,9 +1171,10 @@ mod tests {
 
     #[test]
     fn input_override_replaces_defaults_rather_than_appending() {
-        // `z`, not `v`: `v` is `select`'s default since deliverable 9, and binding it to a
-        // second action is the `Duplicate` this test is not about.
-        let km = Keymap::from_config(&keys(&[("quit", &["x"]), ("scroll_up", &["z"])])).unwrap();
+        // `c`, not `v` or `z`: `v` is `select`'s default since deliverable 9 and `z` is
+        // `undo`'s since Amendment v1.11, and binding either to a second action is the
+        // `Duplicate` this test is not about.
+        let km = Keymap::from_config(&keys(&[("quit", &["x"]), ("scroll_up", &["c"])])).unwrap();
         assert_eq!(to_action(&key('x'), &km), Some(Action::Quit));
         assert_eq!(to_action(&key('q'), &km), None, "q no longer quits");
         assert_eq!(
@@ -1115,7 +1182,7 @@ mod tests {
             None,
             "ctrl-c no longer quits either: the entry replaced both defaults"
         );
-        assert_eq!(to_action(&key('z'), &km), Some(Action::ScrollUp(1)));
+        assert_eq!(to_action(&key('c'), &km), Some(Action::ScrollUp(1)));
         let table = km.table();
         let quit = table.iter().position(|(n, _)| n == "quit").unwrap();
         assert_eq!(table[quit].1, vec!["x".to_owned()]);
@@ -1126,7 +1193,7 @@ mod tests {
         );
         assert_eq!(
             table.last().unwrap(),
-            &("scroll_up".to_owned(), vec!["z".to_owned()]),
+            &("scroll_up".to_owned(), vec!["c".to_owned()]),
             "a newly bound action is appended"
         );
         let untouched = table.iter().find(|(n, _)| n == "nav_up").unwrap();
@@ -1584,6 +1651,10 @@ mod tests {
             (Action::RestoreFile, "key"),
             (Action::Flag, "key"),
             (Action::Unflag, "key"),
+            (Action::Undo, "key"),
+            (Action::Snooze, "key"),
+            (Action::ShowSnoozed, "key"),
+            (Action::SnoozeEdit(SnoozeKey::Apply), "modal-note"),
             (Action::Select, "key"),
             (Action::Copy, "key"),
             (Action::SelectTo(0), "mouse"),
@@ -1651,6 +1722,10 @@ mod tests {
             | Action::RestoreFile
             | Action::Flag
             | Action::Unflag
+            | Action::Undo
+            | Action::Snooze
+            | Action::ShowSnoozed
+            | Action::SnoozeEdit(_)
             | Action::Select
             | Action::Copy
             | Action::SelectTo(_)
@@ -1664,9 +1739,9 @@ mod tests {
             | Action::Ack
             | Action::Jump
             | Action::ScopeToggle
-            | Action::Herdr(_) => 44,
+            | Action::Herdr(_) => 48,
         };
-        assert_eq!(table.len(), 44);
+        assert_eq!(table.len(), 48);
     }
 
     #[test]
@@ -2016,5 +2091,74 @@ mod tests {
             .collect();
         assert_eq!(reqs.len(), 3);
         assert_eq!(reqs, expected, "exactly the held piles, in nav order");
+    }
+
+    /// The snooze modal resolves its own keys, like the note editor: digits and the three
+    /// controls, and nothing from the keymap except a non-printable spelling of `quit`.
+    /// Without that last rule `s` (snooze) or `z` (undo) would fire from inside the field.
+    #[test]
+    fn input_snooze_modal_swallows_the_keymap_and_takes_digits() {
+        let km = Keymap::defaults();
+        let snooze = |e: &Event| snooze_action(e, &km);
+        assert_eq!(
+            snooze(&key('3')),
+            Some(Action::SnoozeEdit(SnoozeKey::Digit('3')))
+        );
+        assert_eq!(
+            snooze(&key_code(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(Action::SnoozeEdit(SnoozeKey::Apply))
+        );
+        assert_eq!(
+            snooze(&key_code(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(Action::SnoozeEdit(SnoozeKey::Cancel))
+        );
+        assert_eq!(
+            snooze(&key_code(KeyCode::Backspace, KeyModifiers::NONE)),
+            Some(Action::SnoozeEdit(SnoozeKey::Backspace))
+        );
+        // The keymap's own letters do nothing here.
+        for c in ['s', 'z', 'a', 'j', 'q'] {
+            assert_eq!(snooze(&key(c)), None, "{c} is not the modal's");
+        }
+        // A non-printable quit still quits — the same escape hatch the note editor has.
+        assert_eq!(
+            snooze(&key_code(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Some(Action::Quit)
+        );
+        // `ctrl-3` is not a digit anyone typed into the field.
+        assert_eq!(
+            snooze(&key_code(KeyCode::Char('3'), KeyModifiers::CONTROL)),
+            None
+        );
+    }
+
+    /// Amendment v1.11's three keys are bound, unshadowed, and described in words the
+    /// overlay can print (design review F15 caps a description at 30 columns).
+    #[test]
+    fn input_undo_and_snooze_are_bound_and_described() {
+        let km = Keymap::defaults();
+        let table = km.table();
+        for (action, spec) in [("undo", "z"), ("snooze", "s"), ("show_snoozed", "S")] {
+            let (_, specs) = table
+                .iter()
+                .find(|(n, _)| n == action)
+                .unwrap_or_else(|| panic!("{action} is in the table"));
+            assert_eq!(specs.first().map(String::as_str), Some(spec), "{action}");
+            let desc = Action::describe(action);
+            assert!(!desc.is_empty(), "{action} has words");
+            assert!(desc.chars().count() <= 30, "{action}: {desc:?}");
+        }
+        assert_eq!(
+            km.lookup(Key::of(&KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE)).unwrap()),
+            Some(Action::Undo)
+        );
+        assert_eq!(
+            km.lookup(Key::of(&KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)).unwrap()),
+            Some(Action::Snooze)
+        );
+        assert_eq!(
+            km.lookup(Key::of(&KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT)).unwrap()),
+            Some(Action::ShowSnoozed)
+        );
     }
 }

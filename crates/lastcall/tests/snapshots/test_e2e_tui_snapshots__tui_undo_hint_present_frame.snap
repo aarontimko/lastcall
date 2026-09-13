@@ -2,11 +2,12 @@
 source: crates/lastcall/tests/test_e2e_tui_snapshots.rs
 expression: frame
 ---
-"lastcall  3 repos · 4 files · 3 hunks  standalone  [Accept All]                           watching W"
+"lastcall  3 repos · 5 files · 7 hunks  standalone  [Accept All]                           watching W"
 "┌──────────────────────────┬───────────────────────────────────────────────────────────────────────┐"
-"│alpha                     │package-lock.json  M  +2,879 −2,666    [A accept file] [U restore file]│"
-"│  main · 1 file           │collapsed (glob) · +2,879 −2,666                             [e expand]│"
-"│  M pack… ⊟  +2,879 −2,666│                                                                       │"
+"│alpha                     │f2  M  +1 −0                           [A accept file] [U restore file]│"
+"│  main · 2 files          │@@ -1 +1,2 @@                           [a accept] [u restore] [m flag]│"
+"│  M f2  +1 −0             │ b                                                                     │"
+"│  M parse.rs  +10 −2      │+agent edit                                                            │"
 "│──────────────────────────│                                                                       │"
 "│beta                      │                                                                       │"
 "│  main · 2 files          │                                                                       │"
@@ -29,6 +30,5 @@ expression: frame
 "│                          │                                                                       │"
 "│                          │                                                                       │"
 "│                          │                                                                       │"
-"│                          │                                                                       │"
 "└──────────────────────────┴───────────────────────────────────────────────────────────────────────┘"
-"↑↓ scroll  ← back  a/A accept file  ^A accept all  z undo  t hide empty  Tab focus  ? help  q quit  "
+"↑↓ select  ⏎ open  n/p hunk  a accept hunk  A accept file  z undo  t hide empty  ? help  q quit     "
