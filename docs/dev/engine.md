@@ -693,6 +693,8 @@ $EDITOR admits of.
       ],
       "omitted": 0,
       "groups": [{"kind": "upstream", "paths": ["u1"]}],
+      "undo": 0,
+      "snoozed_until": "2026-09-20T09:00:00Z | null",
       "notices": ["root-level and scan notices"]
     }
   ]
@@ -715,6 +717,17 @@ the number of changed paths beyond the row cap that this scan did not hash (see 
 the pipeline); `0` whenever everything changed is in `pending`, and the root's `notices`
 name the cap when it is not. `pending` never holds more than `row_cap` non-override rows.
 Readers that predate the field ignore it; `Pile::omitted` deserializes as `0` when absent.
+
+`undo` and `snoozed_until` (additive, Phase 10 / Amendment v1.11; `status_version` stays 1)
+are the two per-root ledger fields the TUI also reads through `Pile`. `undo` is the depth of
+the root's undo stack, `0` when there is nothing to undo and at most `ledger::UNDO_CAP` (20).
+`snoozed_until` is the snooze deadline as ISO-8601 UTC, and it is `null` both when the root
+was never snoozed and when the deadline has passed: expiry is decided by the engine's
+injected `Clock` at scan time, so a report never shows a snooze that is already over. Neither
+field changes what `status` scans or lists; a snoozed root is still scanned and still
+reported with all its pending rows, because snooze is a view in the TUI and not a filter.
+Readers that predate the fields ignore them; `Pile::undo` deserializes as `0` and
+`Pile::snoozed_until` as `null` when absent.
 
 `state_dir`, `store` and `ledger_written_at` (additive, Phase 9a / Amendment v1.9;
 `status_version` stays 1) name **which store this run read**. `state_dir` is the resolved

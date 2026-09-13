@@ -1781,6 +1781,7 @@ fn first_sight(
 pub(crate) mod tests {
     use super::*;
     use crate::config::ConfigSource;
+    use crate::ledger::FixedClock;
     use crate::scan::{Change, Row};
     use crate::status::StatusReport;
     use crate::store::tests::fixture_env;
@@ -2198,6 +2199,84 @@ pub(crate) mod tests {
         let gone = StatusReport::build(&mut engine, None).unwrap();
         assert_eq!(gone.roots[0].ledger_written_at, None);
         assert_eq!(gone.roots[0].store, r.store);
+    }
+
+    /// Amendment v1.11: `status --json` gains two additive per-root fields and the human
+    /// report two suffixes. `status_version` stays 1; the golden
+    /// (`crates/lastcall/tests/golden/status_multi_repo.json`) carries both at their zero
+    /// values for every root.
+    #[test]
+    fn status_reports_the_undo_depth_and_the_snooze_deadline() {
+        let repo = FixtureRepo::new("eng-status-ux").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        // 2026-09-14T00:00:00Z, so a one-day snooze lands on 2026-09-15.
+        let options = EngineOptions {
+            clock: Arc::new(FixedClock::at_unix(1_789_344_000)),
+            ..EngineOptions::default()
+        };
+        let mut engine = open_engine_with(&repo, &state, Config::default(), options);
+        let root = only_root(&engine);
+        assert!(engine.scan(&root).unwrap().is_empty(), "first sight");
+
+        // Nothing accepted, nothing snoozed: both fields at their zero values.
+        let clean = StatusReport::build(&mut engine, None).unwrap();
+        assert_eq!(clean.roots[0].undo, 0);
+        assert_eq!(clean.roots[0].snoozed_until, None);
+        let v: serde_json::Value = serde_json::from_str(&clean.to_json()).unwrap();
+        assert_eq!(v["roots"][0]["undo"], 0);
+        assert_eq!(v["roots"][0]["snoozed_until"], serde_json::Value::Null);
+        assert!(
+            clean
+                .render_human()
+                .contains("\neng-status-ux (main)  0 pending\n"),
+            "no suffix when there is neither: {}",
+            clean.render_human()
+        );
+
+        // One accept, one snooze.
+        repo.write("f1", "changed\n");
+        let pile = engine.scan(&root).unwrap();
+        let rendered = Rendered::of(pile.row(b"f1").unwrap());
+        let acc = engine.accept(&root, AcceptRequest::File(rendered)).unwrap();
+        assert!(acc.outcome.ok(), "{:?}", acc.outcome);
+        assert_eq!(acc.pile.undo, 1, "the pile carries the depth to the UI");
+        let snoozed = engine.snooze(&root, Some(1)).unwrap();
+        assert_eq!(snoozed.until.as_deref(), Some("2026-09-15T00:00:00Z"));
+        assert_eq!(
+            snoozed.pile.snoozed_until.as_deref(),
+            Some("2026-09-15T00:00:00Z")
+        );
+
+        let report = StatusReport::build(&mut engine, None).unwrap();
+        assert_eq!(report.roots[0].undo, 1);
+        assert_eq!(
+            report.roots[0].snoozed_until.as_deref(),
+            Some("2026-09-15T00:00:00Z")
+        );
+        let v: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
+        assert_eq!(v["roots"][0]["undo"], 1);
+        assert_eq!(v["roots"][0]["snoozed_until"], "2026-09-15T00:00:00Z");
+        assert_eq!(v["status_version"], 1, "additive: the version stays 1");
+        let human = report.render_human();
+        assert!(
+            human.contains(
+                "\neng-status-ux (main)  0 pending · 1 undo · snoozed until 2026-09-15\n"
+            ),
+            "{human}"
+        );
+
+        // An expired snooze reads as none, and the read clears it on the next write.
+        let options = EngineOptions {
+            clock: Arc::new(FixedClock::at_unix(1_789_344_000 + 2 * 86_400)),
+            ..EngineOptions::default()
+        };
+        let mut later = open_engine_with(&repo, &state, Config::default(), options);
+        let report = StatusReport::build(&mut later, None).unwrap();
+        assert_eq!(
+            report.roots[0].snoozed_until, None,
+            "a deadline in the past is not a snooze"
+        );
+        assert_eq!(report.roots[0].undo, 1, "the stack is untouched by expiry");
     }
 
     #[test]

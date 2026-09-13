@@ -83,6 +83,8 @@
       ],
       "omitted": 0,
       "groups": [],
+      "undo": 0,
+      "snoozed_until": null,
       "notices": []
     },
     {
@@ -145,6 +147,8 @@
           ]
         }
       ],
+      "undo": 0,
+      "snoozed_until": null,
       "notices": []
     },
     {
@@ -185,6 +189,8 @@
       ],
       "omitted": 0,
       "groups": [],
+      "undo": 0,
+      "snoozed_until": null,
       "notices": []
     }
   ]
