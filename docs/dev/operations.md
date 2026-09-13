@@ -75,8 +75,10 @@ ideas go to Discussions (Q&A, Ideas).
 - **`unsafe_code = "forbid"` workspace-wide and no direct `libc`**; the pre-commit hook greps
   for the dependency edge.
 - **The public surface keeps its house style**: README, `CHANGELOG.md`, the four user docs
-  under `docs/`, the workflows and the scripts carry no em-dashes, no email addresses, no
-  home paths and none of the build program's process vocabulary.
+  under `docs/`, `SECURITY.md`, `CONTRIBUTING.md` and the workflows carry no em-dashes
+  (`AGENTS.md`, `docs/spec/`, the scripts and the `justfile` are exempt from that rule);
+  nothing in the tree carries an email address, a home path or the build program's process
+  vocabulary outside the design record.
 - **The maintainer pushes and tags; agents do not.** Every branch crosses the network by a
   human hand, and `main` takes merge commits through a pull request with the five checks
   green, admins included.
