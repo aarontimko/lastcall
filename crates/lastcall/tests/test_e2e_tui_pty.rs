@@ -1077,6 +1077,73 @@ fn pty_accept_last_file_lands_on_the_repo_row_then_t_hides_it() {
     assert_clean_exit(&pty, since);
 }
 
+/// Amendment v1.11, the maintainer's ruling of 2026-09-14, through a real terminal: a
+/// lowercase `a` on a repository row accepts nothing and says which key does; `A` on the
+/// same row folds the repository. The point of the ruling is the first half: beta has two
+/// files, so before it the repository vanished on one keystroke with no confirm at all
+/// (the confirm only asks above ten files).
+#[test]
+fn pty_repo_accept_needs_shift_a() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let Some(mut pty) = fx.spawn_tui(&bin()) else {
+        return;
+    };
+    wait_first_piles(&mut pty);
+    assert_eq!(undo_depth(&fx, "beta"), 0, "nothing accepted yet");
+
+    // (1) `a` on beta's repo row: the status names `A`, and the pile is exactly where it
+    // was — both rows on the nav and the header's count untouched.
+    select_until(&mut pty, "beta  main · 2 files");
+    let t = Instant::now();
+    pty.send(b"a").expect("a");
+    pty.wait_for(OVERLOADED, |s| status_is(s, "A accepts all in beta"))
+        .unwrap_or_else(|e| panic!("the refusal: {e}\n{}", pty.screen_text()));
+    note(&format!(
+        "PTY repo accept: `a` refused after {:.3?}",
+        t.elapsed()
+    ));
+    let text = pty.screen_text();
+    assert!(text.contains("A u1"), "the rows are still pending:\n{text}");
+    assert!(text.contains("3 repos · 6 files"), "{text}");
+    assert_eq!(
+        undo_depth(&fx, "beta"),
+        0,
+        "and nothing reached the ledger: {}",
+        fx.ledger("beta")
+    );
+
+    // (2) `A` on the same row folds the repository: two files is under the confirm
+    // threshold, so it goes at once and beta is left as an empty row on the nav.
+    let t = Instant::now();
+    pty.send(b"A").expect("A");
+    pty.wait_for(OVERLOADED, |s| {
+        let text = s.contents();
+        status_is(s, "accepted 2 files in beta")
+            && text.contains("nothing pending in beta")
+            && text.contains("3 repos · 4 files")
+    })
+    .unwrap_or_else(|e| panic!("the fold: {e}\n{}", pty.screen_text()));
+    note(&format!(
+        "PTY repo accept: `A` folded beta after {:.3?}",
+        t.elapsed()
+    ));
+    let text = pty.screen_text();
+    assert!(!text.contains("A u1"), "both rows are gone:\n{text}");
+    assert_eq!(
+        undo_depth(&fx, "beta"),
+        1,
+        "one entry on disk, which is what `z` would spend: {}",
+        fx.ledger("beta")
+    );
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}
+
 /// The draft file's 20-line baseline (F1's shape): two later edits six lines apart are two
 /// hunks at `CONTEXT` 3, not one merged hunk.
 fn draft_baseline() -> String {
