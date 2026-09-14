@@ -19,9 +19,9 @@ can see.
 Do not open a public issue, a discussion, or a pull request for a security problem. A
 public report is a disclosure.
 
-If private reporting is unavailable to you, send a direct message to
-[@aarontimko](https://github.com/aarontimko) on GitHub asking for a private channel, and
-say nothing about the issue itself in that message.
+If private reporting is unavailable to you, open an issue titled
+"security contact request" with no other content. The maintainer will
+open a private advisory and invite you to it.
 
 ## What to include
 
