@@ -4565,7 +4565,6 @@ mod tests {
         assert!(narrow.contains("? help"), "the pinned pair stays: {narrow}");
     }
 
-    /// The repository row's branch line carries the deadline, dimmed: the nav is where a
     /// The sponsor's own run (2026-09-14): the wake was not apparent. `s` is offered on a
     /// repository row only, and its label says which of its two jobs it will do there.
     #[test]
@@ -4597,6 +4596,7 @@ mod tests {
         );
     }
 
+    /// The repository row's branch line carries the deadline, dimmed: the nav is where a
     /// reader looks to ask why a repository is quiet, and `shift-s` is the only way it is
     /// on screen at all.
     #[test]

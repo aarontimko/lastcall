@@ -479,10 +479,11 @@ pub const DEFAULT_KEYMAP: &[(&str, &[&str])] = &[
     // (`render_help_uses_two_columns_only_when_one_does_not_fit` pins the shape, with a
     // truncated table that puts them on the right). `{` and `}` are twins of `alt-up` /
     // `alt-down` rather than decoration: on macOS the Cmd key never reaches a terminal
-    // program at all, and Terminal.app sends Option-arrow as a word-jump escape unless its
-    // profile says "Use Option as Meta key", so a keyboard-only reader needs a binding that
-    // is nothing but a character. They are **not** on the hint line, which is full at 100
-    // columns.
+    // program at all, Terminal.app sends Option-arrow as a word jump by default, and a
+    // terminal that implements "Option as Meta" by prefixing an escape sends `ESC ESC [ A`,
+    // which crossterm reads as three keys (`Esc`, `[`, `A`: hunk_prev and accept_file, the
+    // d6 verifier's F1), so a keyboard-only reader needs a binding that is nothing but a
+    // character. They are **not** on the hint line, which is full at 100 columns.
     ("nav_top", &["home"]),
     ("nav_bottom", &["end"]),
     ("nav_prev_root", &["alt-up", "{"]),

@@ -129,9 +129,10 @@ and shift with tab is `backtab`.
 
 On macOS the Cmd key never reaches a program running in a terminal, which is why the two
 repository jumps are bound to Option and an arrow: iTerm2 and herdr panes send that as
-`alt-up` and `alt-down`, while Terminal.app sends it as a word jump unless its profile has
-"Use Option as Meta key" turned on, so `{` and `}` are bound to the same two actions and
-work everywhere.
+`alt-up` and `alt-down`. Terminal.app sends Option-arrow as a word jump instead, and its
+"Use Option as Meta key" setting is not the answer: a terminal that sends Option as an
+escape prefix can deliver Option-Up as three separate keys, and the third of them is `A`.
+Use `{` and `}` there; they are bound to the same two actions and work everywhere.
 
 The confirmation modal's own keys, `y` and `enter` to confirm, `n` and `esc` to cancel, are
 not rebindable in this version.

@@ -1736,6 +1736,7 @@ impl App {
                     }
                     self.orphan_piles.remove(root);
                     self.seq.remove(root);
+                    self.unscannable.remove(root);
                 }
                 if result == Changed::Yes {
                     self.reconcile_selection();
