@@ -278,6 +278,10 @@ impl Plan {
         if empty >= EMPTY_CARD_MIN && !app.hide_empty && !doc.sets(Setting::HideEmptyRepos) {
             cards.push(Card::Empty { empty, total });
         }
+        // `?` is a live key during the launch hold, so the help overlay can already be up
+        // when the welcome opens over it. Close it: the card is a question, and the screen
+        // behind it should be the review screen the card is talking about, not a key list.
+        app.help = false;
         app.tour = Some(Tour::new(cards));
         Changed::Yes
     }

@@ -3097,4 +3097,34 @@ mod tests {
             "the overlay's own row answers, not whatever is under it"
         );
     }
+
+    /// `?` is a live key during the launch hold, so the help overlay can be up when the
+    /// welcome opens over it. It closes as the card opens, and the card's first keystroke
+    /// is the card's: it is not spent closing help underneath.
+    #[test]
+    fn run_tour_opening_closes_the_help_overlay_and_keeps_its_first_key() {
+        let dir = lastcall_testkit::tmp::TempDir::new("lc-run-tour-help");
+        let mut ui = ui();
+        ui.app.help = true;
+        let mut plan = tour::Plan::new(true, Env::empty(dir.path()), dir.path().to_owned());
+        assert_eq!(plan.open(&mut ui.app), Changed::Yes);
+        assert!(ui.app.tour.is_some(), "the welcome is up");
+        assert!(!ui.app.help, "and the help overlay went with it");
+
+        // The first key reaches the card. Before the fix the help gate ate it: the overlay
+        // closed and the welcome was still waiting for a second `q`.
+        assert_eq!(
+            ui.event(&key(KeyCode::Char('q'))),
+            (Changed::Yes, Some(Effect::TourDone))
+        );
+        assert!(ui.app.tour.is_none(), "skipped on the first key");
+        assert!(!ui.app.help);
+
+        // And with help forced back on under an open card, the gate still lets the card's
+        // keys through rather than spending them.
+        let mut ui = ui_with_tour();
+        ui.app.help = true;
+        assert_eq!(ui.event(&key(KeyCode::Down)), (Changed::Yes, None));
+        assert_eq!(ui.app.tour.as_ref().expect("open").row, 1);
+    }
 }

@@ -3761,10 +3761,15 @@ impl App {
         if let Herdr(update) = action {
             return self.herdr_update(update);
         }
+        // `Tour(_)` passes for the same reason `Quit` does: the welcome sits above the help
+        // overlay, so its own keys must act on the card rather than spend themselves closing
+        // help underneath it. `Plan::open` closes help as the welcome opens, so the reader
+        // never sees the two together; this arm is what keeps a card's first keystroke from
+        // being swallowed if it ever does.
         if self.help
             && !matches!(
                 action,
-                Tick | Resize(..) | Drag(..) | Release | Press(..) | Quit
+                Tick | Resize(..) | Drag(..) | Release | Press(..) | Quit | Tour(_)
             )
         {
             self.help = false;
