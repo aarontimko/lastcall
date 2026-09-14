@@ -4190,12 +4190,14 @@ fn wait_welcome(pty: &mut PtyTui) {
     .unwrap_or_else(|e| panic!("the welcome: {e}\n{}", pty.screen_text()));
 }
 
-/// Deliverable 1 through the real binary, on a machine with **no configuration file at
-/// all**: the welcome opens over the live screen, `enter` walks to the herdr card, and the
-/// second row writes the one key it says it writes. The file that appears is the whole
-/// evidence — a provenance comment and the line the reader chose, and nothing else.
+/// The **herdr** card through the real binary, on a machine with no configuration file at
+/// all: the welcome opens over the live screen, `enter` walks to that card, and the second
+/// row writes the one key it says it writes. The file that appears is the whole evidence —
+/// a provenance comment and the line the reader chose, and nothing else.
+///
+/// `tui_tour_first_launch` below is the other card's path, and the one the kickoff names.
 #[test]
-fn tui_tour_first_launch() {
+fn tui_tour_first_launch_herdr() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let fx = Fixture::build();
     let xdg = fx.state.join("xdg");
@@ -4279,23 +4281,181 @@ fn tui_tour_first_launch() {
     rt.block_on(mock.shutdown());
 }
 
+/// How many quiet repositories the scene builds beside the fixture's two that have
+/// something pending. Above `tour::EMPTY_CARD_MIN` (10), and the kickoff's own figure: the
+/// card then reads `12 of your 14 repositories have nothing pending`.
+const QUIET_ROOTS: usize = 12;
+
+/// The kickoff's `tui_tour_first_launch`, end to end through the real binary: a machine
+/// with **no configuration file at all** and fourteen repositories, twelve of them with
+/// nothing pending. The welcome opens, `enter` reaches the card about the empty ones, the
+/// second row hides them in the same keystroke it writes them away, and the file that
+/// appears holds exactly two lines. Then the same state directory is launched again, with
+/// the marker the **child** wrote left where it is: no welcome, and the list it comes up
+/// with is the one the file asked for.
+#[test]
+fn tui_tour_first_launch() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let xdg = fx.state.join("xdg");
+    let config = xdg.join("lastcall").join("config.toml");
+    // Twelve clean repositories beside `alpha` and `beta`: committed and pushed, so there
+    // is nothing to review in any of them. The draft dir is not a root in this scene —
+    // `draft_dirs` lives in the configuration file, and there is none — so the child
+    // discovers fourteen.
+    for i in 1..=QUIET_ROOTS {
+        FixtureRepo::new_in(TempDir::adopt(&fx.parent), &format!("quiet{i:02}"))
+            .unwrap_or_else(|e| panic!("a quiet repository: {e}"));
+    }
+
+    let Ok(mut pty) = fx
+        .command(&bin())
+        .no_config_file(&xdg)
+        .tour(true)
+        .args(["tui", "--poll", "1"])
+        .spawn()
+    else {
+        note("SKIP: this host cannot open a pty");
+        return;
+    };
+    assert!(!config.exists(), "no configuration file to start with");
+    wait_welcome(&mut pty);
+    // The screen underneath is live, and it is listing all fourteen.
+    assert!(
+        pty.screen_text().contains("lastcall  14 repos"),
+        "the header counts every root:\n{}",
+        pty.screen_text()
+    );
+
+    // Card one is the keys; `enter` goes to the card about the quiet ones.
+    pty.send(b"\r").expect("enter");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        s.contents()
+            .contains("12 of your 14 repositories have nothing pending")
+    })
+    .unwrap_or_else(|e| panic!("the empty card: {e}\n{}", pty.screen_text()));
+
+    // The second row is the one that writes; it is not the selected one.
+    pty.send(b"\x1b[B").expect("down");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        s.contents()
+            .contains("> Start with the empty ones hidden, and remember that")
+    })
+    .unwrap_or_else(|e| panic!("the second row: {e}\n{}", pty.screen_text()));
+    pty.send(b"\r").expect("enter");
+
+    // It was the last card, so the welcome closes; and the choice took effect at once —
+    // the twelve are off the list and the header count says so.
+    pty.wait_for(OVERLOADED, |s| {
+        let text = s.contents();
+        !text.contains("Welcome to lastcall") && text.contains("lastcall  2 repos")
+    })
+    .unwrap_or_else(|e| panic!("the choice takes hold: {e}\n{}", pty.screen_text()));
+    let text = pty.screen_text();
+    assert!(
+        !text.contains("quiet01") && !text.contains("quiet12"),
+        "the quiet repositories left the nav:\n{text}"
+    );
+    assert!(
+        text.contains("alpha") && text.contains("beta"),
+        "the two with something pending stayed:\n{text}"
+    );
+
+    let written = std::fs::read_to_string(&config).expect("the tour wrote the config file");
+    note(&format!(
+        "PTY tour: the config file it created, in full:\n{written}"
+    ));
+    let mut lines = written.lines();
+    let comment = lines.next().expect("a provenance comment");
+    assert!(
+        comment.starts_with(CREATED_BY) && comment.len() == CREATED_BY.len() + "2026-09-14".len(),
+        "the comment names the day it was written: {comment:?}"
+    );
+    assert_eq!(
+        lines.collect::<Vec<_>>(),
+        vec!["hide_empty_repos = true"],
+        "one key, and nothing else, in {written:?}"
+    );
+    assert_eq!(
+        written,
+        format!("{comment}\nhide_empty_repos = true\n"),
+        "the whole file, byte for byte"
+    );
+    let marker = std::fs::read_to_string(fx.state.join(MARKER_FILE))
+        .expect("and the welcome recorded that it has been seen");
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+
+    // The second launch, over the same state directory and the same `XDG_CONFIG_HOME`.
+    // `keep_marker` leaves the child's own marker alone, so what happens next is the
+    // binary's decision and not the harness's.
+    let Ok(mut pty) = fx
+        .command(&bin())
+        .no_config_file(&xdg)
+        .keep_marker(true)
+        .args(["tui", "--poll", "1"])
+        .spawn()
+    else {
+        note("SKIP: this host cannot open a pty");
+        return;
+    };
+    pty.wait_for(LONG, |s| s.contents().contains("lastcall  2 repos"))
+        .unwrap_or_else(|e| panic!("the second launch: {e}\n{}", pty.screen_text()));
+    assert!(
+        pty.wait_for(Duration::from_secs(1), |s| s
+            .contents()
+            .contains("Welcome to lastcall"))
+            .is_err(),
+        "a state dir that has answered is not asked again:\n{}",
+        pty.screen_text()
+    );
+    let text = pty.screen_text();
+    assert!(
+        !text.contains("quiet01"),
+        "the file it wrote is the list it comes up with:\n{text}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fx.state.join(MARKER_FILE)).expect("the marker is still there"),
+        marker,
+        "the second launch wrote no marker of its own"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&config).expect("the config"),
+        written,
+        "and it wrote nothing to the config file either"
+    );
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    assert_eq!(pty.wait_exit(QUIT_BUDGET).expect("exit").exit_code(), 0);
+    assert_clean_exit(&pty, since);
+}
+
 /// The file is the user's. The one write the tour is allowed to make is format-preserving:
 /// every comment, every blank line and every key the tour did not set comes back byte for
-/// byte, and the file grows by exactly the lines the card named.
+/// byte, the file grows by exactly the line the card named, and that line lands **at root
+/// level, above the first table header** — appended at the end it would have read as a key
+/// of `[update]` and meant something else entirely.
 #[test]
 fn tui_tour_preserves_config() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let fx = Fixture::build();
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("a runtime for the mock");
-    let sock = fx.state.join("herdr.sock");
-    let mock = mock_in_alpha(&rt, &fx, &sock);
+    // The quiet repositories the empty card counts, as in `tui_tour_first_launch`. This
+    // scene answers that card because it is the one that writes a **root-level** key, which
+    // is where a hand-written file with tables in it can be got wrong.
+    for i in 1..=QUIET_ROOTS {
+        FixtureRepo::new_in(TempDir::adopt(&fx.parent), &format!("quiet{i:02}"))
+            .unwrap_or_else(|e| panic!("a quiet repository: {e}"));
+    }
 
-    // A hand-written file, with the shape a hand-written file has: a comment at the top, a
-    // blank line, a commented `[herdr]` table with a key of its own, and the fixture's
-    // `[update]` table last (the harness rewrites `check` in place inside it).
+    // A hand-written file, with the shape a hand-written file has: a comment at the top,
+    // root-level keys, a blank line, a commented `[herdr]` table with a key of its own, a
+    // `[keys]` table, and the fixture's `[update]` table last (the harness rewrites `check`
+    // in place inside it, so the spawn adds nothing).
     std::fs::write(
         &fx.config,
         format!(
@@ -4308,6 +4468,10 @@ fn tui_tour_preserves_config() {
              # no desktop notifications, thanks\n\
              toast = false\n\
              \n\
+             [keys]\n\
+             # ctrl-n for the next hunk, like the pager\n\
+             hunk_next = [\"n\", \"ctrl-n\"]\n\
+             \n\
              [update]\n\
              check = false\n",
             fx.parent.display()
@@ -4319,27 +4483,39 @@ fn tui_tour_preserves_config() {
         .command(&bin())
         .tour(true)
         .args(["tui", "--poll", "1"])
-        .env("HERDR_SOCKET_PATH", &sock)
-        .env("HERDR_WORKSPACE_ID", "w1")
         .spawn()
     else {
         note("SKIP: this host cannot open a pty");
         return;
     };
-    // Read it back after the spawn: the harness appends `[update]` at spawn time, so this
+    // Read it back after the spawn: the harness rewrites `[update]` at spawn time, so this
     // is the file the child actually opened.
     let before = std::fs::read_to_string(&fx.config).expect("the config the child reads");
     wait_welcome(&mut pty);
     pty.send(b"\r").expect("enter");
-    pty.wait_for(Duration::from_secs(5), |s| {
-        s.contents().contains("You are running inside herdr 0.8.2")
+    // Wait for the choice itself, not for the card's prose: the cursor line is the only
+    // proof the empty card is up **and** listening, and a `down` sent a frame early would
+    // move the row of a card that is not this one.
+    pty.wait_for(OVERLOADED, |s| {
+        s.contents().contains("> Keep listing every repository")
     })
-    .unwrap_or_else(|e| panic!("the herdr card: {e}\n{}", pty.screen_text()));
+    .unwrap_or_else(|e| panic!("the empty card: {e}\n{}", pty.screen_text()));
     pty.send(b"\x1b[B").expect("down");
+    pty.wait_for(OVERLOADED, |s| {
+        s.contents()
+            .contains("> Start with the empty ones hidden, and remember that")
+    })
+    .unwrap_or_else(|e| panic!("the cursor moves to the write: {e}\n{}", pty.screen_text()));
     pty.send(b"\r").expect("enter");
+    // The card is gone and the count fell to the two repositories with something pending:
+    // the loop writes the file before it draws that frame, so this is also the proof the
+    // write is on disk. ("Welcome to lastcall" is the first card's title, not this one's,
+    // so waiting on its absence would pass while the choice was still on screen.)
     pty.wait_for(OVERLOADED, |s| {
         let text = s.contents();
-        !text.contains("Welcome to lastcall") && text.contains("beta")
+        !text.contains("Start with the empty ones hidden")
+            && text.contains("lastcall  2 repos")
+            && !text.contains("quiet")
     })
     .unwrap_or_else(|e| panic!("the choice takes hold: {e}\n{}", pty.screen_text()));
 
@@ -4354,7 +4530,12 @@ fn tui_tour_preserves_config() {
     assert!(after.contains("# the agents live next door"), "{after}");
     assert!(
         after.contains("# no desktop notifications, thanks"),
-        "a comment inside the table the write touched: {after}"
+        "a comment inside a table the write did not touch: {after}"
+    );
+    assert!(
+        after.contains("# ctrl-n for the next hunk, like the pager")
+            && after.contains("hunk_next = [\"n\", \"ctrl-n\"]"),
+        "the [keys] table came through whole: {after}"
     );
     let added: Vec<&str> = after
         .lines()
@@ -4362,8 +4543,19 @@ fn tui_tour_preserves_config() {
         .collect();
     assert_eq!(
         added,
-        vec!["scope = \"all\""],
-        "one line added to a file that already had a [herdr] table:\n{after}"
+        vec!["hide_empty_repos = true"],
+        "one line added to a file that already had three tables:\n{after}"
+    );
+    // Where it landed is the whole point: above `[herdr]`, the first table header, so it is
+    // a root-level key and not a key of the last table in the file.
+    let key = after
+        .find("hide_empty_repos = true")
+        .expect("the line is in the file");
+    let first_table = after.find("\n[").expect("a table header").saturating_add(1);
+    assert!(
+        key < first_table,
+        "the key landed at root level, before {:?}:\n{after}",
+        after[first_table..].lines().next().unwrap_or_default()
     );
     assert!(
         !after.contains(CREATED_BY),
@@ -4374,7 +4566,6 @@ fn tui_tour_preserves_config() {
     pty.send(b"q").expect("q");
     assert_eq!(pty.wait_exit(QUIT_BUDGET).expect("exit").exit_code(), 0);
     assert_clean_exit(&pty, since);
-    rt.block_on(mock.shutdown());
 }
 
 /// `q` on the first card skips the rest: the keys come back at once, nothing is written to

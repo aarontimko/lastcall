@@ -298,14 +298,22 @@ user over. `lastcall tui --tour` ignores it for that run and rewrites it on dism
 the help overlay's last footer row (`render::TOUR_NOTE`) is where a reader finds that out.
 
 **Scenes.** Three snapshot scenes, each at 100×30 and 80×24: `tui_tour_keys`,
-`tui_tour_herdr`, `tui_tour_empty`. Five PTY scenes: `tui_tour_first_launch` (the overlay,
-the live change, the created config file's exact bytes, and a silent second launch),
-`tui_tour_preserves_config` (a one-line diff on a hand-written file), `tui_tour_skip`,
-`tui_tour_flag` and `tui_tour_quit_writes_marker`. The harness knows the marker by name:
-`pty_tui::MARKER_FILE` and `MARKER_SEEN` are what `isolated_lastcall` drops into the state
-directory so every *other* scene launches without the welcome, and `.tour(true)` removes it
-again. `tour_marker_is_the_file_the_harness_writes` pins the two spellings together, because
-the testkit sits below `lastcall` in the dependency graph and cannot import the constant.
+`tui_tour_herdr`, `tui_tour_empty`. Six PTY scenes. `tui_tour_first_launch` is the one a new
+user actually gets: no config file at all, fourteen repositories of which twelve are quiet,
+the keys card, the empty card's live change from `14 repos` to `2 repos`, the created file's
+exact bytes, and then a second launch over the same state directory that shows no welcome
+and keeps the setting. `tui_tour_first_launch_herdr` is its sibling under a live workspace
+link, where the herdr card is the one that writes.
+`tui_tour_preserves_config` (a one-line diff on a hand-written file that already has three
+tables, including a `[keys]` table, with the new key landing at root level above the first
+table header), `tui_tour_skip`, `tui_tour_flag` and `tui_tour_quit_writes_marker` are the
+rest. The harness knows the marker by name: `pty_tui::MARKER_FILE` and `MARKER_SEEN` are
+what `isolated_lastcall` drops into the state directory so every *other* scene launches
+without the welcome, `.tour(true)` removes it again, and `.keep_marker(true)` leaves
+whatever is on disk alone, which is the only way a second launch can see what the first
+one wrote. `tour_marker_is_the_file_the_harness_writes` pins the two spellings together,
+because the testkit sits below `lastcall` in the dependency graph and cannot import the
+constant.
 
 ### Quit, in the only safe order
 

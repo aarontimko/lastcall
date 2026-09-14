@@ -137,6 +137,7 @@ pub struct PtyCommand {
     /// first-launch marker is written into it (or removed from it) at spawn time.
     tour_state: Option<PathBuf>,
     tour: bool,
+    keep_marker: bool,
 }
 
 impl PtyCommand {
@@ -154,6 +155,7 @@ impl PtyCommand {
             update_check: false,
             tour_state: None,
             tour: false,
+            keep_marker: false,
         }
     }
 
@@ -303,6 +305,16 @@ impl PtyCommand {
         self
     }
 
+    /// Leave the first-launch marker exactly as it is on disk: neither written nor removed
+    /// at spawn time. The only way a scene can see what the **child** wrote, which is what
+    /// a second launch over a state dir the first launch has already answered is about.
+    /// Takes precedence over [`tour`](Self::tour), so a second spawn of a scene that used
+    /// `.tour(true)` adds this and changes nothing else.
+    pub fn keep_marker(mut self, on: bool) -> Self {
+        self.keep_marker = on;
+        self
+    }
+
     /// Run the child with **no config file at all**: `$LASTCALL_CONFIG` removed and
     /// `$XDG_CONFIG_HOME` pointed at `xdg`, which is where the tour's one config write
     /// lands. The `[update]` table goes with the config file, so the update check is off
@@ -327,7 +339,9 @@ impl PtyCommand {
         if let Some(config) = &self.update_config {
             write_update_table(config, self.update_check)?;
         }
-        if let Some(state_dir) = &self.tour_state {
+        if let Some(state_dir) = &self.tour_state
+            && !self.keep_marker
+        {
             let marker = state_dir.join(MARKER_FILE);
             if self.tour {
                 match std::fs::remove_file(&marker) {
