@@ -3514,6 +3514,74 @@ fn pty_page_keys_focus_toggle_and_hunk_prev() {
     assert_clean_exit(&pty, since);
 }
 
+/// Wait until the nav's selected row reads exactly `want`.
+fn nav_cursor_reaches(pty: &mut PtyTui, want: &str, what: &str) {
+    let target = want.to_owned();
+    pty.wait_for(Duration::from_secs(5), move |s| {
+        nav_cursor(s).as_deref() == Some(target.as_str())
+    })
+    .unwrap_or_else(|e| {
+        panic!(
+            "{what} selects `{want}`: {e}\nselected: {:?}\n{}",
+            pty.screen(nav_cursor),
+            pty.screen_text()
+        )
+    });
+}
+
+/// The nav jumps (2026-09-14) through a real terminal, over the three-root fixture: `End`
+/// lands on the last entry, `Home` on the first, `}` on the second repository row and
+/// Option-↑ back on the first, each read off the selected row in the frame.
+///
+/// The escapes are the half a unit test cannot prove: `ESC [ F` and `ESC [ H` for the two
+/// ends, and `ESC [ 1 ; 3 A` for Option-↑, which is what iTerm2 and a herdr pane send and
+/// what crossterm reports as `Up` with `ALT`. The `{` / `}` twins exist because
+/// Terminal.app sends that same chord as a word-jump escape unless its profile says "Use
+/// Option as Meta key", so `}` is driven here too.
+#[test]
+fn pty_nav_jumps() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let Some(mut pty) = fx.spawn_tui(&bin()) else {
+        return;
+    };
+    wait_first_piles(&mut pty);
+    assert_eq!(
+        pty.screen(nav_cursor),
+        None,
+        "nothing is selected at launch"
+    );
+
+    // (1) `End` on a nav with nothing selected is still the end: notes' only row, the last
+    // entry of the three roots. `Home` is the first, which is alpha's repository row.
+    pty.send(b"\x1b[F").expect("End");
+    nav_cursor_reaches(&mut pty, "M n2.md  +2 −0", "End");
+    pty.send(b"\x1b[H").expect("Home");
+    nav_cursor_reaches(&mut pty, "alpha", "Home");
+
+    // (2) `}` from inside the first repository is the **second** repository's row, not the
+    // next entry: the three rows of alpha are stepped over.
+    pty.send(b"j").expect("j");
+    nav_cursor_reaches(&mut pty, "M f1  +1 −1", "`j` from the repository row");
+    pty.send(b"}").expect("}");
+    nav_cursor_reaches(&mut pty, "beta", "`}`");
+
+    // (3) and Option-↑ walks back, by the escape a terminal really sends.
+    pty.send(b"\x1b[1;3A").expect("alt-up");
+    nav_cursor_reaches(&mut pty, "alpha", "Option-↑");
+    // Which is not what the bare arrow does: `↑` from a repository row is the entry above.
+    pty.send(b"\x1b[B").expect("↓");
+    nav_cursor_reaches(&mut pty, "M f1  +1 −1", "`↓`");
+    pty.send(b"\x1b[A").expect("↑");
+    nav_cursor_reaches(&mut pty, "alpha", "`↑`");
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}
+
 /// `f` (full paths), `o` (the remote) and `e` (expand a collapsed row) through the terminal,
 /// each its own inverse where it has one.
 #[test]
