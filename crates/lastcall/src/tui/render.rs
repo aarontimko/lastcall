@@ -551,6 +551,7 @@ const HINT_DROP_ORDER: &[&str] = &[
     "refresh",
     "focus_toggle",
     "scope",
+    "snooze",
     "accept_all",
     "hide_empty",
     "undo",
@@ -665,6 +666,25 @@ pub fn hints(app: &App, width: u16) -> String {
         .is_some_and(|n| n > 0)
         .then(|| first("undo").map(|k| format!("{k} undo")))
         .flatten();
+    // Amendment v1.11, the sponsor's own run (2026-09-14): `s` answers only on a
+    // repository row, and there it either snoozes or, on a snoozed repository that
+    // `shift-s` is showing, wakes. The label follows the state so the line promises what
+    // the key will do; on a file row the key is not offered, because there it refuses.
+    let snooze = match &app.selection {
+        Some(Selection::Root(root)) => first("snooze").map(|k| {
+            let verb = if app
+                .roots
+                .get(root)
+                .is_some_and(|v| app.snoozed(v).is_some())
+            {
+                "wake"
+            } else {
+                "snooze"
+            };
+            format!("{k} {verb}")
+        }),
+        _ => None,
+    };
     let diff = app.effective_focus() == Focus::Diff;
     // Verifier (b) F4, the same rule as `accept all in <root>` above: a hint the line
     // promises has to do something. `v` and `y` work on diff *lines*, and a hunkless entry
@@ -748,6 +768,7 @@ pub fn hints(app: &App, width: u16) -> String {
         // has something to undo, which the pile says (`Pile::undo`) — the hint line never
         // promises a key that would land on `nothing to undo`.
         ("undo", undo),
+        ("snooze", snooze),
         ("ack", ack),
         ("jump", jump),
         ("hide_empty", hide_empty),
@@ -4539,6 +4560,37 @@ mod tests {
     }
 
     /// The repository row's branch line carries the deadline, dimmed: the nav is where a
+    /// The sponsor's own run (2026-09-14): the wake was not apparent. `s` is offered on a
+    /// repository row only, and its label says which of its two jobs it will do there.
+    #[test]
+    fn hints_offer_snooze_on_a_repo_row_and_wake_on_a_snoozed_one() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        assert!(
+            !hints(&app, 200).contains("s snooze") && !hints(&app, 200).contains("s wake"),
+            "a file row does not offer s: {}",
+            hints(&app, 200)
+        );
+        app.select(Some(Selection::Root(root("beta"))));
+        assert!(
+            hints(&app, 200).contains("s snooze"),
+            "{}",
+            hints(&app, 200)
+        );
+        app.handle(Action::ShowSnoozed);
+        app.apply(pile_event_seq(
+            "beta",
+            1,
+            snoozed_pile(pile("beta"), "2026-09-20T09:00:00Z"),
+        ));
+        app.select(Some(Selection::Root(root("beta"))));
+        let line = hints(&app, 200);
+        assert!(
+            line.contains("s wake") && !line.contains("s snooze"),
+            "{line}"
+        );
+    }
+
     /// reader looks to ask why a repository is quiet, and `shift-s` is the only way it is
     /// on screen at all.
     #[test]

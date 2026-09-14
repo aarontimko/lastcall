@@ -31,4 +31,4 @@ expression: frame
 "│                          │                                                                       │"
 "│                          │                                                                       │"
 "└──────────────────────────┴───────────────────────────────────────────────────────────────────────┘"
-"↑↓ select  ⏎ open  ^A accept all  z undo  d ack  g jump  t show empty  Tab focus  ? help  q quit    "
+"↑↓ select  ⏎ open  ^A accept all  z undo  s snooze  d ack  g jump  t show empty  ? help  q quit     "
