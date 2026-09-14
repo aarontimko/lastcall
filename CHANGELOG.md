@@ -47,6 +47,17 @@ binary rather than for the commit log.
   files rather than walking through them. Option with an arrow key does the same in
   terminals that send it, and every one of the four can be rebound in `[keys]`.
 
+### Changed
+
+- `shift-a` is now the key that accepts a whole entry from the list: a file, a branch group,
+  or a whole repository from its row. `a` accepts the hunk under the cursor and nothing
+  larger, and on a group or a repository row it says which key to use instead. A repository
+  of ten files or fewer used to vanish on a lowercase `a` with no question at all, because
+  the confirmation only asks above ten.
+- The `parent_dirs` documentation said every repository under a parent directory is watched.
+  It is the repositories directly under it: one a folder deeper, such as
+  `worktrees/<name>`, needs an entry of its own.
+
 ## 0.1.0 - 2026-09-12
 
 The first release. lastcall watches every git repository under your working directory and

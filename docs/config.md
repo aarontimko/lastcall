@@ -48,7 +48,7 @@ the session.
 
 | key | default | what it does |
 |---|---|---|
-| `parent_dirs` | `[]`, meaning the directory you launched in | absolute paths. Every git repository under each one is watched. |
+| `parent_dirs` | `[]`, meaning the directory you launched in | absolute paths. Every git repository directly under each one is watched; a repository one folder deeper (for example `worktrees/<name>`) needs its own entry. |
 | `draft_dirs` | `[]` | directories that are **not** git repositories, each reviewed as a root of its own. Globs relative to a parent directory (`"_drafts/**"`, `"notes"`) or absolute paths. |
 | `draft_initial` | `"seen"` | what the first sight of a draft root means. `seen` starts from zero, so only changes made after that are pending. `pending` treats everything already there as pending. |
 | `collapsed_globs` | the nine common lockfiles | paths shown as one collapsed row instead of a wall of hunks. The default list is `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `Cargo.lock`, `poetry.lock`, `uv.lock`, `Gemfile.lock`, `go.sum`, `composer.lock`. Setting the key replaces the list. |
@@ -108,8 +108,8 @@ and shift with tab is `backtab`.
 | `hide_empty` | `t` | hide or show repositories with nothing pending |
 | `snooze` | `s` | set a repository aside for a number of days |
 | `show_snoozed` | `shift-s` | show or hide the repositories that are set aside |
-| `accept` | `a` | accept the hunk under the cursor, or the selected entry |
-| `accept_file` | `shift-a` | accept the whole file |
+| `accept` | `a` | accept the hunk under the cursor, or a file with no hunks |
+| `accept_file` | `shift-a` | accept the whole file, or the whole repository from its row |
 | `accept_all` | `ctrl-a` | accept everything listed, across every repository |
 | `restore` | `u` | put the hunk back the way it was |
 | `restore_file` | `shift-u` | put the whole file back, asking first |

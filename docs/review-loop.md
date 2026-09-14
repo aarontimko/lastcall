@@ -149,9 +149,12 @@ Accepting means "I have seen this and it is fine". Nothing on disk changes. What
 is that lastcall stops showing it to you, and the next time it scans, only what happened
 after this point is pending.
 
-- `a` accepts the hunk under the cursor, or, in the list, the selected file, branch group
-  or whole repository.
-- `A` accepts the whole file whatever hunk you are on.
+- `a` accepts the hunk under the cursor, and nothing larger. On a file with no hunks to
+  point at (binary, collapsed, deleted, unreadable) it accepts that file.
+- `A` accepts the whole entry: the whole file whatever hunk you are on, and in the list the
+  whole branch group or the whole repository from its row. A repository of ten files or
+  fewer goes at once, so `A` is the key that takes a lot in one keystroke and `a` is the
+  one you can lean on.
 - `ctrl-a` accepts everything listed across every repository. Above ten files it asks
   first, naming the count.
 
