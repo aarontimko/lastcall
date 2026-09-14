@@ -458,15 +458,6 @@ pub const DEFAULT_KEYMAP: &[(&str, &[&str])] = &[
     ("nav_down", &["down", "j"]),
     ("nav_page_up", &["pageup", "b"]),
     ("nav_page_down", &["pagedown", "space"]),
-    // The jumps (2026-09-14). `{` and `}` are twins of `alt-up` / `alt-down` rather than
-    // decoration: on macOS the Cmd key never reaches a terminal program at all, and
-    // Terminal.app sends Option-arrow as a word-jump escape unless its profile says "Use
-    // Option as Meta key", so a keyboard-only reader needs a binding that is nothing but a
-    // character. They are **not** on the hint line, which is full at 100 columns.
-    ("nav_top", &["home"]),
-    ("nav_bottom", &["end"]),
-    ("nav_prev_root", &["alt-up", "{"]),
-    ("nav_next_root", &["alt-down", "}"]),
     ("open", &["enter", "l", "right"]),
     ("back", &["esc", "h", "left"]),
     ("focus_toggle", &["tab"]),
@@ -479,6 +470,23 @@ pub const DEFAULT_KEYMAP: &[(&str, &[&str])] = &[
     ("restore", &["u"]),
     ("restore_file", &["shift-u"]),
     ("undo", &["z"]),
+    // The jumps (2026-09-14) come right after the loop and below the 80×24 fold, which
+    // shows sixteen rows: the loop above (through `z`) is what has to be on that first
+    // page, and each jump is a shortcut for what a long `↓` run already does. Their
+    // descriptions are kept within the right column's width of the 100-column two-column
+    // form (`jump to the agent in herdr`, 26 columns): a longer one lands in that column
+    // for some splits, the form then needs 103 columns, and 100×30 folds sixteen keys
+    // (`render_help_uses_two_columns_only_when_one_does_not_fit` pins the shape, with a
+    // truncated table that puts them on the right). `{` and `}` are twins of `alt-up` /
+    // `alt-down` rather than decoration: on macOS the Cmd key never reaches a terminal
+    // program at all, and Terminal.app sends Option-arrow as a word-jump escape unless its
+    // profile says "Use Option as Meta key", so a keyboard-only reader needs a binding that
+    // is nothing but a character. They are **not** on the hint line, which is full at 100
+    // columns.
+    ("nav_top", &["home"]),
+    ("nav_bottom", &["end"]),
+    ("nav_prev_root", &["alt-up", "{"]),
+    ("nav_next_root", &["alt-down", "}"]),
     ("flag", &["m"]),
     ("unflag", &["shift-m"]),
     ("select", &["v"]),
@@ -583,8 +591,8 @@ impl Action {
             // The jumps, within the overlay's 30-column cap (design review F15): the two
             // ends read as one row each because what they do depends on which pane has the
             // keys, and the repository pair says `repository` in full because it fits.
-            "nav_top" => "first entry / top of the diff",
-            "nav_bottom" => "last entry / end of the diff",
+            "nav_top" => "first entry / top of diff",
+            "nav_bottom" => "last entry / end of diff",
             "nav_prev_root" => "previous repository",
             "nav_next_root" => "next repository",
             "open" => "open the diff",

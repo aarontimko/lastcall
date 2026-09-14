@@ -979,10 +979,16 @@ the standard width, the pair does not fit and the overlay clips: at 30 lines it 
 **What survives the clip is the table's order** (`input::DEFAULT_KEYMAP`), so that order is
 a decision and not an accident: the review loop first (move, open, `t`, accept, restore,
 `z` undo), then the keys that only change what the list shows (`e`, `f`, `o`), the snooze
-pair, `?` and `q`. An 80×24 overlay has room for sixteen of those rows, and the four jumps
-(2026-09-14) sit inside the first group, so the fold there now falls after `A accept the
-whole file`: `Ctrl-A`, the two restores and `z` are below it, counted by the clip notice
-and reachable at 100 columns, where nothing is clipped at all.
+pair, `?` and `q`. An 80×24 overlay has room for sixteen of those rows, and the fold
+there falls after `z undo`; nothing of the loop is below it. The four jumps (2026-09-14)
+come right after `z`, below that fold, because each is a shortcut for what a long `↓` run
+already does. Their descriptions (`first entry / top of diff`, `last entry / end of diff`)
+are kept within the 26 columns of `g jump to the agent in herdr`, the widest row of the
+two-column form's right column: the split is by row count, so a longer description lands
+on the right for some tables, the form then needs 103 columns instead of 100, and 100×30
+folds sixteen keys. (Their first placement, right after the page keys, pushed `Ctrl-A`,
+the two restores and `z` under the 80×24 fold, which reversed the verifier's F3 fix; the
+order is a decision, so the fix was the order.)
 A clipped overlay now **says** it is clipped (**ruling R12**): the row above the pinned
 `quit` is a dim `… N more keys (100 columns shows all)`, so `q / Ctrl-C  quit` as the last
 key row can no longer be read as the whole table.
