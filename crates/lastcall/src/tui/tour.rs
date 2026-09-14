@@ -251,6 +251,7 @@ impl Plan {
         self.show
             && app.tour.is_none()
             && app.loading.is_none()
+            && app.pictured()
             && !app.herdr.scope_pending
             && app.size.0 >= MIN_COLS
             && app.size.1 >= MIN_ROWS
@@ -887,6 +888,44 @@ mod tests {
             !marker_path(dir.path()).exists(),
             "nothing is written before it opens"
         );
+    }
+
+    /// The hold can end on the last `Scanned` tick with the piles still in flight, and the
+    /// empty card counts once, when it opens: a root without a pile holds the welcome back
+    /// until its pile lands or its scan is reported failed.
+    #[test]
+    fn tour_waits_for_every_pile_not_only_for_the_hold() {
+        let dir = TempDir::new("lc-tour-piles");
+        let plan = Plan::new(false, env_at(dir.path()), dir.path().to_owned());
+        let mut app = app_at(100, 30);
+        app.sync_roots(vec![
+            meta("alpha"),
+            meta("beta"),
+            meta("notes"),
+            meta("late"),
+        ]);
+        assert!(
+            app.loading.is_none(),
+            "the hold is not what holds it back here"
+        );
+        assert!(!plan.due(&app), "a root without a pile is not yet counted");
+
+        app.apply(pile_event("late", Pile::default()));
+        assert!(plan.due(&app), "every pile is in, empty ones included");
+
+        app.sync_roots(vec![
+            meta("alpha"),
+            meta("beta"),
+            meta("notes"),
+            meta("late"),
+            meta("broken"),
+        ]);
+        assert!(!plan.due(&app));
+        app.apply(lastcall_engine::watcher::EngineEvent::Notice {
+            root: Some(meta("broken").path),
+            text: "scan failed: boom".into(),
+        });
+        assert!(plan.due(&app), "a failed scan is that root's whole report");
     }
 
     /// Opened twice is not a thing: `due` is false the moment the overlay is up.

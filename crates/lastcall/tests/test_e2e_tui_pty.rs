@@ -4308,17 +4308,15 @@ fn tui_tour_first_launch() {
             .unwrap_or_else(|e| panic!("a quiet repository: {e}"));
     }
 
-    // Thirteen rows is one short of `tour::MIN_ROWS`, so the welcome is withheld while the
-    // scans land. It is not a flourish: a global notice (`watching …`) ends the launch hold
-    // for roots that have not reported, so on a loaded machine the welcome can open over a
-    // half-scanned picture and the card would count `14 of your 14`. The card counts once,
-    // when it opens, so the scene waits for the whole picture and only then gives the
-    // terminal the fourteenth row.
+    // A plain launch at full size. The card counts the empty roots once, when it opens,
+    // and the welcome waits for every pile and not only for the launch hold
+    // (`App::pictured`), so the count is `12 of your 14` on a loaded machine too: the
+    // scan pool's `Scanned` ticks end the hold a frame before the piles land.
     let Ok(mut pty) = fx
         .command(&bin())
         .no_config_file(&xdg)
         .tour(true)
-        .size(100, 13)
+        .size(100, 30)
         .args(["tui", "--poll", "1"])
         .spawn()
     else {
@@ -4326,22 +4324,12 @@ fn tui_tour_first_launch() {
         return;
     };
     assert!(!config.exists(), "no configuration file to start with");
-    pty.wait_for(OVERLOADED, |s| {
-        s.contents()
-            .contains("lastcall  14 repos · 5 files · 7 hunks")
-    })
-    .unwrap_or_else(|e| panic!("every root scanned: {e}\n{}", pty.screen_text()));
-    assert!(
-        !pty.screen_text().contains("Welcome to lastcall"),
-        "no room for the welcome yet:\n{}",
-        pty.screen_text()
-    );
-    pty.resize(100, 30).expect("room for the welcome");
     wait_welcome(&mut pty);
-    // The screen underneath is live, and it is listing all fourteen.
+    // The screen underneath is live, and it is the whole picture: all fourteen, scanned.
     assert!(
-        pty.screen_text().contains("lastcall  14 repos"),
-        "the header counts every root:\n{}",
+        pty.screen_text()
+            .contains("lastcall  14 repos · 5 files · 7 hunks"),
+        "the header counts every root and every pile:\n{}",
         pty.screen_text()
     );
 

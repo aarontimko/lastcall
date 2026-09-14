@@ -2009,9 +2009,10 @@ pub fn run(
                 }
                 // Amendment v1.11: the welcome opens at the first frame where a root
                 // could be listed — the launch hold and the scope verdict are both past,
-                // the instant `is_listed` first admits one. Not before: the two conditional
-                // cards are about the link and the empty-repo count, and neither is known
-                // until then. A frame too small to read it opens nothing and writes
+                // the instant `is_listed` first admits one — and every root's pile has
+                // landed (`App::pictured`: the hold ends on the last `Scanned` tick, a
+                // frame before the piles). Not before: the two conditional cards are about
+                // the link and the empty-repo count, and neither is known until then. A frame too small to read it opens nothing and writes
                 // nothing, so it is still owed on the next launch that has room.
                 if tour.due(&ui.app) {
                     redraw = redraw.or(tour.open(&mut ui.app));

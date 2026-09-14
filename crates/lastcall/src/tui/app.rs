@@ -1101,6 +1101,9 @@ pub struct App {
     /// (the watcher and a refresh or an accept are two channels; this orders them). The
     /// entry goes when the root does, so a re-added root takes piles from its first scan.
     pub seq: BTreeMap<PathBuf, u64>,
+    /// Roots whose scan failed and so will never send a pile (`scan failed` notice); a
+    /// later pile takes the root off it. With `seq`, this is what `pictured` reads.
+    pub unscannable: std::collections::BTreeSet<PathBuf>,
     /// The accept the loop is running, if any; a second one is refused meanwhile.
     pub accepting: Option<Accepting>,
     /// The restore the loop is running, if any; a second one is refused meanwhile. Separate
@@ -1208,6 +1211,7 @@ impl App {
             refreshing: false,
             orphan_piles: BTreeMap::new(),
             seq: BTreeMap::new(),
+            unscannable: std::collections::BTreeSet::new(),
             accepting: None,
             restoring: None,
             note: None,
@@ -1438,6 +1442,18 @@ impl App {
             self.end_loading();
         }
         Changed::Yes
+    }
+
+    /// Every root's pile has landed, or its scan failed and none will. The launch hold
+    /// ends on the last `Scanned` tick, which the scan pool sends the moment that root's
+    /// scan finishes; the piles follow together once every scan is done, and the frame in
+    /// between shows every root with nothing pending. The first-launch welcome counts the
+    /// empty roots once, when it opens, so it waits for this and not only for the hold
+    /// (Phase 10 fix worker's `14 of your 14` under load).
+    pub fn pictured(&self) -> bool {
+        self.roots
+            .keys()
+            .all(|r| self.seq.contains_key(r) || self.unscannable.contains(r))
     }
 
     /// The scans are accounted for. Design pass D5 / ruling R7: when the herdr scope
@@ -1732,6 +1748,7 @@ impl App {
                 match &root {
                     // A failed scan is still that root's report.
                     Some(r) if text.starts_with("scan failed") => {
+                        self.unscannable.insert(r.clone());
                         self.root_reported(r.clone(), 0);
                     }
                     // Every global notice comes after the initial scans (`watching …`,
@@ -1758,6 +1775,7 @@ impl App {
             return Changed::No;
         }
         self.seq.insert(root.clone(), seq);
+        self.unscannable.remove(&root);
         let Some(view) = self.roots.get_mut(&root) else {
             self.orphan_piles.insert(root, pile);
             return Changed::No;
@@ -1819,6 +1837,7 @@ impl App {
         for k in gone {
             self.roots.remove(&k);
             self.seq.remove(&k);
+            self.unscannable.remove(&k);
             changed = Changed::Yes;
         }
         if changed == Changed::Yes {
