@@ -102,6 +102,15 @@ fn write_update_table(config: &Path, on: bool) -> io::Result<()> {
     std::fs::write(config, text)
 }
 
+/// The TUI's first-launch marker, `lastcall::tui::tour::MARKER_FILE`. Spelled out here
+/// because the testkit is below `lastcall` in the dependency graph and cannot import it;
+/// `tour_marker_is_the_file_the_harness_writes` pins the two spellings together.
+pub const MARKER_FILE: &str = "first-launch.json";
+
+/// What [`PtyCommand::spawn`] writes into an isolated state dir so the welcome stays shut:
+/// a marker from a build far enough in the past to be obviously synthetic.
+pub const MARKER_SEEN: &str = r#"{"shown_at":1789344000,"version":"0.0.0-testkit"}"#;
+
 /// What the reader thread fills: the parsed screen and the raw bytes, in order.
 struct Shared {
     parser: vt100::Parser,
@@ -124,6 +133,10 @@ pub struct PtyCommand {
     /// `[update]` table is appended to it at spawn time.
     update_config: Option<PathBuf>,
     update_check: bool,
+    /// The isolated state dir, when [`PtyCommand::isolated_lastcall`] named one: the
+    /// first-launch marker is written into it (or removed from it) at spawn time.
+    tour_state: Option<PathBuf>,
+    tour: bool,
 }
 
 impl PtyCommand {
@@ -139,6 +152,8 @@ impl PtyCommand {
             answer_dsr: false,
             update_config: None,
             update_check: false,
+            tour_state: None,
+            tour: false,
         }
     }
 
@@ -251,6 +266,7 @@ impl PtyCommand {
             .env_remove("VISUAL")
             .env_remove("EDITOR");
         cmd.update_config = Some(config.to_path_buf());
+        cmd.tour_state = Some(state_dir.to_path_buf());
         for (key, _) in std::env::vars_os() {
             if key.to_string_lossy().starts_with("HERDR_") {
                 cmd = cmd.env_remove(key);
@@ -275,11 +291,54 @@ impl PtyCommand {
         self
     }
 
+    /// Let this scene's child open the first-launch welcome (Amendment v1.11). Off by
+    /// default: [`isolated_lastcall`](Self::isolated_lastcall) writes [`MARKER_FILE`] into
+    /// the isolated state dir at spawn time, so a scene that never thought about the
+    /// welcome starts on the review screen, exactly as every scene written before it did.
+    ///
+    /// Turning it on removes the marker instead, so the child's own launch decides.
+    /// Order-independent, like [`update_check`](Self::update_check).
+    pub fn tour(mut self, on: bool) -> Self {
+        self.tour = on;
+        self
+    }
+
+    /// Run the child with **no config file at all**: `$LASTCALL_CONFIG` removed and
+    /// `$XDG_CONFIG_HOME` pointed at `xdg`, which is where the tour's one config write
+    /// lands. The `[update]` table goes with the config file, so the update check is off
+    /// for such a scene by construction — there is nowhere to write `check = false`, and
+    /// the child's own default is `true`, so the scene must keep `curl` unanswerable (the
+    /// probe `curl` on `PATH` exits 99 with `LASTCALL_TEST_RELEASE_DIR` unset).
+    ///
+    /// The isolation is unchanged otherwise: `HOME` is still the scene's own temp dir, so
+    /// nothing here can resolve the developer's real configuration.
+    pub fn no_config_file(mut self, xdg: &Path) -> Self {
+        self.update_config = None;
+        self.env_remove.retain(|k| k != "XDG_CONFIG_HOME");
+        self = self.env("XDG_CONFIG_HOME", xdg);
+        self.env.retain(|(k, _)| k != "LASTCALL_CONFIG");
+        self.env_remove.push("LASTCALL_CONFIG".into());
+        self
+    }
+
     /// Open the PTY and start the child. `ErrorKind::Unsupported` means this host cannot
     /// open a PTY at all (the only reason a PTY test may skip); anything else is a failure.
     pub fn spawn(self) -> io::Result<PtyTui> {
         if let Some(config) = &self.update_config {
             write_update_table(config, self.update_check)?;
+        }
+        if let Some(state_dir) = &self.tour_state {
+            let marker = state_dir.join(MARKER_FILE);
+            if self.tour {
+                match std::fs::remove_file(&marker) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
+            } else {
+                std::fs::create_dir_all(state_dir)?;
+                std::fs::write(&marker, MARKER_SEEN)?;
+            }
         }
         let (cols, rows) = self.size;
         let pair = native_pty_system()

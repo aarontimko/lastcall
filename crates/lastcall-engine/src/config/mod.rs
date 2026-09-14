@@ -7,6 +7,8 @@
 //!
 //! Every environment read goes through the injected [`Env`]; nothing here touches `std::env`.
 
+pub mod write;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 

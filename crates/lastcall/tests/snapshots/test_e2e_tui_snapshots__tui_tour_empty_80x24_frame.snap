@@ -1,0 +1,28 @@
+---
+source: crates/lastcall/tests/test_e2e_tui_snapshots.rs
+expression: frame
+---
+"lastcall  14 repos · 5 files · 7 hunks  standalone  [Accept All]      watching W"
+"┌──────────────────────────┬───────────────────────────────────────────────────┐"
+"│alpha                     │select a file (↑↓ or click) · ? for help           │"
+"│  main · 3 files          │                                                   │"
+"│  M f1  +1 −1             │                                                   │"
+"│  M f2  +1 −0             │                                                   │"
+"│ ┌ welcome ────────────────────────────────────────────────────────────────┐  │"
+"│─│ 12 of your 14 repositories have nothing pending                         │  │"
+"│b│                                                                         │  │"
+"│ │ They are listed anyway so the picture is complete. t hides them for the │  │"
+"│ │ session; the count on the bottom line keeps saying how many are hidden. │  │"
+"│ │                                                                         │  │"
+"│ │ > Keep listing every repository                                         │  │"
+"│─│   Start with the empty ones hidden, and remember that                   │  │"
+"│n│     (writes hide_empty_repos = true)                                    │  │"
+"│ │                                                                         │  │"
+"│─│ enter  choose          q  skip the rest                                 │  │"
+"│r└─────────────────────────────────────────────────────────────────────────┘  │"
+"│  main · 0 files          │                                                   │"
+"│──────────────────────────│                                                   │"
+"│repo01                    │                                                   │"
+"│  main · 0 files          │                                                   │"
+"└──────────────────────────┴───────────────────────────────────────────────────┘"
+"↑↓ select  ⏎ open  ^A accept all  t hide empty  Tab focus  ? help  q quit       "

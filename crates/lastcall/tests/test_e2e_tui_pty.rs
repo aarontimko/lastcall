@@ -4156,3 +4156,365 @@ fn pty_snooze_repo() {
     assert_eq!(status.exit_code(), 0, "{status:?}");
     assert_clean_exit(&pty, since);
 }
+
+// ---- the first-launch welcome (Amendment v1.11, deliverable 1) --------------------------
+
+/// `lastcall::tui::tour::MARKER_FILE`, and `pty_tui::MARKER_FILE` beside it.
+const MARKER_FILE: &str = "first-launch.json";
+/// `config::write::CREATED_BY`.
+const CREATED_BY: &str = "# written by lastcall's first-launch tour on ";
+
+/// A herdr mock over `sock` whose workspace is both panes in `alpha`: the link the herdr
+/// card's condition needs, and the scope it is about.
+fn mock_in_alpha(
+    rt: &tokio::runtime::Runtime,
+    fx: &Fixture,
+    sock: &Path,
+) -> lastcall_testkit::mock_herdr::MockHerdr {
+    let alpha = std::fs::canonicalize(fx.parent.join("alpha")).expect("alpha exists");
+    rt.block_on(async {
+        MockHerdr::builder()
+            .snapshot(herdr_snapshot(&alpha))
+            .serve(sock)
+            .await
+            .expect("bind the mock socket")
+    })
+}
+
+/// Wait for the welcome's first card.
+fn wait_welcome(pty: &mut PtyTui) {
+    pty.wait_for(LONG, |s| {
+        let text = s.contents();
+        text.contains("welcome") && text.contains("Welcome to lastcall")
+    })
+    .unwrap_or_else(|e| panic!("the welcome: {e}\n{}", pty.screen_text()));
+}
+
+/// Deliverable 1 through the real binary, on a machine with **no configuration file at
+/// all**: the welcome opens over the live screen, `enter` walks to the herdr card, and the
+/// second row writes the one key it says it writes. The file that appears is the whole
+/// evidence — a provenance comment and the line the reader chose, and nothing else.
+#[test]
+fn tui_tour_first_launch() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let xdg = fx.state.join("xdg");
+    let config = xdg.join("lastcall").join("config.toml");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime for the mock");
+    let sock = fx.state.join("herdr.sock");
+    let mock = mock_in_alpha(&rt, &fx, &sock);
+
+    let Ok(mut pty) = fx
+        .command(&bin())
+        .no_config_file(&xdg)
+        .tour(true)
+        .args(["tui", "--poll", "1"])
+        .env("HERDR_SOCKET_PATH", &sock)
+        .env("HERDR_WORKSPACE_ID", "w1")
+        .spawn()
+    else {
+        note("SKIP: this host cannot open a pty");
+        return;
+    };
+    assert!(!config.exists(), "no configuration file to start with");
+    wait_welcome(&mut pty);
+    // The screen underneath is live: the welcome is an overlay, not a splash.
+    assert!(
+        pty.screen_text().contains("lastcall  1 repo"),
+        "the header is still there:\n{}",
+        pty.screen_text()
+    );
+
+    // Card one is the keys; `enter` goes to card two, which is about the workspace.
+    pty.send(b"\r").expect("enter");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        s.contents().contains("You are running inside herdr 0.8.2")
+    })
+    .unwrap_or_else(|e| panic!("the herdr card: {e}\n{}", pty.screen_text()));
+
+    // The second row is the one that writes; it is not the selected one.
+    pty.send(b"\x1b[B").expect("down");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        s.contents().contains("> Show every repository instead")
+    })
+    .unwrap_or_else(|e| panic!("the second row: {e}\n{}", pty.screen_text()));
+    pty.send(b"\r").expect("enter");
+
+    // It was the last card, so the welcome closes; and the choice took effect at once —
+    // every repository is listed, which is what it promised.
+    pty.wait_for(OVERLOADED, |s| {
+        let text = s.contents();
+        !text.contains("Welcome to lastcall") && text.contains("beta")
+    })
+    .unwrap_or_else(|e| panic!("the choice takes hold: {e}\n{}", pty.screen_text()));
+
+    let written = std::fs::read_to_string(&config).expect("the tour wrote the config file");
+    note(&format!(
+        "PTY tour: the config file it created, in full:\n{written}"
+    ));
+    let mut lines = written.lines();
+    let comment = lines.next().expect("a provenance comment");
+    assert!(
+        comment.starts_with(CREATED_BY) && comment.len() == CREATED_BY.len() + "2026-09-14".len(),
+        "the comment names the day it was written: {comment:?}"
+    );
+    assert_eq!(
+        lines.collect::<Vec<_>>(),
+        vec!["[herdr]", "scope = \"all\""],
+        "one key, and nothing else, in {written:?}"
+    );
+    assert!(
+        fx.state.join(MARKER_FILE).exists(),
+        "and the welcome recorded that it has been seen"
+    );
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+    rt.block_on(mock.shutdown());
+}
+
+/// The file is the user's. The one write the tour is allowed to make is format-preserving:
+/// every comment, every blank line and every key the tour did not set comes back byte for
+/// byte, and the file grows by exactly the lines the card named.
+#[test]
+fn tui_tour_preserves_config() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime for the mock");
+    let sock = fx.state.join("herdr.sock");
+    let mock = mock_in_alpha(&rt, &fx, &sock);
+
+    // A hand-written file, with the shape a hand-written file has: a comment at the top, a
+    // blank line, a commented `[herdr]` table with a key of its own, and the fixture's
+    // `[update]` table last (the harness rewrites `check` in place inside it).
+    std::fs::write(
+        &fx.config,
+        format!(
+            "# my lastcall\n\
+             parent_dirs = [\"{}\"]\n\
+             draft_dirs = [\"_drafts\"]\n\
+             \n\
+             # the agents live next door\n\
+             [herdr]\n\
+             # no desktop notifications, thanks\n\
+             toast = false\n\
+             \n\
+             [update]\n\
+             check = false\n",
+            fx.parent.display()
+        ),
+    )
+    .expect("a hand-written config");
+
+    let Ok(mut pty) = fx
+        .command(&bin())
+        .tour(true)
+        .args(["tui", "--poll", "1"])
+        .env("HERDR_SOCKET_PATH", &sock)
+        .env("HERDR_WORKSPACE_ID", "w1")
+        .spawn()
+    else {
+        note("SKIP: this host cannot open a pty");
+        return;
+    };
+    // Read it back after the spawn: the harness appends `[update]` at spawn time, so this
+    // is the file the child actually opened.
+    let before = std::fs::read_to_string(&fx.config).expect("the config the child reads");
+    wait_welcome(&mut pty);
+    pty.send(b"\r").expect("enter");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        s.contents().contains("You are running inside herdr 0.8.2")
+    })
+    .unwrap_or_else(|e| panic!("the herdr card: {e}\n{}", pty.screen_text()));
+    pty.send(b"\x1b[B").expect("down");
+    pty.send(b"\r").expect("enter");
+    pty.wait_for(OVERLOADED, |s| {
+        let text = s.contents();
+        !text.contains("Welcome to lastcall") && text.contains("beta")
+    })
+    .unwrap_or_else(|e| panic!("the choice takes hold: {e}\n{}", pty.screen_text()));
+
+    let after = std::fs::read_to_string(&fx.config).expect("the config after the write");
+    for line in before.lines() {
+        assert!(
+            after.lines().any(|l| l == line),
+            "the write dropped {line:?} from\n{after}"
+        );
+    }
+    assert!(after.contains("# my lastcall"), "{after}");
+    assert!(after.contains("# the agents live next door"), "{after}");
+    assert!(
+        after.contains("# no desktop notifications, thanks"),
+        "a comment inside the table the write touched: {after}"
+    );
+    let added: Vec<&str> = after
+        .lines()
+        .filter(|l| !before.lines().any(|b| b == *l))
+        .collect();
+    assert_eq!(
+        added,
+        vec!["scope = \"all\""],
+        "one line added to a file that already had a [herdr] table:\n{after}"
+    );
+    assert!(
+        !after.contains(CREATED_BY),
+        "a file that already existed gets no provenance comment:\n{after}"
+    );
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    assert_eq!(pty.wait_exit(QUIT_BUDGET).expect("exit").exit_code(), 0);
+    assert_clean_exit(&pty, since);
+    rt.block_on(mock.shutdown());
+}
+
+/// `q` on the first card skips the rest: the keys come back at once, nothing is written to
+/// the config file, and the marker says it has been seen — skipping is an answer.
+#[test]
+fn tui_tour_skip() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let Some(mut pty) = ({
+        let cmd = fx.command(&bin()).tour(true).args(["tui", "--poll", "1"]);
+        match cmd.spawn() {
+            Ok(p) => Some(p),
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => None,
+            Err(e) => panic!("spawn lastcall tui: {e}"),
+        }
+    }) else {
+        note("SKIP: this host cannot open a pty");
+        return;
+    };
+    let before = std::fs::read_to_string(&fx.config).expect("the config the child reads");
+    wait_welcome(&mut pty);
+    // `?` while the welcome is up is not the help overlay: its own keys are the only keys,
+    // and the card is still the card a second later.
+    pty.send(b"?").expect("?");
+    assert!(
+        pty.wait_for(Duration::from_secs(1), |s| !s
+            .contents()
+            .contains("Welcome to lastcall"))
+            .is_err(),
+        "a keymap key reached the screen under the welcome:\n{}",
+        pty.screen_text()
+    );
+
+    pty.send(b"q").expect("q skips");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        let text = s.contents();
+        !text.contains("Welcome to lastcall") && text.contains("M f1")
+    })
+    .unwrap_or_else(|e| panic!("the review screen comes back: {e}\n{}", pty.screen_text()));
+    assert!(!pty.eof(), "`q` skipped the welcome, it did not quit");
+
+    // And the keys are the keys again.
+    pty.send(b"?").expect("? for real");
+    pty.wait_for(Duration::from_secs(5), |s| s.contents().contains("quit"))
+        .unwrap_or_else(|e| panic!("the help overlay: {e}\n{}", pty.screen_text()));
+    pty.send(b"\x1b").expect("esc");
+
+    assert_eq!(
+        std::fs::read_to_string(&fx.config).expect("the config"),
+        before,
+        "skipping writes nothing to the config file"
+    );
+    assert!(
+        fx.state.join(MARKER_FILE).exists(),
+        "skipping is an answer: it is not asked again"
+    );
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q quits");
+    assert_eq!(pty.wait_exit(QUIT_BUDGET).expect("exit").exit_code(), 0);
+    assert_clean_exit(&pty, since);
+}
+
+/// The marker is the whole decision: a second launch shows the review screen, and
+/// `lastcall tui --tour` shows the welcome again over it.
+#[test]
+fn tui_tour_flag() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    // A marker is already there (the harness writes one into every isolated state dir):
+    // no welcome, straight to the rows.
+    let Some(mut pty) = fx.spawn_tui(&bin()) else {
+        return;
+    };
+    wait_first_piles(&mut pty);
+    assert!(
+        !pty.screen_text().contains("Welcome to lastcall"),
+        "a state dir that has seen it is not asked again:\n{}",
+        pty.screen_text()
+    );
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    assert_eq!(pty.wait_exit(QUIT_BUDGET).expect("exit").exit_code(), 0);
+    assert_clean_exit(&pty, since);
+
+    // `--tour` over the very same state dir, marker and all.
+    let Ok(mut pty) = fx
+        .command(&bin())
+        .args(["tui", "--poll", "1", "--tour"])
+        .spawn()
+    else {
+        note("SKIP: this host cannot open a pty");
+        return;
+    };
+    wait_welcome(&mut pty);
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q skips");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        !s.contents().contains("Welcome to lastcall")
+    })
+    .unwrap_or_else(|e| panic!("the skip: {e}\n{}", pty.screen_text()));
+    pty.send(b"q").expect("q quits");
+    assert_eq!(pty.wait_exit(QUIT_BUDGET).expect("exit").exit_code(), 0);
+    assert_clean_exit(&pty, since);
+}
+
+/// Quitting with the welcome still open is a dismissal too: ctrl-c leaves, and the marker
+/// it wrote on the way out means the next launch starts on the review screen.
+#[test]
+fn tui_tour_quit_writes_marker() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let marker = fx.state.join(MARKER_FILE);
+    let Some(mut pty) = ({
+        let cmd = fx.command(&bin()).tour(true).args(["tui", "--poll", "1"]);
+        match cmd.spawn() {
+            Ok(p) => Some(p),
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => None,
+            Err(e) => panic!("spawn lastcall tui: {e}"),
+        }
+    }) else {
+        note("SKIP: this host cannot open a pty");
+        return;
+    };
+    assert!(!marker.exists(), "the welcome is owed");
+    wait_welcome(&mut pty);
+
+    let since = pty.raw().len();
+    pty.send(b"\x03").expect("ctrl-c");
+    let status = pty
+        .wait_exit(QUIT_BUDGET)
+        .expect("ctrl-c leaves from inside the welcome");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+    // The marker the child wrote, not the harness's: it names the build that showed it, so
+    // the next launch of this state directory starts on the review screen.
+    let marker = std::fs::read_to_string(&marker).expect("the marker was written on the way out");
+    assert!(
+        marker.contains(&format!("\"version\":\"{}\"", env!("CARGO_PKG_VERSION"))),
+        "the binary's own version: {marker}"
+    );
+    assert!(marker.contains("\"shown_at\":"), "{marker}");
+}

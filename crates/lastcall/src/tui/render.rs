@@ -29,6 +29,7 @@ use super::app::{
 use super::herdr::{Dot, Link};
 use super::input::{Action, MODAL_KEYS};
 use super::textbuf::Wrap;
+use super::tour::{Kind as TourLine, MIN_COLS as TOUR_MIN_COLS};
 
 pub const TOO_SMALL: &str = "too small: 40×10 min";
 /// The note modal's box: wide enough for a sentence, narrow enough to sit over the diff.
@@ -297,6 +298,13 @@ pub fn render(app: &App, frame: &mut Frame<'_>) -> HitMap {
     // only answers on a repository row, and every modal above swallows it.
     if app.snooze.is_some() {
         render_snooze(app, buf, area);
+    }
+    // The welcome overlay is above all of them (Amendment v1.11, F7). It opens on the first
+    // frame past the launch hold, when none of the modals can be open yet, and its rows go
+    // into the hit map **last** so a press on one resolves to the tour and not to whatever
+    // the live screen underneath is drawing.
+    if app.tour.is_some() {
+        render_tour(app, buf, area, &mut hits);
     }
     hits
 }
@@ -1817,7 +1825,7 @@ fn line_text(bytes: &[u8]) -> String {
 
 // ---- help --------------------------------------------------------------------------------
 
-fn key_label(spec: &str) -> String {
+pub(super) fn key_label(spec: &str) -> String {
     match spec {
         "up" => "↑".into(),
         "down" => "↓".into(),
@@ -2218,6 +2226,78 @@ fn render_snooze(app: &App, buf: &mut Buffer, area: Rect) {
             inner.width.saturating_sub(1) as usize,
             *style,
         );
+    }
+}
+
+/// The first-launch welcome overlay (Amendment v1.11, deliverable 1).
+///
+/// The confirm modal's shape at the size of a card: a centred box, at least
+/// [`tour::MIN_COLS`](super::tour::MIN_COLS) wide, the body wrapped to it. The card's text
+/// is `tour.rs`'s — what a card says and how its columns line up is the card's business —
+/// and what happens here is the painting and the hit map, because both are facts about a
+/// frame rather than about the tour.
+///
+/// The height ladder spends the blank separator lines first: a card on a short terminal
+/// closes up rather than losing its footer, which is the one line saying how to leave.
+fn render_tour(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
+    let Some(tour) = &app.tour else {
+        return;
+    };
+    // Two borders and one column of padding on each side, and a column of the screen left
+    // showing on each side of the box so it reads as an overlay rather than a repaint.
+    let max = area.width.saturating_sub(6) as usize;
+    let floor = (TOUR_MIN_COLS as usize).saturating_sub(4).min(max);
+    let text = tour.natural(app).clamp(floor, max.max(1));
+    let mut rows = tour.lines(app, text, area.height.saturating_sub(2) as usize);
+    let width = (rows
+        .iter()
+        .map(|l| l.text.width())
+        .max()
+        .unwrap_or(0)
+        .max(floor)
+        + 4)
+    .min(area.width as usize);
+    let mut height = rows.len() + 2;
+    while height > area.height as usize {
+        let Some(blank) = rows.iter().position(|l| l.text.is_empty()) else {
+            break;
+        };
+        rows.remove(blank);
+        height -= 1;
+    }
+    let rect = centered(area, width as u16, height.min(area.height as usize) as u16);
+    let inner = modal_block(" welcome ", rect, buf);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    // A failed write leaves a choice card with no choice left to make — the setting is
+    // already applied — so its footer is what the mouse advances from.
+    let footer_advances = !tour.card().is_choice() || tour.failed.is_some();
+    for (i, row) in rows.iter().take(inner.height as usize).enumerate() {
+        let y = inner.y + i as u16;
+        let style = match row.kind {
+            TourLine::Title => bold(),
+            TourLine::Choice(n) if n == tour.row => bold(),
+            TourLine::Choice(_) => Style::new(),
+            TourLine::Footer => dim(),
+            TourLine::Body => Style::new(),
+        };
+        buf.set_stringn(
+            inner.x + 1,
+            y,
+            &row.text,
+            inner.width.saturating_sub(1) as usize,
+            style,
+        );
+        let target = match row.kind {
+            TourLine::Choice(n) => Some(Target::TourRow(n)),
+            TourLine::Footer if footer_advances => Some(Target::TourRow(0)),
+            _ => None,
+        };
+        if let Some(target) = target {
+            hits.targets
+                .push((Rect::new(inner.x, y, inner.width, 1), target));
+        }
     }
 }
 

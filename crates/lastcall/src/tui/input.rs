@@ -106,6 +106,10 @@ pub enum Action {
     /// One keystroke inside the snooze modal. Never key-bound: while the modal is open
     /// [`snooze_action`] resolves every key before the keymap, so a digit is a digit.
     SnoozeEdit(SnoozeKey),
+    /// One keystroke inside the first-launch tour (Amendment v1.11). Never key-bound:
+    /// while the overlay is open [`super::tour::tour_action`] resolves every key before the
+    /// keymap and before every modal, so the overlay's keys are the same on every install.
+    Tour(TourKey),
     /// Open the selected file in the **inline** editor, at the line of the hunk under the
     /// cursor (deliverable 8; `Effect::EditInline`). The same rows `EditExternal` opens,
     /// and only when the engine will hand the bytes over: a binary or oversize file says
@@ -184,6 +188,23 @@ pub enum SnoozeKey {
     Apply,
     /// Esc: close, write nothing.
     Cancel,
+}
+
+/// What one keystroke does to the first-launch tour (Amendment v1.11).
+///
+/// Four things, because the overlay asks for one of four: move to the other row, take the
+/// selected one, or stop being asked. Fixed and outside the keymap — a welcome that a
+/// `[keys]` table could make unanswerable would be the one screen nobody can get past.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TourKey {
+    /// Enter: apply the selected row on a choice card, or advance a plain one.
+    Next,
+    /// Up, or `k`.
+    Up,
+    /// Down, or `j`.
+    Down,
+    /// `q` or Esc: write the marker and close, without applying anything.
+    Skip,
 }
 
 /// One edit inside a text buffer ([`super::textbuf::TextBuf`]), for the two places that
@@ -412,7 +433,7 @@ pub fn pick_action(event: &Event, keymap: &Keymap) -> Option<Action> {
 
 /// `Action::Quit` when `key` is a **non-printable** quit binding, else nothing: the escape
 /// hatch a text-entry modal keeps open.
-fn quit_only(keymap: &Keymap, key: Key) -> Option<Action> {
+pub(super) fn quit_only(keymap: &Keymap, key: Key) -> Option<Action> {
     let printable = matches!(key.code, KeyCode::Char(_)) && !key.ctrl && !key.alt;
     match keymap.lookup(key) {
         Some(Action::Quit) if !printable => Some(Action::Quit),
@@ -1655,6 +1676,7 @@ mod tests {
             (Action::Snooze, "key"),
             (Action::ShowSnoozed, "key"),
             (Action::SnoozeEdit(SnoozeKey::Apply), "modal-note"),
+            (Action::Tour(TourKey::Next), "modal-note"),
             (Action::Select, "key"),
             (Action::Copy, "key"),
             (Action::SelectTo(0), "mouse"),
@@ -1726,6 +1748,7 @@ mod tests {
             | Action::Snooze
             | Action::ShowSnoozed
             | Action::SnoozeEdit(_)
+            | Action::Tour(_)
             | Action::Select
             | Action::Copy
             | Action::SelectTo(_)
@@ -1739,9 +1762,9 @@ mod tests {
             | Action::Ack
             | Action::Jump
             | Action::ScopeToggle
-            | Action::Herdr(_) => 48,
+            | Action::Herdr(_) => 49,
         };
-        assert_eq!(table.len(), 48);
+        assert_eq!(table.len(), 49);
     }
 
     #[test]

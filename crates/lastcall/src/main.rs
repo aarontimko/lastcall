@@ -46,6 +46,9 @@ enum Command {
         /// hosts whose filesystem events are late or missing.
         #[arg(long, value_name = "SECS")]
         poll: Option<u64>,
+        /// Show the welcome again, whether or not it has been seen before.
+        #[arg(long)]
+        tour: bool,
     },
     /// Replace this binary with the newest release, after verifying its checksum.
     Update {
@@ -71,7 +74,10 @@ enum Command {
 impl Cli {
     /// The command to run: bare `lastcall` is `tui` with the default timings.
     fn command(self) -> Command {
-        self.command.unwrap_or(Command::Tui { poll: None })
+        self.command.unwrap_or(Command::Tui {
+            poll: None,
+            tour: false,
+        })
     }
 }
 
@@ -82,7 +88,7 @@ fn main() -> std::process::ExitCode {
             commands::hello_herdr::run(socket, exit_after)
         }
         Command::Status { json, roots } => commands::status::run(json, roots),
-        Command::Tui { poll } => commands::tui::run(poll),
+        Command::Tui { poll, tour } => commands::tui::run(poll, tour),
         Command::Update { check } => commands::update::run(check),
         Command::Watch {
             json,
@@ -111,17 +117,32 @@ mod tests {
 
     #[test]
     fn cli_bare_lastcall_is_the_tui_with_default_timings() {
-        assert_eq!(parse(&[]), Command::Tui { poll: None });
-        assert_eq!(parse(&["tui"]), Command::Tui { poll: None });
+        let none = Command::Tui {
+            poll: None,
+            tour: false,
+        };
+        assert_eq!(parse(&[]), none);
+        assert_eq!(parse(&["tui"]), none);
+        // `--tour` is the one way back to the welcome once it has been dismissed.
+        assert_eq!(
+            parse(&["tui", "--tour"]),
+            Command::Tui {
+                poll: None,
+                tour: true
+            }
+        );
     }
 
     #[test]
     fn cli_tui_poll_reaches_the_timings_with_the_watch_clamp() {
         assert_eq!(
             parse(&["tui", "--poll", "0"]),
-            Command::Tui { poll: Some(0) }
+            Command::Tui {
+                poll: Some(0),
+                tour: false
+            }
         );
-        let Command::Tui { poll } = parse(&["tui", "--poll", "0"]) else {
+        let Command::Tui { poll, .. } = parse(&["tui", "--poll", "0"]) else {
             unreachable!()
         };
         let timings = commands::poll_timings(poll);

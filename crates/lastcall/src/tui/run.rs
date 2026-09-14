@@ -71,6 +71,7 @@ use super::input::{
 };
 use super::render::{HitMap, Pane, render};
 use super::term;
+use super::tour::{self, tour_action};
 
 /// How long the quit path waits for the watcher, and then for the runtime.
 pub const SHUTDOWN_BUDGET: Duration = Duration::from_millis(500);
@@ -210,6 +211,35 @@ impl Ui {
         // keys survive, and only in their non-printable form (`note_action`'s `quit_only`,
         // so `q` types a q). `Event::Paste` is why bracketed paste is on while the modal
         // lives: a pasted traceback arrives as one insert rather than a key storm.
+        // The first-launch welcome is above every modal (F7): it opens at the first frame
+        // past the launch hold, when none of them can be open yet, and until it is
+        // dismissed its own keys are the only keys. The mouse reaches exactly its own rows
+        // — `Target::TourRow` — and a press anywhere else on the overlay is dropped here,
+        // before the wheel or a divider drag could act on the screen underneath it.
+        if self.app.tour.is_some() {
+            match event {
+                Event::Key(_) => {
+                    return match tour_action(event, &self.keymap) {
+                        Some(action) => self.app.handle(action),
+                        None => (Changed::No, None),
+                    };
+                }
+                Event::Mouse(_) => {
+                    return match to_action(event, &self.keymap) {
+                        Some(Action::Press(x, y)) => {
+                            match self.hits.as_ref().and_then(|h| h.at(x, y)).cloned() {
+                                Some(target) => self.app.hit(target),
+                                None => (Changed::No, None),
+                            }
+                        }
+                        _ => (Changed::No, None),
+                    };
+                }
+                // A resize still reaches the app below, and invalidates the hit map.
+                Event::Resize(..) => {}
+                _ => return (Changed::No, None),
+            }
+        }
         if self.app.note.is_some() {
             match event {
                 Event::Key(_) | Event::Paste(_) => {
@@ -1509,20 +1539,36 @@ pub type DailyCheck = Box<dyn FnOnce(UpdateSink) + Send + 'static>;
 /// Take the terminal and run the TUI until `q`/Ctrl-C/SIGTERM (exit 0) or the watcher
 /// ends (status notice, exit 0). The caller has already checked that stdout is a terminal
 /// and that the keymap parsed; this enters raw mode and always restores it.
+/// What was decided before the terminal was taken, in one piece: three answers the loop
+/// starts from, each read from a file the loop itself never opens.
+pub struct Launch {
+    /// `hide_empty_repos` from the config file (§6.1, Amendment v1.9): the app's opening
+    /// answer to `t`. The key flips it for the session; nothing writes it back.
+    pub hide_empty: bool,
+    /// The once-a-day update check, or `None` when `[update] check = false`. Started on a
+    /// detached thread the moment the launch hold ends, never before the first frame and
+    /// never on the launch path (kickoff deliverable 2.6).
+    pub daily_check: Option<DailyCheck>,
+    /// The first-launch welcome (Amendment v1.11): whether it is owed, where the marker
+    /// goes, and the environment its one config write resolves through. Every file the
+    /// tour touches is touched from this loop; the reducer holds only which card is on
+    /// screen.
+    pub tour: tour::Plan,
+}
+
 pub fn run(
     engine: Engine,
     timings: EngineTimings,
     keymap: Keymap,
     env: Env,
     plan: HerdrPlan,
-    // `hide_empty_repos` from the config file (§6.1, Amendment v1.9): the app's opening
-    // answer to `t`. The key flips it for the session; nothing writes it back.
-    hide_empty: bool,
-    // The once-a-day update check, or `None` when `[update] check = false`. Started on a
-    // detached thread the moment the launch hold ends, never before the first frame and
-    // never on the launch path (kickoff deliverable 2.6).
-    daily_check: Option<DailyCheck>,
+    launch: Launch,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let Launch {
+        hide_empty,
+        daily_check,
+        tour,
+    } = launch;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -1547,6 +1593,7 @@ pub fn run(
     // writes its stamp.
     let update_quit = Arc::new(AtomicBool::new(false));
     let mut daily_check = daily_check;
+    let mut tour = tour;
 
     // Copied out before the engine is moved into its watcher: both are immutable for the
     // life of the process, and the export path is resolved without taking the engine lock.
@@ -1904,6 +1951,17 @@ pub fn run(
                                 .unwrap_or_else(|| pane.clone());
                             spawn_focus(link.transport.clone(), local_tx.clone(), pane, label);
                         }
+                        // The one config write in lastcall that is not the user's own
+                        // editor (Amendment v1.11). The reducer has already applied the
+                        // setting to this session, so `Err` costs a footer and the file
+                        // keeps whatever it had.
+                        Effect::TourWrite(setting) => {
+                            let result = tour.write(setting, clock.now());
+                            let (changed, next) = ui.app.tour_written(result);
+                            redraw = redraw.or(changed);
+                            effects.extend(next);
+                        }
+                        Effect::TourDone => tour.dismissed(clock.now()),
                         Effect::Toast(request) => {
                             if let Some(tx) = &link.toast {
                                 for (root, name) in request.ready {
@@ -1949,6 +2007,15 @@ pub fn run(
                     };
                     std::thread::spawn(move || check(sink));
                 }
+                // Amendment v1.11: the welcome opens at the first frame where a root
+                // could be listed — the launch hold and the scope verdict are both past,
+                // the instant `is_listed` first admits one. Not before: the two conditional
+                // cards are about the link and the empty-repo count, and neither is known
+                // until then. A frame too small to read it opens nothing and writes
+                // nothing, so it is still owed on the next launch that has room.
+                if tour.due(&ui.app) {
+                    redraw = redraw.or(tour.open(&mut ui.app));
+                }
                 if redraw == Changed::Yes {
                     // Deliverable 8: one line per repaint, saying why and how long. A
                     // `draw` per pile in a burst is the symptom deliverable 6 removed, and
@@ -1965,6 +2032,12 @@ pub fn run(
                         "draw"
                     );
                 }
+            }
+            // Quitting with the welcome still open is a dismissal like any other: the
+            // marker is written here, before the terminal is restored, so a `ctrl-c` on the
+            // first card does not mean the next launch opens it again (F7).
+            if ui.app.tour.is_some() {
+                tour.dismissed(clock.now());
             }
             // A connect still in flight has nothing left to deliver.
             if let Some(task) = connecting.take() {
@@ -2902,5 +2975,126 @@ mod tests {
         assert_eq!(hung, None);
         assert!(started.elapsed() < Duration::from_secs(5));
         rt.shutdown_timeout(Duration::from_millis(20));
+    }
+
+    // ---- the first-launch welcome (Amendment v1.11, deliverable 1) --------------------
+
+    /// A `Ui` with the welcome open on the card that asks about empty repositories.
+    fn ui_with_tour() -> Ui {
+        let mut ui = ui();
+        ui.app.tour = Some(tour::Tour::new(vec![tour::Card::Empty {
+            empty: 12,
+            total: 14,
+        }]));
+        ui
+    }
+
+    /// F7: the welcome resolves before every modal and before the keymap. Its own keys are
+    /// the only keys, `q` skips rather than quits, and ctrl-c is still the way out.
+    #[test]
+    fn run_tour_resolves_before_every_modal_and_before_the_keymap() {
+        let mut ui = ui_with_tour();
+        // Bound to help, accept and refresh outside the welcome: all swallowed.
+        for code in [
+            KeyCode::Char('?'),
+            KeyCode::Char('a'),
+            KeyCode::Char('r'),
+            KeyCode::Char('y'),
+            KeyCode::Tab,
+        ] {
+            assert_eq!(ui.event(&key(code)), (Changed::No, None), "{code:?}");
+        }
+        assert!(!ui.app.help, "no help overlay opened under it");
+        assert!(ui.app.tour.is_some());
+        // Its own keys land.
+        assert_eq!(ui.event(&key(KeyCode::Down)), (Changed::Yes, None));
+        assert_eq!(ui.app.tour.as_ref().expect("open").row, 1);
+        // `q` is the footer's promise, not the keymap's quit.
+        let mut skipping = ui_with_tour();
+        assert_eq!(
+            skipping.event(&key(KeyCode::Char('q'))),
+            (Changed::Yes, Some(Effect::TourDone))
+        );
+        assert!(skipping.app.tour.is_none());
+        // ctrl-c still leaves, and the loop writes the marker on the way out.
+        let mut quitting = ui_with_tour();
+        assert_eq!(
+            quitting.event(&Event::Key(KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL
+            ))),
+            (Changed::No, Some(Effect::Quit))
+        );
+    }
+
+    /// The mouse reaches exactly the card's own rows. A press anywhere else on the screen
+    /// under the overlay, and the wheel over either pane, do nothing at all.
+    #[test]
+    fn run_tour_mouse_reaches_only_the_cards_own_rows() {
+        let mut ui = ui_with_tour();
+        render_into(&mut ui);
+        let (x, y) = target_center(&ui, &Target::TourRow(1));
+        assert_eq!(
+            ui.event(&mouse(MouseEventKind::Down(MouseButton::Left), x, y)),
+            (
+                Changed::Yes,
+                Some(Effect::TourWrite(
+                    lastcall_engine::config::write::Setting::HideEmptyRepos
+                ))
+            ),
+            "a click on the second row takes it"
+        );
+        assert!(ui.app.hide_empty);
+
+        let mut ui = ui_with_tour();
+        render_into(&mut ui);
+        let before = ui.app.selection.clone();
+        // Row 1 of the nav pane, well outside the centred box.
+        assert_eq!(
+            ui.event(&mouse(MouseEventKind::Down(MouseButton::Left), 3, 2)),
+            (Changed::No, None),
+            "a press on the screen under the welcome is dropped"
+        );
+        assert_eq!(
+            ui.event(&mouse(MouseEventKind::ScrollDown, 3, 5)),
+            (Changed::No, None)
+        );
+        assert_eq!(
+            ui.event(&mouse(MouseEventKind::ScrollUp, 60, 5)),
+            (Changed::No, None)
+        );
+        assert_eq!(ui.app.selection, before);
+        assert!(ui.app.tour.is_some());
+    }
+
+    /// A resize still reaches the app underneath: the welcome is an overlay, not a freeze,
+    /// and the card re-wraps to the new frame.
+    #[test]
+    fn run_tour_lets_a_resize_through_to_the_app() {
+        let mut ui = ui_with_tour();
+        assert_eq!(ui.event(&Event::Resize(80, 24)).0, Changed::Yes);
+        assert_eq!(ui.app.size, (80, 24));
+        assert!(ui.app.tour.is_some());
+    }
+
+    /// The welcome is painted last, over the help overlay and the confirm modal both, and
+    /// its rows are the ones the hit map answers with (`HitMap::at` searches in reverse, so
+    /// the last thing pushed wins).
+    #[test]
+    fn run_tour_paints_over_every_other_overlay_and_owns_the_hit_map() {
+        let mut ui = ui_with_tour();
+        ui.app.help = true;
+        render_into(&mut ui);
+        let frame = frame_of(&ui);
+        assert!(
+            frame.contains(" welcome "),
+            "the welcome is on top: {frame}"
+        );
+        let (x, y) = target_center(&ui, &Target::TourRow(0));
+        assert_eq!(
+            ui.hits.as_ref().expect("rendered").at(x, y),
+            Some(&Target::TourRow(0)),
+            "the overlay's own row answers, not whatever is under it"
+        );
     }
 }

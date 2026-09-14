@@ -20,10 +20,12 @@ use lastcall::tui::app::{AcceptFailed, App, Changed, Effect, FlagKind, RootMeta,
 use lastcall::tui::herdr::{AgentCandidate, Attention, Dot, HerdrUpdate, RootAgents, Scope};
 use lastcall::tui::input::{Action, EditKey, EditorKey, NoteKey, PickKey, SnoozeKey};
 use lastcall::tui::render::{render, styles};
+use lastcall::tui::tour::{Card, Tour};
 use lastcall_engine::engine::{Engine, EngineOptions, SaveRequest};
 use lastcall_engine::env::Env;
 use lastcall_engine::ops::NoFault;
 use lastcall_engine::scan::{Annotation, Change, Collapsed, Pile};
+use lastcall_engine::store::RootKind;
 use lastcall_engine::watcher::EngineEvent;
 use lastcall_testkit::engine::{open_engine, open_engine_with};
 use lastcall_testkit::fixture_parent::{self, config, draft_config};
@@ -2096,4 +2098,132 @@ fn tui_scope_and_snooze_notice() {
     );
     app.handle(Action::Resize(80, 24));
     snapshot("tui_scope_and_snooze_notice_80x24", &app, 80, 24);
+}
+
+// ---- the first-launch welcome (Amendment v1.11, deliverable 1) --------------------------
+
+/// Open the welcome on `cards` over the live screen. The snapshot tier never touches a
+/// state directory, so no scene here reads or writes the marker: the overlay is put up
+/// directly, exactly as `tour::Plan::open` would have put it up.
+fn open_tour(app: &mut App, cards: Vec<Card>) {
+    app.tour = Some(Tour::new(cards));
+}
+
+/// Deliverable 1, card one: the keys, over the three-root screen. Always shown, and the
+/// grid is rendered from the effective keymap, so this frame is what a reader with the
+/// default bindings sees on their first launch. At 80×24 the three columns do not fit and
+/// the grid falls back to one key per line.
+#[test]
+fn tui_tour_keys() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    open_tour(&mut app, vec![Card::Keys]);
+    let (frame, _) = draw(&app, W, H);
+    assert!(frame.contains(" welcome "), "{frame}");
+    assert!(
+        frame.contains("a  accept the hunk under the cursor"),
+        "{frame}"
+    );
+    assert!(
+        frame.contains("enter  next          q  skip the rest"),
+        "{frame}"
+    );
+    snapshot("tui_tour_keys", &app, W, H);
+
+    app.handle(Action::Resize(80, 24));
+    let (narrow, _) = draw(&app, 80, 24);
+    assert!(narrow.contains("?  every key, any time"), "{narrow}");
+    snapshot("tui_tour_keys_80x24", &app, 80, 24);
+}
+
+/// Card two: lastcall is following a herdr workspace right now, and the file has never
+/// said whether that is wanted. The second row is the one that writes, and it says what it
+/// writes; the first, selected, row writes nothing.
+#[test]
+fn tui_tour_herdr() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    let alpha = root_named(&engine, "alpha");
+    herdr_connected(&mut app);
+    app.handle(Action::Herdr(HerdrUpdate::Scope(Some(Scope {
+        label: "alpha".to_owned(),
+        roots: [alpha].into_iter().collect(),
+    }))));
+    app.herdr.scoped = true;
+    assert_eq!(app.listed_roots().count(), 1, "the workspace's one repo");
+    open_tour(
+        &mut app,
+        vec![Card::Herdr {
+            version: "0.8.2".to_owned(),
+        }],
+    );
+    let (frame, _) = draw(&app, W, H);
+    assert!(
+        frame.contains("You are running inside herdr 0.8.2"),
+        "{frame}"
+    );
+    assert!(frame.contains("> Keep following the workspace"), "{frame}");
+    assert!(frame.contains("scope = \"all\""), "{frame}");
+    snapshot("tui_tour_herdr", &app, W, H);
+
+    app.handle(Action::Resize(80, 24));
+    snapshot("tui_tour_herdr_80x24", &app, 80, 24);
+}
+
+/// Card three: most of what is listed has nothing pending. Twelve empty repositories and
+/// two with work, so the title counts what is on screen.
+#[test]
+fn tui_tour_empty() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    // The fixture has three roots; the card's condition needs fourteen. The extra eleven
+    // are metas and empty piles, which is all the nav draws — no repository on disk is
+    // needed to render a repository with nothing pending.
+    let mut metas: Vec<RootMeta> = engine.roots().into_iter().map(RootMeta::of).collect();
+    let parent = metas[0].parent.clone();
+    for i in 0..11 {
+        let name = format!("repo{i:02}");
+        metas.push(RootMeta {
+            path: parent.join(&name),
+            name,
+            kind: RootKind::Git,
+            parent: parent.clone(),
+            badge: None,
+            branch: Some("main".to_owned()),
+            head: None,
+            in_progress: None,
+            remote: None,
+        });
+    }
+    let extra: Vec<PathBuf> = metas[3..].iter().map(|m| m.path.clone()).collect();
+    app.sync_roots(metas);
+    for path in &extra {
+        app.apply(EngineEvent::Pile {
+            root: path.clone(),
+            seq: 1,
+            pile: Pile::default(),
+        });
+    }
+    // `notes` is emptied too, so twelve of the fourteen have nothing pending.
+    let notes = root_named(&engine, "notes");
+    mark_seen(&mut engine, &notes);
+    rescan(&mut app, &mut engine, &notes);
+
+    let total = app.listed_roots().count();
+    let empty = app.listed_roots().filter(|v| !v.listed()).count();
+    assert_eq!((empty, total), (12, 14), "twelve of fourteen are empty");
+    open_tour(&mut app, vec![Card::Empty { empty, total }]);
+    let (frame, _) = draw(&app, W, H);
+    assert!(
+        frame.contains("12 of your 14 repositories have nothing pending"),
+        "{frame}"
+    );
+    assert!(frame.contains("hide_empty_repos = true"), "{frame}");
+    snapshot("tui_tour_empty", &app, W, H);
+
+    app.handle(Action::Resize(80, 24));
+    snapshot("tui_tour_empty_80x24", &app, 80, 24);
 }

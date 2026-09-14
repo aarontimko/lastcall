@@ -1,0 +1,28 @@
+---
+source: crates/lastcall/tests/test_e2e_tui_snapshots.rs
+expression: frame
+---
+"lastcall  1 repo · 3 files · 5 hunks  herdr 0.8.2  [Accept All]       watching W"
+"┌──────────────────────────┬───────────────────────────────────────────────────┐"
+"│alpha                     │select a file (↑↓ or click) · ? for help           │"
+"│  main · 3 files          │                                                   │"
+"│  M f1  +1 −1             │                                                   │"
+"│ ┌ welcome ─────────────────────────────────────────────────────────────────┐ │"
+"│ │ You are running inside herdr 0.8.2. Nice!                                │ │"
+"│ │                                                                          │ │"
+"│ │ lastcall follows this workspace. When a pane changes directory, the list │ │"
+"│ │ narrows to the repositories that workspace is working in, and the bottom │ │"
+"│ │ line says how many are out of view. w shows everything for the session.  │ │"
+"│ │                                                                          │ │"
+"│ │ > Keep following the workspace                                           │ │"
+"│ │   Show every repository instead, and remember that                       │ │"
+"│ │     (writes scope = "all" under [herdr])                                 │ │"
+"│ │                                                                          │ │"
+"│ │ enter  choose          q  skip the rest                                  │ │"
+"│ └──────────────────────────────────────────────────────────────────────────┘ │"
+"│                          │                                                   │"
+"│                          │                                                   │"
+"│                          │                                                   │"
+"│                          │                                                   │"
+"└──────────────────────────┴───────────────────────────────────────────────────┘"
+"↑↓ select  ⏎ open  ? help  q quit    scope: alpha · 2 repos hidden (w shows all)"

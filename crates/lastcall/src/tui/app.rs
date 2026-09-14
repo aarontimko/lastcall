@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
+use lastcall_engine::config::write::Setting;
 use lastcall_engine::count::with_thousands;
 use lastcall_engine::engine::{
     AcceptRequest, Accepted, EngineError, Flagged, RenderedHunk, RestoreRequest, Restored,
@@ -29,8 +30,9 @@ use lastcall_engine::store::{Current, RootKind};
 use lastcall_engine::watcher::EngineEvent;
 
 use super::herdr::{AgentCandidate, HerdrUpdate, HerdrView, Link, ToastRequest};
-use super::input::{Action, EditKey, EditorKey, Keymap, NoteKey, PickKey, SnoozeKey};
+use super::input::{Action, EditKey, EditorKey, Keymap, NoteKey, PickKey, SnoozeKey, TourKey};
 use super::textbuf::{TextBuf, Wrap};
+use super::tour::Tour;
 use unicode_width::UnicodeWidthStr;
 
 /// The columns the bottom line keeps for the status text or the hints beside the notice
@@ -272,6 +274,11 @@ pub enum Target {
     /// The header's update notice (`↑ 0.1.1`): a click puts the whole sentence on the
     /// status line, exactly as a click on the badge does (Design pass D6).
     HeaderUpdate,
+    /// Row `n` of the first-launch tour's card (Amendment v1.11): a choice row on a card
+    /// that asks a question, and the footer on one that does not. A click takes it, exactly
+    /// as Enter on it would — a card is a question, and a question answered by the mouse is
+    /// still answered.
+    TourRow(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -387,6 +394,14 @@ pub enum Effect {
         root: PathBuf,
         days: Option<u32>,
     },
+    /// The first-launch tour's one sanctioned config write (Amendment v1.11): set this key
+    /// in the config file through `lastcall_engine::config::write` and feed the answer back
+    /// to [`App::tour_written`]. The reducer has already applied the setting to the session
+    /// by the time this is dispatched — the write is the *remembering*, not the doing — so a
+    /// failure costs a footer, never the choice.
+    TourWrite(Setting),
+    /// The tour closed, by any path: write the marker so it is not shown again.
+    TourDone,
     /// `agent.focus` on this pane id (herdr's own public id, never a name); the result
     /// comes back as `HerdrUpdate::Focused`.
     Focus(String),
@@ -1132,6 +1147,11 @@ pub struct App {
     /// Everything herdr says, and the local ack episodes (Phase 5). Socket-free: the
     /// reducer never sees the client's own types.
     pub herdr: HerdrView,
+    /// The first-launch welcome overlay, if open (Amendment v1.11). It sits above
+    /// everything — the help overlay and the confirm modal included — and only its own keys
+    /// reach the reducer while it is. Opened by the loop at the first frame past the launch
+    /// hold and the scope verdict; see [`super::tour`].
+    pub tour: Option<Tour>,
     /// The launch hold, until every root has reported. See [`Loading`].
     pub loading: Option<Loading>,
     /// The one collapsed row whose hunks `e` fetched, if any. A view, never a baseline;
@@ -1201,6 +1221,7 @@ impl App {
             edit_gen: 0,
             confirm: None,
             herdr: HerdrView::default(),
+            tour: None,
             loading: None,
             expanded: None,
             // The canonical spellings (`shift-a` shows as `A`), as `Keymap::table` gives.
@@ -2991,6 +3012,109 @@ impl App {
     }
 
     /// One keystroke inside the snooze modal.
+    /// One keystroke inside the first-launch welcome overlay (Amendment v1.11).
+    ///
+    /// Enter is the only key that does anything irreversible, and what it does depends on
+    /// the row: the first row of a choice card keeps the default and advances, the second
+    /// applies the change **to this session immediately** and asks the loop to remember it.
+    /// The order matters — the setting is live whether or not the file can be written, so a
+    /// read-only config directory costs a footer and not the choice.
+    fn tour_key(&mut self, key: TourKey) -> (Changed, Option<Effect>) {
+        let Some(tour) = &mut self.tour else {
+            return (Changed::No, None);
+        };
+        match key {
+            TourKey::Up | TourKey::Down => {
+                let rows = tour.rows();
+                // Nothing to move between on a plain card, and nothing to choose once a
+                // failed write has replaced the footer: the choice is already applied.
+                if rows == 0 || tour.failed.is_some() {
+                    return (Changed::No, None);
+                }
+                let row = match key {
+                    TourKey::Up => tour.row.saturating_sub(1),
+                    _ => (tour.row + 1).min(rows - 1),
+                };
+                if row == tour.row {
+                    return (Changed::No, None);
+                }
+                tour.row = row;
+                (Changed::Yes, None)
+            }
+            TourKey::Skip => self.close_tour(),
+            TourKey::Next => {
+                // A failed write has said its piece on the footer; Enter moves on from it.
+                let acknowledged = tour.failed.take().is_some();
+                let setting = tour.card().setting().filter(|_| tour.row == 1);
+                if acknowledged {
+                    return self.advance_tour();
+                }
+                match setting {
+                    Some(setting) => {
+                        self.apply_tour_setting(setting);
+                        (Changed::Yes, Some(Effect::TourWrite(setting)))
+                    }
+                    None => self.advance_tour(),
+                }
+            }
+        }
+    }
+
+    /// The loop's answer to an [`Effect::TourWrite`]: the card advances when the file took
+    /// the key, and keeps the screen with a sentence and the TOML line when it did not.
+    pub fn tour_written(&mut self, result: Result<(), String>) -> (Changed, Option<Effect>) {
+        match result {
+            Ok(()) => self.advance_tour(),
+            Err(message) => {
+                let Some(tour) = &mut self.tour else {
+                    return (Changed::No, None);
+                };
+                tour.failed = Some(message);
+                (Changed::Yes, None)
+            }
+        }
+    }
+
+    /// The next card, or the end of the tour.
+    fn advance_tour(&mut self) -> (Changed, Option<Effect>) {
+        let Some(tour) = &mut self.tour else {
+            return (Changed::No, None);
+        };
+        tour.at += 1;
+        tour.row = 0;
+        tour.failed = None;
+        if tour.at >= tour.cards.len() {
+            return self.close_tour();
+        }
+        (Changed::Yes, None)
+    }
+
+    /// Close the overlay and ask the loop to write the marker. Every dismissal lands here
+    /// but one: quitting with it open, which the loop notices after the event loop ends.
+    fn close_tour(&mut self) -> (Changed, Option<Effect>) {
+        self.tour = None;
+        (Changed::Yes, Some(Effect::TourDone))
+    }
+
+    /// Apply a tour choice to **this session**, the same instant the write is asked for.
+    ///
+    /// Neither of these goes through its `Action`: `ScopeToggle` is a no-op when no scope
+    /// was derived, and both cards are gated on the setting not being in force already, so
+    /// a toggle and an assignment are the same thing here and the assignment is the one that
+    /// says what it means.
+    fn apply_tour_setting(&mut self, setting: Setting) {
+        match setting {
+            Setting::HerdrScopeAll => {
+                self.herdr.scoped = false;
+                self.reconcile_selection();
+            }
+            Setting::HideEmptyRepos => {
+                self.hide_empty = true;
+                self.reconcile_selection();
+            }
+        }
+    }
+
     fn snooze_key(&mut self, key: SnoozeKey) -> (Changed, Option<Effect>) {
         let Some(entry) = &mut self.snooze else {
             return (Changed::No, None);
@@ -3589,6 +3713,22 @@ impl App {
     /// Fold one user action in.
     pub fn handle(&mut self, action: Action) -> (Changed, Option<Effect>) {
         use Action::*;
+        // The first-launch tour is above everything, the help overlay and the confirm modal
+        // included (F7): a `?` before the welcome is dismissed must not open help *under*
+        // it, and a card with a highlighted row is a question that has to be answered or
+        // skipped before anything else happens. `Ui::event` resolves every key through
+        // `tour_action` first, so the only keystrokes that reach here are its own and a
+        // non-printable quit; `Press` reaches here as the no-op it always is (the loop
+        // resolves it through the hit map), and `Tick`, `Resize` and `Herdr` pass because
+        // none of them is a keystroke.
+        if self.tour.is_some()
+            && !matches!(
+                action,
+                Tick | Resize(..) | Tour(_) | Quit | Herdr(_) | Press(..)
+            )
+        {
+            return (Changed::No, None);
+        }
         // The note modal owns the keyboard: `Ui::event` resolves every key through
         // `note_action` before the keymap, so the only actions that reach here are its own
         // edits, a quit, and the events that pass through every modal.
@@ -3766,6 +3906,7 @@ impl App {
                 Changed::Yes
             }
             SnoozeEdit(key) => return self.snooze_key(key),
+            Tour(key) => return self.tour_key(key),
             Edit => return self.edit_inline(),
             EditExternal => return self.edit_external(),
             Editor(key) => return self.editor_key(key),
@@ -4027,6 +4168,19 @@ impl App {
 
     /// Fold a resolved mouse target in (the loop maps `Press(x, y)` through the `HitMap`).
     pub fn hit(&mut self, target: Target) -> (Changed, Option<Effect>) {
+        // The first-launch tour is above every modal, so its rows are resolved first — and
+        // a press anywhere else on the overlay is ignored, not passed through to whatever
+        // the frame under it happens to be drawing.
+        if self.tour.is_some() {
+            let Target::TourRow(n) = target else {
+                return (Changed::No, None);
+            };
+            let tour = self.tour.as_mut().expect("checked above");
+            if tour.rows() > 0 {
+                tour.row = n.min(tour.rows() - 1);
+            }
+            return self.tour_key(TourKey::Next);
+        }
         // A click under any modal is ignored, exactly as it is under the confirm.
         if self.confirm.is_some() || self.note.is_some() || self.picker.is_some() {
             return (Changed::No, None);
@@ -4036,6 +4190,9 @@ impl App {
             return (Changed::Yes, None);
         }
         let changed = match target {
+            // Resolved above, while the overlay is open; once it has closed the rows are
+            // gone from the hit map and a stale press on one does nothing.
+            Target::TourRow(_) => Changed::No,
             Target::HeaderAcceptAll => return self.handle(Action::AcceptAll),
             Target::RootDot(root) => {
                 // The click selects the root exactly as a click on its name does, then
@@ -9645,6 +9802,286 @@ mod tests {
             plain.notice_forms(),
             vec!["1 snoozed (S shows)".to_owned()],
             "a snooze count on its own has one form too"
+        );
+    }
+    // ---- the first-launch welcome (Amendment v1.11, deliverable 1) --------------------
+
+    use crate::tui::tour::{Card, Tour};
+
+    /// A three-root app with the tour open on `cards`.
+    fn with_tour(cards: Vec<Card>) -> App {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.tour = Some(Tour::new(cards));
+        app
+    }
+
+    fn empty_card() -> Card {
+        Card::Empty {
+            empty: 12,
+            total: 14,
+        }
+    }
+
+    /// Whether `name` is on screen, through the same gate the painter uses.
+    fn listed(app: &App, name: &str) -> bool {
+        app.listed_roots().any(|v| v.meta.path == root(name))
+    }
+
+    fn herdr_card() -> Card {
+        Card::Herdr {
+            version: "0.8.2".to_owned(),
+        }
+    }
+
+    /// F7: the overlay sits above everything. While it is up the keymap's actions do not
+    /// reach the screen underneath — `?` does not open the help overlay behind it, `a`
+    /// accepts nothing, `t` hides nothing — and the frame does not even redraw.
+    #[test]
+    fn app_tour_holds_every_key_that_is_not_its_own() {
+        let mut app = with_tour(vec![Card::Keys]);
+        app.select(Some(row("alpha", "f1")));
+        let before = app.selection.clone();
+        for action in [
+            Action::Help,
+            Action::Accept,
+            Action::AcceptFile,
+            Action::AcceptAll,
+            Action::HideEmpty,
+            Action::NavDown,
+            Action::Open,
+            Action::Snooze,
+            Action::Undo,
+            Action::Refresh,
+        ] {
+            assert_eq!(
+                app.handle(action.clone()),
+                (Changed::No, None),
+                "{action:?} reached the screen under the welcome"
+            );
+        }
+        assert!(!app.help, "no help overlay opened behind it");
+        assert!(!app.hide_empty);
+        assert_eq!(app.selection, before, "the cursor did not move");
+        assert!(app.tour.is_some(), "and the welcome is still up");
+    }
+
+    /// The tour's own keys, a resize, the clock and the news from herdr still land: the
+    /// screen behind it stays live and the overlay does not freeze the program.
+    #[test]
+    fn app_tour_lets_the_frame_stay_live_underneath() {
+        let mut app = with_tour(vec![Card::Keys, empty_card()]);
+        assert_eq!(app.handle(Action::Resize(80, 24)).0, Changed::Yes);
+        assert_eq!(app.size, (80, 24));
+        app.handle(Action::Tick);
+        assert_eq!(
+            app.herdr_update(HerdrUpdate::Connected {
+                version: "0.8.2".to_owned(),
+                protocol: 1,
+            })
+            .0,
+            Changed::Yes,
+            "herdr news still lands"
+        );
+        assert!(app.tour.is_some());
+    }
+
+    /// `enter` on a plain card goes to the next one; `enter` on the last closes the tour
+    /// and asks the loop for the marker.
+    #[test]
+    fn app_tour_enter_walks_the_cards_and_the_last_one_closes_it() {
+        let mut app = with_tour(vec![Card::Keys, empty_card()]);
+        assert_eq!(
+            app.handle(Action::Tour(TourKey::Next)),
+            (Changed::Yes, None)
+        );
+        assert_eq!(app.tour.as_ref().expect("open").at, 1);
+        assert_eq!(
+            app.handle(Action::Tour(TourKey::Next)),
+            (Changed::Yes, Some(Effect::TourDone))
+        );
+        assert!(app.tour.is_none(), "the last card closes it");
+    }
+
+    /// `q` and `esc` skip the rest, from any card, and ask for the marker all the same.
+    #[test]
+    fn app_tour_skip_closes_it_from_any_card() {
+        for at in [0usize, 1] {
+            let mut app = with_tour(vec![Card::Keys, empty_card()]);
+            app.tour.as_mut().expect("open").at = at;
+            assert_eq!(
+                app.handle(Action::Tour(TourKey::Skip)),
+                (Changed::Yes, Some(Effect::TourDone)),
+                "skipped from card {at}"
+            );
+            assert!(app.tour.is_none());
+        }
+    }
+
+    /// The arrows move between a choice card's two rows and stop at each end; a plain card
+    /// has no rows and says so by not redrawing.
+    #[test]
+    fn app_tour_arrows_move_between_the_two_choice_rows_only() {
+        let mut app = with_tour(vec![Card::Keys]);
+        assert_eq!(app.handle(Action::Tour(TourKey::Down)), (Changed::No, None));
+        assert_eq!(app.handle(Action::Tour(TourKey::Up)), (Changed::No, None));
+
+        let mut app = with_tour(vec![empty_card()]);
+        assert_eq!(app.handle(Action::Tour(TourKey::Up)), (Changed::No, None));
+        assert_eq!(
+            app.handle(Action::Tour(TourKey::Down)),
+            (Changed::Yes, None)
+        );
+        assert_eq!(app.tour.as_ref().expect("open").row, 1);
+        assert_eq!(
+            app.handle(Action::Tour(TourKey::Down)),
+            (Changed::No, None),
+            "the last row is the last row"
+        );
+        assert_eq!(app.handle(Action::Tour(TourKey::Up)), (Changed::Yes, None));
+        assert_eq!(app.tour.as_ref().expect("open").row, 0);
+    }
+
+    /// The first row of a choice card is the one already selected, and it writes nothing:
+    /// `enter` on it is the same "next card" the keys card's `enter` is.
+    #[test]
+    fn app_tour_first_choice_row_writes_nothing() {
+        let mut app = with_tour(vec![empty_card()]);
+        assert_eq!(
+            app.handle(Action::Tour(TourKey::Next)),
+            (Changed::Yes, Some(Effect::TourDone))
+        );
+        assert!(!app.hide_empty, "and nothing changed for the session");
+    }
+
+    /// The second row applies to this session the instant it is chosen and asks the loop
+    /// for the one config write. The card stays up until the loop answers.
+    #[test]
+    fn app_tour_second_choice_row_applies_now_and_asks_for_the_write() {
+        let mut app = with_tour(vec![empty_card()]);
+        app.handle(Action::Tour(TourKey::Down));
+        assert_eq!(
+            app.handle(Action::Tour(TourKey::Next)),
+            (
+                Changed::Yes,
+                Some(Effect::TourWrite(Setting::HideEmptyRepos))
+            )
+        );
+        assert!(app.hide_empty, "applied to this session straight away");
+        assert!(app.tour.is_some(), "and the card waits for the answer");
+        assert_eq!(
+            app.tour_written(Ok(())),
+            (Changed::Yes, Some(Effect::TourDone)),
+            "the write landed, so the tour moves on"
+        );
+    }
+
+    /// The herdr card's second row stops following the workspace for the session, the same
+    /// thing `w` does, and asks for `scope = "all"`.
+    #[test]
+    fn app_tour_herdr_choice_stops_following_the_workspace() {
+        let mut app = with_tour(vec![herdr_card()]);
+        app.herdr.link = Link::Connected {
+            version: "0.8.2".to_owned(),
+        };
+        app.herdr.scope = Some(crate::tui::herdr::Scope {
+            label: "W".to_owned(),
+            roots: std::collections::BTreeSet::from([root("alpha")]),
+        });
+        app.herdr.scoped = true;
+        assert!(!listed(&app, "beta"), "out of the workspace");
+        app.handle(Action::Tour(TourKey::Down));
+        assert_eq!(
+            app.handle(Action::Tour(TourKey::Next)),
+            (
+                Changed::Yes,
+                Some(Effect::TourWrite(Setting::HerdrScopeAll))
+            )
+        );
+        assert!(!app.herdr.scoped);
+        assert!(listed(&app, "beta"), "every repository is listed now");
+    }
+
+    /// A write that failed keeps the card up with the reason and the line to add. The
+    /// setting stays applied for the session — the choice was made — and `enter`
+    /// acknowledges the sentence and moves on without asking for the write again.
+    #[test]
+    fn app_tour_failed_write_keeps_the_card_and_enter_moves_past_it() {
+        let mut app = with_tour(vec![empty_card(), Card::Keys]);
+        app.handle(Action::Tour(TourKey::Down));
+        app.handle(Action::Tour(TourKey::Next));
+        assert_eq!(
+            app.tour_written(Err(
+                "could not write /c: nope. Add this line yourself:".to_owned()
+            )),
+            (Changed::Yes, None)
+        );
+        let tour = app.tour.as_ref().expect("still up");
+        assert_eq!(tour.at, 0, "the same card");
+        assert!(tour.failed.is_some());
+        assert!(app.hide_empty, "the choice still holds for the session");
+        // The choice is spent: the arrows have nothing left to move between.
+        assert_eq!(app.handle(Action::Tour(TourKey::Down)), (Changed::No, None));
+        assert_eq!(
+            app.handle(Action::Tour(TourKey::Next)),
+            (Changed::Yes, None),
+            "acknowledged, and on to the next card without a second write"
+        );
+        assert_eq!(app.tour.as_ref().expect("open").at, 1);
+    }
+
+    /// A click on a choice row selects it and takes it, in one gesture; a click anywhere
+    /// else on the screen under the overlay does nothing at all.
+    #[test]
+    fn app_tour_click_takes_the_row_it_landed_on() {
+        let mut app = with_tour(vec![empty_card()]);
+        assert_eq!(
+            app.hit(Target::TourRow(1)),
+            (
+                Changed::Yes,
+                Some(Effect::TourWrite(Setting::HideEmptyRepos))
+            )
+        );
+        assert!(app.hide_empty);
+
+        let mut app = with_tour(vec![empty_card()]);
+        for target in [
+            Target::NavRoot(root("alpha")),
+            Target::HeaderAcceptAll,
+            Target::FileAccept,
+        ] {
+            assert_eq!(
+                app.hit(target.clone()),
+                (Changed::No, None),
+                "{target:?} is under the welcome"
+            );
+        }
+        assert!(app.tour.is_some());
+        assert!(!app.help);
+    }
+
+    /// The footer of a plain card is clickable too — `Target::TourRow(0)` on a card with no
+    /// choice rows advances it, so the mouse alone can walk the whole tour.
+    #[test]
+    fn app_tour_click_on_a_plain_cards_footer_advances_it() {
+        let mut app = with_tour(vec![Card::Keys, empty_card()]);
+        assert_eq!(app.hit(Target::TourRow(0)), (Changed::Yes, None));
+        assert_eq!(app.tour.as_ref().expect("open").at, 1);
+    }
+
+    /// A click on a row the card does not have is clamped rather than ignored: the hit map
+    /// is built from the frame, but a stale press must not choose row 1 on a card whose
+    /// row 1 is not there.
+    #[test]
+    fn app_tour_click_past_the_last_row_is_clamped() {
+        let mut app = with_tour(vec![empty_card()]);
+        assert_eq!(
+            app.hit(Target::TourRow(9)),
+            (
+                Changed::Yes,
+                Some(Effect::TourWrite(Setting::HideEmptyRepos))
+            ),
+            "clamped to the last row"
         );
     }
 }
