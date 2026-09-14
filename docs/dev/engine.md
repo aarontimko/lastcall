@@ -35,7 +35,8 @@ Ids are the first 16 hex chars of SHA-256 over the canonicalized path.
 <state>/exports/<root basename>/<YYYY-MM-DD>.md      # flags with nowhere to send them (§6.7, ruling P9)
 <state>/roots/<parent-id>/meta.json                  # the parent dir this group was discovered under
 <state>/roots/<parent-id>/repos/<root-id>/
-    ledger.json      # schema 1.0 (§6.2): seen_tree, seen_at, overrides
+    ledger.json      # schema 1.1 (§6.2): seen_tree, seen_at, overrides, plus snoozed_until
+                     # and the undo stack (Amendment v1.11; both additive, both optional)
     store/           # bare git repo; objects/info/alternates → the user's objects dir (git roots)
     index            # private index seeded from the seen tree (a cache, never truth)
     index.tree       # the tree `index` was seeded from; mismatch with the ledger → reseed
@@ -508,6 +509,75 @@ Two rules make it safe to paste into a live terminal:
 `None`. Phase 7 said "Phase 8 provides it"; Phase 8's deliverable list does not contain it,
 so the field is carried unwritten and the line is never printed. Whichever phase adds the
 herdr attribution to a flag owns it.
+
+## Undo and snooze (Phase 10)
+
+Two fields on the ledger, both additive and both optional, so `SCHEMA_VERSION` stays `"1.1"`
+and a ledger written before Phase 10 loads unchanged:
+
+```rust
+pub snoozed_until: Option<String>,   // ISO-8601 UTC, or absent
+pub undo: Vec<UndoEntry>,            // oldest first, at most UNDO_CAP = 20
+```
+
+### Three operations
+
+`Ops::undo` reverses this root's most recent accept. It **never touches the working tree**:
+it pops one `UndoEntry` and puts every path in it back through `Ops::set_override`, which is
+the whole correctness argument. Going back through `set_override` rather than writing
+`overrides` directly is what makes the three awkward cases fall out for free (design review
+F1):
+
+- a recorded oid equal to the seen tree's entry **drops** the override, which is §6.2's
+  clean-up rule and stops the path counting toward compaction;
+- a `null` on a path the tree has keeps `Some(None)` = `Absent`, correct after any fold;
+- a `null` on a path the tree does **not** have drops the override, so the path resolves to
+  `Empty` again and a later `shift-u` writes a zero-byte file instead of unlinking the
+  user's first-sight draft (Phase 7's F17 rule).
+
+Flags survive an undo and `updated_at` is stamped by `set_override` itself. There is no live
+CAS: a file that moved since the accept is exactly what the user wants back on screen. An
+empty stack is a `Refused::NothingToUndo`, never an error. `Ops::undo_preview` returns
+`(UndoOp, Vec<String>)` — the op and the paths the next undo would restore, in path order —
+which is what the TUI moves its selection to.
+
+`Ops::snooze` writes `snoozed_until` (`Ops::snooze_deadline(days)` computes it from the
+injected clock) and `None` wakes the root. It is a **view** and not a filter: the root stays
+watched, stays scanned, and `status` keeps reporting it in full.
+
+### `pending_undo`, and where the push lives
+
+The entry is built by the staging functions and pushed by the **ledger write**, which is the
+only order that can be right. Every staging function calls `Ops::begin_undo(op)` before it
+touches an override, opening (or widening) an `Ops::pending_undo: Option<PendingUndo>`; the
+last caller's op wins, which is what `accept_group` wants — it re-stamps `AcceptGroup` over
+the per-row `AcceptFile`/`AcceptDeletion` its loop set. `set_override` then records each
+path's **prior** override on first touch only, so an op that sets the same path twice still
+carries one baseline.
+
+The push itself is inside `merge_from_disk`, under the lock, against the ledger that is
+actually on disk — not the one this engine had in memory. That is the subtle part: another
+lastcall may have accepted or compacted since, so the baselines are resolved against the disk
+ledger and the disk seen tree (`take_pending_undo`), and only then is the entry pushed onto
+the merged ledger. The fail-open branch (the ledger file is missing or unreadable) has to
+push too, and its baselines still have to be the *pre*-accept ones, so it rolls the staged
+overrides back on a scratch clone of this ledger first and resolves against that.
+`Ledger::push_undo` caps the stack at `UNDO_CAP` = 20, dropping the oldest.
+
+`UndoOp` is `AcceptHunk`, `AcceptFile`, `AcceptGroup`, `AcceptDeletion`, `AcceptAll` or
+`Save` — the inline editor's save advances the baseline, so it is on the stack like any other
+accept, and undoing it re-presents the user's own edit as pending. That is on purpose.
+
+An `UndoPath` is `{ baseline: Option<Oid>, mode: Option<Mode> }`: an oid and its mode for a
+path that had a baseline, and `null` for **both** `Absent` and `Empty`. The two are
+deliberately not distinguished on the wire: `set_override`'s `equals_tree` rule
+recovers the distinction from the tree at undo time, which is more robust than storing a
+verdict that a compaction in between could invalidate.
+
+`snooze_active(snoozed_until, now)` is the reader's view of the deadline: `Some` only while
+it is still in the future, `None` once it has passed, and the next ledger write clears the
+expired value outright (`clear_expired_snooze`). So a status report never shows a snooze that
+is already over, and nothing in the TUI has to read a clock to work that out.
 
 ## Editing (Phase 8)
 

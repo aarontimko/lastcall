@@ -234,6 +234,79 @@ re-pushes the flags without re-asking and pays nothing (F8, F18).
 terminals known to answer and the one-line flip to a `TERM` allowlist, is
 [`bench.md` "Known costs"](bench.md#known-costs).
 
+#### The first-launch tour (Phase 10)
+
+`tui/tour.rs` holds everything about the welcome except the painting: the marker on disk,
+the `Plan` the loop drives it with, the cards and their wording, the fixed keys, and each
+card's lines as text. `render::render_tour` paints it, beside every other modal's painter,
+because a hit map is a fact about a frame and not about a card.
+
+The split follows the reducer's own rule. Every file this feature touches is touched from
+the loop: `commands/tui.rs` builds `tour::Plan::new(force, env, state_dir)` **before** the
+terminal is taken (one `stat` of `<state_dir>/first-launch.json`, and at most one small read
+of it), and the loop then asks `Plan::due(&app)` before each draw, calls `Plan::open` to
+parse the config document and decide the cards, calls `Plan::write` when a choice asks for
+it, and calls `Plan::dismissed` when the overlay closes. `App` itself only holds
+`Option<Tour>`: which cards, which one is on screen, which row, and the sentence a failed
+write left behind.
+
+`Plan::due` is four conditions, and each is there for a reason a fast checkout will not show
+you:
+
+- `app.loading.is_none()` — **not during the launch hold.** The hold is the frame that says
+  what lastcall is doing; an overlay over it would be a second thing to read about a wait.
+- `!app.herdr.scope_pending` — and not before the scope verdict either, for the same reason
+  nothing is listed before it: the herdr card's own condition asks what the scope came out
+  as.
+- `app.size >= (60, 14)` (`MIN_COLS`, `MIN_ROWS`) — **never on a screen too small to read
+  it**, and in that case nothing is written, so the welcome is still owed on the first launch
+  that has room. The unit test `tour_every_card_fits_the_smallest_frame_it_opens_on` walks
+  every card at exactly that size.
+- `app.tour.is_none()` — it does not open over itself.
+
+Three cards at most, decided once when the overlay opens. `Card::Keys` is always there.
+`Card::Herdr` needs all four parts of its condition — a live link, a scope derived, the scope
+honoured, and a config file that has never said `scope` under `[herdr]` — because any one of
+them missing makes the card an offer about nothing. `Card::Empty` needs ten listed
+repositories with nothing pending (`EMPTY_CARD_MIN`), `t` off, and no `hide_empty_repos` in
+the file.
+
+**Keys.** `tour::tour_action` resolves *before* the keymap and before every other modal
+(`run.rs`'s event arm), so while the overlay is up nothing else in the program sees a key.
+`enter` applies the selected row or advances, the arrows and `j`/`k` move between a choice
+card's two rows, `esc` and `q` skip the rest. `q` never quits here, which is the note modal's
+rule and for the note modal's reason: a highlighted row is a question, and the reader has to
+be able to answer it without leaving. A quit bound to some other printable key skips too;
+only the non-printable spellings (`ctrl-c` out of the box) still quit, and that quit writes
+the marker on its way out — `Plan::owed()` is asked after the event loop ends.
+
+**The one config write in the program.** The second row of a choice card is the only thing
+in lastcall that edits `config.toml`, and it does it through the engine's
+`config::write::Document`, which is `toml_edit` and therefore format-preserving: your
+comments, your key order and your blank lines survive. The row applies its setting to the
+live `App` first and asks for the write second, so a write that fails still leaves the change
+in force for the session — and the card keeps its place, with the footer replaced by what
+went wrong and the TOML line to add by hand. When there is no config file at all the write
+creates one holding a dated `# written by lastcall's first-launch tour on <date>` comment and
+just that setting.
+
+**The marker.** `<state_dir>/first-launch.json` is `{"shown_at":<unix secs>,"version":"…"}`,
+written with `write_stamp`'s idiom (temp beside the target, then rename) by *any* dismissal:
+finishing, skipping, or quitting with it open. Absent, unreadable and unparsable all mean
+"not shown", because a record we wrote and cannot read is not worth refusing to help a new
+user over. `lastcall tui --tour` ignores it for that run and rewrites it on dismissal, and
+the help overlay's last footer row (`render::TOUR_NOTE`) is where a reader finds that out.
+
+**Scenes.** Three snapshot scenes, each at 100×30 and 80×24: `tui_tour_keys`,
+`tui_tour_herdr`, `tui_tour_empty`. Five PTY scenes: `tui_tour_first_launch` (the overlay,
+the live change, the created config file's exact bytes, and a silent second launch),
+`tui_tour_preserves_config` (a one-line diff on a hand-written file), `tui_tour_skip`,
+`tui_tour_flag` and `tui_tour_quit_writes_marker`. The harness knows the marker by name:
+`pty_tui::MARKER_FILE` and `MARKER_SEEN` are what `isolated_lastcall` drops into the state
+directory so every *other* scene launches without the welcome, and `.tour(true)` removes it
+again. `tour_marker_is_the_file_the_harness_writes` pins the two spellings together, because
+the testkit sits below `lastcall` in the dependency graph and cannot import the constant.
+
 ### Quit, in the only safe order
 
 `Effect::Quit` (from `q`, `ctrl-c`, or a SIGTERM) ends the loop; then `shut_down` runs
@@ -833,11 +906,14 @@ Defaults (`input::DEFAULT_KEYMAP`, in help-overlay order):
 | `toggle_full_paths` | `f` | root-relative paths instead of basenames | |
 | `toggle_remote` | `o` | show each repo's `org/repo` slug | |
 | `hide_empty` | `t` | hide / show repos with nothing pending (§6.7 Amendment v1.9); default from `hide_empty_repos`, and independent of the `w` scope | |
+| `snooze` | `s` | on a repo row: open the snooze modal (a day count), or wake a repo that is already snoozed ("The snooze modal" below); on any other row a notice, not a modal | |
+| `show_snoozed` | `shift-s` | list the snoozed repos too, each with `snoozed until <date>` on its branch line | |
 | `accept` | `a` | on a file row: the one hunk under the diff cursor (a hunkless row — binary, collapsed, deleted, unreadable — whole); on a group: the group; on a root: every row of it (asks above 10 files) | the same hunk |
 | `accept_file` | `shift-a` | accept the selected file whole — the only key that does | |
 | `accept_all` | `ctrl-a` | accept everything listed, every root (asks above 10 files) | |
 | `restore` | `u` | put the hunk under the diff cursor back to its baseline (a hunkless, deleted, or one-hunk added row: the file, which asks) | the same hunk |
 | `restore_file` | `shift-u` | put the selected file back whole — always asks first | |
+| `undo` | `z` | reverse the selected repo's most recent accept: the paths it covered go back to pending and the selection moves to the first of them. Never touches the working tree; the stack is in the ledger, at most `ledger::UNDO_CAP` = 20 deep, and survives a restart | the same |
 | `flag` | `m` | flag it with a note: the hunk under the diff cursor (an expansion's hunk counts), or the file from the nav | the same hunk |
 | `unflag` | `shift-m` | clear every flag on the selected file | |
 | `edit` | `i` | open the selected file in the **inline editor**, caret on the current hunk's first changed line ("The inline editor" below) | the same |
@@ -873,9 +949,12 @@ modal keys, a single column runs off the bottom of a 30-row terminal, so
 *and* the pair fits the width — each column sized to its own widest row, because padding both
 to the widest row in the table costs the second column the width it needs. If two columns
 would themselves have to be truncated, one column is no worse, and it stays. The vertical
-clipping that follows eats key rows, never the footer: **three** rows are reserved out of
-the truncation — the blank, the shift-drag note (`render::SELECT_NOTE`) and the
-`any key closes` line — so both survive at any size the overlay is drawn at. At 80 columns,
+clipping that follows eats key rows, never the footer: **four** rows are reserved out of
+the truncation — the clip notice below, the newline note (`render::newline_note`), the
+shift-drag note (`render::SELECT_NOTE`) and the `--tour` line (`render::TOUR_NOTE`) — with
+`any key closes` out of the count by construction, since the last inner row is always its
+own. The blank separator is not reserved; it is the first thing the clip spends. So the
+whole footer survives at any size the overlay is drawn at. At 80 columns,
 the standard width, the pair does not fit and the overlay clips: at 30 lines it reaches the
 `quit` row, at 24 it stops earlier, and the footer is there either way (verifier (b) F4).
 A clipped overlay now **says** it is clipped (**ruling R12**): the row above the pinned
@@ -893,8 +972,54 @@ under the pointer, three lines a notch.
 terminal's. Inside the diff pane a plain drag is now lastcall's own line selection, which
 copies on release ("Select to copy" below); anywhere else, hold **shift** while dragging to
 select and copy with the terminal's own selection (every terminal we target honours the
-shift override). The help overlay says both in its last line
-(`render::SELECT_NOTE` — `shift+drag selects text (mouse capture is on) · v/y copies`).
+shift override). The help overlay says both in its
+second-to-last line (`render::SELECT_NOTE` — `shift+drag selects text (mouse capture is on) ·
+v/y copies`); the last is `render::TOUR_NOTE`, `lastcall tui --tour shows the welcome again`.
+
+### Undo (`z`) and snooze (`s`), and the snooze modal (Phase 10)
+
+Both are `Pile` fields, which is what keeps `tui/app.rs` clean of the "never reads a ledger"
+grep: the reducer reads `view.pile.undo` (a depth) and `view.pile.snoozed_until` (an ISO-8601
+date, or `None`) and never opens anything.
+
+**`z`** queues `Effect::Undo(root)` for the selected repo, and the engine reverses that
+root's most recent accept. The reducer's own refusal path is `NOTHING_TO_UNDO`
+(`nothing to undo`) for a pile that already says `undo: 0`; the engine refuses with the same
+words for the race where the stack emptied since the frame. `UNDO_IN_PROGRESS` guards a
+second `z` while one is running. When it lands, the selection moves to the first path the
+undo put back, in path order, so the reader is looking at what came back rather than hunting
+for it. `z undo` is on the hint line only while the depth is non-zero.
+
+**`s`** on a repo row opens the snooze modal; on anything else it is the notice
+`SNOOZE_NEEDS_ROOT` (`select a repository row to snooze it`) and no modal. On a repo that is
+already snoozed — which you can only be looking at with `shift-s` on — `s` skips the modal
+and wakes it (`Effect::Snooze { root, days: None }`).
+
+The modal is the note modal's shape with a number where the text area is, because one number
+is the whole question: `snooze <name> for [1▏] day(s)`, a blank, and
+`digits edit   ⏎ snooze   Esc cancel` (`render::SNOOZE_KEYS`). It seeds with
+`SNOOZE_DEFAULT_DAYS` = 1 and accepts up to `SNOOZE_MAX_DAYS` = 365; past that the digit is
+**refused rather than clamped**, so the field never shows a number the write would not use.
+An emptied field shows the caret alone rather than a `0` nobody typed, and `enter` on it
+applies the default.
+
+Snoozing is a **view**, exactly like the `w` scope and the `t` toggle: the repo is still
+watched, still scanned, and `lastcall status` still reports it with a `snoozed_until`. The
+`App::is_listed` clause reads
+`snoozed_until.is_none() || show_snoozed || attention()` — the `hide_empty` exception
+exactly, and for the same reason: an agent that is blocked or done is news the reader asked
+for before they asked for quiet. Expiry is a **field test, never a clock read**
+(design review F4): the engine stamps `None` for a deadline that has already passed under its
+own injected clock, and `App::handle`'s `Tick` arm drops one that expires while the TUI is
+open — outside `mod tests` there is no `SystemTime::now()` anywhere under `tui/`. The bottom line carries the
+count as `N snoozed (S shows)`, and the key in the parenthetical comes from the keymap, so a
+rebound `show_snoozed` renames the notice with it.
+
+**Scenes.** `tui_undo_hint` (two frames, `tui_undo_hint_present` and
+`tui_undo_hint_absent`), `tui_snooze_modal`, and `tui_scope_and_snooze_notice` at 100×30 and
+80×24 for the combined bottom line; `pty_undo_file`, `pty_undo_accept_all` and
+`pty_snooze_repo` in the PTY tier (that file's own `pty_*` convention, unlike the tour's
+`tui_tour_*`).
 
 ### Collapsed rows and `e` (Phase 6)
 
@@ -1006,7 +1131,7 @@ rule adds a row. Nothing here is a promise about the final design.
 | Whole frame | below `MIN_SIZE` = 40×10 the frame is only `too small: 40×10 min` and the hit map is empty | `tui_too_small_30x8`, `render_too_small_is_one_line` |
 | Header (**Design pass D14**, confirmed as built) | `lastcall  N repos · N files · N hunks  [Accept All]` + the watch notice right-aligned; when the control and the notice do not both fit (about 60 columns) the control is dropped, **then the badge** (`^A` duplicates the control; nothing else says what is watched or whether herdr is answering); a notice that cannot fit beside the counts at all is dropped and the badge and control return, rather than leaving the right half empty. At 60 columns with the fixture's counts the ladder lands on counts + notice only — badge and control both gone (D14's earlier doc row said only the control was dropped) | `tui_narrow_60x20`, `render_narrow_header_keeps_the_notice_and_drops_the_control`, `render_header_drops_the_accept_control_before_the_herdr_badge` |
 | Nav pane | outer width `App.nav_width`, 16..=60 (default 28), draggable; hidden below `NAV_MIN_COLS` = 70 columns, when the diff takes the whole body and has focus; keeps its scroll offset across selection changes | `tui_narrow_60x20`, `tui_nav_*` |
-| Hint line (status bar) | built from the keymap, **ruling R4** (Phase 9a deliverable 4): every applicable hint is built, the whole line is tried, and while it does not fit **one hint at a time** is removed from a fixed drop order — `y copy`, `v select`, `r refresh`, `Tab focus`, `w scope`, `^A accept all`, `t hide/show empty`, `g jump`, `d ack`, `A accept file`, `n/p hunk`, the accept phrase (`HINT_DROP_ORDER`, keyed by **action name**, so a rebind moves the key and never the order). There are no width constants (D1's 110/128 were not built) and no all-or-nothing tiers. **The first two hints follow the focus** (Design pass D2, **ruling R3**, Phase 9a deliverable 3): with the nav focused the line opens `↑↓ select  ⏎ open`; with the diff focused `↑`/`↓` scroll a line and `⏎` does nothing (see Keys), so it opens `↑↓ scroll  ← back` — `back` is the keymap's own action and `←` its arrow spelling, so a rebind renames the hint (a keymap binding no arrow to `back` falls back to its first key). The two forms are exactly the same width, so no drop step moves; the 19 diff-focused frames say `↑↓ scroll  ← back`. **`? help  q quit` are never dropped and are always the last two hints on the line**, so a cut line still says where the rest of the keys are; the floor is `↑↓ select  ⏎ open  ? help  q quit` at 33 columns, inside `MIN_SIZE`'s 40. Below `NAV_MIN_COLS` = 70 the five that a nav-less frame cannot promise (`w scope`, `Tab focus`, `r refresh`, `v select`, `y copy`) are not offered whatever the arithmetic says. What is on the line follows the state: the accept phrase follows the selection (`a accept hunk  A accept file` / `a/A accept file` on a hunkless row / `a accept group` / `a accept all in <root>` on a **non-empty** repo row only — `a` on an empty one does nothing, verifier (a) F2); `t`'s label follows the toggle (`t hide empty` while showing all, `t show empty` while hiding); `v select  y copy` only with the diff focused; `d ack` only for a ready episode and `g jump` for either flag; `w scope` only under a scope. **A hint is not offered where its key answers nothing** (Phase 9b, verifier (b) F4): `n/p hunk` and `v select  y copy` are gated on `view_hunks()` being non-empty (so a repo row, an empty repo row, the all-clean state, and a collapsed, binary, deleted or unreadable entry drop them), and `^A accept all` on `counts_of(&AcceptScope::All).files > 0` — the same predicate the accept itself uses, so the hint and the key agree by construction rather than by a second rule that can drift. An inapplicable hint is never **built**, so it is not a hint the line is short of and `HINT_DROP_ORDER` is untouched: every width step keeps the order it had. While a confirm modal is open the line is exactly `y confirm  n cancel  q quit`. The Phase 7 keys (`u`, `U`, `m`, `M`) are **not** on the hint line — they live on the hunk controls, the `?` overlay and the modal's own key row. | `render_hints_drop_one_at_a_time_from_the_right`, `render_hints_keep_help_and_quit_at_every_width` (40–70), `render_hints_at_80_keep_accept_file`, `render_hints_follow_the_selection` (the 124-column nav line, the 142-column diff line with its focus-true opening, the rebound-`back` case, and every step below them), `render_hint_line_names_the_toggle_by_state`, `render_hints_and_help_follow_the_app_keymap`, `render_hints_never_promise_a_key_that_answers_nothing`, `tui_hint_diff_focus` (142×20), `tui_narrow_60x20`, `tui_nav_empty_repo_row`, `tui_status_line_head_notice` |
+| Hint line (status bar) | built from the keymap, **ruling R4** (Phase 9a deliverable 4): every applicable hint is built, the whole line is tried, and while it does not fit **one hint at a time** is removed from a fixed drop order — `y copy`, `v select`, `r refresh`, `Tab focus`, `w scope`, `^A accept all`, `t hide/show empty`, `z undo`, `g jump`, `d ack`, `A accept file`, `n/p hunk`, the accept phrase (`HINT_DROP_ORDER`, keyed by **action name**, so a rebind moves the key and never the order). There are no width constants (D1's 110/128 were not built) and no all-or-nothing tiers. **The first two hints follow the focus** (Design pass D2, **ruling R3**, Phase 9a deliverable 3): with the nav focused the line opens `↑↓ select  ⏎ open`; with the diff focused `↑`/`↓` scroll a line and `⏎` does nothing (see Keys), so it opens `↑↓ scroll  ← back` — `back` is the keymap's own action and `←` its arrow spelling, so a rebind renames the hint (a keymap binding no arrow to `back` falls back to its first key). The two forms are exactly the same width, so no drop step moves; the 19 diff-focused frames say `↑↓ scroll  ← back`. **`? help  q quit` are never dropped and are always the last two hints on the line**, so a cut line still says where the rest of the keys are; the floor is `↑↓ select  ⏎ open  ? help  q quit` at 33 columns, inside `MIN_SIZE`'s 40. Below `NAV_MIN_COLS` = 70 the five that a nav-less frame cannot promise (`w scope`, `Tab focus`, `r refresh`, `v select`, `y copy`) are not offered whatever the arithmetic says. What is on the line follows the state: the accept phrase follows the selection (`a accept hunk  A accept file` / `a/A accept file` on a hunkless row / `a accept group` / `a accept all in <root>` on a **non-empty** repo row only — `a` on an empty one does nothing, verifier (a) F2); `t`'s label follows the toggle (`t hide empty` while showing all, `t show empty` while hiding); `v select  y copy` only with the diff focused; `d ack` only for a ready episode and `g jump` for either flag; `w scope` only under a scope. **A hint is not offered where its key answers nothing** (Phase 9b, verifier (b) F4): `n/p hunk` and `v select  y copy` are gated on `view_hunks()` being non-empty (so a repo row, an empty repo row, the all-clean state, and a collapsed, binary, deleted or unreadable entry drop them), and `^A accept all` on `counts_of(&AcceptScope::All).files > 0` — the same predicate the accept itself uses, so the hint and the key agree by construction rather than by a second rule that can drift. An inapplicable hint is never **built**, so it is not a hint the line is short of and `HINT_DROP_ORDER` is untouched: every width step keeps the order it had. `z undo` is offered only where the selected repo's `Pile::undo` is non-zero, on the same terms — so the key and the hint agree by construction, and the hint is what tells a reader the stack has anything in it. While a confirm modal is open the line is exactly `y confirm  n cancel  q quit`. The Phase 7 keys (`u`, `U`, `m`, `M`) and Phase 10's `s` / `S` are **not** on the hint line — they live on the hunk controls, the `?` overlay and the modal's own key row. | `render_hints_drop_one_at_a_time_from_the_right`, `render_hints_keep_help_and_quit_at_every_width` (40–70), `render_hints_at_80_keep_accept_file`, `render_hints_follow_the_selection` (the 124-column nav line, the 142-column diff line with its focus-true opening, the rebound-`back` case, and every step below them), `render_hint_line_names_the_toggle_by_state`, `render_hints_and_help_follow_the_app_keymap`, `render_hints_never_promise_a_key_that_answers_nothing`, `render_hint_line_offers_z_undo_only_when_there_is_something_to_undo`, `tui_hint_diff_focus` (142×20), `tui_undo_hint`, `tui_narrow_60x20`, `tui_nav_empty_repo_row`, `tui_status_line_head_notice` |
 | Status bar vs hints | the latest engine notice with its age replaces the hints for `STATUS_TTL` = 30 s, then the hints return | `tui_status_line_head_notice` |
 | Scope notice | `scope: <ws> · N repos hidden (w shows all)` (43 columns) crowds the header at 100 columns — carried to the pass since Phase 5 | `tui_herdr_scope_notice`, `tui_herdr_scope_notice_with_status` |
 | File header controls | `[A accept file] [U restore file]` right-aligned as one run; a run that does not fit is retried without its last label, so a narrow pane loses the newest control first and `[A accept file]` goes last | `tui_accept_controls`, `tui_narrow_60x20` |
@@ -1406,9 +1531,9 @@ rg -n 'thread::sleep' crates/lastcall/src/tui               # nothing: no blocki
 rg -n 'tokio::time::sleep' crates/lastcall/src/tui          # outside `mod tests`, exactly three, and none of them a fixed wait in the loop: `herdr.rs`'s `due_at` and `run.rs`'s rescan arm are `sleep_until(<deadline>)` inside a `select!` (the arm parks forever when there is no deadline), and `run.rs`'s `sleep(EDITOR_SETTLE)` is the `#[cfg(not(unix))]` half of `Signals::resume`, where unix drains the signal with `timeout_at` instead
 rg -n 'lastcall_engine::herdr' crates/lastcall/src/tui     # only tui/herdr.rs and tui/run.rs (the task side); never app.rs or render.rs
 rg -n 'e\.(restore|flag|unflag)\(' crates/lastcall/src     # only tui/run.rs (restore and flag reach the engine through one seam)
-rg -n 'OpenOptions|File::create|fs::write' crates/lastcall/src   # tui/term.rs (the log file), tui/run.rs (the export fallback) and commands/update.rs (the O_EXCL temp beside the canonical `current_exe`, and the daily-check stamp under the state dir); no worktree file is ever opened for writing
+rg -n 'OpenOptions|File::create|fs::write' crates/lastcall/src   # tui/term.rs (the log file), tui/run.rs (the export fallback), tui/tour.rs (the first-launch marker under the state dir, plus two hits inside its own `mod tests`) and commands/update.rs (the O_EXCL temp beside the canonical `current_exe`, and the daily-check stamp under the state dir); no worktree file is ever opened for writing. The tour's *config* write is not here: it goes through the engine's `config::write`, the one place that may touch `config.toml`
 rg -n 'e\.save\(|e\.read_rendered\(' crates/lastcall/src        # only tui/run.rs (the inline editor reaches the engine through one seam, like restore and flag)
 rg -n 'Command::new' crates/lastcall/src/tui                # only tui/run.rs's `$EDITOR` spawn (Suspend::run); nothing else in the TUI starts a process (the update path's `curl` lives in commands/update.rs, outside tui/)
-rg -n 'openat|renameat|OpenOptions|File::create|fs::write' crates/lastcall-engine/src --glob '!*test*'   # restore.rs is the only file that opens a path under a root; every other hit writes under the state dir (ops.rs's two are in its own in-file `mod tests`)
+rg -n 'openat|renameat|OpenOptions|File::create|fs::write' crates/lastcall-engine/src --glob '!*test*'   # restore.rs is the only file that opens a path under a root, and config/write.rs the only one that opens `config.toml` (one `fs::write`, the temp beside the file it then renames over); every other hit writes under the state dir (the in-file `mod tests` of ops.rs, engine.rs, store.rs, index.rs, ledger.rs, roots.rs and config/write.rs account for the rest)
 cargo tree -e normal -p lastcall -p lastcall-engine | grep -c testkit   # 0
 ```

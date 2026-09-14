@@ -19,7 +19,7 @@
 //!   is large enough.
 //! * **Nothing is written without a keystroke asking for it.** The second row of a choice
 //!   card is the only thing in lastcall that writes to the config file (`config::write`),
-//!   and the first row — the selected one — writes nothing at all.
+//!   and the first row (the selected one) writes nothing at all.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -39,8 +39,8 @@ use super::render::key_label;
 
 use crossterm::event::{Event, KeyCode};
 
-/// The marker file under the state directory. Its presence — parsable or not is a separate
-/// question, see [`shown_before`] — is the whole "has this been seen?" record.
+/// The marker file under the state directory. Its presence (parsable or not is a separate
+/// question, see [`shown_before`]) is the whole "has this been seen?" record.
 pub const MARKER_FILE: &str = "first-launch.json";
 
 /// The narrowest frame the overlay opens on. Under it the tour does not open and **nothing
@@ -166,8 +166,8 @@ impl Tour {
 /// The tour's fixed keys, resolved before the keymap and before every modal (F7).
 ///
 /// `enter` applies the selected row or advances; the arrows and `j`/`k` move between the two
-/// rows of a choice card; `q` and `esc` skip the rest. `q` here **never quits** — the note
-/// modal's rule, because a card with a highlighted row is a question and the reader has to
+/// rows of a choice card; `q` and `esc` skip the rest. `q` here **never quits**. That is the
+/// note modal's rule, because a card with a highlighted row is a question and the reader has to
 /// be able to answer it without leaving. The keymap's quit action survives only in its
 /// non-printable spellings (`ctrl-c` by default), and that quit writes the marker on its way
 /// out. Every other key is ignored.
@@ -261,8 +261,8 @@ impl Plan {
     pub fn open(&mut self, app: &mut App) -> Changed {
         let doc = self.doc.get_or_insert_with(|| Document::open(&self.env));
         let mut cards = vec![Card::Keys];
-        // F5: lastcall is following a workspace *right now* — a live link, a scope it
-        // derived, and the scope honoured — and the file has never said whether that is
+        // F5: lastcall is following a workspace *right now* (a live link, a scope it
+        // derived, and the scope honoured), and the file has never said whether that is
         // wanted. Any one of those missing and the card would be about nothing.
         if let Link::Connected { version } = &app.herdr.link
             && app.herdr.scoped
@@ -308,7 +308,7 @@ impl Plan {
         }
     }
 
-    /// Whether the overlay is still owed — the loop asks after the event loop ends, so a
+    /// Whether the overlay is still owed. The loop asks after the event loop ends, so a
     /// quit with the tour open still writes the marker.
     pub fn owed(&self) -> bool {
         self.show
@@ -331,7 +331,7 @@ pub fn failure_line(path: &str, reason: &str) -> String {
 pub enum Kind {
     Title,
     Body,
-    /// Choice row `n` — a `Target::TourRow(n)` and, when selected, bold.
+    /// Choice row `n`: a `Target::TourRow(n)` and, when selected, bold.
     Choice(usize),
     /// The keys at the bottom, or a failed write's sentence. `Target::TourRow(0)` on a card
     /// with no choice rows, so the mouse can advance a plain card.
@@ -429,7 +429,7 @@ impl Tour {
     /// `height` only ever bites on the keys card in a small frame: the grid falls back to
     /// one key per line when three columns do not fit, and eleven keys plus a title and a
     /// footer do not fit the shortest frame the overlay opens on. It gives up the intro
-    /// first and then the keys themselves, from the end but never the last one — `?` is the
+    /// first and then the keys themselves, from the end but never the last one: `?` is the
     /// way to all of them and is the last thing to go.
     pub fn lines(&self, app: &App, width: usize, height: usize) -> Vec<CardLine> {
         let mut out = Vec::new();
@@ -844,7 +844,7 @@ mod tests {
 
     // ---- when it opens ----------------------------------------------------------------
 
-    /// The launch hold, the scope verdict, and a frame too small each hold it back — and
+    /// The launch hold, the scope verdict, and a frame too small each hold it back, and
     /// nothing is written while they do, so the welcome survives to the next launch.
     #[test]
     fn tour_waits_for_a_settled_frame_with_room_to_read_it() {
@@ -1094,7 +1094,7 @@ mod tests {
     }
 
     /// F15: the keys card is rendered from the effective keymap, so a user with a `[keys]`
-    /// table is told about their own bindings on their first launch — and the **first**
+    /// table is told about their own bindings on their first launch, and the **first**
     /// spelling only, because `n / ]` is a second thing to learn at the worst moment.
     #[test]
     fn tour_keys_card_shows_the_keymap_in_force() {

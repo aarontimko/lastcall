@@ -21,6 +21,29 @@ The first of these that exists wins:
 Every key is optional. **An unknown key is an error**, on every command, naming the key and
 the line: a typo in a config file never silently does nothing.
 
+## The first launch
+
+The first time you open the review screen, a small card sits over the frame and names the
+keys you need to get started. The frame underneath is live, so the scan you launched keeps
+running while you read. `enter` moves to the next card, `q` skips the rest, and once you
+have been through it the card never appears again: a one-line note in the state directory
+records that it has been shown. `lastcall tui --tour` brings it back whenever you want it.
+
+Two of the cards appear only when they apply, and each offers a choice:
+
+- Running inside a herdr session, lastcall narrows the list to the repositories that
+  workspace is working in. The card offers to show every repository instead, which writes
+  `scope = "all"` under `[herdr]`.
+- With ten or more repositories that have nothing pending, the card offers to open with the
+  empty ones hidden, which writes `hide_empty_repos = true`.
+
+Either choice takes effect immediately and is written to the config file named in "Where the
+file lives", under a comment saying where the line came from. If there is no config file
+yet, one is created holding just that comment and that setting. **Nothing else in the file is
+touched**: your comments, your key order and your formatting survive the edit. If the write
+fails, the card says so and prints the line to add by hand, and the change still holds for
+the session.
+
 ## The keys
 
 | key | default | what it does |
@@ -31,7 +54,7 @@ the line: a typo in a config file never silently does nothing.
 | `collapsed_globs` | the nine common lockfiles | paths shown as one collapsed row instead of a wall of hunks. The default list is `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `Cargo.lock`, `poetry.lock`, `uv.lock`, `Gemfile.lock`, `go.sum`, `composer.lock`. Setting the key replaces the list. |
 | `collapse_size_bytes` | `524288` (512 KiB) | files at or above this size collapse too. Must be greater than zero. A file with a NUL byte in its first 8,000 is binary and collapses whatever this says. |
 | `ignore_globs` | `.git/**`, `node_modules/**`, `target/**`, `vendor/**`, `.venv/**` | these scope the filesystem watcher only. An ignored path never wakes a scan, but the next scan still reports a tracked edit under it, so this is a noise filter and not a way to hide changes. |
-| `hide_empty_repos` | `false` | what the `t` toggle starts as. `false` lists every repository under a parent directory, whether it has anything pending or not. `true` opens with the empty ones hidden, except one carrying an agent flag. `t` flips it for the session, and the headless commands are unaffected. |
+| `hide_empty_repos` | `false` | what the `t` toggle starts as. `false` lists every repository under a parent directory, whether it has anything pending or not. `true` opens with the empty ones hidden, except one carrying an agent flag. `t` flips it for the session, and the headless commands are unaffected. The welcome on your first launch offers to write `true` here for you. |
 
 ```toml
 parent_dirs = ["/home/me/src"]
@@ -79,11 +102,14 @@ and shift with tab is `backtab`.
 | `toggle_full_paths` | `f` | full paths instead of basenames |
 | `toggle_remote` | `o` | show `org/repo` instead of the directory name |
 | `hide_empty` | `t` | hide or show repositories with nothing pending |
+| `snooze` | `s` | set a repository aside for a number of days |
+| `show_snoozed` | `shift-s` | show or hide the repositories that are set aside |
 | `accept` | `a` | accept the hunk under the cursor, or the selected entry |
 | `accept_file` | `shift-a` | accept the whole file |
 | `accept_all` | `ctrl-a` | accept everything listed, across every repository |
 | `restore` | `u` | put the hunk back the way it was |
 | `restore_file` | `shift-u` | put the whole file back, asking first |
+| `undo` | `z` | undo the last accept in the selected repository; the last 20 are kept |
 | `flag` | `m` | flag it with a note |
 | `unflag` | `shift-m` | clear that file's flags |
 | `select` | `v` | start a line selection in the diff |
@@ -115,7 +141,7 @@ session. What it adds and how the link is found: [`herdr.md`](herdr.md).
 | `mode` | `"auto"` | `auto` links to herdr when there is a session to link to and runs standalone otherwise, `on` also says in the header why a link failed, `off` never looks. |
 | `session` | unset | pin a named session instead of discovering one. |
 | `toast` | `true` | ask herdr for a desktop notification when a repository first goes ready. herdr's own `[ui.toast] delivery` must be set to `"herdr"` as well, and it is `"off"` by default. |
-| `scope` | `"workspace"` | which repositories the overlay covers: `workspace` narrows to the ones in the herdr workspace this pane belongs to, `all` covers every watched repository. `w` toggles it for the session. |
+| `scope` | `"workspace"` | which repositories the overlay covers: `workspace` narrows to the ones in the herdr workspace this pane belongs to, `all` covers every watched repository. `w` toggles it for the session. The welcome on your first launch offers to write `all` here for you. |
 
 ```toml
 [herdr]
@@ -194,7 +220,8 @@ each with a `ledger.json` recording what you have already seen, a `store/` that 
 git repository holding the baseline objects, a private `index` used as a cache, and a
 `lock` file that serialises writes so two lastcalls over one repository keep each other's
 accepts. Flags that had nowhere to go are written under `exports/`, and the once-a-day
-update check leaves a timestamp in `update-check.json`. The identifiers are hashes of the
+update check leaves a timestamp in `update-check.json`, beside `first-launch.json`, the
+one-line note that the welcome has already been shown. The identifiers are hashes of the
 paths, so `ls` is the quickest way to find the one you want, and `lastcall status` prints
 the state directory it read as its first line. Nothing is ever written inside a watched
 repository. The full layout, and how to read a ledger with `jq` and `git`, are in

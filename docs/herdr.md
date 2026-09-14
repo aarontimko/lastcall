@@ -118,7 +118,8 @@ that workspace is actually working in, and says so on the bottom line:
 scope: <workspace> · 3 repos hidden (w shows all)
 ```
 
-`w` turns it off and on for the session. `scope = "all"` under `[herdr]` starts it off. A
+`w` turns it off and on for the session. `scope = "all"` under `[herdr]` starts it off, and
+the welcome on your first launch inside a herdr session offers to write that line for you. A
 hidden repository is still watched and still scanned: the scope is a view, not a filter, so
 turning it off shows a current list rather than starting a fresh scan.
 

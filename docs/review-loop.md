@@ -90,6 +90,14 @@ restriction: the keys all work the same.
 `o` shows `org/repo` instead of the directory name, `?` lists every key, live, including
 anything you have rebound.
 
+`s` sets one repository aside: it asks for a number of days, one by default and 365 at the
+most, and then drops it out of the list until that many days have gone by. It is a view and
+nothing more. lastcall keeps watching and scanning the repository the whole time,
+`lastcall status` keeps reporting it, and it comes back into the list on its own when an
+agent raises a flag on it. `S` lists the ones you have set aside alongside everything else,
+each saying the date it comes back; `s` on one of those wakes it now. The bottom line keeps
+count either way.
+
 ## 2. Read
 
 `enter` opens the selected file, `n` and `p` walk its hunks, `tab` moves focus between the
@@ -148,6 +156,15 @@ repository row rather than jumping somewhere else.
 
 You do not have to finish. Quit halfway through and what you accepted stays accepted; the
 rest is still there next time.
+
+`z` undoes the last accept in the selected repository, and again for the one before it, up
+to the last twenty. Like an accept it changes nothing on disk: the files it covers simply go
+back to pending, with any flags you put on them still there, and the cursor moves to the
+first of them. Each repository has its own stack, and the stack outlives the session, so a
+morning's accept can be undone that evening. Saving a file in the built-in editor is on the
+stack too, because saving marks the file reviewed (see [Edit](#6-edit)); undoing that one
+puts your own edit back on the list as something to look at, which is the point. `z` with
+nothing left to undo says so and does nothing.
 
 ## 4. Restore
 

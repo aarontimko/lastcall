@@ -92,6 +92,12 @@ pub fn nothing_pending_short(status: &str) -> String {
 /// overlay at 80 (design review F19).
 pub const SELECT_NOTE: &str = "shift+drag selects text (mouse capture is on) · v/y copies";
 
+/// The help overlay's last footer row (Amendment v1.11): the welcome card runs once and
+/// then never again, so the one place a reader looks up a key is also the place that says
+/// how to get it back. 44 columns, narrower than [`SELECT_NOTE`], so it costs the overlay
+/// no width.
+pub const TOUR_NOTE: &str = "lastcall tui --tour shows the welcome again";
+
 /// The inline editor's line-number gutter: four columns of number and one for the `▎` that
 /// marks a line inside a pending hunk (deliverable 8). `App::EDITOR_GUTTER` is the same
 /// number, and the reducer clamps the horizontal scroll to the text width it leaves.
@@ -1868,9 +1874,10 @@ const HELP_GUTTER: usize = 3;
 /// for a key finds it where the config file has it. A short terminal that is also narrow
 /// gets one column and the old truncation; there is nothing better to do with 40 columns.
 fn help_columns(keys: &[String], area: Rect) -> Vec<String> {
-    // `+ 2` for the blank and SELECT_NOTE below the body, `+ 4` for the border, the pad and
-    // the `any key closes` line — the overlay's fixed overhead.
-    if keys.len() + 2 + 4 <= area.height as usize {
+    // `+ 4` for what sits below the body — the blank, the newline note, `SELECT_NOTE` and
+    // `TOUR_NOTE` — and `+ 4` for the border, the pad and the `any key closes` line: the
+    // overlay's fixed overhead.
+    if keys.len() + 4 + 4 <= area.height as usize {
         return keys.to_vec();
     }
     let split = keys.len().div_ceil(2);
@@ -1928,6 +1935,7 @@ fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
     rows.push(String::new());
     rows.push(newline_note(app.enhanced).to_owned());
     rows.push(SELECT_NOTE.to_owned());
+    rows.push(TOUR_NOTE.to_owned());
     let width = (rows.iter().map(|r| r.width()).max().unwrap_or(0) + 4).min(area.width as usize);
     let height = (rows.len() + 4).min(area.height as usize);
     let rect = Rect::new(
@@ -1956,8 +1964,9 @@ fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
         // overlay clips, and what it clips is key rows — never the footer. A reader who
         // cannot see every key can still see what the mouse does and how to leave.
         //
-        // Two rows are reserved out of `cap` here, the newline note and `SELECT_NOTE`;
-        // the `any key closes` line below them is already out of `cap` by construction.
+        // Three rows are reserved out of `cap` here, the newline note, `SELECT_NOTE` and
+        // `TOUR_NOTE`; the `any key closes` line below them is already out of `cap` by
+        // construction.
         // Reserving too few put the body's last row on the footer's row, so the footer was
         // the thing the clip dropped (verifier (b) F4).
         //
@@ -1971,7 +1980,7 @@ fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
             .iter()
             .find(|(name, _)| *name == "quit")
             .map(|(_, row)| row.clone());
-        let mut keep = cap.saturating_sub(3);
+        let mut keep = cap.saturating_sub(4);
         // …and `quit` is pinned to the end of what survives, when what survives does not
         // already carry it. The keymap grows — Phase 8 alone adds four rows — and a clip
         // that simply takes the first N pushes the last row off first, which in this keymap
@@ -2017,6 +2026,7 @@ fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
         }
         rows.push(newline_note(app.enhanced).to_owned());
         rows.push(SELECT_NOTE.to_owned());
+        rows.push(TOUR_NOTE.to_owned());
         rows.truncate(cap);
     }
     for (i, row) in rows.iter().take(cap).enumerate() {
@@ -2975,6 +2985,24 @@ mod tests {
         assert!(frame.contains(SELECT_NOTE), "{frame}");
     }
 
+    /// Amendment v1.11, deliverable 5. The welcome card shows itself once and then writes a
+    /// marker; the only way back to it is the flag, and the one place a reader looks
+    /// something up is this overlay. The row is narrower than `SELECT_NOTE`, so it costs
+    /// the box no width — that is what keeps it from pushing the table into a clip.
+    #[test]
+    fn render_help_says_how_to_see_the_welcome_again() {
+        let mut app = App::new();
+        app.help = true;
+        for (w, h) in [(100u16, 40u16), (100, 30), (80, 24), (60, 14)] {
+            let (frame, _) = frame_of(&app, w, h);
+            assert!(frame.contains(TOUR_NOTE), "{w}x{h}:\n{frame}");
+        }
+        assert!(
+            TOUR_NOTE.width() <= SELECT_NOTE.width(),
+            "the row would widen the overlay"
+        );
+    }
+
     /// Ruling P9 in the one place a reviewer looks a key up: the overlay names `⇧⏎` only
     /// on a terminal that reports the enhancement, and names the key that always works
     /// everywhere else. Which terminals report it is `docs/dev/tui.md`'s answer, not a row.
@@ -3088,6 +3116,9 @@ mod tests {
             let (frame, _) = frame_of(&narrow, w, h);
             assert!(frame.contains("any key closes"), "{w}x{h}:\n{frame}");
             assert!(frame.contains(SELECT_NOTE), "{w}x{h}:\n{frame}");
+            // Amendment v1.11: the welcome runs once, so the row that says how to get it
+            // back is reserved out of the clip beside the other two.
+            assert!(frame.contains(TOUR_NOTE), "{w}x{h}:\n{frame}");
         }
         // At 30 lines the clip stops after the quit row — the one a reader who opened the
         // overlay by accident needs most.

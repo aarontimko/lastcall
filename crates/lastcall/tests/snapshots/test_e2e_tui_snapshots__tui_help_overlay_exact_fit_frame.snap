@@ -24,5 +24,6 @@ expression: frame
 "│                                                                                                  │"
 "│ ^J is a newline in the note (⇧⏎ needs a kitty-protocol terminal)                                 │"
 "│ shift+drag selects text (mouse capture is on) · v/y copies                                       │"
+"│ lastcall tui --tour shows the welcome again                                                      │"
 "│ any key closes                                                                                   │"
 "└──────────────────────────────────────────────────────────────────────────────────────────────────┘"

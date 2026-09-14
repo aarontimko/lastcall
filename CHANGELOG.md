@@ -5,6 +5,40 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html). A version's s
 exactly what its GitHub release notes carry, so it is written for the people installing the
 binary rather than for the commit log.
 
+## Unreleased
+
+### First launch
+
+- The first time you open the review screen, a small card names the keys you need and then
+  gets out of the way. The frame underneath stays live, so the scan you launched keeps
+  running while you read it, and it never opens on a window too small to read.
+- Two of the cards offer to remember a default: showing every repository instead of only the
+  ones your herdr workspace is working in, and starting with the empty repositories hidden.
+  Either choice takes effect at once and is written into your config file, which keeps its
+  comments, its key order and its formatting. If there is no config file yet, one is created
+  holding just that setting.
+- It is shown once. `lastcall tui --tour` brings it back, and the help overlay says so.
+
+### Undo
+
+- `z` reverses the last accept in the selected repository, and again for the one before it,
+  up to the last twenty. Nothing on disk moves: the files go back to pending with their
+  flags intact, and the cursor lands on the first of them.
+- Each repository has its own stack, kept beside the rest of what lastcall remembers, so an
+  accept from this morning can still be undone tonight. Saving a file in the built-in editor
+  is on the stack too, because saving marks the file reviewed.
+- `lastcall status --json` reports the depth as `undo` per root.
+
+### Snooze
+
+- `s` sets a repository aside for a number of days, one by default. `shift-s` lists the ones
+  you have set aside, each with the date it comes back, and `s` on one of those wakes it now.
+- It is a view and nothing more: the repository is still watched, still scanned, and still
+  reported by `lastcall status`. An agent asking for attention brings it back into the list
+  on its own, and the deadline expires on screen without a relaunch.
+- The bottom line keeps the count, beside the workspace scope's when both apply.
+- `lastcall status --json` reports the deadline as `snoozed_until` per root.
+
 ## 0.1.0 - 2026-09-12
 
 The first release. lastcall watches every git repository under your working directory and
