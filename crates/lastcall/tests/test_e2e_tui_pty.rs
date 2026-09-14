@@ -3334,7 +3334,10 @@ fn pty_help_overlay_says_how_to_leave_and_any_key_closes() {
         .iter()
         .position(|r| r.contains("more key"))
         .expect("the clip notice");
-    assert!(rows[at].contains("100 columns shows all"), "{}", rows[at]);
+    // 97 since Amendment v1.11: the widest left-column description is now `back to the
+    // file list (close help)` (34), where it used to be `accept the hunk or the selected
+    // entry` (37), so the two-column form needs three columns fewer than it did.
+    assert!(rows[at].contains("97 columns shows all"), "{}", rows[at]);
     assert!(
         rows[at + 1].contains("quit"),
         "the notice sits directly above the pinned quit:\n{}",
