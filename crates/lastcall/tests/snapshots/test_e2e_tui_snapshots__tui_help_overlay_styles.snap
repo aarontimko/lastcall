@@ -4,8 +4,9 @@ expression: style
 ---
 0 0..37 Reset Reset BOLD
 0 39..49 Reset Reset DIM
-1 0..28 Cyan Reset -
-2 0..100 Cyan Reset -
+1 0..100 Cyan Reset -
+2 0..1 Cyan Reset -
+2 99..100 Cyan Reset -
 3 0..1 Cyan Reset -
 3 99..100 Cyan Reset -
 4 0..1 Cyan Reset -
@@ -53,8 +54,9 @@ expression: style
 25 0..1 Cyan Reset -
 25 99..100 Cyan Reset -
 26 0..1 Cyan Reset -
-26 2..16 Reset Reset DIM
 26 99..100 Cyan Reset -
-27 0..100 Cyan Reset -
-28 0..28 Cyan Reset -
+27 0..1 Cyan Reset -
+27 2..16 Reset Reset DIM
+27 99..100 Cyan Reset -
+28 0..100 Cyan Reset -
 29 0..87 Reset Reset DIM

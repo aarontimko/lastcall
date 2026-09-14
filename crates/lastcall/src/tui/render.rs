@@ -1863,8 +1863,14 @@ pub(super) fn key_label(spec: &str) -> String {
         "tab" => "Tab".into(),
         "pageup" => "PgUp".into(),
         "pagedown" => "PgDn".into(),
+        "home" => "Home".into(),
+        "end" => "End".into(),
         "space" => "Space".into(),
         s if s.starts_with("ctrl-") => format!("Ctrl-{}", s[5..].to_uppercase()),
+        // `Alt-↑`, on the `Ctrl-` row's terms, so the arrow is the same glyph the `nav_up`
+        // row shows. The key itself is what the reader is looking for; the modifier is a
+        // prefix on it, not a different spelling of it.
+        s if s.starts_with("alt-") => format!("Alt-{}", key_label(&s[4..])),
         s => s.to_owned(),
     }
 }

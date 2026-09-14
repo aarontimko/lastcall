@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use lastcall::tui::app::{AcceptFailed, App, Changed, Effect, FlagKind, RootMeta, Selection};
 use lastcall::tui::herdr::{AgentCandidate, Attention, Dot, HerdrUpdate, RootAgents, Scope};
-use lastcall::tui::input::{Action, EditKey, EditorKey, NoteKey, PickKey, SnoozeKey};
+use lastcall::tui::input::{Action, EditKey, EditorKey, MODAL_KEYS, NoteKey, PickKey, SnoozeKey};
 use lastcall::tui::render::{render, styles};
 use lastcall::tui::tour::{Card, Tour};
 use lastcall_engine::engine::{Engine, EngineOptions, SaveRequest};
@@ -625,6 +625,12 @@ fn tui_help_overlay() {
 /// The two-column form (deliverable 8) is a response to a terminal too short to hold the
 /// rows, so the tall terminal is the control — it proves the layout switched for the reason
 /// claimed and not because the table grew.
+///
+/// The height is **derived** rather than written down, for the reason the scene exists: the
+/// four nav jumps (2026-09-14) took the table past the 45 rows this used to say, and a
+/// control that silently becomes a second copy of the two-column scene controls nothing.
+/// `render_help` holds the table in one column at `rows + 8` — the four footer rows below
+/// the body, and the border, the pad, the blank and the `any key closes` line.
 #[test]
 fn tui_help_overlay_tall() {
     let scene = Scene::build();
@@ -634,7 +640,21 @@ fn tui_help_overlay_tall() {
     app.handle(Action::NavDown);
     app.handle(Action::Help);
     assert!(app.help);
-    snapshot("tui_help_overlay_tall", &app, W, 45);
+    let height = (app.keymap.len() + MODAL_KEYS.len() + 8) as u16;
+    let (frame, _) = draw(&app, W, height);
+    assert!(
+        !frame.contains("more key"),
+        "the tall overlay clips nothing:\n{frame}"
+    );
+    let first = frame
+        .lines()
+        .find(|l| l.contains(Action::describe("nav_up")))
+        .expect("the first key row");
+    assert!(
+        !first.contains(Action::describe("flag")),
+        "one column, every row on its own line:\n{first}"
+    );
+    snapshot("tui_help_overlay_tall", &app, W, height);
 }
 
 /// The same overlay with room for neither form: 80 columns is the standard width and this

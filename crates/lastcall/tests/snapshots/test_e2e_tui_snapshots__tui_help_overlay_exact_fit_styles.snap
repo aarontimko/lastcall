@@ -48,6 +48,10 @@ expression: style
 22 0..1 Cyan Reset -
 22 99..100 Cyan Reset -
 23 0..1 Cyan Reset -
-23 2..16 Reset Reset DIM
 23 99..100 Cyan Reset -
-24 0..100 Cyan Reset -
+24 0..1 Cyan Reset -
+24 99..100 Cyan Reset -
+25 0..1 Cyan Reset -
+25 2..16 Reset Reset DIM
+25 99..100 Cyan Reset -
+26 0..100 Cyan Reset -

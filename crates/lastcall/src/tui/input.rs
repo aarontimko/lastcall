@@ -38,6 +38,17 @@ pub enum Action {
     NavPageUp,
     /// Nav focus: a page of entries down. Diff focus: a page of lines down.
     NavPageDown,
+    /// Nav focus: the first entry of the nav. Diff focus: the diff's first line.
+    NavTop,
+    /// Nav focus: the last entry. Diff focus: the last line a long `↓` run reaches.
+    NavBottom,
+    /// The repository row of the listed root **before** the selection's own root; on the
+    /// first root, that root's own row. From the diff the focus comes back to the nav with
+    /// it, because a repository row has no diff to read.
+    NavPrevRoot,
+    /// The repository row of the listed root **after** the selection's own root; on the
+    /// last one, nothing — these jump, they never wrap.
+    NavNextRoot,
     /// Focus the diff for the selected row/group (the cursor stays on that file's current
     /// hunk); on a root entry, select its first row. Bound to `enter`, `l` and `right`.
     Open,
@@ -447,6 +458,15 @@ pub const DEFAULT_KEYMAP: &[(&str, &[&str])] = &[
     ("nav_down", &["down", "j"]),
     ("nav_page_up", &["pageup", "b"]),
     ("nav_page_down", &["pagedown", "space"]),
+    // The jumps (2026-09-14). `{` and `}` are twins of `alt-up` / `alt-down` rather than
+    // decoration: on macOS the Cmd key never reaches a terminal program at all, and
+    // Terminal.app sends Option-arrow as a word-jump escape unless its profile says "Use
+    // Option as Meta key", so a keyboard-only reader needs a binding that is nothing but a
+    // character. They are **not** on the hint line, which is full at 100 columns.
+    ("nav_top", &["home"]),
+    ("nav_bottom", &["end"]),
+    ("nav_prev_root", &["alt-up", "{"]),
+    ("nav_next_root", &["alt-down", "}"]),
     ("open", &["enter", "l", "right"]),
     ("back", &["esc", "h", "left"]),
     ("focus_toggle", &["tab"]),
@@ -514,6 +534,10 @@ impl Action {
             "nav_down" => Action::NavDown,
             "nav_page_up" => Action::NavPageUp,
             "nav_page_down" => Action::NavPageDown,
+            "nav_top" => Action::NavTop,
+            "nav_bottom" => Action::NavBottom,
+            "nav_prev_root" => Action::NavPrevRoot,
+            "nav_next_root" => Action::NavNextRoot,
             "open" => Action::Open,
             "back" => Action::Back,
             "focus_toggle" => Action::FocusToggle,
@@ -556,6 +580,13 @@ impl Action {
             "nav_down" => "next entry / scroll down",
             "nav_page_up" => "page up",
             "nav_page_down" => "page down",
+            // The jumps, within the overlay's 30-column cap (design review F15): the two
+            // ends read as one row each because what they do depends on which pane has the
+            // keys, and the repository pair says `repository` in full because it fits.
+            "nav_top" => "first entry / top of the diff",
+            "nav_bottom" => "last entry / end of the diff",
+            "nav_prev_root" => "previous repository",
+            "nav_next_root" => "next repository",
             "open" => "open the diff",
             "back" => "back to the file list (close help)",
             "focus_toggle" => "toggle focus",
@@ -1632,6 +1663,72 @@ mod tests {
         assert_eq!(names.len(), DEFAULT_KEYMAP.len(), "duplicate action name");
     }
 
+    /// The jumps (2026-09-14): `alt-up` / `alt-down` round-trip through the spec grammar
+    /// and reach the reducer as themselves, and the `{` / `}` twins resolve to the very
+    /// same actions — however the terminal spells the brace, with the shift modifier or
+    /// folded into the glyph.
+    ///
+    /// The escape for Option-↑ is `ESC [ 1 ; 3 A`, which crossterm reports as `Up` with
+    /// `ALT`; `pty_nav_jumps` sends those bytes through a real terminal.
+    #[test]
+    fn input_nav_jumps_bind_the_alt_arrows_and_their_brace_twins() {
+        let km = Keymap::defaults();
+        for (spec, code, twin, jump, plain) in [
+            (
+                "alt-up",
+                KeyCode::Up,
+                '{',
+                Action::NavPrevRoot,
+                Action::NavUp,
+            ),
+            (
+                "alt-down",
+                KeyCode::Down,
+                '}',
+                Action::NavNextRoot,
+                Action::NavDown,
+            ),
+        ] {
+            let parsed = Key::parse(spec).expect("the spec parses");
+            assert!(parsed.alt && !parsed.ctrl && !parsed.shift, "{parsed:?}");
+            assert_eq!(parsed.spec(), spec, "the canonical spelling round-trips");
+            assert_eq!(
+                Key::of(&KeyEvent::new(code, KeyModifiers::ALT)),
+                Some(parsed),
+                "the terminal's own event normalizes onto the spec"
+            );
+            assert_eq!(
+                to_action(&key_code(code, KeyModifiers::ALT), &km),
+                Some(jump.clone()),
+                "{spec} reaches the reducer"
+            );
+            assert_eq!(
+                to_action(&key(twin), &km),
+                Some(jump.clone()),
+                "`{twin}` is its twin"
+            );
+            assert_eq!(
+                to_action(&key_code(KeyCode::Char(twin), KeyModifiers::SHIFT), &km),
+                Some(jump),
+                "`{twin}` with the shift the terminal reports is the same key"
+            );
+            assert_eq!(
+                to_action(&key_code(code, KeyModifiers::NONE), &km),
+                Some(plain),
+                "the bare arrow is untouched"
+            );
+        }
+        for (code, action) in [
+            (KeyCode::Home, Action::NavTop),
+            (KeyCode::End, Action::NavBottom),
+        ] {
+            assert_eq!(
+                to_action(&key_code(code, KeyModifiers::NONE), &km),
+                Some(action)
+            );
+        }
+    }
+
     #[test]
     fn input_every_keymap_name_resolves_and_has_a_description() {
         for (name, _) in DEFAULT_KEYMAP {
@@ -1660,6 +1757,10 @@ mod tests {
             (Action::NavDown, "key"),
             (Action::NavPageUp, "key"),
             (Action::NavPageDown, "key"),
+            (Action::NavTop, "key"),
+            (Action::NavBottom, "key"),
+            (Action::NavPrevRoot, "key"),
+            (Action::NavNextRoot, "key"),
             (Action::Open, "key"),
             (Action::Back, "key"),
             (Action::FocusToggle, "key"),
@@ -1727,6 +1828,10 @@ mod tests {
             | Action::NavDown
             | Action::NavPageUp
             | Action::NavPageDown
+            | Action::NavTop
+            | Action::NavBottom
+            | Action::NavPrevRoot
+            | Action::NavNextRoot
             | Action::Open
             | Action::Back
             | Action::FocusToggle
@@ -1771,9 +1876,9 @@ mod tests {
             | Action::Ack
             | Action::Jump
             | Action::ScopeToggle
-            | Action::Herdr(_) => 49,
+            | Action::Herdr(_) => 53,
         };
-        assert_eq!(table.len(), 49);
+        assert_eq!(table.len(), 53);
     }
 
     #[test]

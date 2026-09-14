@@ -3585,6 +3585,75 @@ impl App {
         self.select(Some(entries[index].clone()))
     }
 
+    /// `nav_top` / `nav_bottom` with the nav focused: the first or the last entry.
+    ///
+    /// The entry comes out of [`Self::nav_entries`] and goes through [`Self::select`],
+    /// which is [`Self::move_selection`]'s own last step: one selection path, so the diff,
+    /// the expansion and an empty nav all answer exactly as `↑`/`↓` make them. What it
+    /// does *not* borrow is `move_selection`'s rule for a nav with nothing selected yet —
+    /// there `↓` starts at the top, and `end` means the end whichever key came first.
+    fn jump_end(&mut self, down: bool) -> Changed {
+        let entries = self.nav_entries();
+        let target = if down {
+            entries.last()
+        } else {
+            entries.first()
+        };
+        let target = target.cloned();
+        self.select(target)
+    }
+
+    /// `nav_top` / `nav_bottom` with the diff focused: the first line, or the last line a
+    /// long `↓` run reaches — [`Self::scroll_by`] clamps to the same place, so this is a
+    /// move of the whole diff's length and not a second scroll path. While a selection is
+    /// running it moves the selection's far end instead, exactly as the page keys do.
+    fn jump_diff_end(&mut self, down: bool) -> Changed {
+        let span = diff_lines(self.view_hunks()) as isize;
+        let delta = if down { span } else { -span };
+        if self.sel.is_some() {
+            self.move_sel_cursor(delta)
+        } else {
+            self.scroll_by(delta)
+        }
+    }
+
+    /// `nav_prev_root` / `nav_next_root`: the repository row of the listed root before or
+    /// after the selection's own ([`Selection::root`]).
+    ///
+    /// The roots come out of [`Self::nav_entries`], so one that the scope, `t` or a snooze
+    /// has taken off the nav is skipped the way `↑`/`↓` skip it. There is no wrap: on the
+    /// last root `}` changes nothing at all, and `{` inside the first selects that root's
+    /// own row, which is where a reader deep inside it means to land. A repository row has
+    /// no diff, so the keys come back to the nav with the selection.
+    fn jump_root(&mut self, forward: bool) -> Changed {
+        let roots: Vec<PathBuf> = self
+            .nav_entries()
+            .into_iter()
+            .filter_map(|e| match e {
+                Selection::Root(root) => Some(root),
+                _ => None,
+            })
+            .collect();
+        let Some(first) = roots.first() else {
+            return self.select(None);
+        };
+        let at = self
+            .selection
+            .as_ref()
+            .and_then(|s| roots.iter().position(|r| r.as_path() == s.root()));
+        let target = match (at, forward) {
+            (Some(i), true) => match roots.get(i + 1) {
+                Some(root) => root.clone(),
+                None => return Changed::No,
+            },
+            (Some(i), false) => roots[i.saturating_sub(1)].clone(),
+            // Nothing selected yet: both keys start at the nav's first repository row.
+            (None, _) => first.clone(),
+        };
+        let moved = self.select(Some(Selection::Root(target)));
+        moved.or(self.set_focus(Focus::Nav))
+    }
+
     // ---- diff cursor ---------------------------------------------------------------------
 
     fn scroll_by(&mut self, delta: isize) -> Changed {
@@ -3801,6 +3870,16 @@ impl App {
             NavDown if nav => self.move_selection(1),
             NavPageUp if nav => self.move_selection(-page),
             NavPageDown if nav => self.move_selection(page),
+            NavTop if nav => self.jump_end(false),
+            NavBottom if nav => self.jump_end(true),
+            // The two ends of the diff, and the whole of a live selection with them.
+            NavTop => self.jump_diff_end(false),
+            NavBottom => self.jump_diff_end(true),
+            // The repository jumps read the same in both panes, which is why they are not
+            // split by focus: they always land on a repository row, and they always leave
+            // the keys in the nav.
+            NavPrevRoot => self.jump_root(false),
+            NavNextRoot => self.jump_root(true),
             // In the diff with a selection running, these keys move its far end
             // (deliverable 9); with none, they scroll the pane as they always have.
             NavUp if self.sel.is_some() => self.move_sel_cursor(-1),
@@ -6603,6 +6682,166 @@ mod tests {
         assert_eq!(app.handle(Action::Back).0, Changed::No, "Back never quits");
         app.handle(Action::FocusToggle);
         assert_eq!(app.focus, Focus::Diff);
+    }
+
+    /// The jumps (2026-09-14) with the nav focused: `home` and `end` reach the ends of
+    /// `nav_entries`, `}` walks the repository rows forward and `{` back, neither wraps,
+    /// and `{` from inside the first repository is that repository's own row.
+    #[test]
+    fn app_nav_jumps_reach_the_ends_and_walk_the_repository_rows() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        let entries = app.nav_entries();
+        let roots = [root("alpha"), root("beta"), root("notes")];
+        assert_eq!(entries.first(), Some(&Selection::Root(root("alpha"))));
+
+        assert_eq!(app.handle(Action::NavBottom).0, Changed::Yes);
+        assert_eq!(app.selection.as_ref(), entries.last());
+        assert_eq!(
+            app.handle(Action::NavBottom).0,
+            Changed::No,
+            "the last entry is already the last entry"
+        );
+        assert_eq!(app.handle(Action::NavTop).0, Changed::Yes);
+        assert_eq!(app.selection.as_ref(), entries.first());
+        assert_eq!(app.handle(Action::NavTop).0, Changed::No);
+
+        for next in &roots[1..] {
+            assert_eq!(app.handle(Action::NavNextRoot).0, Changed::Yes);
+            assert_eq!(app.selection, Some(Selection::Root(next.clone())));
+        }
+        assert_eq!(
+            app.handle(Action::NavNextRoot).0,
+            Changed::No,
+            "the last repository is where `}}` stops"
+        );
+        assert_eq!(app.selection, Some(Selection::Root(root("notes"))));
+        for prev in [root("beta"), root("alpha")] {
+            assert_eq!(app.handle(Action::NavPrevRoot).0, Changed::Yes);
+            assert_eq!(app.selection, Some(Selection::Root(prev)));
+        }
+        assert_eq!(
+            app.handle(Action::NavPrevRoot).0,
+            Changed::No,
+            "and the first is where `{{` stops"
+        );
+
+        // From inside a repository: `{` is the previous repository's row, and inside the
+        // first one it is that repository's own.
+        app.select(Some(row("beta", "u2")));
+        assert_eq!(app.handle(Action::NavPrevRoot).0, Changed::Yes);
+        assert_eq!(app.selection, Some(Selection::Root(root("alpha"))));
+        app.select(Some(row("alpha", "f2")));
+        assert_eq!(app.handle(Action::NavPrevRoot).0, Changed::Yes);
+        assert_eq!(
+            app.selection,
+            Some(Selection::Root(root("alpha"))),
+            "inside the first repository `{{` is its own head"
+        );
+        app.select(Some(row("alpha", "f2")));
+        assert_eq!(app.handle(Action::NavNextRoot).0, Changed::Yes);
+        assert_eq!(
+            app.selection,
+            Some(Selection::Root(root("beta"))),
+            "and `}}` is the next repository's, not this one's"
+        );
+    }
+
+    /// The same four with the **diff** focused: the ends move the pane and leave the
+    /// selection alone, and the repository jumps bring the keys back to the nav with them
+    /// (a repository row has no diff to read).
+    #[test]
+    fn app_nav_jumps_from_the_diff_scroll_it_and_come_back_to_the_nav() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::FocusToggle);
+        assert_eq!(app.effective_focus(), Focus::Diff);
+        let lines = diff_lines(app.view_hunks());
+        assert!(lines > 1, "f1 has a diff to scroll");
+
+        assert_eq!(app.handle(Action::NavBottom).0, Changed::Yes);
+        assert_eq!(app.diff.scroll, lines - 1);
+        assert_eq!(app.handle(Action::NavBottom).0, Changed::No);
+        // The same place a long `↓` run ends.
+        app.handle(Action::NavTop);
+        for _ in 0..lines + 5 {
+            app.handle(Action::NavDown);
+        }
+        assert_eq!(app.diff.scroll, lines - 1, "`end` is where `↓` gives up");
+        assert_eq!(app.handle(Action::NavTop).0, Changed::Yes);
+        assert_eq!(app.diff.scroll, 0);
+        assert_eq!(app.handle(Action::NavTop).0, Changed::No);
+        assert_eq!(
+            app.selection,
+            Some(row("alpha", "f1")),
+            "neither end touched the selection"
+        );
+        assert_eq!(app.focus, Focus::Diff, "nor the focus");
+
+        assert_eq!(app.handle(Action::NavNextRoot).0, Changed::Yes);
+        assert_eq!(app.selection, Some(Selection::Root(root("beta"))));
+        assert_eq!(app.focus, Focus::Nav, "`}}` hands the keys back to the nav");
+
+        app.select(Some(Selection::Root(root("alpha"))));
+        app.handle(Action::FocusToggle);
+        assert_eq!(app.focus, Focus::Diff);
+        assert_eq!(
+            app.handle(Action::NavPrevRoot).0,
+            Changed::Yes,
+            "the focus alone is a change"
+        );
+        assert_eq!(app.selection, Some(Selection::Root(root("alpha"))));
+        assert_eq!(app.focus, Focus::Nav);
+    }
+
+    /// A root the nav is not showing is no stop on the way, exactly as `↑`/`↓` skip it,
+    /// and an empty nav answers `Changed::No` to all four.
+    #[test]
+    fn app_nav_jumps_skip_a_hidden_root_and_an_empty_nav_is_nothing() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.apply(pile_event(
+            "beta",
+            snoozed_pile(pile("beta"), "2026-12-01T00:00:00Z"),
+        ));
+        let beta = root("beta");
+        assert!(
+            !app.nav_entries().iter().any(|e| e.root() == beta),
+            "beta is snoozed off the nav"
+        );
+        app.select(Some(Selection::Root(root("alpha"))));
+        assert_eq!(app.handle(Action::NavNextRoot).0, Changed::Yes);
+        assert_eq!(
+            app.selection,
+            Some(Selection::Root(root("notes"))),
+            "the snoozed repository is not a stop"
+        );
+        assert_eq!(app.handle(Action::NavPrevRoot).0, Changed::Yes);
+        assert_eq!(app.selection, Some(Selection::Root(root("alpha"))));
+        app.handle(Action::NavBottom);
+        let notes = root("notes");
+        assert_eq!(
+            app.selection.as_ref().map(Selection::root),
+            Some(notes.as_path()),
+            "`end` skips it too"
+        );
+
+        let mut empty = App::new();
+        assert!(empty.nav_entries().is_empty());
+        for action in [
+            Action::NavTop,
+            Action::NavBottom,
+            Action::NavPrevRoot,
+            Action::NavNextRoot,
+        ] {
+            assert_eq!(
+                empty.handle(action.clone()).0,
+                Changed::No,
+                "{action:?} on an empty nav"
+            );
+            assert_eq!(empty.selection, None);
+        }
     }
 
     #[test]
