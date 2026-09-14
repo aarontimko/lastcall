@@ -1528,10 +1528,12 @@ impl Ops<'_> {
         let _lock = LedgerLock::acquire(self.paths)?;
         self.merge_from_disk()?;
         // The accept-all entry, taken *before* the fold rewrites anything: the overrides
-        // and the tree as they stand now are the pre-accept baselines. Every path the fold
-        // will take from the snapshot (the row cap already bounds that list) plus every
-        // path that already carried an override, since the fold moves those into the tree
-        // too. `compact` passes an empty snapshot and no `seen_at`, and pushes nothing.
+        // and the tree as they stand now are the pre-accept baselines. It lists exactly the
+        // paths the fold takes from the snapshot (the row cap already bounds that list) and
+        // nothing else: a path that already carried an override is only moved into the tree
+        // by the fold, which changes nothing an undo would have to put back, and if it is
+        // pending as well it is a row of the snapshot and listed on that account.
+        // `compact` passes an empty snapshot and no `seen_at`, and pushes nothing.
         let entry = if seen_at.is_some() && !snapshot.rows.is_empty() {
             let mut keys: Vec<String> = Vec::new();
             for row in &snapshot.rows {

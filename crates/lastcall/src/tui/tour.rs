@@ -658,6 +658,14 @@ mod tests {
         )
     }
 
+    /// A fixed instant for every test that has to stamp one: 2026-09-14T00:00:00Z, the day
+    /// the created config file's comment carries. The tour's own clock is the engine's, so
+    /// nothing here has any business reading the wall — and `SystemTime::now` under `tui/`
+    /// stays a grep that finds nothing, `mod tests` included.
+    fn at() -> SystemTime {
+        UNIX_EPOCH + std::time::Duration::from_secs(1_789_344_000)
+    }
+
     fn config_file(dir: &Path) -> PathBuf {
         dir.join("config").join("lastcall").join("config.toml")
     }
@@ -724,8 +732,7 @@ mod tests {
     fn tour_marker_round_trips_through_the_state_directory() {
         let dir = TempDir::new("lc-tour-marker");
         assert!(!shown_before(dir.path()), "nothing written yet");
-        let now = UNIX_EPOCH + std::time::Duration::from_secs(1_789_344_000);
-        write_marker(dir.path(), now, "0.1.0").expect("write");
+        write_marker(dir.path(), at(), "0.1.0").expect("write");
         assert!(shown_before(dir.path()));
         let text = std::fs::read_to_string(marker_path(dir.path())).expect("read");
         let marker: Marker = serde_json::from_str(&text).expect("parses");
@@ -761,7 +768,7 @@ mod tests {
         let dir = TempDir::new("lc-tour-marker-junk");
         std::fs::write(marker_path(dir.path()), b"{ not json").expect("write");
         assert!(!shown_before(dir.path()));
-        write_marker(dir.path(), SystemTime::now(), "0.1.0").expect("write");
+        write_marker(dir.path(), at(), "0.1.0").expect("write");
         assert!(shown_before(dir.path()), "and then it is a record again");
     }
 
@@ -774,7 +781,7 @@ mod tests {
             Plan::new(false, env.clone(), dir.path().to_owned()).owed(),
             "no marker: the welcome is owed"
         );
-        write_marker(dir.path(), SystemTime::now(), "0.1.0").expect("write");
+        write_marker(dir.path(), at(), "0.1.0").expect("write");
         assert!(!Plan::new(false, env.clone(), dir.path().to_owned()).owed());
         assert!(
             Plan::new(true, env, dir.path().to_owned()).owed(),
@@ -787,7 +794,7 @@ mod tests {
     fn tour_dismissal_writes_the_marker_once() {
         let dir = TempDir::new("lc-tour-dismiss");
         let mut plan = Plan::new(false, env_at(dir.path()), dir.path().to_owned());
-        let first = UNIX_EPOCH + std::time::Duration::from_secs(1_789_344_000);
+        let first = at();
         plan.dismissed(first);
         assert!(!plan.owed(), "dismissed");
         plan.dismissed(first + std::time::Duration::from_secs(99));
@@ -1205,9 +1212,8 @@ mod tests {
     fn tour_write_creates_the_config_file_and_then_edits_it() {
         let dir = TempDir::new("lc-tour-write");
         let mut plan = Plan::new(false, env_at(dir.path()), dir.path().to_owned());
-        let at = UNIX_EPOCH + std::time::Duration::from_secs(1_789_344_000);
-        plan.write(Setting::HideEmptyRepos, at).expect("created");
-        plan.write(Setting::HerdrScopeAll, at).expect("edited");
+        plan.write(Setting::HideEmptyRepos, at()).expect("created");
+        plan.write(Setting::HerdrScopeAll, at()).expect("edited");
         assert_eq!(
             std::fs::read_to_string(config_file(dir.path())).expect("read"),
             "# written by lastcall's first-launch tour on 2026-09-14\n\
@@ -1226,7 +1232,7 @@ mod tests {
         write_config(dir.path(), "herdr = 3\n");
         let mut plan = Plan::new(false, env_at(dir.path()), dir.path().to_owned());
         let message = plan
-            .write(Setting::HerdrScopeAll, SystemTime::now())
+            .write(Setting::HerdrScopeAll, at())
             .expect_err("herdr is not a table");
         assert!(
             message.starts_with("could not write ")

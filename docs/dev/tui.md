@@ -1015,7 +1015,8 @@ exactly, and for the same reason: an agent that is blocked or done is news the r
 for before they asked for quiet. Expiry is a **field test, never a clock read**
 (design review F4): the engine stamps `None` for a deadline that has already passed under its
 own injected clock, and `App::handle`'s `Tick` arm drops one that expires while the TUI is
-open — outside `mod tests` there is no `SystemTime::now()` anywhere under `tui/`. The bottom line carries the
+open. There is no `SystemTime::now()` anywhere under `tui/`, `mod tests` included: the tests
+that need an instant use a fixed one (`tour::tests::at`). The bottom line carries the
 count as `N snoozed (S shows)`, and the key in the parenthetical comes from the keymap, so a
 rebound `show_snoozed` renames the notice with it.
 
