@@ -39,6 +39,14 @@ binary rather than for the commit log.
 - The bottom line keeps the count, beside the workspace scope's when both apply.
 - `lastcall status --json` reports the deadline as `snoozed_until` per root.
 
+### Moving around
+
+- `Home` and `End` go to the first and the last entry of the list, and to the top and the
+  end of the diff when that pane has the keys.
+- `{` and `}` jump to the previous and the next repository's own row, stepping over its
+  files rather than walking through them. Option with an arrow key does the same in
+  terminals that send it, and every one of the four can be rebound in `[keys]`.
+
 ## 0.1.0 - 2026-09-12
 
 The first release. lastcall watches every git repository under your working directory and

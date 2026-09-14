@@ -907,6 +907,8 @@ Defaults (`input::DEFAULT_KEYMAP`, in help-overlay order):
 |---|---|---|---|
 | `nav_up` / `nav_down` | `up` `k` / `down` `j` | previous / next entry | scroll one line |
 | `nav_page_up` / `nav_page_down` | `pageup` `b` / `pagedown` `space` | a page of entries | a page of lines |
+| `nav_top` / `nav_bottom` | `home` / `end` | the first / the last entry of `nav_entries()` | the diff's first line / the line a long `↓` run ends on (a live `v` selection's far end instead) |
+| `nav_prev_root` / `nav_next_root` | `alt-up` `{` / `alt-down` `}` | the repository row of the listed root before / after the selection's own (`Selection::root()`); `{` inside the first root is that root's own row, `}` on the last is `Changed::No` | the same, and the focus comes back to the nav |
 | `open` | `enter` `l` `right` | open the selected row's diff, cursor on that file's current hunk (on a root: its first row) | — |
 | `back` | `esc` `h` `left` | — | back to the file list with the same row selected; closes help first; never quits |
 | `focus_toggle` | `tab` | toggle focus between the panes | |
@@ -937,6 +939,15 @@ Defaults (`input::DEFAULT_KEYMAP`, in help-overlay order):
 | `quit` | `q` `ctrl-c` | exit 0 | |
 | `scroll_up` / `scroll_down` | *(unbound)* | bindable one-line diff scrolls | |
 
+**The jumps are not Cmd bindings, because on macOS the Cmd key never reaches a terminal
+program at all** — the terminal emulator keeps it — while Option-arrow arrives as `alt-up` /
+`alt-down` in iTerm2 and in a herdr pane by default, and Terminal.app sends Option-arrow as a
+word-jump escape unless its profile has "Use Option as Meta key" on, which is why `{` and `}`
+are bound to the same two actions and work everywhere. Every one of the four moves goes
+through `nav_entries()`, so a hidden root is not a stop on the way, and an empty nav answers
+`Changed::No`. `pty_nav_jumps` drives all four through a real terminal (`End`, `Home`, `}`,
+then `alt-up` as the raw `ESC [ 1 ; 3 A`).
+
 **Focus moves horizontally.** The two panes sit side by side, so the arrows move between
 them: `right` (= `enter` / `l`, action `open`) on a selected file row focuses the diff with
 the cursor on that file's current hunk; `left` (= `esc` / `h`, action `back`) returns focus
@@ -951,7 +962,7 @@ The confirm modal answers `y` / `enter` (confirm) and `n` / `esc` (cancel) — f
 `quit` keys, which quit from inside it; nothing else. The note modal and the agent picker
 have their own key sets, printed on the modal itself ("Restore and flag" above).
 
-**The help overlay is two columns when one does not fit.** With 27 bindable rows plus the
+**The help overlay is two columns when one does not fit.** With 37 bindable rows plus the
 modal keys, a single column runs off the bottom of a 30-row terminal, so
 `render::help_columns` splits the rows in half whenever one column would overflow the height
 *and* the pair fits the width — each column sized to its own widest row, because padding both
@@ -967,8 +978,11 @@ the standard width, the pair does not fit and the overlay clips: at 30 lines it 
 `quit` row, at 24 it stops earlier, and the footer is there either way (verifier (b) F4).
 **What survives the clip is the table's order** (`input::DEFAULT_KEYMAP`), so that order is
 a decision and not an accident: the review loop first (move, open, `t`, accept, restore,
-`z` undo), which is exactly the sixteen rows an 80×24 overlay has room for, then the keys
-that only change what the list shows (`e`, `f`, `o`), the snooze pair, `?` and `q`.
+`z` undo), then the keys that only change what the list shows (`e`, `f`, `o`), the snooze
+pair, `?` and `q`. An 80×24 overlay has room for sixteen of those rows, and the four jumps
+(2026-09-14) sit inside the first group, so the fold there now falls after `A accept the
+whole file`: `Ctrl-A`, the two restores and `z` are below it, counted by the clip notice
+and reachable at 100 columns, where nothing is clipped at all.
 A clipped overlay now **says** it is clipped (**ruling R12**): the row above the pinned
 `quit` is a dim `… N more keys (100 columns shows all)`, so `q / Ctrl-C  quit` as the last
 key row can no longer be read as the whole table.

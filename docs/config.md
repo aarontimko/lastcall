@@ -93,6 +93,10 @@ and shift with tab is `backtab`.
 | `nav_down` | `down`, `j` | next entry, or scroll the diff down |
 | `nav_page_up` | `pageup`, `b` | a page up |
 | `nav_page_down` | `pagedown`, `space` | a page down |
+| `nav_top` | `home` | the first entry, or the top of the diff |
+| `nav_bottom` | `end` | the last entry, or the end of the diff |
+| `nav_prev_root` | `alt-up`, `{` | the previous repository's row. Inside the first one, that repository's own row |
+| `nav_next_root` | `alt-down`, `}` | the next repository's row. On the last one, nothing: these jump, they never wrap |
 | `open` | `enter`, `l`, `right` | open the diff for the selected row |
 | `back` | `esc`, `h`, `left` | close the help overlay, else return to the file list. Never quits. |
 | `focus_toggle` | `tab` | move focus between the two panes |
@@ -122,6 +126,12 @@ and shift with tab is `backtab`.
 | `refresh` | `r` | rescan now |
 | `help` | `?` | the help overlay, which lists all of this live |
 | `quit` | `q`, `ctrl-c` | quit |
+
+On macOS the Cmd key never reaches a program running in a terminal, which is why the two
+repository jumps are bound to Option and an arrow: iTerm2 and herdr panes send that as
+`alt-up` and `alt-down`, while Terminal.app sends it as a word jump unless its profile has
+"Use Option as Meta key" turned on, so `{` and `}` are bound to the same two actions and
+work everywhere.
 
 The confirmation modal's own keys, `y` and `enter` to confirm, `n` and `esc` to cancel, are
 not rebindable in this version.
