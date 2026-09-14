@@ -452,12 +452,7 @@ pub const DEFAULT_KEYMAP: &[(&str, &[&str])] = &[
     ("focus_toggle", &["tab"]),
     ("hunk_next", &["n", "]"]),
     ("hunk_prev", &["p", "["]),
-    ("expand", &["e"]),
-    ("toggle_full_paths", &["f"]),
-    ("toggle_remote", &["o"]),
     ("hide_empty", &["t"]),
-    ("snooze", &["s"]),
-    ("show_snoozed", &["shift-s"]),
     ("accept", &["a"]),
     ("accept_file", &["shift-a"]),
     ("accept_all", &["ctrl-a"]),
@@ -474,6 +469,16 @@ pub const DEFAULT_KEYMAP: &[(&str, &[&str])] = &[
     ("jump", &["g"]),
     ("scope", &["w"]),
     ("refresh", &["r"]),
+    // This table is the help overlay's display order, and at 80 columns the overlay is one
+    // column with room for sixteen rows before the fold. What goes above it is the loop
+    // itself: move, open, accept, put back, undo. The keys that only change what the list
+    // shows, and the pair that sets a repository aside, read perfectly well from the second
+    // page (`?` at 100 columns, or the wider terminal the fold line names).
+    ("expand", &["e"]),
+    ("toggle_full_paths", &["f"]),
+    ("toggle_remote", &["o"]),
+    ("snooze", &["s"]),
+    ("show_snoozed", &["shift-s"]),
     ("help", &["?"]),
     ("quit", &["q", "ctrl-c"]),
 ];
@@ -563,8 +568,12 @@ impl Action {
             "hide_empty" => "hide / show empty repos",
             // Amendment v1.11. Every description is capped at 30 columns by the overlay
             // (design review F15), which is why these say `this repo` and not `this
-            // repository`.
-            "snooze" => "snooze this repo for a while",
+            // repository`. `snooze` is shorter still, for the same reason `edit_external`
+            // is: it sits in the overlay's second column, whose width is the whole column
+            // pair's, and at 28 columns ("snooze this repo for a while") it pushed the
+            // two-column form past 100 and the overlay fell back to one clipped column.
+            // How long the snooze is for is the modal's question anyway.
+            "snooze" => "snooze this repo",
             "show_snoozed" => "show / hide snoozed repos",
             "accept" => "accept the hunk or the selected entry",
             "accept_file" => "accept the whole file",

@@ -957,6 +957,10 @@ own. The blank separator is not reserved; it is the first thing the clip spends.
 whole footer survives at any size the overlay is drawn at. At 80 columns,
 the standard width, the pair does not fit and the overlay clips: at 30 lines it reaches the
 `quit` row, at 24 it stops earlier, and the footer is there either way (verifier (b) F4).
+**What survives the clip is the table's order** (`input::DEFAULT_KEYMAP`), so that order is
+a decision and not an accident: the review loop first (move, open, `t`, accept, restore,
+`z` undo), which is exactly the sixteen rows an 80×24 overlay has room for, then the keys
+that only change what the list shows (`e`, `f`, `o`), the snooze pair, `?` and `q`.
 A clipped overlay now **says** it is clipped (**ruling R12**): the row above the pinned
 `quit` is a dim `… N more keys (100 columns shows all)`, so `q / Ctrl-C  quit` as the last
 key row can no longer be read as the whole table.
