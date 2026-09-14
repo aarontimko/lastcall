@@ -615,8 +615,14 @@ impl Action {
             // How long the snooze is for is the modal's question anyway.
             "snooze" => "snooze this repo",
             "show_snoozed" => "show / hide snoozed repos",
-            "accept" => "accept the hunk or the selected entry",
-            "accept_file" => "accept the whole file",
+            // Amendment v1.11 (the ruling of 2026-09-14): `a` is the hunk key and `A` is
+            // the key that takes a whole entry — a file, a branch group, a repository from
+            // its row. 28 and 29 columns, inside the overlay's 30-column cap, and both in
+            // the left column of the two-column form, whose width `back to the file list
+            // (close help)` sets. A hunkless file row is still `a`'s (there is no hunk to
+            // point at); that carve-out is the documentation's to explain, not a help row's.
+            "accept" => "accept the hunk under the cursor",
+            "accept_file" => "accept the whole file or repo",
             "accept_all" => "accept everything listed",
             "restore" => "restore the hunk",
             "restore_file" => "restore the whole file",

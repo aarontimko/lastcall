@@ -2812,7 +2812,14 @@ mod tests {
         render_into(&mut ui);
         let nav = ui.hits.as_ref().unwrap().nav.unwrap();
         let main = ui.hits.as_ref().unwrap().main.unwrap();
-        assert_eq!(ui.event(&key(KeyCode::Char('a'))), (Changed::Yes, None));
+        // Amendment v1.11: `A`, not `a`, is what folds a repository from its row.
+        assert_eq!(
+            ui.event(&Event::Key(KeyEvent::new(
+                KeyCode::Char('A'),
+                KeyModifiers::SHIFT
+            ))),
+            (Changed::Yes, None)
+        );
         assert!(ui.app.confirm.is_some(), "11 files ask first");
         let open = ui.app.clone();
         let (nx, ny) = (nav.x + 1, nav.y + 1);

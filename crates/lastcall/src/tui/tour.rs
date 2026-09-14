@@ -373,6 +373,12 @@ pub const CHOICE_FOOTER: &str = "enter  choose          q  skip the rest";
 const KEY_CELLS: [[(&str, &str); 3]; 4] = [
     [
         ("accept", "accept the hunk under the cursor"),
+        // The help overlay reads `accept the whole file or repo` since Amendment v1.11;
+        // this cell keeps the shorter phrase. The grid's three columns use all 94 columns
+        // the card has at 100 wide, so the eight longer characters cost the card its grid
+        // entirely and every key falls to a line of its own. The card is a first
+        // impression and its shape is the point; the whole-repository half is on the help
+        // overlay, in `docs/config.md` and in `docs/review-loop.md`.
         ("accept_file", "accept the whole file"),
         ("accept_all", "accept everything"),
     ],

@@ -23,8 +23,9 @@ use ratatui::widgets::{Block, Clear, Widget};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::app::{
-    self, AcceptScope, App, Editor, Focus, MIN_SIZE, NAV_MIN_COLS, RootView, Selection, Target,
-    annotation_name, diff_lines, hunk_header, hunk_offsets, plural, restore_question,
+    self, AcceptAnswer, AcceptScope, App, Editor, Focus, MIN_SIZE, NAV_MIN_COLS, RootView,
+    Selection, Target, annotation_name, diff_lines, hunk_header, hunk_offsets, plural,
+    restore_question,
 };
 use super::herdr::{Dot, Link};
 use super::input::{Action, MODAL_KEYS};
@@ -572,9 +573,10 @@ const HINT_NAV_ONLY: &[&str] = &["scope", "focus_toggle", "refresh", "select", "
 /// accept all  t hide empty  Tab focus  r refresh  ? help  q quit`, where `<accept>` follows
 /// the selection — `a accept hunk  A accept file` on a file row with hunks in **either**
 /// pane, `a/A accept file` on a hunkless file row (binary, collapsed, deleted, unreadable),
-/// `a accept group` on a group entry, `a accept all in <root>` on a **non-empty** root entry
-/// (how the per-repo fold is told from the header's global one; on an empty repo row `a`
-/// does nothing, so the line does not offer it — verifier (a) F2). With the **diff** focused
+/// `A accept group` on a group entry, `A accept all in <root>` on a **non-empty** root entry
+/// (Amendment v1.11: `A` is the key that takes a whole entry, and it is how the per-repo
+/// fold is told from the header's global one; on an empty repo row neither key accepts
+/// anything, so the line does not offer it — verifier (a) F2). With the **diff** focused
 /// the first two hints are `↑↓ scroll  ← back` instead, because that is what those keys do
 /// there (Design pass D2, ruling R3); the two forms are the same width.
 ///
@@ -617,28 +619,38 @@ pub fn hints(app: &App, width: u16) -> String {
     let accept = first("accept");
     let accept_file = first("accept_file");
     let scope = app.accept_scope();
-    let context = match &scope {
-        Some(AcceptScope::Hunk { .. }) => accept.as_ref().map(|k| format!("{k} accept hunk")),
-        Some(AcceptScope::File { .. }) => match (&accept, &accept_file) {
+    // What `A` takes here. A group entry and a repository row are its alone since
+    // Amendment v1.11, so their phrases are built from this and named with its key: the
+    // line spells the key that will do the thing it promises.
+    let whole = app.accept_file_scope();
+    let context = match (&scope, &whole) {
+        (Some(AcceptAnswer::Take(AcceptScope::Hunk { .. })), _) => {
+            accept.as_ref().map(|k| format!("{k} accept hunk"))
+        }
+        (Some(AcceptAnswer::Take(AcceptScope::File { .. })), _) => match (&accept, &accept_file) {
             (Some(a), Some(f)) => Some(format!("{a}/{f} accept file")),
             (Some(a), None) => Some(format!("{a} accept file")),
             (None, Some(f)) => Some(format!("{f} accept file")),
             (None, None) => None,
         },
-        Some(AcceptScope::Group { .. }) => accept.as_ref().map(|k| format!("{k} accept group")),
+        (_, Some(AcceptScope::Group { .. })) => {
+            accept_file.as_ref().map(|k| format!("{k} accept group"))
+        }
         // Verifier (a) F2: since v1.9 a repo with nothing pending is a selectable nav row,
-        // and `a` on it lands on `nothing to accept`. A hint the line promises has to do
+        // and `A` on it lands on `nothing to accept`. A hint the line promises has to do
         // something, so the phrase is offered only while the repo has rows.
-        Some(AcceptScope::Root(root)) => accept
+        (_, Some(AcceptScope::Root(root))) => accept_file
             .as_ref()
             .filter(|_| app.roots.get(root).is_some_and(|v| !v.rows().is_empty()))
             .map(|k| format!("{k} accept all in {}", app.root_name(root))),
         // `Bless` is never what the *selection* covers — it is built by the editor-return
         // path and lives only inside a confirm — so the hint line has nothing to say for it.
-        Some(AcceptScope::All) | Some(AcceptScope::Bless { .. }) | None => None,
+        _ => None,
     };
     let file = match &scope {
-        Some(AcceptScope::Hunk { .. }) => accept_file.map(|k| format!("{k} accept file")),
+        Some(AcceptAnswer::Take(AcceptScope::Hunk { .. })) => {
+            accept_file.map(|k| format!("{k} accept file"))
+        }
         _ => None,
     };
     // (hint, tier): when the line must shrink, tier 4 goes first (`t hide empty`), then
@@ -2975,7 +2987,7 @@ mod tests {
         assert!(frame.contains("x              quit"), "{frame}");
         assert!(!frame.contains("q / Ctrl-C"), "{frame}");
         assert!(
-            frame.contains("A              accept the whole file"),
+            frame.contains("A              accept the whole file or repo"),
             "{frame}"
         );
         assert!(frame.contains("y / ⏎          confirm"), "{frame}");
@@ -3240,7 +3252,7 @@ mod tests {
         let mut app = three_roots();
         app.apply(pile_event("alpha", rows_n(11, 0, 0)));
         app.select(Some(Selection::Root(root("alpha"))));
-        assert_eq!(app.handle(Action::Accept), (Changed::Yes, None));
+        assert_eq!(app.handle(Action::AcceptFile), (Changed::Yes, None));
         assert!(app.confirm.is_some());
         assert_eq!(hints(&app, 100), "y confirm  n cancel  q quit");
         assert_eq!(
@@ -3261,7 +3273,7 @@ mod tests {
         assert_eq!(hints(&app, 100), "y confirm  n cancel  ^X quit");
         app.handle(Action::Cancel);
         assert!(
-            hints(&app, 100).contains("a accept all in alpha  ^A accept all"),
+            hints(&app, 100).contains("A accept all in alpha  ^A accept all"),
             "{}",
             hints(&app, 100)
         );
@@ -3339,7 +3351,7 @@ mod tests {
             hints(&rebound, 200)
         );
         // What the line says depends on the selection: a root row trades
-        // `a accept hunk  A accept file` for `a accept all in <root>`. Verifier (b) F4: it
+        // `a accept hunk  A accept file` for `A accept all in <root>`. Verifier (b) F4: it
         // also carries no hunks, so with the diff focused it is offered neither `n/p hunk`
         // nor the diff pane's `v select  y copy` — at any width, since a hint that answers
         // nothing is not a hint the line is short of.
@@ -3353,7 +3365,7 @@ mod tests {
             );
         }
         assert!(
-            hints(&at_root, 200).contains("a accept all in alpha"),
+            hints(&at_root, 200).contains("A accept all in alpha"),
             "{}",
             hints(&at_root, 200)
         );
@@ -3366,7 +3378,7 @@ mod tests {
         app.handle(Action::Open);
         app.select(Some(Selection::Root(root("alpha"))));
         assert!(
-            hints(&app, 100).contains("a accept all in alpha  ^A accept all"),
+            hints(&app, 100).contains("A accept all in alpha  ^A accept all"),
             "{}",
             hints(&app, 100)
         );
@@ -3375,7 +3387,7 @@ mod tests {
             lastcall_engine::scan::Annotation::Upstream,
         )));
         assert!(
-            hints(&app, 100).contains("a accept group  ^A accept all"),
+            hints(&app, 100).contains("A accept group  ^A accept all"),
             "{}",
             hints(&app, 100)
         );
@@ -3821,7 +3833,7 @@ mod tests {
         let mut app = three_roots();
         app.apply(pile_event("alpha", rows_n(11, 2, 1)));
         app.select(Some(Selection::Root(root("alpha"))));
-        assert_eq!(app.handle(Action::Accept), (Changed::Yes, None));
+        assert_eq!(app.handle(Action::AcceptFile), (Changed::Yes, None));
         let (frame, styles) = frame_of(&app, 100, 30);
         assert!(frame.contains("Accept all 11 files in alpha?"), "{frame}");
         assert!(
@@ -4537,7 +4549,7 @@ mod tests {
     }
 
     /// Amendment v1.11: `z undo` is offered only where `z` would do something — the same
-    /// rule as `d ack` and `a accept all in <root>`. The pile's own `undo` count is what
+    /// rule as `d ack` and `A accept all in <root>`. The pile's own `undo` count is what
     /// decides, so a second process's accept puts the hint up at the next pile.
     #[test]
     fn render_hint_line_offers_z_undo_only_when_there_is_something_to_undo() {

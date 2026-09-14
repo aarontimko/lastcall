@@ -31,6 +31,7 @@ use lastcall_engine::watcher::EngineEvent;
 
 use super::herdr::{AgentCandidate, HerdrUpdate, HerdrView, Link, ToastRequest};
 use super::input::{Action, EditKey, EditorKey, Keymap, NoteKey, PickKey, SnoozeKey, TourKey};
+use super::render::key_label;
 use super::textbuf::{TextBuf, Wrap};
 use super::tour::Tour;
 use unicode_width::UnicodeWidthStr;
@@ -613,6 +614,23 @@ pub enum AcceptScope {
         /// The pre-edit row with `oid`/`mode` replaced by what is on disk now.
         rendered: Box<Rendered>,
     },
+}
+
+/// What `accept` (`a`) answers with from the current selection: a scope it takes, or a
+/// refusal that names the key which takes a whole entry.
+///
+/// Amendment v1.11, the maintainer's ruling of 2026-09-14: in the nav `accept_file` (`A`)
+/// is the key that takes a whole entry — a file, a branch group, a repository — and `a`
+/// takes a hunk and nothing larger. Before it, `a` on a repository row folded the whole
+/// repository, and a repository of [`CONFIRM_ABOVE`] files or fewer vanished with no
+/// question asked at all. An **empty** repository row has nothing to refuse over: `a` and
+/// `A` both read [`NOTHING_TO_ACCEPT`] there, which [`App::request_accept`] says for either.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcceptAnswer {
+    /// `a` takes this much.
+    Take(AcceptScope),
+    /// `a` takes nothing here; this is the status text that says which key does.
+    Refuse(String),
 }
 
 /// An accept the loop is running: its scope and the rows each request covered, so the
@@ -1853,36 +1871,73 @@ impl App {
     /// diff cursor — whichever pane has focus, so `a` from the nav takes a hunk, not the
     /// file (`A` / `accept_file` is the only key that takes a whole file). A file row with
     /// no hunks (binary, collapsed, deleted, unreadable) has no hunk to point at, so `a`
-    /// there keeps taking the row whole. A group entry is the group, a root entry every row
-    /// of that root. `None` with nothing selected or a vanished row.
-    pub fn accept_scope(&self) -> Option<AcceptScope> {
+    /// there keeps taking the row whole.
+    ///
+    /// A **group** entry and a **non-empty repository** row are refusals (Amendment v1.11,
+    /// the ruling of 2026-09-14): they are several files, and `A` is the key that takes
+    /// several. The refusal names the `accept_file` key from the effective keymap, so a
+    /// reader who rebound it is sent to their own key. `None` with nothing selected or a
+    /// vanished row.
+    pub fn accept_scope(&self) -> Option<AcceptAnswer> {
         match self.selection.clone()? {
             Selection::Row(root, path) => {
                 let row = self.roots.get(&root)?.row(&path)?;
                 if !row.hunks.is_empty() {
-                    Some(AcceptScope::Hunk {
+                    Some(AcceptAnswer::Take(AcceptScope::Hunk {
                         root,
                         path,
                         index: self.diff.hunk.min(row.hunks.len() - 1),
                         hunks: row.hunks.len(),
-                    })
+                    }))
                 } else {
-                    Some(file_scope(root, row))
+                    Some(AcceptAnswer::Take(file_scope(root, row)))
                 }
             }
-            Selection::Group(root, kind) => Some(AcceptScope::Group { root, kind }),
-            Selection::Root(root) => Some(AcceptScope::Root(root)),
+            Selection::Group(..) => Some(AcceptAnswer::Refuse(format!(
+                "{} accepts the group",
+                self.accept_file_key()
+            ))),
+            // An empty repository row keeps the old answer: `request_accept` counts nothing
+            // and says `nothing to accept`, which is what `A` says there too.
+            Selection::Root(root) if self.rows_in(&root) == 0 => {
+                Some(AcceptAnswer::Take(AcceptScope::Root(root)))
+            }
+            Selection::Root(root) => Some(AcceptAnswer::Refuse(format!(
+                "{} accepts all in {}",
+                self.accept_file_key(),
+                self.root_name(&root)
+            ))),
         }
     }
 
-    /// What `AcceptFile` covers: the selected row whole, whichever pane has focus.
+    /// The `accept_file` key as the help overlay spells it, from the **effective** keymap.
+    ///
+    /// `[keys]` cannot leave an action unbound (an empty list is a config error and every
+    /// default action is in the table), so the fallback is unreachable; the default
+    /// spelling is the honest thing to print if it ever is not.
+    fn accept_file_key(&self) -> String {
+        self.keys_for("accept_file")
+            .first()
+            .map(|s| key_label(s))
+            .unwrap_or_else(|| "A".to_owned())
+    }
+
+    /// How many rows a root holds now, `0` for one this app has never seen.
+    fn rows_in(&self, root: &Path) -> usize {
+        self.roots.get(root).map_or(0, |v| v.rows().len())
+    }
+
+    /// What `AcceptFile` covers: the whole selected entry, whichever pane has focus — a
+    /// file row, a branch group, or every row of a repository from its row (Amendment
+    /// v1.11). Above [`CONFIRM_ABOVE`] files it asks first, exactly as `^A` does.
     pub fn accept_file_scope(&self) -> Option<AcceptScope> {
         match self.selection.clone()? {
             Selection::Row(root, path) => {
                 let row = self.roots.get(&root)?.row(&path)?;
                 Some(file_scope(root, row))
             }
-            _ => None,
+            Selection::Group(root, kind) => Some(AcceptScope::Group { root, kind }),
+            Selection::Root(root) => Some(AcceptScope::Root(root)),
         }
     }
 
@@ -3984,7 +4039,12 @@ impl App {
                 Changed::Yes
             }
             Accept => match self.accept_scope() {
-                Some(scope) => return self.request_accept(scope),
+                Some(AcceptAnswer::Take(scope)) => return self.request_accept(scope),
+                // The status line changed, so the frame did: `Changed::Yes`.
+                Some(AcceptAnswer::Refuse(text)) => {
+                    self.set_status(text);
+                    Changed::Yes
+                }
                 None => Changed::No,
             },
             AcceptFile => match self.accept_file_scope() {
@@ -4918,7 +4978,10 @@ mod tests {
                 "never written back onto the row"
             );
             assert!(
-                matches!(app.accept_scope(), Some(AcceptScope::File { .. })),
+                matches!(
+                    app.accept_scope(),
+                    Some(AcceptAnswer::Take(AcceptScope::File { .. }))
+                ),
                 "a collapsed row is one accept however much is on screen: {:?}",
                 app.accept_scope()
             );
@@ -5142,12 +5205,12 @@ mod tests {
         let held = base.roots[&root("alpha")].row(b"f1").unwrap();
         assert_eq!(
             nav_scope,
-            Some(AcceptScope::Hunk {
+            Some(AcceptAnswer::Take(AcceptScope::Hunk {
                 root: root("alpha"),
                 path: b"f1".to_vec(),
                 index: 1,
                 hunks: 3,
-            }),
+            })),
             "not AcceptScope::File"
         );
         assert_eq!(
@@ -5174,10 +5237,17 @@ mod tests {
             vec![(root("alpha"), AcceptRequest::File(Rendered::of(held)))]
         );
 
-        // A root entry's `a` is untouched: the per-repo fold, not a hunk.
+        // A root entry's `a` refuses since Amendment v1.11 and names `A`; `A` is the fold.
         let mut fold = base;
         fold.select(Some(Selection::Root(root("alpha"))));
-        assert_eq!(fold.accept_scope(), Some(AcceptScope::Root(root("alpha"))));
+        assert_eq!(
+            fold.accept_scope(),
+            Some(AcceptAnswer::Refuse("A accepts all in alpha".to_owned()))
+        );
+        assert_eq!(
+            fold.accept_file_scope(),
+            Some(AcceptScope::Root(root("alpha")))
+        );
     }
 
     /// The carve-out: a file row with no hunks to point at (binary, collapsed, deleted,
@@ -5191,11 +5261,11 @@ mod tests {
         app.select(Some(row("alpha", "f1")));
         let held = app.roots[&root("alpha")].row(b"f1").unwrap().clone();
         assert!(held.hunks.is_empty());
-        let expect = Some(AcceptScope::File {
+        let expect = Some(AcceptAnswer::Take(AcceptScope::File {
             root: root("alpha"),
             path: b"f1".to_vec(),
             deleted: held.change == Change::Deleted,
-        });
+        }));
         assert_eq!(app.accept_scope(), expect, "nav pane");
         app.handle(Action::Open);
         assert_eq!(app.effective_focus(), Focus::Diff);
@@ -5241,12 +5311,14 @@ mod tests {
         );
     }
 
+    /// Amendment v1.11: the whole-repository fold and the whole-group fold are `A`'s, not
+    /// `a`'s. What they fold, and where the cursor lands afterwards, is unchanged.
     #[test]
-    fn app_accept_on_root_entry_folds_the_held_pile_and_on_group_the_group() {
+    fn app_accept_file_on_root_entry_folds_the_held_pile_and_on_group_the_group() {
         let mut app = three_roots();
         app.select(Some(Selection::Root(root("alpha"))));
         assert_eq!(
-            requests(app.handle(Action::Accept).1),
+            requests(app.handle(Action::AcceptFile).1),
             vec![(root("alpha"), AcceptRequest::All(pile("alpha")))]
         );
         assert_eq!(
@@ -5271,7 +5343,7 @@ mod tests {
             .map(|p| Rendered::of(beta.row(p).unwrap()))
             .collect();
         assert_eq!(
-            requests(app.handle(Action::Accept).1),
+            requests(app.handle(Action::AcceptFile).1),
             vec![(root("beta"), AcceptRequest::Group(rendered))]
         );
         let paths: Vec<&str> = group
@@ -5288,6 +5360,114 @@ mod tests {
             app.selection,
             Some(row("beta", "u2")),
             "a vanished group advances to the root's first remaining row"
+        );
+    }
+
+    /// Amendment v1.11, the ruling of 2026-09-14: a lowercase `a` on a repository row no
+    /// longer folds the repository. It accepts nothing, and the status names the key that
+    /// does — which is the whole point, because a repository of ten files or fewer used to
+    /// vanish with no confirm at all.
+    #[test]
+    fn app_accept_on_a_repo_row_refuses_and_names_the_accept_file_key() {
+        let mut app = three_roots();
+        app.select(Some(Selection::Root(root("alpha"))));
+        let before = app.roots[&root("alpha")].clone();
+
+        assert_eq!(app.handle(Action::Accept), (Changed::Yes, None));
+        assert_eq!(status(&app), "A accepts all in alpha");
+        assert_eq!(app.accepting, None, "nothing was sent to the engine");
+        assert_eq!(
+            app.roots[&root("alpha")],
+            before,
+            "the held pile is untouched"
+        );
+
+        // `A` is the fold, and above `CONFIRM_ABOVE` files it asks first.
+        assert_eq!(
+            app.accept_file_scope(),
+            Some(AcceptScope::Root(root("alpha")))
+        );
+        let mut big = three_roots();
+        big.apply(pile_event_seq("alpha", 1, rows_n(11, 0, 0)));
+        big.select(Some(Selection::Root(root("alpha"))));
+        assert_eq!(big.handle(Action::AcceptFile), (Changed::Yes, None));
+        assert_eq!(
+            big.confirm,
+            Some(Confirm {
+                scope: ConfirmScope::Accept(AcceptScope::Root(root("alpha")))
+            }),
+            "eleven files ask"
+        );
+    }
+
+    /// A group is several files too, so `a` refuses there on the same terms and `A` folds
+    /// it. The refusal names the group rather than a repository.
+    #[test]
+    fn app_accept_on_a_group_refuses_and_accept_file_folds_it() {
+        let mut app = three_roots();
+        app.select(Some(Selection::Group(root("beta"), Annotation::Upstream)));
+        let before = app.roots[&root("beta")].clone();
+
+        assert_eq!(
+            app.accept_scope(),
+            Some(AcceptAnswer::Refuse("A accepts the group".to_owned()))
+        );
+        assert_eq!(app.handle(Action::Accept), (Changed::Yes, None));
+        assert_eq!(status(&app), "A accepts the group");
+        assert_eq!(app.accepting, None);
+        assert_eq!(app.roots[&root("beta")], before);
+
+        assert_eq!(
+            app.accept_file_scope(),
+            Some(AcceptScope::Group {
+                root: root("beta"),
+                kind: Annotation::Upstream,
+            })
+        );
+    }
+
+    /// An **empty** repository row has nothing to refuse over: both keys read `nothing to
+    /// accept`, the answer `a` gave there before the ruling (verifier (a) F2's row).
+    #[test]
+    fn app_accept_and_accept_file_on_an_empty_repo_row_read_nothing_to_accept() {
+        let mut app = three_roots();
+        app.apply(pile_event_seq("alpha", 1, Pile::default()));
+        app.select(Some(Selection::Root(root("alpha"))));
+        assert!(app.roots[&root("alpha")].rows().is_empty());
+
+        assert_eq!(
+            app.accept_scope(),
+            Some(AcceptAnswer::Take(AcceptScope::Root(root("alpha")))),
+            "no refusal on an empty row"
+        );
+        assert_eq!(app.handle(Action::Accept), (Changed::Yes, None));
+        assert_eq!(status(&app), NOTHING_TO_ACCEPT);
+        assert_eq!(app.handle(Action::AcceptFile), (Changed::Yes, None));
+        assert_eq!(status(&app), NOTHING_TO_ACCEPT);
+        assert_eq!(app.accepting, None);
+    }
+
+    /// The refusals are spelled from the **effective** keymap, the way the help overlay
+    /// spells a key, so a reader who rebound `accept_file` is sent to their own key.
+    #[test]
+    fn app_accept_refusals_spell_a_rebound_accept_file_key() {
+        let mut app = three_roots();
+        for (name, specs) in &mut app.keymap {
+            if name == "accept_file" {
+                *specs = vec!["ctrl-w".to_owned()];
+            }
+        }
+        app.select(Some(Selection::Root(root("alpha"))));
+        assert_eq!(
+            app.accept_scope(),
+            Some(AcceptAnswer::Refuse(
+                "Ctrl-W accepts all in alpha".to_owned()
+            ))
+        );
+        app.select(Some(Selection::Group(root("beta"), Annotation::Upstream)));
+        assert_eq!(
+            app.accept_scope(),
+            Some(AcceptAnswer::Refuse("Ctrl-W accepts the group".to_owned()))
         );
     }
 
@@ -5442,7 +5622,7 @@ mod tests {
         let mut app = three_roots();
         app.apply(pile_event("alpha", rows_n(12, 0, 0)));
         app.select(Some(Selection::Root(root("alpha"))));
-        app.handle(Action::Accept);
+        app.handle(Action::AcceptFile);
         let asked = app.confirm.clone();
         assert!(asked.is_some(), "the accept-all question is up");
 
@@ -5580,7 +5760,7 @@ mod tests {
         let mut app = three_roots();
         app.apply(pile_event("alpha", rows_n(12, 0, 0)));
         app.select(Some(Selection::Root(root("alpha"))));
-        assert_eq!(app.handle(Action::Accept), (Changed::Yes, None));
+        assert_eq!(app.handle(Action::AcceptFile), (Changed::Yes, None));
         assert!(app.confirm.is_some());
         app.accepting = Some(Accepting {
             scope: AcceptScope::File {
@@ -5643,7 +5823,7 @@ mod tests {
         app.apply(pile_event("notes", Pile::default()));
         app.apply(pile_event_seq("alpha", 1, rows_n(11, 1, 0)));
         app.select(Some(Selection::Root(root("alpha"))));
-        app.handle(Action::Accept);
+        app.handle(Action::AcceptFile);
         assert_eq!(app.confirm_counts().unwrap().files, 11);
         assert_eq!(
             app.apply(pile_event_seq("alpha", 2, rows_n(12, 1, 0))).0,
@@ -8685,7 +8865,10 @@ mod tests {
 
         // Accept and restore are untouched: the row is still one of each.
         assert!(
-            matches!(app.accept_scope(), Some(AcceptScope::File { .. })),
+            matches!(
+                app.accept_scope(),
+                Some(AcceptAnswer::Take(AcceptScope::File { .. }))
+            ),
             "{:?}",
             app.accept_scope()
         );

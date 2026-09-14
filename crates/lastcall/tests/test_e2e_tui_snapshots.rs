@@ -969,7 +969,7 @@ fn tui_nav_empty_repo_row() {
     assert!(frame.contains("nothing pending in beta"), "{frame}");
     assert!(frame.contains("lastcall  3 repos ·"), "{frame}");
     // Verifier (b) F4, the repo-row case: a repo row carries no hunks, so `n`/`p` move
-    // nothing and the hint line does not name them. `a accept all in beta` is absent for
+    // nothing and the hint line does not name them. `A accept all in beta` is absent for
     // the same reason and by the older rule (verifier (a) F2), and `^A` stays because the
     // other two repos do have rows.
     assert!(!frame.contains("n/p hunk"), "{frame}");
@@ -1062,7 +1062,8 @@ fn tui_accept_all_confirm() {
         Some(Annotation::Upstream)
     );
     app.select(Some(Selection::Root(beta.clone())));
-    let (changed, effect) = app.handle(Action::Accept);
+    // Amendment v1.11: `A` is the key that folds a repository from its row.
+    let (changed, effect) = app.handle(Action::AcceptFile);
     assert_eq!(changed, lastcall::tui::app::Changed::Yes);
     assert_eq!(effect, None, "asks first");
     assert!(app.confirm.is_some());
