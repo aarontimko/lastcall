@@ -151,7 +151,26 @@ Build the three features the sponsor ruled on, against the frozen contracts as a
 
 ### 4. Reserved: the sponsor's bug
 
-The sponsor has a bug to describe ("I do have another bug as well, but I'll need to explain that to you probably in the next message"). When it arrives it is added here as a dated orchestrator edit with its own tests; if it arrives after dispatch, the orchestrator decides whether it joins this phase as a resume message or becomes its own mini-phase. **An empty slot at gate time closes as `not received; own mini-phase`, recorded in the §10 close-out; it never blocks the PR** (F16).
+The sponsor has a bug to describe ("I do have another bug as well, but I'll need to explain that to you probably in the next message"). When it arrives it is added here as a dated orchestrator edit with its own tests; if it arrives after dispatch, the orchestrator decides whether it joins this phase as a resume message or becomes its own mini-phase. **An empty slot at gate time closes as `not received; own mini-phase`, recorded in the §10 close-out; it never blocks the PR** (F16). *2026-09-14: the sponsor says the bug may follow his nav-jump ruling; the slot stays open until the push.*
+
+### 6. Nav jumps: top, bottom, previous and next repository (sponsor, 2026-09-14, ruling "2 alt")
+
+*Added 2026-09-14 by the orchestrator after the sponsor's local run of the built phase, under his ruling "1 rec 2 alt" on the numbered Rec/Alt (§10 2026-09-14): item 1 (the `s snooze` / `s wake` hint) is `c79fb8f`; item 2's Alt is this deliverable, built on this branch before the push. The rulings are the sponsor's; the shape below is the orchestrator's under the 2026-09-05 delegation (two-way doors: keys and labels can move in a later phase without a schema).*
+
+Four new keymap actions, rebindable through `[keys]` like every other one, default keys as listed. They are **not** on the hint line (it is full at 100 columns; verifier F6 of this phase shows the cost of one more seat); they are on the help overlay and in the docs.
+
+| action | default keys | with the nav focused | with the diff focused |
+|---|---|---|---|
+| `nav_top` | `home` | select the first entry of `nav_entries()` | scroll the diff to its first line |
+| `nav_bottom` | `end` | select the last entry | scroll the diff to its last page (the same place a long `↓` run ends) |
+| `nav_prev_root` | `alt-up`, `{` | select the **repository row** of the listed root before the selection's root (`Selection::root()`); on the first root, select that root's own row | the same, and focus moves to the nav (a repository row has no diff) |
+| `nav_next_root` | `alt-down`, `}` | select the repository row of the listed root after the selection's root; on the last root, nothing (no wrap, `Changed::No`) | the same, and focus moves to the nav |
+
+Rules: every move goes through `nav_entries()`, so hidden roots (scope, `hide_empty`, snooze) are skipped the way `↑`/`↓` skip them; an empty nav is `Changed::No`; the selection change reconciles the diff and the expansion exactly as `move_selection` does (reuse it or the code it calls; do not add a second selection path). Help overlay rows, in the action order right after `nav_page_down`, descriptions within the 30-column cap: `nav_top` "first entry / top of the diff", `nav_bottom` "last entry / end of the diff", `nav_prev_root` "previous repository", `nav_next_root` "next repository". The overlay gains four rows: check the 100×30 two-column form still lists every key or clips honestly with the right count (`… N more keys`), and say which in the report; regenerate exactly the `tui_help_overlay*` snapshots plus any scene the new rows move, listed by name in the commit message.
+
+Terminal fact the docs must carry: on macOS the Cmd key never reaches a terminal program, which is why these are not Cmd bindings; Option-arrow reaches the program as `alt-up` / `alt-down` in iTerm2 and herdr panes by default, while Terminal.app sends Option-arrow as word-jump escapes unless its profile is set to "Use Option as Meta key", which is why the `{` / `}` twins exist. One sentence each in `docs/config.md` (the `[keys]` table rows and a note under it) and `docs/dev/tui.md` "Keys".
+
+Tests: unit tests in `app.rs` for each action at both focuses, the two boundaries (first and last root), a hidden root skipped, and an empty nav; a keymap test that `alt-up` and `alt-down` parse and the `{` / `}` twins resolve to the same actions; one PTY scene `tui_nav_jumps` over the three-root fixture: `end` lands on the last entry, `home` on the first, `}` on the second repository row, `alt-up` (the PTY sends `ESC [ 1 ; 3 A`) back on the first, each proven by the selected row in the frame. Docs: `docs/config.md` `[keys]` rows; `docs/dev/tui.md` Keys table and the help-overlay row's key count; `docs/review-loop.md` one sentence where `↑`/`↓` are introduced; `CHANGELOG.md` a fourth H3 under `## Unreleased`, `### Moving around`, two bullets in the existing voice. House style as deliverable 5.
 
 ### 5. Docs, CHANGELOG, the help overlay
 
