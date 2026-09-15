@@ -112,7 +112,14 @@ pub fn inspect_with_paths(
     rg: &RepoGit,
     git_paths: &[&str],
 ) -> Result<(HeadState, Vec<PathBuf>), GitError> {
-    let head = rg.rev_parse_verify("HEAD")?;
+    // The branch first, and the commit *through* the branch it names. `git checkout`
+    // updates the working tree and the index before it moves HEAD, so an inspection that
+    // a worktree event started can easily still be running when HEAD flips: reading the
+    // commit first and the branch second pairs the commit one branch had with the name of
+    // the other, and the notice then reads `switched main → main`. Resolving the name's
+    // own ref cannot mix two branches: the pair is either wholly before the checkout or
+    // wholly after it, and the event for the other one follows. An unborn branch has a
+    // name and no commit (verify fails), and a detached HEAD has no name, both as before.
     let branch = {
         let out = rg.run_raw(&["symbolic-ref", "-q", "--short", "HEAD"], None)?;
         if out.success() {
@@ -120,6 +127,10 @@ pub fn inspect_with_paths(
         } else {
             None
         }
+    };
+    let head = match &branch {
+        Some(name) => rg.rev_parse_verify(&format!("refs/heads/{name}"))?,
+        None => rg.rev_parse_verify("HEAD")?,
     };
     let detached = head.is_some() && branch.is_none();
 
@@ -631,6 +642,48 @@ mod tests {
             last_reflog(&d.git_dir).unwrap().message.split(':').next(),
             Some("checkout")
         );
+    }
+
+    /// The commit is read through the branch's own ref, so the pair an inspection reports
+    /// is always one real state and never one branch's name beside another's commit. The
+    /// two states that have no such ref keep their answers: an unborn branch has a name
+    /// and no commit, a detached HEAD a commit and no name.
+    #[test]
+    fn headstate_inspect_pairs_the_branch_with_its_own_ref() {
+        use crate::store::tests::fixture_env;
+        use lastcall_testkit::fixture_repo::FixtureRepo;
+        use lastcall_testkit::tmp::TempDir;
+        let mut repo = FixtureRepo::new("pair").unwrap();
+        let state_dir = TempDir::new("lc-pair");
+        let env = fixture_env(&repo, &state_dir);
+        let rg = RepoGit::new(&env, repo.path());
+
+        let on_main = inspect(&rg).unwrap();
+        assert_eq!(on_main.branch.as_deref(), Some("main"));
+        assert_eq!(
+            on_main.head,
+            rg.rev_parse_verify("refs/heads/main").unwrap(),
+            "the commit is the branch's own tip"
+        );
+
+        // A second branch at a different commit: the name and the commit move together.
+        repo.checkout_b("other").unwrap();
+        repo.commit_files(&[("only-here.txt", "one\n")], "on other")
+            .unwrap();
+        let on_other = inspect(&rg).unwrap();
+        assert_eq!(on_other.branch.as_deref(), Some("other"));
+        assert_eq!(
+            on_other.head,
+            rg.rev_parse_verify("refs/heads/other").unwrap()
+        );
+        assert_ne!(on_other.head, on_main.head);
+
+        // An unborn branch: a name, no commit, not detached.
+        repo.git(&["checkout", "-q", "--orphan", "fresh"]).unwrap();
+        repo.git(&["rm", "-rqf", "--cached", "."]).unwrap();
+        let unborn = inspect(&rg).unwrap();
+        assert_eq!(unborn.branch.as_deref(), Some("fresh"));
+        assert!(unborn.head.is_none() && !unborn.detached);
     }
 
     /// The batched `rev-parse` must answer exactly what the six separate calls answered,
