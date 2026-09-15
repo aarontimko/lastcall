@@ -86,8 +86,8 @@ arrived from a fetch, so it is somebody else's work and not the agent's. **`[mix
 means some of it did and some of it did not. They are a hint about who to ask, not a
 restriction: the keys all work the same.
 
-`↑` and `↓` move one entry at a time. `Home` and `End` jump to the first and the last entry
-of the whole list, and `{` and `}` jump to the previous and the next repository's own row,
+`↑` and `↓` move one entry at a time. `Home` and `End` (Fn-Left and Fn-Right on a Mac laptop
+keyboard) jump to the first and the last entry of the whole list, and `{` and `}` jump to the previous and the next repository's own row,
 which is quicker than walking through a long pile a line at a time. Option with an arrow key
 does what the braces do, in terminals that send it (see [`config.md`](config.md)).
 

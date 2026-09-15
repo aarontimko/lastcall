@@ -135,8 +135,10 @@ and shift with tab is `backtab`.
 | `help` | `?` | the help overlay, which lists all of this live |
 | `quit` | `q`, `ctrl-c` | quit |
 
-On macOS the Cmd key never reaches a program running in a terminal, which is why the two
-repository jumps are bound to Option and an arrow: iTerm2 and herdr panes send that as
+On macOS the Cmd key never reaches a program running in a terminal, so no action here can be
+bound to it; `Home` and `End` on a Mac laptop keyboard are Fn-Left and Fn-Right, which iTerm2
+and Terminal.app send as `home` and `end`. That is also why the two repository jumps are
+bound to Option and an arrow: iTerm2 and herdr panes send that as
 `alt-up` and `alt-down`. Terminal.app sends Option-arrow as a word jump instead, and its
 "Use Option as Meta key" setting is not the answer: a terminal that sends Option as an
 escape prefix can deliver Option-Up as three separate keys, and the third of them is `A`.
