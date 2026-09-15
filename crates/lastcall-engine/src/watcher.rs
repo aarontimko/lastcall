@@ -159,9 +159,33 @@ impl Watcher {
         self.rescan.notify_one();
     }
 
+    /// The same trigger as a value, so a caller that no longer has the watcher in hand can
+    /// still ask for the rescan (deliverable 8).
+    ///
+    /// The TUI never takes the engine lock on the task that draws: it hands the work to a
+    /// blocking thread and comes back. That thread cannot borrow the watcher, so the depth
+    /// the tour applies is set under the lock over there and the rescan asked for here,
+    /// after the guard is gone. Cloning it is free and the clones coalesce exactly as
+    /// [`Watcher::request_rescan`] does.
+    pub fn rescan_trigger(&self) -> RescanTrigger {
+        RescanTrigger(Arc::clone(&self.rescan))
+    }
+
     pub async fn join(self) {
         let _ = self.stop.send(true);
         let _ = self.handle.await;
+    }
+}
+
+/// A clonable handle on the watcher's rescan trigger. Holding one keeps nothing alive that
+/// matters: a notify with no loop listening is a no-op.
+#[derive(Debug, Clone)]
+pub struct RescanTrigger(Arc<Notify>);
+
+impl RescanTrigger {
+    /// [`Watcher::request_rescan`], from wherever the handle got to.
+    pub fn request_rescan(&self) {
+        self.0.notify_one();
     }
 }
 
@@ -1088,5 +1112,20 @@ mod tests {
             Scheduled::Ignore
         ));
         assert!(matches!(is("/w/wt/src/a.rs"), Scheduled::Scan(r) if r == Path::new("/w/wt")));
+    }
+
+    /// The handle a caller carries off the watcher fires the watcher's own trigger, and a
+    /// request made before the loop comes back around is not lost: `notify_one` leaves a
+    /// permit behind. That is what lets deliverable 8 set the depth under the lock first
+    /// and ask for the rescan afterwards without a race either way.
+    #[tokio::test]
+    async fn watcher_rescan_trigger_is_the_loops_own_and_keeps_a_request_made_early() {
+        let rescan = Arc::new(Notify::new());
+        let trigger = RescanTrigger(Arc::clone(&rescan));
+        let far = trigger.clone();
+        far.request_rescan();
+        tokio::time::timeout(Duration::from_secs(5), rescan.notified())
+            .await
+            .expect("the request made before the wait is still there");
     }
 }

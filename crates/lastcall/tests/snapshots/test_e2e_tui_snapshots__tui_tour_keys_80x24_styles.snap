@@ -1,0 +1,49 @@
+---
+source: crates/lastcall/tests/test_e2e_tui_snapshots.rs
+expression: style
+---
+0 0..37 Reset Reset BOLD
+0 39..49 Reset Reset DIM
+1 0..28 Cyan Reset -
+2 0..79 Cyan Reset -
+3 0..2 Cyan Reset -
+3 3..22 Reset Reset BOLD
+3 78..79 Cyan Reset -
+4 0..2 Cyan Reset -
+4 78..79 Cyan Reset -
+5 0..2 Cyan Reset -
+5 78..79 Cyan Reset -
+6 0..2 Cyan Reset -
+6 78..79 Cyan Reset -
+7 0..2 Cyan Reset -
+7 78..79 Cyan Reset -
+8 0..2 Cyan Reset -
+8 78..79 Cyan Reset -
+9 0..2 Cyan Reset -
+9 78..79 Cyan Reset -
+10 0..2 Cyan Reset -
+10 78..79 Cyan Reset -
+11 0..2 Cyan Reset -
+11 78..79 Cyan Reset -
+12 0..2 Cyan Reset -
+12 78..79 Cyan Reset -
+13 0..2 Cyan Reset -
+13 78..79 Cyan Reset -
+14 0..2 Cyan Reset -
+14 78..79 Cyan Reset -
+15 0..2 Cyan Reset -
+15 78..79 Cyan Reset -
+16 0..2 Cyan Reset -
+16 78..79 Cyan Reset -
+17 0..2 Cyan Reset -
+17 78..79 Cyan Reset -
+18 0..2 Cyan Reset -
+18 78..79 Cyan Reset -
+19 0..2 Cyan Reset -
+19 78..79 Cyan Reset -
+20 0..2 Cyan Reset -
+20 3..40 Reset Reset DIM
+20 78..79 Cyan Reset -
+21 0..79 Cyan Reset -
+22 0..28 Cyan Reset -
+23 0..73 Reset Reset DIM

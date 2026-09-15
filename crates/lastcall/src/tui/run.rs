@@ -52,7 +52,7 @@ use lastcall_engine::ledger::FlagSummary;
 use lastcall_engine::ops::{Refused, Rendered};
 use lastcall_engine::scan::{Pile, Row};
 use lastcall_engine::store::Current;
-use lastcall_engine::watcher::{EngineEvent, EngineTimings, Watcher, blocking};
+use lastcall_engine::watcher::{EngineEvent, EngineTimings, RescanTrigger, Watcher, blocking};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
@@ -60,17 +60,18 @@ use tokio::sync::mpsc;
 
 use super::app::{
     AcceptFailed, AcceptResult, App, Changed, EditOpen, Effect, FlagKind, FlagResult,
-    RestoreResult, RootMeta, SaveResult,
+    RestoreResult, RootMeta, SaveResult, SnoozeResult, UndoResult,
 };
 use super::clipboard::Osc52;
 use super::editor::EditorCommand;
 use super::herdr::{self, HerdrLink, HerdrPlan, HerdrUpdate, Link, ToastMsg};
 use super::input::{
     Action, EditorKey, Key, Keymap, editor_action, modal_action, note_action, pick_action, pointer,
-    to_action,
+    snooze_action, to_action,
 };
 use super::render::{HitMap, Pane, render};
 use super::term;
+use super::tour::{self, tour_action};
 
 /// How long the quit path waits for the watcher, and then for the runtime.
 pub const SHUTDOWN_BUDGET: Duration = Duration::from_millis(500);
@@ -99,6 +100,13 @@ pub enum Local {
     /// An `Effect::Restore` finished. Shaped like `Accepted` though a restore covers one
     /// root, so the two reducers read the same way.
     Restored(Vec<(PathBuf, RestoreResult)>),
+    /// An `Effect::Undo` finished (Amendment v1.11): the root it covered and the result.
+    /// One root, never a list — `z` reverses the last accept in the repository the cursor
+    /// is in.
+    Undone(PathBuf, UndoResult),
+    /// An `Effect::Snooze` finished: the root it covered and the result (a wake comes back
+    /// with `until: None`).
+    Snoozed(PathBuf, SnoozeResult),
     /// An `Effect::Flag` or `Effect::Unflag` finished: the root it covered, **which of the
     /// two it was** (with the flag's words), and the ledger write's answer. One root, never
     /// a list — a flag is always one path.
@@ -203,6 +211,35 @@ impl Ui {
         // keys survive, and only in their non-printable form (`note_action`'s `quit_only`,
         // so `q` types a q). `Event::Paste` is why bracketed paste is on while the modal
         // lives: a pasted traceback arrives as one insert rather than a key storm.
+        // The first-launch welcome is above every modal (F7): it opens at the first frame
+        // past the launch hold, when none of them can be open yet, and until it is
+        // dismissed its own keys are the only keys. The mouse reaches exactly its own rows
+        // — `Target::TourRow` — and a press anywhere else on the overlay is dropped here,
+        // before the wheel or a divider drag could act on the screen underneath it.
+        if self.app.tour.is_some() {
+            match event {
+                Event::Key(_) => {
+                    return match tour_action(event, &self.keymap) {
+                        Some(action) => self.app.handle(action),
+                        None => (Changed::No, None),
+                    };
+                }
+                Event::Mouse(_) => {
+                    return match to_action(event, &self.keymap) {
+                        Some(Action::Press(x, y)) => {
+                            match self.hits.as_ref().and_then(|h| h.at(x, y)).cloned() {
+                                Some(target) => self.app.hit(target),
+                                None => (Changed::No, None),
+                            }
+                        }
+                        _ => (Changed::No, None),
+                    };
+                }
+                // A resize still reaches the app below, and invalidates the hit map.
+                Event::Resize(..) => {}
+                _ => return (Changed::No, None),
+            }
+        }
         if self.app.note.is_some() {
             match event {
                 Event::Key(_) | Event::Paste(_) => {
@@ -223,6 +260,21 @@ impl Ui {
             match event {
                 Event::Key(_) => {
                     return match pick_action(event, &self.keymap) {
+                        Some(action) => self.app.handle(action),
+                        None => (Changed::No, None),
+                    };
+                }
+                Event::Resize(..) => {}
+                _ => return (Changed::No, None),
+            }
+        }
+        // The snooze modal is a number field, on the note modal's terms: `snooze_action`
+        // is consulted before the keymap and swallows it whole, so `s` typed into it is
+        // nothing rather than a second snooze, and only a non-printable `quit` survives.
+        if self.app.snooze.is_some() {
+            match event {
+                Event::Key(_) => {
+                    return match snooze_action(event, &self.keymap) {
                         Some(action) => self.app.handle(action),
                         None => (Changed::No, None),
                     };
@@ -361,6 +413,8 @@ impl Ui {
             Local::Pile(root, seq, pile) => self.app.apply(EngineEvent::Pile { root, seq, pile }),
             Local::Accepted(results) => (self.app.accepted(results), None),
             Local::Restored(results) => (self.app.restored(results), None),
+            Local::Undone(root, result) => (self.app.undone(root, result), None),
+            Local::Snoozed(root, result) => (self.app.snoozed_result(root, result), None),
             Local::Flagged { root, kind, result } => self.app.flagged(root, kind, result),
             Local::Staged { flag, result } => (self.app.staged(flag, result), None),
             Local::Exported { label, result } => (self.app.exported(label, result), None),
@@ -731,6 +785,67 @@ fn spawn_restore(
         if let Some(results) = joined(restore, &tx, "restore").await {
             let _ = tx.send(Local::Restored(results));
         }
+    });
+}
+
+/// `Effect::Undo`: one root's `Engine::undo` (the op and its rescan) in one `blocking`
+/// closure, the same shape as `spawn_accept` (Amendment v1.11).
+fn spawn_undo(engine: &Arc<Mutex<Engine>>, tx: mpsc::UnboundedSender<Local>, root: PathBuf) {
+    let engine = engine.clone();
+    tokio::spawn(async move {
+        let undo = {
+            let root = root.clone();
+            tokio::spawn(async move {
+                blocking(&engine, move |e| {
+                    e.undo(&root).map_err(|e| AcceptFailed::of(&e))
+                })
+                .await
+            })
+        };
+        if let Some(result) = joined(undo, &tx, "undo").await {
+            let _ = tx.send(Local::Undone(root, result));
+        }
+    });
+}
+
+/// `Effect::Snooze`: one root's `Engine::snooze` (or wake) and its rescan, off the UI task.
+/// The deadline is the engine's to compute, from its own injected clock.
+fn spawn_snooze(
+    engine: &Arc<Mutex<Engine>>,
+    tx: mpsc::UnboundedSender<Local>,
+    root: PathBuf,
+    days: Option<u32>,
+) {
+    let engine = engine.clone();
+    tokio::spawn(async move {
+        let snooze = {
+            let root = root.clone();
+            tokio::spawn(async move {
+                blocking(&engine, move |e| {
+                    e.snooze(&root, days).map_err(|e| AcceptFailed::of(&e))
+                })
+                .await
+            })
+        };
+        if let Some(result) = joined(snooze, &tx, "snooze").await {
+            let _ = tx.send(Local::Snoozed(root, result));
+        }
+    });
+}
+
+/// The depth half of `Effect::TourWrite(SearchDepth2)`: the setting the tour applies to
+/// this session, and the rescan that makes it visible (deliverable 8).
+///
+/// Two rules shape this. The UI task never takes the engine lock inline, so the set happens
+/// on a blocking thread like every other engine call; and the set has to **land before** the
+/// notify, or a rescan already coalescing runs at the old depth and the later set never gets
+/// one at all. `blocking` returns once the guard is dropped, so awaiting it and then asking
+/// the trigger is exactly that order.
+fn spawn_set_search_depth(engine: &Arc<Mutex<Engine>>, rescan: RescanTrigger, depth: u8) {
+    let engine = engine.clone();
+    tokio::spawn(async move {
+        blocking(&engine, move |e| e.set_search_depth(depth)).await;
+        rescan.request_rescan();
     });
 }
 
@@ -1440,20 +1555,36 @@ pub type DailyCheck = Box<dyn FnOnce(UpdateSink) + Send + 'static>;
 /// Take the terminal and run the TUI until `q`/Ctrl-C/SIGTERM (exit 0) or the watcher
 /// ends (status notice, exit 0). The caller has already checked that stdout is a terminal
 /// and that the keymap parsed; this enters raw mode and always restores it.
+/// What was decided before the terminal was taken, in one piece: three answers the loop
+/// starts from, each read from a file the loop itself never opens.
+pub struct Launch {
+    /// `hide_empty_repos` from the config file (§6.1, Amendment v1.9): the app's opening
+    /// answer to `t`. The key flips it for the session; nothing writes it back.
+    pub hide_empty: bool,
+    /// The once-a-day update check, or `None` when `[update] check = false`. Started on a
+    /// detached thread the moment the launch hold ends, never before the first frame and
+    /// never on the launch path (kickoff deliverable 2.6).
+    pub daily_check: Option<DailyCheck>,
+    /// The first-launch welcome (Amendment v1.11): whether it is owed, where the marker
+    /// goes, and the environment its one config write resolves through. Every file the
+    /// tour touches is touched from this loop; the reducer holds only which card is on
+    /// screen.
+    pub tour: tour::Plan,
+}
+
 pub fn run(
     engine: Engine,
     timings: EngineTimings,
     keymap: Keymap,
     env: Env,
     plan: HerdrPlan,
-    // `hide_empty_repos` from the config file (§6.1, Amendment v1.9): the app's opening
-    // answer to `t`. The key flips it for the session; nothing writes it back.
-    hide_empty: bool,
-    // The once-a-day update check, or `None` when `[update] check = false`. Started on a
-    // detached thread the moment the launch hold ends, never before the first frame and
-    // never on the launch path (kickoff deliverable 2.6).
-    daily_check: Option<DailyCheck>,
+    launch: Launch,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let Launch {
+        hide_empty,
+        daily_check,
+        tour,
+    } = launch;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -1478,6 +1609,7 @@ pub fn run(
     // writes its stamp.
     let update_quit = Arc::new(AtomicBool::new(false));
     let mut daily_check = daily_check;
+    let mut tour = tour;
 
     // Copied out before the engine is moved into its watcher: both are immutable for the
     // life of the process, and the export path is resolved without taking the engine lock.
@@ -1620,7 +1752,13 @@ pub fn run(
                         rescan = true;
                         ("timer", (Changed::No, None))
                     }
-                    _ = tick.tick() => ("tick", ui.app.handle(Action::Tick)),
+                    _ = tick.tick() => ("tick", {
+                        // Design review F4: the TUI has no wall clock of its own, so the
+                        // loop reads the engine's injected one and hands the value to the
+                        // reducer, which is what decides a snooze has run out.
+                        ui.app.wall = Some(clock.now());
+                        ui.app.handle(Action::Tick)
+                    }),
                     },
                 };
                 // Everything else already queued joins this pass, so a burst of piles or a
@@ -1666,6 +1804,10 @@ pub fn run(
                         }
                         Effect::Restore(reqs) => {
                             spawn_restore(&watcher.engine, local_tx.clone(), reqs)
+                        }
+                        Effect::Undo(root) => spawn_undo(&watcher.engine, local_tx.clone(), root),
+                        Effect::Snooze { root, days } => {
+                            spawn_snooze(&watcher.engine, local_tx.clone(), root, days)
                         }
                         Effect::EditInline(open) => {
                             spawn_read_rendered(&watcher.engine, local_tx.clone(), open)
@@ -1825,6 +1967,28 @@ pub fn run(
                                 .unwrap_or_else(|| pane.clone());
                             spawn_focus(link.transport.clone(), local_tx.clone(), pane, label);
                         }
+                        // The one config write in lastcall that is not the user's own
+                        // editor (Amendment v1.11). The reducer has already applied the
+                        // setting to this session, so `Err` costs a footer and the file
+                        // keeps whatever it had.
+                        Effect::TourWrite(setting) => {
+                            let result = tour.write(setting, clock.now());
+                            // The depth is applied to the session whether or not the file
+                            // took the line, the rule every card follows: the reader
+                            // answered the question, and a read-only config directory costs
+                            // a footer and not the answer.
+                            if setting == lastcall_engine::config::write::Setting::SearchDepth2 {
+                                spawn_set_search_depth(
+                                    &watcher.engine,
+                                    watcher.rescan_trigger(),
+                                    2,
+                                );
+                            }
+                            let (changed, next) = ui.app.tour_written(result);
+                            redraw = redraw.or(changed);
+                            effects.extend(next);
+                        }
+                        Effect::TourDone => tour.dismissed(clock.now()),
                         Effect::Toast(request) => {
                             if let Some(tx) = &link.toast {
                                 for (root, name) in request.ready {
@@ -1870,6 +2034,16 @@ pub fn run(
                     };
                     std::thread::spawn(move || check(sink));
                 }
+                // Amendment v1.11: the welcome opens at the first frame where a root
+                // could be listed — the launch hold and the scope verdict are both past,
+                // the instant `is_listed` first admits one — and every root's pile has
+                // landed (`App::pictured`: the hold ends on the last `Scanned` tick, a
+                // frame before the piles). Not before: the two conditional cards are about
+                // the link and the empty-repo count, and neither is known until then. A frame too small to read it opens nothing and writes
+                // nothing, so it is still owed on the next launch that has room.
+                if tour.due(&ui.app) {
+                    redraw = redraw.or(tour.open(&mut ui.app));
+                }
                 if redraw == Changed::Yes {
                     // Deliverable 8: one line per repaint, saying why and how long. A
                     // `draw` per pile in a burst is the symptom deliverable 6 removed, and
@@ -1886,6 +2060,12 @@ pub fn run(
                         "draw"
                     );
                 }
+            }
+            // Quitting with the welcome still open is a dismissal like any other: the
+            // marker is written here, before the terminal is restored, so a `ctrl-c` on the
+            // first card does not mean the next launch opens it again (F7).
+            if ui.app.tour.is_some() {
+                tour.dismissed(clock.now());
             }
             // A connect still in flight has nothing left to deliver.
             if let Some(task) = connecting.take() {
@@ -1925,6 +2105,53 @@ mod tests {
 
     fn key(code: KeyCode) -> Event {
         Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    /// Deliverable 8: the depth the tour applies is set under the engine lock on a blocking
+    /// thread, and the rescan is asked for **after** the guard is gone. The proof is the
+    /// rescan's own result: if the notify went first, the coalesced rescan would run at
+    /// depth 1 and the folder one level down would stay invisible until the thirty-second
+    /// backstop, well past this timeout.
+    #[tokio::test]
+    async fn run_set_search_depth_lands_before_the_rescan_it_asks_for() {
+        use lastcall_engine::config::Config;
+        use lastcall_engine::watcher::{EngineTimings, lock};
+        use lastcall_testkit::engine::open_engine;
+        use lastcall_testkit::fixture_repo::FixtureRepo;
+        use lastcall_testkit::tmp::TempDir;
+
+        let repo = FixtureRepo::new("run-depth").unwrap();
+        let state = TempDir::new("lc-run-depth-state");
+        let deep = repo.parent_dir().join("worktrees").join("b");
+        std::fs::create_dir_all(&deep).unwrap();
+        repo.git_at(&deep, &["init", "-q", "-b", "main"]).unwrap();
+        let deep = std::fs::canonicalize(&deep).unwrap();
+
+        let env = repo.engine_env(state.path());
+        let engine = open_engine(repo.parent_dir(), &env, state.path(), Config::default());
+        let mut watcher = engine.run(EngineTimings::default());
+        assert_eq!(lock(&watcher.engine).search_depth(), 1);
+        assert!(
+            lock(&watcher.engine).root(&deep).is_none(),
+            "invisible at the default depth"
+        );
+
+        spawn_set_search_depth(&watcher.engine, watcher.rescan_trigger(), 2);
+        let found = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while let Some(event) = watcher.events.recv().await {
+                if let EngineEvent::RootsChanged { .. } = event
+                    && lock(&watcher.engine).root(&deep).is_some()
+                {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .expect("the rescan the trigger asked for arrives");
+        assert!(found, "the watcher ended before the rescan landed");
+        assert_eq!(lock(&watcher.engine).search_depth(), 2);
+        watcher.join().await;
     }
 
     fn mouse(kind: MouseEventKind, column: u16, row: u16) -> Event {
@@ -2659,7 +2886,14 @@ mod tests {
         render_into(&mut ui);
         let nav = ui.hits.as_ref().unwrap().nav.unwrap();
         let main = ui.hits.as_ref().unwrap().main.unwrap();
-        assert_eq!(ui.event(&key(KeyCode::Char('a'))), (Changed::Yes, None));
+        // Amendment v1.11: `A`, not `a`, is what folds a repository from its row.
+        assert_eq!(
+            ui.event(&Event::Key(KeyEvent::new(
+                KeyCode::Char('A'),
+                KeyModifiers::SHIFT
+            ))),
+            (Changed::Yes, None)
+        );
         assert!(ui.app.confirm.is_some(), "11 files ask first");
         let open = ui.app.clone();
         let (nx, ny) = (nav.x + 1, nav.y + 1);
@@ -2823,5 +3057,156 @@ mod tests {
         assert_eq!(hung, None);
         assert!(started.elapsed() < Duration::from_secs(5));
         rt.shutdown_timeout(Duration::from_millis(20));
+    }
+
+    // ---- the first-launch welcome (Amendment v1.11, deliverable 1) --------------------
+
+    /// A `Ui` with the welcome open on the card that asks about empty repositories.
+    fn ui_with_tour() -> Ui {
+        let mut ui = ui();
+        ui.app.tour = Some(tour::Tour::new(vec![tour::Card::Empty {
+            empty: 12,
+            total: 14,
+        }]));
+        ui
+    }
+
+    /// F7: the welcome resolves before every modal and before the keymap. Its own keys are
+    /// the only keys, `q` skips rather than quits, and ctrl-c is still the way out.
+    #[test]
+    fn run_tour_resolves_before_every_modal_and_before_the_keymap() {
+        let mut ui = ui_with_tour();
+        // Bound to help, accept and refresh outside the welcome: all swallowed.
+        for code in [
+            KeyCode::Char('?'),
+            KeyCode::Char('a'),
+            KeyCode::Char('r'),
+            KeyCode::Char('y'),
+            KeyCode::Tab,
+        ] {
+            assert_eq!(ui.event(&key(code)), (Changed::No, None), "{code:?}");
+        }
+        assert!(!ui.app.help, "no help overlay opened under it");
+        assert!(ui.app.tour.is_some());
+        // Its own keys land.
+        assert_eq!(ui.event(&key(KeyCode::Down)), (Changed::Yes, None));
+        assert_eq!(ui.app.tour.as_ref().expect("open").row, 1);
+        // `q` is the footer's promise, not the keymap's quit.
+        let mut skipping = ui_with_tour();
+        assert_eq!(
+            skipping.event(&key(KeyCode::Char('q'))),
+            (Changed::Yes, Some(Effect::TourDone))
+        );
+        assert!(skipping.app.tour.is_none());
+        // ctrl-c still leaves, and the loop writes the marker on the way out.
+        let mut quitting = ui_with_tour();
+        assert_eq!(
+            quitting.event(&Event::Key(KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL
+            ))),
+            (Changed::No, Some(Effect::Quit))
+        );
+    }
+
+    /// The mouse reaches exactly the card's own rows. A press anywhere else on the screen
+    /// under the overlay, and the wheel over either pane, do nothing at all.
+    #[test]
+    fn run_tour_mouse_reaches_only_the_cards_own_rows() {
+        let mut ui = ui_with_tour();
+        render_into(&mut ui);
+        let (x, y) = target_center(&ui, &Target::TourRow(1));
+        assert_eq!(
+            ui.event(&mouse(MouseEventKind::Down(MouseButton::Left), x, y)),
+            (
+                Changed::Yes,
+                Some(Effect::TourWrite(
+                    lastcall_engine::config::write::Setting::HideEmptyRepos
+                ))
+            ),
+            "a click on the second row takes it"
+        );
+        assert!(ui.app.hide_empty);
+
+        let mut ui = ui_with_tour();
+        render_into(&mut ui);
+        let before = ui.app.selection.clone();
+        // Row 1 of the nav pane, well outside the centred box.
+        assert_eq!(
+            ui.event(&mouse(MouseEventKind::Down(MouseButton::Left), 3, 2)),
+            (Changed::No, None),
+            "a press on the screen under the welcome is dropped"
+        );
+        assert_eq!(
+            ui.event(&mouse(MouseEventKind::ScrollDown, 3, 5)),
+            (Changed::No, None)
+        );
+        assert_eq!(
+            ui.event(&mouse(MouseEventKind::ScrollUp, 60, 5)),
+            (Changed::No, None)
+        );
+        assert_eq!(ui.app.selection, before);
+        assert!(ui.app.tour.is_some());
+    }
+
+    /// A resize still reaches the app underneath: the welcome is an overlay, not a freeze,
+    /// and the card re-wraps to the new frame.
+    #[test]
+    fn run_tour_lets_a_resize_through_to_the_app() {
+        let mut ui = ui_with_tour();
+        assert_eq!(ui.event(&Event::Resize(80, 24)).0, Changed::Yes);
+        assert_eq!(ui.app.size, (80, 24));
+        assert!(ui.app.tour.is_some());
+    }
+
+    /// The welcome is painted last, over the help overlay and the confirm modal both, and
+    /// its rows are the ones the hit map answers with (`HitMap::at` searches in reverse, so
+    /// the last thing pushed wins).
+    #[test]
+    fn run_tour_paints_over_every_other_overlay_and_owns_the_hit_map() {
+        let mut ui = ui_with_tour();
+        ui.app.help = true;
+        render_into(&mut ui);
+        let frame = frame_of(&ui);
+        assert!(
+            frame.contains(" welcome "),
+            "the welcome is on top: {frame}"
+        );
+        let (x, y) = target_center(&ui, &Target::TourRow(0));
+        assert_eq!(
+            ui.hits.as_ref().expect("rendered").at(x, y),
+            Some(&Target::TourRow(0)),
+            "the overlay's own row answers, not whatever is under it"
+        );
+    }
+
+    /// `?` is a live key during the launch hold, so the help overlay can be up when the
+    /// welcome opens over it. It closes as the card opens, and the card's first keystroke
+    /// is the card's: it is not spent closing help underneath.
+    #[test]
+    fn run_tour_opening_closes_the_help_overlay_and_keeps_its_first_key() {
+        let dir = lastcall_testkit::tmp::TempDir::new("lc-run-tour-help");
+        let mut ui = ui();
+        ui.app.help = true;
+        let mut plan = tour::Plan::new(true, Env::empty(dir.path()), dir.path().to_owned());
+        assert_eq!(plan.open(&mut ui.app), Changed::Yes);
+        assert!(ui.app.tour.is_some(), "the welcome is up");
+        assert!(!ui.app.help, "and the help overlay went with it");
+
+        // The first key reaches the card. Before the fix the help gate ate it: the overlay
+        // closed and the welcome was still waiting for a second `q`.
+        assert_eq!(
+            ui.event(&key(KeyCode::Char('q'))),
+            (Changed::Yes, Some(Effect::TourDone))
+        );
+        assert!(ui.app.tour.is_none(), "skipped on the first key");
+        assert!(!ui.app.help);
+
+        // And with help forced back on under an open card, the gate still lets the card's
+        // keys through rather than spending them.
+        let mut ui = ui_with_tour();
+        ui.app.help = true;
+        assert_eq!(ui.event(&key(KeyCode::Down)), (Changed::Yes, None));
+        assert_eq!(ui.app.tour.as_ref().expect("open").row, 1);
     }
 }

@@ -8,7 +8,7 @@
 ![lastcall in a terminal: three repositories in a list, a diff beside them, a hunk flagged with a note, a file accepted, then the help overlay](docs/demo/lastcall.gif)
 
 The last call before code ships: an agent-agnostic review ledger for the terminal. It
-watches every repository under your working directory, shows exactly what changed since you
+watches the repositories under your working directory, shows exactly what changed since you
 last looked, and lets you accept, flag, restore or fix it hunk by hunk, whichever agent or
 human made the edit.
 
@@ -55,6 +55,11 @@ opinion about your branches.
 - **Four answers per hunk.** `a` accepts it, `u` puts it back, `m` flags it with a note,
   `i` opens the file for editing right there. Accepting is what shrinks the list, and it
   survives a restart.
+- **Undo.** `z` takes back the last accept, and the one before it, up to the last twenty.
+  Nothing on disk moves either way: the files simply go back to pending, flags and all.
+- **Set a repository aside.** `s` drops one out of the list for a number of days, `shift-s`
+  brings them back into view. It keeps being watched the whole time, and an agent asking for
+  attention brings it back on its own.
 - **A pile that shrinks and stays shrunk.** What you accept is recorded outside your
   repositories, so a relaunch starts where you stopped, whatever the agent committed in
   between. The ledger lives in `~/.local/state/lastcall` (or under `$XDG_STATE_HOME`), and

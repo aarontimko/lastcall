@@ -35,7 +35,8 @@ Ids are the first 16 hex chars of SHA-256 over the canonicalized path.
 <state>/exports/<root basename>/<YYYY-MM-DD>.md      # flags with nowhere to send them (§6.7, ruling P9)
 <state>/roots/<parent-id>/meta.json                  # the parent dir this group was discovered under
 <state>/roots/<parent-id>/repos/<root-id>/
-    ledger.json      # schema 1.0 (§6.2): seen_tree, seen_at, overrides
+    ledger.json      # schema 1.1 (§6.2): seen_tree, seen_at, overrides, plus snoozed_until
+                     # and the undo stack (Amendment v1.11; both additive, both optional)
     store/           # bare git repo; objects/info/alternates → the user's objects dir (git roots)
     index            # private index seeded from the seen tree (a cache, never truth)
     index.tree       # the tree `index` was seeded from; mismatch with the ledger → reseed
@@ -222,6 +223,60 @@ ledger busy in <root> — try again
 ```
 
 Pressing the same key a moment later is the entire fix.
+
+## How roots are discovered (Phase 10)
+
+`roots::discover(DiscoverInputs)` is the whole of it, and `search_depth` (1 to 4, default 1)
+is the only dial. Level 1 has not moved since 0.1.0: a parent directory that is itself inside
+a repository **is** that repository and nothing under it is walked; otherwise every direct
+child holding a `.git` entry, file or directory, becomes a root through `toplevel`, a child
+whose `.git` git will not open keeps its notice, and a symlink to a repository is a root
+keyed by its canonical path.
+
+At `search_depth >= 2` two mechanisms are switched on, and they answer two different
+questions.
+
+**Mechanism 1, the plain folders.** A level-1 child that is not a root and whose name is not
+in `WALK_SKIP` (`.git`, `node_modules`, `target`, `.venv`, `vendor`) is read; every directory
+in it with a `.git` entry becomes a root through `toplevel`, and every directory without one
+and not in `WALK_SKIP` is read at the next level, down to level N. The walk never enters a
+root, so a submodule, a vendored repository or a test fixture inside a repository is never
+listed by it, and nothing under a `.git` directory is read. It never enters a `WALK_SKIP`
+name at any level. Past level 1 it uses the draft walk's `file_type().is_dir()`, so a symlink
+is neither a root nor descended into (a level-1 symlink to a plain folder is not descended
+either); level 1's symlink rule is unchanged. Dot-directories are not special.
+
+**Mechanism 2, the worktrees kept inside.** For every root discovery lists, by any mechanism
+and at any level, whose `.git` is a directory, one `git worktree list --porcelain`. Every
+`worktree <path>` entry after the first whose canonical path lies inside that root becomes a
+root, filed where its repository is filed (the configured parent, or the repository's own
+parent when the launch directory is inside it), badged `WorktreeOf(root)`. Entries outside the
+root are not added: mechanism 1 or a second `parent_dirs` entry is for those. A linked root
+skips the call, since its list is the main worktree's. This is what makes `R/.worktrees/wt` a
+row from a launch directory inside `R` or above it, without walking inside `R` at all.
+
+**Badges are still the two sources they were.** The badge pass at the end of `discover` marks
+every linked worktree `WorktreeOf(main)` over any `NestedIn`, and the scan's nested path
+still reports an untracked, non-ignored repository inside a root, so a `.worktrees/` that is
+not gitignored is listed at depth 1 already with the same badge. Roots are keyed by canonical
+path, so a directory reached twice is one root, and `roots::diff` and the `RootsChanged` path
+are untouched. A root that vanishes when the depth goes back down keeps its ledger on disk.
+
+**Cost, and why the docs push back on 3 and 4.** Depth `d` reads every plain directory down
+to level `d`: one `read_dir` per directory and one `exists` per child, with no git call for a
+directory that has no `.git` entry. At `2` and above every listed repository whose `.git` is a
+directory is also asked for its worktrees, one `git worktree list` per repository per rescan
+on top of the badge pass's `rev-parse`, so a parent of a hundred clones pays a hundred more
+git processes each time. Discovery runs at open and again on the watcher's
+30-second backstop, under the engine lock, so depth 3 or 4 wants a narrow `parent_dirs` and
+not a home directory. The draft-glob walk (`matching_dirs`) is a separate walk and is
+unchanged.
+
+**Changing it while running.** `Engine::set_search_depth(depth)` clamps to `1..=4` and sets
+the value the next `rescan` uses; it discovers nothing by itself. The TUI pairs it with
+`Watcher::rescan_trigger()` so the set lands under the lock before the notify goes out, which
+matters because a notify is coalesced: one that arrives first would be answered by a rescan
+still running at the old depth, and the set would then wait for the backstop.
 
 ## Draft roots and collapsed classes (Phase 6)
 
@@ -509,6 +564,75 @@ Two rules make it safe to paste into a live terminal:
 so the field is carried unwritten and the line is never printed. Whichever phase adds the
 herdr attribution to a flag owns it.
 
+## Undo and snooze (Phase 10)
+
+Two fields on the ledger, both additive and both optional, so `SCHEMA_VERSION` stays `"1.1"`
+and a ledger written before Phase 10 loads unchanged:
+
+```rust
+pub snoozed_until: Option<String>,   // ISO-8601 UTC, or absent
+pub undo: Vec<UndoEntry>,            // oldest first, at most UNDO_CAP = 20
+```
+
+### Three operations
+
+`Ops::undo` reverses this root's most recent accept. It **never touches the working tree**:
+it pops one `UndoEntry` and puts every path in it back through `Ops::set_override`, which is
+the whole correctness argument. Going back through `set_override` rather than writing
+`overrides` directly is what makes the three awkward cases fall out for free (design review
+F1):
+
+- a recorded oid equal to the seen tree's entry **drops** the override, which is §6.2's
+  clean-up rule and stops the path counting toward compaction;
+- a `null` on a path the tree has keeps `Some(None)` = `Absent`, correct after any fold;
+- a `null` on a path the tree does **not** have drops the override, so the path resolves to
+  `Empty` again and a later `shift-u` writes a zero-byte file instead of unlinking the
+  user's first-sight draft (Phase 7's F17 rule).
+
+Flags survive an undo and `updated_at` is stamped by `set_override` itself. There is no live
+CAS: a file that moved since the accept is exactly what the user wants back on screen. An
+empty stack is a `Refused::NothingToUndo`, never an error. `Ops::undo_preview` returns
+`(UndoOp, Vec<String>)` — the op and the paths the next undo would restore, in path order —
+which is what the TUI moves its selection to.
+
+`Ops::snooze` writes `snoozed_until` (`Ops::snooze_deadline(days)` computes it from the
+injected clock) and `None` wakes the root. It is a **view** and not a filter: the root stays
+watched, stays scanned, and `status` keeps reporting it in full.
+
+### `pending_undo`, and where the push lives
+
+The entry is built by the staging functions and pushed by the **ledger write**, which is the
+only order that can be right. Every staging function calls `Ops::begin_undo(op)` before it
+touches an override, opening (or widening) an `Ops::pending_undo: Option<PendingUndo>`; the
+last caller's op wins, which is what `accept_group` wants — it re-stamps `AcceptGroup` over
+the per-row `AcceptFile`/`AcceptDeletion` its loop set. `set_override` then records each
+path's **prior** override on first touch only, so an op that sets the same path twice still
+carries one baseline.
+
+The push itself is inside `merge_from_disk`, under the lock, against the ledger that is
+actually on disk — not the one this engine had in memory. That is the subtle part: another
+lastcall may have accepted or compacted since, so the baselines are resolved against the disk
+ledger and the disk seen tree (`take_pending_undo`), and only then is the entry pushed onto
+the merged ledger. The fail-open branch (the ledger file is missing or unreadable) has to
+push too, and its baselines still have to be the *pre*-accept ones, so it rolls the staged
+overrides back on a scratch clone of this ledger first and resolves against that.
+`Ledger::push_undo` caps the stack at `UNDO_CAP` = 20, dropping the oldest.
+
+`UndoOp` is `AcceptHunk`, `AcceptFile`, `AcceptGroup`, `AcceptDeletion`, `AcceptAll` or
+`Save` — the inline editor's save advances the baseline, so it is on the stack like any other
+accept, and undoing it re-presents the user's own edit as pending. That is on purpose.
+
+An `UndoPath` is `{ baseline: Option<Oid>, mode: Option<Mode> }`: an oid and its mode for a
+path that had a baseline, and `null` for **both** `Absent` and `Empty`. The two are
+deliberately not distinguished on the wire: `set_override`'s `equals_tree` rule
+recovers the distinction from the tree at undo time, which is more robust than storing a
+verdict that a compaction in between could invalidate.
+
+`snooze_active(snoozed_until, now)` is the reader's view of the deadline: `Some` only while
+it is still in the future, `None` once it has passed, and the next ledger write clears the
+expired value outright (`clear_expired_snooze`). So a status report never shows a snooze that
+is already over, and nothing in the TUI has to read a clock to work that out.
+
 ## Editing (Phase 8)
 
 Phase 8 adds the third thing a reviewer does with a hunk: change it. Two engine entry
@@ -693,6 +817,8 @@ $EDITOR admits of.
       ],
       "omitted": 0,
       "groups": [{"kind": "upstream", "paths": ["u1"]}],
+      "undo": 0,
+      "snoozed_until": "2026-09-20T09:00:00Z | null",
       "notices": ["root-level and scan notices"]
     }
   ]
@@ -715,6 +841,17 @@ the number of changed paths beyond the row cap that this scan did not hash (see 
 the pipeline); `0` whenever everything changed is in `pending`, and the root's `notices`
 name the cap when it is not. `pending` never holds more than `row_cap` non-override rows.
 Readers that predate the field ignore it; `Pile::omitted` deserializes as `0` when absent.
+
+`undo` and `snoozed_until` (additive, Phase 10 / Amendment v1.11; `status_version` stays 1)
+are the two per-root ledger fields the TUI also reads through `Pile`. `undo` is the depth of
+the root's undo stack, `0` when there is nothing to undo and at most `ledger::UNDO_CAP` (20).
+`snoozed_until` is the snooze deadline as ISO-8601 UTC, and it is `null` both when the root
+was never snoozed and when the deadline has passed: expiry is decided by the engine's
+injected `Clock` at scan time, so a report never shows a snooze that is already over. Neither
+field changes what `status` scans or lists; a snoozed root is still scanned and still
+reported with all its pending rows, because snooze is a view in the TUI and not a filter.
+Readers that predate the fields ignore them; `Pile::undo` deserializes as `0` and
+`Pile::snoozed_until` as `null` when absent.
 
 `state_dir`, `store` and `ledger_written_at` (additive, Phase 9a / Amendment v1.9;
 `status_version` stays 1) name **which store this run read**. `state_dir` is the resolved

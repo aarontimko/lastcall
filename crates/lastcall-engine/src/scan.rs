@@ -131,6 +131,17 @@ pub struct Pile {
     /// older JSON without it reads as `0`.
     #[serde(default)]
     pub omitted: usize,
+    /// How deep this root's undo stack is, stamped by the engine after every scan
+    /// (Amendment v1.11). The reducer never reads a ledger, so everything the UI knows
+    /// about undo rides here: the hint, the status suffix, and a second process's undo.
+    /// Additive: older JSON without it reads as `0`.
+    #[serde(default)]
+    pub undo: usize,
+    /// When this root stops being snoozed, `None` when it is not (an **expired** deadline
+    /// is already `None` here: the engine applies its own injected clock at scan time, so
+    /// the TUI never compares wall clocks of its own; design review F4).
+    #[serde(default)]
+    pub snoozed_until: Option<String>,
 }
 
 impl Pile {
@@ -589,6 +600,9 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
             rows,
             notices,
             omitted,
+            // Stamped by the engine (`scan_root`), which owns the clock the expiry needs.
+            undo: 0,
+            snoozed_until: None,
         },
         nested_repos,
         hash_calls: store.git().hash_object_calls() - calls_before,
@@ -870,6 +884,7 @@ pub(crate) mod fixture_tests {
                 compaction_threshold: self.compaction_threshold,
                 case_insensitive: self.case_insensitive,
                 staged: std::collections::BTreeMap::new(),
+                pending_undo: None,
                 lock: crate::ops::DEFAULT_LOCK,
             }
         }

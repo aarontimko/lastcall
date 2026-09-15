@@ -11,17 +11,18 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
+use lastcall_engine::config::write::Setting;
 use lastcall_engine::count::with_thousands;
 use lastcall_engine::engine::{
     AcceptRequest, Accepted, EngineError, Flagged, RenderedHunk, RestoreRequest, Restored,
-    RootState, Saved,
+    RootState, Saved, Snoozed, Undone,
 };
 use lastcall_engine::git::{Mode, Oid};
 use lastcall_engine::headstate::InProgress;
 use lastcall_engine::hunks::{Expanded, Hunk, Tag};
-use lastcall_engine::ledger::{FlagHunk, FlagSummary, LedgerError};
+use lastcall_engine::ledger::{FlagHunk, FlagSummary, LedgerError, iso8601_date, parse_iso8601};
 use lastcall_engine::ops::{OpsError, Refused, Rendered};
 use lastcall_engine::roots::Badge;
 use lastcall_engine::scan::{Annotation, Change, Collapsed, Entry, Group, Pile, Row};
@@ -29,9 +30,15 @@ use lastcall_engine::store::{Current, RootKind};
 use lastcall_engine::watcher::EngineEvent;
 
 use super::herdr::{AgentCandidate, HerdrUpdate, HerdrView, Link, ToastRequest};
-use super::input::{Action, EditKey, EditorKey, Keymap, NoteKey, PickKey};
+use super::input::{Action, EditKey, EditorKey, Keymap, NoteKey, PickKey, SnoozeKey, TourKey};
+use super::render::key_label;
 use super::textbuf::{TextBuf, Wrap};
+use super::tour::{Card, EMPTY_CARD_MIN, Tour};
+use unicode_width::UnicodeWidthStr;
 
+/// The columns the bottom line keeps for the status text or the hints beside the notice
+/// (design review F6): below this the notice takes a shorter form.
+pub const NOTICE_MIN_TEXT: usize = 30;
 pub const NAV_WIDTH_DEFAULT: u16 = 28;
 pub const NAV_WIDTH_MIN: u16 = 16;
 pub const NAV_WIDTH_MAX: u16 = 60;
@@ -268,6 +275,11 @@ pub enum Target {
     /// The header's update notice (`↑ 0.1.1`): a click puts the whole sentence on the
     /// status line, exactly as a click on the badge does (Design pass D6).
     HeaderUpdate,
+    /// Row `n` of the first-launch tour's card (Amendment v1.11): a choice row on a card
+    /// that asks a question, and the footer on one that does not. A click takes it, exactly
+    /// as Enter on it would — a card is a question, and a question answered by the mouse is
+    /// still answered.
+    TourRow(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -371,6 +383,26 @@ pub enum Effect {
         label: String,
         export: String,
     },
+    /// Run `Engine::undo` for one root and feed the result to [`App::undone`]
+    /// (Amendment v1.11). One root, never a list: `z` reverses the last accept in the
+    /// repository the cursor is in, and an accept-all that spanned several roots left one
+    /// entry on each of them.
+    Undo(PathBuf),
+    /// Run `Engine::snooze` for one root — `days` for a snooze, `None` to wake it — and
+    /// feed the result to [`App::snoozed_result`]. The deadline is computed engine-side
+    /// from its injected clock, so the TUI never reads a wall clock to build one.
+    Snooze {
+        root: PathBuf,
+        days: Option<u32>,
+    },
+    /// The first-launch tour's one sanctioned config write (Amendment v1.11): set this key
+    /// in the config file through `lastcall_engine::config::write` and feed the answer back
+    /// to [`App::tour_written`]. The reducer has already applied the setting to the session
+    /// by the time this is dispatched — the write is the *remembering*, not the doing — so a
+    /// failure costs a footer, never the choice.
+    TourWrite(Setting),
+    /// The tour closed, by any path: write the marker so it is not shown again.
+    TourDone,
     /// `agent.focus` on this pane id (herdr's own public id, never a name); the result
     /// comes back as `HerdrUpdate::Focused`.
     Focus(String),
@@ -584,6 +616,23 @@ pub enum AcceptScope {
     },
 }
 
+/// What `accept` (`a`) answers with from the current selection: a scope it takes, or a
+/// refusal that names the key which takes a whole entry.
+///
+/// Amendment v1.11, the maintainer's ruling of 2026-09-14: in the nav `accept_file` (`A`)
+/// is the key that takes a whole entry — a file, a branch group, a repository — and `a`
+/// takes a hunk and nothing larger. Before it, `a` on a repository row folded the whole
+/// repository, and a repository of [`CONFIRM_ABOVE`] files or fewer vanished with no
+/// question asked at all. An **empty** repository row has nothing to refuse over: `a` and
+/// `A` both read [`NOTHING_TO_ACCEPT`] there, which [`App::request_accept`] says for either.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcceptAnswer {
+    /// `a` takes this much.
+    Take(AcceptScope),
+    /// `a` takes nothing here; this is the status text that says which key does.
+    Refuse(String),
+}
+
 /// An accept the loop is running: its scope and the rows each request covered, so the
 /// status can count what came back `Ok`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -755,6 +804,69 @@ impl NoteEntry {
     }
 }
 
+/// The snooze modal (Amendment v1.11): which repository, and for how many days.
+///
+/// `days` is the digits as typed rather than a number, so backspacing to nothing shows an
+/// empty field instead of jumping to `0`; [`SnoozeEntry::value`] is what Enter applies, and
+/// it is the one place the 1..=365 range lives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnoozeEntry {
+    pub root: PathBuf,
+    /// The repository's display name, captured when `s` was pressed: a pile landing while
+    /// the modal is open must not retitle it.
+    pub name: String,
+    /// The digits typed so far. Seeded with [`SNOOZE_DEFAULT_DAYS`].
+    pub days: String,
+}
+
+/// The snooze the modal offers before anything is typed (§6.7 as amended by v1.11).
+pub const SNOOZE_DEFAULT_DAYS: u32 = 1;
+/// The longest snooze the modal accepts. A year of not looking at a repository is already
+/// further than anyone means; past it the digit is refused rather than clamped, so the
+/// field never shows a number the write would not use.
+pub const SNOOZE_MAX_DAYS: u32 = 365;
+/// What `s` says when the selection is not a repository row.
+pub const SNOOZE_NEEDS_ROOT: &str = "select a repository row to snooze it";
+/// What `z` says when this root's undo stack is empty. The engine refuses with the same
+/// words; this is the reducer's own path, for a root whose pile already says `undo: 0`.
+pub const NOTHING_TO_UNDO: &str = "nothing to undo";
+pub const UNDO_IN_PROGRESS: &str = "undo in progress";
+pub const SNOOZE_IN_PROGRESS: &str = "snooze in progress";
+
+impl SnoozeEntry {
+    /// The number Enter applies: the digits as an integer, clamped into 1..=365, or the
+    /// default when the field has been emptied.
+    pub fn value(&self) -> u32 {
+        match self.days.parse::<u32>() {
+            Ok(0) | Err(_) => SNOOZE_DEFAULT_DAYS,
+            Ok(n) => n.min(SNOOZE_MAX_DAYS),
+        }
+    }
+
+    /// Type one digit, refusing anything that would take the field past
+    /// [`SNOOZE_MAX_DAYS`] — so the field only ever shows a number the write would use.
+    fn digit(&mut self, c: char) -> Changed {
+        let mut next = self.days.clone();
+        next.push(c);
+        // A leading run of zeros is not a number anyone typed on purpose.
+        let trimmed = next.trim_start_matches('0');
+        match trimmed.parse::<u32>() {
+            Ok(n) if (1..=SNOOZE_MAX_DAYS).contains(&n) => {
+                self.days = trimmed.to_owned();
+                Changed::Yes
+            }
+            _ => Changed::No,
+        }
+    }
+
+    fn backspace(&mut self) -> Changed {
+        match self.days.pop() {
+            Some(_) => Changed::Yes,
+            None => Changed::No,
+        }
+    }
+}
+
 /// The agent picker: which pane the export goes to when more than one is a candidate. The
 /// flag is already on disk by the time this opens, so `Esc` loses nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -869,6 +981,13 @@ pub type RestoreResult = Result<Restored, AcceptFailed>;
 /// One root's flag (or unflag) result, on the same terms.
 pub type FlagResult = Result<Flagged, AcceptFailed>;
 
+/// One root's undo result (Amendment v1.11), classified like an accept's: an undo is a
+/// ledger write on one root and fails for the same two reasons.
+pub type UndoResult = Result<Undone, AcceptFailed>;
+
+/// One root's snooze (or wake) result, on the same terms.
+pub type SnoozeResult = Result<Snoozed, AcceptFailed>;
+
 /// The inline editor's save result (deliverable 8), classified like an accept's: a save is
 /// an op on one root's ledger and fails for the same two reasons.
 pub type SaveResult = Result<Saved, AcceptFailed>;
@@ -967,6 +1086,10 @@ pub struct App {
     /// nothing pending as a name-and-branch row. While `true` those rows go, except a repo
     /// whose agent wants attention. Independent of the herdr scope (`w`).
     pub hide_empty: bool,
+    /// `shift-s` (Amendment v1.11): while `true` the snoozed repositories are listed too,
+    /// each with a `snoozed until <date>` suffix on its branch line, and `s` on one of them
+    /// wakes it. Session state like `hide_empty`, never written back.
+    pub show_snoozed: bool,
     /// The nav index the current selection had when it was last **found** on the nav —
     /// written by `select` and refreshed by `reconcile_selection` whenever the selection
     /// survives a pile (design review F7). It is the only thing left to go on when the
@@ -977,6 +1100,15 @@ pub struct App {
     pub status: Option<StatusLine>,
     /// Advanced by `Tick`; render computes ages from it, never from `Instant::now()`.
     pub now: Instant,
+    /// The wall clock at the last `Tick`, as the **engine's** injected clock reports it
+    /// (design review F4). The TUI has no clock of its own and never calls
+    /// `SystemTime::now()`: the loop reads `engine.options().clock` once and hands the
+    /// value down, so a `FixedClock` test and the snapshot tier decide what "now" is.
+    ///
+    /// `None` until the first tick, and in any test that does not set it — a snooze then
+    /// simply never expires under the cursor, which is the safe direction: the next scan's
+    /// pile carries the engine's own verdict.
+    pub wall: Option<SystemTime>,
     /// Terminal size from the last `Resize`, used for page sizes and the hidden-nav rule
     /// in `handle` (render uses the frame's own area).
     pub size: (u16, u16),
@@ -987,6 +1119,9 @@ pub struct App {
     /// (the watcher and a refresh or an accept are two channels; this orders them). The
     /// entry goes when the root does, so a re-added root takes piles from its first scan.
     pub seq: BTreeMap<PathBuf, u64>,
+    /// Roots whose scan failed and so will never send a pile (`scan failed` notice); a
+    /// later pile takes the root off it. With `seq`, this is what `pictured` reads.
+    pub unscannable: std::collections::BTreeSet<PathBuf>,
     /// The accept the loop is running, if any; a second one is refused meanwhile.
     pub accepting: Option<Accepting>,
     /// The restore the loop is running, if any; a second one is refused meanwhile. Separate
@@ -995,6 +1130,19 @@ pub struct App {
     pub restoring: Option<Restoring>,
     /// The note modal, if open. While it is, every key edits the note except `ctrl-c`.
     pub note: Option<NoteEntry>,
+    /// The snooze modal, if open (Amendment v1.11). While it is, every key goes to the day
+    /// count except the non-printable quit spellings — the note modal's rule, for the same
+    /// reason: a field that has the keyboard owns it.
+    pub snooze: Option<SnoozeEntry>,
+    /// The undo the loop is running, if any (the root it covers); a second `z` meanwhile is
+    /// refused, exactly as a second accept is.
+    pub undoing: Option<PathBuf>,
+    /// The roots the last `ctrl-a` actually folded, when it covered more than one. It is
+    /// what lets an undo's status line say how many other repositories are still holding an
+    /// entry from that same fold; cleared by the next accept-all.
+    pub accept_all_roots: Vec<PathBuf>,
+    /// The snooze or wake the loop is running, if any (the root it covers).
+    pub snoozing: Option<PathBuf>,
     /// The agent picker, if open (deliverable 10).
     pub picker: Option<Picker>,
     /// The inline editor, if open (deliverable 8). While it is, it replaces the diff pane
@@ -1020,6 +1168,11 @@ pub struct App {
     /// Everything herdr says, and the local ack episodes (Phase 5). Socket-free: the
     /// reducer never sees the client's own types.
     pub herdr: HerdrView,
+    /// The first-launch welcome overlay, if open (Amendment v1.11). It sits above
+    /// everything — the help overlay and the confirm modal included — and only its own keys
+    /// reach the reducer while it is. Opened by the loop at the first frame past the launch
+    /// hold and the scope verdict; see [`super::tour`].
+    pub tour: Option<Tour>,
     /// The launch hold, until every root has reported. See [`Loading`].
     pub loading: Option<Loading>,
     /// The one collapsed row whose hunks `e` fetched, if any. A view, never a baseline;
@@ -1066,23 +1219,31 @@ impl App {
             full_paths: false,
             show_remote: false,
             hide_empty: false,
+            show_snoozed: false,
             nav_anchor: None,
             help: false,
             status: None,
             now: Instant::now(),
+            wall: None,
             size: (80, 24),
             refreshing: false,
             orphan_piles: BTreeMap::new(),
             seq: BTreeMap::new(),
+            unscannable: std::collections::BTreeSet::new(),
             accepting: None,
             restoring: None,
             note: None,
+            snooze: None,
+            undoing: None,
+            accept_all_roots: Vec::new(),
+            snoozing: None,
             picker: None,
             editor: None,
             edit_pending: None,
             edit_gen: 0,
             confirm: None,
             herdr: HerdrView::default(),
+            tour: None,
             loading: None,
             expanded: None,
             // The canonical spellings (`shift-a` shows as `A`), as `Keymap::table` gives.
@@ -1125,15 +1286,157 @@ impl App {
     /// attention flag (a ready episode, acked or not, or a blocked agent) keeps it;
     /// `working`/`idle`/`unknown` annotate a root, they never decide one.
     pub fn is_listed(&self, view: &RootView) -> bool {
+        let attention = || {
+            self.herdr
+                .flag(&view.meta.path)
+                .is_some_and(|f| f.attention())
+        };
         self.loading.is_none()
             && !self.herdr.scope_pending
             && self.herdr.in_scope(&view.meta.path)
-            && (!self.hide_empty
-                || view.listed()
-                || self
-                    .herdr
-                    .flag(&view.meta.path)
-                    .is_some_and(|f| f.attention()))
+            && (!self.hide_empty || view.listed() || attention())
+            // Amendment v1.11: a snoozed repository is off the nav until its deadline
+            // passes, `shift-s` shows it, or its agent wants attention — the `hide_empty`
+            // exception exactly, and for the same reason: an agent that is blocked or done
+            // is news the reader asked for before they asked for quiet.
+            && (view.pile.snoozed_until.is_none() || self.show_snoozed || attention())
+    }
+
+    /// Whether `view` is snoozed as far as this frame is concerned.
+    ///
+    /// The pile's deadline is the engine's own verdict — it stamps `None` for a deadline
+    /// that has already passed under its injected clock — and [`App::handle`]'s `Tick` arm
+    /// drops one that expires while the TUI is open, so this is a field test and never a
+    /// clock read (design review F4).
+    pub fn snoozed<'a>(&self, view: &'a RootView) -> Option<&'a str> {
+        view.pile.snoozed_until.as_deref()
+    }
+
+    /// Snoozed repositories the nav is not showing: the `N` of the `· N snoozed (S shows)`
+    /// notice. Counted with [`Self::is_listed`]'s other rules in force, so the number
+    /// promises exactly what `shift-s` will reveal.
+    pub fn snoozed_out(&self) -> usize {
+        if self.show_snoozed {
+            return 0;
+        }
+        self.roots
+            .values()
+            .filter(|v| v.pile.snoozed_until.is_some())
+            .filter(|v| {
+                self.loading.is_none()
+                    && !self.herdr.scope_pending
+                    && self.herdr.in_scope(&v.meta.path)
+                    && (!self.hide_empty
+                        || v.listed()
+                        || self.herdr.flag(&v.meta.path).is_some_and(|f| f.attention()))
+                    && !self.herdr.flag(&v.meta.path).is_some_and(|f| f.attention())
+            })
+            .count()
+    }
+
+    /// The snooze half of the bottom-line notice, or `None` when nothing is snoozed away.
+    /// The key comes from the keymap (`Keymap::table` canonicalises `shift-s` to `S`), so a
+    /// rebound `show_snoozed` renames the notice with it.
+    pub fn snooze_notice(&self) -> Option<String> {
+        let n = self.snoozed_out();
+        let key = self
+            .keys_for("show_snoozed")
+            .first()
+            .cloned()
+            .unwrap_or_default();
+        (n > 0).then(|| format!("{n} snoozed ({key} shows)"))
+    }
+
+    /// The bottom line's right-hand notice at `width`, longest form that still leaves the
+    /// status text or the hints room to read (design review F6).
+    ///
+    /// `render_status` has no width tiers and gains none here: the notice offers three
+    /// forms and the line takes the first that fits.
+    ///
+    /// 1. `scope: alpha · 2 repos hidden (w shows all) · 1 snoozed (S shows)`
+    /// 2. `scope: alpha · 2 hidden · 1 snoozed` — the parentheticals go; the keys are in
+    ///    the help overlay, and the counts are the part that cannot be guessed.
+    /// 3. `2 hidden · 1 snoozed` — the scope's label goes too.
+    ///
+    /// A form is taken while it leaves at least [`NOTICE_MIN_TEXT`] columns beside it;
+    /// below that the shortest form stands and `render_status`'s own rule gives it the line
+    /// alone rather than clipping the status text to nothing.
+    pub fn bottom_notice(&self, width: u16) -> Option<String> {
+        let forms = self.notice_forms();
+        let first = forms.first()?;
+        let width = width as usize;
+        for form in &forms {
+            if width.saturating_sub(form.width() + 2) >= NOTICE_MIN_TEXT {
+                return Some(form.clone());
+            }
+        }
+        Some(forms.last().unwrap_or(first).clone())
+    }
+
+    /// The three forms of [`Self::bottom_notice`], longest first. Empty when there is
+    /// neither a scope nor a snooze to report.
+    ///
+    /// The ladder is the **combined** notice's rule (design review F6, whose two shortened
+    /// examples are both combinations). A scope count on its own keeps the mandatory
+    /// wording it has had since deliverable 8 — dropping its label would leave `2 hidden`
+    /// with nothing to say what hid them, which is the trap that made the notice mandatory
+    /// in the first place — and `render_status` gives it the line alone when the frame is
+    /// too narrow for both, exactly as before.
+    pub fn notice_forms(&self) -> Vec<String> {
+        let scope = self.herdr.active_scope();
+        let hidden = self.scoped_out();
+        let snoozed = self.snoozed_out();
+        if scope.is_none() && snoozed == 0 {
+            return Vec::new();
+        }
+        let key = self
+            .keys_for("show_snoozed")
+            .first()
+            .cloned()
+            .unwrap_or_default();
+        let join = |parts: Vec<String>| parts.join(" · ");
+        let full = join(
+            [
+                scope.map(|s| {
+                    format!(
+                        "scope: {} · {} hidden (w shows all)",
+                        s.label,
+                        plural(hidden, "repo")
+                    )
+                }),
+                (snoozed > 0).then(|| format!("{snoozed} snoozed ({key} shows)")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+        );
+        let medium = join(
+            [
+                scope.map(|s| format!("scope: {} · {hidden} hidden", s.label)),
+                (snoozed > 0).then(|| format!("{snoozed} snoozed")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+        );
+        let short = join(
+            [
+                scope.map(|_| format!("{hidden} hidden")),
+                (snoozed > 0).then(|| format!("{snoozed} snoozed")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+        );
+        let mut forms = vec![full];
+        if scope.is_some() && snoozed > 0 {
+            for form in [medium, short] {
+                if forms.last() != Some(&form) {
+                    forms.push(form);
+                }
+            }
+        }
+        forms
     }
 
     /// Begin the launch hold over the roots `sync_roots` just installed (see [`Loading`]).
@@ -1157,6 +1460,18 @@ impl App {
             self.end_loading();
         }
         Changed::Yes
+    }
+
+    /// Every root's pile has landed, or its scan failed and none will. The launch hold
+    /// ends on the last `Scanned` tick, which the scan pool sends the moment that root's
+    /// scan finishes; the piles follow together once every scan is done, and the frame in
+    /// between shows every root with nothing pending. The first-launch welcome counts the
+    /// empty roots once, when it opens, so it waits for this and not only for the hold
+    /// (Phase 10 fix worker's `14 of your 14` under load).
+    pub fn pictured(&self) -> bool {
+        self.roots
+            .keys()
+            .all(|r| self.seq.contains_key(r) || self.unscannable.contains(r))
     }
 
     /// The scans are accounted for. Design pass D5 / ruling R7: when the herdr scope
@@ -1439,6 +1754,7 @@ impl App {
                     }
                     self.orphan_piles.remove(root);
                     self.seq.remove(root);
+                    self.unscannable.remove(root);
                 }
                 if result == Changed::Yes {
                     self.reconcile_selection();
@@ -1451,6 +1767,7 @@ impl App {
                 match &root {
                     // A failed scan is still that root's report.
                     Some(r) if text.starts_with("scan failed") => {
+                        self.unscannable.insert(r.clone());
                         self.root_reported(r.clone(), 0);
                     }
                     // Every global notice comes after the initial scans (`watching …`,
@@ -1477,6 +1794,7 @@ impl App {
             return Changed::No;
         }
         self.seq.insert(root.clone(), seq);
+        self.unscannable.remove(&root);
         let Some(view) = self.roots.get_mut(&root) else {
             self.orphan_piles.insert(root, pile);
             return Changed::No;
@@ -1538,6 +1856,7 @@ impl App {
         for k in gone {
             self.roots.remove(&k);
             self.seq.remove(&k);
+            self.unscannable.remove(&k);
             changed = Changed::Yes;
         }
         if changed == Changed::Yes {
@@ -1552,36 +1871,73 @@ impl App {
     /// diff cursor — whichever pane has focus, so `a` from the nav takes a hunk, not the
     /// file (`A` / `accept_file` is the only key that takes a whole file). A file row with
     /// no hunks (binary, collapsed, deleted, unreadable) has no hunk to point at, so `a`
-    /// there keeps taking the row whole. A group entry is the group, a root entry every row
-    /// of that root. `None` with nothing selected or a vanished row.
-    pub fn accept_scope(&self) -> Option<AcceptScope> {
+    /// there keeps taking the row whole.
+    ///
+    /// A **group** entry and a **non-empty repository** row are refusals (Amendment v1.11,
+    /// the ruling of 2026-09-14): they are several files, and `A` is the key that takes
+    /// several. The refusal names the `accept_file` key from the effective keymap, so a
+    /// reader who rebound it is sent to their own key. `None` with nothing selected or a
+    /// vanished row.
+    pub fn accept_scope(&self) -> Option<AcceptAnswer> {
         match self.selection.clone()? {
             Selection::Row(root, path) => {
                 let row = self.roots.get(&root)?.row(&path)?;
                 if !row.hunks.is_empty() {
-                    Some(AcceptScope::Hunk {
+                    Some(AcceptAnswer::Take(AcceptScope::Hunk {
                         root,
                         path,
                         index: self.diff.hunk.min(row.hunks.len() - 1),
                         hunks: row.hunks.len(),
-                    })
+                    }))
                 } else {
-                    Some(file_scope(root, row))
+                    Some(AcceptAnswer::Take(file_scope(root, row)))
                 }
             }
-            Selection::Group(root, kind) => Some(AcceptScope::Group { root, kind }),
-            Selection::Root(root) => Some(AcceptScope::Root(root)),
+            Selection::Group(..) => Some(AcceptAnswer::Refuse(format!(
+                "{} accepts the group",
+                self.accept_file_key()
+            ))),
+            // An empty repository row keeps the old answer: `request_accept` counts nothing
+            // and says `nothing to accept`, which is what `A` says there too.
+            Selection::Root(root) if self.rows_in(&root) == 0 => {
+                Some(AcceptAnswer::Take(AcceptScope::Root(root)))
+            }
+            Selection::Root(root) => Some(AcceptAnswer::Refuse(format!(
+                "{} accepts all in {}",
+                self.accept_file_key(),
+                self.root_name(&root)
+            ))),
         }
     }
 
-    /// What `AcceptFile` covers: the selected row whole, whichever pane has focus.
+    /// The `accept_file` key as the help overlay spells it, from the **effective** keymap.
+    ///
+    /// `[keys]` cannot leave an action unbound (an empty list is a config error and every
+    /// default action is in the table), so the fallback is unreachable; the default
+    /// spelling is the honest thing to print if it ever is not.
+    fn accept_file_key(&self) -> String {
+        self.keys_for("accept_file")
+            .first()
+            .map(|s| key_label(s))
+            .unwrap_or_else(|| "A".to_owned())
+    }
+
+    /// How many rows a root holds now, `0` for one this app has never seen.
+    fn rows_in(&self, root: &Path) -> usize {
+        self.roots.get(root).map_or(0, |v| v.rows().len())
+    }
+
+    /// What `AcceptFile` covers: the whole selected entry, whichever pane has focus — a
+    /// file row, a branch group, or every row of a repository from its row (Amendment
+    /// v1.11). Above [`CONFIRM_ABOVE`] files it asks first, exactly as `^A` does.
     pub fn accept_file_scope(&self) -> Option<AcceptScope> {
         match self.selection.clone()? {
             Selection::Row(root, path) => {
                 let row = self.roots.get(&root)?.row(&path)?;
                 Some(file_scope(root, row))
             }
-            _ => None,
+            Selection::Group(root, kind) => Some(AcceptScope::Group { root, kind }),
+            Selection::Root(root) => Some(AcceptScope::Root(root)),
         }
     }
 
@@ -2585,6 +2941,375 @@ impl App {
         (Changed::Yes, Some(Effect::Restore(reqs)))
     }
 
+    // ---- undo (Amendment v1.11) ----------------------------------------------------------
+
+    /// `z`: reverse the most recent accept in the selected root.
+    ///
+    /// The depth is read from the selected root's [`Pile::undo`] — the TUI never reads a
+    /// ledger (design review F8) — so a stack another lastcall filled is `z`-able here the
+    /// moment its pile lands, and an empty one is answered without a round trip.
+    fn request_undo(&mut self) -> (Changed, Option<Effect>) {
+        let Some(root) = self.flagged_root() else {
+            return (Changed::No, None);
+        };
+        if self.undoing.is_some() {
+            self.set_status(UNDO_IN_PROGRESS);
+            return (Changed::Yes, None);
+        }
+        if self.roots.get(&root).is_some_and(|v| v.pile.undo == 0) {
+            self.set_status(format!("{NOTHING_TO_UNDO} in {}", self.root_name(&root)));
+            return (Changed::Yes, None);
+        }
+        self.undoing = Some(root.clone());
+        self.set_status("undoing…");
+        (Changed::Yes, Some(Effect::Undo(root)))
+    }
+
+    /// The loop's answer to an [`Effect::Undo`]: the pile takes the watcher path, the
+    /// selection moves onto the first path the entry put back, `undoing` clears, and one
+    /// status line says what came back.
+    ///
+    /// The selection move is the point of the whole gesture: the file the reader accepted
+    /// by mistake has to be under the cursor again, not somewhere down the list. The focus
+    /// is left where it was, so `z` from the diff pane leaves them reading the diff.
+    pub fn undone(&mut self, root: PathBuf, result: UndoResult) -> Changed {
+        let inflight = self.undoing.take();
+        let mut changed = if inflight.is_some() {
+            Changed::Yes
+        } else {
+            Changed::No
+        };
+        let name = self.root_name(&root);
+        let mut parts: Vec<String> = Vec::new();
+        match result {
+            Ok(res) => {
+                let refusals: Vec<String> = res
+                    .outcome
+                    .refused
+                    .iter()
+                    .map(|r| r.message("undone"))
+                    .collect();
+                let paths = res.paths.clone();
+                changed = changed.or(self.apply_pile(root.clone(), res.seq, res.pile));
+                if refusals.is_empty() && !paths.is_empty() {
+                    parts.push(match paths.as_slice() {
+                        [one] => format!("undid accept of {one}"),
+                        many => format!("undid accept of {} in {name}", plural(many.len(), "file")),
+                    });
+                    if let Some(k) = self.other_undo_depth(&root) {
+                        parts.push(format!("({k} other repos have their own undo)"));
+                    }
+                    self.select_undone(&root, &paths);
+                } else if refusals.is_empty() {
+                    parts.push(format!("{NOTHING_TO_UNDO} in {name}"));
+                }
+                parts.extend(refusals);
+            }
+            Err(AcceptFailed::LedgerBusy) => {
+                parts.push(format!("ledger busy in {name} — try again"))
+            }
+            Err(AcceptFailed::Other(e)) => parts.push(format!("{name}: {e}")),
+        }
+        if inflight.is_none() && parts.is_empty() {
+            return changed;
+        }
+        self.set_status(parts.join(" "));
+        Changed::Yes
+    }
+
+    /// How many **other** repositories the last accept-all covered still have an undo entry
+    /// of their own, or `None` when that is not what this undo was part of.
+    ///
+    /// `ctrl-a` across several roots writes one entry per root, so undoing in one of them
+    /// leaves the rest accepted; the sentence says so rather than letting the reader
+    /// believe `z` reached all of them. The roots are the ones the accept-all actually
+    /// covered (recorded by [`App::accepted`]), filtered by what their piles report now, so
+    /// a stack another process emptied meanwhile is not counted.
+    fn other_undo_depth(&self, root: &Path) -> Option<usize> {
+        let k = self
+            .accept_all_roots
+            .iter()
+            .filter(|r| r.as_path() != root)
+            .filter(|r| self.roots.get(*r).is_some_and(|v| v.pile.undo > 0))
+            .count();
+        (k > 0).then_some(k)
+    }
+
+    /// Put the cursor on the first path the undo put back, if the pile has it as a row.
+    fn select_undone(&mut self, root: &Path, paths: &[String]) {
+        let Some(first) = paths.first() else {
+            return;
+        };
+        let bytes = first.as_bytes().to_vec();
+        if self
+            .roots
+            .get(root)
+            .is_some_and(|v| v.row(&bytes).is_some())
+        {
+            let focus = self.focus;
+            self.select(Some(Selection::Row(root.to_path_buf(), bytes)));
+            self.focus = focus;
+        }
+    }
+
+    // ---- snooze (Amendment v1.11) --------------------------------------------------------
+
+    /// `s`: open the snooze modal on the selected repository row, or wake a snoozed
+    /// repository that `shift-s` is showing.
+    ///
+    /// Only a **repository row** answers: `s` on a file would have to guess which repository
+    /// the reader meant, and guessing wrong hides work.
+    fn snooze_selected(&mut self) -> (Changed, Option<Effect>) {
+        let Some(Selection::Root(root)) = self.selection.clone() else {
+            self.set_status(SNOOZE_NEEDS_ROOT);
+            return (Changed::Yes, None);
+        };
+        if self.snoozing.is_some() {
+            self.set_status(SNOOZE_IN_PROGRESS);
+            return (Changed::Yes, None);
+        }
+        // Already snoozed (so `shift-s` is showing it): `s` wakes it, no modal. There is
+        // nothing to ask — the answer to "for how long?" is "not at all".
+        if self
+            .roots
+            .get(&root)
+            .is_some_and(|v| v.pile.snoozed_until.is_some())
+        {
+            self.snoozing = Some(root.clone());
+            return (Changed::Yes, Some(Effect::Snooze { root, days: None }));
+        }
+        self.snooze = Some(SnoozeEntry {
+            name: self.root_name(&root),
+            root,
+            days: SNOOZE_DEFAULT_DAYS.to_string(),
+        });
+        (Changed::Yes, None)
+    }
+
+    /// One keystroke inside the snooze modal.
+    /// One keystroke inside the first-launch welcome overlay (Amendment v1.11).
+    ///
+    /// Enter is the only key that does anything irreversible, and what it does depends on
+    /// the row: the first row of a choice card keeps the default and advances, the second
+    /// applies the change **to this session immediately** and asks the loop to remember it.
+    /// The order matters — the setting is live whether or not the file can be written, so a
+    /// read-only config directory costs a footer and not the choice.
+    fn tour_key(&mut self, key: TourKey) -> (Changed, Option<Effect>) {
+        let Some(tour) = &mut self.tour else {
+            return (Changed::No, None);
+        };
+        match key {
+            TourKey::Up | TourKey::Down => {
+                let rows = tour.rows();
+                // Nothing to move between on a plain card, and nothing to choose once a
+                // failed write has replaced the footer: the choice is already applied.
+                if rows == 0 || tour.failed.is_some() {
+                    return (Changed::No, None);
+                }
+                let row = match key {
+                    TourKey::Up => tour.row.saturating_sub(1),
+                    _ => (tour.row + 1).min(rows - 1),
+                };
+                if row == tour.row {
+                    return (Changed::No, None);
+                }
+                tour.row = row;
+                (Changed::Yes, None)
+            }
+            TourKey::Skip => self.close_tour(),
+            TourKey::Next => {
+                // A failed write has said its piece on the footer; Enter moves on from it.
+                let acknowledged = tour.failed.take().is_some();
+                let setting = tour.card().setting().filter(|_| tour.row == 1);
+                if acknowledged {
+                    return self.advance_tour();
+                }
+                match setting {
+                    Some(setting) => {
+                        self.apply_tour_setting(setting);
+                        (Changed::Yes, Some(Effect::TourWrite(setting)))
+                    }
+                    None => self.advance_tour(),
+                }
+            }
+        }
+    }
+
+    /// The loop's answer to an [`Effect::TourWrite`]: the card advances when the file took
+    /// the key, and keeps the screen with a sentence and the TOML line when it did not.
+    pub fn tour_written(&mut self, result: Result<(), String>) -> (Changed, Option<Effect>) {
+        match result {
+            Ok(()) => self.advance_tour(),
+            Err(message) => {
+                let Some(tour) = &mut self.tour else {
+                    return (Changed::No, None);
+                };
+                tour.failed = Some(message);
+                (Changed::Yes, None)
+            }
+        }
+    }
+
+    /// The next card, or the end of the tour.
+    ///
+    /// The empty-repository card is built **here** rather than when the tour opened
+    /// (deliverable 8, design review F4). The depth card sits in front of it and its second
+    /// row rescans, so roots land between the two cards; a count taken at open would be the
+    /// count from before them. What has landed by the time the reader presses `enter` is
+    /// what the card says, and if that is under [`EMPTY_CARD_MIN`] there is no card.
+    fn advance_tour(&mut self) -> (Changed, Option<Effect>) {
+        if self.tour.is_none() {
+            return (Changed::No, None);
+        }
+        let total = self.listed_roots().count();
+        let empty = self.listed_roots().filter(|v| !v.listed()).count();
+        let hide_empty = self.hide_empty;
+        let Some(tour) = &mut self.tour else {
+            return (Changed::No, None);
+        };
+        tour.at += 1;
+        tour.row = 0;
+        tour.failed = None;
+        while let Some(Card::Empty { .. }) = tour.cards.get(tour.at) {
+            if !hide_empty && empty >= EMPTY_CARD_MIN {
+                tour.cards[tour.at] = Card::Empty { empty, total };
+                break;
+            }
+            tour.at += 1;
+        }
+        if tour.at >= tour.cards.len() {
+            return self.close_tour();
+        }
+        (Changed::Yes, None)
+    }
+
+    /// Close the overlay and ask the loop to write the marker. Every dismissal lands here
+    /// but one: quitting with it open, which the loop notices after the event loop ends.
+    fn close_tour(&mut self) -> (Changed, Option<Effect>) {
+        self.tour = None;
+        (Changed::Yes, Some(Effect::TourDone))
+    }
+
+    /// Apply a tour choice to **this session**, the same instant the write is asked for.
+    ///
+    /// Neither of these goes through its `Action`: `ScopeToggle` is a no-op when no scope
+    /// was derived, and both cards are gated on the setting not being in force already, so
+    /// a toggle and an assignment are the same thing here and the assignment is the one that
+    /// says what it means.
+    fn apply_tour_setting(&mut self, setting: Setting) {
+        match setting {
+            Setting::HerdrScopeAll => {
+                self.herdr.scoped = false;
+                self.reconcile_selection();
+            }
+            Setting::HideEmptyRepos => {
+                self.hide_empty = true;
+                self.reconcile_selection();
+            }
+            // Deliverable 8: the depth card changes nothing the reducer owns. The roots the
+            // deeper walk finds arrive through the engine, on the rescan the loop asks for
+            // once the depth is set, and reach the app as an ordinary roots update.
+            Setting::SearchDepth2 => {}
+        }
+    }
+
+    fn snooze_key(&mut self, key: SnoozeKey) -> (Changed, Option<Effect>) {
+        let Some(entry) = &mut self.snooze else {
+            return (Changed::No, None);
+        };
+        match key {
+            SnoozeKey::Digit(c) => (entry.digit(c), None),
+            SnoozeKey::Backspace => (entry.backspace(), None),
+            SnoozeKey::Cancel => {
+                self.snooze = None;
+                (Changed::Yes, None)
+            }
+            SnoozeKey::Apply => {
+                let entry = self.snooze.take().expect("checked above");
+                let days = entry.value();
+                self.snoozing = Some(entry.root.clone());
+                (
+                    Changed::Yes,
+                    Some(Effect::Snooze {
+                        root: entry.root,
+                        days: Some(days),
+                    }),
+                )
+            }
+        }
+    }
+
+    /// The loop's answer to an [`Effect::Snooze`]: the pile takes the watcher path (which
+    /// takes the repository off the nav and moves the selection through
+    /// `reconcile_selection`), `snoozing` clears, and the status line names the deadline.
+    pub fn snoozed_result(&mut self, root: PathBuf, result: SnoozeResult) -> Changed {
+        let inflight = self.snoozing.take();
+        let mut changed = if inflight.is_some() {
+            Changed::Yes
+        } else {
+            Changed::No
+        };
+        let name = self.root_name(&root);
+        let mut parts: Vec<String> = Vec::new();
+        match result {
+            Ok(res) => {
+                parts.extend(res.outcome.refused.iter().map(|r| r.message("snoozed")));
+                let until = res.until.clone();
+                changed = changed.or(self.apply_pile(root, res.seq, res.pile));
+                if parts.is_empty() {
+                    parts.push(match &until {
+                        Some(u) => format!("snoozed {name} until {}", iso8601_date(u)),
+                        None => format!("woke {name}"),
+                    });
+                }
+            }
+            Err(AcceptFailed::LedgerBusy) => {
+                parts.push(format!("ledger busy in {name} — try again"))
+            }
+            Err(AcceptFailed::Other(e)) => parts.push(format!("{name}: {e}")),
+        }
+        if inflight.is_none() && parts.is_empty() {
+            return changed;
+        }
+        self.set_status(parts.join(" · "));
+        Changed::Yes
+    }
+
+    /// Drop every held deadline the wall clock has passed (design review F4). `Changed::Yes`
+    /// when at least one repository came back, which is also when the nav has to re-list.
+    ///
+    /// The engine clears the field on its own next ledger write and stamps an expired
+    /// deadline as `None` at every scan; this is the same verdict applied to the piles the
+    /// TUI is already holding, so a repository comes back within a second of its deadline
+    /// rather than at the next scan or the next restart.
+    fn drop_expired_snoozes(&mut self) -> Changed {
+        let Some(wall) = self.wall else {
+            return Changed::No;
+        };
+        let expired: Vec<PathBuf> = self
+            .roots
+            .iter()
+            .filter(|(_, v)| {
+                v.pile
+                    .snoozed_until
+                    .as_deref()
+                    .and_then(parse_iso8601)
+                    .is_some_and(|at| at <= wall)
+            })
+            .map(|(p, _)| p.clone())
+            .collect();
+        if expired.is_empty() {
+            return Changed::No;
+        }
+        for root in expired {
+            if let Some(view) = self.roots.get_mut(&root) {
+                view.pile.snoozed_until = None;
+            }
+        }
+        self.reconcile_selection();
+        Changed::Yes
+    }
+
     /// The loop's answer to an `Effect::Restore`: the pile goes through the same path as a
     /// watcher pile (seq included), the §6.7 advance rule runs for the selection the restore
     /// was asked from, `restoring` clears and one status line says what happened.
@@ -2708,6 +3433,15 @@ impl App {
             return changed;
         };
         let taken = refusals.is_empty() && errors.is_empty();
+        // Amendment v1.11: an accept-all that folded more than one repository left an undo
+        // entry on each of them, and the next `z` says so.
+        if matches!(scope, AcceptScope::All) {
+            self.accept_all_roots = if ok_roots.len() > 1 {
+                ok_roots.clone()
+            } else {
+                Vec::new()
+            };
+        }
         self.advance_after(&scope, before, taken);
         let accepted: usize = files
             .iter()
@@ -2930,6 +3664,75 @@ impl App {
         self.select(Some(entries[index].clone()))
     }
 
+    /// `nav_top` / `nav_bottom` with the nav focused: the first or the last entry.
+    ///
+    /// The entry comes out of [`Self::nav_entries`] and goes through [`Self::select`],
+    /// which is [`Self::move_selection`]'s own last step: one selection path, so the diff,
+    /// the expansion and an empty nav all answer exactly as `↑`/`↓` make them. What it
+    /// does *not* borrow is `move_selection`'s rule for a nav with nothing selected yet —
+    /// there `↓` starts at the top, and `end` means the end whichever key came first.
+    fn jump_end(&mut self, down: bool) -> Changed {
+        let entries = self.nav_entries();
+        let target = if down {
+            entries.last()
+        } else {
+            entries.first()
+        };
+        let target = target.cloned();
+        self.select(target)
+    }
+
+    /// `nav_top` / `nav_bottom` with the diff focused: the first line, or the last line a
+    /// long `↓` run reaches — [`Self::scroll_by`] clamps to the same place, so this is a
+    /// move of the whole diff's length and not a second scroll path. While a selection is
+    /// running it moves the selection's far end instead, exactly as the page keys do.
+    fn jump_diff_end(&mut self, down: bool) -> Changed {
+        let span = diff_lines(self.view_hunks()) as isize;
+        let delta = if down { span } else { -span };
+        if self.sel.is_some() {
+            self.move_sel_cursor(delta)
+        } else {
+            self.scroll_by(delta)
+        }
+    }
+
+    /// `nav_prev_root` / `nav_next_root`: the repository row of the listed root before or
+    /// after the selection's own ([`Selection::root`]).
+    ///
+    /// The roots come out of [`Self::nav_entries`], so one that the scope, `t` or a snooze
+    /// has taken off the nav is skipped the way `↑`/`↓` skip it. There is no wrap: on the
+    /// last root `}` changes nothing at all, and `{` inside the first selects that root's
+    /// own row, which is where a reader deep inside it means to land. A repository row has
+    /// no diff, so the keys come back to the nav with the selection.
+    fn jump_root(&mut self, forward: bool) -> Changed {
+        let roots: Vec<PathBuf> = self
+            .nav_entries()
+            .into_iter()
+            .filter_map(|e| match e {
+                Selection::Root(root) => Some(root),
+                _ => None,
+            })
+            .collect();
+        let Some(first) = roots.first() else {
+            return self.select(None);
+        };
+        let at = self
+            .selection
+            .as_ref()
+            .and_then(|s| roots.iter().position(|r| r.as_path() == s.root()));
+        let target = match (at, forward) {
+            (Some(i), true) => match roots.get(i + 1) {
+                Some(root) => root.clone(),
+                None => return Changed::No,
+            },
+            (Some(i), false) => roots[i.saturating_sub(1)].clone(),
+            // Nothing selected yet: both keys start at the nav's first repository row.
+            (None, _) => first.clone(),
+        };
+        let moved = self.select(Some(Selection::Root(target)));
+        moved.or(self.set_focus(Focus::Nav))
+    }
+
     // ---- diff cursor ---------------------------------------------------------------------
 
     fn scroll_by(&mut self, delta: isize) -> Changed {
@@ -3077,6 +3880,22 @@ impl App {
     /// Fold one user action in.
     pub fn handle(&mut self, action: Action) -> (Changed, Option<Effect>) {
         use Action::*;
+        // The first-launch tour is above everything, the help overlay and the confirm modal
+        // included (F7): a `?` before the welcome is dismissed must not open help *under*
+        // it, and a card with a highlighted row is a question that has to be answered or
+        // skipped before anything else happens. `Ui::event` resolves every key through
+        // `tour_action` first, so the only keystrokes that reach here are its own and a
+        // non-printable quit; `Press` reaches here as the no-op it always is (the loop
+        // resolves it through the hit map), and `Tick`, `Resize` and `Herdr` pass because
+        // none of them is a keystroke.
+        if self.tour.is_some()
+            && !matches!(
+                action,
+                Tick | Resize(..) | Tour(_) | Quit | Herdr(_) | Press(..)
+            )
+        {
+            return (Changed::No, None);
+        }
         // The note modal owns the keyboard: `Ui::event` resolves every key through
         // `note_action` before the keymap, so the only actions that reach here are its own
         // edits, a quit, and the events that pass through every modal.
@@ -3085,6 +3904,14 @@ impl App {
         }
         // The picker, on the same terms. A `Herdr` update re-derives its candidates below.
         if self.picker.is_some() && !matches!(action, Tick | Resize(..) | Pick(_) | Quit | Herdr(_))
+        {
+            return (Changed::No, None);
+        }
+        // The snooze modal, on the note modal's terms: `Ui::event` resolves every key
+        // through `snooze_action` first, so only its own edits, a quit and the events that
+        // pass through every modal reach here.
+        if self.snooze.is_some()
+            && !matches!(action, Tick | Resize(..) | SnoozeEdit(_) | Quit | Herdr(_))
         {
             return (Changed::No, None);
         }
@@ -3101,10 +3928,15 @@ impl App {
         if let Herdr(update) = action {
             return self.herdr_update(update);
         }
+        // `Tour(_)` passes for the same reason `Quit` does: the welcome sits above the help
+        // overlay, so its own keys must act on the card rather than spend themselves closing
+        // help underneath it. `Plan::open` closes help as the welcome opens, so the reader
+        // never sees the two together; this arm is what keeps a card's first keystroke from
+        // being swallowed if it ever does.
         if self.help
             && !matches!(
                 action,
-                Tick | Resize(..) | Drag(..) | Release | Press(..) | Quit
+                Tick | Resize(..) | Drag(..) | Release | Press(..) | Quit | Tour(_)
             )
         {
             self.help = false;
@@ -3117,6 +3949,16 @@ impl App {
             NavDown if nav => self.move_selection(1),
             NavPageUp if nav => self.move_selection(-page),
             NavPageDown if nav => self.move_selection(page),
+            NavTop if nav => self.jump_end(false),
+            NavBottom if nav => self.jump_end(true),
+            // The two ends of the diff, and the whole of a live selection with them.
+            NavTop => self.jump_diff_end(false),
+            NavBottom => self.jump_diff_end(true),
+            // The repository jumps read the same in both panes, which is why they are not
+            // split by focus: they always land on a repository row, and they always leave
+            // the keys in the nav.
+            NavPrevRoot => self.jump_root(false),
+            NavNextRoot => self.jump_root(true),
             // In the diff with a selection running, these keys move its far end
             // (deliverable 9); with none, they scroll the pane as they always have.
             NavUp if self.sel.is_some() => self.move_sel_cursor(-1),
@@ -3220,7 +4062,12 @@ impl App {
                 Changed::Yes
             }
             Accept => match self.accept_scope() {
-                Some(scope) => return self.request_accept(scope),
+                Some(AcceptAnswer::Take(scope)) => return self.request_accept(scope),
+                // The status line changed, so the frame did: `Changed::Yes`.
+                Some(AcceptAnswer::Refuse(text)) => {
+                    self.set_status(text);
+                    Changed::Yes
+                }
                 None => Changed::No,
             },
             AcceptFile => match self.accept_file_scope() {
@@ -3238,6 +4085,15 @@ impl App {
             },
             Flag => return self.open_note(),
             Unflag => return self.unflag_selected(),
+            Undo => return self.request_undo(),
+            Snooze => return self.snooze_selected(),
+            ShowSnoozed => {
+                self.show_snoozed = !self.show_snoozed;
+                self.reconcile_selection();
+                Changed::Yes
+            }
+            SnoozeEdit(key) => return self.snooze_key(key),
+            Tour(key) => return self.tour_key(key),
             Edit => return self.edit_inline(),
             EditExternal => return self.edit_external(),
             Editor(key) => return self.editor_key(key),
@@ -3346,8 +4202,14 @@ impl App {
                     Some(_) => Changed::Yes,
                     None => Changed::No,
                 };
+                // Amendment v1.11 / design review F4: a snooze that runs out while the
+                // TUI is open comes back here rather than at the next scan, and the
+                // comparison is against the engine's clock as the loop last reported it —
+                // the reducer owns the decision, `render` never sees a deadline that is
+                // already past.
+                let woke = self.drop_expired_snoozes();
                 // The loading pane carries a seconds counter.
-                if cue_went || self.loading.is_some() {
+                if woke == Changed::Yes || cue_went || self.loading.is_some() {
                     Changed::Yes
                 } else {
                     status
@@ -3493,6 +4355,19 @@ impl App {
 
     /// Fold a resolved mouse target in (the loop maps `Press(x, y)` through the `HitMap`).
     pub fn hit(&mut self, target: Target) -> (Changed, Option<Effect>) {
+        // The first-launch tour is above every modal, so its rows are resolved first — and
+        // a press anywhere else on the overlay is ignored, not passed through to whatever
+        // the frame under it happens to be drawing.
+        if self.tour.is_some() {
+            let Target::TourRow(n) = target else {
+                return (Changed::No, None);
+            };
+            let tour = self.tour.as_mut().expect("checked above");
+            if tour.rows() > 0 {
+                tour.row = n.min(tour.rows() - 1);
+            }
+            return self.tour_key(TourKey::Next);
+        }
         // A click under any modal is ignored, exactly as it is under the confirm.
         if self.confirm.is_some() || self.note.is_some() || self.picker.is_some() {
             return (Changed::No, None);
@@ -3502,6 +4377,9 @@ impl App {
             return (Changed::Yes, None);
         }
         let changed = match target {
+            // Resolved above, while the overlay is open; once it has closed the rows are
+            // gone from the hit map and a stale press on one does nothing.
+            Target::TourRow(_) => Changed::No,
             Target::HeaderAcceptAll => return self.handle(Action::AcceptAll),
             Target::RootDot(root) => {
                 // The click selects the root exactly as a click on its name does, then
@@ -3904,6 +4782,51 @@ pub(crate) mod testfix {
         )
     }
 
+    /// An engine answer for an `Effect::Undo`: a clean outcome, the paths it put back, and
+    /// `pile` as the rescan.
+    pub fn undone_ok(name: &str, seq: u64, paths: &[&str], pile: Pile) -> (PathBuf, UndoResult) {
+        (
+            root(name),
+            Ok(Undone {
+                outcome: lastcall_engine::ops::Outcome::default(),
+                op: Some(lastcall_engine::ledger::UndoOp::AcceptFile),
+                paths: paths.iter().map(|p| (*p).to_owned()).collect(),
+                seq,
+                pile,
+            }),
+        )
+    }
+
+    /// An engine answer for an `Effect::Snooze`: `until` is `None` for a wake.
+    pub fn snoozed_ok(
+        name: &str,
+        seq: u64,
+        until: Option<&str>,
+        pile: Pile,
+    ) -> (PathBuf, SnoozeResult) {
+        (
+            root(name),
+            Ok(Snoozed {
+                outcome: lastcall_engine::ops::Outcome::default(),
+                until: until.map(str::to_owned),
+                seq,
+                pile,
+            }),
+        )
+    }
+
+    /// `pile` with a snooze deadline on it, as the engine stamps one at scan time.
+    pub fn snoozed_pile(mut pile: Pile, until: &str) -> Pile {
+        pile.snoozed_until = Some(until.to_owned());
+        pile
+    }
+
+    /// `pile` with an undo stack `n` deep, as the engine stamps one at scan time.
+    pub fn undo_pile(mut pile: Pile, n: usize) -> Pile {
+        pile.undo = n;
+        pile
+    }
+
     /// `pile` without the rows named.
     pub fn without(mut pile: Pile, paths: &[&str]) -> Pile {
         pile.rows
@@ -4078,7 +5001,10 @@ mod tests {
                 "never written back onto the row"
             );
             assert!(
-                matches!(app.accept_scope(), Some(AcceptScope::File { .. })),
+                matches!(
+                    app.accept_scope(),
+                    Some(AcceptAnswer::Take(AcceptScope::File { .. }))
+                ),
                 "a collapsed row is one accept however much is on screen: {:?}",
                 app.accept_scope()
             );
@@ -4302,12 +5228,12 @@ mod tests {
         let held = base.roots[&root("alpha")].row(b"f1").unwrap();
         assert_eq!(
             nav_scope,
-            Some(AcceptScope::Hunk {
+            Some(AcceptAnswer::Take(AcceptScope::Hunk {
                 root: root("alpha"),
                 path: b"f1".to_vec(),
                 index: 1,
                 hunks: 3,
-            }),
+            })),
             "not AcceptScope::File"
         );
         assert_eq!(
@@ -4334,10 +5260,17 @@ mod tests {
             vec![(root("alpha"), AcceptRequest::File(Rendered::of(held)))]
         );
 
-        // A root entry's `a` is untouched: the per-repo fold, not a hunk.
+        // A root entry's `a` refuses since Amendment v1.11 and names `A`; `A` is the fold.
         let mut fold = base;
         fold.select(Some(Selection::Root(root("alpha"))));
-        assert_eq!(fold.accept_scope(), Some(AcceptScope::Root(root("alpha"))));
+        assert_eq!(
+            fold.accept_scope(),
+            Some(AcceptAnswer::Refuse("A accepts all in alpha".to_owned()))
+        );
+        assert_eq!(
+            fold.accept_file_scope(),
+            Some(AcceptScope::Root(root("alpha")))
+        );
     }
 
     /// The carve-out: a file row with no hunks to point at (binary, collapsed, deleted,
@@ -4351,11 +5284,11 @@ mod tests {
         app.select(Some(row("alpha", "f1")));
         let held = app.roots[&root("alpha")].row(b"f1").unwrap().clone();
         assert!(held.hunks.is_empty());
-        let expect = Some(AcceptScope::File {
+        let expect = Some(AcceptAnswer::Take(AcceptScope::File {
             root: root("alpha"),
             path: b"f1".to_vec(),
             deleted: held.change == Change::Deleted,
-        });
+        }));
         assert_eq!(app.accept_scope(), expect, "nav pane");
         app.handle(Action::Open);
         assert_eq!(app.effective_focus(), Focus::Diff);
@@ -4401,12 +5334,14 @@ mod tests {
         );
     }
 
+    /// Amendment v1.11: the whole-repository fold and the whole-group fold are `A`'s, not
+    /// `a`'s. What they fold, and where the cursor lands afterwards, is unchanged.
     #[test]
-    fn app_accept_on_root_entry_folds_the_held_pile_and_on_group_the_group() {
+    fn app_accept_file_on_root_entry_folds_the_held_pile_and_on_group_the_group() {
         let mut app = three_roots();
         app.select(Some(Selection::Root(root("alpha"))));
         assert_eq!(
-            requests(app.handle(Action::Accept).1),
+            requests(app.handle(Action::AcceptFile).1),
             vec![(root("alpha"), AcceptRequest::All(pile("alpha")))]
         );
         assert_eq!(
@@ -4431,7 +5366,7 @@ mod tests {
             .map(|p| Rendered::of(beta.row(p).unwrap()))
             .collect();
         assert_eq!(
-            requests(app.handle(Action::Accept).1),
+            requests(app.handle(Action::AcceptFile).1),
             vec![(root("beta"), AcceptRequest::Group(rendered))]
         );
         let paths: Vec<&str> = group
@@ -4448,6 +5383,114 @@ mod tests {
             app.selection,
             Some(row("beta", "u2")),
             "a vanished group advances to the root's first remaining row"
+        );
+    }
+
+    /// Amendment v1.11, the ruling of 2026-09-14: a lowercase `a` on a repository row no
+    /// longer folds the repository. It accepts nothing, and the status names the key that
+    /// does — which is the whole point, because a repository of ten files or fewer used to
+    /// vanish with no confirm at all.
+    #[test]
+    fn app_accept_on_a_repo_row_refuses_and_names_the_accept_file_key() {
+        let mut app = three_roots();
+        app.select(Some(Selection::Root(root("alpha"))));
+        let before = app.roots[&root("alpha")].clone();
+
+        assert_eq!(app.handle(Action::Accept), (Changed::Yes, None));
+        assert_eq!(status(&app), "A accepts all in alpha");
+        assert_eq!(app.accepting, None, "nothing was sent to the engine");
+        assert_eq!(
+            app.roots[&root("alpha")],
+            before,
+            "the held pile is untouched"
+        );
+
+        // `A` is the fold, and above `CONFIRM_ABOVE` files it asks first.
+        assert_eq!(
+            app.accept_file_scope(),
+            Some(AcceptScope::Root(root("alpha")))
+        );
+        let mut big = three_roots();
+        big.apply(pile_event_seq("alpha", 1, rows_n(11, 0, 0)));
+        big.select(Some(Selection::Root(root("alpha"))));
+        assert_eq!(big.handle(Action::AcceptFile), (Changed::Yes, None));
+        assert_eq!(
+            big.confirm,
+            Some(Confirm {
+                scope: ConfirmScope::Accept(AcceptScope::Root(root("alpha")))
+            }),
+            "eleven files ask"
+        );
+    }
+
+    /// A group is several files too, so `a` refuses there on the same terms and `A` folds
+    /// it. The refusal names the group rather than a repository.
+    #[test]
+    fn app_accept_on_a_group_refuses_and_accept_file_folds_it() {
+        let mut app = three_roots();
+        app.select(Some(Selection::Group(root("beta"), Annotation::Upstream)));
+        let before = app.roots[&root("beta")].clone();
+
+        assert_eq!(
+            app.accept_scope(),
+            Some(AcceptAnswer::Refuse("A accepts the group".to_owned()))
+        );
+        assert_eq!(app.handle(Action::Accept), (Changed::Yes, None));
+        assert_eq!(status(&app), "A accepts the group");
+        assert_eq!(app.accepting, None);
+        assert_eq!(app.roots[&root("beta")], before);
+
+        assert_eq!(
+            app.accept_file_scope(),
+            Some(AcceptScope::Group {
+                root: root("beta"),
+                kind: Annotation::Upstream,
+            })
+        );
+    }
+
+    /// An **empty** repository row has nothing to refuse over: both keys read `nothing to
+    /// accept`, the answer `a` gave there before the ruling (verifier (a) F2's row).
+    #[test]
+    fn app_accept_and_accept_file_on_an_empty_repo_row_read_nothing_to_accept() {
+        let mut app = three_roots();
+        app.apply(pile_event_seq("alpha", 1, Pile::default()));
+        app.select(Some(Selection::Root(root("alpha"))));
+        assert!(app.roots[&root("alpha")].rows().is_empty());
+
+        assert_eq!(
+            app.accept_scope(),
+            Some(AcceptAnswer::Take(AcceptScope::Root(root("alpha")))),
+            "no refusal on an empty row"
+        );
+        assert_eq!(app.handle(Action::Accept), (Changed::Yes, None));
+        assert_eq!(status(&app), NOTHING_TO_ACCEPT);
+        assert_eq!(app.handle(Action::AcceptFile), (Changed::Yes, None));
+        assert_eq!(status(&app), NOTHING_TO_ACCEPT);
+        assert_eq!(app.accepting, None);
+    }
+
+    /// The refusals are spelled from the **effective** keymap, the way the help overlay
+    /// spells a key, so a reader who rebound `accept_file` is sent to their own key.
+    #[test]
+    fn app_accept_refusals_spell_a_rebound_accept_file_key() {
+        let mut app = three_roots();
+        for (name, specs) in &mut app.keymap {
+            if name == "accept_file" {
+                *specs = vec!["ctrl-w".to_owned()];
+            }
+        }
+        app.select(Some(Selection::Root(root("alpha"))));
+        assert_eq!(
+            app.accept_scope(),
+            Some(AcceptAnswer::Refuse(
+                "Ctrl-W accepts all in alpha".to_owned()
+            ))
+        );
+        app.select(Some(Selection::Group(root("beta"), Annotation::Upstream)));
+        assert_eq!(
+            app.accept_scope(),
+            Some(AcceptAnswer::Refuse("Ctrl-W accepts the group".to_owned()))
         );
     }
 
@@ -4602,7 +5645,7 @@ mod tests {
         let mut app = three_roots();
         app.apply(pile_event("alpha", rows_n(12, 0, 0)));
         app.select(Some(Selection::Root(root("alpha"))));
-        app.handle(Action::Accept);
+        app.handle(Action::AcceptFile);
         let asked = app.confirm.clone();
         assert!(asked.is_some(), "the accept-all question is up");
 
@@ -4740,7 +5783,7 @@ mod tests {
         let mut app = three_roots();
         app.apply(pile_event("alpha", rows_n(12, 0, 0)));
         app.select(Some(Selection::Root(root("alpha"))));
-        assert_eq!(app.handle(Action::Accept), (Changed::Yes, None));
+        assert_eq!(app.handle(Action::AcceptFile), (Changed::Yes, None));
         assert!(app.confirm.is_some());
         app.accepting = Some(Accepting {
             scope: AcceptScope::File {
@@ -4803,7 +5846,7 @@ mod tests {
         app.apply(pile_event("notes", Pile::default()));
         app.apply(pile_event_seq("alpha", 1, rows_n(11, 1, 0)));
         app.select(Some(Selection::Root(root("alpha"))));
-        app.handle(Action::Accept);
+        app.handle(Action::AcceptFile);
         assert_eq!(app.confirm_counts().unwrap().files, 11);
         assert_eq!(
             app.apply(pile_event_seq("alpha", 2, rows_n(12, 1, 0))).0,
@@ -5843,6 +6886,166 @@ mod tests {
         assert_eq!(app.handle(Action::Back).0, Changed::No, "Back never quits");
         app.handle(Action::FocusToggle);
         assert_eq!(app.focus, Focus::Diff);
+    }
+
+    /// The jumps (2026-09-14) with the nav focused: `home` and `end` reach the ends of
+    /// `nav_entries`, `}` walks the repository rows forward and `{` back, neither wraps,
+    /// and `{` from inside the first repository is that repository's own row.
+    #[test]
+    fn app_nav_jumps_reach_the_ends_and_walk_the_repository_rows() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        let entries = app.nav_entries();
+        let roots = [root("alpha"), root("beta"), root("notes")];
+        assert_eq!(entries.first(), Some(&Selection::Root(root("alpha"))));
+
+        assert_eq!(app.handle(Action::NavBottom).0, Changed::Yes);
+        assert_eq!(app.selection.as_ref(), entries.last());
+        assert_eq!(
+            app.handle(Action::NavBottom).0,
+            Changed::No,
+            "the last entry is already the last entry"
+        );
+        assert_eq!(app.handle(Action::NavTop).0, Changed::Yes);
+        assert_eq!(app.selection.as_ref(), entries.first());
+        assert_eq!(app.handle(Action::NavTop).0, Changed::No);
+
+        for next in &roots[1..] {
+            assert_eq!(app.handle(Action::NavNextRoot).0, Changed::Yes);
+            assert_eq!(app.selection, Some(Selection::Root(next.clone())));
+        }
+        assert_eq!(
+            app.handle(Action::NavNextRoot).0,
+            Changed::No,
+            "the last repository is where `}}` stops"
+        );
+        assert_eq!(app.selection, Some(Selection::Root(root("notes"))));
+        for prev in [root("beta"), root("alpha")] {
+            assert_eq!(app.handle(Action::NavPrevRoot).0, Changed::Yes);
+            assert_eq!(app.selection, Some(Selection::Root(prev)));
+        }
+        assert_eq!(
+            app.handle(Action::NavPrevRoot).0,
+            Changed::No,
+            "and the first is where `{{` stops"
+        );
+
+        // From inside a repository: `{` is the previous repository's row, and inside the
+        // first one it is that repository's own.
+        app.select(Some(row("beta", "u2")));
+        assert_eq!(app.handle(Action::NavPrevRoot).0, Changed::Yes);
+        assert_eq!(app.selection, Some(Selection::Root(root("alpha"))));
+        app.select(Some(row("alpha", "f2")));
+        assert_eq!(app.handle(Action::NavPrevRoot).0, Changed::Yes);
+        assert_eq!(
+            app.selection,
+            Some(Selection::Root(root("alpha"))),
+            "inside the first repository `{{` is its own head"
+        );
+        app.select(Some(row("alpha", "f2")));
+        assert_eq!(app.handle(Action::NavNextRoot).0, Changed::Yes);
+        assert_eq!(
+            app.selection,
+            Some(Selection::Root(root("beta"))),
+            "and `}}` is the next repository's, not this one's"
+        );
+    }
+
+    /// The same four with the **diff** focused: the ends move the pane and leave the
+    /// selection alone, and the repository jumps bring the keys back to the nav with them
+    /// (a repository row has no diff to read).
+    #[test]
+    fn app_nav_jumps_from_the_diff_scroll_it_and_come_back_to_the_nav() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::FocusToggle);
+        assert_eq!(app.effective_focus(), Focus::Diff);
+        let lines = diff_lines(app.view_hunks());
+        assert!(lines > 1, "f1 has a diff to scroll");
+
+        assert_eq!(app.handle(Action::NavBottom).0, Changed::Yes);
+        assert_eq!(app.diff.scroll, lines - 1);
+        assert_eq!(app.handle(Action::NavBottom).0, Changed::No);
+        // The same place a long `↓` run ends.
+        app.handle(Action::NavTop);
+        for _ in 0..lines + 5 {
+            app.handle(Action::NavDown);
+        }
+        assert_eq!(app.diff.scroll, lines - 1, "`end` is where `↓` gives up");
+        assert_eq!(app.handle(Action::NavTop).0, Changed::Yes);
+        assert_eq!(app.diff.scroll, 0);
+        assert_eq!(app.handle(Action::NavTop).0, Changed::No);
+        assert_eq!(
+            app.selection,
+            Some(row("alpha", "f1")),
+            "neither end touched the selection"
+        );
+        assert_eq!(app.focus, Focus::Diff, "nor the focus");
+
+        assert_eq!(app.handle(Action::NavNextRoot).0, Changed::Yes);
+        assert_eq!(app.selection, Some(Selection::Root(root("beta"))));
+        assert_eq!(app.focus, Focus::Nav, "`}}` hands the keys back to the nav");
+
+        app.select(Some(Selection::Root(root("alpha"))));
+        app.handle(Action::FocusToggle);
+        assert_eq!(app.focus, Focus::Diff);
+        assert_eq!(
+            app.handle(Action::NavPrevRoot).0,
+            Changed::Yes,
+            "the focus alone is a change"
+        );
+        assert_eq!(app.selection, Some(Selection::Root(root("alpha"))));
+        assert_eq!(app.focus, Focus::Nav);
+    }
+
+    /// A root the nav is not showing is no stop on the way, exactly as `↑`/`↓` skip it,
+    /// and an empty nav answers `Changed::No` to all four.
+    #[test]
+    fn app_nav_jumps_skip_a_hidden_root_and_an_empty_nav_is_nothing() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.apply(pile_event(
+            "beta",
+            snoozed_pile(pile("beta"), "2026-12-01T00:00:00Z"),
+        ));
+        let beta = root("beta");
+        assert!(
+            !app.nav_entries().iter().any(|e| e.root() == beta),
+            "beta is snoozed off the nav"
+        );
+        app.select(Some(Selection::Root(root("alpha"))));
+        assert_eq!(app.handle(Action::NavNextRoot).0, Changed::Yes);
+        assert_eq!(
+            app.selection,
+            Some(Selection::Root(root("notes"))),
+            "the snoozed repository is not a stop"
+        );
+        assert_eq!(app.handle(Action::NavPrevRoot).0, Changed::Yes);
+        assert_eq!(app.selection, Some(Selection::Root(root("alpha"))));
+        app.handle(Action::NavBottom);
+        let notes = root("notes");
+        assert_eq!(
+            app.selection.as_ref().map(Selection::root),
+            Some(notes.as_path()),
+            "`end` skips it too"
+        );
+
+        let mut empty = App::new();
+        assert!(empty.nav_entries().is_empty());
+        for action in [
+            Action::NavTop,
+            Action::NavBottom,
+            Action::NavPrevRoot,
+            Action::NavNextRoot,
+        ] {
+            assert_eq!(
+                empty.handle(action.clone()).0,
+                Changed::No,
+                "{action:?} on an empty nav"
+            );
+            assert_eq!(empty.selection, None);
+        }
     }
 
     #[test]
@@ -7685,7 +8888,10 @@ mod tests {
 
         // Accept and restore are untouched: the row is still one of each.
         assert!(
-            matches!(app.accept_scope(), Some(AcceptScope::File { .. })),
+            matches!(
+                app.accept_scope(),
+                Some(AcceptAnswer::Take(AcceptScope::File { .. }))
+            ),
             "{:?}",
             app.accept_scope()
         );
@@ -8653,5 +9859,771 @@ mod tests {
         let sel = app.sel;
         app.handle(Action::Copy);
         assert_eq!(app.sel, sel, "still there to shrink");
+    }
+
+    // ---- deliverable 2: undo ---------------------------------------------------------------
+
+    /// `z` asks the engine for this root's last entry and, when it comes back, puts the
+    /// cursor on the file that came with it — the whole point of the gesture is that the
+    /// row you accepted by mistake is under the cursor again.
+    #[test]
+    fn app_z_undoes_the_selected_root_and_puts_the_cursor_on_the_file() {
+        let mut app = three_roots();
+        // alpha with `f1` accepted and one entry on the stack.
+        app.apply(pile_event_seq(
+            "alpha",
+            1,
+            undo_pile(without(pile("alpha"), &["f1"]), 1),
+        ));
+        app.select(Some(row("alpha", "f2")));
+        let (changed, effect) = app.handle(Action::Undo);
+        assert_eq!(changed, Changed::Yes);
+        assert_eq!(effect, Some(Effect::Undo(root("alpha"))));
+        assert_eq!(status(&app), "undoing…");
+        assert_eq!(app.undoing.as_deref(), Some(root("alpha").as_path()));
+
+        let (r, res) = undone_ok("alpha", 2, &["f1"], undo_pile(pile("alpha"), 0));
+        assert_eq!(app.undone(r, res), Changed::Yes);
+        assert_eq!(status(&app), "undid accept of f1");
+        assert_eq!(app.selection, Some(row("alpha", "f1")));
+        assert_eq!(app.undoing, None, "the key works again");
+    }
+
+    /// A stack the pile already reports as empty is answered by the reducer: no effect, so
+    /// no engine work and no ledger lock for an answer that is already known.
+    #[test]
+    fn app_z_on_an_empty_stack_says_so_without_asking_the_engine() {
+        let mut app = three_roots();
+        app.select(Some(row("alpha", "f1")));
+        let (changed, effect) = app.handle(Action::Undo);
+        assert_eq!(changed, Changed::Yes);
+        assert_eq!(effect, None, "the pile already said `undo: 0`");
+        assert_eq!(status(&app), "nothing to undo in alpha");
+        assert_eq!(app.undoing, None);
+        // And a second `z` while one is in flight is refused rather than queued.
+        app.apply(pile_event_seq("alpha", 1, undo_pile(pile("alpha"), 1)));
+        assert!(app.handle(Action::Undo).1.is_some());
+        assert_eq!(app.handle(Action::Undo), (Changed::Yes, None));
+        assert_eq!(status(&app), "undo in progress");
+    }
+
+    /// `ctrl-a` writes one entry per root, so undoing in one of them leaves the others
+    /// accepted. The sentence says how many, rather than letting `z` read as a whole-sweep
+    /// undo (§6.7 as amended by v1.11).
+    #[test]
+    fn app_z_after_an_accept_all_names_the_other_repos() {
+        let mut app = three_roots();
+        app.select(Some(Selection::Root(root("alpha"))));
+        app.handle(Action::AcceptAll);
+        app.accepted(vec![
+            accepted_ok("alpha", 2, undo_pile(Pile::default(), 1)),
+            accepted_ok("beta", 2, undo_pile(Pile::default(), 1)),
+            accepted_ok("notes", 2, undo_pile(Pile::default(), 1)),
+        ]);
+        assert_eq!(app.accept_all_roots.len(), 3, "all three were swept");
+
+        app.select(Some(Selection::Root(root("alpha"))));
+        assert_eq!(
+            app.handle(Action::Undo).1,
+            Some(Effect::Undo(root("alpha")))
+        );
+        let (r, res) = undone_ok("alpha", 3, &["f1", "f2"], undo_pile(pile("alpha"), 0));
+        app.undone(r, res);
+        assert_eq!(
+            status(&app),
+            "undid accept of 2 files in alpha (2 other repos have their own undo)"
+        );
+
+        // Once the others' stacks are gone the clause goes with them.
+        app.apply(pile_event_seq("beta", 3, undo_pile(Pile::default(), 0)));
+        app.apply(pile_event_seq("notes", 3, undo_pile(Pile::default(), 0)));
+        app.select(Some(Selection::Root(root("alpha"))));
+        app.apply(pile_event_seq("alpha", 4, undo_pile(pile("alpha"), 1)));
+        app.handle(Action::Undo);
+        let (r, res) = undone_ok("alpha", 5, &["f1"], undo_pile(pile("alpha"), 0));
+        app.undone(r, res);
+        assert_eq!(status(&app), "undid accept of f1");
+    }
+
+    /// An engine that found nothing (a second process drained the stack between the pile
+    /// and the key) says so in the same words the reducer's own short circuit uses.
+    #[test]
+    fn app_z_against_a_stack_another_process_drained_says_nothing_to_undo() {
+        let mut app = three_roots();
+        app.apply(pile_event_seq("beta", 1, undo_pile(pile("beta"), 1)));
+        app.select(Some(Selection::Root(root("beta"))));
+        app.handle(Action::Undo);
+        let (r, res) = undone_ok("beta", 2, &[], undo_pile(pile("beta"), 0));
+        app.undone(r, res);
+        assert_eq!(status(&app), "nothing to undo in beta");
+        assert_eq!(app.selection, Some(Selection::Root(root("beta"))));
+    }
+
+    // ---- deliverable 3: snooze -------------------------------------------------------------
+
+    /// `s` on a file row would have to guess which repository the reader meant. It says so
+    /// instead, and opens nothing.
+    #[test]
+    fn app_s_needs_a_repository_row() {
+        let mut app = three_roots();
+        app.select(Some(row("alpha", "f1")));
+        let (changed, effect) = app.handle(Action::Snooze);
+        assert_eq!(changed, Changed::Yes);
+        assert_eq!(effect, None);
+        assert_eq!(status(&app), SNOOZE_NEEDS_ROOT);
+        assert_eq!(app.snooze, None, "no modal opened");
+    }
+
+    /// The modal's field is the digits as typed: it seeds with the default, takes digits,
+    /// refuses one that would leave the 1..=365 range, backspaces to empty, and an empty
+    /// field applies the default rather than zero.
+    #[test]
+    fn app_snooze_modal_edits_the_day_count_and_clamps_the_range() {
+        let mut app = three_roots();
+        app.select(Some(Selection::Root(root("alpha"))));
+        assert_eq!(app.handle(Action::Snooze), (Changed::Yes, None));
+        let entry = app.snooze.clone().expect("the modal is open");
+        assert_eq!(entry.days, SNOOZE_DEFAULT_DAYS.to_string());
+        assert_eq!(entry.name, "alpha");
+
+        let digit = |app: &mut App, c: char| app.handle(Action::SnoozeEdit(SnoozeKey::Digit(c)));
+        // `1` then `4` is 14 days.
+        assert_eq!(digit(&mut app, '4'), (Changed::Yes, None));
+        assert_eq!(app.snooze.as_ref().unwrap().days, "14");
+        assert_eq!(app.snooze.as_ref().unwrap().value(), 14);
+        // 145 still fits; 1450 does not, and the field is left showing 145.
+        assert_eq!(digit(&mut app, '5'), (Changed::Yes, None));
+        assert_eq!(digit(&mut app, '0'), (Changed::No, None));
+        assert_eq!(app.snooze.as_ref().unwrap().days, "145");
+
+        // Backspace to empty; the field shows nothing rather than jumping to 0.
+        for _ in 0..3 {
+            assert_eq!(
+                app.handle(Action::SnoozeEdit(SnoozeKey::Backspace)),
+                (Changed::Yes, None)
+            );
+        }
+        assert_eq!(app.snooze.as_ref().unwrap().days, "");
+        assert_eq!(
+            app.handle(Action::SnoozeEdit(SnoozeKey::Backspace)),
+            (Changed::No, None),
+            "nothing left to delete, nothing to redraw"
+        );
+        assert_eq!(app.snooze.as_ref().unwrap().value(), SNOOZE_DEFAULT_DAYS);
+        // A leading zero is not a number anyone typed on purpose.
+        digit(&mut app, '0');
+        assert_eq!(app.snooze.as_ref().unwrap().days, "");
+        digit(&mut app, '7');
+        assert_eq!(app.snooze.as_ref().unwrap().days, "7");
+
+        // Esc closes it and writes nothing.
+        assert_eq!(
+            app.handle(Action::SnoozeEdit(SnoozeKey::Cancel)),
+            (Changed::Yes, None)
+        );
+        assert_eq!(app.snooze, None);
+        assert_eq!(app.snoozing, None);
+
+        // Enter applies the number the field is showing.
+        app.handle(Action::Snooze);
+        digit(&mut app, '3');
+        let (changed, effect) = app.handle(Action::SnoozeEdit(SnoozeKey::Apply));
+        assert_eq!(changed, Changed::Yes);
+        assert_eq!(
+            effect,
+            Some(Effect::Snooze {
+                root: root("alpha"),
+                days: Some(13),
+            })
+        );
+        assert_eq!(app.snooze, None, "the modal closed with the key");
+    }
+
+    /// The deadline the engine wrote takes the repository off the nav; `shift-s` shows it
+    /// again, and `s` on a repository that is already snoozed wakes it without a modal.
+    #[test]
+    fn app_snooze_takes_the_repo_off_the_nav_and_shift_s_shows_it() {
+        let mut app = three_roots();
+        app.select(Some(Selection::Root(root("beta"))));
+        app.handle(Action::Snooze);
+        app.handle(Action::SnoozeEdit(SnoozeKey::Apply));
+        let (r, res) = snoozed_ok(
+            "beta",
+            2,
+            Some("2026-09-20T09:00:00Z"),
+            snoozed_pile(pile("beta"), "2026-09-20T09:00:00Z"),
+        );
+        assert_eq!(app.snoozed_result(r, res), Changed::Yes);
+        assert_eq!(status(&app), "snoozed beta until 2026-09-20");
+        assert_eq!(app.snoozing, None);
+
+        let listed = |app: &App| -> Vec<String> {
+            app.roots
+                .values()
+                .filter(|v| app.is_listed(v))
+                .map(|v| v.meta.name.clone())
+                .collect()
+        };
+        assert_eq!(listed(&app), vec!["alpha".to_owned(), "notes".to_owned()]);
+        assert_eq!(app.snoozed_out(), 1);
+        assert_eq!(
+            app.snooze_notice().as_deref(),
+            Some("1 snoozed (S shows)"),
+            "the keymap canonicalises shift-s to S"
+        );
+
+        // `shift-s` shows it again, and the notice goes with it.
+        assert_eq!(app.handle(Action::ShowSnoozed).0, Changed::Yes);
+        assert_eq!(
+            listed(&app),
+            vec!["alpha".to_owned(), "beta".to_owned(), "notes".to_owned()]
+        );
+        assert_eq!(app.snoozed_out(), 0);
+        assert_eq!(app.snooze_notice(), None);
+        assert_eq!(
+            app.snoozed(&app.roots[&root("beta")]),
+            Some("2026-09-20T09:00:00Z"),
+            "shown is not the same as awake"
+        );
+
+        // `s` on it now wakes it: no modal, no question.
+        app.select(Some(Selection::Root(root("beta"))));
+        let (changed, effect) = app.handle(Action::Snooze);
+        assert_eq!(changed, Changed::Yes);
+        assert_eq!(app.snooze, None, "nothing to ask");
+        assert_eq!(
+            effect,
+            Some(Effect::Snooze {
+                root: root("beta"),
+                days: None,
+            })
+        );
+        let (r, res) = snoozed_ok("beta", 3, None, pile("beta"));
+        app.snoozed_result(r, res);
+        assert_eq!(status(&app), "woke beta");
+        assert_eq!(app.snoozed(&app.roots[&root("beta")]), None);
+    }
+
+    /// A snoozed repository whose agent wants attention is listed anyway — the `hide_empty`
+    /// exception exactly, and for the same reason (Amendment v1.11).
+    #[test]
+    fn app_a_snoozed_repo_with_attention_is_listed_anyway() {
+        use crate::tui::herdr::{Attention, HerdrUpdate, RootAgents};
+        let mut app = three_roots();
+        app.apply(pile_event_seq(
+            "beta",
+            1,
+            snoozed_pile(pile("beta"), "2026-09-20T09:00:00Z"),
+        ));
+        assert!(!app.is_listed(&app.roots[&root("beta")]));
+        assert_eq!(app.snoozed_out(), 1);
+
+        app.handle(Action::Herdr(HerdrUpdate::Connected {
+            version: "0.8.2".to_owned(),
+            protocol: 21,
+        }));
+        app.handle(Action::Herdr(HerdrUpdate::Roots(
+            [(
+                root("beta"),
+                RootAgents {
+                    status: Attention::Blocked,
+                    agents: 1,
+                    pane: Some("w1:p1".to_owned()),
+                    agent: Some("claude".to_owned()),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        )));
+        assert!(
+            app.is_listed(&app.roots[&root("beta")]),
+            "a blocked agent is news the reader asked for"
+        );
+        assert_eq!(
+            app.snoozed_out(),
+            0,
+            "and the notice does not promise a row that is already on the nav"
+        );
+    }
+
+    /// Design review F4: the TUI has no wall clock, so the loop hands `Tick` the engine's.
+    /// A deadline the clock has passed is dropped and the repository comes back, without
+    /// waiting for a scan or a restart.
+    #[test]
+    fn app_a_snooze_that_expires_under_the_cursor_comes_back_on_the_next_tick() {
+        let mut app = three_roots();
+        let deadline = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_789_344_000);
+        let until = lastcall_engine::ledger::iso8601(deadline);
+        assert_eq!(until, "2026-09-14T00:00:00Z");
+        app.apply(pile_event_seq(
+            "beta",
+            1,
+            snoozed_pile(pile("beta"), &until),
+        ));
+        assert!(!app.is_listed(&app.roots[&root("beta")]));
+
+        // A tick a second short of the deadline leaves it alone.
+        app.wall = Some(deadline - std::time::Duration::from_secs(1));
+        app.handle(Action::Tick);
+        assert!(!app.is_listed(&app.roots[&root("beta")]));
+
+        // The deadline itself is the boundary: at it, the snooze is over.
+        app.wall = Some(deadline);
+        assert_eq!(app.handle(Action::Tick).0, Changed::Yes);
+        assert_eq!(app.roots[&root("beta")].pile.snoozed_until, None);
+        assert!(app.is_listed(&app.roots[&root("beta")]));
+        assert_eq!(app.snoozed_out(), 0);
+    }
+
+    /// A draft root has no git of its own, but the ledger and the nav treat it like any
+    /// other root, so `s` works on it (§5 draft roots, Amendment v1.11).
+    #[test]
+    fn app_a_draft_root_snoozes_like_a_git_root() {
+        let mut app = three_roots();
+        assert_eq!(app.roots[&root("notes")].meta.kind, RootKind::Draft);
+        app.select(Some(Selection::Root(root("notes"))));
+        app.handle(Action::Snooze);
+        assert_eq!(app.snooze.as_ref().map(|e| e.name.as_str()), Some("notes"));
+        let (_, effect) = app.handle(Action::SnoozeEdit(SnoozeKey::Apply));
+        assert_eq!(
+            effect,
+            Some(Effect::Snooze {
+                root: root("notes"),
+                days: Some(SNOOZE_DEFAULT_DAYS),
+            })
+        );
+        let (r, res) = snoozed_ok(
+            "notes",
+            2,
+            Some("2026-09-15T00:00:00Z"),
+            snoozed_pile(pile("notes"), "2026-09-15T00:00:00Z"),
+        );
+        app.snoozed_result(r, res);
+        assert_eq!(status(&app), "snoozed notes until 2026-09-15");
+        assert!(!app.is_listed(&app.roots[&root("notes")]));
+    }
+
+    /// Design review F6: the bottom-line notice shrinks a form at a time, and only when a
+    /// scope count and a snooze count are on the line together. A scope count on its own
+    /// keeps the mandatory wording it has had since Phase 9.
+    #[test]
+    fn app_bottom_notice_shrinks_only_when_both_counts_are_on_the_line() {
+        use crate::tui::herdr::{HerdrUpdate, Scope};
+        let mut app = three_roots();
+        app.herdr.scoped = true;
+        app.handle(Action::Herdr(HerdrUpdate::Scope(Some(Scope {
+            label: "alpha".to_owned(),
+            roots: [root("alpha"), root("beta")].into_iter().collect(),
+        }))));
+
+        // Scope alone: one form, at every width.
+        assert_eq!(
+            app.notice_forms(),
+            vec!["scope: alpha · 1 repo hidden (w shows all)".to_owned()]
+        );
+        assert_eq!(
+            app.bottom_notice(40).as_deref(),
+            Some("scope: alpha · 1 repo hidden (w shows all)"),
+            "a narrow frame gives it the row rather than shortening it"
+        );
+
+        // With a snooze as well there are three, longest first.
+        app.apply(pile_event_seq(
+            "beta",
+            1,
+            snoozed_pile(pile("beta"), "2026-09-20T09:00:00Z"),
+        ));
+        assert_eq!(
+            app.notice_forms(),
+            vec![
+                "scope: alpha · 1 repo hidden (w shows all) · 1 snoozed (S shows)".to_owned(),
+                "scope: alpha · 1 hidden · 1 snoozed".to_owned(),
+                "1 hidden · 1 snoozed".to_owned(),
+            ]
+        );
+        assert_eq!(
+            app.bottom_notice(100).as_deref(),
+            Some("scope: alpha · 1 repo hidden (w shows all) · 1 snoozed (S shows)")
+        );
+        assert_eq!(
+            app.bottom_notice(80).as_deref(),
+            Some("scope: alpha · 1 hidden · 1 snoozed")
+        );
+        assert_eq!(
+            app.bottom_notice(50).as_deref(),
+            Some("1 hidden · 1 snoozed")
+        );
+        assert_eq!(
+            app.bottom_notice(20).as_deref(),
+            Some("1 hidden · 1 snoozed"),
+            "below the shortest form it stands and takes the row"
+        );
+
+        // Nothing to report at all: no notice, and the hints keep the row.
+        let mut plain = three_roots();
+        assert_eq!(plain.notice_forms(), Vec::<String>::new());
+        assert_eq!(plain.bottom_notice(100), None);
+        plain.apply(pile_event_seq(
+            "beta",
+            1,
+            snoozed_pile(pile("beta"), "2026-09-20T09:00:00Z"),
+        ));
+        assert_eq!(
+            plain.notice_forms(),
+            vec!["1 snoozed (S shows)".to_owned()],
+            "a snooze count on its own has one form too"
+        );
+    }
+    // ---- the first-launch welcome (Amendment v1.11, deliverable 1) --------------------
+
+    use crate::tui::tour::{Card, Tour};
+
+    /// A three-root app with the tour open on `cards`.
+    fn with_tour(cards: Vec<Card>) -> App {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.tour = Some(Tour::new(cards));
+        app
+    }
+
+    fn empty_card() -> Card {
+        Card::Empty {
+            empty: 12,
+            total: 14,
+        }
+    }
+
+    /// The depth card: second in the tour, a choice card, and the only one whose condition
+    /// is about the config file alone, so it is the filler for "the next card" here.
+    fn depth_card() -> Card {
+        Card::Depth {
+            path: Some("/c/config.toml".to_owned()),
+        }
+    }
+
+    /// Whether `name` is on screen, through the same gate the painter uses.
+    fn listed(app: &App, name: &str) -> bool {
+        app.listed_roots().any(|v| v.meta.path == root(name))
+    }
+
+    fn herdr_card() -> Card {
+        Card::Herdr {
+            version: "0.8.2".to_owned(),
+        }
+    }
+
+    /// F7: the overlay sits above everything. While it is up the keymap's actions do not
+    /// reach the screen underneath — `?` does not open the help overlay behind it, `a`
+    /// accepts nothing, `t` hides nothing — and the frame does not even redraw.
+    #[test]
+    fn app_tour_holds_every_key_that_is_not_its_own() {
+        let mut app = with_tour(vec![Card::Keys]);
+        app.select(Some(row("alpha", "f1")));
+        let before = app.selection.clone();
+        for action in [
+            Action::Help,
+            Action::Accept,
+            Action::AcceptFile,
+            Action::AcceptAll,
+            Action::HideEmpty,
+            Action::NavDown,
+            Action::Open,
+            Action::Snooze,
+            Action::Undo,
+            Action::Refresh,
+        ] {
+            assert_eq!(
+                app.handle(action.clone()),
+                (Changed::No, None),
+                "{action:?} reached the screen under the welcome"
+            );
+        }
+        assert!(!app.help, "no help overlay opened behind it");
+        assert!(!app.hide_empty);
+        assert_eq!(app.selection, before, "the cursor did not move");
+        assert!(app.tour.is_some(), "and the welcome is still up");
+    }
+
+    /// The tour's own keys, a resize, the clock and the news from herdr still land: the
+    /// screen behind it stays live and the overlay does not freeze the program.
+    #[test]
+    fn app_tour_lets_the_frame_stay_live_underneath() {
+        let mut app = with_tour(vec![Card::Keys, empty_card()]);
+        assert_eq!(app.handle(Action::Resize(80, 24)).0, Changed::Yes);
+        assert_eq!(app.size, (80, 24));
+        app.handle(Action::Tick);
+        assert_eq!(
+            app.herdr_update(HerdrUpdate::Connected {
+                version: "0.8.2".to_owned(),
+                protocol: 1,
+            })
+            .0,
+            Changed::Yes,
+            "herdr news still lands"
+        );
+        assert!(app.tour.is_some());
+    }
+
+    /// `enter` on a plain card goes to the next one; `enter` on the last closes the tour
+    /// and asks the loop for the marker.
+    #[test]
+    fn app_tour_enter_walks_the_cards_and_the_last_one_closes_it() {
+        let mut app = with_tour(vec![Card::Keys, depth_card()]);
+        assert_eq!(
+            app.handle(Action::Tour(TourKey::Next)),
+            (Changed::Yes, None)
+        );
+        assert_eq!(app.tour.as_ref().expect("open").at, 1);
+        assert_eq!(
+            app.handle(Action::Tour(TourKey::Next)),
+            (Changed::Yes, Some(Effect::TourDone))
+        );
+        assert!(app.tour.is_none(), "the last card closes it");
+    }
+
+    /// `q` and `esc` skip the rest, from any card, and ask for the marker all the same.
+    #[test]
+    fn app_tour_skip_closes_it_from_any_card() {
+        for at in [0usize, 1] {
+            let mut app = with_tour(vec![Card::Keys, empty_card()]);
+            app.tour.as_mut().expect("open").at = at;
+            assert_eq!(
+                app.handle(Action::Tour(TourKey::Skip)),
+                (Changed::Yes, Some(Effect::TourDone)),
+                "skipped from card {at}"
+            );
+            assert!(app.tour.is_none());
+        }
+    }
+
+    /// The arrows move between a choice card's two rows and stop at each end; a plain card
+    /// has no rows and says so by not redrawing.
+    #[test]
+    fn app_tour_arrows_move_between_the_two_choice_rows_only() {
+        let mut app = with_tour(vec![Card::Keys]);
+        assert_eq!(app.handle(Action::Tour(TourKey::Down)), (Changed::No, None));
+        assert_eq!(app.handle(Action::Tour(TourKey::Up)), (Changed::No, None));
+
+        let mut app = with_tour(vec![empty_card()]);
+        assert_eq!(app.handle(Action::Tour(TourKey::Up)), (Changed::No, None));
+        assert_eq!(
+            app.handle(Action::Tour(TourKey::Down)),
+            (Changed::Yes, None)
+        );
+        assert_eq!(app.tour.as_ref().expect("open").row, 1);
+        assert_eq!(
+            app.handle(Action::Tour(TourKey::Down)),
+            (Changed::No, None),
+            "the last row is the last row"
+        );
+        assert_eq!(app.handle(Action::Tour(TourKey::Up)), (Changed::Yes, None));
+        assert_eq!(app.tour.as_ref().expect("open").row, 0);
+    }
+
+    /// The first row of a choice card is the one already selected, and it writes nothing:
+    /// `enter` on it is the same "next card" the keys card's `enter` is.
+    #[test]
+    fn app_tour_first_choice_row_writes_nothing() {
+        let mut app = with_tour(vec![empty_card()]);
+        assert_eq!(
+            app.handle(Action::Tour(TourKey::Next)),
+            (Changed::Yes, Some(Effect::TourDone))
+        );
+        assert!(!app.hide_empty, "and nothing changed for the session");
+    }
+
+    /// The second row applies to this session the instant it is chosen and asks the loop
+    /// for the one config write. The card stays up until the loop answers.
+    #[test]
+    fn app_tour_second_choice_row_applies_now_and_asks_for_the_write() {
+        let mut app = with_tour(vec![empty_card()]);
+        app.handle(Action::Tour(TourKey::Down));
+        assert_eq!(
+            app.handle(Action::Tour(TourKey::Next)),
+            (
+                Changed::Yes,
+                Some(Effect::TourWrite(Setting::HideEmptyRepos))
+            )
+        );
+        assert!(app.hide_empty, "applied to this session straight away");
+        assert!(app.tour.is_some(), "and the card waits for the answer");
+        assert_eq!(
+            app.tour_written(Ok(())),
+            (Changed::Yes, Some(Effect::TourDone)),
+            "the write landed, so the tour moves on"
+        );
+    }
+
+    /// The herdr card's second row stops following the workspace for the session, the same
+    /// thing `w` does, and asks for `scope = "all"`.
+    #[test]
+    fn app_tour_herdr_choice_stops_following_the_workspace() {
+        let mut app = with_tour(vec![herdr_card()]);
+        app.herdr.link = Link::Connected {
+            version: "0.8.2".to_owned(),
+        };
+        app.herdr.scope = Some(crate::tui::herdr::Scope {
+            label: "W".to_owned(),
+            roots: std::collections::BTreeSet::from([root("alpha")]),
+        });
+        app.herdr.scoped = true;
+        assert!(!listed(&app, "beta"), "out of the workspace");
+        app.handle(Action::Tour(TourKey::Down));
+        assert_eq!(
+            app.handle(Action::Tour(TourKey::Next)),
+            (
+                Changed::Yes,
+                Some(Effect::TourWrite(Setting::HerdrScopeAll))
+            )
+        );
+        assert!(!app.herdr.scoped);
+        assert!(listed(&app, "beta"), "every repository is listed now");
+    }
+
+    /// A write that failed keeps the card up with the reason and the line to add. The
+    /// setting stays applied for the session — the choice was made — and `enter`
+    /// acknowledges the sentence and moves on without asking for the write again.
+    #[test]
+    fn app_tour_failed_write_keeps_the_card_and_enter_moves_past_it() {
+        let mut app = with_tour(vec![empty_card(), Card::Keys]);
+        app.handle(Action::Tour(TourKey::Down));
+        app.handle(Action::Tour(TourKey::Next));
+        assert_eq!(
+            app.tour_written(Err(
+                "could not write /c: nope. Add this line yourself:".to_owned()
+            )),
+            (Changed::Yes, None)
+        );
+        let tour = app.tour.as_ref().expect("still up");
+        assert_eq!(tour.at, 0, "the same card");
+        assert!(tour.failed.is_some());
+        assert!(app.hide_empty, "the choice still holds for the session");
+        // The choice is spent: the arrows have nothing left to move between.
+        assert_eq!(app.handle(Action::Tour(TourKey::Down)), (Changed::No, None));
+        assert_eq!(
+            app.handle(Action::Tour(TourKey::Next)),
+            (Changed::Yes, None),
+            "acknowledged, and on to the next card without a second write"
+        );
+        assert_eq!(app.tour.as_ref().expect("open").at, 1);
+    }
+
+    /// A click on a choice row selects it and takes it, in one gesture; a click anywhere
+    /// else on the screen under the overlay does nothing at all.
+    #[test]
+    fn app_tour_click_takes_the_row_it_landed_on() {
+        let mut app = with_tour(vec![empty_card()]);
+        assert_eq!(
+            app.hit(Target::TourRow(1)),
+            (
+                Changed::Yes,
+                Some(Effect::TourWrite(Setting::HideEmptyRepos))
+            )
+        );
+        assert!(app.hide_empty);
+
+        let mut app = with_tour(vec![empty_card()]);
+        for target in [
+            Target::NavRoot(root("alpha")),
+            Target::HeaderAcceptAll,
+            Target::FileAccept,
+        ] {
+            assert_eq!(
+                app.hit(target.clone()),
+                (Changed::No, None),
+                "{target:?} is under the welcome"
+            );
+        }
+        assert!(app.tour.is_some());
+        assert!(!app.help);
+    }
+
+    /// The footer of a plain card is clickable too — `Target::TourRow(0)` on a card with no
+    /// choice rows advances it, so the mouse alone can walk the whole tour.
+    #[test]
+    fn app_tour_click_on_a_plain_cards_footer_advances_it() {
+        let mut app = with_tour(vec![Card::Keys, depth_card()]);
+        assert_eq!(app.hit(Target::TourRow(0)), (Changed::Yes, None));
+        assert_eq!(app.tour.as_ref().expect("open").at, 1);
+    }
+
+    /// Deliverable 8: the depth card's second row asks for the write and changes nothing
+    /// the reducer owns. The roots the deeper walk finds are the engine's to deliver.
+    #[test]
+    fn app_tour_depth_choice_asks_for_the_write_and_changes_no_app_state() {
+        let mut app = with_tour(vec![depth_card()]);
+        let before = app.clone();
+        assert_eq!(
+            app.handle(Action::Tour(TourKey::Next)),
+            (Changed::Yes, Some(Effect::TourDone)),
+            "the first row keeps the default and writes nothing"
+        );
+
+        let mut app = with_tour(vec![depth_card()]);
+        app.handle(Action::Tour(TourKey::Down));
+        assert_eq!(
+            app.handle(Action::Tour(TourKey::Next)),
+            (Changed::Yes, Some(Effect::TourWrite(Setting::SearchDepth2)))
+        );
+        assert_eq!(app.hide_empty, before.hide_empty);
+        assert_eq!(app.herdr.scoped, before.herdr.scoped);
+        assert_eq!(
+            app.listed_roots().count(),
+            before.listed_roots().count(),
+            "no root moved"
+        );
+        assert_eq!(app.selection, before.selection);
+    }
+
+    /// F4: the empty-repository card is built when the tour reaches it, from the list as it
+    /// is then. Roots the depth card's rescan found are counted; a list that is no longer
+    /// worth the question loses the card.
+    #[test]
+    fn app_tour_empty_card_is_built_at_the_advance_step() {
+        let mut app = with_tour(vec![Card::Keys, Card::Empty { empty: 0, total: 0 }]);
+        // Three roots, all with something pending: not worth asking, so no card at all.
+        assert_eq!(
+            app.handle(Action::Tour(TourKey::Next)),
+            (Changed::Yes, Some(Effect::TourDone)),
+            "the slot is dropped and the tour ends"
+        );
+
+        // The same slot, after twelve empty roots landed.
+        let mut app = with_tour(vec![Card::Keys, Card::Empty { empty: 0, total: 0 }]);
+        let names: Vec<String> = (0..12).map(|i| format!("e{i:02}")).collect();
+        let mut metas: Vec<_> = ["alpha", "beta", "notes"].iter().map(|n| meta(n)).collect();
+        metas.extend(names.iter().map(|n| meta(n)));
+        app.sync_roots(metas);
+        for name in &names {
+            app.apply(pile_event(name, Pile::default()));
+        }
+        assert_eq!(
+            app.handle(Action::Tour(TourKey::Next)),
+            (Changed::Yes, None)
+        );
+        assert_eq!(
+            app.tour.as_ref().expect("open").card(),
+            &Card::Empty {
+                empty: 12,
+                total: 15
+            },
+            "counted from the live list, not from when the tour opened"
+        );
+    }
+
+    /// A click on a row the card does not have is clamped rather than ignored: the hit map
+    /// is built from the frame, but a stale press must not choose row 1 on a card whose
+    /// row 1 is not there.
+    #[test]
+    fn app_tour_click_past_the_last_row_is_clamped() {
+        let mut app = with_tour(vec![empty_card()]);
+        assert_eq!(
+            app.hit(Target::TourRow(9)),
+            (
+                Changed::Yes,
+                Some(Effect::TourWrite(Setting::HideEmptyRepos))
+            ),
+            "clamped to the last row"
+        );
     }
 }

@@ -31,6 +31,9 @@ nix = { workspace = true, features = ["fs", "signal"] }
 similar = "3.2.0"
 globset = "0.4.20"
 sha2 = "0.11.0"
+# `config::write`, the first-launch tour's one sanctioned config write (Amendment v1.11):
+# format-preserving, so every other byte of a hand-written file survives the edit.
+toml_edit = "0.25.15"
 
 [dev-dependencies]
 lastcall-testkit.workspace = true

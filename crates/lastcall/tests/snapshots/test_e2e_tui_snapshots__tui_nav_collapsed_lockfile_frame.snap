@@ -31,4 +31,4 @@ expression: frame
 "│                          │                                                                       │"
 "│                          │                                                                       │"
 "└──────────────────────────┴───────────────────────────────────────────────────────────────────────┘"
-"↑↓ scroll  ← back  a/A accept file  ^A accept all  t hide empty  Tab focus  ? help  q quit          "
+"↑↓ scroll  ← back  a/A accept file  ^A accept all  z undo  t hide empty  Tab focus  ? help  q quit  "

@@ -103,6 +103,19 @@ git -C "$R" sparse-checkout set --no-cone src >/dev/null 2>&1; [ -e "$R/other/o"
 fresh d10; git -C "$R" worktree add -q "$W/d10-wt" -b feat-w; R2="$W/d10-wt"; S2="$W/d10-wt.state"; mkdir -p "$S2"
 ( LC_R="$R2"; LC_STATE="$S2"; lc_init "$R2" "$S2" git; lc_first_sight; echo e >> "$R2/f1"; git -C "$R2" commit -qam wt; assert_pile "D10 linked worktree: commit keeps pending" "f1" )
 fresh d11; mkdir -p "$R/docs"; printf 'x\n' > "$R/docs/résumé draft.md"; assert_pile "D11 unicode+space path" "docs/résumé draft.md"
+# D12: search_depth reads N folders down. The fixture is the scenario's, built once.
+P="$W/d12"; mkdir -p "$P"
+git init -q -b main "$P/a"; echo one > "$P/a/f1"; git -C "$P/a" add -A; git -C "$P/a" commit -qm init
+git init -q -b main "$P/a/sub"; echo s > "$P/a/sub/s"; git -C "$P/a/sub" add -A; git -C "$P/a/sub" commit -qm sub
+git -C "$P/a" add sub 2>/dev/null; git -C "$P/a" commit -qm gitlink            # a committed submodule of a
+mkdir -p "$P/worktrees"; git clone -q "$P/a" "$P/worktrees/b"      # a clone kept one folder down
+git -C "$P/a" worktree add -q "$P/worktrees/a-wt" -b feat-w        # a linked worktree beside it
+mkdir -p "$P/deep/er"; git init -q -b main "$P/deep/er/c"          # two folders down
+mkdir -p "$P/node_modules"; git init -q -b main "$P/node_modules/pkg"
+ln -s "$P/deep" "$P/link"
+assert_roots "D12 depth 1: the repositories directly inside the parent" "a" "$P" 1
+assert_roots "D12 depth 2: the folder below too, submodule and node_modules and link never" "a|worktrees/a-wt|worktrees/b" "$P" 2
+assert_roots "D12 depth 3: two folders below" "a|deep/er/c|worktrees/a-wt|worktrees/b" "$P" 3
 
 echo "== E. storage =="
 fresh e2; echo edit >> "$R/f1"; lc_accept_file f1; echo deadbeefdeadbeefdeadbeefdeadbeefdeadbeef > "$S/overrides/f1"

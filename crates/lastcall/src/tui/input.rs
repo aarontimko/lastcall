@@ -38,6 +38,17 @@ pub enum Action {
     NavPageUp,
     /// Nav focus: a page of entries down. Diff focus: a page of lines down.
     NavPageDown,
+    /// Nav focus: the first entry of the nav. Diff focus: the diff's first line.
+    NavTop,
+    /// Nav focus: the last entry. Diff focus: the last line a long `↓` run reaches.
+    NavBottom,
+    /// The repository row of the listed root **before** the selection's own root; on the
+    /// first root, that root's own row. From the diff the focus comes back to the nav with
+    /// it, because a repository row has no diff to read.
+    NavPrevRoot,
+    /// The repository row of the listed root **after** the selection's own root; on the
+    /// last one, nothing — these jump, they never wrap.
+    NavNextRoot,
     /// Focus the diff for the selected row/group (the cursor stays on that file's current
     /// hunk); on a root entry, select its first row. Bound to `enter`, `l` and `right`.
     Open,
@@ -92,6 +103,24 @@ pub enum Action {
     Flag,
     /// Clear every flag on the selected file.
     Unflag,
+    /// `z`: reverse the most recent accept in the selected root (Amendment v1.11). The
+    /// ledger's undo stack is per root and shared by every lastcall over the same state
+    /// directory, so what `z` pops is whatever landed last, this process's or another's.
+    Undo,
+    /// `s`: open the snooze modal on the selected **repository row**, or wake a snoozed
+    /// repository that `shift-s` is showing. Anything else selected says so and does
+    /// nothing.
+    Snooze,
+    /// `shift-s`: list the snoozed repositories for this session. Session state, never
+    /// written back — the same shape as `t`.
+    ShowSnoozed,
+    /// One keystroke inside the snooze modal. Never key-bound: while the modal is open
+    /// [`snooze_action`] resolves every key before the keymap, so a digit is a digit.
+    SnoozeEdit(SnoozeKey),
+    /// One keystroke inside the first-launch tour (Amendment v1.11). Never key-bound:
+    /// while the overlay is open [`super::tour::tour_action`] resolves every key before the
+    /// keymap and before every modal, so the overlay's keys are the same on every install.
+    Tour(TourKey),
     /// Open the selected file in the **inline** editor, at the line of the hunk under the
     /// cursor (deliverable 8; `Effect::EditInline`). The same rows `EditExternal` opens,
     /// and only when the engine will hand the bytes over: a binary or oversize file says
@@ -153,6 +182,40 @@ pub enum NoteKey {
     Send,
     /// Esc: close the modal, write nothing.
     Cancel,
+}
+
+/// What one keystroke does to the snooze modal (Amendment v1.11).
+///
+/// The modal holds a number, not text, so it has its own tiny vocabulary rather than
+/// [`EditKey`]: digits and backspace edit it, Enter applies, Esc cancels. Everything else
+/// is swallowed, on the note modal's terms — including a printable `quit` binding, because
+/// `q` while a field has the keyboard is content, not a command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnoozeKey {
+    /// An ASCII digit typed into the day count.
+    Digit(char),
+    Backspace,
+    /// Enter: write the snooze and close.
+    Apply,
+    /// Esc: close, write nothing.
+    Cancel,
+}
+
+/// What one keystroke does to the first-launch tour (Amendment v1.11).
+///
+/// Four things, because the overlay asks for one of four: move to the other row, take the
+/// selected one, or stop being asked. Fixed and outside the keymap — a welcome that a
+/// `[keys]` table could make unanswerable would be the one screen nobody can get past.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TourKey {
+    /// Enter: apply the selected row on a choice card, or advance a plain one.
+    Next,
+    /// Up, or `k`.
+    Up,
+    /// Down, or `j`.
+    Down,
+    /// `q` or Esc: write the marker and close, without applying anything.
+    Skip,
 }
 
 /// One edit inside a text buffer ([`super::textbuf::TextBuf`]), for the two places that
@@ -337,6 +400,29 @@ pub fn note_action(event: &Event, keymap: &Keymap, enhanced: bool) -> Option<Act
     quit_only(keymap, key)
 }
 
+/// The snooze modal's action for one key event, consulted before the keymap while
+/// `App.snooze` is open (Amendment v1.11).
+///
+/// A number field, so the vocabulary is small on purpose: an ASCII digit types, Backspace
+/// deletes, Enter applies, Esc cancels. Every other key is swallowed except a
+/// **non-printable** `quit` binding (`ctrl-c` by default), which quits as it does under the
+/// note modal — a printable one types nothing here, because a letter is not a digit, but it
+/// must not quit either while a field has the keyboard.
+pub fn snooze_action(event: &Event, keymap: &Keymap) -> Option<Action> {
+    let Event::Key(k) = event else {
+        return None;
+    };
+    let key = Key::of(k)?;
+    let snooze = match key.code {
+        KeyCode::Esc => SnoozeKey::Cancel,
+        KeyCode::Enter => SnoozeKey::Apply,
+        KeyCode::Backspace => SnoozeKey::Backspace,
+        KeyCode::Char(c) if c.is_ascii_digit() && !key.ctrl && !key.alt => SnoozeKey::Digit(c),
+        _ => return quit_only(keymap, key),
+    };
+    Some(Action::SnoozeEdit(snooze))
+}
+
 /// The picker's action for one key event, on the same terms as [`note_action`]. The picker
 /// shows a list, so `j`/`k` move it as they do in the nav.
 pub fn pick_action(event: &Event, keymap: &Keymap) -> Option<Action> {
@@ -358,7 +444,7 @@ pub fn pick_action(event: &Event, keymap: &Keymap) -> Option<Action> {
 
 /// `Action::Quit` when `key` is a **non-printable** quit binding, else nothing: the escape
 /// hatch a text-entry modal keeps open.
-fn quit_only(keymap: &Keymap, key: Key) -> Option<Action> {
+pub(super) fn quit_only(keymap: &Keymap, key: Key) -> Option<Action> {
     let printable = matches!(key.code, KeyCode::Char(_)) && !key.ctrl && !key.alt;
     match keymap.lookup(key) {
         Some(Action::Quit) if !printable => Some(Action::Quit),
@@ -377,15 +463,31 @@ pub const DEFAULT_KEYMAP: &[(&str, &[&str])] = &[
     ("focus_toggle", &["tab"]),
     ("hunk_next", &["n", "]"]),
     ("hunk_prev", &["p", "["]),
-    ("expand", &["e"]),
-    ("toggle_full_paths", &["f"]),
-    ("toggle_remote", &["o"]),
     ("hide_empty", &["t"]),
     ("accept", &["a"]),
     ("accept_file", &["shift-a"]),
     ("accept_all", &["ctrl-a"]),
     ("restore", &["u"]),
     ("restore_file", &["shift-u"]),
+    ("undo", &["z"]),
+    // The jumps (2026-09-14) come right after the loop and below the 80×24 fold, which
+    // shows sixteen rows: the loop above (through `z`) is what has to be on that first
+    // page, and each jump is a shortcut for what a long `↓` run already does. Their
+    // descriptions are kept within the right column's width of the 100-column two-column
+    // form (`jump to the agent in herdr`, 26 columns): a longer one lands in that column
+    // for some splits, the form then needs 103 columns, and 100×30 folds sixteen keys
+    // (`render_help_uses_two_columns_only_when_one_does_not_fit` pins the shape, with a
+    // truncated table that puts them on the right). `{` and `}` are twins of `alt-up` /
+    // `alt-down` rather than decoration: on macOS the Cmd key never reaches a terminal
+    // program at all, Terminal.app sends Option-arrow as a word jump by default, and a
+    // terminal that implements "Option as Meta" by prefixing an escape sends `ESC ESC [ A`,
+    // which crossterm reads as three keys (`Esc`, `[`, `A`: hunk_prev and accept_file, the
+    // d6 verifier's F1), so a keyboard-only reader needs a binding that is nothing but a
+    // character. They are **not** on the hint line, which is full at 100 columns.
+    ("nav_top", &["home"]),
+    ("nav_bottom", &["end"]),
+    ("nav_prev_root", &["alt-up", "{"]),
+    ("nav_next_root", &["alt-down", "}"]),
     ("flag", &["m"]),
     ("unflag", &["shift-m"]),
     ("select", &["v"]),
@@ -396,6 +498,16 @@ pub const DEFAULT_KEYMAP: &[(&str, &[&str])] = &[
     ("jump", &["g"]),
     ("scope", &["w"]),
     ("refresh", &["r"]),
+    // This table is the help overlay's display order, and at 80 columns the overlay is one
+    // column with room for sixteen rows before the fold. What goes above it is the loop
+    // itself: move, open, accept, put back, undo. The keys that only change what the list
+    // shows, and the pair that sets a repository aside, read perfectly well from the second
+    // page (`?` at 100 columns, or the wider terminal the fold line names).
+    ("expand", &["e"]),
+    ("toggle_full_paths", &["f"]),
+    ("toggle_remote", &["o"]),
+    ("snooze", &["s"]),
+    ("show_snoozed", &["shift-s"]),
     ("help", &["?"]),
     ("quit", &["q", "ctrl-c"]),
 ];
@@ -431,6 +543,10 @@ impl Action {
             "nav_down" => Action::NavDown,
             "nav_page_up" => Action::NavPageUp,
             "nav_page_down" => Action::NavPageDown,
+            "nav_top" => Action::NavTop,
+            "nav_bottom" => Action::NavBottom,
+            "nav_prev_root" => Action::NavPrevRoot,
+            "nav_next_root" => Action::NavNextRoot,
             "open" => Action::Open,
             "back" => Action::Back,
             "focus_toggle" => Action::FocusToggle,
@@ -442,11 +558,14 @@ impl Action {
             "toggle_full_paths" => Action::ToggleFullPaths,
             "toggle_remote" => Action::ToggleRemote,
             "hide_empty" => Action::HideEmpty,
+            "snooze" => Action::Snooze,
+            "show_snoozed" => Action::ShowSnoozed,
             "accept" => Action::Accept,
             "accept_file" => Action::AcceptFile,
             "accept_all" => Action::AcceptAll,
             "restore" => Action::Restore,
             "restore_file" => Action::RestoreFile,
+            "undo" => Action::Undo,
             "flag" => Action::Flag,
             "unflag" => Action::Unflag,
             "select" => Action::Select,
@@ -470,6 +589,13 @@ impl Action {
             "nav_down" => "next entry / scroll down",
             "nav_page_up" => "page up",
             "nav_page_down" => "page down",
+            // The jumps, within the overlay's 30-column cap (design review F15): the two
+            // ends read as one row each because what they do depends on which pane has the
+            // keys, and the repository pair says `repository` in full because it fits.
+            "nav_top" => "first entry / top of diff",
+            "nav_bottom" => "last entry / end of diff",
+            "nav_prev_root" => "previous repository",
+            "nav_next_root" => "next repository",
             "open" => "open the diff",
             "back" => "back to the file list (close help)",
             "focus_toggle" => "toggle focus",
@@ -480,11 +606,27 @@ impl Action {
             "toggle_remote" => "show org/repo",
             // 23 columns: the overlay caps a description at 30 (design review F15).
             "hide_empty" => "hide / show empty repos",
-            "accept" => "accept the hunk or the selected entry",
-            "accept_file" => "accept the whole file",
+            // Amendment v1.11. Every description is capped at 30 columns by the overlay
+            // (design review F15), which is why these say `this repo` and not `this
+            // repository`. `snooze` is shorter still, for the same reason `edit_external`
+            // is: it sits in the overlay's second column, whose width is the whole column
+            // pair's, and at 28 columns ("snooze this repo for a while") it pushed the
+            // two-column form past 100 and the overlay fell back to one clipped column.
+            // How long the snooze is for is the modal's question anyway.
+            "snooze" => "snooze this repo",
+            "show_snoozed" => "show / hide snoozed repos",
+            // Amendment v1.11 (the ruling of 2026-09-14): `a` is the hunk key and `A` is
+            // the key that takes a whole entry — a file, a branch group, a repository from
+            // its row. 28 and 29 columns, inside the overlay's 30-column cap, and both in
+            // the left column of the two-column form, whose width `back to the file list
+            // (close help)` sets. A hunkless file row is still `a`'s (there is no hunk to
+            // point at); that carve-out is the documentation's to explain, not a help row's.
+            "accept" => "accept the hunk under the cursor",
+            "accept_file" => "accept the whole file or repo",
             "accept_all" => "accept everything listed",
             "restore" => "restore the hunk",
             "restore_file" => "restore the whole file",
+            "undo" => "undo the last accept",
             "flag" => "flag it with a note",
             "unflag" => "clear the file's flags",
             // Deliverable 7 wrote this description out in full ("open the file in $EDITOR at
@@ -1105,9 +1247,10 @@ mod tests {
 
     #[test]
     fn input_override_replaces_defaults_rather_than_appending() {
-        // `z`, not `v`: `v` is `select`'s default since deliverable 9, and binding it to a
-        // second action is the `Duplicate` this test is not about.
-        let km = Keymap::from_config(&keys(&[("quit", &["x"]), ("scroll_up", &["z"])])).unwrap();
+        // `c`, not `v` or `z`: `v` is `select`'s default since deliverable 9 and `z` is
+        // `undo`'s since Amendment v1.11, and binding either to a second action is the
+        // `Duplicate` this test is not about.
+        let km = Keymap::from_config(&keys(&[("quit", &["x"]), ("scroll_up", &["c"])])).unwrap();
         assert_eq!(to_action(&key('x'), &km), Some(Action::Quit));
         assert_eq!(to_action(&key('q'), &km), None, "q no longer quits");
         assert_eq!(
@@ -1115,7 +1258,7 @@ mod tests {
             None,
             "ctrl-c no longer quits either: the entry replaced both defaults"
         );
-        assert_eq!(to_action(&key('z'), &km), Some(Action::ScrollUp(1)));
+        assert_eq!(to_action(&key('c'), &km), Some(Action::ScrollUp(1)));
         let table = km.table();
         let quit = table.iter().position(|(n, _)| n == "quit").unwrap();
         assert_eq!(table[quit].1, vec!["x".to_owned()]);
@@ -1126,7 +1269,7 @@ mod tests {
         );
         assert_eq!(
             table.last().unwrap(),
-            &("scroll_up".to_owned(), vec!["z".to_owned()]),
+            &("scroll_up".to_owned(), vec!["c".to_owned()]),
             "a newly bound action is appended"
         );
         let untouched = table.iter().find(|(n, _)| n == "nav_up").unwrap();
@@ -1535,6 +1678,72 @@ mod tests {
         assert_eq!(names.len(), DEFAULT_KEYMAP.len(), "duplicate action name");
     }
 
+    /// The jumps (2026-09-14): `alt-up` / `alt-down` round-trip through the spec grammar
+    /// and reach the reducer as themselves, and the `{` / `}` twins resolve to the very
+    /// same actions — however the terminal spells the brace, with the shift modifier or
+    /// folded into the glyph.
+    ///
+    /// The escape for Option-↑ is `ESC [ 1 ; 3 A`, which crossterm reports as `Up` with
+    /// `ALT`; `pty_nav_jumps` sends those bytes through a real terminal.
+    #[test]
+    fn input_nav_jumps_bind_the_alt_arrows_and_their_brace_twins() {
+        let km = Keymap::defaults();
+        for (spec, code, twin, jump, plain) in [
+            (
+                "alt-up",
+                KeyCode::Up,
+                '{',
+                Action::NavPrevRoot,
+                Action::NavUp,
+            ),
+            (
+                "alt-down",
+                KeyCode::Down,
+                '}',
+                Action::NavNextRoot,
+                Action::NavDown,
+            ),
+        ] {
+            let parsed = Key::parse(spec).expect("the spec parses");
+            assert!(parsed.alt && !parsed.ctrl && !parsed.shift, "{parsed:?}");
+            assert_eq!(parsed.spec(), spec, "the canonical spelling round-trips");
+            assert_eq!(
+                Key::of(&KeyEvent::new(code, KeyModifiers::ALT)),
+                Some(parsed),
+                "the terminal's own event normalizes onto the spec"
+            );
+            assert_eq!(
+                to_action(&key_code(code, KeyModifiers::ALT), &km),
+                Some(jump.clone()),
+                "{spec} reaches the reducer"
+            );
+            assert_eq!(
+                to_action(&key(twin), &km),
+                Some(jump.clone()),
+                "`{twin}` is its twin"
+            );
+            assert_eq!(
+                to_action(&key_code(KeyCode::Char(twin), KeyModifiers::SHIFT), &km),
+                Some(jump),
+                "`{twin}` with the shift the terminal reports is the same key"
+            );
+            assert_eq!(
+                to_action(&key_code(code, KeyModifiers::NONE), &km),
+                Some(plain),
+                "the bare arrow is untouched"
+            );
+        }
+        for (code, action) in [
+            (KeyCode::Home, Action::NavTop),
+            (KeyCode::End, Action::NavBottom),
+        ] {
+            assert_eq!(
+                to_action(&key_code(code, KeyModifiers::NONE), &km),
+                Some(action)
+            );
+        }
+    }
+
     #[test]
     fn input_every_keymap_name_resolves_and_has_a_description() {
         for (name, _) in DEFAULT_KEYMAP {
@@ -1563,6 +1772,10 @@ mod tests {
             (Action::NavDown, "key"),
             (Action::NavPageUp, "key"),
             (Action::NavPageDown, "key"),
+            (Action::NavTop, "key"),
+            (Action::NavBottom, "key"),
+            (Action::NavPrevRoot, "key"),
+            (Action::NavNextRoot, "key"),
             (Action::Open, "key"),
             (Action::Back, "key"),
             (Action::FocusToggle, "key"),
@@ -1584,6 +1797,11 @@ mod tests {
             (Action::RestoreFile, "key"),
             (Action::Flag, "key"),
             (Action::Unflag, "key"),
+            (Action::Undo, "key"),
+            (Action::Snooze, "key"),
+            (Action::ShowSnoozed, "key"),
+            (Action::SnoozeEdit(SnoozeKey::Apply), "modal-note"),
+            (Action::Tour(TourKey::Next), "modal-note"),
             (Action::Select, "key"),
             (Action::Copy, "key"),
             (Action::SelectTo(0), "mouse"),
@@ -1625,6 +1843,10 @@ mod tests {
             | Action::NavDown
             | Action::NavPageUp
             | Action::NavPageDown
+            | Action::NavTop
+            | Action::NavBottom
+            | Action::NavPrevRoot
+            | Action::NavNextRoot
             | Action::Open
             | Action::Back
             | Action::FocusToggle
@@ -1651,6 +1873,11 @@ mod tests {
             | Action::RestoreFile
             | Action::Flag
             | Action::Unflag
+            | Action::Undo
+            | Action::Snooze
+            | Action::ShowSnoozed
+            | Action::SnoozeEdit(_)
+            | Action::Tour(_)
             | Action::Select
             | Action::Copy
             | Action::SelectTo(_)
@@ -1664,9 +1891,9 @@ mod tests {
             | Action::Ack
             | Action::Jump
             | Action::ScopeToggle
-            | Action::Herdr(_) => 44,
+            | Action::Herdr(_) => 53,
         };
-        assert_eq!(table.len(), 44);
+        assert_eq!(table.len(), 53);
     }
 
     #[test]
@@ -2016,5 +2243,74 @@ mod tests {
             .collect();
         assert_eq!(reqs.len(), 3);
         assert_eq!(reqs, expected, "exactly the held piles, in nav order");
+    }
+
+    /// The snooze modal resolves its own keys, like the note editor: digits and the three
+    /// controls, and nothing from the keymap except a non-printable spelling of `quit`.
+    /// Without that last rule `s` (snooze) or `z` (undo) would fire from inside the field.
+    #[test]
+    fn input_snooze_modal_swallows_the_keymap_and_takes_digits() {
+        let km = Keymap::defaults();
+        let snooze = |e: &Event| snooze_action(e, &km);
+        assert_eq!(
+            snooze(&key('3')),
+            Some(Action::SnoozeEdit(SnoozeKey::Digit('3')))
+        );
+        assert_eq!(
+            snooze(&key_code(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(Action::SnoozeEdit(SnoozeKey::Apply))
+        );
+        assert_eq!(
+            snooze(&key_code(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(Action::SnoozeEdit(SnoozeKey::Cancel))
+        );
+        assert_eq!(
+            snooze(&key_code(KeyCode::Backspace, KeyModifiers::NONE)),
+            Some(Action::SnoozeEdit(SnoozeKey::Backspace))
+        );
+        // The keymap's own letters do nothing here.
+        for c in ['s', 'z', 'a', 'j', 'q'] {
+            assert_eq!(snooze(&key(c)), None, "{c} is not the modal's");
+        }
+        // A non-printable quit still quits — the same escape hatch the note editor has.
+        assert_eq!(
+            snooze(&key_code(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Some(Action::Quit)
+        );
+        // `ctrl-3` is not a digit anyone typed into the field.
+        assert_eq!(
+            snooze(&key_code(KeyCode::Char('3'), KeyModifiers::CONTROL)),
+            None
+        );
+    }
+
+    /// Amendment v1.11's three keys are bound, unshadowed, and described in words the
+    /// overlay can print (design review F15 caps a description at 30 columns).
+    #[test]
+    fn input_undo_and_snooze_are_bound_and_described() {
+        let km = Keymap::defaults();
+        let table = km.table();
+        for (action, spec) in [("undo", "z"), ("snooze", "s"), ("show_snoozed", "S")] {
+            let (_, specs) = table
+                .iter()
+                .find(|(n, _)| n == action)
+                .unwrap_or_else(|| panic!("{action} is in the table"));
+            assert_eq!(specs.first().map(String::as_str), Some(spec), "{action}");
+            let desc = Action::describe(action);
+            assert!(!desc.is_empty(), "{action} has words");
+            assert!(desc.chars().count() <= 30, "{action}: {desc:?}");
+        }
+        assert_eq!(
+            km.lookup(Key::of(&KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE)).unwrap()),
+            Some(Action::Undo)
+        );
+        assert_eq!(
+            km.lookup(Key::of(&KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)).unwrap()),
+            Some(Action::Snooze)
+        );
+        assert_eq!(
+            km.lookup(Key::of(&KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT)).unwrap()),
+            Some(Action::ShowSnoozed)
+        );
     }
 }

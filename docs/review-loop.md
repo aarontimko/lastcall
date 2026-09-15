@@ -86,9 +86,22 @@ arrived from a fetch, so it is somebody else's work and not the agent's. **`[mix
 means some of it did and some of it did not. They are a hint about who to ask, not a
 restriction: the keys all work the same.
 
+`↑` and `↓` move one entry at a time. `Home` and `End` (Fn-Left and Fn-Right on a Mac laptop
+keyboard) jump to the first and the last entry of the whole list, and `{` and `}` jump to the previous and the next repository's own row,
+which is quicker than walking through a long pile a line at a time. Option with an arrow key
+does what the braces do, in terminals that send it (see [`config.md`](config.md)).
+
 `t` hides repositories with nothing pending, `f` shows full paths instead of basenames,
 `o` shows `org/repo` instead of the directory name, `?` lists every key, live, including
 anything you have rebound.
+
+`s` sets one repository aside: it asks for a number of days, one by default and 365 at the
+most, and then drops it out of the list until that many days have gone by. It is a view and
+nothing more. lastcall keeps watching and scanning the repository the whole time,
+`lastcall status` keeps reporting it, and it comes back into the list on its own when an
+agent raises a flag on it. `S` lists the ones you have set aside alongside everything else,
+each saying the date it comes back; `s` on one of those wakes it now. The bottom line keeps
+count either way.
 
 ## 2. Read
 
@@ -136,9 +149,12 @@ Accepting means "I have seen this and it is fine". Nothing on disk changes. What
 is that lastcall stops showing it to you, and the next time it scans, only what happened
 after this point is pending.
 
-- `a` accepts the hunk under the cursor, or, in the list, the selected file, branch group
-  or whole repository.
-- `A` accepts the whole file whatever hunk you are on.
+- `a` accepts the hunk under the cursor, and nothing larger. On a file with no hunks to
+  point at (binary, collapsed, deleted, unreadable) it accepts that file.
+- `A` accepts the whole entry: the whole file whatever hunk you are on, and in the list the
+  whole branch group or the whole repository from its row. A repository of ten files or
+  fewer goes at once, so `A` is the key that takes a lot in one keystroke and `a` is the
+  one you can lean on.
 - `ctrl-a` accepts everything listed across every repository. Above ten files it asks
   first, naming the count.
 
@@ -148,6 +164,15 @@ repository row rather than jumping somewhere else.
 
 You do not have to finish. Quit halfway through and what you accepted stays accepted; the
 rest is still there next time.
+
+`z` undoes the last accept in the selected repository, and again for the one before it, up
+to the last twenty. Like an accept it changes nothing on disk: the files it covers simply go
+back to pending, with any flags you put on them still there, and the cursor moves to the
+first of them. Each repository has its own stack, and the stack outlives the session, so a
+morning's accept can be undone that evening. Saving a file in the built-in editor is on the
+stack too, because saving marks the file reviewed (see [Edit](#6-edit)); undoing that one
+puts your own edit back on the list as something to look at, which is the point. `z` with
+nothing left to undo says so and does nothing.
 
 ## 4. Restore
 

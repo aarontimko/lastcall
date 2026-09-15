@@ -21,17 +21,47 @@ The first of these that exists wins:
 Every key is optional. **An unknown key is an error**, on every command, naming the key and
 the line: a typo in a config file never silently does nothing.
 
+## The first launch
+
+The first time you open the review screen, a small card sits over the frame and names the
+keys you need to get started. The frame underneath is live, so the scan you launched keeps
+running while you read. `enter` moves to the next card, `q` skips the rest, and once you
+have been through it the card never appears again: a one-line note in the state directory
+records that it has been shown. `lastcall tui --tour` brings it back whenever you want it.
+
+The card after the keys asks how far down the list looks: one folder below the directory
+you launched in, which is what lastcall does today, or two, which also reaches a clone or a
+worktree kept in a folder such as `worktrees/<name>`. Choosing two writes `search_depth = 2`
+and the new repositories appear on the screen behind the card. It names the config file for
+the settings that go further than that.
+
+Two more cards appear only when they apply, and each offers a choice:
+
+- Running inside a herdr session, lastcall narrows the list to the repositories that
+  workspace is working in. The card offers to show every repository instead, which writes
+  `scope = "all"` under `[herdr]`.
+- With ten or more repositories that have nothing pending, the card offers to open with the
+  empty ones hidden, which writes `hide_empty_repos = true`.
+
+Either choice takes effect immediately and is written to the config file named in "Where the
+file lives", under a comment saying where the line came from. If there is no config file
+yet, one is created holding just that comment and that setting. **Nothing else in the file is
+touched**: your comments, your key order and your formatting survive the edit. If the write
+fails, the card says so and prints the line to add by hand, and the change still holds for
+the session.
+
 ## The keys
 
 | key | default | what it does |
 |---|---|---|
-| `parent_dirs` | `[]`, meaning the directory you launched in | absolute paths. Every git repository under each one is watched. |
+| `parent_dirs` | `[]`, meaning the directory you launched in | absolute paths. Every git repository directly under each one is watched, and a repository sitting untracked inside one of those is listed too, with a badge. A repository one plain folder deeper (for example `worktrees/<name>`) is reached with `search_depth`, or with its own entry here when it lives somewhere else entirely. |
 | `draft_dirs` | `[]` | directories that are **not** git repositories, each reviewed as a root of its own. Globs relative to a parent directory (`"_drafts/**"`, `"notes"`) or absolute paths. |
 | `draft_initial` | `"seen"` | what the first sight of a draft root means. `seen` starts from zero, so only changes made after that are pending. `pending` treats everything already there as pending. |
 | `collapsed_globs` | the nine common lockfiles | paths shown as one collapsed row instead of a wall of hunks. The default list is `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `Cargo.lock`, `poetry.lock`, `uv.lock`, `Gemfile.lock`, `go.sum`, `composer.lock`. Setting the key replaces the list. |
 | `collapse_size_bytes` | `524288` (512 KiB) | files at or above this size collapse too. Must be greater than zero. A file with a NUL byte in its first 8,000 is binary and collapses whatever this says. |
 | `ignore_globs` | `.git/**`, `node_modules/**`, `target/**`, `vendor/**`, `.venv/**` | these scope the filesystem watcher only. An ignored path never wakes a scan, but the next scan still reports a tracked edit under it, so this is a noise filter and not a way to hide changes. |
-| `hide_empty_repos` | `false` | what the `t` toggle starts as. `false` lists every repository under a parent directory, whether it has anything pending or not. `true` opens with the empty ones hidden, except one carrying an agent flag. `t` flips it for the session, and the headless commands are unaffected. |
+| `hide_empty_repos` | `false` | what the `t` toggle starts as. `false` lists every repository under a parent directory, whether it has anything pending or not. `true` opens with the empty ones hidden, except one carrying an agent flag. `t` flips it for the session, and the headless commands are unaffected. The welcome on your first launch offers to write `true` here for you. |
+| `search_depth` | `1` | how many folders below each parent directory are read for a repository. `1` is the repositories directly inside it, `2` also reads one plain folder further, such as `worktrees/<name>`, and lists a worktree kept inside a listed repository (one git call per listed repository, each rescan), up to `4`. The walk never enters a repository or a dependency folder such as `node_modules`, `target`, `.venv` or `vendor`, and it runs again every thirty seconds, so `3` and `4` want a narrow parent directory rather than a home directory. The welcome on your first launch offers to write `2` here for you. The key is new in this release: a 0.1.0 binary refuses a config file that has it, so delete the line before going back to that version. |
 
 ```toml
 parent_dirs = ["/home/me/src"]
@@ -40,6 +70,7 @@ draft_initial = "seen"
 collapsed_globs = ["package-lock.json", "Cargo.lock", "*.min.js"]
 collapse_size_bytes = 524288
 hide_empty_repos = false
+search_depth = 1
 ```
 
 If you have a config file and launch somewhere outside `parent_dirs`, that directory is
@@ -70,6 +101,10 @@ and shift with tab is `backtab`.
 | `nav_down` | `down`, `j` | next entry, or scroll the diff down |
 | `nav_page_up` | `pageup`, `b` | a page up |
 | `nav_page_down` | `pagedown`, `space` | a page down |
+| `nav_top` | `home` | the first entry, or the top of the diff |
+| `nav_bottom` | `end` | the last entry, or the end of the diff |
+| `nav_prev_root` | `alt-up`, `{` | the previous repository's row. Inside the first one, that repository's own row |
+| `nav_next_root` | `alt-down`, `}` | the next repository's row. On the last one, nothing: these jump, they never wrap |
 | `open` | `enter`, `l`, `right` | open the diff for the selected row |
 | `back` | `esc`, `h`, `left` | close the help overlay, else return to the file list. Never quits. |
 | `focus_toggle` | `tab` | move focus between the two panes |
@@ -79,11 +114,14 @@ and shift with tab is `backtab`.
 | `toggle_full_paths` | `f` | full paths instead of basenames |
 | `toggle_remote` | `o` | show `org/repo` instead of the directory name |
 | `hide_empty` | `t` | hide or show repositories with nothing pending |
-| `accept` | `a` | accept the hunk under the cursor, or the selected entry |
-| `accept_file` | `shift-a` | accept the whole file |
+| `snooze` | `s` | set a repository aside for a number of days |
+| `show_snoozed` | `shift-s` | show or hide the repositories that are set aside |
+| `accept` | `a` | accept the hunk under the cursor, or a file with no hunks |
+| `accept_file` | `shift-a` | accept the whole file, or the whole repository from its row |
 | `accept_all` | `ctrl-a` | accept everything listed, across every repository |
 | `restore` | `u` | put the hunk back the way it was |
 | `restore_file` | `shift-u` | put the whole file back, asking first |
+| `undo` | `z` | undo the last accept in the selected repository; the last 20 are kept |
 | `flag` | `m` | flag it with a note |
 | `unflag` | `shift-m` | clear that file's flags |
 | `select` | `v` | start a line selection in the diff |
@@ -96,6 +134,15 @@ and shift with tab is `backtab`.
 | `refresh` | `r` | rescan now |
 | `help` | `?` | the help overlay, which lists all of this live |
 | `quit` | `q`, `ctrl-c` | quit |
+
+On macOS the Cmd key never reaches a program running in a terminal, so no action here can be
+bound to it; `Home` and `End` on a Mac laptop keyboard are Fn-Left and Fn-Right, which iTerm2
+and Terminal.app send as `home` and `end`. That is also why the two repository jumps are
+bound to Option and an arrow: iTerm2 and herdr panes send that as
+`alt-up` and `alt-down`. Terminal.app sends Option-arrow as a word jump instead, and its
+"Use Option as Meta key" setting is not the answer: a terminal that sends Option as an
+escape prefix can deliver Option-Up as three separate keys, and the third of them is `A`.
+Use `{` and `}` there; they are bound to the same two actions and work everywhere.
 
 The confirmation modal's own keys, `y` and `enter` to confirm, `n` and `esc` to cancel, are
 not rebindable in this version.
@@ -115,7 +162,7 @@ session. What it adds and how the link is found: [`herdr.md`](herdr.md).
 | `mode` | `"auto"` | `auto` links to herdr when there is a session to link to and runs standalone otherwise, `on` also says in the header why a link failed, `off` never looks. |
 | `session` | unset | pin a named session instead of discovering one. |
 | `toast` | `true` | ask herdr for a desktop notification when a repository first goes ready. herdr's own `[ui.toast] delivery` must be set to `"herdr"` as well, and it is `"off"` by default. |
-| `scope` | `"workspace"` | which repositories the overlay covers: `workspace` narrows to the ones in the herdr workspace this pane belongs to, `all` covers every watched repository. `w` toggles it for the session. |
+| `scope` | `"workspace"` | which repositories the overlay covers: `workspace` narrows to the ones in the herdr workspace this pane belongs to, `all` covers every watched repository. `w` toggles it for the session. The welcome on your first launch offers to write `all` here for you. |
 
 ```toml
 [herdr]
@@ -194,7 +241,8 @@ each with a `ledger.json` recording what you have already seen, a `store/` that 
 git repository holding the baseline objects, a private `index` used as a cache, and a
 `lock` file that serialises writes so two lastcalls over one repository keep each other's
 accepts. Flags that had nowhere to go are written under `exports/`, and the once-a-day
-update check leaves a timestamp in `update-check.json`. The identifiers are hashes of the
+update check leaves a timestamp in `update-check.json`, beside `first-launch.json`, the
+one-line note that the welcome has already been shown. The identifiers are hashes of the
 paths, so `ls` is the quickest way to find the one you want, and `lastcall status` prints
 the state directory it read as its first line. Nothing is ever written inside a watched
 repository. The full layout, and how to read a ledger with `jq` and `git`, are in

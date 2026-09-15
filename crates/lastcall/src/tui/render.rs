@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 
 use lastcall_engine::count::with_thousands;
 use lastcall_engine::hunks::{EXPAND_LINE_CAP, Hunk, Tag};
-use lastcall_engine::ledger::Flag;
+use lastcall_engine::ledger::{Flag, iso8601_date};
 use lastcall_engine::scan::{Change, Collapsed, Rename, Row};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -23,12 +23,14 @@ use ratatui::widgets::{Block, Clear, Widget};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::app::{
-    self, AcceptScope, App, Editor, Focus, MIN_SIZE, NAV_MIN_COLS, RootView, Selection, Target,
-    annotation_name, diff_lines, hunk_header, hunk_offsets, plural, restore_question,
+    self, AcceptAnswer, AcceptScope, App, Editor, Focus, MIN_SIZE, NAV_MIN_COLS, RootView,
+    Selection, Target, annotation_name, diff_lines, hunk_header, hunk_offsets, plural,
+    restore_question,
 };
 use super::herdr::{Dot, Link};
 use super::input::{Action, MODAL_KEYS};
 use super::textbuf::Wrap;
+use super::tour::{Kind as TourLine, MIN_COLS as TOUR_MIN_COLS};
 
 pub const TOO_SMALL: &str = "too small: 40×10 min";
 /// The note modal's box: wide enough for a sentence, narrow enough to sit over the diff.
@@ -52,6 +54,9 @@ pub fn note_keys(enhanced: bool) -> &'static str {
     }
 }
 pub const PICK_KEYS: &str = "↑↓ choose   ⏎ send   Esc cancel";
+/// The snooze modal's key line (Amendment v1.11). Fixed, like the note modal's: these keys
+/// are the modal's own and are not in the keymap.
+pub const SNOOZE_KEYS: &str = "digits edit   ⏎ snooze   Esc cancel";
 pub const NO_SELECTION: &str = "select a file (↑↓ or click) · ? for help";
 /// The right pane while the herdr scope verdict is still pending at launch
 /// (`HerdrView::scope_pending`): nothing is listed yet, so nothing is selectable.
@@ -87,6 +92,12 @@ pub fn nothing_pending_short(status: &str) -> String {
 /// OSC 52 does not — with `v`/`y` named beside it. 62 columns, so the note fits inside the
 /// overlay at 80 (design review F19).
 pub const SELECT_NOTE: &str = "shift+drag selects text (mouse capture is on) · v/y copies";
+
+/// The help overlay's last footer row (Amendment v1.11): the welcome card runs once and
+/// then never again, so the one place a reader looks up a key is also the place that says
+/// how to get it back. 44 columns, narrower than [`SELECT_NOTE`], so it costs the overlay
+/// no width.
+pub const TOUR_NOTE: &str = "lastcall tui --tour shows the welcome again";
 
 /// The inline editor's line-number gutter: four columns of number and one for the `▎` that
 /// marks a line inside a pending hunk (deliverable 8). `App::EDITOR_GUTTER` is the same
@@ -290,6 +301,18 @@ pub fn render(app: &App, frame: &mut Frame<'_>) -> HitMap {
     if app.picker.is_some() {
         render_picker(app, buf, area);
     }
+    // The snooze modal is the top layer too, and never open beside any of the others: `s`
+    // only answers on a repository row, and every modal above swallows it.
+    if app.snooze.is_some() {
+        render_snooze(app, buf, area);
+    }
+    // The welcome overlay is above all of them (Amendment v1.11, F7). It opens on the first
+    // frame past the launch hold, when none of the modals can be open yet, and its rows go
+    // into the hit map **last** so a press on one resolves to the tour and not to whatever
+    // the live screen underneath is drawing.
+    if app.tour.is_some() {
+        render_tour(app, buf, area, &mut hits);
+    }
     hits
 }
 
@@ -466,7 +489,10 @@ fn count_plus(n: usize, plus: bool, noun: &str) -> String {
 /// the status text is truncated first and the notice keeps its right-hand column.
 fn render_status(app: &App, buf: &mut Buffer, area: Rect) {
     let width = area.width as usize;
-    let notice = app.scope_notice();
+    // Amendment v1.11 / design review F6: the scope count and the snooze count share one
+    // right-hand notice, and it chooses its own form for the width — `render_status` itself
+    // still has no tiers.
+    let notice = app.bottom_notice(area.width);
     // The notice needs its own column plus a gap; below that it takes the line alone.
     let notice_room = notice.as_ref().filter(|n| n.width() + 4 <= width);
     let line = match (&app.status, app.status_age()) {
@@ -526,8 +552,10 @@ const HINT_DROP_ORDER: &[&str] = &[
     "refresh",
     "focus_toggle",
     "scope",
+    "snooze",
     "accept_all",
     "hide_empty",
+    "undo",
     "jump",
     "ack",
     "accept_file",
@@ -545,9 +573,10 @@ const HINT_NAV_ONLY: &[&str] = &["scope", "focus_toggle", "refresh", "select", "
 /// accept all  t hide empty  Tab focus  r refresh  ? help  q quit`, where `<accept>` follows
 /// the selection — `a accept hunk  A accept file` on a file row with hunks in **either**
 /// pane, `a/A accept file` on a hunkless file row (binary, collapsed, deleted, unreadable),
-/// `a accept group` on a group entry, `a accept all in <root>` on a **non-empty** root entry
-/// (how the per-repo fold is told from the header's global one; on an empty repo row `a`
-/// does nothing, so the line does not offer it — verifier (a) F2). With the **diff** focused
+/// `A accept group` on a group entry, `A accept all in <root>` on a **non-empty** root entry
+/// (Amendment v1.11: `A` is the key that takes a whole entry, and it is how the per-repo
+/// fold is told from the header's global one; on an empty repo row neither key accepts
+/// anything, so the line does not offer it — verifier (a) F2). With the **diff** focused
 /// the first two hints are `↑↓ scroll  ← back` instead, because that is what those keys do
 /// there (Design pass D2, ruling R3); the two forms are the same width.
 ///
@@ -590,28 +619,38 @@ pub fn hints(app: &App, width: u16) -> String {
     let accept = first("accept");
     let accept_file = first("accept_file");
     let scope = app.accept_scope();
-    let context = match &scope {
-        Some(AcceptScope::Hunk { .. }) => accept.as_ref().map(|k| format!("{k} accept hunk")),
-        Some(AcceptScope::File { .. }) => match (&accept, &accept_file) {
+    // What `A` takes here. A group entry and a repository row are its alone since
+    // Amendment v1.11, so their phrases are built from this and named with its key: the
+    // line spells the key that will do the thing it promises.
+    let whole = app.accept_file_scope();
+    let context = match (&scope, &whole) {
+        (Some(AcceptAnswer::Take(AcceptScope::Hunk { .. })), _) => {
+            accept.as_ref().map(|k| format!("{k} accept hunk"))
+        }
+        (Some(AcceptAnswer::Take(AcceptScope::File { .. })), _) => match (&accept, &accept_file) {
             (Some(a), Some(f)) => Some(format!("{a}/{f} accept file")),
             (Some(a), None) => Some(format!("{a} accept file")),
             (None, Some(f)) => Some(format!("{f} accept file")),
             (None, None) => None,
         },
-        Some(AcceptScope::Group { .. }) => accept.as_ref().map(|k| format!("{k} accept group")),
+        (_, Some(AcceptScope::Group { .. })) => {
+            accept_file.as_ref().map(|k| format!("{k} accept group"))
+        }
         // Verifier (a) F2: since v1.9 a repo with nothing pending is a selectable nav row,
-        // and `a` on it lands on `nothing to accept`. A hint the line promises has to do
+        // and `A` on it lands on `nothing to accept`. A hint the line promises has to do
         // something, so the phrase is offered only while the repo has rows.
-        Some(AcceptScope::Root(root)) => accept
+        (_, Some(AcceptScope::Root(root))) => accept_file
             .as_ref()
             .filter(|_| app.roots.get(root).is_some_and(|v| !v.rows().is_empty()))
             .map(|k| format!("{k} accept all in {}", app.root_name(root))),
         // `Bless` is never what the *selection* covers — it is built by the editor-return
         // path and lives only inside a confirm — so the hint line has nothing to say for it.
-        Some(AcceptScope::All) | Some(AcceptScope::Bless { .. }) | None => None,
+        _ => None,
     };
     let file = match &scope {
-        Some(AcceptScope::Hunk { .. }) => accept_file.map(|k| format!("{k} accept file")),
+        Some(AcceptAnswer::Take(AcceptScope::Hunk { .. })) => {
+            accept_file.map(|k| format!("{k} accept file"))
+        }
         _ => None,
     };
     // (hint, tier): when the line must shrink, tier 4 goes first (`t hide empty`), then
@@ -633,6 +672,31 @@ pub fn hints(app: &App, width: u16) -> String {
         .is_some_and(|f| f.attention())
         .then(|| first("jump").map(|k| format!("{k} jump")))
         .flatten();
+    let undo = app
+        .flagged_root()
+        .and_then(|r| app.roots.get(&r).map(|v| v.pile.undo))
+        .is_some_and(|n| n > 0)
+        .then(|| first("undo").map(|k| format!("{k} undo")))
+        .flatten();
+    // Amendment v1.11, the sponsor's own run (2026-09-14): `s` answers only on a
+    // repository row, and there it either snoozes or, on a snoozed repository that
+    // `shift-s` is showing, wakes. The label follows the state so the line promises what
+    // the key will do; on a file row the key is not offered, because there it refuses.
+    let snooze = match &app.selection {
+        Some(Selection::Root(root)) => first("snooze").map(|k| {
+            let verb = if app
+                .roots
+                .get(root)
+                .is_some_and(|v| app.snoozed(v).is_some())
+            {
+                "wake"
+            } else {
+                "snooze"
+            };
+            format!("{k} {verb}")
+        }),
+        _ => None,
+    };
     let diff = app.effective_focus() == Focus::Diff;
     // Verifier (b) F4, the same rule as `accept all in <root>` above: a hint the line
     // promises has to do something. `v` and `y` work on diff *lines*, and a hunkless entry
@@ -712,6 +776,11 @@ pub fn hints(app: &App, width: u16) -> String {
                 .filter(|_| app.counts_of(&AcceptScope::All).files > 0)
                 .map(|k| format!("{k} accept all")),
         ),
+        // Amendment v1.11 (design review F14): offered only while the selected repository
+        // has something to undo, which the pile says (`Pile::undo`) — the hint line never
+        // promises a key that would land on `nothing to undo`.
+        ("undo", undo),
+        ("snooze", snooze),
         ("ack", ack),
         ("jump", jump),
         ("hide_empty", hide_empty),
@@ -854,12 +923,21 @@ fn render_nav(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
             view.meta.branch_label(),
             count_plus(view.rows().len(), view.pile.omitted > 0, "file")
         );
+        let mut branch_spans = vec![if empty {
+            Span::styled(branch, dim())
+        } else {
+            Span::raw(branch)
+        }];
+        // Amendment v1.11: a snoozed repository is only on the nav because `shift-s` is
+        // showing it (or its agent wants attention), so the line says why it is here.
+        if let Some(until) = app.snoozed(view) {
+            branch_spans.push(Span::styled(
+                format!(" · snoozed until {}", iso8601_date(until)),
+                dim(),
+            ));
+        }
         lines.push(NavLine {
-            line: Line::from(if empty {
-                Span::styled(branch, dim())
-            } else {
-                Span::raw(branch)
-            }),
+            line: Line::from(branch_spans),
             target: None,
             selected: false,
         });
@@ -1786,7 +1864,7 @@ fn line_text(bytes: &[u8]) -> String {
 
 // ---- help --------------------------------------------------------------------------------
 
-fn key_label(spec: &str) -> String {
+pub(super) fn key_label(spec: &str) -> String {
     match spec {
         "up" => "↑".into(),
         "down" => "↓".into(),
@@ -1797,8 +1875,14 @@ fn key_label(spec: &str) -> String {
         "tab" => "Tab".into(),
         "pageup" => "PgUp".into(),
         "pagedown" => "PgDn".into(),
+        "home" => "Home".into(),
+        "end" => "End".into(),
         "space" => "Space".into(),
         s if s.starts_with("ctrl-") => format!("Ctrl-{}", s[5..].to_uppercase()),
+        // `Alt-↑`, on the `Ctrl-` row's terms, so the arrow is the same glyph the `nav_up`
+        // row shows. The key itself is what the reader is looking for; the modifier is a
+        // prefix on it, not a different spelling of it.
+        s if s.starts_with("alt-") => format!("Alt-{}", key_label(&s[4..])),
         s => s.to_owned(),
     }
 }
@@ -1829,9 +1913,10 @@ const HELP_GUTTER: usize = 3;
 /// for a key finds it where the config file has it. A short terminal that is also narrow
 /// gets one column and the old truncation; there is nothing better to do with 40 columns.
 fn help_columns(keys: &[String], area: Rect) -> Vec<String> {
-    // `+ 2` for the blank and SELECT_NOTE below the body, `+ 4` for the border, the pad and
-    // the `any key closes` line — the overlay's fixed overhead.
-    if keys.len() + 2 + 4 <= area.height as usize {
+    // `+ 4` for what sits below the body — the blank, the newline note, `SELECT_NOTE` and
+    // `TOUR_NOTE` — and `+ 4` for the border, the pad and the `any key closes` line: the
+    // overlay's fixed overhead.
+    if keys.len() + 4 + 4 <= area.height as usize {
         return keys.to_vec();
     }
     let split = keys.len().div_ceil(2);
@@ -1889,6 +1974,7 @@ fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
     rows.push(String::new());
     rows.push(newline_note(app.enhanced).to_owned());
     rows.push(SELECT_NOTE.to_owned());
+    rows.push(TOUR_NOTE.to_owned());
     let width = (rows.iter().map(|r| r.width()).max().unwrap_or(0) + 4).min(area.width as usize);
     let height = (rows.len() + 4).min(area.height as usize);
     let rect = Rect::new(
@@ -1917,8 +2003,9 @@ fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
         // overlay clips, and what it clips is key rows — never the footer. A reader who
         // cannot see every key can still see what the mouse does and how to leave.
         //
-        // Two rows are reserved out of `cap` here, the newline note and `SELECT_NOTE`;
-        // the `any key closes` line below them is already out of `cap` by construction.
+        // Three rows are reserved out of `cap` here, the newline note, `SELECT_NOTE` and
+        // `TOUR_NOTE`; the `any key closes` line below them is already out of `cap` by
+        // construction.
         // Reserving too few put the body's last row on the footer's row, so the footer was
         // the thing the clip dropped (verifier (b) F4).
         //
@@ -1932,7 +2019,7 @@ fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
             .iter()
             .find(|(name, _)| *name == "quit")
             .map(|(_, row)| row.clone());
-        let mut keep = cap.saturating_sub(3);
+        let mut keep = cap.saturating_sub(4);
         // …and `quit` is pinned to the end of what survives, when what survives does not
         // already carry it. The keymap grows — Phase 8 alone adds four rows — and a clip
         // that simply takes the first N pushes the last row off first, which in this keymap
@@ -1978,6 +2065,7 @@ fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
         }
         rows.push(newline_note(app.enhanced).to_owned());
         rows.push(SELECT_NOTE.to_owned());
+        rows.push(TOUR_NOTE.to_owned());
         rows.truncate(cap);
     }
     for (i, row) in rows.iter().take(cap).enumerate() {
@@ -2145,6 +2233,123 @@ fn render_note(app: &App, buf: &mut Buffer, area: Rect) {
             inner.width.saturating_sub(1) as usize,
             *style,
         );
+    }
+}
+
+/// The snooze modal: which repository, for how many days, and the keys that end it
+/// (Amendment v1.11).
+///
+/// The note modal's shape with a number in place of the text area — one line, because that
+/// is the whole question. The field carries the same caret the note does, so a reader who
+/// has used `m` knows where their digits will land, and an emptied field shows the caret
+/// alone rather than a `0` nobody typed.
+fn render_snooze(app: &App, buf: &mut Buffer, area: Rect) {
+    let Some(entry) = &app.snooze else {
+        return;
+    };
+    let rows: Vec<(String, Style)> = vec![
+        (
+            format!(
+                "snooze {} for [{}{NOTE_CARET}] day(s)",
+                entry.name, entry.days
+            ),
+            bold(),
+        ),
+        (String::new(), Style::new()),
+        (SNOOZE_KEYS.to_owned(), dim()),
+    ];
+    let width = (rows.iter().map(|(r, _)| r.width()).max().unwrap_or(0) + 4)
+        .min(area.width as usize)
+        .max(8);
+    let height = (rows.len() + 2).min(area.height as usize);
+    let rect = centered(area, width as u16, height as u16);
+    let inner = modal_block(" snooze ", rect, buf);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    for (i, (row, style)) in rows.iter().take(inner.height as usize).enumerate() {
+        buf.set_stringn(
+            inner.x + 1,
+            inner.y + i as u16,
+            row,
+            inner.width.saturating_sub(1) as usize,
+            *style,
+        );
+    }
+}
+
+/// The first-launch welcome overlay (Amendment v1.11, deliverable 1).
+///
+/// The confirm modal's shape at the size of a card: a centred box, at least
+/// [`tour::MIN_COLS`](super::tour::MIN_COLS) wide, the body wrapped to it. The card's text
+/// is `tour.rs`'s — what a card says and how its columns line up is the card's business —
+/// and what happens here is the painting and the hit map, because both are facts about a
+/// frame rather than about the tour.
+///
+/// The height ladder spends the blank separator lines first: a card on a short terminal
+/// closes up rather than losing its footer, which is the one line saying how to leave. A
+/// card that would rather give up a paragraph than its spacing says so itself: the height
+/// budget goes to `Tour::lines` before the painter sees a row, which is how the depth card
+/// drops its hint block at 60x14 (deliverable 8).
+fn render_tour(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
+    let Some(tour) = &app.tour else {
+        return;
+    };
+    // Two borders and one column of padding on each side, and a column of the screen left
+    // showing on each side of the box so it reads as an overlay rather than a repaint.
+    let max = area.width.saturating_sub(6) as usize;
+    let floor = (TOUR_MIN_COLS as usize).saturating_sub(4).min(max);
+    let text = tour.natural(app).clamp(floor, max.max(1));
+    let mut rows = tour.lines(app, text, area.height.saturating_sub(2) as usize);
+    let width = (rows
+        .iter()
+        .map(|l| l.text.width())
+        .max()
+        .unwrap_or(0)
+        .max(floor)
+        + 4)
+    .min(area.width as usize);
+    let mut height = rows.len() + 2;
+    while height > area.height as usize {
+        let Some(blank) = rows.iter().position(|l| l.text.is_empty()) else {
+            break;
+        };
+        rows.remove(blank);
+        height -= 1;
+    }
+    let rect = centered(area, width as u16, height.min(area.height as usize) as u16);
+    let inner = modal_block(" welcome ", rect, buf);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    // A failed write leaves a choice card with no choice left to make — the setting is
+    // already applied — so its footer is what the mouse advances from.
+    let footer_advances = !tour.card().is_choice() || tour.failed.is_some();
+    for (i, row) in rows.iter().take(inner.height as usize).enumerate() {
+        let y = inner.y + i as u16;
+        let style = match row.kind {
+            TourLine::Title => bold(),
+            TourLine::Choice(n) if n == tour.row => bold(),
+            TourLine::Choice(_) => Style::new(),
+            TourLine::Footer => dim(),
+            TourLine::Body => Style::new(),
+        };
+        buf.set_stringn(
+            inner.x + 1,
+            y,
+            &row.text,
+            inner.width.saturating_sub(1) as usize,
+            style,
+        );
+        let target = match row.kind {
+            TourLine::Choice(n) => Some(Target::TourRow(n)),
+            TourLine::Footer if footer_advances => Some(Target::TourRow(0)),
+            _ => None,
+        };
+        if let Some(target) = target {
+            hits.targets
+                .push((Rect::new(inner.x, y, inner.width, 1), target));
+        }
     }
 }
 
@@ -2391,6 +2596,7 @@ fn modifier_names(m: Modifier) -> String {
 #[cfg(test)]
 mod tests {
     use super::super::app::{Changed, diff_len, testfix::*};
+    use super::super::input::SnoozeKey;
     use super::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -2784,7 +2990,7 @@ mod tests {
         assert!(frame.contains("x              quit"), "{frame}");
         assert!(!frame.contains("q / Ctrl-C"), "{frame}");
         assert!(
-            frame.contains("A              accept the whole file"),
+            frame.contains("A              accept the whole file or repo"),
             "{frame}"
         );
         assert!(frame.contains("y / ⏎          confirm"), "{frame}");
@@ -2819,6 +3025,24 @@ mod tests {
             );
         }
         assert!(frame.contains(SELECT_NOTE), "{frame}");
+    }
+
+    /// Amendment v1.11, deliverable 5. The welcome card shows itself once and then writes a
+    /// marker; the only way back to it is the flag, and the one place a reader looks
+    /// something up is this overlay. The row is narrower than `SELECT_NOTE`, so it costs
+    /// the box no width — that is what keeps it from pushing the table into a clip.
+    #[test]
+    fn render_help_says_how_to_see_the_welcome_again() {
+        let mut app = App::new();
+        app.help = true;
+        for (w, h) in [(100u16, 40u16), (100, 30), (80, 24), (60, 14)] {
+            let (frame, _) = frame_of(&app, w, h);
+            assert!(frame.contains(TOUR_NOTE), "{w}x{h}:\n{frame}");
+        }
+        assert!(
+            TOUR_NOTE.width() <= SELECT_NOTE.width(),
+            "the row would widen the overlay"
+        );
     }
 
     /// Ruling P9 in the one place a reviewer looks a key up: the overlay names `⇧⏎` only
@@ -2934,6 +3158,9 @@ mod tests {
             let (frame, _) = frame_of(&narrow, w, h);
             assert!(frame.contains("any key closes"), "{w}x{h}:\n{frame}");
             assert!(frame.contains(SELECT_NOTE), "{w}x{h}:\n{frame}");
+            // Amendment v1.11: the welcome runs once, so the row that says how to get it
+            // back is reserved out of the clip beside the other two.
+            assert!(frame.contains(TOUR_NOTE), "{w}x{h}:\n{frame}");
         }
         // At 30 lines the clip stops after the quit row — the one a reader who opened the
         // overlay by accident needs most.
@@ -3028,7 +3255,7 @@ mod tests {
         let mut app = three_roots();
         app.apply(pile_event("alpha", rows_n(11, 0, 0)));
         app.select(Some(Selection::Root(root("alpha"))));
-        assert_eq!(app.handle(Action::Accept), (Changed::Yes, None));
+        assert_eq!(app.handle(Action::AcceptFile), (Changed::Yes, None));
         assert!(app.confirm.is_some());
         assert_eq!(hints(&app, 100), "y confirm  n cancel  q quit");
         assert_eq!(
@@ -3049,7 +3276,7 @@ mod tests {
         assert_eq!(hints(&app, 100), "y confirm  n cancel  ^X quit");
         app.handle(Action::Cancel);
         assert!(
-            hints(&app, 100).contains("a accept all in alpha  ^A accept all"),
+            hints(&app, 100).contains("A accept all in alpha  ^A accept all"),
             "{}",
             hints(&app, 100)
         );
@@ -3127,7 +3354,7 @@ mod tests {
             hints(&rebound, 200)
         );
         // What the line says depends on the selection: a root row trades
-        // `a accept hunk  A accept file` for `a accept all in <root>`. Verifier (b) F4: it
+        // `a accept hunk  A accept file` for `A accept all in <root>`. Verifier (b) F4: it
         // also carries no hunks, so with the diff focused it is offered neither `n/p hunk`
         // nor the diff pane's `v select  y copy` — at any width, since a hint that answers
         // nothing is not a hint the line is short of.
@@ -3141,7 +3368,7 @@ mod tests {
             );
         }
         assert!(
-            hints(&at_root, 200).contains("a accept all in alpha"),
+            hints(&at_root, 200).contains("A accept all in alpha"),
             "{}",
             hints(&at_root, 200)
         );
@@ -3154,7 +3381,7 @@ mod tests {
         app.handle(Action::Open);
         app.select(Some(Selection::Root(root("alpha"))));
         assert!(
-            hints(&app, 100).contains("a accept all in alpha  ^A accept all"),
+            hints(&app, 100).contains("A accept all in alpha  ^A accept all"),
             "{}",
             hints(&app, 100)
         );
@@ -3163,7 +3390,7 @@ mod tests {
             lastcall_engine::scan::Annotation::Upstream,
         )));
         assert!(
-            hints(&app, 100).contains("a accept group  ^A accept all"),
+            hints(&app, 100).contains("A accept group  ^A accept all"),
             "{}",
             hints(&app, 100)
         );
@@ -3609,7 +3836,7 @@ mod tests {
         let mut app = three_roots();
         app.apply(pile_event("alpha", rows_n(11, 2, 1)));
         app.select(Some(Selection::Root(root("alpha"))));
-        assert_eq!(app.handle(Action::Accept), (Changed::Yes, None));
+        assert_eq!(app.handle(Action::AcceptFile), (Changed::Yes, None));
         let (frame, styles) = frame_of(&app, 100, 30);
         assert!(frame.contains("Accept all 11 files in alpha?"), "{frame}");
         assert!(
@@ -4322,5 +4549,119 @@ mod tests {
             styles(&buf),
             "0 1..3 Reset Reset BOLD\n0 3..4 Reset Reset BOLD|DIM\n1 0..1 Green Reset -\n"
         );
+    }
+
+    /// Amendment v1.11: `z undo` is offered only where `z` would do something — the same
+    /// rule as `d ack` and `A accept all in <root>`. The pile's own `undo` count is what
+    /// decides, so a second process's accept puts the hint up at the next pile.
+    #[test]
+    fn render_hint_line_offers_z_undo_only_when_there_is_something_to_undo() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(120, 30));
+        app.select(Some(row("alpha", "f1")));
+        assert!(
+            !hints(&app, 120).contains("z undo"),
+            "an empty stack promises nothing: {}",
+            hints(&app, 120)
+        );
+
+        app.apply(pile_event_seq("alpha", 1, undo_pile(pile("alpha"), 1)));
+        let line = hints(&app, 120);
+        assert!(line.contains("z undo"), "{line}");
+        // beta's stack is its own: the hint follows the selection, not the frame.
+        app.select(Some(row("beta", "u1")));
+        assert!(!hints(&app, 120).contains("z undo"), "{}", hints(&app, 120));
+
+        // It sits between `t hide/show empty` and the herdr jumps in the drop order, so a
+        // line that has dropped down to the accept phrases has dropped it too.
+        app.select(Some(row("alpha", "f1")));
+        let narrow = hints(&app, 60);
+        assert!(!narrow.contains("z undo"), "{narrow}");
+        assert!(narrow.contains("? help"), "the pinned pair stays: {narrow}");
+    }
+
+    /// The sponsor's own run (2026-09-14): the wake was not apparent. `s` is offered on a
+    /// repository row only, and its label says which of its two jobs it will do there.
+    #[test]
+    fn hints_offer_snooze_on_a_repo_row_and_wake_on_a_snoozed_one() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        assert!(
+            !hints(&app, 200).contains("s snooze") && !hints(&app, 200).contains("s wake"),
+            "a file row does not offer s: {}",
+            hints(&app, 200)
+        );
+        app.select(Some(Selection::Root(root("beta"))));
+        assert!(
+            hints(&app, 200).contains("s snooze"),
+            "{}",
+            hints(&app, 200)
+        );
+        app.handle(Action::ShowSnoozed);
+        app.apply(pile_event_seq(
+            "beta",
+            1,
+            snoozed_pile(pile("beta"), "2026-09-20T09:00:00Z"),
+        ));
+        app.select(Some(Selection::Root(root("beta"))));
+        let line = hints(&app, 200);
+        assert!(
+            line.contains("s wake") && !line.contains("s snooze"),
+            "{line}"
+        );
+    }
+
+    /// The repository row's branch line carries the deadline, dimmed: the nav is where a
+    /// reader looks to ask why a repository is quiet, and `shift-s` is the only way it is
+    /// on screen at all.
+    #[test]
+    fn render_nav_says_when_a_repo_is_snoozed() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        // The suffix rides the branch line, so it wants a nav pane wide enough to hold it;
+        // a narrower one clips it like any other branch-line part.
+        app.nav_width = 50;
+        app.handle(Action::ShowSnoozed);
+        app.apply(pile_event_seq(
+            "beta",
+            1,
+            snoozed_pile(pile("beta"), "2026-09-20T09:00:00Z"),
+        ));
+        let (frame, _) = frame_of(&app, 100, 30);
+        assert!(
+            frame.contains("snoozed until 2026-09-20"),
+            "the date, not the timestamp: {frame}"
+        );
+        assert!(
+            !frame.contains("09:00:00"),
+            "the time of day is noise here: {frame}"
+        );
+    }
+
+    /// The modal names the repository it is about and shows the digits as typed, with the
+    /// caret the note modal uses. Its own keys are on the last row, because the hint line
+    /// belongs to the nav.
+    #[test]
+    fn render_snooze_modal_names_the_repo_and_the_day_field() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.select(Some(Selection::Root(root("beta"))));
+        app.handle(Action::Snooze);
+        let (frame, _) = frame_of(&app, 100, 30);
+        assert!(frame.contains("snooze beta for [1"), "{frame}");
+        assert!(frame.contains("day(s)"), "{frame}");
+        assert!(frame.contains(SNOOZE_KEYS), "{frame}");
+        assert!(frame.contains(" snooze "), "the box is titled: {frame}");
+
+        app.handle(Action::SnoozeEdit(SnoozeKey::Backspace));
+        app.handle(Action::SnoozeEdit(SnoozeKey::Digit('3')));
+        app.handle(Action::SnoozeEdit(SnoozeKey::Digit('0')));
+        let (frame, _) = frame_of(&app, 100, 30);
+        assert!(frame.contains("snooze beta for [30"), "{frame}");
+
+        // Esc takes it off the frame entirely.
+        app.handle(Action::SnoozeEdit(SnoozeKey::Cancel));
+        let (frame, _) = frame_of(&app, 100, 30);
+        assert!(!frame.contains("day(s)"), "{frame}");
     }
 }

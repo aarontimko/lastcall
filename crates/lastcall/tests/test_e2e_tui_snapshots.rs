@@ -18,12 +18,14 @@ use std::path::{Path, PathBuf};
 
 use lastcall::tui::app::{AcceptFailed, App, Changed, Effect, FlagKind, RootMeta, Selection};
 use lastcall::tui::herdr::{AgentCandidate, Attention, Dot, HerdrUpdate, RootAgents, Scope};
-use lastcall::tui::input::{Action, EditKey, EditorKey, NoteKey, PickKey};
+use lastcall::tui::input::{Action, EditKey, EditorKey, MODAL_KEYS, NoteKey, PickKey, SnoozeKey};
 use lastcall::tui::render::{render, styles};
+use lastcall::tui::tour::{Card, Tour};
 use lastcall_engine::engine::{Engine, EngineOptions, SaveRequest};
 use lastcall_engine::env::Env;
 use lastcall_engine::ops::NoFault;
 use lastcall_engine::scan::{Annotation, Change, Collapsed, Pile};
+use lastcall_engine::store::RootKind;
 use lastcall_engine::watcher::EngineEvent;
 use lastcall_testkit::engine::{open_engine, open_engine_with};
 use lastcall_testkit::fixture_parent::{self, config, draft_config};
@@ -623,6 +625,12 @@ fn tui_help_overlay() {
 /// The two-column form (deliverable 8) is a response to a terminal too short to hold the
 /// rows, so the tall terminal is the control — it proves the layout switched for the reason
 /// claimed and not because the table grew.
+///
+/// The height is **derived** rather than written down, for the reason the scene exists: the
+/// four nav jumps (2026-09-14) took the table past the 45 rows this used to say, and a
+/// control that silently becomes a second copy of the two-column scene controls nothing.
+/// `render_help` holds the table in one column at `rows + 8` — the four footer rows below
+/// the body, and the border, the pad, the blank and the `any key closes` line.
 #[test]
 fn tui_help_overlay_tall() {
     let scene = Scene::build();
@@ -632,11 +640,26 @@ fn tui_help_overlay_tall() {
     app.handle(Action::NavDown);
     app.handle(Action::Help);
     assert!(app.help);
-    snapshot("tui_help_overlay_tall", &app, W, 45);
+    let height = (app.keymap.len() + MODAL_KEYS.len() + 8) as u16;
+    let (frame, _) = draw(&app, W, height);
+    assert!(
+        !frame.contains("more key"),
+        "the tall overlay clips nothing:\n{frame}"
+    );
+    let first = frame
+        .lines()
+        .find(|l| l.contains(Action::describe("nav_up")))
+        .expect("the first key row");
+    assert!(
+        !first.contains(Action::describe("flag")),
+        "one column, every row on its own line:\n{first}"
+    );
+    snapshot("tui_help_overlay_tall", &app, W, height);
 }
 
 /// The same overlay with room for neither form: 80 columns is the standard width and this
-/// keymap needs 100 for two columns, so the body is one column and it clips.
+/// keymap needs 97 for two columns (`help_two_column_width`, computed from the table), so
+/// the body is one column and it clips.
 ///
 /// Design pass D12 (ruling R12): the clip **says so**. The last body row above the pinned
 /// `quit` is a dim `… N more keys (100 columns shows all)` — the count is the rows that are
@@ -812,9 +835,11 @@ fn tui_accept_controls() {
     assert!(frame.contains("[A accept file]"), "{frame}");
     assert_eq!(frame.matches("[a accept]").count(), 2, "{frame}");
     // Deliverable 4: at 100 columns `^A accept all` has already gone — the header's
-    // `[Accept All]` on the same frame says it, and `t hide empty` outlives it.
+    // `[Accept All]` on the same frame says it, and `t hide empty` outlives it. Amendment
+    // v1.11 puts `z undo` between them (this fixture marked its pile seen, so `z` has
+    // something to undo); it drops before `t` and after the accept phrases.
     assert!(
-        frame.contains("a accept hunk  A accept file  t hide empty"),
+        frame.contains("a accept hunk  A accept file  z undo  t hide empty"),
         "{frame}"
     );
     snapshot("tui_accept_controls", &app, W, H);
@@ -945,7 +970,7 @@ fn tui_nav_empty_repo_row() {
     assert!(frame.contains("nothing pending in beta"), "{frame}");
     assert!(frame.contains("lastcall  3 repos ·"), "{frame}");
     // Verifier (b) F4, the repo-row case: a repo row carries no hunks, so `n`/`p` move
-    // nothing and the hint line does not name them. `a accept all in beta` is absent for
+    // nothing and the hint line does not name them. `A accept all in beta` is absent for
     // the same reason and by the older rule (verifier (a) F2), and `^A` stays because the
     // other two repos do have rows.
     assert!(!frame.contains("n/p hunk"), "{frame}");
@@ -1038,7 +1063,8 @@ fn tui_accept_all_confirm() {
         Some(Annotation::Upstream)
     );
     app.select(Some(Selection::Root(beta.clone())));
-    let (changed, effect) = app.handle(Action::Accept);
+    // Amendment v1.11: `A` is the key that folds a repository from its row.
+    let (changed, effect) = app.handle(Action::AcceptFile);
     assert_eq!(changed, lastcall::tui::app::Changed::Yes);
     assert_eq!(effect, None, "asks first");
     assert!(app.confirm.is_some());
@@ -1961,4 +1987,324 @@ fn tui_editor_long_path_60x20() {
         "the path and the position did not move to make room for it: {dirty_header}"
     );
     snapshot("tui_editor_long_path_60x20", &app, 60, 20);
+}
+
+// ---- Phase 10: undo and snooze (Amendment v1.11) -----------------------------------------
+
+/// The clock the snooze scenes run on: 2026-09-14T00:00:00Z, so every deadline they write
+/// is a fixed date and the frames are reproducible.
+const SNOOZE_CLOCK: u64 = 1_789_344_000;
+
+/// Run the reducer's undo effect against the engine the way the loop does.
+fn run_undo(app: &mut App, engine: &mut Engine, effect: Option<Effect>) {
+    let Some(Effect::Undo(root)) = effect else {
+        panic!("an undo effect, got {effect:?}");
+    };
+    let result = engine.undo(&root).map_err(|e| AcceptFailed::of(&e));
+    app.undone(root, result);
+}
+
+/// Run the reducer's snooze effect against the engine the way the loop does.
+fn run_snooze(app: &mut App, engine: &mut Engine, effect: Option<Effect>) {
+    let Some(Effect::Snooze { root, days }) = effect else {
+        panic!("a snooze effect, got {effect:?}");
+    };
+    let result = engine.snooze(&root, days).map_err(|e| AcceptFailed::of(&e));
+    app.snoozed_result(root, result);
+}
+
+/// Deliverable 2: `z undo` is on the hint line only where `z` would do something. The two
+/// frames are the same app before and after one accept — the only thing that moved is the
+/// root's undo depth, which is what puts the hint up.
+#[test]
+fn tui_undo_hint() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    let alpha = root_named(&engine, "alpha");
+    select_row(&mut app, &alpha, "f1");
+    assert_eq!(app.roots[&alpha].pile.undo, 0, "nothing accepted yet");
+    let (frame, _) = draw(&app, W, H);
+    assert!(!frame.contains("z undo"), "{frame}");
+    snapshot("tui_undo_hint_absent", &app, W, H);
+
+    // Accept `f1`: the stack is one deep and the hint is on the line.
+    let (_, effect) = app.handle(Action::AcceptFile);
+    run_accept(&mut app, &mut engine, effect);
+    assert_eq!(app.roots[&alpha].pile.undo, 1);
+    // The accept's transient status owns the bottom row for 30 s; this frame is of the
+    // hint line that comes back after it, which is where the new hint lives.
+    app.status = None;
+    let (frame, _) = draw(&app, W, H);
+    assert!(frame.contains("z undo"), "{frame}");
+    snapshot("tui_undo_hint_present", &app, W, H);
+
+    // And `z` puts the file back, with the cursor on it.
+    let (_, effect) = app.handle(Action::Undo);
+    run_undo(&mut app, &mut engine, effect);
+    assert_eq!(status_text(&app), "undid accept of f1");
+    assert_eq!(
+        app.selection,
+        Some(Selection::Row(alpha.clone(), b"f1".to_vec()))
+    );
+    assert_eq!(app.roots[&alpha].pile.undo, 0, "the stack is empty again");
+}
+
+/// Deliverable 3: the snooze modal over the nav, asking how long. The field shows the
+/// digits as typed, and the box's own keys are on its last row.
+#[test]
+fn tui_snooze_modal() {
+    let scene = Scene::build();
+    let mut engine = scene.engine_with(EngineOptions {
+        clock: std::sync::Arc::new(lastcall_engine::ledger::FixedClock::at_unix(SNOOZE_CLOCK)),
+        ..EngineOptions::default()
+    });
+    let mut app = app_of(&mut engine);
+    let beta = root_named(&engine, "beta");
+    app.select(Some(Selection::Root(beta.clone())));
+    assert_eq!(app.handle(Action::Snooze), (Changed::Yes, None));
+    // `1` backspaced away, then `14`.
+    app.handle(Action::SnoozeEdit(SnoozeKey::Backspace));
+    for c in ['1', '4'] {
+        app.handle(Action::SnoozeEdit(SnoozeKey::Digit(c)));
+    }
+    let (frame, _) = draw(&app, W, H);
+    assert!(frame.contains("snooze beta for [14"), "{frame}");
+    snapshot("tui_snooze_modal", &app, W, H);
+
+    // Enter writes it and the repo leaves the nav.
+    let (_, effect) = app.handle(Action::SnoozeEdit(SnoozeKey::Apply));
+    run_snooze(&mut app, &mut engine, effect);
+    assert_eq!(status_text(&app), "snoozed beta until 2026-09-28");
+    assert!(!app.listed_roots().any(|v| v.meta.path == beta));
+}
+
+/// Design review F6: a scope count and a snooze count on the same bottom line. At 100
+/// columns both are spelled out; at 80 the line takes the next form down rather than
+/// clipping either count away.
+#[test]
+fn tui_scope_and_snooze_notice() {
+    let scene = Scene::build();
+    let mut engine = scene.engine_with(EngineOptions {
+        clock: std::sync::Arc::new(lastcall_engine::ledger::FixedClock::at_unix(SNOOZE_CLOCK)),
+        ..EngineOptions::default()
+    });
+    let mut app = app_of(&mut engine);
+    let alpha = root_named(&engine, "alpha");
+    let beta = root_named(&engine, "beta");
+
+    // beta is snoozed…
+    app.select(Some(Selection::Root(beta.clone())));
+    app.handle(Action::Snooze);
+    let (_, effect) = app.handle(Action::SnoozeEdit(SnoozeKey::Apply));
+    run_snooze(&mut app, &mut engine, effect);
+
+    // …and the workspace scope covers alpha and beta, leaving notes out.
+    herdr_connected(&mut app);
+    app.handle(Action::Herdr(HerdrUpdate::Scope(Some(Scope {
+        label: "alpha".to_owned(),
+        roots: [alpha, beta].into_iter().collect(),
+    }))));
+    app.herdr.scoped = true;
+    assert_eq!(app.snoozed_out(), 1);
+    assert_eq!(
+        app.bottom_notice(W).as_deref(),
+        Some("scope: alpha · 1 repo hidden (w shows all) · 1 snoozed (S shows)")
+    );
+    snapshot("tui_scope_and_snooze_notice", &app, W, H);
+
+    assert_eq!(
+        app.bottom_notice(80).as_deref(),
+        Some("scope: alpha · 1 hidden · 1 snoozed"),
+        "one form down, both counts still on the line"
+    );
+    app.handle(Action::Resize(80, 24));
+    snapshot("tui_scope_and_snooze_notice_80x24", &app, 80, 24);
+}
+
+// ---- the first-launch welcome (Amendment v1.11, deliverable 1) --------------------------
+
+/// Open the welcome on `cards` over the live screen. The snapshot tier never touches a
+/// state directory, so no scene here reads or writes the marker: the overlay is put up
+/// directly, exactly as `tour::Plan::open` would have put it up.
+fn open_tour(app: &mut App, cards: Vec<Card>) {
+    app.tour = Some(Tour::new(cards));
+}
+
+/// The config path the depth card's hint block names. The real one is whatever
+/// `Document::path()` resolves to, which is a temp directory in a test and the reader's own
+/// home on a real launch; a snapshot needs one string for good, so this is it.
+const DEPTH_CONFIG_PATH: &str = "/home/me/.config/lastcall/config.toml";
+
+fn depth_card() -> Card {
+    Card::Depth {
+        path: Some(DEPTH_CONFIG_PATH.to_owned()),
+    }
+}
+
+/// Deliverable 1, card one: the keys, over the three-root screen. Always shown, and the
+/// grid is rendered from the effective keymap, so this frame is what a reader with the
+/// default bindings sees on their first launch. At 80×24 the three columns do not fit and
+/// the grid falls back to one key per line.
+#[test]
+fn tui_tour_keys() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    open_tour(&mut app, vec![Card::Keys]);
+    let (frame, _) = draw(&app, W, H);
+    assert!(frame.contains(" welcome "), "{frame}");
+    assert!(
+        frame.contains("a  accept the hunk under the cursor"),
+        "{frame}"
+    );
+    assert!(
+        frame.contains("enter  next          q  skip the rest"),
+        "{frame}"
+    );
+    snapshot("tui_tour_keys", &app, W, H);
+
+    app.handle(Action::Resize(80, 24));
+    let (narrow, _) = draw(&app, 80, 24);
+    assert!(narrow.contains("?  every key, any time"), "{narrow}");
+    snapshot("tui_tour_keys_80x24", &app, 80, 24);
+}
+
+/// Deliverable 8, card two: how far down the list looks. Shown on every first launch, so
+/// it is drawn over the ordinary three-root screen. The hint block names the config file
+/// the deeper settings go in; the snapshot tier opens cards directly and never touches a
+/// config directory, so the path is the fixed one a reader on a home directory would see.
+#[test]
+fn tui_tour_depth() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    open_tour(&mut app, vec![depth_card()]);
+    let (frame, _) = draw(&app, W, H);
+    assert!(frame.contains("Where lastcall looks"), "{frame}");
+    assert!(frame.contains("worktrees/<name>"), "{frame}");
+    assert!(frame.contains("> Keep looking one folder down"), "{frame}");
+    assert!(frame.contains("(writes search_depth = 2)"), "{frame}");
+    assert!(frame.contains(DEPTH_CONFIG_PATH), "{frame}");
+    snapshot("tui_tour_depth", &app, W, H);
+
+    app.handle(Action::Resize(80, 24));
+    let (narrow, _) = draw(&app, 80, 24);
+    assert!(narrow.contains(DEPTH_CONFIG_PATH), "{narrow}");
+    snapshot("tui_tour_depth_80x24", &app, 80, 24);
+}
+
+/// The smallest frame the overlay opens on. The card counts its blank rows, so what goes
+/// is the hint block, whole: the question, both answers and the spacing stay.
+#[test]
+fn tui_tour_depth_small() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    app.handle(Action::Resize(60, 14));
+    open_tour(&mut app, vec![depth_card()]);
+    let (frame, _) = draw(&app, 60, 14);
+    assert!(frame.contains("Where lastcall looks"), "{frame}");
+    assert!(frame.contains("> Keep looking one folder down"), "{frame}");
+    assert!(frame.contains("(writes search_depth = 2)"), "{frame}");
+    assert!(
+        !frame.contains(DEPTH_CONFIG_PATH),
+        "the hint block goes first: {frame}"
+    );
+    assert!(
+        !frame.contains("go in the config file"),
+        "and it goes whole: {frame}"
+    );
+    snapshot("tui_tour_depth_small", &app, 60, 14);
+}
+
+/// Card three: lastcall is following a herdr workspace right now, and the file has never
+/// said whether that is wanted. The second row is the one that writes, and it says what it
+/// writes; the first, selected, row writes nothing.
+#[test]
+fn tui_tour_herdr() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    let alpha = root_named(&engine, "alpha");
+    herdr_connected(&mut app);
+    app.handle(Action::Herdr(HerdrUpdate::Scope(Some(Scope {
+        label: "alpha".to_owned(),
+        roots: [alpha].into_iter().collect(),
+    }))));
+    app.herdr.scoped = true;
+    assert_eq!(app.listed_roots().count(), 1, "the workspace's one repo");
+    open_tour(
+        &mut app,
+        vec![Card::Herdr {
+            version: "0.8.2".to_owned(),
+        }],
+    );
+    let (frame, _) = draw(&app, W, H);
+    assert!(
+        frame.contains("You are running inside herdr 0.8.2"),
+        "{frame}"
+    );
+    assert!(frame.contains("> Keep following the workspace"), "{frame}");
+    assert!(frame.contains("scope = \"all\""), "{frame}");
+    snapshot("tui_tour_herdr", &app, W, H);
+
+    app.handle(Action::Resize(80, 24));
+    snapshot("tui_tour_herdr_80x24", &app, 80, 24);
+}
+
+/// Card four: most of what is listed has nothing pending. Twelve empty repositories and
+/// two with work, so the title counts what is on screen.
+#[test]
+fn tui_tour_empty() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    // The fixture has three roots; the card's condition needs fourteen. The extra eleven
+    // are metas and empty piles, which is all the nav draws — no repository on disk is
+    // needed to render a repository with nothing pending.
+    let mut metas: Vec<RootMeta> = engine.roots().into_iter().map(RootMeta::of).collect();
+    let parent = metas[0].parent.clone();
+    for i in 0..11 {
+        let name = format!("repo{i:02}");
+        metas.push(RootMeta {
+            path: parent.join(&name),
+            name,
+            kind: RootKind::Git,
+            parent: parent.clone(),
+            badge: None,
+            branch: Some("main".to_owned()),
+            head: None,
+            in_progress: None,
+            remote: None,
+        });
+    }
+    let extra: Vec<PathBuf> = metas[3..].iter().map(|m| m.path.clone()).collect();
+    app.sync_roots(metas);
+    for path in &extra {
+        app.apply(EngineEvent::Pile {
+            root: path.clone(),
+            seq: 1,
+            pile: Pile::default(),
+        });
+    }
+    // `notes` is emptied too, so twelve of the fourteen have nothing pending.
+    let notes = root_named(&engine, "notes");
+    mark_seen(&mut engine, &notes);
+    rescan(&mut app, &mut engine, &notes);
+
+    let total = app.listed_roots().count();
+    let empty = app.listed_roots().filter(|v| !v.listed()).count();
+    assert_eq!((empty, total), (12, 14), "twelve of fourteen are empty");
+    open_tour(&mut app, vec![Card::Empty { empty, total }]);
+    let (frame, _) = draw(&app, W, H);
+    assert!(
+        frame.contains("12 of your 14 repositories have nothing pending"),
+        "{frame}"
+    );
+    assert!(frame.contains("hide_empty_repos = true"), "{frame}");
+    snapshot("tui_tour_empty", &app, W, H);
+
+    app.handle(Action::Resize(80, 24));
+    snapshot("tui_tour_empty_80x24", &app, 80, 24);
 }

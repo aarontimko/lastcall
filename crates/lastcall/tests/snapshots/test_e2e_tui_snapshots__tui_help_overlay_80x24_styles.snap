@@ -61,10 +61,10 @@ expression: style
 16 73..74 Cyan Reset -
 17 0..1 Cyan Reset -
 17 6..7 Cyan Reset -
+17 8..45 Reset Reset DIM
 17 73..74 Cyan Reset -
 18 0..1 Cyan Reset -
 18 6..7 Cyan Reset -
-18 8..46 Reset Reset DIM
 18 73..74 Cyan Reset -
 19 0..1 Cyan Reset -
 19 6..7 Cyan Reset -

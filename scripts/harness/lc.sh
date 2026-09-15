@@ -143,9 +143,33 @@ lc_accept_all() {   # build tree from rendered blobs: baseline-composed = curren
 lc_snapshot_rendered() { mkdir -p "$LC_STATE/rendered"; local p; for p in "$@"; do lc_hash "$p" > "$LC_STATE/rendered/$(enc "$p")"; done; }
 lc_restart() { lc_seed_index; }   # everything else is recomputed
 
+# ---------- discovery (search_depth, D12) ----------
+# lc_discover PARENT DEPTH -> the directories holding a .git entry that discovery lists at
+# that depth, parent-relative, one per line, sorted by bytes.
+#
+# The rules the engine's walk follows, in find's vocabulary: -maxdepth caps the level (a
+# root at level N has its .git entry at find depth N+1); the skip names are pruned before
+# anything under them is read; .git is pruned so nothing inside one is read; find does not
+# follow symlinks without -L, so a symlinked directory is neither read nor listed; and the
+# awk pass drops any candidate under another, which is how "the walk never enters a
+# repository" reads as output (a submodule or a vendored clone inside a root is not listed).
+lc_discover() {
+  local p="$1" n="$2"
+  ( cd "$p" && find . -maxdepth $((n + 1)) \
+      \( -name node_modules -o -name target -o -name .venv -o -name vendor \) -prune -o \
+      -name .git -print -prune ) |
+    sed 's|^\./||' | grep '/\.git$' | sed 's|/\.git$||' | LC_ALL=C sort |
+    awk '{ keep = 1; for (r in kept) if (index($0, r "/") == 1) keep = 0
+           if (keep) { kept[$0] = 1; print } }'
+}
+
 # ---------- assertions ----------
 PASS=0; FAIL=0
 assert_pile() {   # assert_pile "scenario" "expected lines joined by |"
   local name="$1" exp="$2" got; got="$(lc_pile | tr '\n' '|' | sed 's/|$//')"
+  if [ "$got" = "$exp" ]; then PASS=$((PASS+1)); echo "  ok   $name"; else FAIL=$((FAIL+1)); echo "  FAIL $name"; echo "       expected: [$exp]"; echo "       got:      [$got]"; fi
+}
+assert_roots() {   # assert_roots "scenario" "expected joined by |" PARENT DEPTH
+  local name="$1" exp="$2" got; got="$(lc_discover "$3" "$4" | tr '\n' '|' | sed 's/|$//')"
   if [ "$got" = "$exp" ]; then PASS=$((PASS+1)); echo "  ok   $name"; else FAIL=$((FAIL+1)); echo "  FAIL $name"; echo "       expected: [$exp]"; echo "       got:      [$got]"; fi
 }

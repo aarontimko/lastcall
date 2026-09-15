@@ -10,7 +10,7 @@ use std::process::ExitCode;
 
 use lastcall::tui::herdr::HerdrPlan;
 use lastcall::tui::input::Keymap;
-use lastcall::tui::{run, term};
+use lastcall::tui::{run, term, tour};
 use lastcall_engine::config;
 use lastcall_engine::engine::Engine;
 use lastcall_engine::env::Env;
@@ -35,7 +35,7 @@ fn discovering(parent_dirs: &[std::path::PathBuf]) -> Option<String> {
     (!named.is_empty()).then(|| format!("{DISCOVERING}{}…", named.join(", ")))
 }
 
-pub fn run(poll: Option<u64>) -> Result<ExitCode, Box<dyn std::error::Error>> {
+pub fn run(poll: Option<u64>, tour: bool) -> Result<ExitCode, Box<dyn std::error::Error>> {
     if !io::stdout().is_terminal() {
         eprintln!("{NOT_A_TERMINAL}");
         return Ok(ExitCode::from(2));
@@ -67,14 +67,22 @@ pub fn run(poll: Option<u64>) -> Result<ExitCode, Box<dyn std::error::Error>> {
     // What `[herdr]` asks for, resolved before the terminal is taken; the link itself is
     // opened inside the loop's runtime, after the first frame (kickoff deliverable 4).
     let plan = HerdrPlan::of(&loaded.config.herdr, &env);
+    // Amendment v1.11. The marker is read here, once, before the terminal is taken:
+    // `--tour` ignores it for this run and rewrites it on dismissal. The `Env` travels with
+    // the plan because the tour's one config write resolves the same file `config::load`
+    // just read, and the engine's injected environment is the only one lastcall may see.
+    let tour = tour::Plan::new(tour, env.clone(), loaded.state_dir.clone());
     run::run(
         engine,
         super::poll_timings(poll),
         keymap,
         env,
         plan,
-        loaded.config.hide_empty_repos,
-        daily_check(&loaded),
+        run::Launch {
+            hide_empty: loaded.config.hide_empty_repos,
+            daily_check: daily_check(&loaded),
+            tour,
+        },
     )
 }
 

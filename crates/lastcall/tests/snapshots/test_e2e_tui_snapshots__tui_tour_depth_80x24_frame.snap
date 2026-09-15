@@ -1,0 +1,28 @@
+---
+source: crates/lastcall/tests/test_e2e_tui_snapshots.rs
+expression: frame
+---
+"lastcall  3 repos · 6 files · 8 hunks  standalone  [Accept All]       watching W"
+"┌──────────────────────────┬───────────────────────────────────────────────────┐"
+"│alpha                     │select a file (↑↓ or click) · ? for help           │"
+"│  main · 3 files          │                                                   │"
+"│┌ welcome ──────────────────────────────────────────────────────────────────┐ │"
+"││ Where lastcall looks                                                      │ │"
+"││                                                                           │ │"
+"││ The list holds every git repository directly inside this directory. One   │ │"
+"││ kept a folder deeper, such as worktrees/<name>, is not listed unless you  │ │"
+"││ ask.                                                                      │ │"
+"││                                                                           │ │"
+"││ Deeper than two, or clones and worktrees kept somewhere else entirely, go │ │"
+"││ in the config file: search_depth = N and one parent_dirs entry per place. │ │"
+"││     /home/me/.config/lastcall/config.toml                                 │ │"
+"││                                                                           │ │"
+"││ > Keep looking one folder down                                            │ │"
+"││   Look two folders down, and remember that   (writes search_depth = 2)    │ │"
+"││                                                                           │ │"
+"││ enter  choose          q  skip the rest                                   │ │"
+"│└───────────────────────────────────────────────────────────────────────────┘ │"
+"│                          │                                                   │"
+"│                          │                                                   │"
+"└──────────────────────────┴───────────────────────────────────────────────────┘"
+"↑↓ select  ⏎ open  ^A accept all  t hide empty  Tab focus  ? help  q quit       "

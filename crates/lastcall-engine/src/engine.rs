@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 
@@ -24,7 +25,7 @@ use crate::hunks::{self, Hunk};
 use crate::index::{IndexError, PrivateIndex};
 use crate::ledger::{
     self, Clock, FlagHunk, FlagSummary, Ledger, LedgerError, LedgerLock, LoadResult, SeenAt,
-    SystemClock, TreeEntries,
+    SystemClock, TreeEntries, UndoOp,
 };
 use crate::ops::{self, FaultInjector, NoFault, Ops, OpsError, Outcome, Refused, Rendered};
 use crate::paths::{Layout, ParentId, ParentMeta, RepoPaths, RootId};
@@ -383,6 +384,32 @@ pub struct Flagged {
     pub pile: Pile,
 }
 
+/// What [`Engine::undo`] produced (Amendment v1.11): the outcome, what the popped entry
+/// was, the paths it put back in path order, and the pile of the rescan that followed.
+///
+/// `op` and `paths` are empty when nothing was undone (`outcome` then carries
+/// [`Refused::NothingToUndo`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Undone {
+    pub outcome: Outcome,
+    pub op: Option<UndoOp>,
+    pub paths: Vec<String>,
+    /// [`Engine::scan_seq`] of `pile`.
+    pub seq: u64,
+    pub pile: Pile,
+}
+
+/// What [`Engine::snooze`] produced: the deadline it wrote (`None` for a wake) and the
+/// pile of the rescan that followed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Snoozed {
+    pub outcome: Outcome,
+    pub until: Option<String>,
+    /// [`Engine::scan_seq`] of `pile`.
+    pub seq: u64,
+    pub pile: Pile,
+}
+
 /// What [`Engine::accept`] produced: the op's outcome (a refusal is data, never `Err`) and
 /// the pile of the rescan that followed, numbered like every other pile.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -526,6 +553,24 @@ impl Engine {
         self.discovery_runs
     }
 
+    /// Change how many folders below each parent dir the next discovery pass reads
+    /// (Amendment v1.11, deliverable 8). The value the first-launch tour's depth card
+    /// applies for the session, whether or not it could write it to the config file.
+    ///
+    /// It only sets the number: the roots appear on the next [`Engine::rescan`], which the
+    /// watcher runs when it is asked to and on its own backstop. Out-of-range values are
+    /// clamped rather than refused — `Config::validate` is where a bad *file* is rejected,
+    /// and a caller in the binary asking for depth 9 should get the deepest walk there is,
+    /// not a panic in the middle of a keystroke.
+    pub fn set_search_depth(&mut self, depth: u8) {
+        self.config.search_depth = depth.clamp(1, crate::config::MAX_SEARCH_DEPTH);
+    }
+
+    /// How many folders below each parent dir discovery currently reads.
+    pub fn search_depth(&self) -> u8 {
+        self.config.search_depth
+    }
+
     /// The number of the most recent scan that produced a pile (engine-global, strictly
     /// increasing across roots, `0` before the first). Read it under the same lock as the
     /// [`Engine::scan`] it describes.
@@ -559,6 +604,7 @@ impl Engine {
             parent_dirs: &self.resolved.parent_dirs,
             draft_dirs: &self.config.draft_dirs,
             nested: &nested,
+            search_depth: self.config.search_depth,
         });
         let changed = roots::diff(&self.discovery, &next);
         for n in &next.notices {
@@ -866,6 +912,9 @@ struct ScanCtx {
     collapsed: GlobSet,
     collapse_size_bytes: u64,
     row_cap: usize,
+    /// The engine's injected wall clock, read once per `scan_all` so every root in one
+    /// sweep decides snooze expiry against the same instant (Amendment v1.11).
+    now: SystemTime,
 }
 
 /// Scan one root, start to finish, mutating **only** that root's state: its nested-repo
@@ -907,6 +956,11 @@ fn scan_root(state: &mut RootState, ctx: &ScanCtx) -> Result<Pile, EngineError> 
         row_cap: ctx.row_cap,
     })?;
     let mut pile = out.pile;
+    // The two per-root ledger facts the reducer may never read for itself (design review
+    // F8), stamped here rather than inside `scan` because the expiry needs a wall clock and
+    // the engine owns the injected one.
+    pile.undo = state.ledger.undo.len();
+    pile.snoozed_until = ledger::snooze_active(state.ledger.snoozed_until.as_deref(), ctx.now);
     if out.nested_repos != state.nested_repos {
         state.nested_repos = out.nested_repos;
         state.nested_changed = true;
@@ -947,6 +1001,7 @@ impl Engine {
             collapsed: self.collapsed.clone(),
             collapse_size_bytes: self.config.collapse_size_bytes,
             row_cap: self.options.row_cap,
+            now: self.options.clock.now(),
         }
     }
 
@@ -1400,6 +1455,86 @@ impl Engine {
         })
     }
 
+    /// Reverse the most recent accept in `root` (Amendment v1.11, deliverable 2).
+    ///
+    /// Op-then-rescan like [`Engine::accept_with`], and for the same reason: the pile that
+    /// comes back is the one the UI should show next, with the undone paths pending again.
+    /// `paths` is what the entry put back, in path order, so the caller can move the
+    /// selection to the first of them; an empty stack comes back as
+    /// [`Refused::NothingToUndo`] in `outcome`, never as `Err`.
+    pub fn undo(&mut self, root: &Path) -> Result<Undone, EngineError> {
+        self.undo_with(root, &NoFault)
+    }
+
+    /// [`Engine::undo`] with a fault injector.
+    pub fn undo_with(
+        &mut self,
+        root: &Path,
+        fault: &dyn FaultInjector,
+    ) -> Result<Undone, EngineError> {
+        let (result, preview) = {
+            let mut ops = self.ops(root)?;
+            let preview = ops.undo_preview();
+            (ops.undo(fault), preview)
+        };
+        let outcome = match result {
+            Ok(o) => o,
+            Err(e) => {
+                if let Some(state) = self.roots.get_mut(root) {
+                    state.ledger_stamp = None;
+                    state.reload_ledger_if_changed();
+                }
+                return Err(EngineError::Ops(e));
+            }
+        };
+        let (op, paths) = match preview {
+            Some((op, paths)) if outcome.ok() => (Some(op), paths),
+            _ => (None, Vec::new()),
+        };
+        let pile = self.scan(root)?;
+        Ok(Undone {
+            outcome,
+            op,
+            paths,
+            seq: self.scan_seq,
+            pile,
+        })
+    }
+
+    /// Snooze `root` for `days` (1 to 365), or wake it when `days` is `None`.
+    ///
+    /// The deadline is computed from the engine's injected clock, so a `FixedClock` test
+    /// can name the date the status line will print.
+    pub fn snooze(&mut self, root: &Path, days: Option<u32>) -> Result<Snoozed, EngineError> {
+        let (result, until) = {
+            let mut ops = self.ops(root)?;
+            match days {
+                Some(d) => {
+                    let until = ops.snooze_deadline(d);
+                    (ops.snooze(&until, &NoFault), Some(until))
+                }
+                None => (ops.unsnooze(&NoFault), None),
+            }
+        };
+        let outcome = match result {
+            Ok(o) => o,
+            Err(e) => {
+                if let Some(state) = self.roots.get_mut(root) {
+                    state.ledger_stamp = None;
+                    state.reload_ledger_if_changed();
+                }
+                return Err(EngineError::Ops(e));
+            }
+        };
+        let pile = self.scan(root)?;
+        Ok(Snoozed {
+            outcome,
+            until,
+            seq: self.scan_seq,
+            pile,
+        })
+    }
+
     /// Flag `path` — optionally one hunk of it — with a note, and render the export.
     ///
     /// Op-then-rescan like [`Engine::accept_with`], though a flag never changes a baseline:
@@ -1534,6 +1669,7 @@ impl Engine {
             compaction_threshold: threshold,
             case_insensitive,
             staged: BTreeMap::new(),
+            pending_undo: None,
             lock: crate::ops::DEFAULT_LOCK,
         })
     }
@@ -1664,6 +1800,7 @@ fn first_sight(
 pub(crate) mod tests {
     use super::*;
     use crate::config::ConfigSource;
+    use crate::ledger::FixedClock;
     use crate::scan::{Change, Row};
     use crate::status::StatusReport;
     use crate::store::tests::fixture_env;
@@ -2081,6 +2218,84 @@ pub(crate) mod tests {
         let gone = StatusReport::build(&mut engine, None).unwrap();
         assert_eq!(gone.roots[0].ledger_written_at, None);
         assert_eq!(gone.roots[0].store, r.store);
+    }
+
+    /// Amendment v1.11: `status --json` gains two additive per-root fields and the human
+    /// report two suffixes. `status_version` stays 1; the golden
+    /// (`crates/lastcall/tests/golden/status_multi_repo.json`) carries both at their zero
+    /// values for every root.
+    #[test]
+    fn status_reports_the_undo_depth_and_the_snooze_deadline() {
+        let repo = FixtureRepo::new("eng-status-ux").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        // 2026-09-14T00:00:00Z, so a one-day snooze lands on 2026-09-15.
+        let options = EngineOptions {
+            clock: Arc::new(FixedClock::at_unix(1_789_344_000)),
+            ..EngineOptions::default()
+        };
+        let mut engine = open_engine_with(&repo, &state, Config::default(), options);
+        let root = only_root(&engine);
+        assert!(engine.scan(&root).unwrap().is_empty(), "first sight");
+
+        // Nothing accepted, nothing snoozed: both fields at their zero values.
+        let clean = StatusReport::build(&mut engine, None).unwrap();
+        assert_eq!(clean.roots[0].undo, 0);
+        assert_eq!(clean.roots[0].snoozed_until, None);
+        let v: serde_json::Value = serde_json::from_str(&clean.to_json()).unwrap();
+        assert_eq!(v["roots"][0]["undo"], 0);
+        assert_eq!(v["roots"][0]["snoozed_until"], serde_json::Value::Null);
+        assert!(
+            clean
+                .render_human()
+                .contains("\neng-status-ux (main)  0 pending\n"),
+            "no suffix when there is neither: {}",
+            clean.render_human()
+        );
+
+        // One accept, one snooze.
+        repo.write("f1", "changed\n");
+        let pile = engine.scan(&root).unwrap();
+        let rendered = Rendered::of(pile.row(b"f1").unwrap());
+        let acc = engine.accept(&root, AcceptRequest::File(rendered)).unwrap();
+        assert!(acc.outcome.ok(), "{:?}", acc.outcome);
+        assert_eq!(acc.pile.undo, 1, "the pile carries the depth to the UI");
+        let snoozed = engine.snooze(&root, Some(1)).unwrap();
+        assert_eq!(snoozed.until.as_deref(), Some("2026-09-15T00:00:00Z"));
+        assert_eq!(
+            snoozed.pile.snoozed_until.as_deref(),
+            Some("2026-09-15T00:00:00Z")
+        );
+
+        let report = StatusReport::build(&mut engine, None).unwrap();
+        assert_eq!(report.roots[0].undo, 1);
+        assert_eq!(
+            report.roots[0].snoozed_until.as_deref(),
+            Some("2026-09-15T00:00:00Z")
+        );
+        let v: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
+        assert_eq!(v["roots"][0]["undo"], 1);
+        assert_eq!(v["roots"][0]["snoozed_until"], "2026-09-15T00:00:00Z");
+        assert_eq!(v["status_version"], 1, "additive: the version stays 1");
+        let human = report.render_human();
+        assert!(
+            human.contains(
+                "\neng-status-ux (main)  0 pending · 1 undo · snoozed until 2026-09-15\n"
+            ),
+            "{human}"
+        );
+
+        // An expired snooze reads as none, and the read clears it on the next write.
+        let options = EngineOptions {
+            clock: Arc::new(FixedClock::at_unix(1_789_344_000 + 2 * 86_400)),
+            ..EngineOptions::default()
+        };
+        let mut later = open_engine_with(&repo, &state, Config::default(), options);
+        let report = StatusReport::build(&mut later, None).unwrap();
+        assert_eq!(
+            report.roots[0].snoozed_until, None,
+            "a deadline in the past is not a snooze"
+        );
+        assert_eq!(report.roots[0].undo, 1, "the stack is untouched by expiry");
     }
 
     #[test]
@@ -3437,6 +3652,84 @@ pub(crate) mod tests {
             runs1,
             "no rediscovery while the nested set is unchanged"
         );
+    }
+
+    /// Deliverable 8: the depth the tour's card applies is a session setting the next
+    /// discovery pass reads. The repository two folders down is invisible at the default
+    /// depth, appears after `set_search_depth(2)` and one `rescan`, and the ledger of the
+    /// root that was already open is not touched on the way.
+    #[test]
+    fn engine_set_search_depth_adds_the_deeper_roots_on_the_next_rescan() {
+        let repo = FixtureRepo::new("eng-depth").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        // A plain folder beside the fixture repo, with a repository inside it: level 2.
+        let deep = repo.parent_dir().join("worktrees").join("b");
+        std::fs::create_dir_all(&deep).unwrap();
+        repo.git_at(&deep, &["init", "-q", "-b", "main"]).unwrap();
+        std::fs::write(deep.join("n"), "n\n").unwrap();
+
+        repo.write("f1", "one\n");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let root = only_root(&engine);
+        assert_eq!(engine.search_depth(), 1, "the default is level 1 alone");
+        // Give the open root a ledger worth comparing: a fold, not a fresh file.
+        let snapshot = engine.scan(&root).unwrap();
+        assert_eq!(scan::pile_lines(&snapshot), vec!["f1".to_owned()]);
+        assert!(
+            engine
+                .accept(&root, AcceptRequest::All(snapshot))
+                .unwrap()
+                .outcome
+                .ok()
+        );
+        let before = engine.root(&root).unwrap().ledger.clone();
+
+        let runs0 = engine.discovery_runs();
+        engine.set_search_depth(2);
+        assert_eq!(engine.search_depth(), 2);
+        assert_eq!(
+            engine.root_paths(),
+            vec![root.clone()],
+            "setting the number alone discovers nothing"
+        );
+        let changed = engine.rescan().unwrap();
+        assert_eq!(
+            engine.discovery_runs(),
+            runs0 + 1,
+            "one rescan is one discovery run"
+        );
+        let canon_deep = std::fs::canonicalize(&deep).unwrap();
+        assert_eq!(changed.added, vec![canon_deep.clone()]);
+        assert!(changed.removed.is_empty(), "{:?}", changed.removed);
+        let mut want = vec![root.clone(), canon_deep];
+        want.sort();
+        assert_eq!(
+            engine.root_paths(),
+            want,
+            "the level-2 repository is a root"
+        );
+        assert_eq!(
+            engine.root(&root).unwrap().ledger,
+            before,
+            "the open root's ledger is untouched by a rescan"
+        );
+
+        // And it is a number, not a ratchet: back to 1 and the deeper root is gone again.
+        engine.set_search_depth(1);
+        engine.rescan().unwrap();
+        assert_eq!(engine.root_paths(), vec![root]);
+    }
+
+    /// Out-of-range depths clamp rather than panic: the binary's callers are keystrokes.
+    #[test]
+    fn engine_set_search_depth_clamps_out_of_range_values() {
+        let repo = FixtureRepo::new("eng-depth-clamp").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        engine.set_search_depth(0);
+        assert_eq!(engine.search_depth(), 1);
+        engine.set_search_depth(200);
+        assert_eq!(engine.search_depth(), crate::config::MAX_SEARCH_DEPTH);
     }
 
     /// R7: `--root` outside every root (or nonexistent) is an error, not an empty report.

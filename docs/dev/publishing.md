@@ -132,20 +132,27 @@ The repository was private for its whole construction. The history carries whate
 written then, and a public push cannot be taken back.
 
 ```sh
-# Zero hits required, for every term, in both commands.
-git grep -I -e <term> -- . ':!z_ignore'
-git log --all -S<term> --oneline
+# Zero hits required in the tree. A history hit is either rewritten before the flip or
+# accepted on the record (see below).
+terms=$(mktemp)
+cat ~/.config/oss-publish/denylist.txt z_ignore/oss-denylist.txt 2>/dev/null \
+  | grep -v '^[[:space:]]*#' | grep -v '^[[:space:]]*$' > "$terms"
+git grep -n -i -F -f "$terms" -- . ':!z_ignore'
+git log --all -p | grep -n -i -F -f "$terms"
+git log --all -S<term> --oneline    # which commits a history hit came from
 ```
 
 - The denylist of terms (private hostnames, internal project names, machine names, paths,
-  handles, anything that identifies a person) lives **outside the repository**, in the
-  maintainer's own notes. It is not committed here, because committing the list publishes
-  the list.
+  handles, anything that identifies a person) lives **outside every repository**, in the
+  maintainer's shared `~/.config/oss-publish/denylist.txt`, one plain term per line with `#`
+  comment lines for the reasons; a repo-specific `z_ignore/oss-denylist.txt` is read too if
+  it exists. Neither is committed here, because committing the list publishes the list.
 - Project names count. A private repository's name quoted as an example in a design note,
   a fixture path or a source comment (a ledger row named after the repository it tracked)
   belongs on the list: it tells a reader the project exists and what it is called.
-- Run both commands for every term. The first catches the working tree, the second catches
-  a string that was added and later removed.
+- Run both greps. The first catches the working tree, the second catches a string that was
+  added and later removed. Prove the instrument on a term you know is present before
+  trusting a zero.
 - `z_ignore/` is gitignored and untracked, so `git grep` would skip it anyway; the
   pathspec makes that explicit and survives someone force-adding a file there. The
   `git log -S` pass is deliberately unfiltered: a term that ever lived in a committed file

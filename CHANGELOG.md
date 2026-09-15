@@ -5,6 +5,70 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html). A version's s
 exactly what its GitHub release notes carry, so it is written for the people installing the
 binary rather than for the commit log.
 
+## Unreleased
+
+### First launch
+
+- The first time you open the review screen, a small card names the keys you need and then
+  gets out of the way. The frame underneath stays live, so the scan you launched keeps
+  running while you read it, and it never opens on a window too small to read.
+- The card after the keys asks how far down lastcall looks. One folder below the directory
+  you launched in is what it has always done; two also reaches a clone or a worktree kept in
+  a folder such as `worktrees/<name>`, and a worktree kept inside a repository you already
+  watch. Choosing two writes `search_depth = 2` and the repositories appear on the screen
+  behind the card, with no relaunch. The card names your config file for the settings that
+  go further than that.
+- Two more of the cards offer to remember a default: showing every repository instead of only
+  the ones your herdr workspace is working in, and starting with the empty repositories hidden.
+  Either choice takes effect at once and is written into your config file, which keeps its
+  comments, its key order and its formatting. If there is no config file yet, one is created
+  holding just that setting.
+- It is shown once. `lastcall tui --tour` brings it back, and the help overlay says so.
+
+### Undo
+
+- `z` reverses the last accept in the selected repository, and again for the one before it,
+  up to the last twenty. Nothing on disk moves: the files go back to pending with their
+  flags intact, and the cursor lands on the first of them.
+- Each repository has its own stack, kept beside the rest of what lastcall remembers, so an
+  accept from this morning can still be undone tonight. Saving a file in the built-in editor
+  is on the stack too, because saving marks the file reviewed.
+- `lastcall status --json` reports the depth as `undo` per root.
+
+### Snooze
+
+- `s` sets a repository aside for a number of days, one by default. `shift-s` lists the ones
+  you have set aside, each with the date it comes back, and `s` on one of those wakes it now.
+- It is a view and nothing more: the repository is still watched, still scanned, and still
+  reported by `lastcall status`. An agent asking for attention brings it back into the list
+  on its own, and the deadline expires on screen without a relaunch.
+- The bottom line keeps the count, beside the workspace scope's when both apply.
+- `lastcall status --json` reports the deadline as `snoozed_until` per root.
+
+### Moving around
+
+- `Home` and `End` go to the first and the last entry of the list, and to the top and the
+  end of the diff when that pane has the keys.
+- `{` and `}` jump to the previous and the next repository's own row, stepping over its
+  files rather than walking through them. Option with an arrow key does the same in
+  terminals that send it, and every one of the four can be rebound in `[keys]`.
+
+### Changed
+
+- `shift-a` is now the key that accepts a whole entry from the list: a file, a branch group,
+  or a whole repository from its row. `a` accepts the hunk under the cursor and nothing
+  larger, and on a group or a repository row it says which key to use instead. A repository
+  of ten files or fewer used to vanish on a lowercase `a` with no question at all, because
+  the confirmation only asks above ten.
+- The `parent_dirs` documentation said every repository under a parent directory is watched.
+  It is the repositories directly under it. One a folder deeper, such as `worktrees/<name>`,
+  is now reached with the new `search_depth` key (`1` to `4`, default `1`), which also lists
+  a worktree kept inside a repository you already watch; a clone that lives somewhere else
+  entirely still wants an entry of its own. The walk never enters a repository or a
+  dependency folder, so `3` and `4` want a narrow parent directory. `search_depth` is new in
+  this release: a 0.1.0 binary refuses a config file that has the line, so delete it before
+  going back to that version.
+
 ## 0.1.0 - 2026-09-12
 
 The first release. lastcall watches every git repository under your working directory and
