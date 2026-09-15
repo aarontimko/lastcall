@@ -17,6 +17,7 @@ mk_repo() {  # mk_repo NAME -> repo at $W/NAME with origin bare at $W/NAME.git, 
 coworker_push() { local n="$1" count="$2" prefix="${3:-u}"; local c="$W/$n.cw"; rm -rf "$c"
   git clone -q "$W/$n.git" "$c"; local i; for i in $(seq 1 "$count"); do echo "up$i" > "$c/$prefix$i"; done
   git -C "$c" add -A; GIT_AUTHOR_EMAIL=coworker@example.com GIT_COMMITTER_EMAIL=coworker@example.com git -C "$c" commit -q -m "coworker $count files"; git -C "$c" push -q origin main; }
+new_repo() { local n="$1"; R="$(mk_repo "$n")"; S="$W/$n.state"; mkdir -p "$S"; }   # $W is fresh, so no state to clear
 fresh() { local n="$1"; R="$(mk_repo "$n")"; S="$W/$n.state"; rm -rf "$S"; mkdir -p "$S"; lc_init "$R" "$S" git; lc_first_sight; }
 
 echo "== A. core =="
@@ -116,6 +117,108 @@ ln -s "$P/deep" "$P/link"
 assert_roots "D12 depth 1: the repositories directly inside the parent" "a" "$P" 1
 assert_roots "D12 depth 2: the folder below too, submodule and node_modules and link never" "a|worktrees/a-wt|worktrees/b" "$P" 2
 assert_roots "D12 depth 3: two folders below" "a|deep/er/c|worktrees/a-wt|worktrees/b" "$P" 3
+
+echo "== D. branches (per-branch seen records, Amendment v1.12) =="
+# D14: accepted on a branch, then the start branch checked out (the reported case).
+new_repo d14
+git -C "$R" checkout -q -b future                      # first sight happens HERE, on future
+lc_init "$R" "$S" git; lc_first_sight
+for i in 1 2 3 4; do echo "n$i" > "$R/n$i"; done
+git -C "$R" add -A; git -C "$R" commit -qm "agent adds four files"
+lc_accept_file n1; lc_accept_file n2; lc_accept_file n3; lc_accept_file n4
+assert_pile "D14 the four files accepted on future" ""
+assert_str "D14 four overrides on future's record" "4" "$(ls "$S/overrides" | grep -v '\.mode$' | wc -l | tr -d ' ')"
+lc_restart; assert_pile "D14 restart on future" ""
+git -C "$R" checkout -q main
+assert_pile "D14 checkout main: the fold takes main's content, no deletions" ""
+assert_str "D14 main in force, future parked" "main future" "$(cat "$S/seen_branch") $(lc_parked)"
+lc_restart; assert_pile "D14 restart on main" ""
+git -C "$R" checkout -q future
+assert_pile "D14 back on future: the parked record is back" ""
+lc_restart; assert_pile "D14 restart back on future" ""
+# D14 variant: first sight on main, then the branch.
+new_repo d14v
+lc_init "$R" "$S" git; lc_first_sight
+assert_pile "D14 variant first sight on main" ""
+git -C "$R" checkout -q -b future
+assert_pile "D14 variant at the branch creation: main's record parked, a copy in force" ""
+for i in 1 2 3 4; do echo "n$i" > "$R/n$i"; done
+git -C "$R" add -A; git -C "$R" commit -qm "agent adds four files"
+lc_accept_file n1; lc_accept_file n2; lc_accept_file n3; lc_accept_file n4
+assert_pile "D14 variant the four files accepted on future" ""
+git -C "$R" checkout -q main
+assert_pile "D14 variant back on main: no deletions" ""
+git -C "$R" checkout -q future
+assert_pile "D14 variant back on future" ""
+# D15: an unattended run on a generated branch.
+fresh d15; assert_pile "D15 first sight on main" ""
+git -C "$R" checkout -q -b run-1
+echo a > "$R/a.rs"; echo b > "$R/b.rs"; git -C "$R" add -A; git -C "$R" commit -qm "run-1 work"
+echo scratch > "$R/scratch.tmp"
+assert_pile "D15 run-1 after the writes" "a.rs|b.rs|scratch.tmp"
+git -C "$R" checkout -q .; git -C "$R" clean -qfd
+assert_pile "D15 after the clean: the committed work waits" "a.rs|b.rs"
+git -C "$R" checkout -q main
+assert_pile "D15 back on main" ""
+git -C "$R" checkout -q -b run-2; echo c > "$R/c.rs"; git -C "$R" add -A; git -C "$R" commit -qm "run-2 work"
+git -C "$R" checkout -q .; git -C "$R" clean -qfd; git -C "$R" checkout -q main
+assert_pile "D15 back on main after the second run" ""
+git -C "$R" checkout -q run-1
+assert_pile "D15 run-1's parked record: the run's work waiting for review" "a.rs|b.rs"
+lc_accept_all; assert_pile "D15 accept-all on run-1" ""
+git -C "$R" checkout -q main; assert_pile "D15 main after the review" ""
+git -C "$R" checkout -q run-2; assert_pile "D15 run-2's work" "c.rs"
+assert_str "D15 three records: run-2 in force, main and run-1 parked" "run-2 main|run-1" "$(cat "$S/seen_branch") $(lc_parked)"
+lc_restart; assert_pile "D15 restart on run-2" "c.rs"
+# D16: cherry-picks onto a named feature branch show once more, by design.
+lc_accept_all; assert_pile "D16 run-2 reviewed and accepted" ""
+git -C "$R" checkout -q main; git -C "$R" checkout -q -b feat/x
+assert_pile "D16 feat/x is a copy of main's record" ""
+git -C "$R" cherry-pick main..run-1 >/dev/null 2>&1; git -C "$R" cherry-pick main..run-2 >/dev/null 2>&1
+assert_pile "D16 the cherry-picked content shows again" "a.rs|b.rs|c.rs"
+lc_accept_all; assert_pile "D16 accept-all on feat/x" ""
+git -C "$R" checkout -q main; assert_pile "D16 main's record untouched" ""
+lc_restart; assert_pile "D16 restart on main" ""
+# D18: a branch that is ahead, never seen.
+fresh d18; assert_pile "D18 first sight on main" ""
+git -C "$R" checkout -q -b feat/other
+echo o1 > "$R/o1"; git -C "$R" add -A; git -C "$R" commit -qm o1
+echo o2 > "$R/o2"; git -C "$R" add -A; git -C "$R" commit -qm o2
+git -C "$R" checkout -q main            # lastcall never saw feat/other: no entry point ran above
+git -C "$R" checkout -q feat/other
+assert_pile "D18 ahead and never seen: a copy, no fold, over-show" "o1|o2"
+lc_accept_all; assert_pile "D18 accept-all on feat/other" ""
+git -C "$R" checkout -q main; assert_pile "D18 main" ""
+git -C "$R" checkout -q feat/other; assert_pile "D18 the return: the parked record" ""
+lc_restart; assert_pile "D18 restart on feat/other" ""
+# D20 (the prune and the recreate; both renames are engine-side).
+fresh d20; assert_pile "D20 first sight on main" ""
+git -C "$R" checkout -q -b run-1; echo a > "$R/a.rs"; git -C "$R" add -A; git -C "$R" commit -qm run1
+assert_pile "D20 run-1's work pending" "a.rs"
+git -C "$R" checkout -q main; assert_pile "D20 back on main" ""
+git -C "$R" checkout -q -b run-2; echo c > "$R/c.rs"; git -C "$R" add -A; git -C "$R" commit -qm run2
+assert_pile "D20 run-2's work pending" "c.rs"
+git -C "$R" checkout -q main; assert_pile "D20 main again" ""
+assert_str "D20 two parked records" "run-1|run-2" "$(lc_parked)"
+git -C "$R" branch -q -D run-1
+git -C "$R" checkout -q run-2
+assert_pile "D20 run-2's parked record after run-1 was deleted" "c.rs"
+assert_str "D20 the deleted branch's record is pruned at the next switch" "main" "$(lc_parked)"
+git -C "$R" checkout -q main; assert_pile "D20 main before run-1 is recreated" ""
+git -C "$R" checkout -q -b run-1
+assert_pile "D20 the recreated run-1 is a first sight; nothing of the old one survives" ""
+# D23: uncommitted work and its accepted hunk survive checkout -b.
+fresh d23
+printf 'A1\na2\na3\na4\na5\na6\na7\na8\na9\nA10\n' > "$R/f1"       # two hunks on disk
+h1="$(printf 'A1\na2\na3\na4\na5\na6\na7\na8\na9\na10\n' | lcg hash-object -w --stdin)"   # hunk 1 only
+lc_accept_file f1 "$h1"
+assert_pile "D23 hunk 1 accepted, hunk 2 pending" "f1"
+git -C "$R" checkout -q -b feat/w
+assert_pile "D23 checkout -b carries the uncommitted work" "f1"
+assert_str "D23 the override survives the copy" "$h1" "$(lc_baseline f1)"
+git -C "$R" checkout -q main
+assert_pile "D23 back on main: the parked record and its override" "f1"
+assert_str "D23 the override is back with main's record" "$h1" "$(lc_baseline f1)"
 
 echo "== E. storage =="
 fresh e2; echo edit >> "$R/f1"; lc_accept_file f1; echo deadbeefdeadbeefdeadbeefdeadbeefdeadbeef > "$S/overrides/f1"
