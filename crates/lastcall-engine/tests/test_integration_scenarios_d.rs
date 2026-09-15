@@ -10,7 +10,9 @@ use lastcall_engine::ops::Refused;
 use lastcall_engine::roots::Badge;
 use lastcall_engine::scan::{Change, Collapsed, Rename, probe_case_insensitive};
 use lastcall_testkit::assert_pile;
+use lastcall_testkit::engine::open_engine;
 use lastcall_testkit::fixture_repo::FixtureRepo;
+use lastcall_testkit::tmp::TempDir;
 
 #[test]
 fn scenario_d1_mode_only_change() {
@@ -782,4 +784,279 @@ fn scenario_d11_restore_of_a_unicode_and_space_path() {
     assert!(out.outcome.ok(), "{:?}", out.outcome);
     assert_eq!(s.bytes_at(path), b"one\ntwo\nthree\n");
     assert_pile!(s.engine, s.root, "");
+}
+
+// ---- D12 and D13: search_depth (Amendment v1.11, deliverable 8) ----
+
+/// Every root path the engine lists, relative to the parent dir, sorted by bytes.
+fn listed(engine: &lastcall_engine::engine::Engine, parent: &std::path::Path) -> Vec<String> {
+    engine
+        .roots()
+        .iter()
+        .map(|r| {
+            r.path
+                .strip_prefix(parent)
+                .unwrap_or(&r.path)
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect()
+}
+
+fn at_depth(
+    parent: &std::path::Path,
+    env: &lastcall_engine::env::Env,
+    state: &std::path::Path,
+    depth: u8,
+) -> lastcall_engine::engine::Engine {
+    open_engine(
+        parent,
+        env,
+        state,
+        Config {
+            search_depth: depth,
+            ..Config::default()
+        },
+    )
+}
+
+#[test]
+fn scenario_d12_search_depth_reads_n_folders_down() {
+    // Setup, line by line from D12: P/a (repo), P/a/sub (a committed submodule of a),
+    // P/worktrees/b (a clone of a), P/worktrees/a-wt (a linked worktree of a),
+    // P/deep/er/c, P/node_modules/pkg, P/link -> P/deep.
+    let repo = FixtureRepo::new("a").unwrap();
+    let parent = std::fs::canonicalize(repo.parent_dir()).unwrap();
+    let a = std::fs::canonicalize(repo.path()).unwrap();
+
+    let sub = repo.path().join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    repo.git_at(&sub, &["init", "-q", "-b", "main"]).unwrap();
+    std::fs::write(sub.join("s"), "s\n").unwrap();
+    repo.git_at(&sub, &["add", "s"]).unwrap();
+    repo.git_at(&sub, &["commit", "-qm", "sub"]).unwrap();
+    repo.git(&["add", "sub"]).unwrap();
+    repo.git(&["commit", "-qm", "gitlink"]).unwrap();
+
+    let worktrees = parent.join("worktrees");
+    std::fs::create_dir_all(&worktrees).unwrap();
+    let b = worktrees.join("b");
+    repo.git(&["clone", "-q", a.to_str().unwrap(), b.to_str().unwrap()])
+        .unwrap();
+    let a_wt = worktrees.join("a-wt");
+    repo.git(&[
+        "worktree",
+        "add",
+        "-q",
+        a_wt.to_str().unwrap(),
+        "-b",
+        "feat-w",
+    ])
+    .unwrap();
+
+    let c = parent.join("deep/er/c");
+    std::fs::create_dir_all(&c).unwrap();
+    repo.git_at(&c, &["init", "-q", "-b", "main"]).unwrap();
+    let pkg = parent.join("node_modules/pkg");
+    std::fs::create_dir_all(&pkg).unwrap();
+    repo.git_at(&pkg, &["init", "-q", "-b", "main"]).unwrap();
+    std::os::unix::fs::symlink(parent.join("deep"), parent.join("link")).unwrap();
+
+    let state = TempDir::new("lc-d12-state");
+    let env = repo.engine_env(state.path());
+    let never = ["a/sub", "node_modules/pkg", "link/er/c"];
+
+    // search_depth = 1: the repositories directly inside P, which is what every release
+    // before Amendment v1.11 listed.
+    let engine = at_depth(&parent, &env, state.path(), 1);
+    assert_eq!(listed(&engine, &parent), vec!["a"], "D12 depth 1");
+    drop(engine);
+    let engine = at_depth(&parent, &env, state.path(), 1);
+    assert_eq!(listed(&engine, &parent), vec!["a"], "D12 depth 1 restart");
+    drop(engine);
+
+    // search_depth = 2: one plain folder further, with the badges and the parents.
+    let mut engine = at_depth(&parent, &env, state.path(), 2);
+    assert_eq!(
+        listed(&engine, &parent),
+        vec!["a", "worktrees/a-wt", "worktrees/b"],
+        "D12 depth 2"
+    );
+    for root in engine.roots() {
+        assert_eq!(
+            root.parent,
+            parent,
+            "{} is filed under P",
+            root.path.display()
+        );
+    }
+    assert_eq!(
+        engine.root(&a_wt).unwrap().badge,
+        Some(Badge::WorktreeOf(a.clone())),
+        "D12 the linked worktree keeps its badge one folder down"
+    );
+    assert_eq!(
+        engine.root(&b).unwrap().badge,
+        None,
+        "D12 a clone is a clone"
+    );
+    // The ledgers that must still be on disk after the depth goes back down.
+    let kept: Vec<std::path::PathBuf> = [&a_wt, &b]
+        .iter()
+        .map(|p| engine.root(p).unwrap().paths.ledger.clone())
+        .collect();
+    // The pile of each new root is its own, and the submodule is nobody's root.
+    assert_pile!(engine, b, "", "D12 the clone's first sight");
+    assert_pile!(engine, a_wt, "", "D12 the linked worktree's first sight");
+    for name in never {
+        assert!(
+            engine.root(&parent.join(name)).is_none(),
+            "D12 depth 2 never lists {name}"
+        );
+    }
+    drop(engine);
+    let engine = at_depth(&parent, &env, state.path(), 2);
+    assert_eq!(
+        listed(&engine, &parent),
+        vec!["a", "worktrees/a-wt", "worktrees/b"],
+        "D12 depth 2 restart"
+    );
+    drop(engine);
+
+    // search_depth = 3: two folders further.
+    let engine = at_depth(&parent, &env, state.path(), 3);
+    assert_eq!(
+        listed(&engine, &parent),
+        vec!["a", "deep/er/c", "worktrees/a-wt", "worktrees/b"],
+        "D12 depth 3"
+    );
+    for name in never {
+        assert!(
+            engine.root(&parent.join(name)).is_none(),
+            "D12 depth 3 never lists {name}"
+        );
+    }
+    drop(engine);
+    let engine = at_depth(&parent, &env, state.path(), 3);
+    assert_eq!(
+        listed(&engine, &parent),
+        vec!["a", "deep/er/c", "worktrees/a-wt", "worktrees/b"],
+        "D12 depth 3 restart"
+    );
+    drop(engine);
+
+    // Back to 1: `a` only, and the ledgers the deeper roots wrote are still on disk.
+    let engine = at_depth(&parent, &env, state.path(), 1);
+    assert_eq!(listed(&engine, &parent), vec!["a"], "D12 back to depth 1");
+    for ledger in &kept {
+        assert!(
+            ledger.is_file(),
+            "D12 {} survives the depth drop",
+            ledger.display()
+        );
+    }
+}
+
+#[test]
+fn scenario_d13_worktree_kept_inside_its_repository() {
+    // Setup: P/R with `.worktrees/` in its committed .gitignore, and a linked worktree
+    // inside it. Mechanism 1 cannot see it (the walk stops at a repository); mechanism 2
+    // is what lists it.
+    let mut repo = FixtureRepo::new("R").unwrap();
+    repo.commit_files(&[(".gitignore", ".worktrees/\n")], "ignore worktrees")
+        .unwrap();
+    repo.git(&["worktree", "add", "-q", ".worktrees/wt", "-b", "feat-w"])
+        .unwrap();
+    let parent = std::fs::canonicalize(repo.parent_dir()).unwrap();
+    let r = std::fs::canonicalize(repo.path()).unwrap();
+    let wt = std::fs::canonicalize(repo.path().join(".worktrees/wt")).unwrap();
+
+    let state = TempDir::new("lc-d13-state");
+    let env = repo.engine_env(state.path());
+
+    // search_depth = 1: R alone. The worktree is ignored, so D9's nested path does not
+    // report it either.
+    let engine = at_depth(&parent, &env, state.path(), 1);
+    assert_eq!(listed(&engine, &parent), vec!["R"], "D13 depth 1");
+    drop(engine);
+
+    // search_depth = 2: both, filed under P, the worktree badged.
+    let mut engine = at_depth(&parent, &env, state.path(), 2);
+    assert_eq!(
+        listed(&engine, &parent),
+        vec!["R", "R/.worktrees/wt"],
+        "D13 depth 2"
+    );
+    for root in engine.roots() {
+        assert_eq!(
+            root.parent,
+            parent,
+            "{} is filed under P",
+            root.path.display()
+        );
+    }
+    assert_eq!(
+        engine.root(&wt).unwrap().badge,
+        Some(Badge::WorktreeOf(r.clone())),
+        "D13 worktree of R"
+    );
+    assert_pile!(engine, r, "", "D13 R holds nothing under .worktrees/");
+    // D10 in the new shape: an agent edit inside the worktree is pending there only.
+    std::fs::write(
+        wt.join("f1"),
+        "a1\na2\na3\na4\na5\na6\na7\na8\na9\na10\ne\n",
+    )
+    .unwrap();
+    assert_pile!(engine, wt, "f1", "D13 the edit is pending in wt");
+    assert_pile!(engine, r, "", "D13 and nowhere else");
+    drop(engine);
+    let engine = at_depth(&parent, &env, state.path(), 2);
+    assert_eq!(
+        listed(&engine, &parent),
+        vec!["R", "R/.worktrees/wt"],
+        "D13 depth 2 restart"
+    );
+    drop(engine);
+
+    // Launched from inside R: the parent dir is itself a repository, so nothing is walked
+    // under it, and mechanism 2 still lists the worktree kept inside it.
+    let inside = TempDir::new("lc-d13-inside");
+    let inside_env = repo.engine_env(inside.path());
+    let engine = at_depth(&r, &inside_env, inside.path(), 2);
+    assert_eq!(
+        listed(&engine, &r),
+        vec!["", ".worktrees/wt"],
+        "D13 launched inside R"
+    );
+    assert_eq!(
+        engine.root(&wt).unwrap().badge,
+        Some(Badge::WorktreeOf(r.clone()))
+    );
+    drop(engine);
+
+    // A `.worktrees/` that is not ignored is listed at depth 1 already, through D9's
+    // nested path, with the same badge.
+    let mut open = FixtureRepo::new("R2").unwrap();
+    open.commit_files(&[("keep", "keep\n")], "no ignore")
+        .unwrap();
+    open.git(&["worktree", "add", "-q", ".worktrees/wt", "-b", "feat-w"])
+        .unwrap();
+    let open_parent = std::fs::canonicalize(open.parent_dir()).unwrap();
+    let open_r = std::fs::canonicalize(open.path()).unwrap();
+    let open_wt = std::fs::canonicalize(open.path().join(".worktrees/wt")).unwrap();
+    let open_state = TempDir::new("lc-d13-open-state");
+    let open_env = open.engine_env(open_state.path());
+    let mut engine = at_depth(&open_parent, &open_env, open_state.path(), 1);
+    let results = engine.scan_all();
+    assert!(results.iter().all(|(_, _, r)| r.is_ok()), "{results:?}");
+    assert_eq!(
+        listed(&engine, &open_parent),
+        vec!["R2", "R2/.worktrees/wt"],
+        "D13 a .worktrees/ that is not ignored is a nested root at depth 1"
+    );
+    assert_eq!(
+        engine.root(&open_wt).unwrap().badge,
+        Some(Badge::WorktreeOf(open_r)),
+        "D13 the worktree badge wins over NestedIn"
+    );
 }

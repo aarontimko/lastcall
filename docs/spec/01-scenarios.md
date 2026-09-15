@@ -90,6 +90,10 @@ Legend for the harness column: **H** = verifiable with the git-plumbing harness 
 
 **D11 — Paths with unicode and spaces.** Setup: `docs/résumé draft.md`. Expect: appears, accepts, restores correctly (all plumbing uses `-z`). *(H)*
 
+**D12 — `search_depth` reads N folders down.** Setup: parent `P`; `P/a` (repo, one commit); `P/a/sub` (a git submodule of `a`, committed); `P/worktrees/b` (a clone of `a`); `P/worktrees/a-wt` (`git -C P/a worktree add ../worktrees/a-wt -b feat-w`); `P/deep/er/c` (repo); `P/node_modules/pkg` (repo); `P/link` (a symlink to `P/deep`). Expect at `search_depth = 1`: `[a]`. At 2: `[a, worktrees/a-wt (worktree of a), worktrees/b]`, every root filed under `P`; `a/sub` is not a root at any depth. At 3: adds `deep/er/c`. `node_modules/pkg` and anything through `link` are never listed at any depth. Restart at each depth: the same list. Back to 1: `a` only, the other ledgers still on disk. *(H for the listing at each depth; E for the badges, the parents, the restart and the ledgers. PROPOSED with Amendment v1.11, ratified by merging the Phase 10 PR.)*
+
+**D13 — a worktree kept inside its repository.** Setup: parent `P`; `P/R` (repo, one commit) with `.worktrees/` in its committed `.gitignore`; `git -C P/R worktree add .worktrees/wt -b feat-w`. Expect at `search_depth = 1`: `[R]`. At 2: `[R, R/.worktrees/wt (worktree of R)]`, both filed under `P`; `R`'s pile holds nothing under `.worktrees/`. An agent edit in `wt` is pending in `wt` only (D10). Restart: the same list. Launched from inside `R` (parent inside a repository) at 2: the same two rows. A `.worktrees/` that is not ignored is listed at depth 1 already, through D9's nested path, with the same badge; the test covers that case too. *(E. PROPOSED with Amendment v1.11, ratified by merging the Phase 10 PR.)*
+
 ## E. Storage and crash safety
 
 **E1 — Crash mid-accept.** Action: kill -9 between object write and ledger rename. Expect on restart: ledger is the previous version; orphan object harmless; pile identical to pre-accept. *(E)*
@@ -138,6 +142,6 @@ Legend for the harness column: **H** = verifiable with the git-plumbing harness 
 
 ## Harness notes (§7.4)
 
-**Status 2026-09-01:** `scripts/harness/scenarios.sh` (run: `bash scripts/harness/scenarios.sh`; fixtures go to `scripts/harness/work/`, gitignored, or `$LC_WORK`) — 46 assertions, all passing. Scenarios marked *verified* above ran green; the remaining H scenarios (A3 property, A6, D2 restore, D5 pairing, E1/E3/E4) are Phase 2 tests.
+**Status 2026-09-01:** `scripts/harness/scenarios.sh` (run: `bash scripts/harness/scenarios.sh`; fixtures go to `scripts/harness/work/`, gitignored, or `$LC_WORK`) — 49 assertions, all passing. Scenarios marked *verified* above ran green; the remaining H scenarios (A3 property, A6, D2 restore, D5 pairing, E1/E3/E4) are Phase 2 tests.
 
 The pre-Phase-2 harness implements only the plumbing the engine will call — no TUI, no watcher, no ledger JSON — as shell functions: `lc_init_store R` (bare store + alternates), `lc_first_sight`, `lc_scan` (private index refresh + `diff-files` + `ls-files --others`), `lc_accept_file`, `lc_accept_all` (index-info + write-tree), `lc_upstream_paths` (rev-list `--not --remotes`, `diff-tree --cc` for merges), and `lc_pile` (composes the expected output). Every **H** scenario above is one function call sequence with an `assert_pile` at each Expect line. A failing assertion is a spec bug to fix here first, not a test to loosen.
