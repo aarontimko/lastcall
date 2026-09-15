@@ -316,6 +316,15 @@ watching, there is no `.lastcall` directory, and nothing you do here appears in 
 status`. Two lastcalls looking at the same repository take a lock and keep each other's
 work rather than the last one winning.
 
+What you accept is remembered per branch. Accept work on a feature branch, check out the
+branch you started from, and the pile there is the one you left: the files you just accepted
+are not in that branch's tree, so they are not shown as deletions you have to accept a second
+time. Checking out a branch for the first time carries across what you have seen so far, so
+the switch itself shows nothing new, and going back later finds that branch's own pile
+waiting. A change that reaches another branch by cherry-pick shows once more on that branch,
+because lastcall never guesses that you have already read it somewhere else. A detached HEAD
+keeps whichever record you were on, and deleting a branch drops what it remembered.
+
 lastcall watches the filesystem, so the screen follows an agent as it writes. Where those
 events do not arrive, which happens on some network filesystems and inside some containers,
 `lastcall tui --poll 2` rescans every two seconds instead. It is a fallback and not a

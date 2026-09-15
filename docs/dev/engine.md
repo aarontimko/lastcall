@@ -17,9 +17,12 @@ private store; per-path **overrides** in `ledger.json` sit on top of it (a blob 
 accepted, `null` for "seen as absent", or a flag). The **baseline** of a path is:
 override blob → override `null` (absent) → seen-tree entry → empty. **Pending** is
 `diff(baseline, worktree)`: a row exists iff the baseline and the live file differ by oid or
-mode. HEAD is never a baseline input; it is consulted only for first sight, the transition
-notices (`headstate.rs`) and the upstream annotation (`upstream.rs`). Every accept is a CAS
-against the oid/mode the user was shown; on any doubt the engine shows *more*, never less.
+mode. A git root keeps **one such record per branch** and exactly one of them is in force:
+the branch name in `<git_dir>/HEAD` chooses it, the others are parked in the same
+`ledger.json` (see "Branches"). HEAD's *commit* is never a baseline input; it is consulted
+only for first sight, the transition notices (`headstate.rs`) and the upstream annotation
+(`upstream.rs`). Every accept is a CAS against the oid/mode the user was shown; on any doubt
+the engine shows *more*, never less.
 
 ## Storage walkthrough
 
@@ -326,6 +329,101 @@ listing that *builds* the key is the listing `classify` is given, so a scan runs
 effect is one fewer git process per root per scan (17 → 16 on S1; `docs/dev/bench.md`
 run D).
 
+## Branches (Phase 11)
+
+A git root keeps one seen record per branch. One of them is **in force** and lives at the top
+level of `ledger.json` exactly where the only record used to live; the rest are **parked** in
+`branches`, keyed by branch name. Nothing here changes what a pile is: it is still
+`diff(baseline, worktree)` against the record in force.
+
+**Which record.** The branch is the name in `<git_dir>/HEAD` when that file reads
+`ref: refs/heads/<name>`, one file read and no git process (`headstate::head_branch`; a linked
+worktree reads its own `HEAD`). Anything else, a detached sha, an empty or unreadable file, a
+draft root, means no switch: the record in force stays in force. `RootState::sync_branch` is
+the step that compares that name with `seen_branch` and calls the switch, and it runs in three
+places so no caller can see a stale record: in `scan_root` right after the ledger is re-read,
+in `inspect_head` before the heads are compared, and at the tail of `open_root_with`, which is
+where a switch made while lastcall was not running lands. Git writes the working tree and the
+index before it writes `HEAD`, so a scan can still fall inside git's own window and compare
+one branch's files against the other's record. That is an over-show and it closes at the next
+event; an accept inside the window is refused instead, see "Concurrency" below.
+
+**Arriving somewhere new.** A branch with no parked record starts as a **copy** of the record
+just left: the same `seen_tree` oid, the overrides cloned, `seen_at` copied verbatim (it is
+what the upstream annotation's range is computed from, so restamping it would turn a
+coworker's commits into an unexplained pile), and an empty undo stack. The switch itself
+therefore shows nothing new. Then the **ancestor fold**: if the branch left still has a ref and
+the arriving head is an ancestor of it (`merge-base --is-ancestor`, true when they are the same
+commit), every path that differs between the two committed trees (`diff-tree -r --name-only`)
+takes the arriving branch's committed content in one `write_tree`, and those paths lose the
+blob and mode of any override they carried; a flag-only override stays, as `Ops::fold` already
+keeps flagged overrides, and a gitlink entry is left out because the content model cannot
+render a submodule pointer as a baseline. A diverged or ahead branch, a deleted `A`, an unborn
+head: no fold, the copy is the record. Content that arrives on another branch by cherry-pick
+shows again there, by design: lastcall never guesses that you have read it.
+
+**Parking, loading, pruning, renaming.** Leaving a branch parks its record whole, undo stack
+and all, and arriving on a branch that has one moves it back into force exactly as it was left.
+At every switch the parked names are checked against `for-each-ref refs/heads` and a name with
+no ref is dropped, so a deleted branch's record goes; if that listing fails the prune is
+skipped for that switch, because keeping a record costs nothing and dropping one hides nothing
+either way. The record in force is never pruned. When `HEAD` names a branch other than
+`seen_branch` and `refs/heads/<seen_branch>` no longer exists, this is `git branch -m` of the
+branch you are on: the record in force is re-labelled with the new name, no park, no first
+sight, no fold. That re-label is written, unlike the 1.1 adoption below, because the next
+`merge_from_disk` would otherwise read the old name back off disk.
+
+**Detached, unborn, in progress.** A detached `HEAD` keeps the record in force and accepts land
+in it; when a name comes back, the same name is no switch and a different one is a switch from
+that record. An unborn branch is a branch with no head, so there is nothing to fold.
+`in_progress` suppresses the notice as it always did and never suppresses the switch.
+
+**Concurrency.** A switch is one locked read-modify-write sharing `LedgerLock`,
+`merge_from_disk`, the tmp write and the rename with every other ledger write, and it pushes
+nothing on any undo stack: a switch is not an operation you can take back, it is which record
+your next operation applies to. If the file already names the target under the lock, another
+process switched first: adopt it and do nothing else. An accept or a restore staged under one
+branch whose commit finds, under the lock, the disk ledger or the `HEAD` file naming another is
+refused with `branch changed under this accept (now Y); try again`, and drops its staged
+overrides: the rows it was computed from belong to the other record. Flag and snooze are not
+baseline operations and merge as they always did.
+
+**What does not move.** Root first sight is unchanged and stamps `seen_branch` from `HEAD`.
+Compaction folds the record in force only, undo pops its stack only, and a parked stack waits
+with its record. Flags travel with their record, so a flag raised on a feature branch is not
+shown on the branch you return to and is back when you return to it. Snooze stays per root.
+The upstream annotation's range is now per record, which is what it always meant. The TUI
+learns nothing new except the notice wording, and still never reads a ledger.
+
+**Notices** (`headstate::transition`). A return to a branch with a parked record keeps the
+existing text, `switched main → feat-y: N files differ from seen state`. A first sight at the
+same commit keeps `switched main → feat-x (same commit)`: nothing moved, so there is nothing to
+report. A first sight whose head moved reads
+`switched main → feat-x: first time here, seen state carried from main; N files pending`. A
+folded copy and a copy with nothing to fold read the same; the fold is visible only through the
+count.
+
+**Schema.** 1.2, additive under major 1 (Amendment v1.12): top-level `seen_branch` and
+`branches`, the latter omitted when it is empty so an untouched ledger still rewrites byte for
+byte. The record in force stays at the top level, so a 1.1 binary opening a 1.2 file keeps
+working on the branch it is on; its first write drops the parked records, which is an over-show
+at the next switch and a §11 residual. A 1.1 file read by this build has no `seen_branch`: the
+first sync attributes the record to whatever branch `HEAD` names, with no switch and no fold,
+and stamps it on the next write. On the wire `seen_branch` is absent (a 1.1 file, adopt) or
+`null` (known, and no branch), and the two must stay distinguishable, so it is never omitted
+once the file is 1.2.
+
+Look at the records with plain tools:
+
+```sh
+cd ~/.local/state/lastcall/roots/<parent>/repos/<root>
+jq -r '.seen_branch // "none"' ledger.json                    # the record in force
+jq -r '.branches // {} | keys[]' ledger.json                  # the parked branches
+jq -r '.branches["feat-x"].seen_tree' ledger.json             # one parked record's tree
+GIT_DIR=store git ls-tree -r "$(jq -r '.branches["feat-x"].seen_tree' ledger.json)"
+lastcall status --json | jq -r '.roots[] | "\(.root) \(.seen_branch) \(.parked_branches)"'
+```
+
 ## The fail-open ladder
 
 Every rung shows *more* than the truth, never less, and says why in a notice:
@@ -346,6 +444,9 @@ Every rung shows *more* than the truth, never less, and says why in a notice:
 | a path that cannot be hashed (unreadable, a socket, `git-lfs` missing) | an `Unhashable` row |
 | accept whose rendered oid/mode/baseline (oid **and** mode for hunks, so a stale mode hunk cannot apply twice) no longer matches the live file | refused, nothing written; the next scan shows the new state (A5/A6) |
 | ledger lock busy after 40 × 50 ms (2 s) | the op errors; nothing is written unlocked, and the TUI says `ledger busy in <root> — try again` with the row still pending |
+| `<git_dir>/HEAD` cannot be read, or names no branch (detached, unborn) | no switch: the record in force stays the one it was, and the pile is shown against it |
+| a parked record that does not parse | dropped at load with the notice `the parked seen record for branch "<name>" has an unreadable shape …`; every other record and the file itself survive, and that branch first-sights on its next arrival |
+| a parked seen tree the store no longer has (a `gc` in the store, a hand-edited ledger) | the record loads as it is; the "seen tree not resolvable" rung then applies to it once it is in force, so that branch shows every path pending rather than hiding one |
 
 ## Accepting through the engine (Phase 4)
 

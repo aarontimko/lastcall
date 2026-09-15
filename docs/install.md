@@ -3,6 +3,12 @@
 lastcall is a single binary. There is nothing to configure before it runs, and nothing is
 written to the repositories it watches.
 
+There are two routes, and the difference that matters is how each one upgrades. A
+**prebuilt release binary** is the route [`lastcall update`](#staying-current) serves: it
+replaces the running binary in place with the next release. Built **from source with
+`cargo install`**, the binary belongs to cargo, `lastcall update` leaves it alone, and you
+upgrade by running the install line again with the new tag and `--force`.
+
 ## From a release
 
 Every release publishes four binaries and a `SHA256SUMS` file:
@@ -70,11 +76,15 @@ Requires [rustup](https://rustup.rs) and `git`. The repository pins its toolchai
 cargo install --git https://github.com/aarontimko/lastcall --tag v0.2.0 lastcall
 ```
 
-That puts `lastcall` in `~/.cargo/bin`. A clone plus `just cargo build --release -p lastcall`
-works too, and is what you want if you intend to change the code:
-[`CONTRIBUTING.md`](../CONTRIBUTING.md).
+That puts `lastcall` in `~/.cargo/bin`. To upgrade later, run the same line with the tag of
+the release you want and `--force`; `lastcall update` refuses this route and prints that
+line. A clone plus `just cargo build --release -p lastcall` works too, and is what you want
+if you intend to change the code: [`CONTRIBUTING.md`](../CONTRIBUTING.md).
 
 ## Staying current
+
+This is the release-binary route's upgrade step. A binary installed with `cargo install` is
+upgraded by that line instead, with the new tag and `--force`.
 
 ```sh
 lastcall update --check    # is there a newer release?

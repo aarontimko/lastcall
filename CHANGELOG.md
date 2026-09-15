@@ -5,6 +5,37 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html). A version's s
 exactly what its GitHub release notes carry, so it is written for the people installing the
 binary rather than for the commit log.
 
+## Unreleased
+
+### Changed
+
+- **What you accept is remembered per branch.** Each branch of a repository now keeps its own
+  record of what you have seen. Accept work on a feature branch, check the branch you started
+  from back out, and you get that branch's own pile, not a screen of files you already dealt
+  with. The first time you check a branch out, the record carries across from the branch you
+  came from, so the switch itself shows nothing new, and if the new branch is behind the one
+  you left, the commits it does not have yet are folded away rather than listed. Going back to
+  a branch you have been on before brings its pile back exactly as you left it, flags and undo
+  included. A change that reaches another branch by cherry-pick shows once more on that branch,
+  because lastcall never assumes you have read it somewhere else. Deleting a branch drops what
+  it remembered; renaming the branch you are on keeps it.
+- `lastcall status --json` gains two fields per repository, `seen_branch` and
+  `parked_branches`; every other field still describes the branch you are on. The report's
+  `status_version` is unchanged.
+- The state file for a repository is now schema 1.2. It is read and written in place by this
+  version and needs nothing from you. An older lastcall can still open it and work on the
+  branch it is on; the first thing it writes there drops the other branches' records, which
+  costs a screen of already-seen files the next time you switch, never a missing one.
+
+### Fixed
+
+- Files accepted on a branch no longer come back as deletions on the branch you return to.
+  Before this, one record covered the whole repository, so checking out a branch without those
+  files showed every one of them as deleted and waiting to be accepted again.
+- A notice printed while git was switching branches could pair one branch's name with the
+  other's commit, reading `switched main → main`. The branch and its commit are now read as
+  one state.
+
 ## 0.2.0 - 2026-09-14
 
 ### First launch
