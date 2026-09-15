@@ -6,11 +6,12 @@ use common::Fresh;
 use lastcall_engine::config::Config;
 use lastcall_engine::engine::EngineOptions;
 use lastcall_engine::git::Mode;
-use lastcall_engine::ops::Refused;
+use lastcall_engine::headstate::{self, InProgress};
+use lastcall_engine::ops::{NoFault, Refused, Rendered};
 use lastcall_engine::roots::Badge;
 use lastcall_engine::scan::{Change, Collapsed, Rename, probe_case_insensitive};
 use lastcall_testkit::assert_pile;
-use lastcall_testkit::engine::open_engine;
+use lastcall_testkit::engine::{open_engine, open_engine_with};
 use lastcall_testkit::fixture_repo::FixtureRepo;
 use lastcall_testkit::tmp::TempDir;
 
@@ -1058,5 +1059,718 @@ fn scenario_d13_worktree_kept_inside_its_repository() {
         engine.root(&open_wt).unwrap().badge,
         Some(Badge::WorktreeOf(open_r)),
         "D13 the worktree badge wins over NestedIn"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// Per-branch seen records (D14 to D23, Amendment v1.12). One record per branch the repo has
+// been checked out on while lastcall watched; the record in force is the one the branch
+// name in <git_dir>/HEAD selects.
+// ---------------------------------------------------------------------------------------
+
+/// The branch the record in force belongs to, read from the ledger's own JSON (the shape
+/// the next process loads).
+fn seen_branch(s: &Fresh) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(&s.ledger().to_json()).expect("ledger json");
+    v.get("seen_branch")
+        .and_then(|b| b.as_str())
+        .map(str::to_owned)
+}
+
+/// The parked branch names, sorted (the `branches` map's keys; empty when the field is
+/// omitted).
+fn parked(s: &Fresh) -> Vec<String> {
+    let v: serde_json::Value = serde_json::from_str(&s.ledger().to_json()).expect("ledger json");
+    match v.get("branches") {
+        Some(serde_json::Value::Object(m)) => m.keys().cloned().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The root's `ledger.json` under the state dir, found by its `root` field the way a second
+/// process finds it.
+fn ledger_file(s: &Fresh) -> std::path::PathBuf {
+    let want = s.root.to_string_lossy().into_owned();
+    let roots = s.state.path().join("roots");
+    let mut found = Vec::new();
+    for parent in std::fs::read_dir(&roots).expect("state/roots").flatten() {
+        let Ok(repos) = std::fs::read_dir(parent.path().join("repos")) else {
+            continue;
+        };
+        for repo in repos.flatten() {
+            let path = repo.path().join("ledger.json");
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let v: serde_json::Value = serde_json::from_str(&text).expect("ledger json");
+            if v["root"].as_str() == Some(want.as_str()) {
+                found.push(path);
+            }
+        }
+    }
+    assert_eq!(found.len(), 1, "exactly one ledger for {want}: {found:?}");
+    found.pop().unwrap()
+}
+
+/// D15's fixture up to "three records": first sight on `main`, a run branch `run-1` with
+/// `a.rs`/`b.rs` committed on it, a second run `run-2` with `c.rs`, and `main` in force at
+/// the end with both runs parked.
+fn d15_three_records(name: &str) -> Fresh {
+    let mut s = Fresh::new(name);
+    assert_pile!(s.engine, s.root, "", "D15 first sight on main");
+    s.repo.checkout_b("run-1").unwrap();
+    assert_pile!(
+        s.engine,
+        s.root,
+        "",
+        "D15 run-1 starts as a copy of main's record"
+    );
+    s.repo.write("a.rs", "a\n");
+    s.repo.write("b.rs", "b\n");
+    s.repo.commit("run-1 work").unwrap();
+    assert_pile!(
+        s.engine,
+        s.root,
+        "a.rs|b.rs",
+        "D15 the run's work is pending"
+    );
+    let _ = s.engine.inspect_head(&s.root).unwrap();
+    s.repo.checkout("main").unwrap();
+    assert_pile!(s.engine, s.root, "", "D15 back on main");
+    s.repo.checkout_b("run-2").unwrap();
+    assert_pile!(
+        s.engine,
+        s.root,
+        "",
+        "D15 run-2 starts as a copy of main's record"
+    );
+    s.repo.write("c.rs", "c\n");
+    s.repo.commit("run-2 work").unwrap();
+    assert_pile!(
+        s.engine,
+        s.root,
+        "c.rs",
+        "D15 the second run's work is pending"
+    );
+    let _ = s.engine.inspect_head(&s.root).unwrap();
+    s.repo.checkout("main").unwrap();
+    assert_pile!(
+        s.engine,
+        s.root,
+        "",
+        "D15 back on main after the second run"
+    );
+    assert_eq!(seen_branch(&s).as_deref(), Some("main"));
+    assert_eq!(parked(&s), vec!["run-1".to_string(), "run-2".to_string()]);
+    s
+}
+
+#[test]
+fn scenario_d14_accepted_on_a_branch_then_the_start_branch_checked_out() {
+    let repo = FixtureRepo::new("d14").unwrap();
+    repo.checkout_b("future").unwrap(); // first sight happens here, on future
+    let mut s = Fresh::over(repo, Config::default(), EngineOptions::default(), false);
+    assert_eq!(seen_branch(&s).as_deref(), Some("future"));
+    assert!(parked(&s).is_empty(), "no record for main");
+    for i in 1..=4 {
+        s.repo.write(&format!("n{i}"), format!("n{i}\n"));
+    }
+    s.repo.commit("agent adds four files").unwrap();
+    for i in 1..=4 {
+        assert!(s.accept_file(&format!("n{i}")).ok());
+    }
+    assert_pile!(
+        s.engine,
+        s.root,
+        "",
+        "D14 the four files accepted on future"
+    );
+    assert_eq!(s.ledger().overrides.len(), 4, "four overrides on future");
+    let _ = s.engine.inspect_head(&s.root).unwrap();
+    s.restart();
+    assert_pile!(s.engine, s.root, "", "D14 restart on future");
+
+    s.repo.checkout("main").unwrap();
+    assert_pile!(
+        s.engine,
+        s.root,
+        "",
+        "D14 checkout main: the fold takes main's content, no deletions"
+    );
+    assert_eq!(
+        s.head_notice().as_deref(),
+        Some(
+            "switched future → main: first time here, seen state carried from future; 0 files pending"
+        )
+    );
+    assert_eq!(seen_branch(&s).as_deref(), Some("main"));
+    assert_eq!(parked(&s), vec!["future".to_string()]);
+    assert!(
+        s.ledger().overrides.is_empty(),
+        "the fold dropped the four overrides"
+    );
+    s.restart();
+    assert_pile!(s.engine, s.root, "", "D14 restart on main");
+
+    s.repo.checkout("future").unwrap();
+    assert_pile!(
+        s.engine,
+        s.root,
+        "",
+        "D14 back on future: the parked record"
+    );
+    assert_eq!(
+        s.head_notice().as_deref(),
+        Some("switched main → future: 0 files differ from seen state")
+    );
+    assert_eq!(s.ledger().overrides.len(), 4, "future's overrides are back");
+    s.restart();
+    assert_pile!(s.engine, s.root, "", "D14 restart back on future");
+}
+
+#[test]
+fn scenario_d14_variant_first_sight_on_main_then_the_branch() {
+    let mut s = Fresh::new("d14v");
+    assert_pile!(s.engine, s.root, "", "D14 variant first sight on main");
+    s.repo.checkout_b("future").unwrap();
+    assert_pile!(
+        s.engine,
+        s.root,
+        "",
+        "D14 variant at the branch creation: main parked, a copy in force"
+    );
+    assert_eq!(seen_branch(&s).as_deref(), Some("future"));
+    assert_eq!(parked(&s), vec!["main".to_string()]);
+    for i in 1..=4 {
+        s.repo.write(&format!("n{i}"), format!("n{i}\n"));
+    }
+    s.repo.commit("agent adds four files").unwrap();
+    for i in 1..=4 {
+        assert!(s.accept_file(&format!("n{i}")).ok());
+    }
+    assert_pile!(s.engine, s.root, "", "D14 variant accepted on future");
+    s.repo.checkout("main").unwrap();
+    assert_pile!(
+        s.engine,
+        s.root,
+        "",
+        "D14 variant back on main: no deletions"
+    );
+    s.repo.checkout("future").unwrap();
+    assert_pile!(s.engine, s.root, "", "D14 variant back on future");
+    s.restart();
+    assert_pile!(s.engine, s.root, "", "D14 variant restart");
+}
+
+#[test]
+fn scenario_d15_an_unattended_run_on_a_generated_branch() {
+    let mut s = Fresh::new("d15");
+    assert_pile!(s.engine, s.root, "", "D15 first sight on main");
+    s.repo.checkout_b("run-1").unwrap();
+    assert_pile!(s.engine, s.root, "", "D15 the copy at the branch creation");
+    assert_eq!(
+        s.head_notice().as_deref(),
+        Some("switched main → run-1 (same commit)")
+    );
+    s.repo.write("a.rs", "a\n");
+    s.repo.write("b.rs", "b\n");
+    s.repo.commit("run-1 work").unwrap();
+    s.repo.write("scratch.tmp", "scratch\n");
+    assert_pile!(
+        s.engine,
+        s.root,
+        "a.rs|b.rs|scratch.tmp",
+        "D15 run-1 after the writes"
+    );
+    let _ = s.engine.inspect_head(&s.root).unwrap();
+    s.repo.git(&["checkout", "-q", "."]).unwrap();
+    s.repo.git(&["clean", "-qfd"]).unwrap();
+    assert_pile!(
+        s.engine,
+        s.root,
+        "a.rs|b.rs",
+        "D15 after the clean: the committed work waits"
+    );
+    s.restart();
+    assert_pile!(s.engine, s.root, "a.rs|b.rs", "D15 restart on run-1");
+    s.repo.checkout("main").unwrap();
+    assert_pile!(s.engine, s.root, "", "D15 back on main");
+    assert_eq!(
+        s.head_notice().as_deref(),
+        Some("switched run-1 → main: 0 files differ from seen state")
+    );
+    s.repo.checkout_b("run-2").unwrap();
+    s.repo.write("c.rs", "c\n");
+    s.repo.commit("run-2 work").unwrap();
+    s.repo.git(&["checkout", "-q", "."]).unwrap();
+    s.repo.git(&["clean", "-qfd"]).unwrap();
+    s.repo.checkout("main").unwrap();
+    assert_pile!(
+        s.engine,
+        s.root,
+        "",
+        "D15 back on main after the second run"
+    );
+    s.repo.checkout("run-1").unwrap();
+    assert_pile!(
+        s.engine,
+        s.root,
+        "a.rs|b.rs",
+        "D15 run-1's parked record: the run's work waiting for review"
+    );
+    assert!(s.accept_all().ok());
+    assert_pile!(s.engine, s.root, "", "D15 accept-all on run-1");
+    s.repo.checkout("main").unwrap();
+    assert_pile!(s.engine, s.root, "", "D15 main after the review");
+    s.repo.checkout("run-2").unwrap();
+    assert_pile!(s.engine, s.root, "c.rs", "D15 run-2's work");
+    assert_eq!(seen_branch(&s).as_deref(), Some("run-2"));
+    assert_eq!(
+        parked(&s),
+        vec!["main".to_string(), "run-1".to_string()],
+        "three records: run-2 in force and two parked"
+    );
+    s.restart();
+    assert_pile!(s.engine, s.root, "c.rs", "D15 restart on run-2");
+}
+
+#[test]
+fn scenario_d16_cherry_picks_show_once_more_by_design() {
+    let mut s = d15_three_records("d16");
+    s.repo.checkout("run-1").unwrap();
+    assert_pile!(s.engine, s.root, "a.rs|b.rs");
+    assert!(s.accept_all().ok());
+    s.repo.checkout("run-2").unwrap();
+    assert_pile!(s.engine, s.root, "c.rs");
+    assert!(s.accept_all().ok());
+    s.repo.checkout("main").unwrap();
+    assert_pile!(
+        s.engine,
+        s.root,
+        "",
+        "D16 main after both runs were accepted"
+    );
+    s.repo.checkout_b("feat/x").unwrap();
+    assert_pile!(
+        s.engine,
+        s.root,
+        "",
+        "D16 feat/x is a copy of main's record"
+    );
+    s.repo.git(&["cherry-pick", "main..run-1"]).unwrap();
+    s.repo.git(&["cherry-pick", "main..run-2"]).unwrap();
+    assert_pile!(
+        s.engine,
+        s.root,
+        "a.rs|b.rs|c.rs",
+        "D16 the cherry-picked content shows again"
+    );
+    let before = s.ledger().seen_tree.clone();
+    assert!(s.accept_all().ok());
+    assert_pile!(s.engine, s.root, "", "D16 accept-all on feat/x");
+    assert_ne!(s.ledger().seen_tree, before, "feat/x's seen_tree is a fold");
+    s.repo.checkout("main").unwrap();
+    assert_pile!(s.engine, s.root, "", "D16 main's record is untouched");
+    s.restart();
+    assert_pile!(s.engine, s.root, "", "D16 restart on main");
+}
+
+#[test]
+fn scenario_d17_the_run_in_a_linked_worktree() {
+    let repo = FixtureRepo::new("d17").unwrap();
+    let wt = repo.parent_dir().join("d17-run");
+    repo.git(&["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "run-3"])
+        .unwrap();
+    let mut s = Fresh::over(repo, Config::default(), EngineOptions::default(), true);
+    let wt = std::fs::canonicalize(&wt).unwrap();
+    assert_pile!(s.engine, wt, "", "D17 the worktree is its own root");
+    let wt_ledger: serde_json::Value =
+        serde_json::from_str(&s.engine.root(&wt).unwrap().ledger.to_json()).unwrap();
+    assert_eq!(
+        wt_ledger["seen_branch"].as_str(),
+        Some("run-3"),
+        "the worktree's own first sight, on its own branch"
+    );
+    assert!(parked(&s).is_empty(), "R's ledger has no run-3 record");
+    let before = s.ledger().to_json();
+
+    std::fs::write(wt.join("w1"), "w1\n").unwrap();
+    s.repo.git_at(&wt, &["add", "-A"]).unwrap();
+    s.repo
+        .git_at(&wt, &["commit", "-qm", "run-3 work"])
+        .unwrap();
+    let pile = assert_pile!(s.engine, wt, "w1", "D17 the run's work, reviewed there");
+    s.engine
+        .ops(&wt)
+        .unwrap()
+        .accept_all(&pile, &NoFault)
+        .unwrap();
+    assert_pile!(
+        s.engine,
+        wt,
+        "",
+        "D17 accepted in the worktree's own ledger"
+    );
+    assert_pile!(s.engine, s.root, "", "D17 R's pile is empty throughout");
+
+    s.repo.git_at(&wt, &["checkout", "-q", "--detach"]).unwrap();
+    s.repo
+        .git(&["worktree", "remove", wt.to_str().unwrap()])
+        .unwrap();
+    assert_pile!(s.engine, s.root, "", "D17 R after the worktree is removed");
+    assert_eq!(s.ledger().to_json(), before, "R's ledger is unchanged");
+    s.repo.checkout("run-3").unwrap();
+    assert_pile!(
+        s.engine,
+        s.root,
+        "w1",
+        "D17 R first-sights run-3 from main's record: ahead, no fold, over-show"
+    );
+}
+
+#[test]
+fn scenario_d18_a_branch_that_is_ahead_never_seen() {
+    let mut s = Fresh::new("d18");
+    assert_pile!(s.engine, s.root, "", "D18 first sight on main");
+    // feat/other exists locally and was never checked out while lastcall watched.
+    s.repo.checkout_b("feat/other").unwrap();
+    s.repo.write("o1", "o1\n");
+    s.repo.commit("o1").unwrap();
+    s.repo.write("o2", "o2\n");
+    s.repo.commit("o2").unwrap();
+    s.repo.checkout("main").unwrap();
+
+    s.repo.checkout("feat/other").unwrap();
+    assert_pile!(
+        s.engine,
+        s.root,
+        "o1|o2",
+        "D18 a copy of main's record, no fold: over-show"
+    );
+    assert_eq!(
+        s.head_notice().as_deref(),
+        Some(
+            "switched main → feat/other: first time here, seen state carried from main; 2 files pending"
+        )
+    );
+    assert!(s.accept_all().ok());
+    assert_pile!(s.engine, s.root, "", "D18 accept-all on feat/other");
+    s.repo.checkout("main").unwrap();
+    assert_pile!(s.engine, s.root, "", "D18 main");
+    let _ = s.engine.inspect_head(&s.root).unwrap();
+    s.repo.checkout("feat/other").unwrap();
+    assert_pile!(s.engine, s.root, "", "D18 the return: the parked record");
+    assert_eq!(
+        s.head_notice().as_deref(),
+        Some("switched main → feat/other: 0 files differ from seen state"),
+        "the second arrival is the return form"
+    );
+    s.restart();
+    assert_pile!(s.engine, s.root, "", "D18 restart on feat/other");
+}
+
+#[test]
+fn scenario_d19_detached_head_and_in_progress_keep_the_record() {
+    // D18 after accept-all on feat/other.
+    let mut s = Fresh::new("d19");
+    assert_pile!(s.engine, s.root, "");
+    s.repo.checkout_b("feat/other").unwrap();
+    s.repo.write("o1", "o1\n");
+    s.repo.commit("o1").unwrap();
+    s.repo.write("o2", "o2\n");
+    s.repo.commit("o2").unwrap();
+    s.repo.checkout("main").unwrap();
+    s.repo.checkout("feat/other").unwrap();
+    assert_pile!(s.engine, s.root, "o1|o2");
+    assert!(s.accept_all().ok());
+    assert_pile!(s.engine, s.root, "");
+    let _ = s.engine.inspect_head(&s.root).unwrap();
+
+    s.repo
+        .git(&["checkout", "-q", "--detach", "HEAD~1"])
+        .unwrap();
+    assert_pile!(
+        s.engine,
+        s.root,
+        "o2",
+        "D19 the detach removes o2 from the worktree: over-show against the record"
+    );
+    assert_eq!(
+        seen_branch(&s).as_deref(),
+        Some("feat/other"),
+        "a detached HEAD never switches"
+    );
+    let notice = s.head_notice().expect("the detach is a checkout");
+    assert!(
+        notice.starts_with("switched feat/other → ")
+            && notice.ends_with(": 1 files differ from seen state"),
+        "{notice}"
+    );
+    // An accept at the detached HEAD lands in the record in force (feat/other's).
+    s.repo.write("o1", "o1 edited\n");
+    assert!(s.accept_file("o1").ok());
+    assert!(s.ledger().overrides.contains_key("o1"));
+    assert_eq!(seen_branch(&s).as_deref(), Some("feat/other"));
+    s.repo.checkout("feat/other").unwrap();
+    assert_pile!(
+        s.engine,
+        s.root,
+        "",
+        "D19 back on the branch: no switch, and the accept is there"
+    );
+
+    // A rebase stopped on a conflict: the record in force does not move.
+    s.repo.commit("o1 edited").unwrap();
+    s.repo.write("f2", "mine\n");
+    s.repo.commit("mine").unwrap();
+    assert!(s.accept_all().ok());
+    let _ = s.engine.inspect_head(&s.root).unwrap();
+    s.repo
+        .coworker_commit(&[("f2", "theirs\n"), ("u1", "other\n")], "cw")
+        .unwrap();
+    s.repo.git(&["fetch", "-q"]).unwrap();
+    assert!(
+        s.repo.git(&["rebase", "-q", "origin/main"]).is_err(),
+        "the rebase stops on f2"
+    );
+    let rg = s.engine.root(&s.root).unwrap().repo.as_ref().unwrap();
+    assert_eq!(
+        headstate::inspect(rg).unwrap().in_progress,
+        Some(InProgress::Rebase)
+    );
+    let pile = s.scan();
+    assert!(
+        pile.row(b"f2").expect("f2 pending mid-rebase").conflicted,
+        "conflict markers pending"
+    );
+    assert_eq!(
+        seen_branch(&s).as_deref(),
+        Some("feat/other"),
+        "mid-rebase the record in force is unchanged"
+    );
+    s.repo.write("f2", "resolved\n");
+    s.repo.git(&["add", "f2"]).unwrap();
+    s.repo
+        .git(&["-c", "core.editor=true", "rebase", "--continue"])
+        .unwrap();
+    let pile = s.scan();
+    assert!(
+        pile.row(b"o1").is_none() && pile.row(b"o2").is_none(),
+        "B5's rule: the rebased commits re-flag nothing ({})",
+        common::pile_string(&pile)
+    );
+    assert_eq!(seen_branch(&s).as_deref(), Some("feat/other"));
+
+    // Detached, then a new branch: the first sight copies the record in force.
+    s.repo.git(&["checkout", "-q", "--detach"]).unwrap();
+    let _ = s.scan();
+    s.repo.checkout_b("feat/from-detached").unwrap();
+    let _ = s.scan();
+    assert_eq!(seen_branch(&s).as_deref(), Some("feat/from-detached"));
+    assert!(
+        parked(&s).contains(&"feat/other".to_string()),
+        "A was the record in force, feat/other: {:?}",
+        parked(&s)
+    );
+}
+
+#[test]
+fn scenario_d20_deleted_recreated_renamed() {
+    let mut s = d15_three_records("d20");
+    s.repo.git(&["branch", "-D", "run-1"]).unwrap();
+    s.repo.checkout("run-2").unwrap();
+    assert_pile!(s.engine, s.root, "c.rs", "D20 any switch prunes");
+    assert_eq!(
+        parked(&s),
+        vec!["main".to_string()],
+        "the deleted branch's record is pruned; main is parked while run-2 is in force"
+    );
+    s.repo.checkout("main").unwrap();
+    assert_pile!(s.engine, s.root, "");
+    s.repo.checkout_b("run-1").unwrap();
+    assert_pile!(
+        s.engine,
+        s.root,
+        "",
+        "D20 the recreated run-1 is a first sight; nothing of the old record survives"
+    );
+
+    // A rename of the branch in force: re-label, no park, no first sight.
+    s.repo.checkout("run-2").unwrap();
+    assert_pile!(s.engine, s.root, "c.rs");
+    let tree = s.ledger().seen_tree.clone();
+    s.repo.git(&["branch", "-m", "run-2", "run-two"]).unwrap();
+    assert_pile!(
+        s.engine,
+        s.root,
+        "c.rs",
+        "D20 the rename leaves the pile unchanged"
+    );
+    assert_eq!(seen_branch(&s).as_deref(), Some("run-two"));
+    assert_eq!(s.ledger().seen_tree, tree, "the same record, re-labelled");
+    let names = parked(&s);
+    assert!(
+        !names.contains(&"run-2".to_string()) && !names.contains(&"run-two".to_string()),
+        "no park and no first sight for a rename: {names:?}"
+    );
+
+    // A parked branch renamed: pruned at the next switch; the new name first-sights.
+    s.repo.git(&["branch", "-m", "main", "trunk"]).unwrap();
+    s.repo.checkout("trunk").unwrap();
+    assert_pile!(
+        s.engine,
+        s.root,
+        "",
+        "D20 trunk first-sights from the record in force"
+    );
+    assert_eq!(seen_branch(&s).as_deref(), Some("trunk"));
+    assert_eq!(
+        parked(&s),
+        vec!["run-1".to_string(), "run-two".to_string()],
+        "main's parked record is pruned with its ref"
+    );
+}
+
+#[test]
+fn scenario_d21_restart_and_offline_switches() {
+    let mut s = d15_three_records("d21");
+    s.repo.checkout("run-1").unwrap(); // lastcall is not watching
+    s.restart();
+    assert_pile!(
+        s.engine,
+        s.root,
+        "a.rs|b.rs",
+        "D21 the switch happens at open"
+    );
+    assert_eq!(seen_branch(&s).as_deref(), Some("run-1"));
+    assert!(
+        s.engine.inspect_head(&s.root).unwrap().is_none(),
+        "no notice: nothing moved while lastcall watched"
+    );
+    s.repo.checkout("main").unwrap();
+    s.restart();
+    assert_pile!(s.engine, s.root, "", "D21 back on main at open");
+    assert_eq!(seen_branch(&s).as_deref(), Some("main"));
+}
+
+#[test]
+fn scenario_d21_a_1_1_ledger_adopts_the_branch_without_a_fold() {
+    let mut s = Fresh::new("d21b");
+    s.repo.write("x.txt", "x\n");
+    assert_pile!(s.engine, s.root, "x.txt");
+    assert!(s.accept_file("x.txt").ok());
+    s.repo.write("x.txt", "x edited\n");
+    assert_pile!(
+        s.engine,
+        s.root,
+        "x.txt",
+        "D21 a pending file and an override"
+    );
+    s.repo.checkout_b("feat/y").unwrap();
+
+    // The file a 1.1 binary would have left: no seen_branch, no branches.
+    let path = ledger_file(&s);
+    let text = std::fs::read_to_string(&path).unwrap();
+    let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let obj = v.as_object_mut().unwrap();
+    obj.insert(
+        "schema_version".to_string(),
+        serde_json::Value::String("1.1".to_string()),
+    );
+    obj.remove("seen_branch");
+    obj.remove("branches");
+    let text = format!("{}\n", serde_json::to_string_pretty(&v).unwrap());
+    std::fs::write(&path, &text).unwrap();
+
+    s.restart();
+    assert_pile!(
+        s.engine,
+        s.root,
+        "x.txt",
+        "D21 the 1.1 file adopts HEAD's branch with no fold and no change to the pile"
+    );
+    assert_eq!(seen_branch(&s).as_deref(), Some("feat/y"));
+    assert!(parked(&s).is_empty());
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        text,
+        "byte-identical until the next write"
+    );
+    assert!(s.accept_file("x.txt").ok());
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(after["schema_version"].as_str(), Some("1.2"));
+    assert_eq!(after["seen_branch"].as_str(), Some("feat/y"));
+}
+
+#[test]
+fn scenario_d22_two_processes_over_one_root() {
+    let mut s = Fresh::new("d22");
+    let env = s.repo.engine_env(s.state.path());
+    let mut e2 = open_engine_with(
+        s.repo.path(),
+        &env,
+        s.state.path(),
+        Config::default(),
+        EngineOptions::default(),
+    );
+    s.repo.checkout_b("feat/z").unwrap();
+    s.repo.write("z1", "z1\n");
+    s.repo.commit("z1 on feat/z").unwrap();
+    assert_pile!(s.engine, s.root, "z1", "D22 engine 1 performs the switch");
+    assert_pile!(
+        e2,
+        s.root,
+        "z1",
+        "D22 engine 2 adopts the file, no second first sight"
+    );
+    let row = e2.scan(&s.root).unwrap().row(b"z1").unwrap().clone();
+    let rendered = Rendered::of(&row);
+
+    s.repo.checkout("main").unwrap();
+    assert_pile!(s.engine, s.root, "", "D22 engine 1 switches back to main");
+    let out = e2
+        .ops(&s.root)
+        .unwrap()
+        .accept_file(&rendered, &NoFault)
+        .expect("accept_file");
+    assert!(!out.ok(), "the accept is refused");
+    assert_eq!(
+        out.refused[0].to_string(),
+        "branch changed under this accept (now main); try again"
+    );
+    assert!(!out.written, "nothing written");
+    assert_pile!(e2, s.root, "", "D22 engine 2's next scan shows main's pile");
+}
+
+#[test]
+fn scenario_d23_uncommitted_work_and_its_accepted_hunk_survive_checkout_b() {
+    let mut s = Fresh::new("d23");
+    s.repo
+        .write("f1", "A1\na2\na3\na4\na5\na6\na7\na8\na9\nA10\n");
+    let pile = assert_pile!(s.engine, s.root, "f1");
+    assert_eq!(pile.row(b"f1").unwrap().hunks.len(), 2, "two hunks");
+    assert!(s.accept_hunk("f1", 0).ok());
+    let pile = assert_pile!(s.engine, s.root, "f1", "D23 hunk 2 only");
+    assert_eq!(pile.row(b"f1").unwrap().hunks.len(), 1);
+    let over = s.ledger().overrides["f1"].clone();
+
+    s.repo.checkout_b("feat/w").unwrap();
+    let pile = assert_pile!(s.engine, s.root, "f1", "D23 the copy carries the override");
+    assert_eq!(pile.row(b"f1").unwrap().hunks.len(), 1, "exactly hunk 2");
+    assert_eq!(s.ledger().overrides["f1"], over);
+    assert_eq!(
+        s.head_notice().as_deref(),
+        Some(
+            "switched main → feat/w: first time here, seen state carried from main; 1 file pending"
+        )
+    );
+    s.repo.checkout("main").unwrap();
+    let pile = assert_pile!(s.engine, s.root, "f1", "D23 back on main");
+    assert_eq!(pile.row(b"f1").unwrap().hunks.len(), 1);
+    assert_eq!(s.ledger().overrides["f1"], over);
+    assert_eq!(
+        s.head_notice().as_deref(),
+        Some("switched feat/w → main: 1 files differ from seen state")
     );
 }
