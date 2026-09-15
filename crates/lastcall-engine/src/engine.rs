@@ -553,6 +553,24 @@ impl Engine {
         self.discovery_runs
     }
 
+    /// Change how many folders below each parent dir the next discovery pass reads
+    /// (Amendment v1.11, deliverable 8). The value the first-launch tour's depth card
+    /// applies for the session, whether or not it could write it to the config file.
+    ///
+    /// It only sets the number: the roots appear on the next [`Engine::rescan`], which the
+    /// watcher runs when it is asked to and on its own backstop. Out-of-range values are
+    /// clamped rather than refused — `Config::validate` is where a bad *file* is rejected,
+    /// and a caller in the binary asking for depth 9 should get the deepest walk there is,
+    /// not a panic in the middle of a keystroke.
+    pub fn set_search_depth(&mut self, depth: u8) {
+        self.config.search_depth = depth.clamp(1, crate::config::MAX_SEARCH_DEPTH);
+    }
+
+    /// How many folders below each parent dir discovery currently reads.
+    pub fn search_depth(&self) -> u8 {
+        self.config.search_depth
+    }
+
     /// The number of the most recent scan that produced a pile (engine-global, strictly
     /// increasing across roots, `0` before the first). Read it under the same lock as the
     /// [`Engine::scan`] it describes.
@@ -586,6 +604,7 @@ impl Engine {
             parent_dirs: &self.resolved.parent_dirs,
             draft_dirs: &self.config.draft_dirs,
             nested: &nested,
+            search_depth: self.config.search_depth,
         });
         let changed = roots::diff(&self.discovery, &next);
         for n in &next.notices {
@@ -3633,6 +3652,84 @@ pub(crate) mod tests {
             runs1,
             "no rediscovery while the nested set is unchanged"
         );
+    }
+
+    /// Deliverable 8: the depth the tour's card applies is a session setting the next
+    /// discovery pass reads. The repository two folders down is invisible at the default
+    /// depth, appears after `set_search_depth(2)` and one `rescan`, and the ledger of the
+    /// root that was already open is not touched on the way.
+    #[test]
+    fn engine_set_search_depth_adds_the_deeper_roots_on_the_next_rescan() {
+        let repo = FixtureRepo::new("eng-depth").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        // A plain folder beside the fixture repo, with a repository inside it: level 2.
+        let deep = repo.parent_dir().join("worktrees").join("b");
+        std::fs::create_dir_all(&deep).unwrap();
+        repo.git_at(&deep, &["init", "-q", "-b", "main"]).unwrap();
+        std::fs::write(deep.join("n"), "n\n").unwrap();
+
+        repo.write("f1", "one\n");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let root = only_root(&engine);
+        assert_eq!(engine.search_depth(), 1, "the default is level 1 alone");
+        // Give the open root a ledger worth comparing: a fold, not a fresh file.
+        let snapshot = engine.scan(&root).unwrap();
+        assert_eq!(scan::pile_lines(&snapshot), vec!["f1".to_owned()]);
+        assert!(
+            engine
+                .accept(&root, AcceptRequest::All(snapshot))
+                .unwrap()
+                .outcome
+                .ok()
+        );
+        let before = engine.root(&root).unwrap().ledger.clone();
+
+        let runs0 = engine.discovery_runs();
+        engine.set_search_depth(2);
+        assert_eq!(engine.search_depth(), 2);
+        assert_eq!(
+            engine.root_paths(),
+            vec![root.clone()],
+            "setting the number alone discovers nothing"
+        );
+        let changed = engine.rescan().unwrap();
+        assert_eq!(
+            engine.discovery_runs(),
+            runs0 + 1,
+            "one rescan is one discovery run"
+        );
+        let canon_deep = std::fs::canonicalize(&deep).unwrap();
+        assert_eq!(changed.added, vec![canon_deep.clone()]);
+        assert!(changed.removed.is_empty(), "{:?}", changed.removed);
+        let mut want = vec![root.clone(), canon_deep];
+        want.sort();
+        assert_eq!(
+            engine.root_paths(),
+            want,
+            "the level-2 repository is a root"
+        );
+        assert_eq!(
+            engine.root(&root).unwrap().ledger,
+            before,
+            "the open root's ledger is untouched by a rescan"
+        );
+
+        // And it is a number, not a ratchet: back to 1 and the deeper root is gone again.
+        engine.set_search_depth(1);
+        engine.rescan().unwrap();
+        assert_eq!(engine.root_paths(), vec![root]);
+    }
+
+    /// Out-of-range depths clamp rather than panic: the binary's callers are keystrokes.
+    #[test]
+    fn engine_set_search_depth_clamps_out_of_range_values() {
+        let repo = FixtureRepo::new("eng-depth-clamp").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        engine.set_search_depth(0);
+        assert_eq!(engine.search_depth(), 1);
+        engine.set_search_depth(200);
+        assert_eq!(engine.search_depth(), crate::config::MAX_SEARCH_DEPTH);
     }
 
     /// R7: `--root` outside every root (or nonexistent) is an error, not an empty report.

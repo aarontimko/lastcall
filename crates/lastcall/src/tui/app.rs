@@ -3187,6 +3187,10 @@ impl App {
                 self.hide_empty = true;
                 self.reconcile_selection();
             }
+            // Deliverable 8: the depth card changes nothing the reducer owns. The roots the
+            // deeper walk finds arrive through the engine, on the rescan the loop asks for
+            // once the depth is set, and reach the app as an ordinary roots update.
+            Setting::SearchDepth2 => {}
         }
     }
 

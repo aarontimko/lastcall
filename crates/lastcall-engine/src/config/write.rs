@@ -42,6 +42,8 @@ pub enum Setting {
     HideEmptyRepos,
     /// `scope = "all"` under `[herdr]` (§5.9).
     HerdrScopeAll,
+    /// `search_depth = 2` at the top level (§6.1, deliverable 8).
+    SearchDepth2,
 }
 
 impl Setting {
@@ -51,6 +53,7 @@ impl Setting {
         match self {
             Setting::HideEmptyRepos => &["hide_empty_repos = true"],
             Setting::HerdrScopeAll => &["[herdr]", "scope = \"all\""],
+            Setting::SearchDepth2 => &["search_depth = 2"],
         }
     }
 }
@@ -142,6 +145,7 @@ impl Document {
                 .and_then(Item::as_table_like)
                 .and_then(|t| t.get("scope"))
                 .is_some(),
+            Setting::SearchDepth2 => doc.get("search_depth").is_some(),
         }
     }
 
@@ -208,6 +212,9 @@ fn apply(doc: &mut DocumentMut, setting: Setting) -> Result<(), String> {
                 .as_table_like_mut()
                 .ok_or_else(|| "herdr is set to something that is not a table".to_owned())?;
             table.insert("scope", value("all"));
+        }
+        Setting::SearchDepth2 => {
+            doc["search_depth"] = value(2);
         }
     }
     Ok(())
@@ -447,6 +454,102 @@ mod tests {
         );
     }
 
+    /// Deliverable 8's setting: the question is the document's, the write lands at root
+    /// level **above the first table header**, and a table-first file (the shape the e2e
+    /// harness writes, and the one `toml_edit` has to get right on its own) keeps every
+    /// other byte.
+    #[test]
+    fn config_write_search_depth_lands_at_root_level_in_a_table_first_file() {
+        let dir = tmp();
+        let path = dir.path().join("config.toml");
+        let before = concat!(
+            "[update]\n",
+            "# the daily check is off on this machine\n",
+            "check = false\n",
+            "\n",
+            "[keys]\n",
+            "quit = \"x\"\n",
+        );
+        std::fs::write(&path, before).expect("write");
+        let env = Env::empty(dir.path()).with_var("LASTCALL_CONFIG", path.to_str().unwrap());
+        let mut doc = Document::open(&env);
+        assert!(!doc.sets(Setting::SearchDepth2), "the file has never said");
+        doc.write(Setting::SearchDepth2, "2026-09-14")
+            .expect("write");
+        let after = std::fs::read_to_string(&path).expect("read back");
+
+        let removed: Vec<&str> = before.lines().filter(|l| !after.contains(*l)).collect();
+        assert!(removed.is_empty(), "nothing may be lost: {removed:?}");
+        let added: Vec<&str> = after
+            .lines()
+            .filter(|l| !before.lines().any(|b| b == *l))
+            .collect();
+        assert_eq!(added, vec!["search_depth = 2"], "exactly one line is added");
+        // Below `[update]` the line would have been `update.search_depth` and meant
+        // nothing at all, so where it landed is the whole test.
+        let key = after.find("search_depth").expect("the key");
+        assert!(key < after.find("[update]").expect("the table"), "{after}");
+        // And the file it left behind is a config file lastcall reads, with the value.
+        let loaded = super::super::load(
+            &Env::empty(dir.path())
+                .with_var("LASTCALL_CONFIG", path.to_str().unwrap())
+                .with_var(
+                    "LASTCALL_STATE_DIR",
+                    dir.path().join("state").to_str().unwrap(),
+                ),
+        )
+        .expect("load");
+        assert_eq!(loaded.config.search_depth, 2);
+
+        // Asked again over the file it wrote, the card is not offered a second time.
+        let asked = Document::open(&env);
+        assert!(asked.sets(Setting::SearchDepth2));
+    }
+
+    /// With no file at all the depth card creates one, and the bytes are the comment and
+    /// the one line.
+    #[test]
+    fn config_write_search_depth_creates_the_file_with_one_line() {
+        let dir = tmp();
+        let env = Env::empty(dir.path())
+            .with_var("XDG_CONFIG_HOME", dir.path().to_str().unwrap())
+            .with_var(
+                "LASTCALL_STATE_DIR",
+                dir.path().join("state").to_str().unwrap(),
+            );
+        let mut doc = Document::open(&env);
+        doc.write(Setting::SearchDepth2, "2026-09-14")
+            .expect("create");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("lastcall").join("config.toml"))
+                .expect("read back"),
+            "# written by lastcall's first-launch tour on 2026-09-14\nsearch_depth = 2\n"
+        );
+    }
+
+    /// `sets` is about the key being there, with **any** value: a user who wrote
+    /// `search_depth = 1` by hand has said what they want as loudly as one who wrote `4`.
+    #[test]
+    fn config_write_search_depth_sets_is_about_the_document_not_the_value() {
+        let dir = tmp();
+        let path = dir.path().join("config.toml");
+        for (text, want) in [
+            ("", false),
+            ("search_depth = 1\n", true),
+            ("search_depth = 4\n", true),
+            ("hide_empty_repos = true\n", false),
+            ("[herdr]\nscope = \"all\"\n", false),
+        ] {
+            std::fs::write(&path, text).expect("write");
+            let env = Env::empty(dir.path()).with_var("LASTCALL_CONFIG", path.to_str().unwrap());
+            assert_eq!(
+                Document::open(&env).sets(Setting::SearchDepth2),
+                want,
+                "search_depth in {text:?}"
+            );
+        }
+    }
+
     /// The lines a failed write tells the user to add themselves are the TOML it would have
     /// written, table header included.
     #[test]
@@ -459,9 +562,14 @@ mod tests {
             Setting::HerdrScopeAll.lines(),
             &["[herdr]", "scope = \"all\""]
         );
+        assert_eq!(Setting::SearchDepth2.lines(), &["search_depth = 2"]);
         // Each set of lines is a config file lastcall parses on its own.
         let dir = tmp();
-        for setting in [Setting::HideEmptyRepos, Setting::HerdrScopeAll] {
+        for setting in [
+            Setting::HideEmptyRepos,
+            Setting::HerdrScopeAll,
+            Setting::SearchDepth2,
+        ] {
             let mut doc = Document::empty_at(dir.path().join("config.toml"));
             doc.write(setting, "2026-09-14").expect("write");
             let env = Env::empty(dir.path())

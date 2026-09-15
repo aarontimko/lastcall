@@ -16,6 +16,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::env::Env;
 
+/// Default `search_depth`: the repositories directly inside each parent dir, which is what
+/// every release before Amendment v1.11 did and the only thing it did.
+pub const DEFAULT_SEARCH_DEPTH: u8 = 1;
+
+/// The deepest `search_depth` the walk will go, and the draft glob walk's own ceiling.
+pub const MAX_SEARCH_DEPTH: u8 = 4;
+
 /// Default `collapse_size_bytes`: 512 KiB.
 pub const DEFAULT_COLLAPSE_SIZE_BYTES: u64 = 512 * 1024;
 
@@ -67,6 +74,13 @@ pub struct Config {
     /// pending included; `true` starts with those hidden. Engine-side only as a value the
     /// binary reads; nothing here changes what a scan or `status` reports.
     pub hide_empty_repos: bool,
+    /// How many folders below each parent directory discovery reads for a repository
+    /// (Amendment v1.11, §6.1). `1` — the default, and every release before this one — is
+    /// the repositories directly inside each parent; `2` also reads one plain folder
+    /// further (`worktrees/<name>`) and lists a linked worktree kept inside a listed
+    /// repository; up to `4`, the walk's ceiling. The walk never enters a repository or a
+    /// dependency folder, so what it costs is a `read_dir` per plain folder.
+    pub search_depth: u8,
     /// The `[herdr]` table.
     pub herdr: HerdrConfig,
     /// The `[update]` table (Amendment v1.10 item 2).
@@ -94,6 +108,7 @@ impl Default for Config {
                 .map(|s| (*s).to_string())
                 .collect(),
             hide_empty_repos: false,
+            search_depth: DEFAULT_SEARCH_DEPTH,
             herdr: HerdrConfig::default(),
             update: UpdateConfig::default(),
             keys: BTreeMap::new(),
@@ -389,6 +404,11 @@ impl Config {
         if self.collapse_size_bytes == 0 {
             return Err(invalid("collapse_size_bytes must be > 0".to_string()));
         }
+        if self.search_depth < 1 || self.search_depth > MAX_SEARCH_DEPTH {
+            return Err(invalid(format!(
+                "search_depth must be between 1 and {MAX_SEARCH_DEPTH}"
+            )));
+        }
         for entry in &self.draft_dirs {
             if !is_absolute_or_relative_glob(entry) {
                 return Err(invalid(format!(
@@ -495,6 +515,7 @@ collapsed_globs = ["*.lock"]
 collapse_size_bytes = 1024
 ignore_globs = [".git/**"]
 hide_empty_repos = true
+search_depth = 3
 
 [herdr]
 mode = "on"
@@ -533,6 +554,7 @@ nav_down = ["down", "j", "ctrl-n"]
         assert_eq!(c.collapse_size_bytes, 1024);
         assert_eq!(c.ignore_globs, vec![".git/**"]);
         assert!(c.hide_empty_repos);
+        assert_eq!(c.search_depth, 3);
         assert_eq!(c.herdr.mode, HerdrMode::On);
         assert_eq!(c.herdr.session.as_deref(), Some("work"));
         assert!(!c.update.check);
@@ -927,6 +949,55 @@ nav_down = ["down", "j", "ctrl-n"]
         let err = load(&env).unwrap_err();
         assert!(matches!(err, ConfigError::Parse { .. }), "{err}");
         assert!(err.to_string().contains("expected a boolean"), "{err}");
+    }
+
+    /// Deliverable 8 (§6.1, Amendment v1.11): `search_depth` is a top-level integer,
+    /// default `1`, valid `1` to `4`. A config file from before this release loads with the
+    /// default, `lastcall config` prints the key on its own (it serializes `Config` whole,
+    /// so there is no code to add there, only this assertion), and `0` or `5` is the same
+    /// shape of validation error `collapse_size_bytes` has. A value outside `u8` fails in
+    /// the parser with serde's own wording, before `validate` ever runs.
+    #[test]
+    fn config_search_depth_defaults_to_one_and_is_range_checked() {
+        assert_eq!(Config::default().search_depth, DEFAULT_SEARCH_DEPTH);
+        assert_eq!(DEFAULT_SEARCH_DEPTH, 1, "one folder down, as it always was");
+        // A v1.0 file that has never heard of the key still loads.
+        let old: Config = toml::from_str("parent_dirs = []\ncollapse_size_bytes = 4096\n").unwrap();
+        assert_eq!(old.search_depth, 1);
+
+        let path = Path::new("/c/config.toml");
+        for depth in 1..=MAX_SEARCH_DEPTH {
+            let c: Config = toml::from_str(&format!("search_depth = {depth}\n")).unwrap();
+            assert_eq!(c.search_depth, depth);
+            c.validate(path).expect("in range");
+        }
+        for depth in [0, 5, 200] {
+            let c: Config = toml::from_str(&format!("search_depth = {depth}\n")).unwrap();
+            let err = c.validate(path).expect_err("out of range");
+            assert!(
+                err.to_string()
+                    .contains("search_depth must be between 1 and 4"),
+                "{err}"
+            );
+        }
+
+        // Round-trips, and `lastcall config` prints it with every other key.
+        let two: Config = toml::from_str("search_depth = 2\n").unwrap();
+        let text = toml::to_string_pretty(&two).unwrap();
+        assert!(text.contains("search_depth = 2"), "{text}");
+        assert_eq!(toml::from_str::<Config>(&text).unwrap(), two);
+        let printed = toml::to_string_pretty(&Config::default()).unwrap();
+        assert!(printed.contains("search_depth = 1"), "{printed}");
+
+        // Out of `u8` is the parser's error, with its own wording, and a load error either
+        // way; the range message is not promised for it.
+        let dir = TempDir::new("lc-config");
+        let (env, _) = env_with_config(&dir, "search_depth = 300\n");
+        let err = load(&env).unwrap_err();
+        assert!(matches!(err, ConfigError::Parse { .. }), "{err}");
+        let (env, _) = env_with_config(&dir, "search_depth = 0\n");
+        let err = load(&env).unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid { .. }), "{err}");
     }
 
     /// Amendment v1.10 item 2 (§6.1): `[update] check` is a bool, default `true` — a
