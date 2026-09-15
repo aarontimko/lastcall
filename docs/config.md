@@ -29,7 +29,13 @@ running while you read. `enter` moves to the next card, `q` skips the rest, and 
 have been through it the card never appears again: a one-line note in the state directory
 records that it has been shown. `lastcall tui --tour` brings it back whenever you want it.
 
-Two of the cards appear only when they apply, and each offers a choice:
+The card after the keys asks how far down the list looks: one folder below the directory
+you launched in, which is what lastcall does today, or two, which also reaches a clone or a
+worktree kept in a folder such as `worktrees/<name>`. Choosing two writes `search_depth = 2`
+and the new repositories appear on the screen behind the card. It names the config file for
+the settings that go further than that.
+
+Two more cards appear only when they apply, and each offers a choice:
 
 - Running inside a herdr session, lastcall narrows the list to the repositories that
   workspace is working in. The card offers to show every repository instead, which writes
@@ -48,13 +54,14 @@ the session.
 
 | key | default | what it does |
 |---|---|---|
-| `parent_dirs` | `[]`, meaning the directory you launched in | absolute paths. Every git repository directly under each one is watched, and a repository sitting untracked inside one of those is listed too, with a badge. A repository one plain folder deeper (for example `worktrees/<name>`) needs its own entry. |
+| `parent_dirs` | `[]`, meaning the directory you launched in | absolute paths. Every git repository directly under each one is watched, and a repository sitting untracked inside one of those is listed too, with a badge. A repository one plain folder deeper (for example `worktrees/<name>`) is reached with `search_depth`, or with its own entry here when it lives somewhere else entirely. |
 | `draft_dirs` | `[]` | directories that are **not** git repositories, each reviewed as a root of its own. Globs relative to a parent directory (`"_drafts/**"`, `"notes"`) or absolute paths. |
 | `draft_initial` | `"seen"` | what the first sight of a draft root means. `seen` starts from zero, so only changes made after that are pending. `pending` treats everything already there as pending. |
 | `collapsed_globs` | the nine common lockfiles | paths shown as one collapsed row instead of a wall of hunks. The default list is `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `Cargo.lock`, `poetry.lock`, `uv.lock`, `Gemfile.lock`, `go.sum`, `composer.lock`. Setting the key replaces the list. |
 | `collapse_size_bytes` | `524288` (512 KiB) | files at or above this size collapse too. Must be greater than zero. A file with a NUL byte in its first 8,000 is binary and collapses whatever this says. |
 | `ignore_globs` | `.git/**`, `node_modules/**`, `target/**`, `vendor/**`, `.venv/**` | these scope the filesystem watcher only. An ignored path never wakes a scan, but the next scan still reports a tracked edit under it, so this is a noise filter and not a way to hide changes. |
 | `hide_empty_repos` | `false` | what the `t` toggle starts as. `false` lists every repository under a parent directory, whether it has anything pending or not. `true` opens with the empty ones hidden, except one carrying an agent flag. `t` flips it for the session, and the headless commands are unaffected. The welcome on your first launch offers to write `true` here for you. |
+| `search_depth` | `1` | how many folders below each parent directory are read for a repository. `1` is the repositories directly inside it, `2` also reads one plain folder further, such as `worktrees/<name>`, and lists a worktree kept inside a listed repository, up to `4`. The walk never enters a repository or a dependency folder such as `node_modules`, `target`, `.venv` or `vendor`, and it runs again every thirty seconds, so `3` and `4` want a narrow parent directory rather than a home directory. The welcome on your first launch offers to write `2` here for you. The key is new in this release: a 0.1.0 binary refuses a config file that has it, so delete the line before going back to that version. |
 
 ```toml
 parent_dirs = ["/home/me/src"]
@@ -63,6 +70,7 @@ draft_initial = "seen"
 collapsed_globs = ["package-lock.json", "Cargo.lock", "*.min.js"]
 collapse_size_bytes = 524288
 hide_empty_repos = false
+search_depth = 1
 ```
 
 If you have a config file and launch somewhere outside `parent_dirs`, that directory is

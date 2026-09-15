@@ -12,8 +12,14 @@ binary rather than for the commit log.
 - The first time you open the review screen, a small card names the keys you need and then
   gets out of the way. The frame underneath stays live, so the scan you launched keeps
   running while you read it, and it never opens on a window too small to read.
-- Two of the cards offer to remember a default: showing every repository instead of only the
-  ones your herdr workspace is working in, and starting with the empty repositories hidden.
+- The card after the keys asks how far down lastcall looks. One folder below the directory
+  you launched in is what it has always done; two also reaches a clone or a worktree kept in
+  a folder such as `worktrees/<name>`, and a worktree kept inside a repository you already
+  watch. Choosing two writes `search_depth = 2` and the repositories appear on the screen
+  behind the card, with no relaunch. The card names your config file for the settings that
+  go further than that.
+- Two more of the cards offer to remember a default: showing every repository instead of only
+  the ones your herdr workspace is working in, and starting with the empty repositories hidden.
   Either choice takes effect at once and is written into your config file, which keeps its
   comments, its key order and its formatting. If there is no config file yet, one is created
   holding just that setting.
@@ -55,8 +61,13 @@ binary rather than for the commit log.
   of ten files or fewer used to vanish on a lowercase `a` with no question at all, because
   the confirmation only asks above ten.
 - The `parent_dirs` documentation said every repository under a parent directory is watched.
-  It is the repositories directly under it: one a folder deeper, such as
-  `worktrees/<name>`, needs an entry of its own.
+  It is the repositories directly under it. One a folder deeper, such as `worktrees/<name>`,
+  is now reached with the new `search_depth` key (`1` to `4`, default `1`), which also lists
+  a worktree kept inside a repository you already watch; a clone that lives somewhere else
+  entirely still wants an entry of its own. The walk never enters a repository or a
+  dependency folder, so `3` and `4` want a narrow parent directory. `search_depth` is new in
+  this release: a 0.1.0 binary refuses a config file that has the line, so delete it before
+  going back to that version.
 
 ## 0.1.0 - 2026-09-12
 

@@ -224,6 +224,56 @@ ledger busy in <root> — try again
 
 Pressing the same key a moment later is the entire fix.
 
+## How roots are discovered (Phase 10)
+
+`roots::discover(DiscoverInputs)` is the whole of it, and `search_depth` (1 to 4, default 1)
+is the only dial. Level 1 has not moved since 0.1.0: a parent directory that is itself inside
+a repository **is** that repository and nothing under it is walked; otherwise every direct
+child holding a `.git` entry, file or directory, becomes a root through `toplevel`, a child
+whose `.git` git will not open keeps its notice, and a symlink to a repository is a root
+keyed by its canonical path.
+
+At `search_depth >= 2` two mechanisms are switched on, and they answer two different
+questions.
+
+**Mechanism 1, the plain folders.** A level-1 child that is not a root and whose name is not
+in `WALK_SKIP` (`.git`, `node_modules`, `target`, `.venv`, `vendor`) is read; every directory
+in it with a `.git` entry becomes a root through `toplevel`, and every directory without one
+and not in `WALK_SKIP` is read at the next level, down to level N. The walk never enters a
+root, so a submodule, a vendored repository or a test fixture inside a repository is never
+listed by it, and nothing under a `.git` directory is read. It never enters a `WALK_SKIP`
+name at any level. Past level 1 it uses the draft walk's `file_type().is_dir()`, so a symlink
+is neither a root nor descended into (a level-1 symlink to a plain folder is not descended
+either); level 1's symlink rule is unchanged. Dot-directories are not special.
+
+**Mechanism 2, the worktrees kept inside.** For every root discovery lists, by any mechanism
+and at any level, whose `.git` is a directory, one `git worktree list --porcelain`. Every
+`worktree <path>` entry after the first whose canonical path lies inside that root becomes a
+root, filed under the same configured parent, badged `WorktreeOf(root)`. Entries outside the
+root are not added: mechanism 1 or a second `parent_dirs` entry is for those. A linked root
+skips the call, since its list is the main worktree's. This is what makes `R/.worktrees/wt` a
+row from a launch directory inside `R` or above it, without walking inside `R` at all.
+
+**Badges are still the two sources they were.** The badge pass at the end of `discover` marks
+every linked worktree `WorktreeOf(main)` over any `NestedIn`, and the scan's nested path
+still reports an untracked, non-ignored repository inside a root, so a `.worktrees/` that is
+not gitignored is listed at depth 1 already with the same badge. Roots are keyed by canonical
+path, so a directory reached twice is one root, and `roots::diff` and the `RootsChanged` path
+are untouched. A root that vanishes when the depth goes back down keeps its ledger on disk.
+
+**Cost, and why the docs push back on 3 and 4.** Depth `d` reads every plain directory down
+to level `d`: one `read_dir` per directory and one `exists` per child, with no git call for a
+directory that has no `.git` entry. Discovery runs at open and again on the watcher's
+30-second backstop, under the engine lock, so depth 3 or 4 wants a narrow `parent_dirs` and
+not a home directory. The draft-glob walk (`matching_dirs`) is a separate walk and is
+unchanged.
+
+**Changing it while running.** `Engine::set_search_depth(depth)` clamps to `1..=4` and sets
+the value the next `rescan` uses; it discovers nothing by itself. The TUI pairs it with
+`Watcher::rescan_trigger()` so the set lands under the lock before the notify goes out, which
+matters because a notify is coalesced: one that arrives first would be answered by a rescan
+still running at the old depth, and the set would then wait for the backstop.
+
 ## Draft roots and collapsed classes (Phase 6)
 
 **A draft root is a directory, not a repo.** `draft_dirs` (globs relative to a parent dir,

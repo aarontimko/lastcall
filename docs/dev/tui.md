@@ -264,12 +264,30 @@ you:
   every card at exactly that size.
 - `app.tour.is_none()` — it does not open over itself.
 
-Three cards at most, decided once when the overlay opens. `Card::Keys` is always there.
-`Card::Herdr` needs all four parts of its condition — a live link, a scope derived, the scope
-honoured, and a config file that has never said `scope` under `[herdr]` — because any one of
-them missing makes the card an offer about nothing. `Card::Empty` needs ten listed
-repositories with nothing pending (`EMPTY_CARD_MIN`), `t` off, and no `hide_empty_repos` in
-the file.
+Four cards at most, in a fixed order, with the document answers read once when the overlay
+opens. `Card::Keys` is always there. `Card::Depth` (Phase 10 deliverable 8) is second and is
+shown on every first launch, whatever the walk would find, unless the config document already
+sets `search_depth` to any value. `Card::Herdr` needs all four parts of its condition — a
+live link, a scope derived, the scope honoured, and a config file that has never said `scope`
+under `[herdr]` — because any one of them missing makes the card an offer about nothing.
+`Card::Empty` needs ten listed repositories with nothing pending (`EMPTY_CARD_MIN`), `t` off,
+and no `hide_empty_repos` in the file.
+
+**The empty card is counted late.** Its two numbers would be the pre-rescan list if
+`Plan::open` filled them in, and the depth card sitting in front of it can add roots while the tour
+is still up. So `Plan::open` pushes an empty slot when the document answer allows the card at
+all, and `App::advance_tour` is what fills it from the live `listed_roots()` when the tour
+lands on it, or drops it when the count is under `EMPTY_CARD_MIN`. A reader who presses
+`enter` the instant the depth card's new roots appear is counted over what has landed: the
+tour does not wait on `pictured` a second time.
+
+**A card that would rather give up a paragraph than its spacing.** The renderer's text width
+is `width - 6` and its height budget `height - 2`, and the painter's own rule is to drop
+blank rows first, which is why the keys card counts only solid rows. The depth card counts
+its blank rows too: when solid plus blank exceed the budget it drops its hint block, the
+second paragraph and the config path as one unit, and only then does the painter's blank rule
+apply. Its question and its two answers are never dropped. At 60×14 that is 16 rows against
+12, which is the `tui_tour_depth_small` frame.
 
 **Keys.** `tour::tour_action` resolves *before* the keymap and before every other modal
 (`run.rs`'s event arm), so while the overlay is up nothing else in the program sees a key.
@@ -290,6 +308,17 @@ went wrong and the TOML line to add by hand. When there is no config file at all
 creates one holding a dated `# written by lastcall's first-launch tour on <date>` comment and
 just that setting.
 
+The depth card's live half is not the reducer's: the list is the engine's.
+`App::apply_tour_setting` has a no-op arm for `Setting::SearchDepth2`, and `run.rs`'s
+`Effect::TourWrite` handler calls `spawn_set_search_depth(engine, watcher.rescan_trigger(),
+2)` for that setting alone. The helper sets the depth under the engine lock on a blocking
+thread and notifies the trigger after the guard drops, in that order: a notify that arrives
+first can be coalesced into a rescan that still runs at depth 1, and the later set would then
+wait for the thirty-second backstop. The roots that appear take the ordinary `RootsChanged`
+path, and their piles land under an open tour because `apply` is not behind the tour's key
+gate. `Watcher::rescan_trigger` exists because the handler no longer has the watcher to hand
+by the time the blocking thread is done.
+
 **The marker.** `<state_dir>/first-launch.json` is `{"shown_at":<unix secs>,"version":"…"}`,
 written with `write_stamp`'s idiom (temp beside the target, then rename) by *any* dismissal:
 finishing, skipping, or quitting with it open. Absent, unreadable and unparsable all mean
@@ -297,17 +326,25 @@ finishing, skipping, or quitting with it open. Absent, unreadable and unparsable
 user over. `lastcall tui --tour` ignores it for that run and rewrites it on dismissal, and
 the help overlay's last footer row (`render::TOUR_NOTE`) is where a reader finds that out.
 
-**Scenes.** Three snapshot scenes, each at 100×30 and 80×24: `tui_tour_keys`,
-`tui_tour_herdr`, `tui_tour_empty`. Six PTY scenes. `tui_tour_first_launch` is the one a new
+**Scenes.** Four snapshot scenes: `tui_tour_keys`, `tui_tour_depth`, `tui_tour_herdr` and
+`tui_tour_empty` at 100×30 and 80×24, plus `tui_tour_depth_small` at 60×14, the frame with
+the hint block gone and the spacing kept. The snapshot tier opens cards directly and never
+touches a config directory, so the depth card's path line is the fixed
+`/home/me/.config/lastcall/config.toml`. Seven PTY scenes. `tui_tour_first_launch` is the one a new
 user actually gets: no config file at all, fourteen repositories of which twelve are quiet,
 the keys card, the empty card's live change from `14 repos` to `2 repos`, the created file's
 exact bytes, and then a second launch over the same state directory that shows no welcome
 and keeps the setting. `tui_tour_first_launch_herdr` is its sibling under a live workspace
 link, where the herdr card is the one that writes.
+`tui_tour_search_depth` is the depth card's own: a plain `worktrees/` folder under the
+fixture parent holding a clone and a linked worktree of `alpha`, neither listed at the
+default depth, both on the screen behind the closing overlay after the second row is chosen.
 `tui_tour_preserves_config` (a one-line diff on a hand-written file that already has three
 tables, including a `[keys]` table, with the new key landing at root level above the first
 table header), `tui_tour_skip`, `tui_tour_flag` and `tui_tour_quit_writes_marker` are the
-rest. The harness knows the marker by name: `pty_tui::MARKER_FILE` and `MARKER_SEEN` are
+rest. Every scene that walks the cards sends one extra `enter` past the depth card on its
+first row and asserts the config bytes did not move, because a row that keeps today's
+behaviour writes nothing. The harness knows the marker by name: `pty_tui::MARKER_FILE` and `MARKER_SEEN` are
 what `isolated_lastcall` drops into the state directory so every *other* scene launches
 without the welcome, `.tour(true)` removes it again, and `.keep_marker(true)` leaves
 whatever is on disk alone, which is the only way a second launch can see what the first
