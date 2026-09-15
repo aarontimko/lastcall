@@ -249,7 +249,8 @@ either); level 1's symlink rule is unchanged. Dot-directories are not special.
 **Mechanism 2, the worktrees kept inside.** For every root discovery lists, by any mechanism
 and at any level, whose `.git` is a directory, one `git worktree list --porcelain`. Every
 `worktree <path>` entry after the first whose canonical path lies inside that root becomes a
-root, filed under the same configured parent, badged `WorktreeOf(root)`. Entries outside the
+root, filed where its repository is filed (the configured parent, or the repository's own
+parent when the launch directory is inside it), badged `WorktreeOf(root)`. Entries outside the
 root are not added: mechanism 1 or a second `parent_dirs` entry is for those. A linked root
 skips the call, since its list is the main worktree's. This is what makes `R/.worktrees/wt` a
 row from a launch directory inside `R` or above it, without walking inside `R` at all.
@@ -263,7 +264,10 @@ are untouched. A root that vanishes when the depth goes back down keeps its ledg
 
 **Cost, and why the docs push back on 3 and 4.** Depth `d` reads every plain directory down
 to level `d`: one `read_dir` per directory and one `exists` per child, with no git call for a
-directory that has no `.git` entry. Discovery runs at open and again on the watcher's
+directory that has no `.git` entry. At `2` and above every listed repository whose `.git` is a
+directory is also asked for its worktrees, one `git worktree list` per repository per rescan
+on top of the badge pass's `rev-parse`, so a parent of a hundred clones pays a hundred more
+git processes each time. Discovery runs at open and again on the watcher's
 30-second backstop, under the engine lock, so depth 3 or 4 wants a narrow `parent_dirs` and
 not a home directory. The draft-glob walk (`matching_dirs`) is a separate walk and is
 unchanged.

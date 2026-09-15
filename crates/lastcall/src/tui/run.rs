@@ -1972,8 +1972,9 @@ pub fn run(
                         // setting to this session, so `Err` costs a footer and the file
                         // keeps whatever it had.
                         Effect::TourWrite(setting) => {
+                            let result = tour.write(setting, clock.now());
                             // The depth is applied to the session whether or not the file
-                            // takes the line, the rule every card follows: the reader
+                            // took the line, the rule every card follows: the reader
                             // answered the question, and a read-only config directory costs
                             // a footer and not the answer.
                             if setting == lastcall_engine::config::write::Setting::SearchDepth2 {
@@ -1983,7 +1984,6 @@ pub fn run(
                                     2,
                                 );
                             }
-                            let result = tour.write(setting, clock.now());
                             let (changed, next) = ui.app.tour_written(result);
                             redraw = redraw.or(changed);
                             effects.extend(next);

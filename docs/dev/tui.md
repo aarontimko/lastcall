@@ -285,9 +285,9 @@ tour does not wait on `pictured` a second time.
 is `width - 6` and its height budget `height - 2`, and the painter's own rule is to drop
 blank rows first, which is why the keys card counts only solid rows. The depth card counts
 its blank rows too: when solid plus blank exceed the budget it drops its hint block, the
-second paragraph and the config path as one unit, and only then does the painter's blank rule
-apply. Its question and its two answers are never dropped. At 60×14 that is 16 rows against
-12, which is the `tui_tour_depth_small` frame.
+blank above it, the second paragraph and the config path as one unit, and only then does the
+painter's blank rule apply. Its question and its two answers are never dropped. At 60×14 that
+is 16 rows to 11 of a 12-row budget, which is the `tui_tour_depth_small` frame.
 
 **Keys.** `tour::tour_action` resolves *before* the keymap and before every other modal
 (`run.rs`'s event arm), so while the overlay is up nothing else in the program sees a key.

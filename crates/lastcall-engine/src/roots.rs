@@ -244,12 +244,15 @@ pub fn discover(inputs: &DiscoverInputs<'_>) -> Discovery {
             .map(|r| r.path.clone())
             .collect();
         for main in listed {
+            // Filed where its repository is filed, so the two rows sit under one parent
+            // even when the launch directory is deep inside the repository (there the
+            // repository falls back to its own parent, and the worktree follows it).
+            let parent = roots[&main].parent.clone();
             for path in worktrees_inside(inputs.env, &main) {
-                let parent = parent_of(&path);
                 roots.entry(path.clone()).or_insert(DiscoveredRoot {
                     path,
                     kind: RootKind::Git,
-                    parent,
+                    parent: parent.clone(),
                     badge: Some(Badge::WorktreeOf(main.clone())),
                 });
             }
@@ -741,6 +744,19 @@ mod tests {
             !inside.paths().contains(&canon(&parent.join("outside-wt"))),
             "a worktree outside the repository needs its own parent_dirs entry"
         );
+
+        // Launched from a subdirectory of R: R is filed under its own parent by the
+        // fallback rule, and the worktree is filed where R is, not under `R/.worktrees`.
+        let src = repo.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let deep = at(std::slice::from_ref(&src), 2);
+        assert!(deep.paths().contains(&wt), "{:?}", deep.paths());
+        assert_eq!(
+            deep.get(&wt).unwrap().parent,
+            deep.get(&canon(&repo)).unwrap().parent,
+            "filed where its repository is filed"
+        );
+        assert_eq!(deep.get(&wt).unwrap().parent, canon(&parent));
     }
 
     #[test]
