@@ -870,6 +870,111 @@ BENCH S4 rows_shown=10000
 BENCH S4 omitted=40000
 ```
 
+## Phase 11 (run H): the per-branch record costs no git process
+
+One run, taken after the branch-switch engine change landed (Amendment v1.12). The change
+adds one `HEAD` file read per scan and per head inspection, made with `std::fs::read` and no
+git process, so the instrument that matters here is the spawn counts.
+
+Machine block: unchanged except the date (**2026-09-15**) and the commit (this phase's branch
+at `e6ba9cc`). Command: `just bench`, all five scenarios, `--test-threads=1`, once.
+`5 passed; 0 failed`, **115.95 s** of measured time. The machine was not otherwise idle: an
+editor and a long-running assistant session were open, which is the condition runs E and F
+were taken under and run G was not.
+
+### The counts did not move
+
+| scenario | metric | run D | run G ×2 | run H |
+|---|---|---|---|---|
+| S1 | `open_spawns` | 1102 | 1102 / 1102 | **1102** |
+| S1 | `scan_all_spawns` | 1600 | 1600 / 1600 | **1600** |
+| S1 | `rows` / `roots` | 4000 / 100 | 4000 / 100 | **4000 / 100** |
+| S1h | `open_spawns` / `scan_all_spawns` | 552 / 800 | 552 / 800 | **552 / 800** |
+| S2 | `scan_spawns` / `hunks` | 16 / 2 | 16 / 2 | **16 / 2** |
+| S3 | `files` | 1000 | 1000 | **1000** |
+| S4 | `scan_spawns` | 15 | 15 | **15** |
+| S4 | `rows_shown` / `omitted` | 10000 / 40000 | 10000 / 40000 | **10000 / 40000** |
+
+Bit-identical to every run since D. The branch sync reads `<git_dir>/HEAD` directly and the
+switch itself only runs when the name changed, which no bench scenario does: none of them
+checks a branch out.
+
+### Wall times
+
+Read against run G's two-run mean, the quiet-machine baseline.
+
+| scenario | metric | run G mean | run H | Δ |
+|---|---|---|---|---|
+| S1 | `open_ms` | 3673 | **4357** | +18.6 % |
+| S1 | `scan_all_ms` | 4052 | **4444** | +9.7 % |
+| S1 | `first_frame_ms` | 7324 | **9086** | +24.1 % |
+| S1h | `open_ms` | 1892 | **2273** | +20.1 % |
+| S1h | `scan_all_ms` | 3436 | **3040** | −11.5 % |
+| S1h | `first_frame_ms` | 3997 | **4640** | +16.1 % |
+| S2 | `scan_ms` | 210 | **248** | +18.1 % |
+| S3 | `settle_ms` | 1515 | **1559** | +2.9 % |
+| S3_events | `settle_ms` | 1528 | **1569** | +2.7 % |
+| S4 | `capped_count_ms` | 3743 | **3831** | +2.4 % |
+| S4 | `scan_ms` | 1624 | **1652** | +1.7 % |
+| S4 | `settle_ms` | 5388 | **5591** | +3.8 % |
+
+The shape is runs E and F's, not a new cost: the scenarios that spend their time launching
+and scanning many roots at once (S1, S1h, S2) are 10 to 24 % up, while the ones whose number
+is a watcher settling or a capped scan (S3, S4) are within 4 %. S1h `scan_all_ms` is *down*
+11.5 %, which a real per-scan cost could not produce. Run G's own two quiet runs were 15.7 %
+apart on that row. The counts above are the reason to read this table as the machine rather
+than the change; a quiet-machine pair would settle it, and run G's note already says that is
+the honest way to take wall times on this page.
+
+`peak_rss_kb`: S1 19824 and S1h 18240, beside run G's 19472 / 19408 and 19552 / 19744. S2
+62240 is inside the range that page calls "tens of megabytes". S4 90128 against run G's
+85296 and 90672.
+
+### The raw `BENCH` lines
+
+```text
+BENCH S1 open_ms=4357
+BENCH S1 open_spawns=1102
+BENCH S1 roots=100
+BENCH S1 rows=4000
+BENCH S1 scan_all_ms=4444
+BENCH S1 scan_all_spawns=1600
+BENCH S1 first_checked_ms=9086
+BENCH S1 first_frame_ms=9086
+BENCH S1 peak_rss_kb=19824
+BENCH S1h open_ms=2273
+BENCH S1h open_spawns=552
+BENCH S1h roots=50
+BENCH S1h rows=4000
+BENCH S1h scan_all_ms=3040
+BENCH S1h scan_all_spawns=800
+BENCH S1h first_checked_ms=4640
+BENCH S1h first_frame_ms=4640
+BENCH S1h peak_rss_kb=18240
+BENCH S2 file_bytes=1100001
+BENCH S2 hunks=2
+BENCH S2 scan_ms=248
+BENCH S2 scan_spawns=16
+BENCH S2 open_ms=12
+BENCH S2 hunk_next_ms=15
+BENCH S2 page_down_ms=10
+BENCH S2 peak_rss_kb=62240
+BENCH S2_default_config open_ms=14
+BENCH S3 files=1000
+BENCH S3 settle_ms=1559
+BENCH S3 peak_rss_kb=11216
+BENCH S3_events files=1000
+BENCH S3_events settle_ms=1569
+BENCH S3_events peak_rss_kb=10720
+BENCH S4 capped_count_ms=3831
+BENCH S4 settle_ms=5591
+BENCH S4 peak_rss_kb=90128
+BENCH S4 scan_ms=1652
+BENCH S4 scan_spawns=15
+BENCH S4 rows_shown=10000
+BENCH S4 omitted=40000
+```
+
 ## Known costs
 
 Not scan costs and not scenarios: things a user can *wait* for that no `BENCH` line
