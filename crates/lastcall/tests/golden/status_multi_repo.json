@@ -16,6 +16,8 @@
       "in_progress": null,
       "seen_tree": "e5e869706f2b973134ffaf98e1941da872561bac",
       "seen_head": "4663c9b43e10eba49ab2d6fda9afd701f4ae9b6c",
+      "seen_branch": "main",
+      "parked_branches": [],
       "pending": [
         {
           "path": "f1",
@@ -100,6 +102,8 @@
       "in_progress": null,
       "seen_tree": "ca2391dfaaa5b99135e687f93d88a46b143ccb16",
       "seen_head": "2d06521f7566830cbcde5b3753f450dc35d6dbba",
+      "seen_branch": "main",
+      "parked_branches": [],
       "pending": [
         {
           "path": "u1",
@@ -164,6 +168,8 @@
       "in_progress": null,
       "seen_tree": "06d3a4e06722f8463c85f088c0056a9bde816c39",
       "seen_head": null,
+      "seen_branch": null,
+      "parked_branches": [],
       "pending": [
         {
           "path": "n2.md",
