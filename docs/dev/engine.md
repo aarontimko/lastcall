@@ -802,6 +802,7 @@ $EDITOR admits of.
       "remote": "org/repo | null",
       "in_progress": null | "merge" | "rebase" | "cherry-pick" | "revert",
       "seen_tree": "<oid> | null", "seen_head": "<oid> | null",
+      "seen_branch": "main | null", "parked_branches": ["feat-x", "run-1"],
       "pending": [
         {
           "path": "rel/path", "change": "modified | added | deleted | mode | typechange | unreadable",
@@ -852,6 +853,17 @@ field changes what `status` scans or lists; a snoozed root is still scanned and 
 reported with all its pending rows, because snooze is a view in the TUI and not a filter.
 Readers that predate the fields ignore them; `Pile::undo` deserializes as `0` and
 `Pile::snoozed_until` as `null` when absent.
+
+`seen_branch` and `parked_branches` (additive, Phase 11 / Amendment v1.12; `status_version`
+stays 1) say which of a root's seen records this report is about. `seen_branch` is the branch
+the record in force belongs to, chosen by the branch name in `<git_dir>/HEAD`; it is `null`
+for a draft root, at a detached or unborn `HEAD`, and for a `ledger.json` a 1.1 binary wrote
+that no scan has attributed yet. `parked_branches` lists the branches with a record of their
+own, sorted by name, and is `[]` for a root that has only ever been on one branch; a name
+leaves the list when its branch is deleted. Every other field in the report describes the
+record in force alone: `seen_tree`, `seen_head`, `pending`, `groups` and `undo` say nothing
+about a parked record, and there is no flag that reports one. Readers that predate the fields
+ignore them.
 
 `state_dir`, `store` and `ledger_written_at` (additive, Phase 9a / Amendment v1.9;
 `status_version` stays 1) name **which store this run read**. `state_dir` is the resolved

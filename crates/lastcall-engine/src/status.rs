@@ -54,6 +54,13 @@ pub struct RootStatus {
     pub in_progress: Option<InProgress>,
     pub seen_tree: Option<Oid>,
     pub seen_head: Option<Oid>,
+    /// The branch the seen record above belongs to; `null` for a draft root, a detached
+    /// `HEAD`, or a ledger a 1.1 binary wrote that has not been attributed yet. Additive in
+    /// v1.12 (`status_version` stays 1).
+    pub seen_branch: Option<String>,
+    /// The branches with a parked seen record, sorted; empty when this root has only ever
+    /// been on one. Additive in v1.12 (`status_version` stays 1).
+    pub parked_branches: Vec<String>,
     pub pending: Vec<RowStatus>,
     /// Changed paths the row cap left unscanned (`Pile::omitted`); `0` when nothing was
     /// cut. Additive in Phase 4 (`status_version` stays 1).
@@ -222,6 +229,9 @@ impl RootStatus {
             in_progress: root.head.in_progress,
             seen_tree: root.ledger.seen_tree.clone(),
             seen_head: root.ledger.seen_at.head_commit.clone(),
+            seen_branch: root.ledger.seen_branch.clone(),
+            // `BTreeMap`, so the names come out sorted without a sort here.
+            parked_branches: root.ledger.branches.keys().cloned().collect(),
             pending,
             omitted: pile.map(|p| p.omitted).unwrap_or(0),
             groups,
