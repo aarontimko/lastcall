@@ -8,7 +8,7 @@
 ![lastcall in a terminal: three repositories in a list, a diff beside them, a hunk flagged with a note, a file accepted, then the help overlay](docs/demo/lastcall.gif)
 
 The last call before code ships: an agent-agnostic review ledger for the terminal. It
-watches every repository under your working directory, shows exactly what changed since you
+watches the repositories under your working directory, shows exactly what changed since you
 last looked, and lets you accept, flag, restore or fix it hunk by hunk, whichever agent or
 human made the edit.
 

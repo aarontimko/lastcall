@@ -4368,12 +4368,25 @@ fn tui_tour_first_launch_herdr() {
         pty.screen_text()
     );
 
-    // Card one is the keys; `enter` goes to card two, which is about the workspace.
+    // Card one is the keys; `enter` goes to card two, the depth card, and another to the
+    // card about the workspace.
     pty.send(b"\r").expect("enter");
+    // Card two is deliverable 8's, on every first launch: how far down the list looks.
+    pty.wait_for(OVERLOADED, |s| {
+        s.contents().contains("> Keep looking one folder down")
+    })
+    .unwrap_or_else(|e| panic!("the depth card: {e}\n{}", pty.screen_text()));
+    // Its first row keeps today's behaviour, so walking past it writes nothing.
+    pty.send(b"\r").expect("enter past the depth card");
     pty.wait_for(Duration::from_secs(5), |s| {
         s.contents().contains("You are running inside herdr 0.8.2")
     })
     .unwrap_or_else(|e| panic!("the herdr card: {e}\n{}", pty.screen_text()));
+    assert!(
+        !config.exists(),
+        "the depth card's first row wrote nothing:\n{}",
+        std::fs::read_to_string(&config).unwrap_or_default()
+    );
 
     // The second row is the one that writes; it is not the selected one.
     pty.send(b"\x1b[B").expect("down");
@@ -4471,13 +4484,26 @@ fn tui_tour_first_launch() {
         pty.screen_text()
     );
 
-    // Card one is the keys; `enter` goes to the card about the quiet ones.
+    // Card one is the keys; `enter` goes to the depth card, and another to the card about
+    // the quiet ones.
     pty.send(b"\r").expect("enter");
+    // Card two is deliverable 8's, on every first launch: how far down the list looks.
+    pty.wait_for(OVERLOADED, |s| {
+        s.contents().contains("> Keep looking one folder down")
+    })
+    .unwrap_or_else(|e| panic!("the depth card: {e}\n{}", pty.screen_text()));
+    // Its first row keeps today's behaviour, so walking past it writes nothing.
+    pty.send(b"\r").expect("enter past the depth card");
     pty.wait_for(Duration::from_secs(5), |s| {
         s.contents()
             .contains("12 of your 14 repositories have nothing pending")
     })
     .unwrap_or_else(|e| panic!("the empty card: {e}\n{}", pty.screen_text()));
+    assert!(
+        !config.exists(),
+        "the depth card's first row wrote nothing:\n{}",
+        std::fs::read_to_string(&config).unwrap_or_default()
+    );
 
     // The second row is the one that writes; it is not the selected one.
     pty.send(b"\x1b[B").expect("down");
@@ -4637,6 +4663,13 @@ fn tui_tour_preserves_config() {
     let before = std::fs::read_to_string(&fx.config).expect("the config the child reads");
     wait_welcome(&mut pty);
     pty.send(b"\r").expect("enter");
+    // Card two is deliverable 8's, on every first launch: how far down the list looks.
+    pty.wait_for(OVERLOADED, |s| {
+        s.contents().contains("> Keep looking one folder down")
+    })
+    .unwrap_or_else(|e| panic!("the depth card: {e}\n{}", pty.screen_text()));
+    // Its first row keeps today's behaviour, so walking past it writes nothing.
+    pty.send(b"\r").expect("enter past the depth card");
     // Wait for the choice itself, not for the card's prose: the cursor line is the only
     // proof the empty card is up **and** listening, and a `down` sent a frame early would
     // move the row of a card that is not this one.
@@ -4644,6 +4677,11 @@ fn tui_tour_preserves_config() {
         s.contents().contains("> Keep listing every repository")
     })
     .unwrap_or_else(|e| panic!("the empty card: {e}\n{}", pty.screen_text()));
+    assert_eq!(
+        std::fs::read_to_string(&fx.config).expect("the config"),
+        before,
+        "the depth card's first row wrote nothing"
+    );
     pty.send(b"\x1b[B").expect("down");
     pty.wait_for(OVERLOADED, |s| {
         s.contents()
@@ -4704,6 +4742,176 @@ fn tui_tour_preserves_config() {
     assert!(
         !after.contains(CREATED_BY),
         "a file that already existed gets no provenance comment:\n{after}"
+    );
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    assert_eq!(pty.wait_exit(QUIT_BUDGET).expect("exit").exit_code(), 0);
+    assert_clean_exit(&pty, since);
+}
+
+/// Deliverable 8 end to end: the depth card's **second** row, through the real binary. The
+/// fixture parent gains a plain `worktrees/` folder holding a clone (`gamma`) and a linked
+/// worktree of `alpha` (`alpha-wt`); neither is listed at the default depth. Answering the
+/// card writes `search_depth = 2`, and the same keystroke sets the depth on the engine and
+/// asks the watcher for a rescan, so the two new roots arrive on the live screen with the
+/// badge the discovery gave them. Then the same file is launched again: the list it comes
+/// up with is the one the file asked for, and there is no welcome.
+#[test]
+fn tui_tour_search_depth() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let xdg = fx.state.join("xdg");
+    let config = xdg.join("lastcall").join("config.toml");
+
+    // A plain folder one level below the parent, with two repositories in it. Distinct
+    // names on purpose: a row's label is its directory name, so `worktrees/alpha` would
+    // read the same as `alpha` (the §10 circle-back).
+    let alpha = FixtureRepo::open_in(TempDir::adopt(&fx.parent), "alpha");
+    alpha
+        .git_at(
+            &fx.parent,
+            &[
+                "clone",
+                "-q",
+                &alpha.origin().display().to_string(),
+                "worktrees/gamma",
+            ],
+        )
+        .expect("a clone one folder down");
+    alpha
+        .git(&[
+            "worktree",
+            "add",
+            "-q",
+            "../worktrees/alpha-wt",
+            "-b",
+            "feat-w",
+        ])
+        .expect("a linked worktree one folder down");
+
+    let Ok(mut pty) = fx
+        .command(&bin())
+        .no_config_file(&xdg)
+        .tour(true)
+        .size(100, 30)
+        .args(["tui", "--poll", "1"])
+        .spawn()
+    else {
+        note("SKIP: this host cannot open a pty");
+        return;
+    };
+    assert!(!config.exists(), "no configuration file to start with");
+    wait_welcome(&mut pty);
+    // The default depth is one folder down, so the two below `worktrees/` are not there.
+    let text = pty.screen_text();
+    assert!(
+        text.contains("lastcall  2 repos"),
+        "the header counts the two directly inside:\n{text}"
+    );
+    assert!(
+        !text.contains("gamma") && !text.contains("alpha-wt"),
+        "nothing a folder deeper is listed yet:\n{text}"
+    );
+
+    // Card one is the keys; `enter` reaches the depth card, and its second row is the one
+    // that writes.
+    pty.send(b"\r").expect("enter");
+    pty.wait_for(OVERLOADED, |s| {
+        s.contents().contains("> Keep looking one folder down")
+    })
+    .unwrap_or_else(|e| panic!("the depth card: {e}\n{}", pty.screen_text()));
+    pty.send(b"\x1b[B").expect("down");
+    pty.wait_for(OVERLOADED, |s| {
+        s.contents()
+            .contains("> Look two folders down, and remember that")
+    })
+    .unwrap_or_else(|e| panic!("the second row: {e}\n{}", pty.screen_text()));
+    pty.send(b"\r").expect("enter");
+
+    // The welcome closes (nothing conditional follows on this machine) and the rescan the
+    // choice asked for brings the two new roots in. `LONG` because a rescan is a discovery
+    // run, a scan of every root and then the piles.
+    pty.wait_for(LONG, |s| {
+        let text = s.contents();
+        !text.contains("Welcome to lastcall") && text.contains("lastcall  4 repos")
+    })
+    .unwrap_or_else(|e| panic!("the two new roots arrive: {e}\n{}", pty.screen_text()));
+    let text = pty.screen_text();
+    assert!(
+        text.contains("gamma"),
+        "the clone a folder down is listed:\n{text}"
+    );
+    assert!(
+        text.contains("alpha-wt"),
+        "and so is the linked worktree:\n{text}"
+    );
+    // The nav column is 26 wide at 100 columns, so the badge is clipped on screen; what is
+    // on it is enough to say which of the two sources marked the row.
+    assert!(
+        text.contains("alpha-wt  [worktree of alp"),
+        "the linked one keeps the badge discovery gave it:\n{text}"
+    );
+
+    let written = std::fs::read_to_string(&config).expect("the tour wrote the config file");
+    note(&format!(
+        "PTY tour: the config file the depth card created, in full:\n{written}"
+    ));
+    let comment = written.lines().next().expect("a provenance comment");
+    assert!(
+        comment.starts_with(CREATED_BY) && comment.len() == CREATED_BY.len() + "2026-09-14".len(),
+        "the comment names the day it was written: {comment:?}"
+    );
+    assert_eq!(
+        written,
+        format!("{comment}\nsearch_depth = 2\n"),
+        "the whole file, byte for byte"
+    );
+    let marker = std::fs::read_to_string(fx.state.join(MARKER_FILE))
+        .expect("and the welcome recorded that it has been seen");
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    assert_eq!(pty.wait_exit(QUIT_BUDGET).expect("exit").exit_code(), 0);
+    assert_clean_exit(&pty, since);
+
+    // The second launch over the same state directory and the same `XDG_CONFIG_HOME`, with
+    // the child's own marker left where it is.
+    let Ok(mut pty) = fx
+        .command(&bin())
+        .no_config_file(&xdg)
+        .keep_marker(true)
+        .size(100, 30)
+        .args(["tui", "--poll", "1"])
+        .spawn()
+    else {
+        note("SKIP: this host cannot open a pty");
+        return;
+    };
+    pty.wait_for(LONG, |s| s.contents().contains("lastcall  4 repos"))
+        .unwrap_or_else(|e| panic!("the second launch: {e}\n{}", pty.screen_text()));
+    assert!(
+        pty.wait_for(Duration::from_secs(1), |s| s
+            .contents()
+            .contains("Welcome to lastcall"))
+            .is_err(),
+        "a state dir that has answered is not asked again:\n{}",
+        pty.screen_text()
+    );
+    let text = pty.screen_text();
+    assert!(
+        text.contains("gamma") && text.contains("alpha-wt"),
+        "the file it wrote is the list it comes up with:\n{text}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fx.state.join(MARKER_FILE)).expect("the marker is still there"),
+        marker,
+        "the second launch wrote no marker of its own"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&config).expect("the config"),
+        written,
+        "and it wrote nothing to the config file either"
     );
 
     let since = pty.raw().len();

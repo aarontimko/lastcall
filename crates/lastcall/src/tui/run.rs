@@ -52,7 +52,7 @@ use lastcall_engine::ledger::FlagSummary;
 use lastcall_engine::ops::{Refused, Rendered};
 use lastcall_engine::scan::{Pile, Row};
 use lastcall_engine::store::Current;
-use lastcall_engine::watcher::{EngineEvent, EngineTimings, Watcher, blocking};
+use lastcall_engine::watcher::{EngineEvent, EngineTimings, RescanTrigger, Watcher, blocking};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
@@ -830,6 +830,22 @@ fn spawn_snooze(
         if let Some(result) = joined(snooze, &tx, "snooze").await {
             let _ = tx.send(Local::Snoozed(root, result));
         }
+    });
+}
+
+/// The depth half of `Effect::TourWrite(SearchDepth2)`: the setting the tour applies to
+/// this session, and the rescan that makes it visible (deliverable 8).
+///
+/// Two rules shape this. The UI task never takes the engine lock inline, so the set happens
+/// on a blocking thread like every other engine call; and the set has to **land before** the
+/// notify, or a rescan already coalescing runs at the old depth and the later set never gets
+/// one at all. `blocking` returns once the guard is dropped, so awaiting it and then asking
+/// the trigger is exactly that order.
+fn spawn_set_search_depth(engine: &Arc<Mutex<Engine>>, rescan: RescanTrigger, depth: u8) {
+    let engine = engine.clone();
+    tokio::spawn(async move {
+        blocking(&engine, move |e| e.set_search_depth(depth)).await;
+        rescan.request_rescan();
     });
 }
 
@@ -1956,6 +1972,17 @@ pub fn run(
                         // setting to this session, so `Err` costs a footer and the file
                         // keeps whatever it had.
                         Effect::TourWrite(setting) => {
+                            // The depth is applied to the session whether or not the file
+                            // takes the line, the rule every card follows: the reader
+                            // answered the question, and a read-only config directory costs
+                            // a footer and not the answer.
+                            if setting == lastcall_engine::config::write::Setting::SearchDepth2 {
+                                spawn_set_search_depth(
+                                    &watcher.engine,
+                                    watcher.rescan_trigger(),
+                                    2,
+                                );
+                            }
                             let result = tour.write(setting, clock.now());
                             let (changed, next) = ui.app.tour_written(result);
                             redraw = redraw.or(changed);
@@ -2078,6 +2105,53 @@ mod tests {
 
     fn key(code: KeyCode) -> Event {
         Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    /// Deliverable 8: the depth the tour applies is set under the engine lock on a blocking
+    /// thread, and the rescan is asked for **after** the guard is gone. The proof is the
+    /// rescan's own result: if the notify went first, the coalesced rescan would run at
+    /// depth 1 and the folder one level down would stay invisible until the thirty-second
+    /// backstop, well past this timeout.
+    #[tokio::test]
+    async fn run_set_search_depth_lands_before_the_rescan_it_asks_for() {
+        use lastcall_engine::config::Config;
+        use lastcall_engine::watcher::{EngineTimings, lock};
+        use lastcall_testkit::engine::open_engine;
+        use lastcall_testkit::fixture_repo::FixtureRepo;
+        use lastcall_testkit::tmp::TempDir;
+
+        let repo = FixtureRepo::new("run-depth").unwrap();
+        let state = TempDir::new("lc-run-depth-state");
+        let deep = repo.parent_dir().join("worktrees").join("b");
+        std::fs::create_dir_all(&deep).unwrap();
+        repo.git_at(&deep, &["init", "-q", "-b", "main"]).unwrap();
+        let deep = std::fs::canonicalize(&deep).unwrap();
+
+        let env = repo.engine_env(state.path());
+        let engine = open_engine(repo.parent_dir(), &env, state.path(), Config::default());
+        let mut watcher = engine.run(EngineTimings::default());
+        assert_eq!(lock(&watcher.engine).search_depth(), 1);
+        assert!(
+            lock(&watcher.engine).root(&deep).is_none(),
+            "invisible at the default depth"
+        );
+
+        spawn_set_search_depth(&watcher.engine, watcher.rescan_trigger(), 2);
+        let found = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while let Some(event) = watcher.events.recv().await {
+                if let EngineEvent::RootsChanged { .. } = event
+                    && lock(&watcher.engine).root(&deep).is_some()
+                {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .expect("the rescan the trigger asked for arrives");
+        assert!(found, "the watcher ended before the rescan landed");
+        assert_eq!(lock(&watcher.engine).search_depth(), 2);
+        watcher.join().await;
     }
 
     fn mouse(kind: MouseEventKind, column: u16, row: u16) -> Event {

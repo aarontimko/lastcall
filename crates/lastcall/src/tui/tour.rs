@@ -1,9 +1,10 @@
 //! The first-launch welcome overlay (Amendment v1.11, deliverable 1).
 //!
 //! The first `lastcall tui` ever run against a state directory opens an overlay over the
-//! live screen, once the launch hold and the scope verdict are past: a card of keys, then up
-//! to two cards that appear only when their condition holds, each offering to change one
-//! default and remember it. It is shown once, and `lastcall tui --tour` shows it again.
+//! live screen, once the launch hold and the scope verdict are past: up to four cards. A
+//! card of keys, then a card asking how far down the list should look, then two more that
+//! appear only when their condition holds; the last three each offer to change one default
+//! and remember it. It is shown once, and `lastcall tui --tour` shows it again.
 //!
 //! What lives here: the marker on disk, the [`Plan`] the loop drives it with, the cards and
 //! their wording, the fixed keys ([`tour_action`]), and the card's lines as text. The
@@ -100,6 +101,11 @@ pub fn write_marker(state_dir: &Path, now: SystemTime, version: &str) -> io::Res
 pub enum Card {
     /// Always first, and always shown: what the keys are.
     Keys,
+    /// Always second, and shown on every first launch unless the config file already sets
+    /// `search_depth`: how far below this directory the list looks, and the offer to look
+    /// one folder further (deliverable 8). `path` is the config file the hint block names,
+    /// absent when there is no config directory to write one into.
+    Depth { path: Option<String> },
     /// Shown when lastcall is actually following a herdr workspace right now and the config
     /// file has never said whether that is wanted (F5).
     Herdr { version: String },
@@ -117,6 +123,7 @@ impl Card {
     pub fn setting(&self) -> Option<Setting> {
         match self {
             Card::Keys => None,
+            Card::Depth { .. } => Some(Setting::SearchDepth2),
             Card::Herdr { .. } => Some(Setting::HerdrScopeAll),
             Card::Empty { .. } => Some(Setting::HideEmptyRepos),
         }
@@ -259,9 +266,24 @@ impl Plan {
 
     /// Open it: parse the config document once, decide which cards apply, and hand them to
     /// the reducer.
+    ///
+    /// Every condition decided here is a question about the **config document**, which
+    /// cannot change while the tour is open. The one condition about the live root list is
+    /// the empty-repository card's, and that one is decided at the advance step instead
+    /// (design review F4): the depth card's rescan lands roots between the two cards, and
+    /// a count taken now would be the count from before it.
     pub fn open(&mut self, app: &mut App) -> Changed {
         let doc = self.doc.get_or_insert_with(|| Document::open(&self.env));
         let mut cards = vec![Card::Keys];
+        // Deliverable 8: shown on every first launch, never gated on what the walk would
+        // find (a user with one repository in view is exactly who needs to be told the
+        // list has a depth). The file having a `search_depth` line is the only thing that
+        // takes it away, the rule the other two cards follow.
+        if !doc.sets(Setting::SearchDepth2) {
+            cards.push(Card::Depth {
+                path: doc.path().map(|p| p.display().to_string()),
+            });
+        }
         // F5: lastcall is following a workspace *right now* (a live link, a scope it
         // derived, and the scope honoured), and the file has never said whether that is
         // wanted. Any one of those missing and the card would be about nothing.
@@ -274,10 +296,11 @@ impl Plan {
                 version: version.clone(),
             });
         }
-        let total = app.listed_roots().count();
-        let empty = app.listed_roots().filter(|v| !v.listed()).count();
-        if empty >= EMPTY_CARD_MIN && !app.hide_empty && !doc.sets(Setting::HideEmptyRepos) {
-            cards.push(Card::Empty { empty, total });
+        // The slot, not the card: `App::advance_tour` fills in the two counts from the
+        // list as it is when the reader gets here, and drops the card when the live count
+        // is under `EMPTY_CARD_MIN`.
+        if !app.hide_empty && !doc.sets(Setting::HideEmptyRepos) {
+            cards.push(Card::Empty { empty: 0, total: 0 });
         }
         // `?` is a live key during the launch hold, so the help overlay can already be up
         // when the welcome opens over it. Close it: the card is a question, and the screen
@@ -358,7 +381,7 @@ fn line(text: impl Into<String>, kind: Kind) -> CardLine {
 }
 
 /// The keys card's intro.
-pub const KEYS_INTRO: &str = "The list on the left is every repository under this directory. Pick a file and the diff opens on the right.";
+pub const KEYS_INTRO: &str = "The list on the left is the repositories under this directory. Pick a file and the diff opens on the right.";
 /// The keys card's second row, which is prose rather than a key: it spans the two right
 /// columns of the grid.
 pub const KEYS_PANES: &str = "tab, or left and right, move between the two panes";
@@ -466,6 +489,51 @@ impl Tour {
                 }
                 out.push(line("", Kind::Body));
                 out.extend(grid.into_iter().map(|t| line(t, Kind::Body)));
+            }
+            Card::Depth { path } => {
+                // Everything above the hint block, which is the only part that ever goes.
+                let mut head = vec![line("Where lastcall looks", Kind::Title)];
+                head.push(line("", Kind::Body));
+                head.extend(
+                    wrap(
+                        "The list holds every git repository directly inside this directory. One kept a folder deeper, such as worktrees/<name>, is not listed unless you ask.",
+                        width,
+                    )
+                    .into_iter()
+                    .map(|t| line(t, Kind::Body)),
+                );
+                // The hint block: its separator, the paragraph, and the path. One unit,
+                // because a paragraph pointing at a file with the file missing says less
+                // than nothing, and a card with the gap but not the text is a hole.
+                let mut hint = vec![line("", Kind::Body)];
+                hint.extend(
+                    wrap(
+                        "Deeper than two, or clones and worktrees kept somewhere else entirely, go in the config file: search_depth = N and one parent_dirs entry per place.",
+                        width,
+                    )
+                    .into_iter()
+                    .map(|t| line(t, Kind::Body)),
+                );
+                if let Some(path) = path {
+                    hint.push(line(format!("    {path}"), Kind::Footer));
+                }
+                let mut tail = vec![line("", Kind::Body)];
+                tail.extend(self.choice(0, "Keep looking one folder down", "", width));
+                tail.extend(self.choice(
+                    1,
+                    "Look two folders down, and remember that",
+                    "(writes search_depth = 2)",
+                    width,
+                ));
+                // Unlike the keys card, this one counts its blank rows: its shape is the
+                // spacing, and the painter's blank rule would eat that before the prose.
+                // `+ 2` is the blank and the footer every card ends with.
+                let fits = head.len() + hint.len() + tail.len() + 2 <= height;
+                out.extend(head);
+                if fits {
+                    out.extend(hint);
+                }
+                out.extend(tail);
             }
             Card::Herdr { version } => {
                 out.push(line(
@@ -667,7 +735,7 @@ mod tests {
 
     /// A fixed instant for every test that has to stamp one: 2026-09-14T00:00:00Z, the day
     /// the created config file's comment carries. The tour's own clock is the engine's, so
-    /// nothing here has any business reading the wall — and `SystemTime::now` under `tui/`
+    /// nothing here has any business reading the wall, and `SystemTime::now` under `tui/`
     /// stays a grep that finds nothing, `mod tests` included.
     fn at() -> SystemTime {
         UNIX_EPOCH + std::time::Duration::from_secs(1_789_344_000)
@@ -947,16 +1015,60 @@ mod tests {
 
     // ---- which cards ------------------------------------------------------------------
 
-    /// The keys card is the tour's floor: it is always there, alone when nothing else
-    /// applies.
+    /// The keys card and the depth card are the tour's spine: both are there on every
+    /// first launch, in that order, and the herdr card is not there without its reason.
+    /// The empty-repository slot is decided at the advance step, so it is always in the
+    /// list and often never shown.
     #[test]
-    fn tour_always_has_the_keys_card_and_nothing_it_has_no_reason_for() {
+    fn tour_always_has_the_keys_card_and_the_depth_card() {
         let dir = TempDir::new("lc-tour-cards");
         let mut plan = Plan::new(false, env_at(dir.path()), dir.path().to_owned());
         let mut app = app_at(100, 30);
         plan.open(&mut app);
         let tour = app.tour.as_ref().expect("open");
-        assert_eq!(tour.cards, vec![Card::Keys]);
+        assert_eq!(
+            tour.cards,
+            vec![
+                Card::Keys,
+                Card::Depth {
+                    path: Some(config_file(dir.path()).display().to_string()),
+                },
+                Card::Empty { empty: 0, total: 0 },
+            ]
+        );
+    }
+
+    /// Deliverable 8: the depth card is shown on every first launch, whatever the walk
+    /// would find, and the config file naming `search_depth` is the only thing that takes
+    /// it away. Its hint block names the file it would be written into.
+    #[test]
+    fn tour_depth_card_is_second_and_only_a_config_line_takes_it_away() {
+        let cards = |dir: &Path| -> Vec<Card> {
+            let mut plan = Plan::new(false, env_at(dir), dir.to_owned());
+            let mut app = app_at(100, 30);
+            plan.open(&mut app);
+            app.tour.expect("open").cards
+        };
+
+        let dir = TempDir::new("lc-tour-depth");
+        assert_eq!(
+            cards(dir.path()).get(1),
+            Some(&Card::Depth {
+                path: Some(config_file(dir.path()).display().to_string()),
+            }),
+            "second, right after the keys"
+        );
+
+        for text in ["search_depth = 1\n", "search_depth = 4\n"] {
+            let answered = TempDir::new("lc-tour-depth-set");
+            write_config(answered.path(), text);
+            assert!(
+                !cards(answered.path())
+                    .iter()
+                    .any(|c| matches!(c, Card::Depth { .. })),
+                "the file already answered it with {text:?}"
+            );
+        }
     }
 
     /// F5: the herdr card needs a live link, a derived scope, that scope honoured, and a
@@ -1005,62 +1117,58 @@ mod tests {
     }
 
     /// The empty card needs enough empty repositories to be worth a question, the setting
-    /// not already on for the session, and a file that has not already answered.
+    /// not already on for the session, and a file that has not already answered. Only the
+    /// last of those is decided when the tour opens (F4); the other two are decided when
+    /// the reader gets there, so this walks the cards to find out.
     #[test]
     fn tour_empty_card_needs_ten_empty_repositories_and_an_unanswered_file() {
-        let dir = TempDir::new("lc-tour-empty");
-        let card = Card::Empty {
-            empty: 12,
-            total: 14,
-        };
-
-        let cards = |dir: &Path, empty: usize, edit: fn(&mut App)| -> Vec<Card> {
+        // Walk to the end and collect every card that was actually shown.
+        let shown = |dir: &Path, empty: usize, edit: fn(&mut App)| -> Vec<Card> {
             let mut plan = Plan::new(false, env_at(dir), dir.to_owned());
             let mut app = app_with_empties(empty, 2);
             edit(&mut app);
             plan.open(&mut app);
-            app.tour.expect("open").cards
+            let mut seen = Vec::new();
+            while let Some(tour) = &app.tour {
+                seen.push(tour.card().clone());
+                app.handle(Action::Tour(TourKey::Next));
+            }
+            seen
         };
 
-        assert!(cards(dir.path(), 12, |_| {}).contains(&card));
         assert!(
-            !cards(dir.path(), EMPTY_CARD_MIN - 1, |_| {})
-                .iter()
-                .any(|c| matches!(c, Card::Empty { .. })),
+            shown(TempDir::new("lc-tour-empty").path(), 12, |_| {}).contains(&Card::Empty {
+                empty: 12,
+                total: 14,
+            }),
+            "twelve empty of fourteen, counted from the live list"
+        );
+        assert!(
+            !shown(
+                TempDir::new("lc-tour-empty").path(),
+                EMPTY_CARD_MIN - 1,
+                |_| {}
+            )
+            .iter()
+            .any(|c| matches!(c, Card::Empty { .. })),
             "under {EMPTY_CARD_MIN} empty repositories is not worth a question"
         );
         assert!(
-            !cards(dir.path(), 12, |a: &mut App| a.hide_empty = true)
-                .iter()
-                .any(|c| matches!(c, Card::Empty { .. })),
+            !shown(TempDir::new("lc-tour-empty").path(), 12, |a: &mut App| a
+                .hide_empty =
+                true)
+            .iter()
+            .any(|c| matches!(c, Card::Empty { .. })),
             "already hidden for the session"
         );
 
         let answered = TempDir::new("lc-tour-empty-set");
         write_config(answered.path(), "hide_empty_repos = false\n");
         assert!(
-            !cards(answered.path(), 12, |_| {})
+            !shown(answered.path(), 12, |_| {})
                 .iter()
                 .any(|c| matches!(c, Card::Empty { .. })),
             "the file already answered it, with either value"
-        );
-    }
-
-    /// The empty card's title counts what is on screen, not what is on disk.
-    #[test]
-    fn tour_empty_card_counts_the_roots_that_are_listed() {
-        let dir = TempDir::new("lc-tour-count");
-        let mut plan = Plan::new(false, env_at(dir.path()), dir.path().to_owned());
-        let mut app = app_with_empties(12, 2);
-        plan.open(&mut app);
-        let tour = app.tour.as_ref().expect("open");
-        assert!(
-            tour.cards.contains(&Card::Empty {
-                empty: 12,
-                total: 14
-            }),
-            "cards were {:?}",
-            tour.cards
         );
     }
 
@@ -1071,10 +1179,16 @@ mod tests {
     #[test]
     fn tour_every_card_fits_the_smallest_frame_it_opens_on() {
         let app = app_at(MIN_COLS, MIN_ROWS);
-        let width = usize::from(MIN_COLS) - 4;
+        // What the renderer actually gives the text: two borders, one column of padding
+        // each side, and one column of the screen showing each side of the box.
+        let width = usize::from(MIN_COLS) - 6;
         let height = usize::from(MIN_ROWS) - 2;
         for cards in [
             vec![Card::Keys],
+            vec![Card::Depth {
+                path: Some("/home/me/.config/lastcall/config.toml".to_owned()),
+            }],
+            vec![Card::Depth { path: None }],
             vec![Card::Herdr {
                 version: "0.8.2".to_owned(),
             }],
@@ -1109,6 +1223,91 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The depth card's own fit rule: it counts its blank rows too, because its shape is
+    /// the spacing. At the smallest frame the hint block goes, whole, and the choice rows,
+    /// the blanks and the footer stay; at 80x24 and 100x30 everything is there.
+    #[test]
+    fn tour_depth_card_drops_the_hint_block_on_the_smallest_frame() {
+        let path = "/home/me/.config/lastcall/config.toml";
+        let tour = Tour::new(vec![Card::Depth {
+            path: Some(path.to_owned()),
+        }]);
+        let at = |w: u16, h: u16| -> Vec<CardLine> {
+            tour.lines(&app_at(w, h), usize::from(w) - 6, usize::from(h) - 2)
+        };
+        let texts =
+            |rows: &[CardLine]| -> Vec<String> { rows.iter().map(|l| l.text.clone()).collect() };
+
+        let small = at(MIN_COLS, MIN_ROWS);
+        let small_text = texts(&small);
+        assert!(
+            !small_text.iter().any(|t| t.contains("config file")),
+            "the hint paragraph goes: {small_text:?}"
+        );
+        assert!(
+            !small_text.iter().any(|t| t.contains(path)),
+            "and the path goes with it: {small_text:?}"
+        );
+        assert!(
+            small_text
+                .iter()
+                .any(|t| t.contains("One kept a folder deeper")),
+            "the body stays: {small_text:?}"
+        );
+        assert_eq!(
+            small.iter().filter(|l| l.text.is_empty()).count(),
+            3,
+            "the spacing is kept: {small_text:?}"
+        );
+        assert_eq!(
+            small.iter().filter(|l| l.kind == Kind::Choice(0)).count(),
+            1
+        );
+        assert!(small.iter().any(|l| l.kind == Kind::Choice(1)));
+        assert_eq!(small_text.last().map(String::as_str), Some(CHOICE_FOOTER));
+        assert!(
+            small.len() <= usize::from(MIN_ROWS) - 2,
+            "{} rows do not fit: {small_text:?}",
+            small.len()
+        );
+
+        for (w, h) in [(80u16, 24u16), (100, 30)] {
+            let rows = at(w, h);
+            let text = texts(&rows);
+            assert!(
+                text.iter().any(|t| t.contains("search_depth = N")),
+                "{w}x{h} carries the hint: {text:?}"
+            );
+            assert!(
+                text.iter().any(|t| t == &format!("    {path}")),
+                "{w}x{h} carries the path: {text:?}"
+            );
+            assert!(
+                rows.len() <= usize::from(h) - 2,
+                "{w}x{h}: {} rows",
+                rows.len()
+            );
+            let one_line = "  Look two folders down, and remember that   (writes search_depth = 2)";
+            assert!(
+                text.iter().any(|t| t == one_line),
+                "{w}x{h}: the second choice row is one line: {text:?}"
+            );
+        }
+    }
+
+    /// No config directory, no path line, and the paragraph pointing at it still reads.
+    #[test]
+    fn tour_depth_card_without_a_config_path_drops_only_the_path_line() {
+        let app = app_at(100, 30);
+        let rows = Tour::new(vec![Card::Depth { path: None }]).lines(&app, 94, 28);
+        assert!(rows.iter().any(|l| l.text.contains("search_depth = N")));
+        assert!(
+            !rows.iter().any(|l| l.text.starts_with("    /")),
+            "no path line: {:?}",
+            rows.iter().map(|l| &l.text).collect::<Vec<_>>()
+        );
     }
 
     /// A choice row that will not fit on one line keeps its sentence and puts what it

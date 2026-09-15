@@ -2131,6 +2131,17 @@ fn open_tour(app: &mut App, cards: Vec<Card>) {
     app.tour = Some(Tour::new(cards));
 }
 
+/// The config path the depth card's hint block names. The real one is whatever
+/// `Document::path()` resolves to, which is a temp directory in a test and the reader's own
+/// home on a real launch; a snapshot needs one string for good, so this is it.
+const DEPTH_CONFIG_PATH: &str = "/home/me/.config/lastcall/config.toml";
+
+fn depth_card() -> Card {
+    Card::Depth {
+        path: Some(DEPTH_CONFIG_PATH.to_owned()),
+    }
+}
+
 /// Deliverable 1, card one: the keys, over the three-root screen. Always shown, and the
 /// grid is rendered from the effective keymap, so this frame is what a reader with the
 /// default bindings sees on their first launch. At 80×24 the three columns do not fit and
@@ -2159,7 +2170,55 @@ fn tui_tour_keys() {
     snapshot("tui_tour_keys_80x24", &app, 80, 24);
 }
 
-/// Card two: lastcall is following a herdr workspace right now, and the file has never
+/// Deliverable 8, card two: how far down the list looks. Shown on every first launch, so
+/// it is drawn over the ordinary three-root screen. The hint block names the config file
+/// the deeper settings go in; the snapshot tier opens cards directly and never touches a
+/// config directory, so the path is the fixed one a reader on a home directory would see.
+#[test]
+fn tui_tour_depth() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    open_tour(&mut app, vec![depth_card()]);
+    let (frame, _) = draw(&app, W, H);
+    assert!(frame.contains("Where lastcall looks"), "{frame}");
+    assert!(frame.contains("worktrees/<name>"), "{frame}");
+    assert!(frame.contains("> Keep looking one folder down"), "{frame}");
+    assert!(frame.contains("(writes search_depth = 2)"), "{frame}");
+    assert!(frame.contains(DEPTH_CONFIG_PATH), "{frame}");
+    snapshot("tui_tour_depth", &app, W, H);
+
+    app.handle(Action::Resize(80, 24));
+    let (narrow, _) = draw(&app, 80, 24);
+    assert!(narrow.contains(DEPTH_CONFIG_PATH), "{narrow}");
+    snapshot("tui_tour_depth_80x24", &app, 80, 24);
+}
+
+/// The smallest frame the overlay opens on. The card counts its blank rows, so what goes
+/// is the hint block, whole: the question, both answers and the spacing stay.
+#[test]
+fn tui_tour_depth_small() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    app.handle(Action::Resize(60, 14));
+    open_tour(&mut app, vec![depth_card()]);
+    let (frame, _) = draw(&app, 60, 14);
+    assert!(frame.contains("Where lastcall looks"), "{frame}");
+    assert!(frame.contains("> Keep looking one folder down"), "{frame}");
+    assert!(frame.contains("(writes search_depth = 2)"), "{frame}");
+    assert!(
+        !frame.contains(DEPTH_CONFIG_PATH),
+        "the hint block goes first: {frame}"
+    );
+    assert!(
+        !frame.contains("go in the config file"),
+        "and it goes whole: {frame}"
+    );
+    snapshot("tui_tour_depth_small", &app, 60, 14);
+}
+
+/// Card three: lastcall is following a herdr workspace right now, and the file has never
 /// said whether that is wanted. The second row is the one that writes, and it says what it
 /// writes; the first, selected, row writes nothing.
 #[test]
@@ -2194,7 +2253,7 @@ fn tui_tour_herdr() {
     snapshot("tui_tour_herdr_80x24", &app, 80, 24);
 }
 
-/// Card three: most of what is listed has nothing pending. Twelve empty repositories and
+/// Card four: most of what is listed has nothing pending. Twelve empty repositories and
 /// two with work, so the title counts what is on screen.
 #[test]
 fn tui_tour_empty() {

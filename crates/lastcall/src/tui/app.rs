@@ -33,7 +33,7 @@ use super::herdr::{AgentCandidate, HerdrUpdate, HerdrView, Link, ToastRequest};
 use super::input::{Action, EditKey, EditorKey, Keymap, NoteKey, PickKey, SnoozeKey, TourKey};
 use super::render::key_label;
 use super::textbuf::{TextBuf, Wrap};
-use super::tour::Tour;
+use super::tour::{Card, EMPTY_CARD_MIN, Tour};
 use unicode_width::UnicodeWidthStr;
 
 /// The columns the bottom line keeps for the status text or the hints beside the notice
@@ -3151,13 +3151,32 @@ impl App {
     }
 
     /// The next card, or the end of the tour.
+    ///
+    /// The empty-repository card is built **here** rather than when the tour opened
+    /// (deliverable 8, design review F4). The depth card sits in front of it and its second
+    /// row rescans, so roots land between the two cards; a count taken at open would be the
+    /// count from before them. What has landed by the time the reader presses `enter` is
+    /// what the card says, and if that is under [`EMPTY_CARD_MIN`] there is no card.
     fn advance_tour(&mut self) -> (Changed, Option<Effect>) {
+        if self.tour.is_none() {
+            return (Changed::No, None);
+        }
+        let total = self.listed_roots().count();
+        let empty = self.listed_roots().filter(|v| !v.listed()).count();
+        let hide_empty = self.hide_empty;
         let Some(tour) = &mut self.tour else {
             return (Changed::No, None);
         };
         tour.at += 1;
         tour.row = 0;
         tour.failed = None;
+        while let Some(Card::Empty { .. }) = tour.cards.get(tour.at) {
+            if !hide_empty && empty >= EMPTY_CARD_MIN {
+                tour.cards[tour.at] = Card::Empty { empty, total };
+                break;
+            }
+            tour.at += 1;
+        }
         if tour.at >= tour.cards.len() {
             return self.close_tour();
         }
@@ -10274,6 +10293,14 @@ mod tests {
         }
     }
 
+    /// The depth card: second in the tour, a choice card, and the only one whose condition
+    /// is about the config file alone, so it is the filler for "the next card" here.
+    fn depth_card() -> Card {
+        Card::Depth {
+            path: Some("/c/config.toml".to_owned()),
+        }
+    }
+
     /// Whether `name` is on screen, through the same gate the painter uses.
     fn listed(app: &App, name: &str) -> bool {
         app.listed_roots().any(|v| v.meta.path == root(name))
@@ -10341,7 +10368,7 @@ mod tests {
     /// and asks the loop for the marker.
     #[test]
     fn app_tour_enter_walks_the_cards_and_the_last_one_closes_it() {
-        let mut app = with_tour(vec![Card::Keys, empty_card()]);
+        let mut app = with_tour(vec![Card::Keys, depth_card()]);
         assert_eq!(
             app.handle(Action::Tour(TourKey::Next)),
             (Changed::Yes, None)
@@ -10515,9 +10542,73 @@ mod tests {
     /// choice rows advances it, so the mouse alone can walk the whole tour.
     #[test]
     fn app_tour_click_on_a_plain_cards_footer_advances_it() {
-        let mut app = with_tour(vec![Card::Keys, empty_card()]);
+        let mut app = with_tour(vec![Card::Keys, depth_card()]);
         assert_eq!(app.hit(Target::TourRow(0)), (Changed::Yes, None));
         assert_eq!(app.tour.as_ref().expect("open").at, 1);
+    }
+
+    /// Deliverable 8: the depth card's second row asks for the write and changes nothing
+    /// the reducer owns. The roots the deeper walk finds are the engine's to deliver.
+    #[test]
+    fn app_tour_depth_choice_asks_for_the_write_and_changes_no_app_state() {
+        let mut app = with_tour(vec![depth_card()]);
+        let before = app.clone();
+        assert_eq!(
+            app.handle(Action::Tour(TourKey::Next)),
+            (Changed::Yes, Some(Effect::TourDone)),
+            "the first row keeps the default and writes nothing"
+        );
+
+        let mut app = with_tour(vec![depth_card()]);
+        app.handle(Action::Tour(TourKey::Down));
+        assert_eq!(
+            app.handle(Action::Tour(TourKey::Next)),
+            (Changed::Yes, Some(Effect::TourWrite(Setting::SearchDepth2)))
+        );
+        assert_eq!(app.hide_empty, before.hide_empty);
+        assert_eq!(app.herdr.scoped, before.herdr.scoped);
+        assert_eq!(
+            app.listed_roots().count(),
+            before.listed_roots().count(),
+            "no root moved"
+        );
+        assert_eq!(app.selection, before.selection);
+    }
+
+    /// F4: the empty-repository card is built when the tour reaches it, from the list as it
+    /// is then. Roots the depth card's rescan found are counted; a list that is no longer
+    /// worth the question loses the card.
+    #[test]
+    fn app_tour_empty_card_is_built_at_the_advance_step() {
+        let mut app = with_tour(vec![Card::Keys, Card::Empty { empty: 0, total: 0 }]);
+        // Three roots, all with something pending: not worth asking, so no card at all.
+        assert_eq!(
+            app.handle(Action::Tour(TourKey::Next)),
+            (Changed::Yes, Some(Effect::TourDone)),
+            "the slot is dropped and the tour ends"
+        );
+
+        // The same slot, after twelve empty roots landed.
+        let mut app = with_tour(vec![Card::Keys, Card::Empty { empty: 0, total: 0 }]);
+        let names: Vec<String> = (0..12).map(|i| format!("e{i:02}")).collect();
+        let mut metas: Vec<_> = ["alpha", "beta", "notes"].iter().map(|n| meta(n)).collect();
+        metas.extend(names.iter().map(|n| meta(n)));
+        app.sync_roots(metas);
+        for name in &names {
+            app.apply(pile_event(name, Pile::default()));
+        }
+        assert_eq!(
+            app.handle(Action::Tour(TourKey::Next)),
+            (Changed::Yes, None)
+        );
+        assert_eq!(
+            app.tour.as_ref().expect("open").card(),
+            &Card::Empty {
+                empty: 12,
+                total: 15
+            },
+            "counted from the live list, not from when the tour opened"
+        );
     }
 
     /// A click on a row the card does not have is clamped rather than ignored: the hit map

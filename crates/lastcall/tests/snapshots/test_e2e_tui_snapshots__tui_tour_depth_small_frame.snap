@@ -1,0 +1,18 @@
+---
+source: crates/lastcall/tests/test_e2e_tui_snapshots.rs
+expression: frame
+---
+"l┌ welcome ───────────────────────────────────────────────┐W"
+"┌│ Where lastcall looks                                   │┐"
+"││                                                        ││"
+"││ The list holds every git repository directly inside    ││"
+"││ this directory. One kept a folder deeper, such as      ││"
+"││ worktrees/<name>, is not listed unless you ask.        ││"
+"││                                                        ││"
+"││ > Keep looking one folder down                         ││"
+"││   Look two folders down, and remember that             ││"
+"││     (writes search_depth = 2)                          ││"
+"││                                                        ││"
+"││ enter  choose          q  skip the rest                ││"
+"└└────────────────────────────────────────────────────────┘┘"
+"↑↓ scroll  ← back  t hide empty  ? help  q quit             "

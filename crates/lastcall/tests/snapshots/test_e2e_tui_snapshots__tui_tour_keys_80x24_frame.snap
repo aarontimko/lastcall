@@ -7,7 +7,7 @@ expression: frame
 "│┌ welcome ───────────────────────────────────────────────────────────────────┐│"
 "││ Welcome to lastcall                                                        ││"
 "││                                                                            ││"
-"││ The list on the left is every repository under this directory. Pick a file ││"
+"││ The list on the left is the repositories under this directory. Pick a file ││"
 "││ and the diff opens on the right.                                           ││"
 "││                                                                            ││"
 "││ a  accept the hunk under the cursor                                        ││"

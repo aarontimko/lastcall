@@ -2287,7 +2287,10 @@ fn render_snooze(app: &App, buf: &mut Buffer, area: Rect) {
 /// frame rather than about the tour.
 ///
 /// The height ladder spends the blank separator lines first: a card on a short terminal
-/// closes up rather than losing its footer, which is the one line saying how to leave.
+/// closes up rather than losing its footer, which is the one line saying how to leave. A
+/// card that would rather give up a paragraph than its spacing says so itself: the height
+/// budget goes to `Tour::lines` before the painter sees a row, which is how the depth card
+/// drops its hint block at 60x14 (deliverable 8).
 fn render_tour(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
     let Some(tour) = &app.tour else {
         return;
