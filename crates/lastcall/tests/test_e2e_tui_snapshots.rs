@@ -658,7 +658,8 @@ fn tui_help_overlay_tall() {
 }
 
 /// The same overlay with room for neither form: 80 columns is the standard width and this
-/// keymap needs 100 for two columns, so the body is one column and it clips.
+/// keymap needs 97 for two columns (`help_two_column_width`, computed from the table), so
+/// the body is one column and it clips.
 ///
 /// Design pass D12 (ruling R12): the clip **says so**. The last body row above the pinned
 /// `quit` is a dim `… N more keys (100 columns shows all)` — the count is the rows that are

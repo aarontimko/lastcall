@@ -3256,7 +3256,7 @@ fn pty_help_overlay_says_how_to_leave_and_any_key_closes() {
     })
     .unwrap_or_else(|e| panic!("the help overlay: {e}"));
 
-    // 100 columns is the width two columns need and 30 rows hold them: every row of the
+    // 100 columns is past the 97 two columns need and 30 rows hold them: every row of the
     // keymap is on the frame, the modal keys included, and nothing is clipped.
     let text = pty.screen_text();
     for row in [
