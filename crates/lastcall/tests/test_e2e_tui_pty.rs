@@ -4959,11 +4959,20 @@ fn tui_tour_skip() {
     .unwrap_or_else(|e| panic!("the review screen comes back: {e}\n{}", pty.screen_text()));
     assert!(!pty.eof(), "`q` skipped the welcome, it did not quit");
 
-    // And the keys are the keys again.
+    // And the keys are the keys again. The hint line says `q quit` on its own, so the
+    // overlay is known by its footer, and Esc is waited on before the next key: a slow
+    // host reads `Esc` and `q` in one chunk, which crossterm parses as Alt-q, and nothing
+    // quits (the macOS CI runner did exactly that).
     pty.send(b"?").expect("? for real");
-    pty.wait_for(Duration::from_secs(5), |s| s.contents().contains("quit"))
-        .unwrap_or_else(|e| panic!("the help overlay: {e}\n{}", pty.screen_text()));
+    pty.wait_for(Duration::from_secs(5), |s| {
+        s.contents().contains("any key closes")
+    })
+    .unwrap_or_else(|e| panic!("the help overlay: {e}\n{}", pty.screen_text()));
     pty.send(b"\x1b").expect("esc");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        !s.contents().contains("any key closes")
+    })
+    .unwrap_or_else(|e| panic!("esc closes the help overlay: {e}\n{}", pty.screen_text()));
 
     assert_eq!(
         std::fs::read_to_string(&fx.config).expect("the config"),
