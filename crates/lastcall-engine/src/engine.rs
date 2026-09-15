@@ -224,6 +224,13 @@ pub struct RootState {
     pub remote: Option<String>,
     /// Identity of `ledger.json` when `ledger` was read; a scan re-reads on change.
     pub ledger_stamp: Option<ledger::Stamp>,
+    /// Set by [`RootState::sync_branch`] when the switch it performed was the arriving
+    /// branch's **first sight**, and taken by the next head inspection for R8's notice.
+    ///
+    /// It has to wait here rather than be computed in `inspect_head`: a scan can perform
+    /// the switch (a file event arriving before the git-dir event) long before any head
+    /// inspection runs, and by then the record has been made and the fact is gone.
+    pub first_sight_from: Option<String>,
 }
 
 impl RootState {
@@ -260,6 +267,98 @@ impl RootState {
             };
         }
         self.ledger = fresh;
+    }
+
+    /// The per-worktree `HEAD` file this root's record in force follows (R1). `None` for
+    /// a draft root and before the first head inspection.
+    fn head_file_dir(&self) -> Option<&Path> {
+        if self.repo.is_none() || self.head.git_dir.as_os_str().is_empty() {
+            return None;
+        }
+        Some(&self.head.git_dir)
+    }
+
+    /// R1: bring the record in force into step with the branch `<git_dir>/HEAD` names.
+    ///
+    /// Every reader and writer of a baseline runs this first: `scan_root` right after
+    /// `reload_ledger_if_changed` (so `scan` and `scan_all` both reach it), `inspect_head`
+    /// before it compares heads, and the tail of `open_root_with` (where an offline switch
+    /// lands, D21). It is a `RootState` step and not an `Engine` method because the scan
+    /// pool owns one `&mut RootState` per worker and an `Engine` method cannot be called
+    /// there.
+    ///
+    /// Four outcomes, and only the last writes anything:
+    /// - **no switch** — a draft root, a detached or unborn `HEAD`, a missing or locked
+    ///   `HEAD`, or the name already in force (R4);
+    /// - **adopt** — the record belongs to no branch yet (a file a 1.1 binary wrote, R6, or
+    ///   a record made at a detached HEAD): it is attributed to `HEAD`'s branch with no
+    ///   park, no first sight and no fold, so nothing in the pile moves;
+    /// - **re-label** — `HEAD` names another branch and the record's own ref is gone
+    ///   (`git branch -m` of the current branch, R3): the same record, a new name;
+    /// - **switch** — [`Ops::switch_branch`], the one that parks, loads or first-sights.
+    ///
+    /// The first three write no ledger: they are attributions, not changes, and the next
+    /// ordinary write stamps them. That also makes them idempotent, which matters because
+    /// `reload_ledger_if_changed` can put the file's version back at any time.
+    fn sync_branch(&mut self, clock: &dyn Clock) {
+        let Some(dir) = self.head_file_dir() else {
+            return;
+        };
+        let Some(name) = headstate::head_branch(dir) else {
+            return; // R4: detached, unborn-and-unnamed, missing or mid-write
+        };
+        match self.ledger.seen_branch.clone() {
+            Some(current) if current == name => {
+                self.ledger.adopt_branch = false;
+            }
+            None => {
+                self.ledger.seen_branch = Some(name);
+                self.ledger.adopt_branch = false;
+            }
+            Some(_) => {
+                let mut ops = self.switch_ops(clock);
+                match ops.switch_branch(&name, &NoFault) {
+                    Ok(switched) => {
+                        if switched.first_sight_from.is_some() {
+                            self.first_sight_from = switched.first_sight_from;
+                        }
+                        if switched.happened {
+                            self.ledger_stamp = ledger::stamp(&self.paths);
+                        }
+                    }
+                    Err(e) => {
+                        // Fail open: the record in force stays, which over-shows the new
+                        // branch's delta and hides nothing.
+                        self.notices
+                            .push(format!("branch switch to {name} skipped: {e}"));
+                    }
+                }
+            }
+        }
+    }
+
+    /// An [`Ops`] over this root for the branch switch alone. It stages nothing and never
+    /// compacts (`switch_branch` does not reach the threshold check), so the threshold is
+    /// the one field with no meaningful value here.
+    fn switch_ops<'a>(&'a mut self, clock: &'a dyn Clock) -> Ops<'a> {
+        let git_dir =
+            (!self.head.git_dir.as_os_str().is_empty()).then(|| self.head.git_dir.clone());
+        Ops {
+            store: &self.store,
+            index: &self.index,
+            repo: self.repo.as_ref(),
+            paths: &self.paths,
+            branch: self.ledger.seen_branch.clone(),
+            git_dir,
+            ledger: &mut self.ledger,
+            tree: &mut self.tree,
+            clock,
+            compaction_threshold: usize::MAX,
+            case_insensitive: self.case_insensitive,
+            staged: BTreeMap::new(),
+            pending_undo: None,
+            lock: crate::ops::DEFAULT_LOCK,
+        }
     }
 
     pub fn seen_head(&self) -> Option<&Oid> {
@@ -827,7 +926,7 @@ fn open_root_with(ctx: &OpenCtx<'_>, d: &roots::DiscoveredRoot) -> Result<RootSt
                             // find *this* ledger, not fall to first sight at the current
                             // HEAD (which would hide everything committed since the old
                             // ledger was last good).
-                            let l = Ledger::new(
+                            let mut l = Ledger::new(
                                 &d.path,
                                 d.kind,
                                 None,
@@ -837,6 +936,7 @@ fn open_root_with(ctx: &OpenCtx<'_>, d: &roots::DiscoveredRoot) -> Result<RootSt
                                     at: clock.now_iso8601(),
                                 },
                             );
+                            l.seen_branch = head.branch.clone();
                             ledger::save(&paths, &l)?;
                             l
                         }
@@ -881,7 +981,7 @@ fn open_root_with(ctx: &OpenCtx<'_>, d: &roots::DiscoveredRoot) -> Result<RootSt
         None => TreeEntries::new(),
     };
     let ledger_stamp = ledger::stamp(&paths);
-    Ok(RootState {
+    let mut state = RootState {
         path: d.path.clone(),
         kind: d.kind,
         parent: d.parent.clone(),
@@ -903,7 +1003,13 @@ fn open_root_with(ctx: &OpenCtx<'_>, d: &roots::DiscoveredRoot) -> Result<RootSt
         user_email,
         remote,
         ledger_stamp,
-    })
+        first_sight_from: None,
+    };
+    // R1, and D21's landing place: a switch made while lastcall was not running is seen
+    // here, before the root's first scan, so the very first pile is the arriving branch's.
+    // A root that first-sighted just now already named its branch, so this is a no-op.
+    state.sync_branch(clock);
+    Ok(state)
 }
 
 /// What one root's scan needs from the engine that is not in its own [`RootState`]. Shared
@@ -915,6 +1021,9 @@ struct ScanCtx {
     /// The engine's injected wall clock, read once per `scan_all` so every root in one
     /// sweep decides snooze expiry against the same instant (Amendment v1.11).
     now: SystemTime,
+    /// The clock itself, for the branch sync's ledger write (Amendment v1.12): a switch
+    /// stamps `seen_at` and `parked_at`.
+    clock: Arc<dyn Clock + Send + Sync>,
 }
 
 /// Scan one root, start to finish, mutating **only** that root's state: its nested-repo
@@ -941,6 +1050,9 @@ fn trace_scan_done(root: &Path, started: &std::time::Instant, rows: usize, seq: 
 
 fn scan_root(state: &mut RootState, ctx: &ScanCtx) -> Result<Pile, EngineError> {
     state.reload_ledger_if_changed();
+    // R1: which record is in force, before a single baseline is read. A scan that arrives
+    // on file events alone, with no head inspection behind it, still sees the switch.
+    state.sync_branch(ctx.clock.as_ref());
     let out = scan::scan(&ScanInputs {
         store: &state.store,
         index: &state.index,
@@ -1002,6 +1114,7 @@ impl Engine {
             collapse_size_bytes: self.config.collapse_size_bytes,
             row_cap: self.options.row_cap,
             now: self.options.clock.now(),
+            clock: self.options.clock.clone(),
         }
     }
 
@@ -1179,10 +1292,16 @@ impl Engine {
 
     /// Re-inspect HEAD; when it moved (or an operation finished), scan and describe it.
     pub fn inspect_head(&mut self, root: &Path) -> Result<Option<HeadChange>, EngineError> {
+        let clock = self.options.clock.clone();
         let state = self
             .roots
-            .get(root)
+            .get_mut(root)
             .ok_or_else(|| EngineError::NoSuchRoot(root.to_path_buf()))?;
+        // R1: the record in force follows `<git_dir>/HEAD`, and this is the event that
+        // usually carries the checkout. It runs before the heads are compared so the notice
+        // below reports the delta against the branch's own baseline, not the one it left.
+        state.sync_branch(clock.as_ref());
+        let state = &*state;
         let Some(rg) = &state.repo else {
             return Ok(None);
         };
@@ -1202,9 +1321,18 @@ impl Engine {
         self.roots.get_mut(root).expect("checked").head = next.clone();
         let pile = self.scan(root)?;
         let seq = self.scan_seq;
+        // R8: taken, not read, so the first-sight wording is used once. The scan above
+        // cannot have set it (the sync at the top of this function already moved the
+        // record in force), but it is taken after the scan so a switch either sync saw
+        // reaches this notice.
+        let first_sight_from = self
+            .roots
+            .get_mut(root)
+            .and_then(|s| s.first_sight_from.take());
         let facts = TransitionFacts {
             commits,
             files_differ: pile.rows.len(),
+            first_sight_from,
         };
         let notice = headstate::transition(&prev, &next, hint.as_ref(), &facts);
         Ok(Some(HeadChange {
@@ -1658,11 +1786,18 @@ impl Engine {
             .get_mut(root)
             .ok_or_else(|| EngineError::NoSuchRoot(root.to_path_buf()))?;
         let case_insensitive = state.case_insensitive;
+        // R5: the branch this op is staged under, and the `HEAD` file `commit` re-reads
+        // under the lock to prove it is still in force.
+        let branch = state.ledger.seen_branch.clone();
+        let git_dir =
+            (!state.head.git_dir.as_os_str().is_empty()).then(|| state.head.git_dir.clone());
         Ok(Ops {
             store: &state.store,
             index: &state.index,
             repo: state.repo.as_ref(),
             paths: &state.paths,
+            branch,
+            git_dir,
             ledger: &mut state.ledger,
             tree: &mut state.tree,
             clock,
@@ -1784,7 +1919,7 @@ fn first_sight(
             DraftInitial::Pending => None,
         },
     };
-    Ok(Ledger::new(
+    let mut ledger = Ledger::new(
         root,
         kind,
         seen_tree,
@@ -1793,7 +1928,11 @@ fn first_sight(
             branch: head.branch.clone(),
             at: clock.now_iso8601(),
         },
-    ))
+    );
+    // R7: a root's first sight is unchanged and names the branch it happened on, so the
+    // first sync is a no-op rather than an adoption.
+    ledger.seen_branch = head.branch.clone();
+    Ok(ledger)
 }
 
 #[cfg(test)]

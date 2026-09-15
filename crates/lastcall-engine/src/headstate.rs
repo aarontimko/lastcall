@@ -81,6 +81,20 @@ pub fn current_head(rg: &RepoGit) -> (Option<Oid>, Option<String>) {
     (head, branch)
 }
 
+/// The branch `<git_dir>/HEAD` names, or `None` when it is detached, unborn-and-unnamed,
+/// missing, locked or mid-write (Amendment v1.12, R1).
+///
+/// One file read and **no git process**: this runs on every scan of every root, and the
+/// answer decides which seen record is in force. `checkout` and `switch` write `HEAD`
+/// through a lockfile and a rename, so a torn read never happens; a missing file or a
+/// `HEAD.lock` can, and both answer `None`, which means "no switch" everywhere upstream.
+pub fn head_branch(git_dir: &Path) -> Option<String> {
+    let bytes = std::fs::read(git_dir.join("HEAD")).ok()?;
+    let text = String::from_utf8(bytes).ok()?;
+    let name = text.trim().strip_prefix("ref: refs/heads/")?;
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
 pub fn inspect(rg: &RepoGit) -> Result<HeadState, GitError> {
     Ok(inspect_with_paths(rg, &[])?.0)
 }
@@ -238,6 +252,10 @@ pub struct TransitionFacts {
     pub commits: Option<u64>,
     /// Pending rows after the scan that followed the switch.
     pub files_differ: usize,
+    /// The branch left, when the arrival was the new branch's **first sight** (Amendment
+    /// v1.12, R8): its record had to be made, as a copy of that branch's. `None` for every
+    /// other transition, including a return to a branch whose record was parked.
+    pub first_sight_from: Option<String>,
 }
 
 fn label(state: &HeadState) -> String {
@@ -277,8 +295,19 @@ pub fn transition(
         }
         Transition::Commit => format!("switched {} → {} (same commit)", label(prev), label(next)),
         Transition::Checkout => {
+            // A move that changed no commit says so and stops there, first sight or not
+            // (B2, B3, D15): there is nothing for the user to have missed, and the copy
+            // had nothing to fold.
             if prev.head == next.head {
                 format!("switched {} → {} (same commit)", label(prev), label(next))
+            } else if let Some(from) = &facts.first_sight_from {
+                let n = facts.files_differ;
+                let plural = if n == 1 { "file" } else { "files" };
+                format!(
+                    "switched {} → {}: first time here, seen state carried from {from}; {n} {plural} pending",
+                    label(prev),
+                    label(next),
+                )
             } else {
                 format!(
                     "switched {} → {}: {} files differ from seen state",
@@ -380,6 +409,79 @@ mod tests {
         ));
     }
 
+    /// R8's first-sight form, the count in the singular. The branch left is named because
+    /// the state the user is looking at is that branch's, carried over.
+    #[test]
+    fn headstate_transition_first_sight_with_files_pending() {
+        let a = state("a", Some("main"), None);
+        let b = state("b", Some("feat/other"), None);
+        let facts = TransitionFacts {
+            commits: None,
+            files_differ: 1,
+            first_sight_from: Some("main".into()),
+        };
+        assert_eq!(
+            transition(
+                &a,
+                &b,
+                Some(&hint("checkout: moving from main to feat/other")),
+                &facts
+            )
+            .unwrap(),
+            "switched main → feat/other: first time here, seen state carried from main; 1 file pending"
+        );
+        let two = TransitionFacts {
+            files_differ: 2,
+            ..facts
+        };
+        assert_eq!(
+            transition(
+                &a,
+                &b,
+                Some(&hint("checkout: moving from main to feat/other")),
+                &two
+            )
+            .unwrap(),
+            "switched main → feat/other: first time here, seen state carried from main; 2 files pending"
+        );
+    }
+
+    /// D14's return leg: a first sight that folded everything away still says so, with a
+    /// zero — the wording is about where the state came from, not about the count. And the
+    /// same-commit case (B2, D15, D23) keeps today's text whether it is a first sight or
+    /// not, which is the one place the form is decided by the heads and not by the fact.
+    #[test]
+    fn headstate_transition_first_sight_with_nothing_pending() {
+        let a = state("a", Some("future"), None);
+        let b = state("b", Some("main"), None);
+        let facts = TransitionFacts {
+            commits: None,
+            files_differ: 0,
+            first_sight_from: Some("future".into()),
+        };
+        assert_eq!(
+            transition(
+                &a,
+                &b,
+                Some(&hint("checkout: moving from future to main")),
+                &facts
+            )
+            .unwrap(),
+            "switched future → main: first time here, seen state carried from future; 0 files pending"
+        );
+        let same = state("a", Some("feat/w"), None);
+        assert_eq!(
+            transition(
+                &a,
+                &same,
+                Some(&hint("checkout: moving from future to feat/w")),
+                &facts
+            )
+            .unwrap(),
+            "switched future → feat/w (same commit)"
+        );
+    }
+
     #[test]
     fn headstate_transition_texts() {
         let a = state("a", Some("main"), None);
@@ -387,6 +489,7 @@ mod tests {
         let facts = TransitionFacts {
             commits: Some(1),
             files_differ: 0,
+            first_sight_from: None,
         };
         assert_eq!(
             transition(&a, &b, Some(&hint("commit: agent commit")), &facts),
@@ -395,6 +498,7 @@ mod tests {
         let three = TransitionFacts {
             commits: Some(3),
             files_differ: 0,
+            first_sight_from: None,
         };
         assert_eq!(
             transition(&a, &b, Some(&hint("commit: x")), &three).unwrap(),
@@ -415,6 +519,7 @@ mod tests {
         let differ = TransitionFacts {
             commits: None,
             files_differ: 2,
+            first_sight_from: None,
         };
         assert_eq!(
             transition(

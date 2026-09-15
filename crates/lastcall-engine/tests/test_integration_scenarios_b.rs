@@ -96,9 +96,13 @@ fn scenario_b4_divergent_branch_and_back() {
     let over = s.ledger().overrides["f1"].clone();
     s.repo.checkout("feat-y").unwrap();
     assert_pile!(s.engine, s.root, "g1|g2", "B4 switch to feat-y over-shows");
+    // Amendment v1.12: feat-y has never been in force, so the arrival is a first sight and
+    // says where the state it is showing came from. The count is the same one.
     assert_eq!(
         s.head_notice().as_deref(),
-        Some("switched main → feat-y: 2 files differ from seen state")
+        Some(
+            "switched main → feat-y: first time here, seen state carried from main; 2 files pending"
+        )
     );
     s.repo.checkout("main").unwrap();
     assert_pile!(

@@ -869,15 +869,29 @@ pub(crate) mod fixture_tests {
         pub(crate) case_insensitive: bool,
         pub(crate) clock: FixedClock,
         pub(crate) compaction_threshold: usize,
+        /// The fixture's `.git`, for the tests that drive the branch switch.
+        pub(crate) git_dir: std::path::PathBuf,
     }
 
     impl Harness {
+        /// [`Harness::ops`] with R5's two fields filled in: the branch the op stages its
+        /// work under, and the git dir whose `HEAD` says which branch is really in force.
+        pub(crate) fn ops_on(&mut self, branch: &str) -> Ops<'_> {
+            let git_dir = self.git_dir.clone();
+            let mut ops = self.ops();
+            ops.branch = Some(branch.to_owned());
+            ops.git_dir = Some(git_dir);
+            ops
+        }
+
         pub(crate) fn ops(&mut self) -> Ops<'_> {
             Ops {
                 store: &self.store,
                 index: &self.index,
                 repo: Some(&self.repo_git),
                 paths: &self.paths,
+                branch: None,
+                git_dir: None,
                 ledger: &mut self.ledger,
                 tree: &mut self.tree_entries,
                 clock: &self.clock,
@@ -898,6 +912,12 @@ pub(crate) mod fixture_tests {
             let (store, _) =
                 Store::open(&env, repo.path(), RootKind::Git, &paths, Some(&facts)).unwrap();
             let exclude = repo_git.git_path("info/exclude").unwrap();
+            let git_dir = repo_git
+                .git_path("HEAD")
+                .unwrap()
+                .parent()
+                .expect("a git dir above HEAD")
+                .to_path_buf();
             let index =
                 PrivateIndex::new(store.git().clone(), &paths, RootKind::Git, Some(exclude));
             let tree = Oid::parse(repo.git(&["rev-parse", "HEAD^{tree}"]).unwrap().trim()).unwrap();
@@ -926,6 +946,7 @@ pub(crate) mod fixture_tests {
                 paths,
                 clock: FixedClock::at_unix(1_800_000_000),
                 compaction_threshold: 500,
+                git_dir,
             }
         }
 

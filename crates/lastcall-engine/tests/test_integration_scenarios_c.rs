@@ -228,9 +228,12 @@ fn scenario_c8_checkout_of_a_coworker_branch() {
         "z1 upstream",
         "C8 coworker branch: grouped as upstream"
     );
+    // Amendment v1.12: feat-z is first-sighted from main's record here, and the head moved.
     assert_eq!(
         s.head_notice().as_deref(),
-        Some("switched main → feat-z: 1 files differ from seen state")
+        Some(
+            "switched main → feat-z: first time here, seen state carried from main; 1 file pending"
+        )
     );
     accept_groups(&mut s);
     assert_pile!(s.engine, s.root, "");

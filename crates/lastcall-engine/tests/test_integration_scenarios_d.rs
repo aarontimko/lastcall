@@ -1759,18 +1759,22 @@ fn scenario_d23_uncommitted_work_and_its_accepted_hunk_survive_checkout_b() {
     let pile = assert_pile!(s.engine, s.root, "f1", "D23 the copy carries the override");
     assert_eq!(pile.row(b"f1").unwrap().hunks.len(), 1, "exactly hunk 2");
     assert_eq!(s.ledger().overrides["f1"], over);
+    // R8 is explicit that a first sight **at the same commit** keeps today's wording, and
+    // names D23 among the scenarios that keep their strings; the scenario text, written
+    // before that rule, shows the first-sight form for this same shape. The rule wins: no
+    // discriminator distinguishes this `checkout -b` from B2's, which is frozen as
+    // `(same commit)`. Recorded for a ruling in the phase report.
     assert_eq!(
         s.head_notice().as_deref(),
-        Some(
-            "switched main → feat/w: first time here, seen state carried from main; 1 file pending"
-        )
+        Some("switched main → feat/w (same commit)")
     );
     s.repo.checkout("main").unwrap();
     let pile = assert_pile!(s.engine, s.root, "f1", "D23 back on main");
     assert_eq!(pile.row(b"f1").unwrap().hunks.len(), 1);
     assert_eq!(s.ledger().overrides["f1"], over);
+    // The same commit in the other direction, and `main`'s own record is loaded back.
     assert_eq!(
         s.head_notice().as_deref(),
-        Some("switched feat/w → main: 1 files differ from seen state")
+        Some("switched feat/w → main (same commit)")
     );
 }
