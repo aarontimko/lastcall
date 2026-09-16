@@ -78,8 +78,9 @@ cargo install --git https://github.com/aarontimko/lastcall --tag v0.2.0 lastcall
 
 That puts `lastcall` in `~/.cargo/bin`. To upgrade later, run the same line with the tag of
 the release you want and `--force`; `lastcall update` refuses this route and prints that
-line back, with the tag left for you to fill in. A clone plus `just cargo build --release -p lastcall` works too, and is what you want
-if you intend to change the code: [`CONTRIBUTING.md`](../CONTRIBUTING.md).
+line back, with the tag left for you to fill in. A clone plus
+`just cargo build --release -p lastcall` works too, and is what you want if you intend to
+change the code: [`CONTRIBUTING.md`](../CONTRIBUTING.md).
 
 ## Staying current
 
