@@ -4,7 +4,7 @@ mod common;
 
 use common::Fresh;
 use lastcall_engine::config::Config;
-use lastcall_engine::engine::EngineOptions;
+use lastcall_engine::engine::{EngineOptions, RestoreRequest};
 use lastcall_engine::git::Mode;
 use lastcall_engine::headstate::{self, InProgress};
 use lastcall_engine::ops::{NoFault, Refused, Rendered};
@@ -1802,6 +1802,84 @@ fn scenario_d22_two_processes_over_one_root() {
     );
     assert!(!out.written, "nothing written");
     assert_pile!(e2, s.root, "", "D22 engine 2's next scan shows main's pile");
+}
+
+/// R5 covers the snapshot as well as the staged op (verifier F4). Once engine 2 has
+/// adopted the branch engine 1 switched to, every `Ops` it builds is staged under the new
+/// branch and the staged-op refusal has nothing left to compare; the pile engine 2 is still
+/// holding was computed against the record it left, and a fold of it would write every one
+/// of those rows, restamp `seen_at` and push an undo entry into the wrong record. The pile
+/// carries the branch it was scanned under, so the accept is refused instead.
+#[test]
+fn scenario_d22_a_snapshot_rendered_on_the_branch_left_is_refused() {
+    let mut s = Fresh::new("d22b");
+    let env = s.repo.engine_env(s.state.path());
+    let mut e2 = open_engine_with(
+        s.repo.path(),
+        &env,
+        s.state.path(),
+        Config::default(),
+        EngineOptions::default(),
+    );
+    s.repo.write("f1", "edited on main\n");
+    assert_pile!(s.engine, s.root, "f1", "f1 pending on main");
+    let snapshot = e2.scan(&s.root).unwrap();
+    assert_eq!(
+        snapshot.seen_branch.as_deref(),
+        Some("main"),
+        "the pile says which record it was computed against"
+    );
+    assert_eq!(common::pile_string(&snapshot), "f1");
+    let rendered = Rendered::of(snapshot.row(b"f1").unwrap());
+
+    // Engine 1 performs the switch; the uncommitted f1 travels with the checkout.
+    s.repo.checkout_b("feat").unwrap();
+    assert_pile!(s.engine, s.root, "f1", "engine 1 first-sights feat");
+
+    // Engine 2 still believes it is on main: its restore is refused, and its rescan adopts.
+    let restored = e2
+        .restore(&s.root, RestoreRequest::File(rendered))
+        .expect("restore");
+    assert!(!restored.outcome.ok(), "{:?}", restored.outcome);
+    assert_eq!(
+        restored.outcome.refused[0].message("restored"),
+        "branch changed under this restore (now feat); try again"
+    );
+    let adopted = e2.scan(&s.root).unwrap();
+    assert_eq!(adopted.seen_branch.as_deref(), Some("feat"));
+
+    let before = e2.root(&s.root).unwrap().ledger.clone();
+    let out = e2
+        .ops(&s.root)
+        .unwrap()
+        .accept_all(&snapshot, &NoFault)
+        .expect("accept_all");
+    assert!(!out.ok(), "the stale snapshot is refused: {out:?}");
+    assert!(!out.written, "nothing written");
+    assert_eq!(
+        out.refused[0].to_string(),
+        "branch changed under this accept (now feat); try again"
+    );
+    let after = e2.root(&s.root).unwrap().ledger.clone();
+    assert_eq!(
+        after.seen_tree, before.seen_tree,
+        "feat's tree is untouched"
+    );
+    assert!(
+        after.overrides.is_empty() && after.undo.is_empty(),
+        "no override and no undo entry landed in feat's record: {:?}",
+        after.overrides.keys().collect::<Vec<_>>()
+    );
+    assert_pile!(e2, s.root, "f1", "the row is still pending on feat");
+    // The pile engine 2 scans now is feat's, and accepting *that* one lands normally.
+    let fresh = e2.scan(&s.root).unwrap();
+    let out = e2
+        .ops(&s.root)
+        .unwrap()
+        .accept_all(&fresh, &NoFault)
+        .expect("accept_all");
+    assert!(out.ok() && out.written, "{out:?}");
+    assert_pile!(e2, s.root, "", "accepted into feat's own record");
 }
 
 #[test]

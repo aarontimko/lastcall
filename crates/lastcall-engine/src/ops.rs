@@ -744,6 +744,24 @@ impl Ops<'_> {
         }))
     }
 
+    /// R5's other order (verifier F4): the branch the **snapshot** was rendered under.
+    ///
+    /// [`Ops::branch_refusal`] compares the branch this `Ops` staged its work under against
+    /// the record in force now, which catches a switch that lands under a staged op. It
+    /// cannot catch the reverse: the switch is adopted first, the next `Ops` is staged
+    /// under the arriving branch, and the pile the caller is still holding belongs to the
+    /// branch it left. A multi-row accept writes every one of those rows, restamps
+    /// `seen_at` and pushes one undo entry, so it is the write that must least be allowed
+    /// to land in a record its rows were not computed against. The single-row paths need
+    /// none of this: their CAS pins a baseline and a content oid.
+    fn snapshot_refusal(&self, rendered_on: Option<&str>) -> Option<Refused> {
+        let staged = self.branch.as_deref()?;
+        let on = rendered_on?;
+        (on != staged).then(|| Refused::BranchChanged {
+            now: staged.to_owned(),
+        })
+    }
+
     /// Accept one file at its rendered content (A6 CAS). A rendered `oid: None` is a
     /// deletion and follows [`Ops::accept_deletion`].
     pub fn accept_file(
@@ -767,10 +785,17 @@ impl Ops<'_> {
     pub fn accept_group(
         &mut self,
         rows: &[Rendered],
+        rendered_on: Option<&str>,
         fault: &dyn FaultInjector,
     ) -> Result<Outcome, OpsError> {
         if let Some(out) = self.accept_preflight()? {
             return Ok(out);
+        }
+        if let Some(r) = self.snapshot_refusal(rendered_on) {
+            return Ok(Outcome {
+                refused: vec![r],
+                ..Default::default()
+            });
         }
         let mut refused = Vec::new();
         let mut any = false;
@@ -1535,6 +1560,12 @@ impl Ops<'_> {
     ) -> Result<Outcome, OpsError> {
         if let Some(out) = self.accept_preflight()? {
             return Ok(out);
+        }
+        if let Some(r) = self.snapshot_refusal(snapshot.seen_branch.as_deref()) {
+            return Ok(Outcome {
+                refused: vec![r],
+                ..Default::default()
+            });
         }
         let seen_at = self.head_now();
         match self.fold(snapshot, Some(seen_at), fault)? {
@@ -2545,7 +2576,7 @@ mod tests {
         assert_eq!(pile_lines(&pile), vec!["f1", "f2", "f3"]);
         let rows: Vec<Rendered> = pile.rows.iter().map(Rendered::of).collect();
         repo.write("f3", "moved\n");
-        let out = h.ops().accept_group(&rows, &NoFault).unwrap();
+        let out = h.ops().accept_group(&rows, None, &NoFault).unwrap();
         assert_eq!(out.refused.len(), 1);
         assert!(matches!(&out.refused[0], Refused::Moved { path, .. } if path == b"f3"));
         assert!(out.written, "one write for the rows that passed");
@@ -3732,7 +3763,7 @@ mod tests {
         repo.write("f3", "three\n");
         repo.write("grouped", "g2\n");
         let rows = vec![rendered(&h, b"f3"), rendered(&h, b"grouped")];
-        assert!(h.ops().accept_group(&rows, &NoFault).unwrap().ok());
+        assert!(h.ops().accept_group(&rows, None, &NoFault).unwrap().ok());
         assert_eq!(top(&h).op, UndoOp::AcceptGroup);
         assert_eq!(
             top(&h).paths.keys().cloned().collect::<Vec<_>>(),

@@ -22,7 +22,7 @@ fn accept_groups(s: &mut Fresh) {
             .engine
             .ops(&s.root)
             .unwrap()
-            .accept_group(&rendered, &NoFault)
+            .accept_group(&rendered, pile.seen_branch.as_deref(), &NoFault)
             .unwrap();
         assert!(out.ok(), "{out:?}");
     }

@@ -2055,7 +2055,19 @@ impl App {
                     .map(Rendered::of)
                     .collect();
                 if !rendered.is_empty() {
-                    out.push((root.clone(), AcceptRequest::Group(rendered)));
+                    // R5: the branch the pile these rows came from was scanned under, so
+                    // the engine can refuse the write when the record in force has moved.
+                    let rendered_on = self
+                        .roots
+                        .get(root)
+                        .and_then(|v| v.pile.seen_branch.clone());
+                    out.push((
+                        root.clone(),
+                        AcceptRequest::Group {
+                            rows: rendered,
+                            rendered_on,
+                        },
+                    ));
                 }
             }
             AcceptScope::Root(root) => {
@@ -2278,7 +2290,7 @@ impl App {
             .map(|(root, req)| {
                 let n = match req {
                     AcceptRequest::Hunk { .. } | AcceptRequest::File(_) => 1,
-                    AcceptRequest::Group(rendered) => rendered.len(),
+                    AcceptRequest::Group { rows, .. } => rows.len(),
                     AcceptRequest::All(pile) => pile.rows.len(),
                 };
                 (root.clone(), n)
@@ -5367,7 +5379,13 @@ mod tests {
             .collect();
         assert_eq!(
             requests(app.handle(Action::AcceptFile).1),
-            vec![(root("beta"), AcceptRequest::Group(rendered))]
+            vec![(
+                root("beta"),
+                AcceptRequest::Group {
+                    rows: rendered,
+                    rendered_on: beta.seen_branch.clone(),
+                }
+            )]
         );
         let paths: Vec<&str> = group
             .paths

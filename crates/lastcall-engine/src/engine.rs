@@ -406,8 +406,13 @@ pub enum AcceptRequest {
     },
     /// One file; a deletion row (`rendered.oid == None`) accepts the deletion.
     File(Rendered),
-    /// Several files in one ledger write.
-    Group(Vec<Rendered>),
+    /// Several files in one ledger write. `rendered_on` is the branch the pile these rows
+    /// were taken from was scanned under, so the write can be refused when the record in
+    /// force has moved on since (R5, and [`Pile::seen_branch`]).
+    Group {
+        rows: Vec<Rendered>,
+        rendered_on: Option<String>,
+    },
     /// Everything in the pile the user saw (a fold).
     All(Pile),
 }
@@ -1394,7 +1399,9 @@ impl Engine {
                     ops.accept_deletion(rendered, fault)
                 }
                 AcceptRequest::File(rendered) => ops.accept_file(rendered, fault),
-                AcceptRequest::Group(rows) => ops.accept_group(rows, fault),
+                AcceptRequest::Group { rows, rendered_on } => {
+                    ops.accept_group(rows, rendered_on.as_deref(), fault)
+                }
                 AcceptRequest::All(pile) => ops.accept_all(pile, fault),
             }
         };
@@ -2878,7 +2885,15 @@ pub(crate) mod tests {
             .map(|p| Rendered::of(pile.row(p).unwrap()))
             .collect();
         let before = engine.root(&root).unwrap().ledger.seen_at.at.clone();
-        let acc = engine.accept(&root, AcceptRequest::Group(rows)).unwrap();
+        let acc = engine
+            .accept(
+                &root,
+                AcceptRequest::Group {
+                    rows,
+                    rendered_on: pile.seen_branch.clone(),
+                },
+            )
+            .unwrap();
         assert!(acc.outcome.ok() && acc.outcome.written);
         assert_eq!(scan::pile_lines(&acc.pile), vec!["f1".to_owned()]);
         let ledger = &engine.root(&root).unwrap().ledger;

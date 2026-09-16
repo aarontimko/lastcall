@@ -142,6 +142,14 @@ pub struct Pile {
     /// the TUI never compares wall clocks of its own; design review F4).
     #[serde(default)]
     pub snoozed_until: Option<String>,
+    /// The branch whose record this pile was computed against (the ledger's `seen_branch`,
+    /// Amendment v1.12). An accept-all or a group accept carries the snapshot the user
+    /// saw, and R5 is about exactly that: a snapshot rendered under one branch must not be
+    /// written into another's record, even after the `Ops` has adopted it. `None` for a
+    /// draft root, for a record that belongs to no branch, and for a pile built by hand in
+    /// a test. Additive: older JSON without it reads as `None`.
+    #[serde(default)]
+    pub seen_branch: Option<String>,
 }
 
 impl Pile {
@@ -603,6 +611,7 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
             // Stamped by the engine (`scan_root`), which owns the clock the expiry needs.
             undo: 0,
             snoozed_until: None,
+            seen_branch: inputs.ledger.seen_branch.clone(),
         },
         nested_repos,
         hash_calls: store.git().hash_object_calls() - calls_before,
