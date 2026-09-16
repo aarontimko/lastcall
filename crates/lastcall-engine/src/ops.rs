@@ -1810,13 +1810,29 @@ impl Ops<'_> {
 
     /// R2's second half, the ancestor fold.
     ///
-    /// If `refs/heads/<from>` still exists and this branch's head is an **ancestor** of
-    /// that tip (true when they are the same commit), every path whose committed content
-    /// differs between the two trees takes this branch's content in one `write_tree`, and
-    /// those paths lose the blob and mode of any override they carried — a flag-only
-    /// override stays, exactly as [`Ops::fold`] retains flagged overrides. A path whose
-    /// entry here is a **gitlink** is left out: the content model cannot render a submodule
-    /// pointer as a baseline.
+    /// The fold runs at all only when `refs/heads/<from>` still exists and this branch's
+    /// head is an **ancestor** of that tip (true when they are the same commit). It then
+    /// decides path by path, over the paths whose committed content differs between the
+    /// two trees, and it folds only what the record it copied has actually seen at the
+    /// branch it left (verifier F2). Per path, with `base` the record's composed baseline
+    /// (the override's blob and mode, else the seen tree's entry, else absent), `tip_a` the
+    /// entry at the departed branch's tip and `tip_b` the entry here:
+    ///
+    /// - fold when `base == tip_a` (same blob and mode, or both absent) **and not** when
+    ///   `base` is absent while `tip_b` is present;
+    /// - a folded path takes `tip_b` (absent here removes it) and loses the blob and mode
+    ///   of any override it carried — a flag-only override stays, exactly as [`Ops::fold`]
+    ///   retains flagged overrides;
+    /// - every other differing path keeps the copied baseline and over-shows.
+    ///
+    /// The first half is the whole point: content the user never looked at on `A` — a
+    /// commit the agent made there that is still pending — must not become seen state on
+    /// `B` just because the two tips differ. The second half covers its mirror image, a
+    /// path the record holds as **absent** (never seen, or its deletion accepted): folding
+    /// it to `tip_b`'s blob would baseline a file the user has never been shown at all.
+    ///
+    /// A path whose entry here is a **gitlink** is left out: the content model cannot
+    /// render a submodule pointer as a baseline.
     ///
     /// Anything else leaves the copy exactly as it is, which is the over-show §2 allows: a
     /// branch that is ahead or diverged (the cherry-pick case), `from` deleted, either head
@@ -1875,10 +1891,32 @@ impl Ops<'_> {
             return Ok(());
         };
         let entries = self.store.ls_tree(&tree_oid)?;
+        // The departed tip, one `ls-tree` for the whole list rather than one call per path:
+        // without it there is no way to tell content the record accepted on `A` from
+        // content that was merely committed there.
+        let Some(from_tree_oid) = rg
+            .rev_parse_verify(&format!("{from_ref}^{{tree}}"))
+            .ok()
+            .flatten()
+        else {
+            return Ok(());
+        };
+        let departed = self.store.ls_tree(&from_tree_oid)?;
         let mut writes: Vec<TreeWrite> = Vec::new();
         for path in &paths {
-            match entries.get(path) {
-                Some((Mode::Gitlink, _)) => {}
+            let here = entries.get(path);
+            if matches!(here, Some((Mode::Gitlink, _))) {
+                continue;
+            }
+            let base = self.fold_baseline(path);
+            let tip_a = departed.get(path).map(|(m, o)| (*m, o.clone()));
+            if base != tip_a {
+                continue;
+            }
+            if base.is_none() && here.is_some() {
+                continue;
+            }
+            match here {
                 Some((mode, oid)) => writes.push(TreeWrite::Set {
                     path: path.clone(),
                     mode: *mode,
@@ -1913,6 +1951,26 @@ impl Ops<'_> {
             }
         }
         Ok(())
+    }
+
+    /// The record's composed baseline for one path, as the fold compares it: the
+    /// override's blob and mode, else the seen tree's entry, else absent (`None`).
+    ///
+    /// The same §6.2 order [`ledger::BaselineResolver`] walks, minus the store-presence
+    /// check and its notices: the fold is comparing two committed trees against what the
+    /// record says it has seen, and a missing object makes the two unequal, which is the
+    /// over-showing answer already.
+    fn fold_baseline(&self, path: &[u8]) -> Option<(Mode, Oid)> {
+        if let Ok(key) = std::str::from_utf8(path)
+            && let Some(o) = self.ledger.overrides.get(key)
+        {
+            match &o.blob {
+                Some(Some(oid)) => return Some((o.mode.unwrap_or(Mode::Regular), oid.clone())),
+                Some(None) => return None,
+                None => {}
+            }
+        }
+        self.tree.get(path).map(|(m, o)| (*m, o.clone()))
     }
 
     /// R3: at every switch the parked names are checked against the repository's branches
@@ -2280,6 +2338,49 @@ mod tests {
         assert_eq!(parked.seen_tree, future_tree, "future's record is whole");
         assert!(parked.overrides.contains_key("n1"));
         assert!(h.ledger.undo.is_empty(), "a switch pushes no undo entry");
+    }
+
+    /// P2c from the verifier's report (F2): the agent commits `f1 = v2` on `c2` and
+    /// deletes it on `c3`, a branch is cut at `c2`, and the arrival **is** an ancestor —
+    /// but `v2` was never accepted, so the record's baseline for `f1` is still `v1`, which
+    /// is not what the departed tip holds. Folding it would make content that was never on
+    /// screen the seen state. `q` is the absent-baseline half of the same rule.
+    #[test]
+    fn ops_switch_branch_does_not_fold_content_the_record_never_saw() {
+        let mut repo = FixtureRepo::new("ops-switch-fold-unseen").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        h.ledger.seen_branch = Some("main".into());
+        let seen = h.ledger.seen_tree.clone();
+        repo.write("f1", "v2\n");
+        repo.write("q", "w1\n");
+        let c2 = repo.commit("c2: f1 = v2, q added").unwrap();
+        repo.remove("f1");
+        repo.remove("q");
+        repo.commit("c3: f1 and q deleted").unwrap();
+        repo.git(&["branch", "mid", &c2]).unwrap();
+        repo.checkout("mid").unwrap();
+
+        let out = h.ops_on("main").switch_branch("mid", &NoFault).unwrap();
+        assert!(out.happened);
+        assert_eq!(out.first_sight_from.as_deref(), Some("main"));
+        assert_eq!(
+            h.ledger.seen_tree, seen,
+            "neither path is folded, so the copy's tree stands as it is"
+        );
+        let mut paths: Vec<String> = h
+            .scan()
+            .pile
+            .rows
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.path).into_owned())
+            .collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec!["f1".to_string(), "q".to_string()],
+            "both differing paths over-show on the branch just arrived on"
+        );
     }
 
     /// The other half of R2: `feat`'s tip is not in the arrival's history, so the copy

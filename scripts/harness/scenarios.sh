@@ -219,6 +219,35 @@ assert_str "D23 the override survives the copy" "$h1" "$(lc_baseline f1)"
 git -C "$R" checkout -q main
 assert_pile "D23 back on main: the parked record and its override" "f1"
 assert_str "D23 the override is back with main's record" "$h1" "$(lc_baseline f1)"
+# D24: the fold takes only what the record has accepted at the departed tip.
+# P = f1 (seen at v1), Q = q (absent at c1), f = f2. c2: all three written; c3: P and Q deleted.
+fresh d24; assert_pile "D24 first sight on main at c1" ""
+printf 'P v2\n' > "$R/f1"; printf 'Q w1\n' > "$R/q"; printf 'f v2\n' > "$R/f2"
+git -C "$R" add -A; git -C "$R" commit -qm c2; c2="$(git -C "$R" rev-parse HEAD)"
+git -C "$R" rm -q f1 q; git -C "$R" commit -qm c3
+assert_pile "D24 on main at c3: P's deletion and f pending" "f1|f2"
+lc_accept_file f2; assert_pile "D24 f accepted, P's deletion still pending" "f1"
+git -C "$R" branch -q mid "$c2"; git -C "$R" checkout -q mid
+assert_pile "D24 on mid: neither P nor Q is folded, both over-show" "f1|q"
+assert_str "D24 P's baseline on mid is still the v1 the record saw" "$(git -C "$R" rev-parse "$c2~1:f1")" "$(lc_baseline f1)"
+assert_str "D24 Q's baseline on mid is absent, never mid's blob" "EMPTY" "$(lc_baseline q)"
+git -C "$R" checkout -q main
+assert_pile "D24 back on main: its own record, unchanged" "f1"
+# Variant A: the accepted deletion is not refilled by the fold.
+lc_accept_file f1; assert_pile "D24A P's deletion accepted on main" ""
+git -C "$R" branch -q mid-a "$c2"; git -C "$R" checkout -q mid-a
+assert_pile "D24A P is shown as added, not baselined" "f1|q"
+assert_str "D24A P's baseline is still absent" "ABSENT" "$(lc_baseline f1)"
+# Variant B, the positive fold: content accepted AT the departed tip still folds.
+new_repo d24b
+git -C "$R" checkout -q -b future                      # first sight happens here, on future
+lc_init "$R" "$S" git; lc_first_sight
+printf 'f v2\n' > "$R/f2"; git -C "$R" add -A; git -C "$R" commit -qm "f = v2 on future"
+assert_pile "D24B the agent's commit is pending on future" "f2"
+lc_accept_file f2; assert_pile "D24B accepted on future" ""
+git -C "$R" checkout -q main
+assert_pile "D24B the fold takes main's v1 for f" ""
+assert_str "D24B the folded path lost its override" "$(git -C "$R" rev-parse "main:f2")" "$(lc_baseline f2)"
 
 echo "== E. storage =="
 fresh e2; echo edit >> "$R/f1"; lc_accept_file f1; echo deadbeefdeadbeefdeadbeefdeadbeefdeadbeef > "$S/overrides/f1"

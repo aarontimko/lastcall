@@ -1917,3 +1917,129 @@ fn scenario_d23_uncommitted_work_and_its_accepted_hunk_survive_checkout_b() {
         Some("switched feat/w → main (same commit)")
     );
 }
+
+/// D24's fixture: first sight on `main` at `c1` (`P = f1` at `v1` and seen, `Q = q` absent,
+/// `f = f2` at `v1`); the agent commits `c2` (`P = v2`, `Q` added, `f = v2`) and `c3` (`P`
+/// and `Q` deleted); the user accepts `f` only. Returns the fixture and `c2`'s hash.
+fn d24_main_at_c3(name: &str) -> (Fresh, String) {
+    let mut s = Fresh::new(name);
+    assert_pile!(s.engine, s.root, "", "D24 first sight on main at c1");
+    s.repo.write("f1", "P v2\n");
+    s.repo.write("q", "Q w1\n");
+    s.repo.write("f2", "f v2\n");
+    let c2 = s.repo.commit("c2").unwrap();
+    s.repo.remove("f1");
+    s.repo.remove("q");
+    s.repo.commit("c3").unwrap();
+    let pile = assert_pile!(s.engine, s.root, "f1|f2", "D24 P's deletion and f pending");
+    assert_eq!(pile.row(b"f1").unwrap().change, Change::Deleted);
+    assert!(
+        pile.row(b"q").is_none(),
+        "Q is absent against an absent baseline"
+    );
+    assert!(s.accept_file("f2").ok());
+    assert_pile!(
+        s.engine,
+        s.root,
+        "f1",
+        "D24 on main at c3: only P's deletion"
+    );
+    let _ = s.engine.inspect_head(&s.root).unwrap();
+    (s, c2)
+}
+
+/// D24: the fold takes only what the record has accepted at the departed tip, and never a
+/// blob for a path it holds as absent (verifier F2).
+#[test]
+fn scenario_d24_the_fold_takes_only_what_the_record_saw_at_the_departed_tip() {
+    let (mut s, c2) = d24_main_at_c3("d24");
+    s.repo.git(&["branch", "mid", &c2]).unwrap();
+    s.repo.checkout("mid").unwrap();
+    let pile = assert_pile!(
+        s.engine,
+        s.root,
+        "f1|q",
+        "D24 neither P nor Q is folded onto mid"
+    );
+    assert_eq!(
+        pile.row(b"f1").unwrap().change,
+        Change::Modified,
+        "P's baseline v1 is not main's tip (absent), so it over-shows as v1 → v2"
+    );
+    assert_eq!(
+        pile.row(b"q").unwrap().change,
+        Change::Added,
+        "Q's baseline is absent and mid has a blob: never folded, shown as added"
+    );
+    assert!(
+        pile.row(b"f2").is_none(),
+        "f does not differ between the tips and is not considered"
+    );
+    assert_eq!(
+        s.head_notice().as_deref(),
+        Some("switched main → mid: first time here, seen state carried from main; 2 files pending")
+    );
+    assert_eq!(seen_branch(&s).as_deref(), Some("mid"));
+    s.repo.checkout("main").unwrap();
+    assert_pile!(
+        s.engine,
+        s.root,
+        "f1",
+        "D24 main's own record comes back unchanged"
+    );
+}
+
+/// D24 Variant A: an accepted deletion is a baseline of its own, and the fold must not
+/// refill it with the blob the arrived-on tip happens to carry.
+#[test]
+fn scenario_d24_variant_a_an_accepted_deletion_is_never_refilled_by_the_fold() {
+    let (mut s, c2) = d24_main_at_c3("d24a");
+    assert!(s.accept_file("f1").ok(), "P's deletion is accepted on main");
+    assert_pile!(s.engine, s.root, "", "D24A nothing pending on main");
+    let _ = s.engine.inspect_head(&s.root).unwrap();
+    s.repo.git(&["branch", "mid", &c2]).unwrap();
+    s.repo.checkout("mid").unwrap();
+    let pile = assert_pile!(s.engine, s.root, "f1|q", "D24A P is shown, not baselined");
+    assert_eq!(
+        pile.row(b"f1").unwrap().change,
+        Change::Added,
+        "P's baseline is absent and mid has v2, so it shows as added"
+    );
+    assert_eq!(pile.row(b"q").unwrap().change, Change::Added);
+}
+
+/// D24 Variant B, the positive fold: a path the record accepted **at** the departed tip
+/// still folds to the arrived-on tip's content, override and all.
+#[test]
+fn scenario_d24_variant_b_content_accepted_at_the_departed_tip_still_folds() {
+    // The repo is on `main` at `c1` and `future` is cut from it before lastcall opens, so
+    // the return to `main` is a genuine first sight (the D14 shape). Opening on `main`
+    // first would park its record and the return would load it back, with no fold to test.
+    let repo = FixtureRepo::new("d24b").unwrap();
+    repo.checkout_b("future").unwrap();
+    let mut s = Fresh::over(repo, Config::default(), EngineOptions::default(), false);
+    assert_eq!(seen_branch(&s).as_deref(), Some("future"));
+    assert!(parked(&s).is_empty(), "D24B no record for main");
+    s.repo.write("f2", "f v2\n");
+    s.repo.commit("f = v2 on future").unwrap();
+    assert_pile!(s.engine, s.root, "f2", "D24B the agent's commit is pending");
+    assert!(s.accept_file("f2").ok());
+    assert_pile!(s.engine, s.root, "", "D24B accepted on future");
+    assert!(s.ledger().overrides.contains_key("f2"));
+    let _ = s.engine.inspect_head(&s.root).unwrap();
+
+    s.repo.checkout("main").unwrap();
+    assert_pile!(s.engine, s.root, "", "D24B the fold takes main's v1 for f");
+    assert_eq!(
+        s.head_notice().as_deref(),
+        Some(
+            "switched future → main: first time here, seen state carried from future; 0 files pending"
+        )
+    );
+    assert!(
+        s.ledger().overrides.is_empty(),
+        "the folded path loses the blob and mode of its override"
+    );
+    s.repo.checkout("future").unwrap();
+    assert_pile!(s.engine, s.root, "", "D24B future's own record comes back");
+}

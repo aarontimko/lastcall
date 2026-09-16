@@ -82,10 +82,30 @@ lc_branch_prune() {
     printf '%s\n' "$refs" | grep -qx "refs/heads/$n" || rm -rf "$d"
   done
 }
+# The record's composed baseline for one path, as "<mode> <oid>" or ABSENT: the override's
+# blob and mode, else the seen tree's entry, else absent. The fold's own reader, so it never
+# calls lc_branch_sync the way lc_baseline does.
+lc_fold_base() {
+  local p="$1" t="$2" o b m line
+  o="$LC_STATE/overrides/$(enc "$p")"
+  if [ -f "$o" ]; then
+    b="$(cat "$o")"
+    [ "$b" = null ] && { echo ABSENT; return; }
+    m=100644; [ -f "$o.mode" ] && m="$(cat "$o.mode")"
+    echo "$m $b"; return
+  fi
+  [ -z "$t" ] && { echo ABSENT; return; }
+  line="$(lcg ls-tree "$t" -- "$p" | head -1)"
+  [ -z "$line" ] && { echo ABSENT; return; }
+  printf '%s' "$line" | awk '{print $1" "$3}'
+}
 # R2's second half: arriving on B from A's record, when refs/heads/A still exists and B's
-# HEAD is an ancestor of A's tip, every path that differs between the two committed trees
-# takes B's committed content (absent in B -> removed from the record; a gitlink -> left
-# alone) and loses its override. Anything else leaves the copy as it is.
+# HEAD is an ancestor of A's tip. Of the paths that differ between the two committed trees,
+# a path is folded onto B's content only when the record's composed baseline for it equals
+# A's tip entry, and never when that baseline is absent while B has a blob: what the record
+# has not seen at the branch it left must not become seen state here. A folded path takes
+# B's entry (absent in B -> removed from the record) and loses its override; every other
+# differing path keeps the copy's baseline and over-shows. A gitlink is left alone.
 lc_branch_fold() {
   local a="$1"
   rg rev-parse -q --verify "refs/heads/$a" >/dev/null 2>&1 || return 0
@@ -94,23 +114,36 @@ lc_branch_fold() {
   rg merge-base --is-ancestor "$bh" "refs/heads/$a" 2>/dev/null || return 0
   local paths; paths="$(rg diff-tree -r -z --name-only "refs/heads/$a" "$bh" 2>/dev/null | tr '\0' '\n' | grep -v '^$')"
   [ -n "$paths" ] || return 0
-  local tmp="$LC_STATE/index.fold"; rm -f "$tmp"
   local t; t="$(cat "$LC_STATE/seen_tree")"
-  if [ -n "$t" ]; then lcgi "$tmp" read-tree "$t"; else lcgi "$tmp" read-tree --empty; fi
+  local folded="$LC_STATE/fold.paths" info="$LC_STATE/fold.info"
+  : > "$folded"; : > "$info"
   printf '%s\n' "$paths" | while IFS= read -r p; do
-    local line mode oid; line="$(rg ls-tree "$bh" -- "$p" | head -1)"
-    if [ -z "$line" ]; then printf '0 0000000000000000000000000000000000000000\t%s\n' "$p"
-    else
+    local line mode oid base tipa; line="$(rg ls-tree "$bh" -- "$p" | head -1)"
+    mode=""; oid=""
+    if [ -n "$line" ]; then
       mode="$(printf '%s' "$line" | awk '{print $1}')"; oid="$(printf '%s' "$line" | awk '{print $3}')"
       [ "$mode" = 160000 ] && continue
-      printf '%s %s\t%s\n' "$mode" "$oid" "$p"
     fi
-  done | lcgi "$tmp" update-index --index-info
-  lcgi "$tmp" write-tree > "$LC_STATE/seen_tree"
-  printf '%s\n' "$paths" | while IFS= read -r p; do
-    rm -f "$LC_STATE/overrides/$(enc "$p")" "$LC_STATE/overrides/$(enc "$p").mode"
+    base="$(lc_fold_base "$p" "$t")"
+    tipa="$(rg ls-tree "refs/heads/$a" -- "$p" | head -1 | awk '{print $1" "$3}')"
+    [ -n "$tipa" ] || tipa=ABSENT
+    [ "$base" = "$tipa" ] || continue
+    [ "$base" = ABSENT ] && [ -n "$line" ] && continue
+    printf '%s\n' "$p" >> "$folded"
+    if [ -z "$line" ]; then printf '0 0000000000000000000000000000000000000000\t%s\n' "$p" >> "$info"
+    else printf '%s %s\t%s\n' "$mode" "$oid" "$p" >> "$info"; fi
   done
-  rm -f "$tmp"
+  if [ -s "$info" ]; then
+    local tmp="$LC_STATE/index.fold"; rm -f "$tmp"
+    if [ -n "$t" ]; then lcgi "$tmp" read-tree "$t"; else lcgi "$tmp" read-tree --empty; fi
+    lcgi "$tmp" update-index --index-info < "$info"
+    lcgi "$tmp" write-tree > "$LC_STATE/seen_tree"
+    while IFS= read -r p; do
+      rm -f "$LC_STATE/overrides/$(enc "$p")" "$LC_STATE/overrides/$(enc "$p").mode"
+    done < "$folded"
+    rm -f "$tmp"
+  fi
+  rm -f "$folded" "$info"
 }
 # The sync every entry point that reads or writes state runs first (R1, R2, R3).
 lc_branch_sync() {
