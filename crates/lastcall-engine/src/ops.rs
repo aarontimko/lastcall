@@ -358,8 +358,16 @@ pub struct PendingUndo {
     pub prior: BTreeMap<String, Option<Override>>,
 }
 
-/// One record's composed baseline for one path: the override's blob and mode, else the
-/// tree's entry, else absent (`None`).
+/// One record's composed baseline for one path: `Some(Some(entry))` from the override's
+/// blob and mode, else from the tree's entry; `Some(None)` when the override says absent or
+/// the tree has no entry; and `None` when the record has nothing to say at all.
+///
+/// The last case is a record with no seen tree and no blob override for the path. Such a
+/// record has seen nothing (the scan shows every path on disk as added against it), so it
+/// composes no baseline rather than "absent": treating its silence as a seen absence let
+/// the fold baseline an unaccepted deletion onto a parked record that had lost its tree
+/// (verifier round four, F1). The record in force never lands there, because [`Ops`]
+/// holds an empty tree for it when the ledger has none.
 ///
 /// Free rather than a method because R2's seen-state target asks the same question of the
 /// record in force ([`Ops::fold_baseline`]) and of every parked record, whose tree is a
@@ -369,17 +377,17 @@ fn compose_baseline(
     tree: Option<&TreeEntries>,
     overrides: &BTreeMap<String, Override>,
     path: &[u8],
-) -> Option<(Mode, Oid)> {
+) -> Option<Option<(Mode, Oid)>> {
     if let Ok(key) = std::str::from_utf8(path)
         && let Some(o) = overrides.get(key)
     {
         match &o.blob {
-            Some(Some(oid)) => return Some((o.mode.unwrap_or(Mode::Regular), oid.clone())),
-            Some(None) => return None,
+            Some(Some(oid)) => return Some(Some((o.mode.unwrap_or(Mode::Regular), oid.clone()))),
+            Some(None) => return Some(None),
             None => {}
         }
     }
-    tree.and_then(|t| t.get(path)).map(|(m, o)| (*m, o.clone()))
+    tree.map(|t| t.get(path).map(|(m, o)| (*m, o.clone())))
 }
 
 /// Compare-and-swap one path's live content against the row that was rendered (A6): `Ok`
@@ -1976,10 +1984,12 @@ impl Ops<'_> {
         {
             // (b), built only when (a) did not settle the fold. Each *distinct* parked seen
             // tree is read once; a record whose tree will not read is dropped from the list,
-            // which refuses more folds than it allows and so can only over-show. The record
-            // just parked is left out on purpose: it is the same record as the copy now in
-            // force, and guard 1 has already required `base == tip_a` while every path here
-            // differs between `tip_a` and `tip_m`, so it can never match.
+            // which refuses more folds than it allows and so can only over-show. A record
+            // with no seen tree stays on the list for its overrides alone: with none naming
+            // the path it composes nothing, never "absent" (see `compose_baseline`). The
+            // record just parked is left out on purpose: it is the same record as the copy
+            // now in force, and guard 1 has already required `base == tip_a` while every
+            // path here differs between `tip_a` and `tip_m`, so it can never match.
             let mut trees: BTreeMap<Oid, TreeEntries> = BTreeMap::new();
             let mut records: Vec<(Option<&TreeEntries>, &BTreeMap<String, Override>)> = Vec::new();
             if !first_sight_covers {
@@ -2021,9 +2031,9 @@ impl Ops<'_> {
                 }
                 let tip_m = here.map(|(m, o)| (*m, o.clone()));
                 let seen_state = first_sight_covers
-                    || records
-                        .iter()
-                        .any(|(tree, overrides)| compose_baseline(*tree, overrides, path) == tip_m);
+                    || records.iter().any(|(tree, overrides)| {
+                        compose_baseline(*tree, overrides, path).is_some_and(|b| b == tip_m)
+                    });
                 if !seen_state {
                     continue;
                 }
@@ -2074,7 +2084,9 @@ impl Ops<'_> {
     /// record says it has seen, and a missing object makes the two unequal, which is the
     /// over-showing answer already.
     fn fold_baseline(&self, path: &[u8]) -> Option<(Mode, Oid)> {
-        compose_baseline(Some(self.tree), &self.ledger.overrides, path)
+        // The record in force always has a tree here (empty when the ledger has none), so
+        // the composer always answers and the flatten never meets its outer `None`.
+        compose_baseline(Some(self.tree), &self.ledger.overrides, path).flatten()
     }
 
     /// R3: at every switch the parked names are checked against the repository's branches
@@ -2748,6 +2760,66 @@ mod tests {
             .map(|r| String::from_utf8_lossy(&r.path).into_owned())
             .collect();
         assert_eq!(paths, vec!["f1".to_string()], "the over-show, once");
+    }
+
+    /// A parked record that has seen nothing vouches for nothing (verifier round four, F1).
+    /// Its seen tree is `None`, which the scan reads as "everything on disk is new"; read
+    /// as "every path is absent" it would let clause (b) fold an unaccepted deletion to
+    /// absent. Here `main` deletes `f1`, never accepts the deletion, and restores it; a
+    /// branch cut at the deleting commit must show `f1` as deleted, whatever a treeless
+    /// record parked beside it says.
+    #[test]
+    fn ops_switch_branch_refuses_the_fold_when_a_parked_record_has_seen_nothing() {
+        let mut repo = FixtureRepo::new("ops-switch-seen-treeless").unwrap();
+        let c1 = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_owned();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        h.ledger.seen_branch = Some("main".into());
+        h.ledger.branches.insert(
+            "ghost".into(),
+            BranchRecord {
+                seen_tree: None,
+                seen_at: h.ledger.seen_at.clone(),
+                overrides: BTreeMap::new(),
+                undo: Vec::new(),
+                parked_at: "2026-09-16T00:00:00Z".into(),
+            },
+        );
+        repo.git(&["rm", "-q", "f1"]).unwrap();
+        let c2 = repo
+            .commit("c2: f1 removed on main, never accepted")
+            .unwrap();
+        repo.git(&["checkout", &c1, "--", "f1"]).unwrap();
+        repo.commit("c3: f1 restored on main").unwrap();
+        assert!(
+            h.scan().pile.is_empty(),
+            "the restored entry is the first-sight entry"
+        );
+        let before = h.ledger.clone();
+
+        repo.git(&["branch", "cut", &c2]).unwrap();
+        repo.checkout("cut").unwrap();
+        let out = h.ops_on("main").switch_branch("cut", &NoFault).unwrap();
+        assert!(out.happened);
+        assert_eq!(out.first_sight_from.as_deref(), Some("main"));
+        assert_eq!(out.fold_skipped, None, "the fold ran and refused the path");
+        assert_eq!(
+            h.ledger.seen_tree, before.seen_tree,
+            "f1 absent at the merge-base is seen state nowhere: the copy's tree stands"
+        );
+        assert_eq!(h.ledger.overrides, before.overrides);
+        let paths: Vec<String> = h
+            .scan()
+            .pile
+            .rows
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.path).into_owned())
+            .collect();
+        assert_eq!(
+            paths,
+            vec!["f1".to_string()],
+            "the deletion nobody accepted shows"
+        );
     }
 
     /// A state file older than `first_sight_head` knows no first-sight commit, so clause
