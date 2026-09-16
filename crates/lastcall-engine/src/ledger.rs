@@ -433,6 +433,11 @@ struct LedgerWire {
     /// always there, so the distinction survives every rewrite.
     #[serde(default, deserialize_with = "deserialize_double_option")]
     seen_branch: Option<Option<String>>,
+    /// The commit the root was first sighted at (Amendment v1.12, R2's seen-state target).
+    /// Omitted when unknown, so a 1.1 file and a 1.2 file written before the field both
+    /// read as `None` and rewrite byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    first_sight_head: Option<Oid>,
     #[serde(default)]
     overrides: BTreeMap<String, serde_json::Value>,
     /// The parked records (Amendment v1.12). Omitted when empty, so a root that has only
@@ -461,6 +466,12 @@ pub struct Ledger {
     /// The branch whose record is in force (Amendment v1.12, R1): the name in
     /// `<git_dir>/HEAD`. `None` for a draft root and for a record made at a detached HEAD.
     pub seen_branch: Option<String>,
+    /// The commit this root was first sighted at (R2's seen-state target): set once, at
+    /// the root's first sight, and never changed by an accept, a switch, an adoption, a
+    /// rename or a compaction. It belongs to the root, not to a branch, so no
+    /// [`BranchRecord`] carries it. `None` when the root was first sighted at an unborn
+    /// head, when it is a draft root, or when the state file predates the field.
+    pub first_sight_head: Option<Oid>,
     pub overrides: BTreeMap<String, Override>,
     /// One parked record per branch this root has been checked out on while lastcall
     /// watched, never including [`Ledger::seen_branch`] (R3).
@@ -489,6 +500,7 @@ impl Ledger {
             seen_tree,
             seen_at,
             seen_branch: None,
+            first_sight_head: None,
             overrides: BTreeMap::new(),
             branches: BTreeMap::new(),
             adopt_branch: false,
@@ -540,6 +552,7 @@ impl Ledger {
             seen_at: self.seen_at.clone(),
             // Always `Some(..)`, so the field is always written: see `LedgerWire`.
             seen_branch: Some(self.seen_branch.clone()),
+            first_sight_head: self.first_sight_head.clone(),
             overrides,
             branches: self
                 .branches
@@ -594,6 +607,7 @@ impl Ledger {
             // both read as `None` in memory; only the first asks for the adoption.
             adopt_branch: wire.seen_branch.is_none(),
             seen_branch: wire.seen_branch.flatten(),
+            first_sight_head: wire.first_sight_head,
             overrides,
             branches,
             unparsable,
@@ -1235,7 +1249,9 @@ mod tests {
     }
 
     /// R6's other half: a root that has only ever been on one branch gains exactly one key
-    /// over its 1.1 self, and rewrites byte-for-byte from then on.
+    /// over its 1.1 self, and rewrites byte-for-byte from then on — with and without the
+    /// first-sight head, which is the other field this schema omits when it has nothing to
+    /// say (R2's seen-state target).
     #[test]
     fn ledger_1_2_with_no_parked_records_rewrites_byte_identical() {
         let mut l = sample();
@@ -1245,10 +1261,27 @@ mod tests {
             !once.contains("\"branches\""),
             "no parked records, no field: {once}"
         );
+        assert!(
+            !once.contains("\"first_sight_head\""),
+            "an unknown first-sight head is omitted, so a file written before the field \
+             rewrites unchanged: {once}"
+        );
         let (back, notices) = parse(once.as_bytes()).unwrap();
         assert!(notices.is_empty(), "{notices:?}");
         assert!(back.branches.is_empty());
+        assert!(back.first_sight_head.is_none());
         assert_eq!(back.to_json(), once, "rewrite is byte-identical");
+
+        // And the same for the shape that has it.
+        let mut with_head = l.clone();
+        with_head.first_sight_head = Some(oid('d'));
+        let text = with_head.to_json();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["first_sight_head"], oid('d').as_str());
+        let (back, notices) = parse(text.as_bytes()).unwrap();
+        assert!(notices.is_empty(), "{notices:?}");
+        assert_eq!(back.first_sight_head, Some(oid('d')));
+        assert_eq!(back.to_json(), text, "rewrite is byte-identical");
 
         // And the detached case is `null`, not an absent key: a reader must be able to tell
         // "this record belongs to no branch" from "a 1.1 binary wrote this".
@@ -1277,12 +1310,43 @@ mod tests {
         assert!(l.seen_branch.is_none());
         assert!(l.branches.is_empty());
         assert!(l.adopt_branch, "the missing field is the adoption signal");
+        assert!(
+            l.first_sight_head.is_none(),
+            "a file older than the field knows no first-sight head, and R2's clause (a) \
+             simply never holds for it"
+        );
         assert!(l.overrides.contains_key("f1"), "nothing else moved");
         // The adoption itself is `RootState::sync_branch`'s, and is not written until the
         // next ordinary write; what this build writes is 1.2 and says so.
         let v: serde_json::Value = serde_json::from_str(&l.to_json()).unwrap();
         assert_eq!(v["schema_version"], "1.2");
         assert!(v["seen_branch"].is_null());
+    }
+
+    /// R2's seen-state target is additive: a 1.2 file written before `first_sight_head`
+    /// existed reads as `None` — the same answer a 1.1 file gives — and no parked record
+    /// carries one, because the commit the root was first sighted at belongs to the root
+    /// and not to any branch.
+    #[test]
+    fn ledger_a_1_2_file_without_a_first_sight_head_reads_as_none() {
+        let json = r#"{"schema_version":"1.2","root":"/r","kind":"git","seen_tree":null,
+            "seen_at":{"head_commit":null,"branch":null,"at":"x"},"seen_branch":"main",
+            "overrides":{},
+            "branches":{"old":{"seen_tree":null,"seen_at":{"head_commit":null,"branch":null,
+                               "at":"x"},"overrides":{},"parked_at":"t"}}}"#;
+        let (l, notices) = parse(json.as_bytes()).unwrap();
+        assert!(notices.is_empty(), "{notices:?}");
+        assert!(l.first_sight_head.is_none());
+        assert_eq!(l.seen_branch.as_deref(), Some("main"));
+        let v: serde_json::Value = serde_json::from_str(&l.to_json()).unwrap();
+        assert!(
+            v.get("first_sight_head").is_none(),
+            "and the rewrite does not invent one"
+        );
+        assert!(
+            v["branches"]["old"].get("first_sight_head").is_none(),
+            "a parked record never carries it"
+        );
     }
 
     /// A parked record whose shape this build cannot read costs that branch its record,

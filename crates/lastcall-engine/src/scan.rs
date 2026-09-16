@@ -931,7 +931,8 @@ pub(crate) mod fixture_tests {
                 PrivateIndex::new(store.git().clone(), &paths, RootKind::Git, Some(exclude));
             let tree = Oid::parse(repo.git(&["rev-parse", "HEAD^{tree}"]).unwrap().trim()).unwrap();
             let tree_entries = store.ls_tree(&tree).unwrap();
-            let ledger = Ledger::new(
+            let head_commit = Oid::parse(repo.git(&["rev-parse", "HEAD"]).unwrap().trim()).unwrap();
+            let mut ledger = Ledger::new(
                 repo.path(),
                 RootKind::Git,
                 Some(tree),
@@ -941,6 +942,11 @@ pub(crate) mod fixture_tests {
                     at: "2026-01-01T00:00:00Z".into(),
                 },
             );
+            // What `engine::first_sight` sets for a git root: the commit the root was first
+            // sighted at, which R2's seen-state target asks about. The ops tests build their
+            // ledger by hand, so without this every fixture would look like a state file
+            // older than the field.
+            ledger.first_sight_head = Some(head_commit);
             let mut b = globset::GlobSetBuilder::new();
             b.add(globset::Glob::new("**/Cargo.lock").unwrap());
             b.add(globset::Glob::new("Cargo.lock").unwrap());

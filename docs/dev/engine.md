@@ -420,15 +420,20 @@ report. A first sight whose head moved reads
 folded copy and a copy with nothing to fold read the same; the fold is visible only through the
 count.
 
-**Schema.** 1.2, additive under major 1 (Amendment v1.12): top-level `seen_branch` and
-`branches`, the latter omitted when it is empty so an untouched ledger still rewrites byte for
-byte. The record in force stays at the top level, so a 1.1 binary opening a 1.2 file keeps
+**Schema.** 1.2, additive under major 1 (Amendment v1.12): top-level `seen_branch`,
+`branches` and `first_sight_head`, the last two omitted when they are empty or unknown so an
+untouched ledger still rewrites byte for byte. The record in force stays at the top level, so a 1.1 binary opening a 1.2 file keeps
 working on the branch it is on; its first write drops the parked records, which is an over-show
 at the next switch and a §11 residual. A 1.1 file read by this build has no `seen_branch`: the
 first sync attributes the record to whatever branch `HEAD` names, with no switch and no fold,
 and stamps it on the next write. On the wire `seen_branch` is absent (a 1.1 file, adopt) or
 `null` (known, and no branch), and the two must stay distinguishable, so it is never omitted
-once the file is 1.2.
+once the file is 1.2. `first_sight_head` is the commit the root was first sighted at, written
+once at that first sight and never changed by an accept, a switch, an adoption, a rename or a
+compaction. It belongs to the root, so no parked record carries one; it is omitted when there
+is none, which is what a state file older than the field, a root first sighted at an unborn
+head and a draft root all look like, and the fold's clause (a) simply never holds for them.
+`status --json` does not report it.
 
 Look at the records with plain tools:
 

@@ -231,6 +231,12 @@ pub struct RootState {
     /// the switch (a file event arriving before the git-dir event) long before any head
     /// inspection runs, and by then the record has been made and the fact is gone.
     pub first_sight_from: Option<String>,
+    /// Why the first-sight fold did not run, when the switch [`RootState::sync_branch`]
+    /// performed skipped or abandoned it (verifier F6). Taken by the next head inspection,
+    /// exactly as [`RootState::first_sight_from`] is, and also said once in
+    /// [`RootState::notices`] so a one-shot `status` — which never inspects a head — reports
+    /// it too.
+    pub fold_skipped: Option<String>,
 }
 
 impl RootState {
@@ -327,6 +333,16 @@ impl RootState {
                         // leave the record alone too.
                         if switched.happened {
                             self.first_sight_from = switched.first_sight_from;
+                            // F6: a fold that did not run says so once, here and at the
+                            // next head inspection. The copy stands whole either way, so
+                            // this explains an over-show rather than reporting a failure.
+                            if let Some(why) = &switched.fold_skipped {
+                                self.notices.push(format!(
+                                    "switched to {name}: first time here, seen state carried \
+                                     without folding ({why})"
+                                ));
+                            }
+                            self.fold_skipped = switched.fold_skipped;
                         }
                         // The ledger was re-read under the lock on every `Ok` path, so what
                         // is in memory is the file, whether this switch wrote one or adopted
@@ -1017,6 +1033,7 @@ fn open_root_with(ctx: &OpenCtx<'_>, d: &roots::DiscoveredRoot) -> Result<RootSt
         remote,
         ledger_stamp,
         first_sight_from: None,
+        fold_skipped: None,
     };
     // R1, and D21's landing place: a switch made while lastcall was not running is seen
     // here, before the root's first scan, so the very first pile is the arriving branch's.
@@ -1331,6 +1348,7 @@ impl Engine {
             // *next* head move is not that first sight.
             if let Some(s) = self.roots.get_mut(root) {
                 s.first_sight_from = None;
+                s.fold_skipped = None;
             }
             return Ok(None);
         }
@@ -1349,14 +1367,15 @@ impl Engine {
         // cannot have set it (the sync at the top of this function already moved the
         // record in force), but it is taken after the scan so a switch either sync saw
         // reaches this notice.
-        let first_sight_from = self
-            .roots
-            .get_mut(root)
-            .and_then(|s| s.first_sight_from.take());
+        let (first_sight_from, fold_skipped) = match self.roots.get_mut(root) {
+            Some(s) => (s.first_sight_from.take(), s.fold_skipped.take()),
+            None => (None, None),
+        };
         let facts = TransitionFacts {
             commits,
             files_differ: pile.rows.len(),
             first_sight_from,
+            fold_skipped,
         };
         let notice = headstate::transition(&prev, &next, hint.as_ref(), &facts);
         Ok(Some(HeadChange {
@@ -1958,6 +1977,11 @@ fn first_sight(
     // R7: a root's first sight is unchanged and names the branch it happened on, so the
     // first sync is a no-op rather than an adoption.
     ledger.seen_branch = head.branch.clone();
+    // R2's seen-state target: the commit the root was first sighted at, set once and never
+    // changed again. `None` at an unborn head and for a draft root.
+    if matches!(kind, RootKind::Git) {
+        ledger.first_sight_head = head.head.clone();
+    }
     Ok(ledger)
 }
 

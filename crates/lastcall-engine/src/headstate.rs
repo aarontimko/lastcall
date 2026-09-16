@@ -286,6 +286,11 @@ pub struct TransitionFacts {
     /// v1.12, R8): its record had to be made, as a copy of that branch's. `None` for every
     /// other transition, including a return to a branch whose record was parked.
     pub first_sight_from: Option<String>,
+    /// Why the first-sight fold did not run (verifier F6), when [`Self::first_sight_from`]
+    /// is set and the fold was skipped or abandoned: `refs/heads/A` gone, no commit in
+    /// common, an unborn head, or a git call that did not answer. `None` when the fold ran,
+    /// including when it ran and folded nothing.
+    pub fold_skipped: Option<String>,
 }
 
 fn label(state: &HeadState) -> String {
@@ -333,11 +338,20 @@ pub fn transition(
             } else if let Some(from) = &facts.first_sight_from {
                 let n = facts.files_differ;
                 let plural = if n == 1 { "file" } else { "files" };
-                format!(
-                    "switched {} → {}: first time here, seen state carried from {from}; {n} {plural} pending",
-                    label(prev),
-                    label(next),
-                )
+                // F6: when the fold did not run the line says so, in the same breath and on
+                // the same line, because the pile it announces is the un-folded copy's.
+                match &facts.fold_skipped {
+                    Some(why) => format!(
+                        "switched {} → {}: first time here, seen state carried from {from} without folding ({why}); {n} {plural} pending",
+                        label(prev),
+                        label(next),
+                    ),
+                    None => format!(
+                        "switched {} → {}: first time here, seen state carried from {from}; {n} {plural} pending",
+                        label(prev),
+                        label(next),
+                    ),
+                }
             } else {
                 format!(
                     "switched {} → {}: {} files differ from seen state",
@@ -449,6 +463,7 @@ mod tests {
             commits: None,
             files_differ: 1,
             first_sight_from: Some("main".into()),
+            fold_skipped: None,
         };
         assert_eq!(
             transition(
@@ -488,6 +503,7 @@ mod tests {
             commits: None,
             files_differ: 0,
             first_sight_from: Some("future".into()),
+            fold_skipped: None,
         };
         assert_eq!(
             transition(
@@ -512,6 +528,47 @@ mod tests {
         );
     }
 
+    /// Verifier F6: a first sight whose fold could not run says so on the same line. The
+    /// copy stands whole, so the count that follows is the un-folded pile's, and the reason
+    /// is what explains it.
+    #[test]
+    fn headstate_transition_first_sight_says_when_the_fold_was_skipped() {
+        let a = state("a", Some("main"), None);
+        let b = state("b", Some("alone"), None);
+        let facts = TransitionFacts {
+            commits: None,
+            files_differ: 3,
+            first_sight_from: Some("main".into()),
+            fold_skipped: Some("no commit in common with main".into()),
+        };
+        assert_eq!(
+            transition(
+                &a,
+                &b,
+                Some(&hint("checkout: moving from main to alone")),
+                &facts
+            )
+            .unwrap(),
+            "switched main → alone: first time here, seen state carried from main without \
+             folding (no commit in common with main); 3 files pending"
+        );
+        // And the fold that ran keeps the wording it had, whether or not it folded anything.
+        let ran = TransitionFacts {
+            fold_skipped: None,
+            ..facts
+        };
+        assert_eq!(
+            transition(
+                &a,
+                &b,
+                Some(&hint("checkout: moving from main to alone")),
+                &ran
+            )
+            .unwrap(),
+            "switched main → alone: first time here, seen state carried from main; 3 files pending"
+        );
+    }
+
     #[test]
     fn headstate_transition_texts() {
         let a = state("a", Some("main"), None);
@@ -520,6 +577,7 @@ mod tests {
             commits: Some(1),
             files_differ: 0,
             first_sight_from: None,
+            fold_skipped: None,
         };
         assert_eq!(
             transition(&a, &b, Some(&hint("commit: agent commit")), &facts),
@@ -529,6 +587,7 @@ mod tests {
             commits: Some(3),
             files_differ: 0,
             first_sight_from: None,
+            fold_skipped: None,
         };
         assert_eq!(
             transition(&a, &b, Some(&hint("commit: x")), &three).unwrap(),
@@ -550,6 +609,7 @@ mod tests {
             commits: None,
             files_differ: 2,
             first_sight_from: None,
+            fold_skipped: None,
         };
         assert_eq!(
             transition(
