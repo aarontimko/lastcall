@@ -1782,7 +1782,7 @@ impl Ops<'_> {
             }
             // R2: first sight of this branch is a **copy** of the record just left — the
             // same seen tree oid, the same `seen_at`, the overrides cloned, an empty undo
-            // stack — and then the ancestor fold.
+            // stack — and then the fold onto the merge-base.
             //
             // `seen_at` is copied and not restamped, which is the whole of the copy being
             // a copy: it is what C8's upstream annotation is computed from, and restamping
@@ -1808,19 +1808,24 @@ impl Ops<'_> {
         Ok(out)
     }
 
-    /// R2's second half, the ancestor fold.
+    /// R2's second half, the fold onto the merge-base.
     ///
-    /// The fold runs at all only when `refs/heads/<from>` still exists and this branch's
-    /// head is an **ancestor** of that tip (true when they are the same commit). It then
+    /// The fold runs at all when `refs/heads/<from>` still exists and the two tips have a
+    /// merge-base `M` (`git merge-base`, Amendment v1.12 as ruled 2026-09-15). `M` is the
+    /// fold's target: the branch just arrived on and the branch just left agree on
+    /// everything up to `M`, so what the record has seen at the departed tip can be carried
+    /// back to `M` without claiming anything about the commits either branch made after it.
+    /// When the two tips are the same commit, or the arrived-on head is behind the departed
+    /// tip, `M` is the arrived-on head and this is the fold as it has always been. It then
     /// decides path by path, over the paths whose committed content differs between the
-    /// two trees, and it folds only what the record it copied has actually seen at the
-    /// branch it left (verifier F2). Per path, with `base` the record's composed baseline
-    /// (the override's blob and mode, else the seen tree's entry, else absent), `tip_a` the
-    /// entry at the departed branch's tip and `tip_b` the entry here:
+    /// departed tip and `M`, and it folds only what the record it copied has actually seen
+    /// at the branch it left (verifier F2). Per path, with `base` the record's composed
+    /// baseline (the override's blob and mode, else the seen tree's entry, else absent),
+    /// `tip_a` the entry at the departed branch's tip and `tip_m` the entry at `M`:
     ///
     /// - fold when `base == tip_a` (same blob and mode, or both absent) **and not** when
-    ///   `base` is absent while `tip_b` is present;
-    /// - a folded path takes `tip_b` (absent here removes it) and loses the blob and mode
+    ///   `base` is absent while `tip_m` is present;
+    /// - a folded path takes `tip_m` (absent there removes it) and loses the blob and mode
     ///   of any override it carried — a flag-only override stays, exactly as [`Ops::fold`]
     ///   retains flagged overrides;
     /// - every other differing path keeps the copied baseline and over-shows.
@@ -1831,12 +1836,15 @@ impl Ops<'_> {
     /// path the record holds as **absent** (never seen, or its deletion accepted): folding
     /// it to `tip_b`'s blob would baseline a file the user has never been shown at all.
     ///
-    /// A path whose entry here is a **gitlink** is left out: the content model cannot
+    /// A path whose entry at `M` is a **gitlink** is left out: the content model cannot
     /// render a submodule pointer as a baseline.
     ///
-    /// Anything else leaves the copy exactly as it is, which is the over-show §2 allows: a
-    /// branch that is ahead or diverged (the cherry-pick case), `from` deleted, either head
-    /// unborn, or any git call that does not answer.
+    /// Anything else leaves the copy exactly as it is, which is the over-show §2 allows:
+    /// two histories with no commit in common, `from` deleted, either head unborn, or any
+    /// git call that does not answer. A change the arrived-on branch has that the departed
+    /// tip and `M` agree about (a cherry-pick, D25 Variant B) is never hidden by the copy:
+    /// the path differs between the departed tip and `M`, the record accepted it at that
+    /// tip, so it folds back to `M`'s entry and the content here shows against it.
     fn fold_onto_first_sight(
         &mut self,
         from: &str,
@@ -1852,14 +1860,16 @@ impl Ops<'_> {
         let Some(head) = rg.rev_parse_verify("HEAD").ok().flatten() else {
             return Ok(());
         };
-        let ancestor = rg
-            .run_raw(
-                &["merge-base", "--is-ancestor", head.as_str(), &from_ref],
-                None,
-            )
-            .map(|o| o.success())
-            .unwrap_or(false);
-        if !ancestor {
+        // The merge-base of the two tips, the fold's target. No answer at all (unrelated
+        // histories, or git not answering) leaves the copy exactly as it is.
+        let Ok(mb) = rg.run(&["merge-base", &from_ref, head.as_str()]) else {
+            return Ok(());
+        };
+        let Ok(mb) = std::str::from_utf8(&mb) else {
+            return Ok(());
+        };
+        let merge_base = mb.trim();
+        if merge_base.is_empty() {
             return Ok(());
         }
         let Ok(out) = rg.run(&[
@@ -1868,7 +1878,7 @@ impl Ops<'_> {
             "-z",
             "--name-only",
             &from_ref,
-            head.as_str(),
+            merge_base,
         ]) else {
             return Ok(());
         };
@@ -1884,7 +1894,7 @@ impl Ops<'_> {
         // (`objects/info/alternates`), so this reads the repository's own tree without a
         // write of any kind to it.
         let Some(tree_oid) = rg
-            .rev_parse_verify(&format!("{head}^{{tree}}"))
+            .rev_parse_verify(&format!("{merge_base}^{{tree}}"))
             .ok()
             .flatten()
         else {
@@ -1904,6 +1914,7 @@ impl Ops<'_> {
         let departed = self.store.ls_tree(&from_tree_oid)?;
         let mut writes: Vec<TreeWrite> = Vec::new();
         for path in &paths {
+            // `tip_m`: the entry at the merge-base, which is what a folded path takes.
             let here = entries.get(path);
             if matches!(here, Some((Mode::Gitlink, _))) {
                 continue;
@@ -2281,9 +2292,10 @@ mod tests {
         assert!(!a.ledger.overrides["f3"].flags.is_empty());
     }
 
-    /// D14's shape at the ops layer: `main`'s tip is already in `future`'s history, so the
-    /// copy folds — the differing path takes `main`'s committed content (here: absent) and
-    /// the override that held it is gone. No deletion row is left behind.
+    /// D14's shape at the ops layer: `main`'s tip is already in `future`'s history, so it
+    /// is the merge-base of the two and the copy folds onto it — the differing path takes
+    /// `main`'s committed content (here: absent) and the override that held it is gone. No
+    /// deletion row is left behind.
     #[test]
     fn ops_switch_branch_folds_when_the_arrival_is_an_ancestor() {
         let mut repo = FixtureRepo::new("ops-switch-fold").unwrap();
@@ -2383,10 +2395,12 @@ mod tests {
         );
     }
 
-    /// The other half of R2: `feat`'s tip is not in the arrival's history, so the copy
-    /// stands as it is and the over-show §2 allows is what the user sees.
+    /// The other half of R2: the two branches have diverged, and the branch just left is
+    /// itself the merge-base (it committed nothing after the cut), so no path differs
+    /// between the departed tip and the fold's target and the copy stands as it is. The
+    /// over-show §2 allows is what the user sees.
     #[test]
-    fn ops_switch_branch_copies_without_a_fold_when_it_is_not_an_ancestor() {
+    fn ops_switch_branch_copies_without_a_fold_when_the_departed_tip_is_the_merge_base() {
         let mut repo = FixtureRepo::new("ops-switch-copy").unwrap();
         let state = TempDir::new("lc-ops");
         let mut h = Harness::new(&repo, &state);
@@ -2416,6 +2430,84 @@ mod tests {
             "and `seen_at` is copied, not restamped: it is what the upstream range is \
              computed from"
         );
+    }
+
+    /// D25's shape at the ops layer, the case the ancestor form got wrong: the record
+    /// accepted `p` on `feat` at `c2`, the arrival `feat2` was cut from `c1` and has a
+    /// commit of its own, so the two tips have diverged and `M = c1`. `p` differs between
+    /// `feat`'s tip and `M`, its baseline is exactly what `feat`'s tip holds, so it folds
+    /// back to `c1`'s entry (absent) and the override is spent: no deletion row for work
+    /// the user accepted. `d`, which only the arrival has, is not in that set and shows.
+    #[test]
+    fn ops_switch_branch_folds_to_the_merge_base_when_the_tips_have_diverged() {
+        let mut repo = FixtureRepo::new("ops-switch-mergebase").unwrap();
+        repo.checkout_b("feat").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        h.ledger.seen_branch = Some("feat".into());
+        repo.write("p", "accepted\n");
+        repo.commit("c2: p on feat").unwrap();
+        let r = rendered(&h, b"p");
+        assert!(h.ops_on("feat").accept_file(&r, &NoFault).unwrap().ok());
+        assert!(h.ledger.overrides.contains_key("p"));
+
+        // One shell line, no scan in between: back to the shared ancestor, a branch of its
+        // own, a commit on it.
+        repo.checkout("main").unwrap();
+        repo.checkout_b("feat2").unwrap();
+        repo.write("d", "new work\n");
+        repo.commit("c3: d on feat2").unwrap();
+
+        let out = h.ops_on("feat").switch_branch("feat2", &NoFault).unwrap();
+        assert!(out.happened);
+        assert_eq!(out.first_sight_from.as_deref(), Some("feat"));
+        assert!(
+            !h.ledger.overrides.contains_key("p"),
+            "p folded onto the merge-base, so the override that held it is spent"
+        );
+        let paths: Vec<String> = h
+            .scan()
+            .pile
+            .rows
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.path).into_owned())
+            .collect();
+        assert_eq!(
+            paths,
+            vec!["d".to_string()],
+            "the arrival's own commit shows and nothing else does"
+        );
+    }
+
+    /// No merge-base at all (two root commits): there is no common point to fold onto, so
+    /// the copy stands exactly as it is, overrides included.
+    #[test]
+    fn ops_switch_branch_copies_without_a_fold_when_the_histories_are_unrelated() {
+        let mut repo = FixtureRepo::new("ops-switch-unrelated").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        h.ledger.seen_branch = Some("main".into());
+        repo.write("n1", "new\n");
+        repo.commit("n1 on main").unwrap();
+        let r = rendered(&h, b"n1");
+        assert!(h.ops_on("main").accept_file(&r, &NoFault).unwrap().ok());
+        let before = h.ledger.clone();
+
+        repo.git(&["checkout", "-q", "--orphan", "alone"]).unwrap();
+        for seed in ["f1", "f2", "f3", "n1"] {
+            repo.remove(seed);
+        }
+        repo.write("solo", "unrelated\n");
+        repo.commit("a root commit of its own").unwrap();
+
+        let out = h.ops_on("main").switch_branch("alone", &NoFault).unwrap();
+        assert!(out.happened);
+        assert_eq!(out.first_sight_from.as_deref(), Some("main"));
+        assert_eq!(
+            h.ledger.seen_tree, before.seen_tree,
+            "a plain copy: the seen tree is the one just left"
+        );
+        assert_eq!(h.ledger.overrides, before.overrides);
     }
 
     /// R3's prune: a parked record whose branch is gone goes with it, and only that one.

@@ -42,8 +42,10 @@
 //! Case count: the unit tier's 8, `PROPTEST_CASES` when set (64 from the pre-push tier),
 //! the same machinery as the store-backed proptests in `ops::tests::proptests`, read here
 //! rather than through `crate::env` because this is an integration test and that reader is
-//! crate-private. The sequence is four to nine operations rather than deliverable 7's six
-//! to twelve, to hold the 64-case run inside the pre-push budget; the report says so.
+//! crate-private. The sequence is four to seven operations rather than deliverable 7's six
+//! to twelve, to hold the 64-case run inside the pre-push budget; the report says so. Every
+//! shape the generator has found so far, the gate run's included, is four to six operations
+//! long once proptest has shrunk it.
 
 mod common;
 
@@ -129,7 +131,7 @@ fn op() -> impl Strategy<Value = Op> {
 }
 
 fn ops() -> impl Strategy<Value = Vec<Op>> {
-    prop::collection::vec(op(), 4..=9)
+    prop::collection::vec(op(), 4..=7)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -180,6 +182,10 @@ struct World {
     cur: String,
     next_id: usize,
     seen: BTreeMap<&'static str, BTreeSet<Option<String>>>,
+    /// The branch whose record the unwatched run holds: the one it was on at its last
+    /// scan. Both runs track it, because it depends on the generated sequence alone, and
+    /// both refuse to delete it (see [`Op::DeleteBranch`]).
+    in_force: String,
     /// Every git command and scan, in order: the failure message is a script.
     log: Vec<String>,
 }
@@ -211,6 +217,7 @@ impl World {
             cur: "main".to_owned(),
             next_id: 0,
             seen,
+            in_force: "main".to_owned(),
             log: vec![format!(
                 "# run: {}",
                 if observed { "observed" } else { "unobserved" }
@@ -300,6 +307,9 @@ impl World {
                 b.dirty.push(true);
             }
             Op::AcceptAll => {
+                // An accept has to see a pile, so this is a scan point in both runs, and
+                // the unwatched run's record in force becomes this branch's.
+                self.in_force = self.cur.clone();
                 let pile = self.scan()?;
                 self.s.accept_all_snapshot(&pile);
                 self.log.push("accept-all".to_owned());
@@ -348,10 +358,17 @@ impl World {
                 self.cur = name;
             }
             Op::DeleteBranch(i) => {
+                // Never the current branch, and never the branch whose record the
+                // unwatched run still holds: deleting that one takes the fold's other tip
+                // away with it, and the fail-open ladder's answer is the copy as it is
+                // (`docs/dev/engine.md`, "the branch left has no ref"). The watching run
+                // folded before the ref went, so the two runs part company for a reason
+                // the fold never had a say in. Pinned as a test of its own,
+                // `seen_oracle_deleting_the_branch_left_before_the_scan_keeps_the_copy`.
                 let others: Vec<String> = self
                     .names
                     .iter()
-                    .filter(|n| **n != self.cur)
+                    .filter(|n| **n != self.cur && **n != self.in_force)
                     .cloned()
                     .collect();
                 if others.is_empty() {
@@ -477,6 +494,41 @@ fn seen_oracle_the_gate_run_shape_manufactures_no_deletion() {
     let (observed, log_o) = run(&ops, true).expect("the watching run");
     let (unobserved, log_u) = run(&ops, false).expect("the unwatched run");
     no_row_manufactured(&observed, &unobserved, &log_o, &log_u).expect("no row is manufactured");
+}
+
+/// The third shape the generator found, pinned here and kept out of it: `f1` is accepted on
+/// `main` at `c2`, a branch is cut at `c1`, and `main` is deleted before lastcall looks. The
+/// watching run folded `f1` back to `c1` while `refs/heads/main` was still there; the
+/// unwatched run reaches its first scan with the record in force belonging to a branch that
+/// no longer has a tip to compare against, so the copy stands as it is and `f1` over-shows.
+/// That is the fail-open ladder's row for "the branch left has no ref", not the fold's
+/// doing: it reads the same before and after the merge-base change.
+#[test]
+fn seen_oracle_deleting_the_branch_left_before_the_scan_keeps_the_copy() {
+    let ops = vec![
+        Op::Commit(vec![(0, Some(0))]),
+        Op::AcceptAll,
+        Op::Cut(CutAt::Older),
+    ];
+    let mut watched = World::new(true);
+    let mut unwatched = World::new(false);
+    for op in &ops {
+        watched.step(op, true).expect("the watching run");
+        unwatched.step(op, false).expect("the unwatched run");
+    }
+    // `git branch -D main` by hand: the generator's own DeleteBranch refuses the branch
+    // whose record the unwatched run holds, which is exactly this one.
+    watched.git(&["branch", "-q", "-D", "main"]);
+    unwatched.git(&["branch", "-q", "-D", "main"]);
+    let o = watched.finish().expect("watched");
+    let u = unwatched.finish().expect("unwatched");
+    assert!(o.pile.is_empty(), "the watching run folded f1 away: {o:?}");
+    assert_eq!(
+        u.pile,
+        vec!["f1:Modified".to_owned()],
+        "and the unwatched run over-shows it, the copy standing as it is: {}",
+        unwatched.log.join("\n")
+    );
 }
 
 /// A pinned finding, green before and after the merge-base change: the equality

@@ -2093,11 +2093,13 @@ fn scenario_d25_a_branch_cut_from_the_shared_ancestor_folds_to_the_merge_base() 
         Change::Added,
         "feat2's own commit is not in the fold's path list and shows"
     );
+    // The notice reports the last thing that moved HEAD, and in this sequence that is the
+    // commit, not the checkout: git's reflog has `commit: c3 adds d` on top, so the head
+    // watcher classifies the move as a commit and never reaches R8's first-sight form. The
+    // first sight itself happened all the same, which is what the pile above shows.
     assert_eq!(
         s.head_notice().as_deref(),
-        Some(
-            "switched feat → feat2: first time here, seen state carried from feat; 1 file pending"
-        )
+        Some("committed on feat2 (1 commit)")
     );
     assert_eq!(seen_branch(&s).as_deref(), Some("feat2"));
     assert!(

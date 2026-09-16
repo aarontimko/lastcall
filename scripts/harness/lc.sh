@@ -99,26 +99,28 @@ lc_fold_base() {
   [ -z "$line" ] && { echo ABSENT; return; }
   printf '%s' "$line" | awk '{print $1" "$3}'
 }
-# R2's second half: arriving on B from A's record, when refs/heads/A still exists and B's
-# HEAD is an ancestor of A's tip. Of the paths that differ between the two committed trees,
-# a path is folded onto B's content only when the record's composed baseline for it equals
-# A's tip entry, and never when that baseline is absent while B has a blob: what the record
-# has not seen at the branch it left must not become seen state here. A folded path takes
-# B's entry (absent in B -> removed from the record) and loses its override; every other
-# differing path keeps the copy's baseline and over-shows. A gitlink is left alone.
+# R2's second half: arriving on B from A's record, when refs/heads/A still exists and the
+# two tips have a merge-base M (the same commit and "B behind A" both give M = B's head).
+# Of the paths that differ between A's tip and M, a path is folded onto M's content only
+# when the record's composed baseline for it equals A's tip entry, and never when that
+# baseline is absent while M has a blob: what the record has not seen at the branch it left
+# must not become seen state here. A folded path takes M's entry (absent at M -> removed
+# from the record) and loses its override; every other differing path keeps the copy's
+# baseline and over-shows. A gitlink is left alone.
 lc_branch_fold() {
   local a="$1"
   rg rev-parse -q --verify "refs/heads/$a" >/dev/null 2>&1 || return 0
   local bh; bh="$(rg rev-parse -q --verify HEAD 2>/dev/null)" || return 0
   [ -n "$bh" ] || return 0
-  rg merge-base --is-ancestor "$bh" "refs/heads/$a" 2>/dev/null || return 0
-  local paths; paths="$(rg diff-tree -r -z --name-only "refs/heads/$a" "$bh" 2>/dev/null | tr '\0' '\n' | grep -v '^$')"
+  local mb; mb="$(rg merge-base "refs/heads/$a" "$bh" 2>/dev/null)" || return 0
+  [ -n "$mb" ] || return 0
+  local paths; paths="$(rg diff-tree -r -z --name-only "refs/heads/$a" "$mb" 2>/dev/null | tr '\0' '\n' | grep -v '^$')"
   [ -n "$paths" ] || return 0
   local t; t="$(cat "$LC_STATE/seen_tree")"
   local folded="$LC_STATE/fold.paths" info="$LC_STATE/fold.info"
   : > "$folded"; : > "$info"
   printf '%s\n' "$paths" | while IFS= read -r p; do
-    local line mode oid base tipa; line="$(rg ls-tree "$bh" -- "$p" | head -1)"
+    local line mode oid base tipa; line="$(rg ls-tree "$mb" -- "$p" | head -1)"
     mode=""; oid=""
     if [ -n "$line" ]; then
       mode="$(printf '%s' "$line" | awk '{print $1}')"; oid="$(printf '%s' "$line" | awk '{print $3}')"
