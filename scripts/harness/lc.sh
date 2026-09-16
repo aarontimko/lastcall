@@ -115,7 +115,10 @@ lc_rec_base() {   # lc_rec_base <record dir> <path>
     echo "$m $b"; return
   fi
   t="$(cat "$d/seen_tree" 2>/dev/null)"
-  [ -z "$t" ] && { echo ABSENT; return; }
+  # A record with no seen tree has seen nothing; without an override naming the path it
+  # composes no baseline at all, never ABSENT (verifier round four, F1: read as ABSENT, a
+  # parked record that had lost its tree vouched for an unaccepted deletion).
+  [ -z "$t" ] && { echo UNKNOWN; return; }
   lc_entry lcg "$t" "$p"
 }
 # R2's second half: arriving on B from A's record, when refs/heads/A still exists and the
@@ -164,6 +167,9 @@ lc_branch_fold() {
     tipm="$(lc_entry rg "$mb" "$p")"
     case "$tipm" in 160000\ *) continue;; esac
     base="$(lc_rec_base "$LC_STATE" "$p")"
+    # The record in force composes against its tree, empty when it has none, as the engine's
+    # Ops does; only a parked record's UNKNOWN stays UNKNOWN and matches nothing below.
+    [ "$base" = UNKNOWN ] && base=ABSENT
     tipa="$(lc_entry rg "refs/heads/$a" "$p")"
     [ "$base" = "$tipa" ] || continue
     seen="$cov"

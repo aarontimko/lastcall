@@ -349,6 +349,21 @@ lc_accept_file f1; assert_pile "D26C the removal accepted on b1" ""
 git -C "$R" checkout -q b0
 assert_pile "D26C the first-sight entry folds back on b0" ""
 assert_str "D26C the accepted deletion is spent by the fold" "$(git -C "$R" rev-parse "main:f1")" "$(lc_baseline f1)"
+# Variant D, a record that has seen nothing vouches for nothing: main's record starts with
+# no seen tree (a first sight at an unborn head, or a tree the store lost); parked, it must
+# not let clause (b) fold an unaccepted deletion to absent on a branch cut at the deleting
+# commit.
+fresh d26d; : > "$S/seen_tree"; : > "$S/first_sight_head"; lc_seed_index
+assert_pile "D26D a record with no seen tree shows everything as new" "f1|f2|f3"
+git -C "$R" checkout -q -b X; assert_pile "D26D X is a copy of that record" "f1|f2|f3"
+lc_accept_all; assert_pile "D26D everything accepted on X" ""
+git -C "$R" rm -q f1; git -C "$R" commit -qm "c2 removes f1 on X"; c2="$(git -C "$R" rev-parse HEAD)"
+assert_pile "D26D the removal is pending on X" "f1"
+git -C "$R" checkout -q "$c2^" -- f1; git -C "$R" commit -qm "c3 restores f1 on X"
+assert_pile "D26D c3 restores the entry X accepted" ""
+git -C "$R" branch -q Y "$c2"; git -C "$R" checkout -q Y
+assert_pile "D26D the deletion nobody accepted shows on Y" "f1"
+assert_str "D26D the record still holds f1" "$(git -C "$R" rev-parse "$c2^:f1")" "$(lc_baseline f1)"
 
 echo "== E. storage =="
 fresh e2; echo edit >> "$R/f1"; lc_accept_file f1; echo deadbeefdeadbeefdeadbeefdeadbeefdeadbeef > "$S/overrides/f1"
