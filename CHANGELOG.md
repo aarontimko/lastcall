@@ -14,7 +14,9 @@ binary rather than for the commit log.
   from back out, and you get that branch's own pile, not a screen of files you already dealt
   with. The first time you check a branch out, the record carries across from the branch you
   came from, so the switch itself shows nothing new, and if the new branch is behind the one
-  you left, the commits it does not have yet are folded away rather than listed. Going back to
+  you left, the work you had already accepted there is folded away rather than listed as a
+  screen of deletions. Anything still pending when you left is still pending here: content you
+  have not looked at never becomes seen state by changing branch. Going back to
   a branch you have been on before brings its pile back exactly as you left it, flags and undo
   included. A change that reaches another branch by cherry-pick shows once more on that branch,
   because lastcall never assumes you have read it somewhere else. Deleting a branch drops what

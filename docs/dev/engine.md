@@ -346,7 +346,10 @@ in `inspect_head` before the heads are compared, and at the tail of `open_root_w
 where a switch made while lastcall was not running lands. Git writes the working tree and the
 index before it writes `HEAD`, so a scan can still fall inside git's own window and compare
 one branch's files against the other's record. That is an over-show and it closes at the next
-event; an accept inside the window is refused instead, see "Concurrency" below.
+event. An accept inside the window is not refused: it files into the record `HEAD` still names,
+and the rows show again on the branch the switch was heading for. The refusal covers the other
+order, where `HEAD` has already moved under an `Ops` that was staged before it did (see
+"Concurrency" below).
 
 **Arriving somewhere new.** A branch with no parked record starts as a **copy** of the record
 just left: the same `seen_tree` oid, the overrides cloned, `seen_at` copied verbatim (it is
@@ -354,12 +357,19 @@ what the upstream annotation's range is computed from, so restamping it would tu
 coworker's commits into an unexplained pile), and an empty undo stack. The switch itself
 therefore shows nothing new. Then the **ancestor fold**: if the branch left still has a ref and
 the arriving head is an ancestor of it (`merge-base --is-ancestor`, true when they are the same
-commit), every path that differs between the two committed trees (`diff-tree -r --name-only`)
-takes the arriving branch's committed content in one `write_tree`, and those paths lose the
-blob and mode of any override they carried; a flag-only override stays, as `Ops::fold` already
-keeps flagged overrides, and a gitlink entry is left out because the content model cannot
-render a submodule pointer as a baseline. A diverged or ahead branch, a deleted `A`, an unborn
-head: no fold, the copy is the record. Content that arrives on another branch by cherry-pick
+commit), the paths that differ between the two committed trees (`diff-tree -r --name-only`) are
+considered one by one. A path is folded onto the arriving branch's committed content only when
+the record's composed baseline for it (the override's blob and mode, else the seen tree's entry,
+else absent) is exactly what the branch left holds at its tip, and never when that baseline is
+absent while the arriving tip has a blob. Content the record has not seen at the branch it left
+is not seen state here either: a commit the agent made on `A` that nobody has read yet still
+shows on `B`, and a path the record holds as absent, never seen or its deletion accepted, is
+never baselined to a blob. The folded paths take their entries in one `write_tree` (absent on
+the arriving branch removes them) and lose the blob and mode of any override they carried; a
+flag-only override stays, as `Ops::fold` already keeps flagged overrides, and a gitlink entry is
+left out because the content model cannot render a submodule pointer as a baseline. Every other
+differing path keeps the copy's baseline and over-shows. A diverged or ahead branch, a deleted
+`A`, an unborn head: no fold at all, the copy is the record. Content that arrives on another branch by cherry-pick
 shows again there, by design: lastcall never guesses that you have read it.
 
 **Parking, loading, pruning, renaming.** Leaving a branch parks its record whole, undo stack
