@@ -174,7 +174,11 @@ lc_restart; assert_pile "D15 restart on run-2" "c.rs"
 lc_accept_all; assert_pile "D16 run-2 reviewed and accepted" ""
 git -C "$R" checkout -q main; git -C "$R" checkout -q -b feat/x
 assert_pile "D16 feat/x is a copy of main's record" ""
-git -C "$R" cherry-pick main..run-1 >/dev/null 2>&1; git -C "$R" cherry-pick main..run-2 >/dev/null 2>&1
+# The picks carry a pinned committer date: a pick made inside the same second as the commit it
+# copies (same parent, tree, message and author date) reproduces that commit's sha, and two
+# branches at one commit are the same-commit case, not a cherry-pick.
+GIT_COMMITTER_DATE="@2000000000 +0000" git -C "$R" cherry-pick main..run-1 >/dev/null 2>&1
+GIT_COMMITTER_DATE="@2000000001 +0000" git -C "$R" cherry-pick main..run-2 >/dev/null 2>&1
 assert_pile "D16 the cherry-picked content shows again" "a.rs|b.rs|c.rs"
 lc_accept_all; assert_pile "D16 accept-all on feat/x" ""
 git -C "$R" checkout -q main; assert_pile "D16 main's record untouched" ""
@@ -282,7 +286,9 @@ git -C "$R" checkout -q -b run-2; echo c > "$R/c.rs"; git -C "$R" add -A; git -C
 assert_pile "D25B the run's work is pending" "c.rs"
 lc_accept_all; assert_pile "D25B accepted on run-2" ""
 # lastcall is closed: the run's commit is cherry-picked onto a branch cut from main.
-git -C "$R" checkout -q -b feat/x main && git -C "$R" cherry-pick main..run-2 >/dev/null 2>&1
+# The pinned committer date again (D16): inside one second the pick reproduces run-2's sha and
+# the two tips are one commit, which is the same-commit case and hides nothing to test.
+git -C "$R" checkout -q -b feat/x main && GIT_COMMITTER_DATE="@2000000000 +0000" git -C "$R" cherry-pick main..run-2 >/dev/null 2>&1
 assert_pile "D25B the cherry-picked content shows once more, never hidden by the copy" "c.rs"
 
 echo "== E. storage =="
