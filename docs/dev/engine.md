@@ -358,12 +358,21 @@ commits into an unexplained pile), and an empty undo stack. The switch itself th
 nothing new. Then the **fold onto the merge-base**: if the branch left still has a ref and the
 two tips have a commit in common (`merge-base`), that commit is the fold's target `M`, and the
 paths that differ between the branch left and `M` (`diff-tree -r --name-only`) are considered
-one by one. A path is folded onto `M`'s committed content only when the record's composed
-baseline for it (the override's blob and mode, else the seen tree's entry, else absent) is
-exactly what the branch left holds at its tip, and never when that baseline is absent while `M`
-has a blob. Content the record has not seen at the branch it left is not seen state here
-either: a commit the agent made on `A` that nobody has read yet still shows on `B`, and a path
-the record holds as absent, never seen or its deletion accepted, is never baselined to a blob.
+one by one. A path is folded onto `M`'s committed content only when **both** of two things
+hold. First, the record's composed baseline for it (the override's blob and mode, else the seen
+tree's entry, else absent) is exactly what the branch left holds at its tip: a commit the agent
+made on `A` that nobody has read yet is not finished there, so it still shows on `B`. Second,
+`M`'s own entry is **already seen state**, which is either that `M` is reachable from
+`first_sight_head`, the commit the root was first sighted at, so everything committed there was
+in the repository before lastcall looked at all, or that some record in the ledger, in force or
+parked, composes exactly that entry as its own baseline, which makes it a first-sight entry, an
+accepted one, or one an earlier fold already carried. The fold takes only entries the ledger
+can point at and say where they were seen. Everything else keeps the copied baseline and shows,
+which is the honest answer: a version committed and reverted while its row was never accepted,
+a mode flip, a symlink, a deletion nobody accepted, the content of a branch merged or rebased
+in without ever being checked out, whichever of two merge-bases git happens to pick for a
+criss-cross. A root whose state file predates `first_sight_head` has no answer to the first
+question and folds through the records alone, which over-shows and hides nothing.
 The folded paths take their entries in one `write_tree` (absent at `M` removes them) and lose
 the blob and mode of any override they carried; a flag-only override stays, as `Ops::fold`
 already keeps flagged overrides, and a gitlink entry is left out because the content model
@@ -371,7 +380,8 @@ cannot render a submodule pointer as a baseline. Every other differing path keep
 baseline and over-shows. Two histories with no commit in common, a deleted `A`, an unborn head:
 no fold at all, the copy is the record. When the arriving head is behind the branch left, or
 the two are the same commit, `M` is the arriving head itself and the fold is the one it has
-always been. When they have diverged, `M` is the commit both were cut from: work accepted on
+always been, narrowed to the entries the ledger has seen. When they have diverged, `M` is the
+commit both were cut from: work accepted on
 the branch left folds back to there instead of being listed on the arriving branch as a screen
 of deletions, and the commits the arriving branch made of its own are not in the differing set
 at all, so they show. Content that arrives on another branch by cherry-pick shows again there,
@@ -418,7 +428,11 @@ same commit keeps `switched main → feat-x (same commit)`: nothing moved, so th
 report. A first sight whose head moved reads
 `switched main → feat-x: first time here, seen state carried from main; N files pending`. A
 folded copy and a copy with nothing to fold read the same; the fold is visible only through the
-count.
+count. A first sight whose fold could not run at all says so on the same line,
+`… seen state carried from main without folding (no commit in common with main); N files
+pending`, and the reason is repeated once in the root's notices so a one-shot `status`, which
+never inspects a head, reports it too. A fold that ran and folded nothing is not that case: it
+asked and was refused, which is the ordinary answer.
 
 **Schema.** 1.2, additive under major 1 (Amendment v1.12): top-level `seen_branch`,
 `branches` and `first_sight_head`, the last two omitted when they are empty or unknown so an
@@ -468,7 +482,9 @@ Every rung shows *more* than the truth, never less, and says why in a notice:
 | ledger lock busy after 40 × 50 ms (2 s) | the op errors; nothing is written unlocked, and the TUI says `ledger busy in <root> — try again` with the row still pending |
 | `<git_dir>/HEAD` cannot be read, or names no branch (detached, unborn) | no switch: the record in force stays the one it was, and the pile is shown against it |
 | a parked record that does not parse | dropped at load with the notice `the parked seen record for branch "<name>" has an unreadable shape …`; every other record and the file itself survive, and that branch first-sights on its next arrival |
-| the branch left has no ref when the switch is noticed (deleted or renamed before the scan) | no fold: the copy stands as it is, so what was accepted there over-shows once on the branch arrived on |
+| the branch left has no ref when the switch is noticed (deleted or renamed before the scan) | no fold: the copy stands as it is, so what was accepted there over-shows once on the branch arrived on, and the first-sight notice says the fold did not run and why |
+| no commit in common with the branch left, an unborn head on either side, or a git call in the fold that does not answer | the same: the copy is the record, and the reason rides on the first-sight notice and on the root's notices |
+| the root's state file knows no `first_sight_head` (written before the field, or first sighted at an unborn head) | not a failure and not a skip: the fold runs and asks the records alone, so it folds less and shows more |
 | a parked seen tree the store no longer has (a `gc` in the store, a hand-edited ledger) | the record loads as it is; the "seen tree not resolvable" rung then applies to it once it is in force, so that branch shows every path pending rather than hiding one |
 
 ## Accepting through the engine (Phase 4)
