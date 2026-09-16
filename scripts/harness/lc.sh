@@ -23,6 +23,7 @@ lc_init() {
   fi
   mkdir -p "$LC_STATE/branches"
   : > "$LC_STATE/seen_tree"; : > "$LC_STATE/seen_head"; : > "$LC_STATE/seen_branch"
+  : > "$LC_STATE/first_sight_head"
 }
 # all plumbing runs against OUR store with R as the work tree and OUR index
 lcg() { GIT_DIR="$LC_STATE/objects" GIT_WORK_TREE="$LC_R" GIT_INDEX_FILE="$LC_STATE/index" git -c core.excludesfile=/dev/null "$@"; }
@@ -34,6 +35,10 @@ enc() { printf '%s' "$1" | sed 's|/|%2F|g'; }
 lc_first_sight() {
   if [ "$LC_KIND" = git ] && rg rev-parse -q --verify HEAD >/dev/null 2>&1; then
     rg rev-parse 'HEAD^{tree}' > "$LC_STATE/seen_tree"; rg rev-parse HEAD > "$LC_STATE/seen_head"
+    # R2's seen-state target: the commit the root was first sighted at, written once here
+    # and never again. Empty at an unborn head and for a draft root, which makes clause (a)
+    # never hold rather than making anything fail.
+    rg rev-parse HEAD > "$LC_STATE/first_sight_head"
   elif [ "$LC_KIND" = draft ] && [ "${LC_DRAFT_INITIAL:-seen}" = seen ]; then
     lc_write_tree_of_disk > "$LC_STATE/seen_tree"
   else : > "$LC_STATE/seen_tree"; fi
@@ -82,31 +87,49 @@ lc_branch_prune() {
     printf '%s\n' "$refs" | grep -qx "refs/heads/$n" || rm -rf "$d"
   done
 }
-# The record's composed baseline for one path, as "<mode> <oid>" or ABSENT: the override's
-# blob and mode, else the seen tree's entry, else absent. The fold's own reader, so it never
-# calls lc_branch_sync the way lc_baseline does.
-lc_fold_base() {
-  local p="$1" t="$2" o b m line
-  o="$LC_STATE/overrides/$(enc "$p")"
+# One commit-or-tree's entry for exactly one path, as "<mode> <oid>" or ABSENT, read
+# through the named runner (rg = the user's repo, lcg = our store). A path that names a
+# **directory** there is ABSENT: the engine reads the whole tree with `ls-tree -r`, whose
+# map holds the blobs under that name and not the name itself, and writing a 040000 entry
+# into the fold's index is how the twin used to disagree with it (verifier F4).
+lc_entry() {   # lc_entry <rg|lcg> <rev-or-tree> <path>
+  local run="$1" rev="$2" p="$3" line mode
+  line="$("$run" ls-tree "$rev" -- "$p" 2>/dev/null | head -1)"
+  [ -z "$line" ] && { echo ABSENT; return; }
+  mode="$(printf '%s' "$line" | awk '{print $1}')"
+  [ "$mode" = 040000 ] && { echo ABSENT; return; }
+  printf '%s' "$line" | awk '{print $1" "$3}'
+}
+# One record's composed baseline for one path, as "<mode> <oid>" or ABSENT: the override's
+# blob and mode, else that record's seen tree's entry, else absent. The record is named by
+# its directory, and the record in force is $LC_STATE itself — one composer for the record
+# in force and for every parked record, so R2's seen-state target cannot disagree with
+# itself about what a baseline is.
+lc_rec_base() {   # lc_rec_base <record dir> <path>
+  local d="$1" p="$2" o b m t
+  o="$d/overrides/$(enc "$p")"
   if [ -f "$o" ]; then
     b="$(cat "$o")"
     [ "$b" = null ] && { echo ABSENT; return; }
     m=100644; [ -f "$o.mode" ] && m="$(cat "$o.mode")"
     echo "$m $b"; return
   fi
+  t="$(cat "$d/seen_tree" 2>/dev/null)"
   [ -z "$t" ] && { echo ABSENT; return; }
-  line="$(lcg ls-tree "$t" -- "$p" | head -1)"
-  [ -z "$line" ] && { echo ABSENT; return; }
-  printf '%s' "$line" | awk '{print $1" "$3}'
+  lc_entry lcg "$t" "$p"
 }
 # R2's second half: arriving on B from A's record, when refs/heads/A still exists and the
 # two tips have a merge-base M (the same commit and "B behind A" both give M = B's head).
-# Of the paths that differ between A's tip and M, a path is folded onto M's content only
-# when the record's composed baseline for it equals A's tip entry, and never when that
-# baseline is absent while M has a blob: what the record has not seen at the branch it left
-# must not become seen state here. A folded path takes M's entry (absent at M -> removed
-# from the record) and loses its override; every other differing path keeps the copy's
-# baseline and over-shows. A gitlink is left alone.
+# Of the paths that differ between A's tip and M, a path is folded onto M's entry only when
+# both hold:
+#   1. the record's composed baseline for it equals A's tip entry — the user has finished
+#      with that path on the branch they left;
+#   2. M's entry is already seen state, which is (a) M reachable from the commit the root
+#      was first sighted at, so it was committed before lastcall ever looked, or (b) some
+#      other record composes exactly that entry as its own baseline.
+# A folded path takes M's entry (absent at M -> removed from the record) and loses its
+# override; every other differing path keeps the copy's baseline and over-shows. A gitlink
+# is left alone.
 lc_branch_fold() {
   local a="$1"
   rg rev-parse -q --verify "refs/heads/$a" >/dev/null 2>&1 || return 0
@@ -116,24 +139,46 @@ lc_branch_fold() {
   [ -n "$mb" ] || return 0
   local paths; paths="$(rg diff-tree -r -z --name-only "refs/heads/$a" "$mb" 2>/dev/null | tr '\0' '\n' | grep -v '^$')"
   [ -n "$paths" ] || return 0
+  # (a), asked once for the whole fold and only now that there is something to fold.
+  local fsh=""; [ -f "$LC_STATE/first_sight_head" ] && fsh="$(cat "$LC_STATE/first_sight_head")"
+  local cov=0
+  if [ -n "$fsh" ] && rg merge-base --is-ancestor "$mb" "$fsh" >/dev/null 2>&1; then cov=1; fi
+  # (b): the parked records to ask, built only when (a) did not settle the fold. The record
+  # just parked is left out — it is the same record as the copy now in force, and rule 1
+  # has already required base == tipA while every path here differs between tipA and M, so
+  # it could never match.
+  local recs="" d
+  if [ "$cov" = 0 ]; then
+    for d in "$LC_STATE/branches"/*; do
+      [ -d "$d" ] || continue
+      [ "$(basename "$d")" = "$(enc "$a")" ] && continue
+      recs="$recs$d
+"
+    done
+  fi
   local t; t="$(cat "$LC_STATE/seen_tree")"
   local folded="$LC_STATE/fold.paths" info="$LC_STATE/fold.info"
   : > "$folded"; : > "$info"
   printf '%s\n' "$paths" | while IFS= read -r p; do
-    local line mode oid base tipa; line="$(rg ls-tree "$mb" -- "$p" | head -1)"
-    mode=""; oid=""
-    if [ -n "$line" ]; then
-      mode="$(printf '%s' "$line" | awk '{print $1}')"; oid="$(printf '%s' "$line" | awk '{print $3}')"
-      [ "$mode" = 160000 ] && continue
-    fi
-    base="$(lc_fold_base "$p" "$t")"
-    tipa="$(rg ls-tree "refs/heads/$a" -- "$p" | head -1 | awk '{print $1" "$3}')"
-    [ -n "$tipa" ] || tipa=ABSENT
+    local tipm base tipa seen r
+    tipm="$(lc_entry rg "$mb" "$p")"
+    case "$tipm" in 160000\ *) continue;; esac
+    base="$(lc_rec_base "$LC_STATE" "$p")"
+    tipa="$(lc_entry rg "refs/heads/$a" "$p")"
     [ "$base" = "$tipa" ] || continue
-    [ "$base" = ABSENT ] && [ -n "$line" ] && continue
+    seen="$cov"
+    if [ "$seen" = 0 ] && [ -n "$recs" ]; then
+      while IFS= read -r r; do
+        [ -n "$r" ] || continue
+        [ "$(lc_rec_base "$r" "$p")" = "$tipm" ] && { seen=1; break; }
+      done <<INNER
+$recs
+INNER
+    fi
+    [ "$seen" = 1 ] || continue
     printf '%s\n' "$p" >> "$folded"
-    if [ -z "$line" ]; then printf '0 0000000000000000000000000000000000000000\t%s\n' "$p" >> "$info"
-    else printf '%s %s\t%s\n' "$mode" "$oid" "$p" >> "$info"; fi
+    if [ "$tipm" = ABSENT ]; then printf '0 0000000000000000000000000000000000000000\t%s\n' "$p" >> "$info"
+    else printf '%s\t%s\n' "$tipm" "$p" >> "$info"; fi
   done
   if [ -s "$info" ]; then
     local tmp="$LC_STATE/index.fold"; rm -f "$tmp"
@@ -157,7 +202,11 @@ lc_branch_sync() {
   [ "$cur" = "$name" ] && return 0
   # R3 rename: the record in force is re-labelled when its own ref is gone. No park, no
   # first sight, no fold.
-  if ! rg rev-parse -q --verify "refs/heads/$cur" >/dev/null 2>&1; then
+  # ...and only when the name it moved to has no parked record of its own: a checkout of a
+  # branch we have been on before is a switch, never a re-label, whatever became of the ref
+  # we left (verifier F4).
+  if ! rg rev-parse -q --verify "refs/heads/$cur" >/dev/null 2>&1 \
+     && [ ! -d "$LC_STATE/branches/$(enc "$name")" ]; then
     echo "$name" > "$LC_STATE/seen_branch"; lc_branch_prune; return 0
   fi
   local pd="$LC_STATE/branches/$(enc "$cur")"                 # R3: park the record we leave
