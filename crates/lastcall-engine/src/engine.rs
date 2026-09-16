@@ -319,12 +319,20 @@ impl RootState {
                 let mut ops = self.switch_ops(clock);
                 match ops.switch_branch(&name, &NoFault) {
                     Ok(switched) => {
-                        if switched.first_sight_from.is_some() {
+                        // A switch that happened says what the notice must say, and that
+                        // includes saying nothing: a **load** clears the value, so a first
+                        // sight one sync performed cannot travel to the next head move and
+                        // relabel it as one. Only a switch that wrote nothing (the record
+                        // already on this branch, or R5's adopt) leaves it alone, and those
+                        // leave the record alone too.
+                        if switched.happened {
                             self.first_sight_from = switched.first_sight_from;
                         }
-                        if switched.happened {
-                            self.ledger_stamp = ledger::stamp(&self.paths);
-                        }
+                        // The ledger was re-read under the lock on every `Ok` path, so what
+                        // is in memory is the file, whether this switch wrote one or adopted
+                        // another process's (F10b): the next `reload_ledger_if_changed` has
+                        // nothing to re-read.
+                        self.ledger_stamp = ledger::stamp(&self.paths);
                     }
                     Err(e) => {
                         // Fail open: the record in force stays, which over-shows the new
@@ -1009,6 +1017,10 @@ fn open_root_with(ctx: &OpenCtx<'_>, d: &roots::DiscoveredRoot) -> Result<RootSt
     // here, before the root's first scan, so the very first pile is the arriving branch's.
     // A root that first-sighted just now already named its branch, so this is a no-op.
     state.sync_branch(clock);
+    // An open describes nothing: there is no previous HEAD to have moved, so the first
+    // inspection answers `None`. A first sight performed here must therefore not leave the
+    // R8 wording waiting for whatever the user does next (verifier F3).
+    state.first_sight_from = None;
     Ok(state)
 }
 
@@ -1308,6 +1320,13 @@ impl Engine {
         let next = headstate::inspect(rg)?;
         let prev = state.head.clone();
         if next == prev {
+            // Nothing to describe, so nothing may keep the first-sight wording waiting: the
+            // sync above (or the one a scan ran) may have first-sighted a branch whose
+            // checkout `HEAD` had already reached by the time this inspection ran, and the
+            // *next* head move is not that first sight.
+            if let Some(s) = self.roots.get_mut(root) {
+                s.first_sight_from = None;
+            }
             return Ok(None);
         }
         let commits = match (&prev.head, &next.head) {

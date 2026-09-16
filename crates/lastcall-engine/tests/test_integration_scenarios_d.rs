@@ -1653,6 +1653,67 @@ fn scenario_d21_restart_and_offline_switches() {
     assert_eq!(seen_branch(&s).as_deref(), Some("main"));
 }
 
+/// Four records, the last of them first-sighted while lastcall was not running: `main`
+/// seen first, `feat` with one commit of its own, back on `main`, then an offline
+/// `checkout -b new` whose switch lands at open. Nothing describes that switch, so R8's
+/// first-sight wording must not be waiting for whatever the user does next (verifier F3).
+fn d21_first_sight_at_open(name: &str) -> Fresh {
+    let mut s = Fresh::new(name);
+    assert_pile!(s.engine, s.root, "", "first sight on main");
+    s.repo.checkout_b("feat").unwrap();
+    assert_pile!(
+        s.engine,
+        s.root,
+        "",
+        "feat starts as a copy of main's record"
+    );
+    s.repo.write("n.rs", "n\n");
+    s.repo.commit("on feat").unwrap();
+    assert_pile!(
+        s.engine,
+        s.root,
+        "n.rs",
+        "feat's own commit is pending there"
+    );
+    s.repo.checkout("main").unwrap();
+    assert_pile!(s.engine, s.root, "", "main's parked record is back");
+    // Not watching: the branch is cut and the switch is only seen at the next open.
+    s.repo.checkout_b("new").unwrap();
+    s.restart();
+    assert_eq!(seen_branch(&s).as_deref(), Some("new"));
+    s
+}
+
+#[test]
+fn scenario_d21_a_first_sight_at_open_does_not_relabel_the_next_checkout() {
+    let mut s = d21_first_sight_at_open("d21c");
+    s.repo.checkout("feat").unwrap();
+    assert_eq!(
+        s.head_notice().as_deref(),
+        Some("switched new → feat: 1 files differ from seen state"),
+        "a return to a parked record keeps today's text"
+    );
+    assert_eq!(seen_branch(&s).as_deref(), Some("feat"));
+}
+
+#[test]
+fn scenario_d21_a_first_sight_at_open_does_not_relabel_a_detach() {
+    let mut s = d21_first_sight_at_open("d21d");
+    let feat_tip = s.repo.git(&["rev-parse", "refs/heads/feat"]).unwrap();
+    let short: String = feat_tip.trim().chars().take(7).collect();
+    s.repo.git(&["checkout", "-q", "--detach", "feat"]).unwrap();
+    assert_eq!(
+        s.head_notice().as_deref(),
+        Some(format!("switched new → {short}: 1 files differ from seen state").as_str()),
+        "a detach performs no switch, so the plain checkout text"
+    );
+    assert_eq!(
+        seen_branch(&s).as_deref(),
+        Some("new"),
+        "R4: the record in force stays while HEAD is detached"
+    );
+}
+
 #[test]
 fn scenario_d21_a_1_1_ledger_adopts_the_branch_without_a_fold() {
     let mut s = Fresh::new("d21b");
