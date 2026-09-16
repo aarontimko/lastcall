@@ -102,8 +102,8 @@ cargo install --git https://github.com/aarontimko/lastcall --tag v0.2.0 lastcall
 
 That puts `lastcall` in `~/.cargo/bin`. Upgrading is the same line with the tag of the
 release you want and `--force`. `lastcall update` will not touch a binary cargo installed:
-it says so and prints the `cargo install` line to run instead, because replacing a file a
-package manager owns is that package manager's job.
+it says so and prints the `cargo install` line to run instead, with the tag left for you to
+fill in, because replacing a file a package manager owns is that package manager's job.
 
 ## Use it
 
