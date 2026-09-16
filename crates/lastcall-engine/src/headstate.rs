@@ -88,11 +88,23 @@ pub fn current_head(rg: &RepoGit) -> (Option<Oid>, Option<String>) {
 /// answer decides which seen record is in force. `checkout` and `switch` write `HEAD`
 /// through a lockfile and a rename, so a torn read never happens; a missing file or a
 /// `HEAD.lock` can, and both answer `None`, which means "no switch" everywhere upstream.
+///
+/// A name that is not one a ref can have (it holds whitespace) answers `None` as well:
+/// git never writes such a file, and a corrupted one must not invent a branch, park the
+/// record in force under it and have the name pruned at the next switch.
 pub fn head_branch(git_dir: &Path) -> Option<String> {
     let bytes = std::fs::read(git_dir.join("HEAD")).ok()?;
     let text = String::from_utf8(bytes).ok()?;
     let name = text.trim().strip_prefix("ref: refs/heads/")?;
-    (!name.is_empty()).then(|| name.to_owned())
+    if name.is_empty() || name.chars().any(char::is_whitespace) {
+        return None;
+    }
+    // The stat is paid only on the branch answer, which is the only one a lock can change:
+    // every other path here already answers `None`.
+    if git_dir.join("HEAD.lock").exists() {
+        return None;
+    }
+    Some(name.to_owned())
 }
 
 pub fn inspect(rg: &RepoGit) -> Result<HeadState, GitError> {
@@ -691,6 +703,42 @@ mod tests {
         let unborn = inspect(&rg).unwrap();
         assert_eq!(unborn.branch.as_deref(), Some("fresh"));
         assert!(unborn.head.is_none() && !unborn.detached);
+    }
+
+    /// R1's "no switch" states, read from the file alone: a detached or unborn `HEAD`, a
+    /// missing or empty one, a `HEAD.lock` beside it (git is mid-write, so the name on disk
+    /// is the one it is about to replace), and a name no ref could have.
+    #[test]
+    fn headstate_head_branch_answers_none_while_head_is_locked_or_unusable() {
+        let dir = lastcall_testkit::tmp::TempDir::new("lc-headbranch");
+        let git_dir = dir.mkdir("g");
+        assert_eq!(head_branch(&git_dir), None, "no HEAD at all");
+
+        dir.write("g/HEAD", "ref: refs/heads/main\n");
+        assert_eq!(head_branch(&git_dir).as_deref(), Some("main"));
+        dir.write("g/HEAD", "ref: refs/heads/feat/deep/x\n");
+        assert_eq!(
+            head_branch(&git_dir).as_deref(),
+            Some("feat/deep/x"),
+            "a slashed name is a name"
+        );
+
+        // F5: a lock beside it means no switch, and the answer comes back when it goes.
+        dir.write("g/HEAD", "ref: refs/heads/main\n");
+        let lock = dir.write("g/HEAD.lock", "ref: refs/heads/other\n");
+        assert_eq!(head_branch(&git_dir), None, "HEAD.lock is mid-write");
+        std::fs::remove_file(&lock).unwrap();
+        assert_eq!(head_branch(&git_dir).as_deref(), Some("main"));
+
+        // F9: trailing garbage is not a branch name.
+        dir.write("g/HEAD", "ref: refs/heads/main junk\n");
+        assert_eq!(head_branch(&git_dir), None, "whitespace in the name");
+        dir.write("g/HEAD", "ref: refs/heads/\n");
+        assert_eq!(head_branch(&git_dir), None, "an empty name");
+        dir.write("g/HEAD", "");
+        assert_eq!(head_branch(&git_dir), None, "an empty file");
+        dir.write("g/HEAD", "1111111111111111111111111111111111111111\n");
+        assert_eq!(head_branch(&git_dir), None, "detached");
     }
 
     /// A tag with the branch's own name must change nothing. `symbolic-ref --short` would
