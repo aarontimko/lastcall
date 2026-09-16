@@ -248,6 +248,42 @@ lc_accept_file f2; assert_pile "D24B accepted on future" ""
 git -C "$R" checkout -q main
 assert_pile "D24B the fold takes main's v1 for f" ""
 assert_str "D24B the folded path lost its override" "$(git -C "$R" rev-parse "main:f2")" "$(lc_baseline f2)"
+# D25: a branch cut from the shared ancestor and committed to before lastcall looks.
+# The fold's target is the merge-base of the two tips, so the work accepted on the branch
+# left is not carried onto a branch that never had it.
+fresh d25; assert_pile "D25 first sight on main at c1" ""
+git -C "$R" checkout -q -b feat
+echo a > "$R/a.rs"; echo b > "$R/b.rs"; echo c > "$R/c.rs"; git -C "$R" add -A; git -C "$R" commit -qm c2
+assert_pile "D25 the agent's commit is pending on feat" "a.rs|b.rs|c.rs"
+lc_accept_file a.rs; lc_accept_file b.rs; lc_accept_file c.rs
+assert_pile "D25 the three files accepted on feat" ""
+# One shell line: the harness observes no intermediate state between these commands.
+git -C "$R" checkout -q main && git -C "$R" checkout -q -b feat2 && \
+  { echo d > "$R/d.rs"; git -C "$R" add -A; git -C "$R" commit -qm c3; }
+assert_pile "D25 on feat2: the accepted work folds to the merge-base, only d shows" "d.rs"
+assert_str "D25 feat2 in force, main and feat parked" "feat2 feat|main" "$(cat "$S/seen_branch") $(lc_parked)"
+lc_accept_file d.rs
+git -C "$R" checkout -q feat; assert_pile "D25 feat's parked record" ""
+git -C "$R" checkout -q main; assert_pile "D25 main at c1" ""
+# Variant A (timing independence): the same sequence with a scan after every command.
+fresh d25a; assert_pile "D25A first sight on main at c1" ""
+git -C "$R" checkout -q -b feat; assert_pile "D25A feat is a copy of main's record" ""
+echo a > "$R/a.rs"; echo b > "$R/b.rs"; echo c > "$R/c.rs"; git -C "$R" add -A; git -C "$R" commit -qm c2
+assert_pile "D25A the agent's commit is pending on feat" "a.rs|b.rs|c.rs"
+lc_accept_file a.rs; lc_accept_file b.rs; lc_accept_file c.rs
+assert_pile "D25A accepted on feat" ""
+git -C "$R" checkout -q main; assert_pile "D25A main's parked record, no deletions" ""
+git -C "$R" checkout -q -b feat2; assert_pile "D25A feat2 is a copy of main's record" ""
+echo d > "$R/d.rs"; git -C "$R" add -A; git -C "$R" commit -qm c3
+assert_pile "D25A the same pile as the unobserved run" "d.rs"
+# Variant B: the hide the ancestor form admitted (a cherry-pick of accepted content).
+fresh d25b; assert_pile "D25B first sight on main" ""
+git -C "$R" checkout -q -b run-2; echo c > "$R/c.rs"; git -C "$R" add -A; git -C "$R" commit -qm "run-2 work"
+assert_pile "D25B the run's work is pending" "c.rs"
+lc_accept_all; assert_pile "D25B accepted on run-2" ""
+# lastcall is closed: the run's commit is cherry-picked onto a branch cut from main.
+git -C "$R" checkout -q -b feat/x main && git -C "$R" cherry-pick main..run-2 >/dev/null 2>&1
+assert_pile "D25B the cherry-picked content shows once more, never hidden by the copy" "c.rs"
 
 echo "== E. storage =="
 fresh e2; echo edit >> "$R/f1"; lc_accept_file f1; echo deadbeefdeadbeefdeadbeefdeadbeefdeadbeef > "$S/overrides/f1"

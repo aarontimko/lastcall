@@ -2043,3 +2043,169 @@ fn scenario_d24_variant_b_content_accepted_at_the_departed_tip_still_folds() {
     s.repo.checkout("future").unwrap();
     assert_pile!(s.engine, s.root, "", "D24B future's own record comes back");
 }
+
+// ---------------------------------------------------------------------------------------
+// D25: the fold's target is the merge-base of the two tips, not the branch it left.
+// ---------------------------------------------------------------------------------------
+
+/// D25: a branch cut from the shared ancestor and committed to before lastcall looks.
+///
+/// The whole sequence `checkout main && checkout -b feat2 && commit` runs with no scan
+/// between the commands, so the record in force when the scan finally runs is `feat`'s: the
+/// two tips have diverged and the fold takes the merge-base, which is the commit both
+/// branches were cut from.
+#[test]
+fn scenario_d25_a_branch_cut_from_the_shared_ancestor_folds_to_the_merge_base() {
+    let mut s = Fresh::new("d25");
+    assert_pile!(s.engine, s.root, "", "D25 first sight on main at c1");
+    s.repo.checkout_b("feat").unwrap();
+    assert_pile!(s.engine, s.root, "", "D25 feat is a copy of main's record");
+    for n in ["a.rs", "b.rs", "c.rs"] {
+        s.repo.write(n, format!("{n}\n"));
+    }
+    s.repo.commit("c2 adds a, b and c").unwrap();
+    assert_pile!(
+        s.engine,
+        s.root,
+        "a.rs|b.rs|c.rs",
+        "D25 the agent's commit is pending on feat"
+    );
+    for n in ["a.rs", "b.rs", "c.rs"] {
+        assert!(s.accept_file(n).ok());
+    }
+    assert_pile!(s.engine, s.root, "", "D25 the three files accepted on feat");
+    let _ = s.engine.inspect_head(&s.root).unwrap();
+
+    // One shell line: lastcall observes no intermediate state between these three commands.
+    s.repo.checkout("main").unwrap();
+    s.repo.checkout_b("feat2").unwrap();
+    s.repo.write("d.rs", "d\n");
+    s.repo.commit("c3 adds d").unwrap();
+
+    let pile = assert_pile!(
+        s.engine,
+        s.root,
+        "d.rs",
+        "D25 on feat2: the accepted work folds to the merge-base, only d shows"
+    );
+    assert_eq!(
+        pile.row(b"d.rs").unwrap().change,
+        Change::Added,
+        "feat2's own commit is not in the fold's path list and shows"
+    );
+    assert_eq!(
+        s.head_notice().as_deref(),
+        Some(
+            "switched feat → feat2: first time here, seen state carried from feat; 1 file pending"
+        )
+    );
+    assert_eq!(seen_branch(&s).as_deref(), Some("feat2"));
+    assert!(
+        s.ledger().overrides.is_empty(),
+        "the folded paths lost their overrides"
+    );
+    s.restart();
+    assert_pile!(s.engine, s.root, "d.rs", "D25 restart on feat2");
+
+    assert!(s.accept_file("d.rs").ok());
+    s.repo.checkout("feat").unwrap();
+    assert_pile!(
+        s.engine,
+        s.root,
+        "",
+        "D25 feat's parked record: its own work is still accepted"
+    );
+    s.repo.checkout("main").unwrap();
+    assert_pile!(s.engine, s.root, "", "D25 main: nothing pending at c1");
+}
+
+/// D25 Variant A, timing independence: the same sequence with a scan after every git
+/// command reaches the same pile at every step the two runs share.
+#[test]
+fn scenario_d25_variant_a_a_scan_after_every_command_reaches_the_same_pile() {
+    let mut s = Fresh::new("d25a");
+    assert_pile!(s.engine, s.root, "", "D25A first sight on main at c1");
+    s.repo.checkout_b("feat").unwrap();
+    assert_pile!(s.engine, s.root, "", "D25A feat is a copy of main's record");
+    for n in ["a.rs", "b.rs", "c.rs"] {
+        s.repo.write(n, format!("{n}\n"));
+    }
+    s.repo.commit("c2 adds a, b and c").unwrap();
+    assert_pile!(
+        s.engine,
+        s.root,
+        "a.rs|b.rs|c.rs",
+        "D25A the agent's commit is pending on feat"
+    );
+    for n in ["a.rs", "b.rs", "c.rs"] {
+        assert!(s.accept_file(n).ok());
+    }
+    assert_pile!(s.engine, s.root, "", "D25A accepted on feat");
+    let _ = s.engine.inspect_head(&s.root).unwrap();
+    s.repo.checkout("main").unwrap();
+    assert_pile!(
+        s.engine,
+        s.root,
+        "",
+        "D25A main's parked record, no deletions"
+    );
+    s.repo.checkout_b("feat2").unwrap();
+    assert_pile!(
+        s.engine,
+        s.root,
+        "",
+        "D25A feat2 is a copy of main's record"
+    );
+    s.repo.write("d.rs", "d\n");
+    s.repo.commit("c3 adds d").unwrap();
+    assert_pile!(
+        s.engine,
+        s.root,
+        "d.rs",
+        "D25A the same pile as the unobserved run"
+    );
+    assert!(s.accept_file("d.rs").ok());
+    s.repo.checkout("feat").unwrap();
+    assert_pile!(s.engine, s.root, "", "D25A feat's parked record");
+    s.repo.checkout("main").unwrap();
+    assert_pile!(s.engine, s.root, "", "D25A main");
+}
+
+/// D25 Variant B, the hide the ancestor form admitted: the cherry-picked copy of content
+/// accepted on a run branch must show again on the feature branch (D16's rule), and the
+/// carried override must not hide it.
+#[test]
+fn scenario_d25_variant_b_a_cherry_pick_is_never_hidden_by_the_carried_override() {
+    let mut s = d15_three_records("d25b");
+    s.repo.checkout("run-1").unwrap();
+    assert_pile!(s.engine, s.root, "a.rs|b.rs", "D25B run-1's work");
+    assert!(s.accept_all().ok());
+    s.repo.checkout("run-2").unwrap();
+    assert_pile!(s.engine, s.root, "c.rs", "D25B run-2's work");
+    assert!(s.accept_all().ok());
+    assert_pile!(s.engine, s.root, "", "D25B accepted on run-2");
+
+    // lastcall is closed while the run's commit is cherry-picked onto a branch cut from
+    // main: a new commit id, so run-2 is not an ancestor of feat/x.
+    s.repo
+        .git(&["checkout", "-q", "-b", "feat/x", "main"])
+        .unwrap();
+    s.repo.git(&["cherry-pick", "main..run-2"]).unwrap();
+    s.restart();
+
+    assert_pile!(
+        s.engine,
+        s.root,
+        "c.rs",
+        "D25B the cherry-picked content shows once more, by design (D16)"
+    );
+    assert_eq!(seen_branch(&s).as_deref(), Some("feat/x"));
+    assert!(
+        s.engine.inspect_head(&s.root).unwrap().is_none(),
+        "no notice: nothing moved while lastcall watched"
+    );
+    assert!(
+        s.ledger().overrides.is_empty(),
+        "c.rs was accepted at run-2's tip, so the fold took the merge-base's absence"
+    );
+}
