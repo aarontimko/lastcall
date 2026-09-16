@@ -12,7 +12,7 @@ use lastcall_engine::roots::Badge;
 use lastcall_engine::scan::{Change, Collapsed, Rename, probe_case_insensitive};
 use lastcall_testkit::assert_pile;
 use lastcall_testkit::engine::{open_engine, open_engine_with};
-use lastcall_testkit::fixture_repo::FixtureRepo;
+use lastcall_testkit::fixture_repo::{AUTHOR_EMAIL, AUTHOR_NAME, FixtureRepo, SEED_FILES};
 use lastcall_testkit::tmp::TempDir;
 
 #[test]
@@ -2209,5 +2209,277 @@ fn scenario_d25_variant_b_a_cherry_pick_is_never_hidden_by_the_carried_override(
     assert!(
         s.ledger().overrides.is_empty(),
         "c.rs was accepted at run-2's tip, so the fold took the merge-base's absence"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// D26 — the fold takes only entries that are already seen state.
+// ---------------------------------------------------------------------------------------
+
+/// One git plumbing command against `repo`'s git dir with an index file of its own and an
+/// optional stdin, in the same isolated environment the fixture uses.
+///
+/// [`FixtureRepo::git`] removes `GIT_INDEX_FILE` and offers no stdin, so a branch built
+/// without a checkout (D26 Variant B) needs its own runner.
+fn plumb(
+    cwd: &std::path::Path,
+    index: &std::path::Path,
+    args: &[&str],
+    stdin: Option<&[u8]>,
+) -> String {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env("GIT_INDEX_FILE", index)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", AUTHOR_NAME)
+        .env("GIT_AUTHOR_EMAIL", AUTHOR_EMAIL)
+        .env("GIT_COMMITTER_NAME", AUTHOR_NAME)
+        .env("GIT_COMMITTER_EMAIL", AUTHOR_EMAIL)
+        .env("GIT_AUTHOR_DATE", "1700000000 +0000")
+        .env("GIT_COMMITTER_DATE", "1700000000 +0000")
+        .env("LC_ALL", "C")
+        .env("TZ", "UTC")
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn git");
+    if let Some(bytes) = stdin {
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(bytes)
+            .expect("write stdin");
+    }
+    let out = child.wait_with_output().expect("git output");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+/// A branch built from `base` by plumbing alone, with `sets` written over `base`'s tree.
+/// It is never checked out, so it never becomes the branch in force and never gets a
+/// record of its own.
+fn plumb_branch(repo: &FixtureRepo, name: &str, base: &str, sets: &[(&str, &str)]) -> String {
+    let index = repo.parent_dir().join(format!("{name}.index"));
+    let _ = std::fs::remove_file(&index);
+    let cwd = repo.path();
+    plumb(cwd, &index, &["read-tree", base], None);
+    for (path, contents) in sets {
+        let blob = plumb(
+            cwd,
+            &index,
+            &["hash-object", "-w", "--stdin"],
+            Some(contents.as_bytes()),
+        );
+        plumb(
+            cwd,
+            &index,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("100644,{blob},{path}"),
+            ],
+            None,
+        );
+    }
+    let tree = plumb(cwd, &index, &["write-tree"], None);
+    let commit = plumb(
+        cwd,
+        &index,
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            base,
+            "-m",
+            &format!("{name} built without a checkout"),
+        ],
+        None,
+    );
+    plumb(
+        cwd,
+        &index,
+        &["update-ref", &format!("refs/heads/{name}"), &commit],
+        None,
+    );
+    let _ = std::fs::remove_file(&index);
+    commit
+}
+
+/// D26, the main case: a version committed and put back before it was ever accepted is
+/// not seen state, so a branch cut at that commit must show it.
+///
+/// `main` goes c1 (first sight) → c2 (f1 = v2, pending, never accepted) → c3 (f1 back to
+/// the first-sight content). `B` is cut at c2, so the merge-base of the two tips is c2
+/// itself and its entry for f1 is the version that was never on a screen.
+#[test]
+fn scenario_d26_a_version_that_was_never_accepted_is_not_folded_in() {
+    let mut s = Fresh::new("d26");
+    assert_pile!(s.engine, s.root, "", "D26 first sight on main at c1");
+    let c1 = s.head();
+    let seed = SEED_FILES[0].1;
+
+    s.repo.write("f1", "P v2\n");
+    s.repo.commit("c2 sets f1 to v2").unwrap();
+    assert_pile!(
+        s.engine,
+        s.root,
+        "f1",
+        "D26 c2 is pending and never accepted"
+    );
+    let c2 = s.head();
+
+    s.repo.write("f1", seed);
+    s.repo.commit("c3 puts f1 back").unwrap();
+    assert_pile!(
+        s.engine,
+        s.root,
+        "",
+        "D26 c3 restores the entry lastcall saw"
+    );
+
+    s.repo.git(&["checkout", "-q", "-b", "B", &c2]).unwrap();
+    let pile = assert_pile!(s.engine, s.root, "f1", "D26 v2 was never seen state");
+    let row = pile.row(b"f1").unwrap();
+    assert_eq!(row.change, Change::Modified);
+    assert_eq!(
+        row.baseline.as_ref().unwrap().oid.to_string(),
+        s.repo
+            .git(&["rev-parse", &format!("{c1}:f1")])
+            .unwrap()
+            .trim(),
+        "the record still holds the first-sight entry"
+    );
+
+    assert!(s.accept_file("f1").ok());
+    assert_pile!(s.engine, s.root, "", "D26 v2 accepted on B");
+    s.repo.checkout("main").unwrap();
+    assert_pile!(
+        s.engine,
+        s.root,
+        "",
+        "D26 main's parked record is untouched"
+    );
+}
+
+/// D26 Variant A, the same shape with a mode flip: the executable bit set at c2 and
+/// cleared at c3 was never accepted, so `B` at c2 must show the mode.
+#[test]
+fn scenario_d26_variant_a_a_mode_that_was_never_accepted_is_not_folded_in() {
+    let mut s = Fresh::new("d26a");
+    assert_pile!(s.engine, s.root, "", "D26A first sight on main at c1");
+
+    s.repo.chmod_x("f2", true);
+    s.repo.commit("c2 makes f2 executable").unwrap();
+    assert_pile!(s.engine, s.root, "f2", "D26A the bit is pending on main");
+    let c2 = s.head();
+
+    s.repo.chmod_x("f2", false);
+    s.repo.commit("c3 clears the bit").unwrap();
+    assert_pile!(
+        s.engine,
+        s.root,
+        "",
+        "D26A c3 restores the mode lastcall saw"
+    );
+
+    s.repo.git(&["checkout", "-q", "-b", "B", &c2]).unwrap();
+    let pile = assert_pile!(s.engine, s.root, "f2", "D26A the bit was never seen state");
+    assert_eq!(pile.row(b"f2").unwrap().change, Change::Mode);
+    assert!(
+        s.ledger().overrides.is_empty(),
+        "the fold wrote no override"
+    );
+}
+
+/// D26 Variant B: a branch built without a checkout never has a record, so nothing in the
+/// ledger has ever shown its content. Merged into the watched branch with `-X ours` and
+/// then checked out, its own tip is the merge-base, and the entry it carries for f1 must
+/// still show.
+#[test]
+fn scenario_d26_variant_b_a_never_visited_branch_is_not_seen_state() {
+    let mut s = Fresh::new("d26b");
+    assert_pile!(s.engine, s.root, "", "D26B first sight on main at c1");
+    let c1 = s.head();
+
+    s.repo.checkout_b("A").unwrap();
+    assert_pile!(s.engine, s.root, "", "D26B A is a copy of main's record");
+    s.repo.write("f1", "P v2\n");
+    s.repo.commit("c2 sets f1 to v2 on A").unwrap();
+    assert_pile!(s.engine, s.root, "f1", "D26B the commit on A is pending");
+    assert!(s.accept_file("f1").ok());
+    assert_pile!(s.engine, s.root, "", "D26B v2 accepted on A");
+
+    plumb_branch(&s.repo, "other", &c1, &[("f1", "P vm\n"), ("k2", "k2\n")]);
+    s.repo
+        .git(&[
+            "merge",
+            "-q",
+            "--no-ff",
+            "-X",
+            "ours",
+            "-m",
+            "merge other into A",
+            "other",
+        ])
+        .unwrap();
+    assert_pile!(s.engine, s.root, "k2", "D26B the merge brings k2 in");
+    assert!(s.accept_file("k2").ok());
+    assert_pile!(s.engine, s.root, "", "D26B k2 accepted on A");
+
+    s.repo.checkout("other").unwrap();
+    let pile = assert_pile!(
+        s.engine,
+        s.root,
+        "f1",
+        "D26B other's f1 was never seen state"
+    );
+    assert_eq!(pile.row(b"f1").unwrap().change, Change::Modified);
+}
+
+/// D26 Variant C, the seed folds back: a deletion accepted on `b1` must not survive the
+/// walk back to `b0`, whose entry at the merge-base is the one lastcall first saw. This
+/// is the over-show the seen-state target removes.
+#[test]
+fn scenario_d26_variant_c_the_first_sight_entry_folds_back() {
+    let mut s = Fresh::new("d26c");
+    assert_pile!(s.engine, s.root, "", "D26C first sight on main at c1");
+
+    // Two cuts with no scan between them, so b0 never gets a record of its own.
+    s.repo.git(&["checkout", "-q", "-b", "b0"]).unwrap();
+    s.repo.git(&["checkout", "-q", "-b", "b1"]).unwrap();
+    s.repo.remove("f1");
+    s.repo.commit("c2 removes f1 on b1").unwrap();
+    assert_pile!(s.engine, s.root, "f1", "D26C the removal is pending on b1");
+    assert!(s.accept_file("f1").ok());
+    assert_pile!(s.engine, s.root, "", "D26C the removal accepted on b1");
+
+    s.repo.checkout("b0").unwrap();
+    assert_pile!(
+        s.engine,
+        s.root,
+        "",
+        "D26C the first-sight entry folds back on b0"
+    );
+    assert!(
+        s.ledger().overrides.is_empty(),
+        "the accepted deletion is spent by the fold"
     );
 }

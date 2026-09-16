@@ -291,6 +291,65 @@ lc_accept_all; assert_pile "D25B accepted on run-2" ""
 git -C "$R" checkout -q -b feat/x main && GIT_COMMITTER_DATE="@2000000000 +0000" git -C "$R" cherry-pick main..run-2 >/dev/null 2>&1
 assert_pile "D25B the cherry-picked content shows once more, never hidden by the copy" "c.rs"
 
+# D26: the fold takes only entries that are already seen state. Main case: a version
+# committed and put back before it was ever accepted is not seen state, so a branch cut at
+# that commit must show it (its own tip is the merge-base of the two tips).
+fresh d26; assert_pile "D26 first sight on main at c1" ""
+c1="$(git -C "$R" rev-parse HEAD)"
+printf 'P v2\n' > "$R/f1"; git -C "$R" add -A; git -C "$R" commit -qm c2; c2="$(git -C "$R" rev-parse HEAD)"
+assert_pile "D26 c2 is pending and never accepted" "f1"
+git -C "$R" show "$c1:f1" > "$R/f1"; git -C "$R" add -A; git -C "$R" commit -qm c3
+assert_pile "D26 c3 restores the entry lastcall saw" ""
+git -C "$R" branch -q B "$c2"; git -C "$R" checkout -q B
+assert_pile "D26 v2 was never seen state" "f1"
+assert_str "D26 the record still holds the first-sight entry" "$(git -C "$R" rev-parse "$c1:f1")" "$(lc_baseline f1)"
+lc_accept_file f1; assert_pile "D26 v2 accepted on B" ""
+git -C "$R" checkout -q main; assert_pile "D26 main's parked record is untouched" ""
+# Variant A: the same shape with a mode flip. The bit set at c2 and cleared at c3 was
+# never accepted, so B at c2 shows the mode.
+fresh d26a; assert_pile "D26A first sight on main at c1" ""
+chmod +x "$R/f2"; git -C "$R" add -A; git -C "$R" commit -qm c2; c2="$(git -C "$R" rev-parse HEAD)"
+assert_pile "D26A the bit is pending on main" "f2"
+chmod -x "$R/f2"; git -C "$R" add -A; git -C "$R" commit -qm c3
+assert_pile "D26A c3 restores the mode lastcall saw" ""
+git -C "$R" branch -q B "$c2"; git -C "$R" checkout -q B
+assert_pile "D26A the bit was never seen state" "f2"
+assert_str "D26A the record still holds the mode lastcall saw" "100644" "$(lc_tree_mode f2)"
+# Variant B: a branch built without a checkout never had a record, so nothing in the ledger
+# has shown its content. Merged in with -X ours and then checked out, its own tip is the
+# merge-base and the entry it carries for f1 must still show.
+fresh d26b; assert_pile "D26B first sight on main at c1" ""
+c1="$(git -C "$R" rev-parse HEAD)"
+git -C "$R" checkout -q -b A; assert_pile "D26B A is a copy of main's record" ""
+printf 'P v2\n' > "$R/f1"; git -C "$R" add -A; git -C "$R" commit -qm "c2 sets f1 to v2 on A"
+assert_pile "D26B the commit on A is pending" "f1"
+lc_accept_file f1; assert_pile "D26B v2 accepted on A" ""
+idx="$W/d26b.index"; rm -f "$idx"
+GIT_INDEX_FILE="$idx" git -C "$R" read-tree "$c1"
+ob1="$(printf 'P vm\n' | git -C "$R" hash-object -w --stdin)"
+ob2="$(printf 'k2\n' | git -C "$R" hash-object -w --stdin)"
+GIT_INDEX_FILE="$idx" git -C "$R" update-index --add --cacheinfo "100644,$ob1,f1"
+GIT_INDEX_FILE="$idx" git -C "$R" update-index --add --cacheinfo "100644,$ob2,k2"
+otree="$(GIT_INDEX_FILE="$idx" git -C "$R" write-tree)"
+ocommit="$(git -C "$R" commit-tree "$otree" -p "$c1" -m "other built without a checkout")"
+git -C "$R" update-ref refs/heads/other "$ocommit"; rm -f "$idx"
+git -C "$R" merge -q --no-ff -X ours -m "merge other into A" other
+assert_pile "D26B the merge brings k2 in" "k2"
+lc_accept_file k2; assert_pile "D26B k2 accepted on A" ""
+git -C "$R" checkout -q other
+assert_pile "D26B other's f1 was never seen state" "f1"
+# Variant C, the seed folds back: a deletion accepted on b1 must not survive the walk back
+# to b0, whose entry at the merge-base is the one lastcall first saw.
+fresh d26c; assert_pile "D26C first sight on main at c1" ""
+# One shell line: b0 never gets a record of its own.
+git -C "$R" checkout -q -b b0 && git -C "$R" checkout -q -b b1 && \
+  { git -C "$R" rm -q f1; git -C "$R" commit -qm "c2 removes f1 on b1"; }
+assert_pile "D26C the removal is pending on b1" "f1"
+lc_accept_file f1; assert_pile "D26C the removal accepted on b1" ""
+git -C "$R" checkout -q b0
+assert_pile "D26C the first-sight entry folds back on b0" ""
+assert_str "D26C the accepted deletion is spent by the fold" "$(git -C "$R" rev-parse "main:f1")" "$(lc_baseline f1)"
+
 echo "== E. storage =="
 fresh e2; echo edit >> "$R/f1"; lc_accept_file f1; echo deadbeefdeadbeefdeadbeefdeadbeefdeadbeef > "$S/overrides/f1"
 assert_pile "E2 corrupt override -> falls to tree baseline (over-show)" "f1"
