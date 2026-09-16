@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::Fresh;
+use common::{Fresh, plumb_branch};
 use lastcall_engine::config::Config;
 use lastcall_engine::engine::{EngineOptions, RestoreRequest};
 use lastcall_engine::git::Mode;
@@ -12,7 +12,7 @@ use lastcall_engine::roots::Badge;
 use lastcall_engine::scan::{Change, Collapsed, Rename, probe_case_insensitive};
 use lastcall_testkit::assert_pile;
 use lastcall_testkit::engine::{open_engine, open_engine_with};
-use lastcall_testkit::fixture_repo::{AUTHOR_EMAIL, AUTHOR_NAME, FixtureRepo, SEED_FILES};
+use lastcall_testkit::fixture_repo::{FixtureRepo, SEED_FILES};
 use lastcall_testkit::tmp::TempDir;
 
 #[test]
@@ -2216,113 +2216,6 @@ fn scenario_d25_variant_b_a_cherry_pick_is_never_hidden_by_the_carried_override(
 // D26 — the fold takes only entries that are already seen state.
 // ---------------------------------------------------------------------------------------
 
-/// One git plumbing command against `repo`'s git dir with an index file of its own and an
-/// optional stdin, in the same isolated environment the fixture uses.
-///
-/// [`FixtureRepo::git`] removes `GIT_INDEX_FILE` and offers no stdin, so a branch built
-/// without a checkout (D26 Variant B) needs its own runner.
-fn plumb(
-    cwd: &std::path::Path,
-    index: &std::path::Path,
-    args: &[&str],
-    stdin: Option<&[u8]>,
-) -> String {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-    let mut child = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env("GIT_INDEX_FILE", index)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_AUTHOR_NAME", AUTHOR_NAME)
-        .env("GIT_AUTHOR_EMAIL", AUTHOR_EMAIL)
-        .env("GIT_COMMITTER_NAME", AUTHOR_NAME)
-        .env("GIT_COMMITTER_EMAIL", AUTHOR_EMAIL)
-        .env("GIT_AUTHOR_DATE", "1700000000 +0000")
-        .env("GIT_COMMITTER_DATE", "1700000000 +0000")
-        .env("LC_ALL", "C")
-        .env("TZ", "UTC")
-        .stdin(if stdin.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn git");
-    if let Some(bytes) = stdin {
-        child
-            .stdin
-            .take()
-            .expect("stdin")
-            .write_all(bytes)
-            .expect("write stdin");
-    }
-    let out = child.wait_with_output().expect("git output");
-    assert!(
-        out.status.success(),
-        "git {args:?}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).trim().to_owned()
-}
-
-/// A branch built from `base` by plumbing alone, with `sets` written over `base`'s tree.
-/// It is never checked out, so it never becomes the branch in force and never gets a
-/// record of its own.
-fn plumb_branch(repo: &FixtureRepo, name: &str, base: &str, sets: &[(&str, &str)]) -> String {
-    let index = repo.parent_dir().join(format!("{name}.index"));
-    let _ = std::fs::remove_file(&index);
-    let cwd = repo.path();
-    plumb(cwd, &index, &["read-tree", base], None);
-    for (path, contents) in sets {
-        let blob = plumb(
-            cwd,
-            &index,
-            &["hash-object", "-w", "--stdin"],
-            Some(contents.as_bytes()),
-        );
-        plumb(
-            cwd,
-            &index,
-            &[
-                "update-index",
-                "--add",
-                "--cacheinfo",
-                &format!("100644,{blob},{path}"),
-            ],
-            None,
-        );
-    }
-    let tree = plumb(cwd, &index, &["write-tree"], None);
-    let commit = plumb(
-        cwd,
-        &index,
-        &[
-            "commit-tree",
-            &tree,
-            "-p",
-            base,
-            "-m",
-            &format!("{name} built without a checkout"),
-        ],
-        None,
-    );
-    plumb(
-        cwd,
-        &index,
-        &["update-ref", &format!("refs/heads/{name}"), &commit],
-        None,
-    );
-    let _ = std::fs::remove_file(&index);
-    commit
-}
-
 /// D26, the main case: a version committed and put back before it was ever accepted is
 /// not seen state, so a branch cut at that commit must show it.
 ///
@@ -2427,7 +2320,12 @@ fn scenario_d26_variant_b_a_never_visited_branch_is_not_seen_state() {
     assert!(s.accept_file("f1").ok());
     assert_pile!(s.engine, s.root, "", "D26B v2 accepted on A");
 
-    plumb_branch(&s.repo, "other", &c1, &[("f1", "P vm\n"), ("k2", "k2\n")]);
+    plumb_branch(
+        &s.repo,
+        "other",
+        &c1,
+        &[("f1", Some("P vm\n")), ("k2", Some("k2\n"))],
+    );
     s.repo
         .git(&[
             "merge",

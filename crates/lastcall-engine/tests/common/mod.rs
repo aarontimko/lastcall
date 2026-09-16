@@ -205,3 +205,160 @@ pub fn open_plain(
 ) -> Engine {
     open_engine(parent, env, state, config)
 }
+
+// ---------------------------------------------------------------------------------------
+// Plumbing: commits and branches built without a checkout.
+// ---------------------------------------------------------------------------------------
+
+/// One git plumbing command against `cwd` with an index file of its own, a fixed identity,
+/// a fixed date and an optional stdin.
+///
+/// [`FixtureRepo::git`] removes `GIT_INDEX_FILE` and offers no stdin, so a commit built
+/// without touching the working tree needs its own runner.
+fn plumb(cwd: &Path, index: &Path, date: &str, args: &[&str], stdin: Option<&[u8]>) -> String {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env("GIT_INDEX_FILE", index)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "Me")
+        .env("GIT_AUTHOR_EMAIL", "me@example.com")
+        .env("GIT_COMMITTER_NAME", "Me")
+        .env("GIT_COMMITTER_EMAIL", "me@example.com")
+        .env("GIT_AUTHOR_DATE", date)
+        .env("GIT_COMMITTER_DATE", date)
+        .env("LC_ALL", "C")
+        .env("TZ", "UTC")
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn git");
+    if let Some(bytes) = stdin {
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(bytes)
+            .expect("write stdin");
+    }
+    let out = child.wait_with_output().expect("git output");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+/// A commit built from `base`'s tree with `sets` written over it (`None` removes the path),
+/// carrying `parents`, dated `after` seconds past the current HEAD, with
+/// `refs/heads/<name>` moved to it. Returns the new commit.
+///
+/// Nothing is checked out and the repository's own index is never touched, so lastcall
+/// never sees the branch while this runs and the branch gets no record of its own.
+pub fn plumb_commit(
+    repo: &FixtureRepo,
+    name: &str,
+    base: &str,
+    parents: &[&str],
+    sets: &[(&str, Option<&str>)],
+    message: &str,
+    after: u64,
+) -> String {
+    let cwd = repo.path();
+    let head_at: u64 = repo
+        .git(&["log", "-1", "--format=%ct", "HEAD"])
+        .expect("HEAD date")
+        .trim()
+        .parse()
+        .expect("a unix timestamp");
+    let date = format!("{} +0000", head_at + after);
+    let index = repo.parent_dir().join(format!("plumb-{name}.index"));
+    let _ = std::fs::remove_file(&index);
+    plumb(cwd, &index, &date, &["read-tree", base], None);
+    for (path, contents) in sets {
+        match contents {
+            Some(c) => {
+                let blob = plumb(
+                    cwd,
+                    &index,
+                    &date,
+                    &["hash-object", "-w", "--stdin"],
+                    Some(c.as_bytes()),
+                );
+                plumb(
+                    cwd,
+                    &index,
+                    &date,
+                    &[
+                        "update-index",
+                        "--add",
+                        "--cacheinfo",
+                        &format!("100644,{blob},{path}"),
+                    ],
+                    None,
+                );
+            }
+            None => {
+                plumb(
+                    cwd,
+                    &index,
+                    &date,
+                    &["update-index", "--force-remove", path],
+                    None,
+                );
+            }
+        }
+    }
+    let tree = plumb(cwd, &index, &date, &["write-tree"], None);
+    let mut args: Vec<String> = vec![
+        "commit-tree".to_owned(),
+        tree,
+        "-m".to_owned(),
+        message.to_owned(),
+    ];
+    for p in parents {
+        args.push("-p".to_owned());
+        args.push((*p).to_owned());
+    }
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let commit = plumb(cwd, &index, &date, &argv, None);
+    plumb(
+        cwd,
+        &index,
+        &date,
+        &["update-ref", &format!("refs/heads/{name}"), &commit],
+        None,
+    );
+    let _ = std::fs::remove_file(&index);
+    commit
+}
+
+/// [`plumb_commit`] for the common case: a branch cut from `base` with one commit on top.
+pub fn plumb_branch(
+    repo: &FixtureRepo,
+    name: &str,
+    base: &str,
+    sets: &[(&str, Option<&str>)],
+) -> String {
+    plumb_commit(
+        repo,
+        name,
+        base,
+        &[base],
+        sets,
+        &format!("{name} built without a checkout"),
+        1,
+    )
+}
