@@ -13,14 +13,15 @@ binary rather than for the commit log.
   record of what you have seen. Accept work on a feature branch, check the branch you started
   from back out, and you get that branch's own pile, not a screen of files you already dealt
   with. The first time you check a branch out, the record carries across from the branch you
-  came from, so the switch itself shows nothing new, and if the new branch is behind the one
-  you left, the work you had already accepted there is folded away rather than listed as a
-  screen of deletions. Anything still pending when you left is still pending here: content you
-  have not looked at never becomes seen state by changing branch. Going back to
-  a branch you have been on before brings its pile back exactly as you left it, flags and undo
-  included. A change that reaches another branch by cherry-pick shows once more on that branch,
-  because lastcall never assumes you have read it somewhere else. Deleting a branch drops what
-  it remembered; renaming the branch you are on keeps it.
+  came from, so the switch itself shows nothing new, and the work you had already accepted on
+  the branch you left is folded away back to the point the two branches have in common rather
+  than listed as a screen of deletions. A branch cut from your main line while you were working
+  on another one shows its own commits and nothing else. Anything still pending when you left
+  is still pending here: content you have not looked at never becomes seen state by changing
+  branch. Going back to a branch you have been on before brings its pile back exactly as you
+  left it, flags and undo included. A change that reaches another branch by cherry-pick shows
+  once more on that branch, because lastcall never assumes you have read it somewhere else.
+  Deleting a branch drops what it remembered; renaming the branch you are on keeps it.
 - `lastcall status --json` gains two fields per repository, `seen_branch` and
   `parked_branches`; every other field still describes the branch you are on. The report's
   `status_version` is unchanged.

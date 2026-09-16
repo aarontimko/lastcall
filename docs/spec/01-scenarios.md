@@ -166,7 +166,7 @@ Legend for the harness column: **H** = verifiable with the git-plumbing harness 
 
 ## Harness notes (§7.4)
 
-**Phase 11 (Amendment v1.12, PROPOSED):** `lc.sh` gains `lc_branch_sync` (the record in force follows the branch named in `HEAD`; park to `branches/<enc name>/`, copy on first sight, the ancestor fold with `merge-base --is-ancestor` and `diff-tree`), called first by every `lc_*` entry point that reads or writes state; D14, D15, D16, D18, D20, D23, D24 and D25 are its assertions, and B2, B3, B4 keep theirs. `scripts/harness/scenarios.sh` now runs **100 assertions**, all passing (49 before this phase).
+**Phase 11 (Amendment v1.12, PROPOSED):** `lc.sh` gains `lc_branch_sync` (the record in force follows the branch named in `HEAD`; park to `branches/<enc name>/`, copy on first sight, then the fold onto the merge-base of the two tips: `merge-base`, `diff-tree` between the branch left and that commit, and the departed tip's `ls-tree` to tell accepted content from merely committed content), called first by every `lc_*` entry point that reads or writes state; D14, D15, D16, D18, D20, D23, D24 and D25 are its assertions, and B2, B3, B4 keep theirs. `scripts/harness/scenarios.sh` now runs **132 assertions**, all passing (49 before this phase).
 
 **Status 2026-09-01:** `scripts/harness/scenarios.sh` (run: `bash scripts/harness/scenarios.sh`; fixtures go to `scripts/harness/work/`, gitignored, or `$LC_WORK`) — 49 assertions, all passing. Scenarios marked *verified* above ran green; the remaining H scenarios (A3 property, A6, D2 restore, D5 pairing, E1/E3/E4) are Phase 2 tests.
 
