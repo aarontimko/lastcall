@@ -120,18 +120,25 @@ pub fn inspect_with_paths(
     // own ref cannot mix two branches: the pair is either wholly before the checkout or
     // wholly after it, and the event for the other one follows. An unborn branch has a
     // name and no commit (verify fails), and a detached HEAD has no name, both as before.
-    let branch = {
-        let out = rg.run_raw(&["symbolic-ref", "-q", "--short", "HEAD"], None)?;
+    //
+    // The name is read in **full** (`refs/heads/main`), never `--short`: `--short`
+    // abbreviates ambiguity-aware, so a repository that also has a tag called `main`
+    // answers `heads/main`, and the ref lookup then asks for `refs/heads/heads/main` and
+    // finds nothing — the commit, the upstream annotation and the commit counts all go.
+    // The label is the full name with `refs/heads/` stripped.
+    let full = {
+        let out = rg.run_raw(&["symbolic-ref", "-q", "HEAD"], None)?;
         if out.success() {
             Some(out.stdout_trimmed()).filter(|s| !s.is_empty())
         } else {
             None
         }
     };
-    let head = match &branch {
-        Some(name) => rg.rev_parse_verify(&format!("refs/heads/{name}"))?,
+    let head = match &full {
+        Some(name) => rg.rev_parse_verify(name)?,
         None => rg.rev_parse_verify("HEAD")?,
     };
+    let branch = full.map(|r| r.strip_prefix("refs/heads/").unwrap_or(&r).to_owned());
     let detached = head.is_some() && branch.is_none();
 
     let mut flags: Vec<&str> = vec!["--git-dir", "--git-common-dir", "--is-shallow-repository"];
@@ -684,6 +691,53 @@ mod tests {
         let unborn = inspect(&rg).unwrap();
         assert_eq!(unborn.branch.as_deref(), Some("fresh"));
         assert!(unborn.head.is_none() && !unborn.detached);
+    }
+
+    /// A tag with the branch's own name must change nothing. `symbolic-ref --short` would
+    /// disambiguate the answer to `heads/main`, whose ref (`refs/heads/heads/main`) does not
+    /// exist, and the inspection would lose its commit: the root would first-sight with no
+    /// tree and show every committed file as an addition. Reading the full name keeps the
+    /// pair, before the tag and after it.
+    #[test]
+    fn headstate_inspect_survives_a_tag_named_like_the_branch() {
+        use crate::store::tests::fixture_env;
+        use lastcall_testkit::fixture_repo::FixtureRepo;
+        use lastcall_testkit::tmp::TempDir;
+        let mut repo = FixtureRepo::new("tagname").unwrap();
+        let state_dir = TempDir::new("lc-tagname");
+        let env = fixture_env(&repo, &state_dir);
+        let rg = RepoGit::new(&env, repo.path());
+
+        repo.git(&["tag", "main"]).unwrap();
+        let s = inspect(&rg).unwrap();
+        assert_eq!(s.branch.as_deref(), Some("main"), "the label is the branch");
+        assert_eq!(
+            s.head,
+            rg.rev_parse_verify("refs/heads/main").unwrap(),
+            "and the commit is that branch's own tip, not None"
+        );
+        assert!(s.head.is_some() && !s.detached);
+
+        // P1c's shape: the tag arrives after the first inspection, then a commit. Every
+        // later inspection still pairs the branch with its own moved tip.
+        repo.commit_files(&[("after-tag.txt", "one\n")], "after the tag")
+            .unwrap();
+        let moved = inspect(&rg).unwrap();
+        assert_eq!(moved.branch.as_deref(), Some("main"));
+        assert_eq!(moved.head, rg.rev_parse_verify("refs/heads/main").unwrap());
+        assert_ne!(moved.head, s.head, "the tag did not pin the answer");
+
+        // A tag on a second branch's name too: the checkout keeps name and commit together.
+        repo.checkout_b("feat").unwrap();
+        repo.git(&["tag", "feat"]).unwrap();
+        repo.commit_files(&[("on-feat.txt", "one\n")], "on feat")
+            .unwrap();
+        let on_feat = inspect(&rg).unwrap();
+        assert_eq!(on_feat.branch.as_deref(), Some("feat"));
+        assert_eq!(
+            on_feat.head,
+            rg.rev_parse_verify("refs/heads/feat").unwrap()
+        );
     }
 
     /// The batched `rev-parse` must answer exactly what the six separate calls answered,
