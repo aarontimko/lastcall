@@ -14,11 +14,14 @@ binary rather than for the commit log.
   from back out, and you get that branch's own pile, not a screen of files you already dealt
   with. The first time you check a branch out, the record carries across from the branch you
   came from, so the switch itself shows nothing new, and the work you had already accepted on
-  the branch you left is folded away back to the point the two branches have in common rather
-  than listed as a screen of deletions. A branch cut from your main line while you were working
-  on another one shows its own commits and nothing else. Anything still pending when you left
-  is still pending here: content you have not looked at never becomes seen state by changing
-  branch. Going back to a branch you have been on before brings its pile back exactly as you
+  the branch you left is folded away rather than listed as a screen of deletions, as long as
+  what the new branch holds at those paths is something you have already seen or something
+  that was in the repository before lastcall first opened it. A branch cut from your main line
+  while you were working on another one shows its own commits and nothing else. A branch
+  switch never marks content as seen that was not on your screen: a version committed and
+  reverted while you were not looking, or brought in by merging a branch you never checked
+  out, shows on the branch that carries it.
+  Going back to a branch you have been on before brings its pile back exactly as you
   left it, flags and undo included. A change that reaches another branch by cherry-pick shows
   once more on that branch, because lastcall never assumes you have read it somewhere else.
   Deleting a branch drops what it remembered; renaming the branch you are on keeps it.
