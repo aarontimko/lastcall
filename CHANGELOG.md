@@ -5,7 +5,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html). A version's s
 exactly what its GitHub release notes carry, so it is written for the people installing the
 binary rather than for the commit log.
 
-## Unreleased
+## 0.3.0 - 2026-09-17
 
 ### Changed
 
