@@ -82,26 +82,25 @@ opinion about your branches.
 
 ## Install
 
-Two routes. They upgrade differently, so pick the one whose upgrade step you want.
-
-**A prebuilt binary**, the route `lastcall update` serves. Releases carry four binaries for
-macOS and Linux, a `SHA256SUMS` file and a build attestation; the download, checksum and
-attestation steps are in [`docs/install.md`](docs/install.md), which puts the binary in
-`~/.local/bin`, or any other directory on your `PATH`. After that:
+**Install the prebuilt binary.** Releases carry four binaries for macOS and Linux, a
+`SHA256SUMS` file and a build attestation; the download, checksum and attestation steps are
+in [`docs/install.md`](docs/install.md), which puts the binary in `~/.local/bin`, or any
+other directory on your `PATH`. From then on lastcall upgrades itself:
 
 ```sh
 lastcall update --check    # is there a newer release?
 lastcall update            # download it, verify its checksum, replace this binary
 ```
 
-**cargo**, built from the tagged source:
+**Or build it with cargo**, from the tagged source, if you would rather compile it yourself:
 
 ```sh
 cargo install --git https://github.com/aarontimko/lastcall --tag v0.3.0 lastcall
 ```
 
-That puts `lastcall` in `~/.cargo/bin`. Upgrading is the same line with the tag of the
-release you want and `--force`. `lastcall update` will not touch a binary cargo installed:
+That puts `lastcall` in `~/.cargo/bin`. This route upgrades by hand: the same line with the
+tag of the release you want and `--force`. `lastcall update` will not touch a binary cargo
+installed:
 it says so and prints the `cargo install` line to run instead, with the tag left for you to
 fill in, because replacing a file a package manager owns is that package manager's job.
 
