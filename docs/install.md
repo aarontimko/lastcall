@@ -3,11 +3,11 @@
 lastcall is a single binary. There is nothing to configure before it runs, and nothing is
 written to the repositories it watches.
 
-There are two routes, and the difference that matters is how each one upgrades. A
-**prebuilt release binary** is the route [`lastcall update`](#staying-current) serves: it
-replaces the running binary in place with the next release. Built **from source with
-`cargo install`**, the binary belongs to cargo, `lastcall update` leaves it alone, and you
-upgrade by running the install line again with the new tag and `--force`.
+The recommended route is a **prebuilt release binary**, because it is the one
+[`lastcall update`](#staying-current) serves: one command replaces the running binary in
+place with the next release. Building **from source with `cargo install`** is the second
+option: the binary then belongs to cargo, `lastcall update` leaves it alone, and you upgrade
+by running the install line again with the new tag and `--force`.
 
 ## From a release
 
