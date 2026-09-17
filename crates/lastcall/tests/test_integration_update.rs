@@ -355,7 +355,12 @@ fn update_refuses_a_cargo_installed_binary_before_any_fetch() {
     assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
     let said = stderr(&out);
     assert!(said.contains("installed by cargo"), "{said}");
-    assert!(said.contains("cargo install --git"), "{said}");
+    assert!(
+        said.contains(
+            "cargo install --git https://github.com/aarontimko/lastcall --tag <release> --force lastcall"
+        ),
+        "{said}"
+    );
     assert_eq!(scene.urls(), Vec::<String>::new(), "nothing was fetched");
     assert_eq!(std::fs::read(&installed).unwrap(), before);
 }

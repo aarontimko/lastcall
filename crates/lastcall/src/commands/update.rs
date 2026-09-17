@@ -364,7 +364,7 @@ pub fn refusal_under(
         .any(|dir| under(&format!("{}/", dir.display())))
     {
         return Some(
-            "installed by cargo — run: cargo install --git https://github.com/aarontimko/lastcall --force"
+            "installed by cargo — run: cargo install --git https://github.com/aarontimko/lastcall --tag <release> --force lastcall"
                 .to_owned(),
         );
     }
@@ -1101,8 +1101,15 @@ ef lastcall-0.1.0-x86_64-unknown-linux-gnu
             assert!(refusal.contains("brew upgrade lastcall"), "{refusal}");
         }
         let cargo = refuse("/home/a/.cargo/bin/lastcall").expect("cargo");
-        assert!(cargo.contains("cargo install --git"), "{cargo}");
-        assert!(cargo.contains("--force"), "{cargo}");
+        // The line has to be one a reader can run once they fill the tag in: the crate
+        // name and `--tag` are what make it that line rather than a sketch of it (verifier
+        // F8). The refusal fires before any fetch, so there is no release to name here.
+        assert!(
+            cargo.ends_with(
+                "cargo install --git https://github.com/aarontimko/lastcall --tag <release> --force lastcall"
+            ),
+            "{cargo}"
+        );
         let nix = refuse("/nix/store/abc-lastcall-0.1.0/bin/lastcall").expect("nix");
         assert!(nix.contains("nix"), "{nix}");
         // Everything else updates itself.
@@ -1127,7 +1134,10 @@ ef lastcall-0.1.0-x86_64-unknown-linux-gnu
         let elsewhere = Path::new("/opt/ci/cargo");
         for path in ["/opt/ci/cargo/bin/lastcall", "/home/a/.cargo/bin/lastcall"] {
             let moved = refusal_under(Path::new(path), Some(home), Some(elsewhere)).expect(path);
-            assert!(moved.contains("cargo install --git"), "{moved}");
+            assert!(
+                moved.contains("--tag <release> --force lastcall"),
+                "{moved}"
+            );
         }
         assert_eq!(
             refusal_under(

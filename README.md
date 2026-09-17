@@ -64,6 +64,10 @@ opinion about your branches.
   repositories, so a relaunch starts where you stopped, whatever the agent committed in
   between. The ledger lives in `~/.local/state/lastcall` (or under `$XDG_STATE_HOME`), and
   nothing is ever written into a repository it watches.
+- **Remembered per branch.** Accept work on a feature branch, check the branch you started
+  from back out, and you get that branch's own pile rather than everything you just accepted
+  coming back as deletions. The first time you check a branch out it carries across what you
+  have seen so far, so the switch itself shows nothing new.
 - **Notes that reach the agent.** A flag written next to a herdr agent is typed into that
   agent's pane, not into a file you will never open again.
 - **Generated files collapse.** A lockfile, a binary or anything very large is one row to
@@ -78,12 +82,28 @@ opinion about your branches.
 
 ## Install
 
+Two routes. They upgrade differently, so pick the one whose upgrade step you want.
+
+**A prebuilt binary**, the route `lastcall update` serves. Releases carry four binaries for
+macOS and Linux, a `SHA256SUMS` file and a build attestation; the download, checksum and
+attestation steps are in [`docs/install.md`](docs/install.md), which puts the binary in
+`~/.local/bin`, or any other directory on your `PATH`. After that:
+
+```sh
+lastcall update --check    # is there a newer release?
+lastcall update            # download it, verify its checksum, replace this binary
+```
+
+**cargo**, built from the tagged source:
+
 ```sh
 cargo install --git https://github.com/aarontimko/lastcall --tag v0.2.0 lastcall
 ```
 
-Prebuilt binaries for macOS and Linux, checksums, attestation, and `lastcall update`:
-[`docs/install.md`](docs/install.md).
+That puts `lastcall` in `~/.cargo/bin`. Upgrading is the same line with the tag of the
+release you want and `--force`. `lastcall update` will not touch a binary cargo installed:
+it says so and prints the `cargo install` line to run instead, with the tag left for you to
+fill in, because replacing a file a package manager owns is that package manager's job.
 
 ## Use it
 

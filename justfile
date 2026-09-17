@@ -67,12 +67,17 @@ test-e2e:
 test-prepush:
     #!/usr/bin/env bash
     set -euo pipefail
-    echo "--- test-prepush 1/3: just test-integration ---"
+    echo "--- test-prepush 1/4: just test-integration ---"
     just test-integration
-    echo "--- test-prepush 2/3: PROPTEST_CASES=64 cargo test -p lastcall-engine --lib proptests ---"
+    echo "--- test-prepush 2/4: PROPTEST_CASES=64 cargo test -p lastcall-engine --lib proptests ---"
     PROPTEST_CASES=64 cargo test -p lastcall-engine --lib proptests
-    echo "--- test-prepush 3/3: PROPTEST_CASES=64 cargo test -p lastcall --lib proptests ---"
+    echo "--- test-prepush 3/4: PROPTEST_CASES=64 cargo test -p lastcall --lib proptests ---"
     PROPTEST_CASES=64 cargo test -p lastcall --lib proptests
+    # The seen oracle is an integration test (it needs a real repository and the real
+    # engine), so step 1 runs it at the unit tier's case count and this step is what
+    # gives it the pre-push 64.
+    echo "--- test-prepush 4/4: PROPTEST_CASES=64 cargo test -p lastcall-engine --test test_integration_seen_oracle ---"
+    PROPTEST_CASES=64 cargo test -p lastcall-engine --test test_integration_seen_oracle
     echo "--- test-prepush: green ---"
 
 # All three tiers, in order.

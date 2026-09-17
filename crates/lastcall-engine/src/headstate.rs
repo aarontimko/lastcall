@@ -81,6 +81,32 @@ pub fn current_head(rg: &RepoGit) -> (Option<Oid>, Option<String>) {
     (head, branch)
 }
 
+/// The branch `<git_dir>/HEAD` names, or `None` when it is detached, unborn-and-unnamed,
+/// missing, locked or mid-write (Amendment v1.12, R1).
+///
+/// One file read and **no git process**: this runs on every scan of every root, and the
+/// answer decides which seen record is in force. `checkout` and `switch` write `HEAD`
+/// through a lockfile and a rename, so a torn read never happens; a missing file or a
+/// `HEAD.lock` can, and both answer `None`, which means "no switch" everywhere upstream.
+///
+/// A name that is not one a ref can have (it holds whitespace) answers `None` as well:
+/// git never writes such a file, and a corrupted one must not invent a branch, park the
+/// record in force under it and have the name pruned at the next switch.
+pub fn head_branch(git_dir: &Path) -> Option<String> {
+    let bytes = std::fs::read(git_dir.join("HEAD")).ok()?;
+    let text = String::from_utf8(bytes).ok()?;
+    let name = text.trim().strip_prefix("ref: refs/heads/")?;
+    if name.is_empty() || name.chars().any(char::is_whitespace) {
+        return None;
+    }
+    // The stat is paid only on the branch answer, which is the only one a lock can change:
+    // every other path here already answers `None`.
+    if git_dir.join("HEAD.lock").exists() {
+        return None;
+    }
+    Some(name.to_owned())
+}
+
 pub fn inspect(rg: &RepoGit) -> Result<HeadState, GitError> {
     Ok(inspect_with_paths(rg, &[])?.0)
 }
@@ -98,15 +124,33 @@ pub fn inspect_with_paths(
     rg: &RepoGit,
     git_paths: &[&str],
 ) -> Result<(HeadState, Vec<PathBuf>), GitError> {
-    let head = rg.rev_parse_verify("HEAD")?;
-    let branch = {
-        let out = rg.run_raw(&["symbolic-ref", "-q", "--short", "HEAD"], None)?;
+    // The branch first, and the commit *through* the branch it names. `git checkout`
+    // updates the working tree and the index before it moves HEAD, so an inspection that
+    // a worktree event started can easily still be running when HEAD flips: reading the
+    // commit first and the branch second pairs the commit one branch had with the name of
+    // the other, and the notice then reads `switched main → main`. Resolving the name's
+    // own ref cannot mix two branches: the pair is either wholly before the checkout or
+    // wholly after it, and the event for the other one follows. An unborn branch has a
+    // name and no commit (verify fails), and a detached HEAD has no name, both as before.
+    //
+    // The name is read in **full** (`refs/heads/main`), never `--short`: `--short`
+    // abbreviates ambiguity-aware, so a repository that also has a tag called `main`
+    // answers `heads/main`, and the ref lookup then asks for `refs/heads/heads/main` and
+    // finds nothing — the commit, the upstream annotation and the commit counts all go.
+    // The label is the full name with `refs/heads/` stripped.
+    let full = {
+        let out = rg.run_raw(&["symbolic-ref", "-q", "HEAD"], None)?;
         if out.success() {
             Some(out.stdout_trimmed()).filter(|s| !s.is_empty())
         } else {
             None
         }
     };
+    let head = match &full {
+        Some(name) => rg.rev_parse_verify(name)?,
+        None => rg.rev_parse_verify("HEAD")?,
+    };
+    let branch = full.map(|r| r.strip_prefix("refs/heads/").unwrap_or(&r).to_owned());
     let detached = head.is_some() && branch.is_none();
 
     let mut flags: Vec<&str> = vec!["--git-dir", "--git-common-dir", "--is-shallow-repository"];
@@ -238,6 +282,15 @@ pub struct TransitionFacts {
     pub commits: Option<u64>,
     /// Pending rows after the scan that followed the switch.
     pub files_differ: usize,
+    /// The branch left, when the arrival was the new branch's **first sight** (Amendment
+    /// v1.12, R8): its record had to be made, as a copy of that branch's. `None` for every
+    /// other transition, including a return to a branch whose record was parked.
+    pub first_sight_from: Option<String>,
+    /// Why the first-sight fold did not run (verifier F6), when [`Self::first_sight_from`]
+    /// is set and the fold was skipped or abandoned: `refs/heads/A` gone, no commit in
+    /// common, an unborn head, or a git call that did not answer. `None` when the fold ran,
+    /// including when it ran and folded nothing.
+    pub fold_skipped: Option<String>,
 }
 
 fn label(state: &HeadState) -> String {
@@ -277,8 +330,28 @@ pub fn transition(
         }
         Transition::Commit => format!("switched {} → {} (same commit)", label(prev), label(next)),
         Transition::Checkout => {
+            // A move that changed no commit says so and stops there, first sight or not
+            // (B2, B3, D15): there is nothing for the user to have missed, and the copy
+            // had nothing to fold.
             if prev.head == next.head {
                 format!("switched {} → {} (same commit)", label(prev), label(next))
+            } else if let Some(from) = &facts.first_sight_from {
+                let n = facts.files_differ;
+                let plural = if n == 1 { "file" } else { "files" };
+                // F6: when the fold did not run the line says so, in the same breath and on
+                // the same line, because the pile it announces is the un-folded copy's.
+                match &facts.fold_skipped {
+                    Some(why) => format!(
+                        "switched {} → {}: first time here, seen state carried from {from} without folding ({why}); {n} {plural} pending",
+                        label(prev),
+                        label(next),
+                    ),
+                    None => format!(
+                        "switched {} → {}: first time here, seen state carried from {from}; {n} {plural} pending",
+                        label(prev),
+                        label(next),
+                    ),
+                }
             } else {
                 format!(
                     "switched {} → {}: {} files differ from seen state",
@@ -380,6 +453,122 @@ mod tests {
         ));
     }
 
+    /// R8's first-sight form, the count in the singular. The branch left is named because
+    /// the state the user is looking at is that branch's, carried over.
+    #[test]
+    fn headstate_transition_first_sight_with_files_pending() {
+        let a = state("a", Some("main"), None);
+        let b = state("b", Some("feat/other"), None);
+        let facts = TransitionFacts {
+            commits: None,
+            files_differ: 1,
+            first_sight_from: Some("main".into()),
+            fold_skipped: None,
+        };
+        assert_eq!(
+            transition(
+                &a,
+                &b,
+                Some(&hint("checkout: moving from main to feat/other")),
+                &facts
+            )
+            .unwrap(),
+            "switched main → feat/other: first time here, seen state carried from main; 1 file pending"
+        );
+        let two = TransitionFacts {
+            files_differ: 2,
+            ..facts
+        };
+        assert_eq!(
+            transition(
+                &a,
+                &b,
+                Some(&hint("checkout: moving from main to feat/other")),
+                &two
+            )
+            .unwrap(),
+            "switched main → feat/other: first time here, seen state carried from main; 2 files pending"
+        );
+    }
+
+    /// D14's return leg: a first sight that folded everything away still says so, with a
+    /// zero — the wording is about where the state came from, not about the count. And the
+    /// same-commit case (B2, D15, D23) keeps today's text whether it is a first sight or
+    /// not, which is the one place the form is decided by the heads and not by the fact.
+    #[test]
+    fn headstate_transition_first_sight_with_nothing_pending() {
+        let a = state("a", Some("future"), None);
+        let b = state("b", Some("main"), None);
+        let facts = TransitionFacts {
+            commits: None,
+            files_differ: 0,
+            first_sight_from: Some("future".into()),
+            fold_skipped: None,
+        };
+        assert_eq!(
+            transition(
+                &a,
+                &b,
+                Some(&hint("checkout: moving from future to main")),
+                &facts
+            )
+            .unwrap(),
+            "switched future → main: first time here, seen state carried from future; 0 files pending"
+        );
+        let same = state("a", Some("feat/w"), None);
+        assert_eq!(
+            transition(
+                &a,
+                &same,
+                Some(&hint("checkout: moving from future to feat/w")),
+                &facts
+            )
+            .unwrap(),
+            "switched future → feat/w (same commit)"
+        );
+    }
+
+    /// Verifier F6: a first sight whose fold could not run says so on the same line. The
+    /// copy stands whole, so the count that follows is the un-folded pile's, and the reason
+    /// is what explains it.
+    #[test]
+    fn headstate_transition_first_sight_says_when_the_fold_was_skipped() {
+        let a = state("a", Some("main"), None);
+        let b = state("b", Some("alone"), None);
+        let facts = TransitionFacts {
+            commits: None,
+            files_differ: 3,
+            first_sight_from: Some("main".into()),
+            fold_skipped: Some("no commit in common with main".into()),
+        };
+        assert_eq!(
+            transition(
+                &a,
+                &b,
+                Some(&hint("checkout: moving from main to alone")),
+                &facts
+            )
+            .unwrap(),
+            "switched main → alone: first time here, seen state carried from main without \
+             folding (no commit in common with main); 3 files pending"
+        );
+        // And the fold that ran keeps the wording it had, whether or not it folded anything.
+        let ran = TransitionFacts {
+            fold_skipped: None,
+            ..facts
+        };
+        assert_eq!(
+            transition(
+                &a,
+                &b,
+                Some(&hint("checkout: moving from main to alone")),
+                &ran
+            )
+            .unwrap(),
+            "switched main → alone: first time here, seen state carried from main; 3 files pending"
+        );
+    }
+
     #[test]
     fn headstate_transition_texts() {
         let a = state("a", Some("main"), None);
@@ -387,6 +576,8 @@ mod tests {
         let facts = TransitionFacts {
             commits: Some(1),
             files_differ: 0,
+            first_sight_from: None,
+            fold_skipped: None,
         };
         assert_eq!(
             transition(&a, &b, Some(&hint("commit: agent commit")), &facts),
@@ -395,6 +586,8 @@ mod tests {
         let three = TransitionFacts {
             commits: Some(3),
             files_differ: 0,
+            first_sight_from: None,
+            fold_skipped: None,
         };
         assert_eq!(
             transition(&a, &b, Some(&hint("commit: x")), &three).unwrap(),
@@ -415,6 +608,8 @@ mod tests {
         let differ = TransitionFacts {
             commits: None,
             files_differ: 2,
+            first_sight_from: None,
+            fold_skipped: None,
         };
         assert_eq!(
             transition(
@@ -525,6 +720,131 @@ mod tests {
         assert_eq!(
             last_reflog(&d.git_dir).unwrap().message.split(':').next(),
             Some("checkout")
+        );
+    }
+
+    /// The commit is read through the branch's own ref, so the pair an inspection reports
+    /// is always one real state and never one branch's name beside another's commit. The
+    /// two states that have no such ref keep their answers: an unborn branch has a name
+    /// and no commit, a detached HEAD a commit and no name.
+    #[test]
+    fn headstate_inspect_pairs_the_branch_with_its_own_ref() {
+        use crate::store::tests::fixture_env;
+        use lastcall_testkit::fixture_repo::FixtureRepo;
+        use lastcall_testkit::tmp::TempDir;
+        let mut repo = FixtureRepo::new("pair").unwrap();
+        let state_dir = TempDir::new("lc-pair");
+        let env = fixture_env(&repo, &state_dir);
+        let rg = RepoGit::new(&env, repo.path());
+
+        let on_main = inspect(&rg).unwrap();
+        assert_eq!(on_main.branch.as_deref(), Some("main"));
+        assert_eq!(
+            on_main.head,
+            rg.rev_parse_verify("refs/heads/main").unwrap(),
+            "the commit is the branch's own tip"
+        );
+
+        // A second branch at a different commit: the name and the commit move together.
+        repo.checkout_b("other").unwrap();
+        repo.commit_files(&[("only-here.txt", "one\n")], "on other")
+            .unwrap();
+        let on_other = inspect(&rg).unwrap();
+        assert_eq!(on_other.branch.as_deref(), Some("other"));
+        assert_eq!(
+            on_other.head,
+            rg.rev_parse_verify("refs/heads/other").unwrap()
+        );
+        assert_ne!(on_other.head, on_main.head);
+
+        // An unborn branch: a name, no commit, not detached.
+        repo.git(&["checkout", "-q", "--orphan", "fresh"]).unwrap();
+        repo.git(&["rm", "-rqf", "--cached", "."]).unwrap();
+        let unborn = inspect(&rg).unwrap();
+        assert_eq!(unborn.branch.as_deref(), Some("fresh"));
+        assert!(unborn.head.is_none() && !unborn.detached);
+    }
+
+    /// R1's "no switch" states, read from the file alone: a detached or unborn `HEAD`, a
+    /// missing or empty one, a `HEAD.lock` beside it (git is mid-write, so the name on disk
+    /// is the one it is about to replace), and a name no ref could have.
+    #[test]
+    fn headstate_head_branch_answers_none_while_head_is_locked_or_unusable() {
+        let dir = lastcall_testkit::tmp::TempDir::new("lc-headbranch");
+        let git_dir = dir.mkdir("g");
+        assert_eq!(head_branch(&git_dir), None, "no HEAD at all");
+
+        dir.write("g/HEAD", "ref: refs/heads/main\n");
+        assert_eq!(head_branch(&git_dir).as_deref(), Some("main"));
+        dir.write("g/HEAD", "ref: refs/heads/feat/deep/x\n");
+        assert_eq!(
+            head_branch(&git_dir).as_deref(),
+            Some("feat/deep/x"),
+            "a slashed name is a name"
+        );
+
+        // F5: a lock beside it means no switch, and the answer comes back when it goes.
+        dir.write("g/HEAD", "ref: refs/heads/main\n");
+        let lock = dir.write("g/HEAD.lock", "ref: refs/heads/other\n");
+        assert_eq!(head_branch(&git_dir), None, "HEAD.lock is mid-write");
+        std::fs::remove_file(&lock).unwrap();
+        assert_eq!(head_branch(&git_dir).as_deref(), Some("main"));
+
+        // F9: trailing garbage is not a branch name.
+        dir.write("g/HEAD", "ref: refs/heads/main junk\n");
+        assert_eq!(head_branch(&git_dir), None, "whitespace in the name");
+        dir.write("g/HEAD", "ref: refs/heads/\n");
+        assert_eq!(head_branch(&git_dir), None, "an empty name");
+        dir.write("g/HEAD", "");
+        assert_eq!(head_branch(&git_dir), None, "an empty file");
+        dir.write("g/HEAD", "1111111111111111111111111111111111111111\n");
+        assert_eq!(head_branch(&git_dir), None, "detached");
+    }
+
+    /// A tag with the branch's own name must change nothing. `symbolic-ref --short` would
+    /// disambiguate the answer to `heads/main`, whose ref (`refs/heads/heads/main`) does not
+    /// exist, and the inspection would lose its commit: the root would first-sight with no
+    /// tree and show every committed file as an addition. Reading the full name keeps the
+    /// pair, before the tag and after it.
+    #[test]
+    fn headstate_inspect_survives_a_tag_named_like_the_branch() {
+        use crate::store::tests::fixture_env;
+        use lastcall_testkit::fixture_repo::FixtureRepo;
+        use lastcall_testkit::tmp::TempDir;
+        let mut repo = FixtureRepo::new("tagname").unwrap();
+        let state_dir = TempDir::new("lc-tagname");
+        let env = fixture_env(&repo, &state_dir);
+        let rg = RepoGit::new(&env, repo.path());
+
+        repo.git(&["tag", "main"]).unwrap();
+        let s = inspect(&rg).unwrap();
+        assert_eq!(s.branch.as_deref(), Some("main"), "the label is the branch");
+        assert_eq!(
+            s.head,
+            rg.rev_parse_verify("refs/heads/main").unwrap(),
+            "and the commit is that branch's own tip, not None"
+        );
+        assert!(s.head.is_some() && !s.detached);
+
+        // P1c's shape: the tag arrives after the first inspection, then a commit. Every
+        // later inspection still pairs the branch with its own moved tip.
+        repo.commit_files(&[("after-tag.txt", "one\n")], "after the tag")
+            .unwrap();
+        let moved = inspect(&rg).unwrap();
+        assert_eq!(moved.branch.as_deref(), Some("main"));
+        assert_eq!(moved.head, rg.rev_parse_verify("refs/heads/main").unwrap());
+        assert_ne!(moved.head, s.head, "the tag did not pin the answer");
+
+        // A tag on a second branch's name too: the checkout keeps name and commit together.
+        repo.checkout_b("feat").unwrap();
+        repo.git(&["tag", "feat"]).unwrap();
+        repo.commit_files(&[("on-feat.txt", "one\n")], "on feat")
+            .unwrap();
+        let on_feat = inspect(&rg).unwrap();
+        assert_eq!(on_feat.branch.as_deref(), Some("feat"));
+        assert_eq!(
+            on_feat.head,
+            rg.rev_parse_verify("refs/heads/feat").unwrap()
         );
     }
 

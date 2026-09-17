@@ -17,15 +17,17 @@
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::git::{GitError, Mode, Oid, RepoGit};
-use crate::headstate::current_head;
+use crate::headstate::{current_head, head_branch};
 use crate::hunks::{self, Hunk};
 use crate::index::{IndexError, PrivateIndex};
 use crate::ledger::{
-    self, Baseline, BaselineResolver, Clock, Flag, FlagHunk, FlagSummary, Ledger, LedgerError,
-    LedgerLock, LoadResult, Override, SeenAt, TreeEntries, UndoEntry, UndoOp, UndoPath,
+    self, Baseline, BaselineResolver, BranchRecord, Clock, Flag, FlagHunk, FlagSummary, Ledger,
+    LedgerError, LedgerLock, LoadResult, Override, SeenAt, TreeEntries, UndoEntry, UndoOp,
+    UndoPath,
 };
 use crate::paths::RepoPaths;
 use crate::scan::{Entry, Pile, Row};
@@ -133,6 +135,11 @@ pub enum Refused {
     /// `why` is a short noun phrase the UI can also render on its own (`use shift-i:
     /// <why>`), so it never repeats the path.
     NotEditable { path: Vec<u8>, why: String },
+    /// The record in force moved to another branch between the render and the write (R5,
+    /// Amendment v1.12): the rows the user was looking at were computed against a baseline
+    /// that is no longer the one this root is on, so nothing is written and the staged work
+    /// is dropped. `now` is the branch the ledger or `HEAD` names instead.
+    BranchChanged { now: String },
     /// The hunk list handed to `restore_hunk` does not reassemble the rendered content, so
     /// "everything but hunk k" would silently drop whatever is missing from it (verifier
     /// F3). The one refusal that is about the *caller's* view rather than the file.
@@ -195,6 +202,17 @@ impl Refused {
                     lossy(path)
                 )
             }
+            // The one refusal that names no path: the whole record moved, not one row.
+            // The sentence wants the operation's own noun rather than its participle, and
+            // there are exactly two ("restored" is the only caller that is not an accept).
+            Refused::BranchChanged { now } => {
+                let noun = if verb == "restored" {
+                    "restore"
+                } else {
+                    "accept"
+                };
+                format!("branch changed under this {noun} (now {now}); try again")
+            }
         }
     }
 }
@@ -235,6 +253,32 @@ impl OpsError {
 /// The basename glob a restore's temp file matches, re-exported here so `scan` and `ops`
 /// share one constant (F8). The rule itself is [`crate::restore::is_restore_temp`].
 pub use crate::restore::RESTORE_TEMP_GLOB;
+
+/// What one ledger write did: the file was written (and whether a compaction followed),
+/// or the branch moved under the op and nothing was written (R5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Committed {
+    Written { compacted: bool },
+    Refused(Refused),
+}
+
+/// What one branch switch did (R2, R3), for the notice the head inspection builds.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Switched {
+    /// Whether a record actually moved. An adopt, a re-label and a switch another process
+    /// had already performed are all `false`: nothing was parked and nothing was loaded.
+    pub happened: bool,
+    /// The branch left, when the arrival was the new branch's **first sight** (R8's notice
+    /// input); `None` when a parked record came back into force.
+    pub first_sight_from: Option<String>,
+    /// Why the first-sight fold did not run, when it was skipped or abandoned (verifier
+    /// F6): the copy stands whole, which over-shows and hides nothing, and the reason is
+    /// said out loud rather than left to be inferred from the pile. `None` when the fold
+    /// ran, including when it ran and folded nothing, and on every arrival that is not a
+    /// first sight. A [`Ledger::first_sight_head`] this root does not know is **not** a
+    /// skip: the fold ran and asked the records instead.
+    pub fold_skipped: Option<String>,
+}
 
 /// The result of one op: refusals (empty on success) and whether a compaction ran.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -286,6 +330,13 @@ pub struct Ops<'a> {
     /// and the baselines are resolved under the lock, from the on-disk ledger, before the
     /// replay.
     pub pending_undo: Option<PendingUndo>,
+    /// The branch whose record this `Ops` was staged against (the ledger's `seen_branch`
+    /// when the engine built it), and the per-worktree git dir whose `HEAD` says which
+    /// branch is in force now. `None` for a draft root, for a root whose record belongs to
+    /// no branch, and in the unit harnesses that do not exercise R5; the branch check is
+    /// skipped then.
+    pub branch: Option<String>,
+    pub git_dir: Option<PathBuf>,
     /// How long `commit` waits for the root's ledger lock: [`ledger::LOCK_RETRIES`] ×
     /// [`ledger::LOCK_BACKOFF`] = 2 s in the shipping engine (`Engine::ops` sets it).
     /// A test that wants the `LockBusy` path shortens it rather than sleeping for two
@@ -305,6 +356,38 @@ pub struct Ops<'a> {
 pub struct PendingUndo {
     pub op: UndoOp,
     pub prior: BTreeMap<String, Option<Override>>,
+}
+
+/// One record's composed baseline for one path: `Some(Some(entry))` from the override's
+/// blob and mode, else from the tree's entry; `Some(None)` when the override says absent or
+/// the tree has no entry; and `None` when the record has nothing to say at all.
+///
+/// The last case is a record with no seen tree and no blob override for the path. Such a
+/// record has seen nothing (the scan shows every path on disk as added against it), so it
+/// composes no baseline rather than "absent": treating its silence as a seen absence let
+/// the fold baseline an unaccepted deletion onto a parked record that had lost its tree
+/// (verifier round four, F1). The record in force never lands there, because [`Ops`]
+/// holds an empty tree for it when the ledger has none.
+///
+/// Free rather than a method because R2's seen-state target asks the same question of the
+/// record in force ([`Ops::fold_baseline`]) and of every parked record, whose tree is a
+/// `BTreeMap` the store read rather than the one the [`Ops`] holds. One answer for both
+/// means the target cannot disagree with itself about what a baseline is.
+fn compose_baseline(
+    tree: Option<&TreeEntries>,
+    overrides: &BTreeMap<String, Override>,
+    path: &[u8],
+) -> Option<Option<(Mode, Oid)>> {
+    if let Ok(key) = std::str::from_utf8(path)
+        && let Some(o) = overrides.get(key)
+    {
+        match &o.blob {
+            Some(Some(oid)) => return Some(Some((o.mode.unwrap_or(Mode::Regular), oid.clone()))),
+            Some(None) => return Some(None),
+            None => {}
+        }
+    }
+    tree.map(|t| t.get(path).map(|(m, o)| (*m, o.clone())))
 }
 
 /// Compare-and-swap one path's live content against the row that was rendered (A6): `Ok`
@@ -541,6 +624,17 @@ impl Ops<'_> {
                 None => TreeEntries::new(),
             };
         }
+        // R1/R6: a disk ledger that names no branch of its own — a file a 1.1 binary
+        // wrote, or a record made at a detached HEAD — keeps the attribution this engine
+        // made for it, which is what makes the adoption survive to the next write without
+        // a write of its own. Every other case takes the disk's name: that is how R5's
+        // refusal sees a switch another process performed.
+        if merged.seen_branch.is_none() {
+            merged.seen_branch = self.ledger.seen_branch.clone();
+            if merged.seen_branch.is_some() {
+                merged.adopt_branch = false;
+            }
+        }
         *self.ledger = merged;
         self.clear_expired_snooze();
         Ok(())
@@ -557,11 +651,63 @@ impl Ops<'_> {
         }
     }
 
+    /// R5: whether the branch this `Ops` staged its work under is still the one in force.
+    ///
+    /// Two authorities and either one refuses: the **disk** ledger's `seen_branch` (another
+    /// process performed the switch and wrote it) and the **`HEAD` file** (git moved the
+    /// branch and no scan has caught up yet, the worktree-then-`HEAD` window of R1). A
+    /// draft root, a record that belongs to no branch, and a ledger with nothing readable
+    /// on disk all leave nothing to compare against, which is the pre-Phase-11 behaviour.
+    fn branch_refusal(&self) -> Result<Option<Refused>, OpsError> {
+        let Some(staged) = self.branch.clone() else {
+            return Ok(None);
+        };
+        let disk = match ledger::load(self.paths, self.clock)? {
+            LoadResult::Loaded { ledger, .. } => ledger.seen_branch,
+            _ => None,
+        };
+        let live = self.git_dir.as_deref().and_then(head_branch);
+        let now = disk
+            .filter(|b| *b != staged)
+            .or_else(|| live.filter(|b| *b != staged));
+        Ok(now.map(|now| Refused::BranchChanged { now }))
+    }
+
     /// Lock, merge with disk, tmp-write, (fault), rename; then compact when over the
-    /// threshold.
-    fn commit(&mut self, fault: &dyn FaultInjector) -> Result<bool, OpsError> {
+    /// threshold. The R5 branch check runs first, under the same lock.
+    fn commit(&mut self, fault: &dyn FaultInjector) -> Result<Committed, OpsError> {
+        self.commit_inner(fault, true)
+    }
+
+    /// [`Ops::commit`] without the branch check, for the two writes that are not baseline
+    /// operations and merge exactly as they always did (R5): flag and unflag.
+    fn commit_unchecked(&mut self, fault: &dyn FaultInjector) -> Result<bool, OpsError> {
+        match self.commit_inner(fault, false)? {
+            Committed::Written { compacted } => Ok(compacted),
+            Committed::Refused(r) => {
+                unreachable!("the branch check was not asked for, yet it refused: {r}")
+            }
+        }
+    }
+
+    fn commit_inner(
+        &mut self,
+        fault: &dyn FaultInjector,
+        branch_check: bool,
+    ) -> Result<Committed, OpsError> {
         {
             let _lock = LedgerLock::acquire_with(self.paths, self.lock.0, self.lock.1)?;
+            if branch_check && let Some(r) = self.branch_refusal()? {
+                // The staged overrides and the pending undo entry go **before** the merge:
+                // `merge_from_disk` replays whatever is staged onto the ledger it adopts,
+                // which is now another branch's record, and that is the one thing R5
+                // exists to prevent. What the engine keeps afterwards is the on-disk
+                // ledger and its tree, so the next scan renders the record in force.
+                self.staged.clear();
+                self.pending_undo = None;
+                self.merge_from_disk()?;
+                return Ok(Committed::Refused(r));
+            }
             self.merge_from_disk()?;
             let tmp = ledger::write_tmp(self.paths, self.ledger)?;
             fault.at(FaultPoint::AfterLedgerTmpWrite);
@@ -570,9 +716,25 @@ impl Ops<'_> {
         self.staged.clear();
         if self.ledger.blob_override_count() > self.compaction_threshold {
             self.compact(fault)?;
-            return Ok(true);
+            return Ok(Committed::Written { compacted: true });
         }
-        Ok(false)
+        Ok(Committed::Written { compacted: false })
+    }
+
+    /// [`Ops::commit`] as the accept paths report it: the success `Outcome`, or the R5
+    /// refusal with nothing written.
+    fn commit_outcome(&mut self, fault: &dyn FaultInjector) -> Result<Outcome, OpsError> {
+        Ok(match self.commit(fault)? {
+            Committed::Written { compacted } => Outcome {
+                refused: Vec::new(),
+                compacted,
+                written: true,
+            },
+            Committed::Refused(r) => Outcome {
+                refused: vec![r],
+                ..Default::default()
+            },
+        })
     }
 
     /// CAS on the live path against the rendered oid/mode.
@@ -607,6 +769,38 @@ impl Ops<'_> {
         Ok(())
     }
 
+    /// R5's check, run **before** anything is staged.
+    ///
+    /// The refusal also fires under the lock in [`Ops::commit`], which is the one that
+    /// actually protects the write. This one is about what the user is told: a row rendered
+    /// on the branch they left is stale in every way at once, and without this the accept
+    /// comes back "changed since rendered" — true, and useless. The switch is the reason,
+    /// so the switch is the refusal.
+    fn accept_preflight(&self) -> Result<Option<Outcome>, OpsError> {
+        Ok(self.branch_refusal()?.map(|r| Outcome {
+            refused: vec![r],
+            ..Default::default()
+        }))
+    }
+
+    /// R5's other order (verifier F4): the branch the **snapshot** was rendered under.
+    ///
+    /// [`Ops::branch_refusal`] compares the branch this `Ops` staged its work under against
+    /// the record in force now, which catches a switch that lands under a staged op. It
+    /// cannot catch the reverse: the switch is adopted first, the next `Ops` is staged
+    /// under the arriving branch, and the pile the caller is still holding belongs to the
+    /// branch it left. A multi-row accept writes every one of those rows, restamps
+    /// `seen_at` and pushes one undo entry, so it is the write that must least be allowed
+    /// to land in a record its rows were not computed against. The single-row paths need
+    /// none of this: their CAS pins a baseline and a content oid.
+    fn snapshot_refusal(&self, rendered_on: Option<&str>) -> Option<Refused> {
+        let staged = self.branch.as_deref()?;
+        let on = rendered_on?;
+        (on != staged).then(|| Refused::BranchChanged {
+            now: staged.to_owned(),
+        })
+    }
+
     /// Accept one file at its rendered content (A6 CAS). A rendered `oid: None` is a
     /// deletion and follows [`Ops::accept_deletion`].
     pub fn accept_file(
@@ -614,15 +808,11 @@ impl Ops<'_> {
         rendered: &Rendered,
         fault: &dyn FaultInjector,
     ) -> Result<Outcome, OpsError> {
+        if let Some(out) = self.accept_preflight()? {
+            return Ok(out);
+        }
         match self.stage_file(rendered) {
-            Ok(()) => {
-                let compacted = self.commit(fault)?;
-                Ok(Outcome {
-                    refused: Vec::new(),
-                    compacted,
-                    written: true,
-                })
-            }
+            Ok(()) => self.commit_outcome(fault),
             Err(r) => Ok(Outcome {
                 refused: vec![r],
                 ..Default::default()
@@ -634,8 +824,18 @@ impl Ops<'_> {
     pub fn accept_group(
         &mut self,
         rows: &[Rendered],
+        rendered_on: Option<&str>,
         fault: &dyn FaultInjector,
     ) -> Result<Outcome, OpsError> {
+        if let Some(out) = self.accept_preflight()? {
+            return Ok(out);
+        }
+        if let Some(r) = self.snapshot_refusal(rendered_on) {
+            return Ok(Outcome {
+                refused: vec![r],
+                ..Default::default()
+            });
+        }
         let mut refused = Vec::new();
         let mut any = false;
         for r in rows {
@@ -649,12 +849,13 @@ impl Ops<'_> {
             // keystroke, one entry, and `z` puts the whole group back.
             self.begin_undo(UndoOp::AcceptGroup);
         }
-        let compacted = if any { self.commit(fault)? } else { false };
-        Ok(Outcome {
-            refused,
-            compacted,
-            written: any,
-        })
+        let mut out = if any {
+            self.commit_outcome(fault)?
+        } else {
+            Outcome::default()
+        };
+        out.refused.extend(refused);
+        Ok(out)
     }
 
     /// Accept a deletion: refused while the path still exists (A7); else the override
@@ -664,15 +865,11 @@ impl Ops<'_> {
         rendered: &Rendered,
         fault: &dyn FaultInjector,
     ) -> Result<Outcome, OpsError> {
+        if let Some(out) = self.accept_preflight()? {
+            return Ok(out);
+        }
         match self.stage_deletion(rendered) {
-            Ok(()) => {
-                let compacted = self.commit(fault)?;
-                Ok(Outcome {
-                    refused: Vec::new(),
-                    compacted,
-                    written: true,
-                })
-            }
+            Ok(()) => self.commit_outcome(fault),
             Err(r) => Ok(Outcome {
                 refused: vec![r],
                 ..Default::default()
@@ -709,6 +906,9 @@ impl Ops<'_> {
         hunk_index: usize,
         fault: &dyn FaultInjector,
     ) -> Result<Outcome, OpsError> {
+        if let Some(out) = self.accept_preflight()? {
+            return Ok(out);
+        }
         let refuse = |r: Refused| {
             Ok(Outcome {
                 refused: vec![r],
@@ -774,12 +974,7 @@ impl Ops<'_> {
         };
         self.begin_undo(UndoOp::AcceptHunk);
         self.set_override(&key, blob, mode);
-        let compacted = self.commit(fault)?;
-        Ok(Outcome {
-            refused: Vec::new(),
-            compacted,
-            written: true,
-        })
+        self.commit_outcome(fault)
     }
 
     // -----------------------------------------------------------------------------------
@@ -805,6 +1000,13 @@ impl Ops<'_> {
     /// `filter` attribute the store cannot promise to reproduce (F2).
     fn restore_preflight(&self, path: &[u8]) -> Result<(), Refused> {
         Self::key(path)?;
+        // R5: a restore reads a baseline, so it refuses for the same reason an accept
+        // does — the rows it was computed from belong to another branch's record. A load
+        // error is no refusal: "nothing readable on disk, nothing to compare" is
+        // `merge_from_disk`'s rule too, and the write path's own CAS still guards the file.
+        if let Ok(Some(r)) = self.branch_refusal() {
+            return Err(r);
+        }
         if self.is_conflicted(path) {
             return Err(Refused::Conflicted {
                 path: path.to_vec(),
@@ -1385,12 +1587,7 @@ impl Ops<'_> {
         };
         self.begin_undo(UndoOp::Save);
         self.set_override(&key, Some(oid), Some(live.mode));
-        let compacted = self.commit(fault)?;
-        Ok(Outcome {
-            refused: Vec::new(),
-            compacted,
-            written: true,
-        })
+        self.commit_outcome(fault)
     }
 
     /// Accept everything in `snapshot` at its rendered content (A5), stamp `seen_at`
@@ -1400,19 +1597,37 @@ impl Ops<'_> {
         snapshot: &Pile,
         fault: &dyn FaultInjector,
     ) -> Result<Outcome, OpsError> {
+        if let Some(out) = self.accept_preflight()? {
+            return Ok(out);
+        }
+        if let Some(r) = self.snapshot_refusal(snapshot.seen_branch.as_deref()) {
+            return Ok(Outcome {
+                refused: vec![r],
+                ..Default::default()
+            });
+        }
         let seen_at = self.head_now();
-        self.fold(snapshot, Some(seen_at), fault)?;
-        Ok(Outcome {
-            refused: Vec::new(),
-            compacted: false,
-            written: true,
-        })
+        match self.fold(snapshot, Some(seen_at), fault)? {
+            Some(r) => Ok(Outcome {
+                refused: vec![r],
+                ..Default::default()
+            }),
+            None => Ok(Outcome {
+                refused: Vec::new(),
+                compacted: false,
+                written: true,
+            }),
+        }
     }
 
     /// Fold every override into the seen tree; `seen_at` unchanged (§6.2). Pile before ==
     /// pile after.
     pub fn compact(&mut self, fault: &dyn FaultInjector) -> Result<(), OpsError> {
-        self.fold(&Pile::empty(), None, fault)
+        // A refusal here is not an error and not a user-visible outcome: the accept that
+        // triggered the compaction already landed in the right record, and the fold that
+        // would have followed is simply not run on another branch's.
+        self.fold(&Pile::empty(), None, fault)?;
+        Ok(())
     }
 
     /// Reverse the most recent accept in this root (Amendment v1.11, deliverable 2).
@@ -1435,6 +1650,17 @@ impl Ops<'_> {
     pub fn undo(&mut self, fault: &dyn FaultInjector) -> Result<Outcome, OpsError> {
         let written = {
             let _lock = LedgerLock::acquire_with(self.paths, self.lock.0, self.lock.1)?;
+            // R5: the stack an undo pops belongs to the record in force, so a switch under
+            // it refuses exactly as an accept does (and pops nothing).
+            if let Some(r) = self.branch_refusal()? {
+                self.staged.clear();
+                self.pending_undo = None;
+                self.merge_from_disk()?;
+                return Ok(Outcome {
+                    refused: vec![r],
+                    ..Default::default()
+                });
+            }
             self.merge_from_disk()?;
             let Some(entry) = self.ledger.undo.pop() else {
                 return Ok(Outcome {
@@ -1505,6 +1731,406 @@ impl Ops<'_> {
         ledger::iso8601(self.clock.now() + Duration::from_secs(u64::from(days) * 86_400))
     }
 
+    // -----------------------------------------------------------------------------------
+    // The branch switch (Amendment v1.12, R2/R3/R5)
+    // -----------------------------------------------------------------------------------
+
+    /// Move the record in force onto the branch `HEAD` now names.
+    ///
+    /// One locked read-modify-write, sharing `merge_from_disk`, the tmp + rename and the
+    /// fault points with every other ledger write, so a second process's accepts are never
+    /// dropped by a switch. Nothing is pushed on any undo stack: a switch is not an
+    /// operation the user can take back, it is which record their next operation applies
+    /// to. `RootState::sync_branch` decides *whether* to call this; the adopt and the
+    /// re-label never reach here because they write nothing.
+    pub(crate) fn switch_branch(
+        &mut self,
+        to: &str,
+        fault: &dyn FaultInjector,
+    ) -> Result<Switched, OpsError> {
+        let mut out = Switched::default();
+        let _lock = LedgerLock::acquire_with(self.paths, self.lock.0, self.lock.1)?;
+        self.merge_from_disk()?;
+        // R5: another process may have performed this very switch while we waited for the
+        // lock. `merge_from_disk` has adopted its ledger and re-read the tree, so there is
+        // nothing left to do and certainly no second first sight.
+        if self.ledger.seen_branch.as_deref() == Some(to) {
+            self.ledger.adopt_branch = false;
+            return Ok(out);
+        }
+        // And git may have moved again while we waited: the branch we were asked to move
+        // to must still be the one `HEAD` names, or we would park a record on a branch
+        // nobody is on.
+        if let Some(dir) = &self.git_dir
+            && head_branch(dir).as_deref() != Some(to)
+        {
+            return Ok(out);
+        }
+        let Some(from) = self.ledger.seen_branch.clone() else {
+            // The record in force belongs to no branch (a file a 1.1 binary wrote, or a
+            // record made at a detached HEAD): it is attributed, never parked, and nothing
+            // is written — `merge_from_disk` carries the attribution into the next write,
+            // whenever that is. Reaching this under the lock means the disk ledger moved
+            // under the sync's decision.
+            self.ledger.seen_branch = Some(to.to_owned());
+            self.ledger.adopt_branch = false;
+            return Ok(out);
+        };
+        // R3, the rename of the branch in force (`git branch -m`): the ref we were on is
+        // gone and the name that replaced it has no record of its own, so this is the same
+        // record under a new name. No park, no first sight, no fold — but it is written,
+        // because the next `merge_from_disk` would otherwise read the old name back off
+        // disk and park the record under a branch that no longer exists.
+        //
+        // The decision is made here rather than in the caller because `merge_from_disk`
+        // has just run: the name it is made about is the one on disk.
+        let renamed = !self.ledger.branches.contains_key(to)
+            && self.repo.is_some_and(|rg| {
+                rg.rev_parse_verify(&format!("refs/heads/{from}"))
+                    .ok()
+                    .flatten()
+                    .is_none()
+            });
+        if renamed {
+            self.ledger.seen_branch = Some(to.to_owned());
+            self.ledger.adopt_branch = false;
+            self.prune_parked();
+            let tmp = ledger::write_tmp(self.paths, self.ledger)?;
+            fault.at(FaultPoint::AfterLedgerTmpWrite);
+            ledger::commit_tmp(self.paths, &tmp)?;
+            out.happened = true;
+            return Ok(out);
+        }
+        let now = self.clock.now_iso8601();
+        // R3: park the record we are leaving, whole.
+        let parked = BranchRecord {
+            seen_tree: self.ledger.seen_tree.clone(),
+            seen_at: self.ledger.seen_at.clone(),
+            overrides: std::mem::take(&mut self.ledger.overrides),
+            undo: std::mem::take(&mut self.ledger.undo),
+            parked_at: now,
+        };
+        match self.ledger.branches.remove(to) {
+            // R3: this branch has been here before; its record comes back exactly as it
+            // was left, undo stack and all.
+            Some(rec) => {
+                self.ledger.seen_tree = rec.seen_tree;
+                self.ledger.seen_at = rec.seen_at;
+                self.ledger.overrides = rec.overrides;
+                self.ledger.undo = rec.undo;
+            }
+            // R2: first sight of this branch is a **copy** of the record just left — the
+            // same seen tree oid, the same `seen_at`, the overrides cloned, an empty undo
+            // stack — and then the fold onto the merge-base.
+            //
+            // `seen_at` is copied and not restamped, which is the whole of the copy being
+            // a copy: it is what C8's upstream annotation is computed from, and restamping
+            // it to the arriving head makes the range empty, so a coworker's commits
+            // arrive as an unexplained pile instead of as someone else's work.
+            None => {
+                self.ledger.overrides = parked.overrides.clone();
+                out.first_sight_from = Some(from.clone());
+            }
+        }
+        self.ledger.branches.insert(from.clone(), parked);
+        if out.first_sight_from.is_some() {
+            out.fold_skipped = self.fold_onto_first_sight(&from, fault)?;
+        }
+        self.ledger.seen_branch = Some(to.to_owned());
+        self.ledger.adopt_branch = false;
+        self.prune_parked();
+        self.retree()?;
+        let tmp = ledger::write_tmp(self.paths, self.ledger)?;
+        fault.at(FaultPoint::AfterLedgerTmpWrite);
+        ledger::commit_tmp(self.paths, &tmp)?;
+        out.happened = true;
+        Ok(out)
+    }
+
+    /// R2's second half, the fold onto the merge-base, targeted at seen state.
+    ///
+    /// The fold runs at all when `refs/heads/<from>` still exists and the two tips have a
+    /// merge-base `M` (`git merge-base`, Amendment v1.12 as ruled 2026-09-15). `M` is the
+    /// fold's target: the branch just arrived on and the branch just left agree on
+    /// everything up to `M`, so what the record has seen at the departed tip can be carried
+    /// back to `M` without claiming anything about the commits either branch made after it.
+    /// When the two tips are the same commit, or the arrived-on head is behind the departed
+    /// tip, `M` is the arrived-on head and this is the fold as it has always been. It then
+    /// decides path by path, over the paths whose committed content differs between the
+    /// departed tip and `M`. Per path, with `base` the record's composed baseline (the
+    /// override's blob and mode, else the seen tree's entry, else absent), `tip_a` the entry
+    /// at the departed branch's tip and `tip_m` the entry at `M`, both of them a blob and a
+    /// mode or nothing at all:
+    ///
+    /// - **the path must be finished on the branch just left**: `base == tip_a`. Content
+    ///   the user never looked at on `A` must not become seen state on `B` just because the
+    ///   two tips differ.
+    /// - **and `tip_m` must already be seen state** (2026-09-16, the third verifier's F1),
+    ///   which is one of two things: (a) `M` is reachable from the commit this root was
+    ///   first sighted at (`git merge-base --is-ancestor <M> <first_sight_head>`, equality
+    ///   included), so everything committed at `M` was in the repository before lastcall
+    ///   ever looked at it; or (b) some record in the ledger composes `tip_m` as its own
+    ///   baseline for that path, which makes it a first-sight entry, an accepted one, or one
+    ///   an earlier fold already carried. An unknown `first_sight_head` (a state file older
+    ///   than the field) simply makes (a) never hold; it is not a failure and not a skip.
+    /// - a folded path takes `tip_m` (absent there removes it) and loses the blob and mode
+    ///   of any override it carried — a flag-only override stays, exactly as [`Ops::fold`]
+    ///   retains flagged overrides;
+    /// - every other differing path keeps the copied baseline and over-shows.
+    ///
+    /// The old second guard (never a blob for an absent baseline) is subsumed: an absent
+    /// baseline folds to a blob exactly when that blob is seen state.
+    ///
+    /// A path whose entry at `M` is a **gitlink** is left out: the content model cannot
+    /// render a submodule pointer as a baseline.
+    ///
+    /// Anything else leaves the copy exactly as it is, which is the over-show §2 allows,
+    /// and returns the reason so the next head inspection can say it out loud (F6): two
+    /// histories with no commit in common, `from` deleted, either head unborn, or any git
+    /// call that does not answer. A change the arrived-on branch has that the departed tip
+    /// and `M` agree about (a cherry-pick, D25 Variant B) is never hidden by the copy: the
+    /// path differs between the departed tip and `M`, the record accepted it at that tip,
+    /// so it folds back to `M`'s entry and the content here shows against it.
+    ///
+    /// Process cost of a first sight that folds: one `merge-base`, one `diff-tree`, three
+    /// `rev-parse`s, at most one `merge-base --is-ancestor`, and the store's tree reads —
+    /// `M`'s tree, the departed tip's tree, and, only when (a) did not settle the fold, one
+    /// per *distinct* parked seen tree. Nothing here runs in a scan.
+    fn fold_onto_first_sight(
+        &mut self,
+        from: &str,
+        fault: &dyn FaultInjector,
+    ) -> Result<Option<String>, OpsError> {
+        let Some(rg) = self.repo else {
+            // No git handle at all: there is no fold to skip and no branch switch a user
+            // could see, so this says nothing rather than inventing a reason.
+            return Ok(None);
+        };
+        let from_ref = format!("refs/heads/{from}");
+        if rg.rev_parse_verify(&from_ref).ok().flatten().is_none() {
+            return Ok(Some(format!(
+                "the branch left, {from}, has no ref any more"
+            )));
+        }
+        let Some(head) = rg.rev_parse_verify("HEAD").ok().flatten() else {
+            return Ok(Some("this branch has no commit yet".to_owned()));
+        };
+        // The merge-base of the two tips, the fold's target. No answer at all (unrelated
+        // histories, or git not answering) leaves the copy exactly as it is.
+        let Ok(mb) = rg.run(&["merge-base", &from_ref, head.as_str()]) else {
+            return Ok(Some(format!("no commit in common with {from}")));
+        };
+        let Ok(mb) = std::str::from_utf8(&mb) else {
+            return Ok(Some("a git call did not answer".to_owned()));
+        };
+        let merge_base = mb.trim();
+        if merge_base.is_empty() {
+            return Ok(Some(format!("no commit in common with {from}")));
+        }
+        let Ok(out) = rg.run(&[
+            "diff-tree",
+            "-r",
+            "-z",
+            "--name-only",
+            &from_ref,
+            merge_base,
+        ]) else {
+            return Ok(Some("a git call did not answer".to_owned()));
+        };
+        let paths: Vec<Vec<u8>> = out
+            .split(|b| *b == 0)
+            .filter(|p| !p.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect();
+        if paths.is_empty() {
+            // The fold ran and had nothing to do: not a skip.
+            return Ok(None);
+        }
+        // The entries come through the store, which has the user's objects as an alternate
+        // (`objects/info/alternates`), so this reads the repository's own tree without a
+        // write of any kind to it.
+        let Some(tree_oid) = rg
+            .rev_parse_verify(&format!("{merge_base}^{{tree}}"))
+            .ok()
+            .flatten()
+        else {
+            return Ok(Some("a git call did not answer".to_owned()));
+        };
+        let entries = self.store.ls_tree(&tree_oid)?;
+        // The departed tip, one `ls-tree` for the whole list rather than one call per path:
+        // without it there is no way to tell content the record accepted on `A` from
+        // content that was merely committed there.
+        let Some(from_tree_oid) = rg
+            .rev_parse_verify(&format!("{from_ref}^{{tree}}"))
+            .ok()
+            .flatten()
+        else {
+            return Ok(Some("a git call did not answer".to_owned()));
+        };
+        let departed = self.store.ls_tree(&from_tree_oid)?;
+        // (a), asked once for the whole fold and only now that there is something to fold:
+        // `--is-ancestor` exits 0 for yes, 1 for no, and anything else is git not
+        // answering, which refuses (a) and leaves (b) to settle what it can.
+        let first_sight_covers = match &self.ledger.first_sight_head {
+            Some(fsh) => rg
+                .run_raw(
+                    &["merge-base", "--is-ancestor", merge_base, fsh.as_str()],
+                    None,
+                )
+                .is_ok_and(|o| o.success()),
+            None => false,
+        };
+        let mut writes: Vec<TreeWrite> = Vec::new();
+        {
+            // (b), built only when (a) did not settle the fold. Each *distinct* parked seen
+            // tree is read once; a record whose tree will not read is dropped from the list,
+            // which refuses more folds than it allows and so can only over-show. A record
+            // with no seen tree stays on the list for its overrides alone: with none naming
+            // the path it composes nothing, never "absent" (see `compose_baseline`). The
+            // record just parked is left out on purpose: it is the same record as the copy
+            // now in force, and guard 1 has already required `base == tip_a` while every
+            // path here differs between `tip_a` and `tip_m`, so it can never match.
+            let mut trees: BTreeMap<Oid, TreeEntries> = BTreeMap::new();
+            let mut records: Vec<(Option<&TreeEntries>, &BTreeMap<String, Override>)> = Vec::new();
+            if !first_sight_covers {
+                for (name, rec) in self.ledger.branches.iter() {
+                    if name == from {
+                        continue;
+                    }
+                    if let Some(t) = &rec.seen_tree
+                        && !trees.contains_key(t)
+                        && let Ok(e) = self.store.ls_tree(t)
+                    {
+                        trees.insert(t.clone(), e);
+                    }
+                }
+                for (name, rec) in self.ledger.branches.iter() {
+                    if name == from {
+                        continue;
+                    }
+                    match &rec.seen_tree {
+                        Some(t) => {
+                            if let Some(e) = trees.get(t) {
+                                records.push((Some(e), &rec.overrides));
+                            }
+                        }
+                        None => records.push((None, &rec.overrides)),
+                    }
+                }
+            }
+            for path in &paths {
+                // `tip_m`: the entry at the merge-base, which is what a folded path takes.
+                let here = entries.get(path);
+                if matches!(here, Some((Mode::Gitlink, _))) {
+                    continue;
+                }
+                let base = self.fold_baseline(path);
+                let tip_a = departed.get(path).map(|(m, o)| (*m, o.clone()));
+                if base != tip_a {
+                    continue;
+                }
+                let tip_m = here.map(|(m, o)| (*m, o.clone()));
+                let seen_state = first_sight_covers
+                    || records.iter().any(|(tree, overrides)| {
+                        compose_baseline(*tree, overrides, path).is_some_and(|b| b == tip_m)
+                    });
+                if !seen_state {
+                    continue;
+                }
+                match here {
+                    Some((mode, oid)) => writes.push(TreeWrite::Set {
+                        path: path.clone(),
+                        mode: *mode,
+                        oid: oid.clone(),
+                    }),
+                    None => writes.push(TreeWrite::Remove { path: path.clone() }),
+                }
+            }
+        }
+        if writes.is_empty() {
+            // The fold ran and refused every path: an over-show, not a skip.
+            return Ok(None);
+        }
+        let new_tree = self
+            .store
+            .write_tree(self.ledger.seen_tree.as_ref(), &writes)?;
+        fault.at(FaultPoint::AfterObjectWrite);
+        self.ledger.seen_tree = Some(new_tree);
+        let now = self.clock.now_iso8601();
+        for w in &writes {
+            let (TreeWrite::Set { path, .. } | TreeWrite::Remove { path }) = w;
+            let Ok(key) = std::str::from_utf8(path) else {
+                continue;
+            };
+            if let Some(o) = self.ledger.overrides.get_mut(key) {
+                if o.blob.is_some() || o.mode.is_some() {
+                    o.blob = None;
+                    o.mode = None;
+                    o.updated_at = now.clone();
+                }
+                if o.is_empty() {
+                    self.ledger.overrides.remove(key);
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// The record's composed baseline for one path, as the fold compares it: the
+    /// override's blob and mode, else the seen tree's entry, else absent (`None`).
+    ///
+    /// The same §6.2 order [`ledger::BaselineResolver`] walks, minus the store-presence
+    /// check and its notices: the fold is comparing two committed trees against what the
+    /// record says it has seen, and a missing object makes the two unequal, which is the
+    /// over-showing answer already.
+    fn fold_baseline(&self, path: &[u8]) -> Option<(Mode, Oid)> {
+        // The record in force always has a tree here (empty when the ledger has none), so
+        // the composer always answers and the flatten never meets its outer `None`.
+        compose_baseline(Some(self.tree), &self.ledger.overrides, path).flatten()
+    }
+
+    /// R3: at every switch the parked names are checked against the repository's branches
+    /// and a name with no ref is dropped.
+    ///
+    /// Full names from `%(refname)`, never `%(refname:short)`, which a same-named tag can
+    /// shadow. If the listing fails for any reason the prune is skipped for this switch:
+    /// dropping a record is the fail-closed side (an over-show at that branch's next
+    /// arrival), keeping one costs nothing. The record in force is never a candidate — it
+    /// is not in the map.
+    fn prune_parked(&mut self) {
+        if self.ledger.branches.is_empty() {
+            return;
+        }
+        let Some(rg) = self.repo else {
+            return;
+        };
+        let Ok(out) = rg.run(&["for-each-ref", "--format=%(refname)", "refs/heads"]) else {
+            return;
+        };
+        let text = String::from_utf8_lossy(&out).into_owned();
+        let live: std::collections::HashSet<&str> = text
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("refs/heads/"))
+            .collect();
+        self.ledger
+            .branches
+            .retain(|name, _| live.contains(name.as_str()));
+    }
+
+    /// Point the cached `ls-tree` at the record in force's seen tree, failing open the way
+    /// `merge_from_disk` does when the tree itself has gone.
+    fn retree(&mut self) -> Result<(), OpsError> {
+        *self.tree = match &self.ledger.seen_tree {
+            Some(t) if self.store.exists(t) => self.store.ls_tree(t)?,
+            Some(_) => {
+                self.ledger.seen_tree = None;
+                TreeEntries::new()
+            }
+            None => TreeEntries::new(),
+        };
+        Ok(())
+    }
+
     fn head_now(&self) -> SeenAt {
         let (head_commit, branch) = match self.repo {
             Some(rg) if self.ledger.kind == RootKind::Git => current_head(rg),
@@ -1522,10 +2148,19 @@ impl Ops<'_> {
         snapshot: &Pile,
         seen_at: Option<SeenAt>,
         fault: &dyn FaultInjector,
-    ) -> Result<(), OpsError> {
+    ) -> Result<Option<Refused>, OpsError> {
         // The lock spans the whole fold: the tree is built from the on-disk ledger's
         // overrides, so another process's accepts are folded in, never dropped.
         let _lock = LedgerLock::acquire(self.paths)?;
+        // R5, and the gate's "compaction touches the record in force only": a fold rewrites
+        // the whole seen tree, so it is the write that must least be allowed to land in
+        // another branch's record.
+        if let Some(r) = self.branch_refusal()? {
+            self.staged.clear();
+            self.pending_undo = None;
+            self.merge_from_disk()?;
+            return Ok(Some(r));
+        }
         self.merge_from_disk()?;
         // The accept-all entry, taken *before* the fold rewrites anything: the overrides
         // and the tree as they stand now are the pre-accept baselines. It lists exactly the
@@ -1619,7 +2254,7 @@ impl Ops<'_> {
         self.staged.clear();
         *self.tree = self.store.ls_tree(&new_tree)?;
         self.index.seed(Some(&new_tree))?;
-        Ok(())
+        Ok(None)
     }
 
     /// Append a flag to `path` (A8; Amendment v1.7). Never touches `blob`.
@@ -1667,7 +2302,7 @@ impl Ops<'_> {
         entry.updated_at = now;
         let staged = entry.clone();
         self.staged.insert(key, Some(staged));
-        let compacted = self.commit(fault)?;
+        let compacted = self.commit_unchecked(fault)?;
         Ok(Outcome {
             refused: Vec::new(),
             compacted,
@@ -1699,7 +2334,7 @@ impl Ops<'_> {
         }
         self.staged
             .insert(key.clone(), self.ledger.overrides.get(&key).cloned());
-        let compacted = self.commit(fault)?;
+        let compacted = self.commit_unchecked(fault)?;
         Ok(Outcome {
             refused: Vec::new(),
             compacted,
@@ -1760,6 +2395,650 @@ mod tests {
         let r1 = rendered(&a, b"f1");
         assert!(a.ops().accept_file(&r1, &NoFault).unwrap().ok());
         assert!(!a.ledger.overrides["f3"].flags.is_empty());
+    }
+
+    /// D14's shape at the ops layer: `main`'s tip is already in `future`'s history, so it
+    /// is the merge-base of the two and the copy folds onto it — the differing path takes
+    /// `main`'s committed content (here: absent) and the override that held it is gone. No
+    /// deletion row is left behind.
+    #[test]
+    fn ops_switch_branch_folds_when_the_arrival_is_an_ancestor() {
+        let mut repo = FixtureRepo::new("ops-switch-fold").unwrap();
+        repo.checkout_b("future").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        h.ledger.seen_branch = Some("future".into());
+        // Two additions on `future`: `n2` accepted and folded into the seen tree, `n1`
+        // accepted and still an override. The fold has to deal with both.
+        repo.write("n2", "second\n");
+        repo.commit("n2 on future").unwrap();
+        let r = rendered(&h, b"n2");
+        assert!(h.ops_on("future").accept_file(&r, &NoFault).unwrap().ok());
+        h.ops_on("future").compact(&NoFault).unwrap();
+        repo.write("n1", "new\n");
+        repo.commit("n1 on future").unwrap();
+        let r = rendered(&h, b"n1");
+        assert!(h.ops_on("future").accept_file(&r, &NoFault).unwrap().ok());
+        assert!(h.ledger.overrides.contains_key("n1"));
+        let future_tree = h.ledger.seen_tree.clone();
+        assert!(
+            h.store
+                .ls_tree(future_tree.as_ref().unwrap())
+                .unwrap()
+                .contains_key(b"n2".as_slice()),
+            "n2 is in the seen tree the switch will fold"
+        );
+
+        repo.checkout("main").unwrap();
+        let out = h.ops_on("future").switch_branch("main", &NoFault).unwrap();
+        assert!(out.happened);
+        assert_eq!(out.first_sight_from.as_deref(), Some("future"));
+        assert_eq!(h.ledger.seen_branch.as_deref(), Some("main"));
+        assert!(
+            !h.ledger.overrides.contains_key("n1"),
+            "the fold took main's content for n1, so the override that held it is spent"
+        );
+        assert_ne!(h.ledger.seen_tree, future_tree, "the tree was rewritten");
+        assert!(
+            !h.store
+                .ls_tree(h.ledger.seen_tree.as_ref().unwrap())
+                .unwrap()
+                .contains_key(b"n2".as_slice()),
+            "n2 took main's committed content, which is no entry at all"
+        );
+        assert!(
+            h.scan().pile.is_empty(),
+            "and nothing is pending — no deletion row: {:?}",
+            h.scan().pile.rows.len()
+        );
+        let parked = &h.ledger.branches["future"];
+        assert_eq!(parked.seen_tree, future_tree, "future's record is whole");
+        assert!(parked.overrides.contains_key("n1"));
+        assert!(h.ledger.undo.is_empty(), "a switch pushes no undo entry");
+    }
+
+    /// P2c from the verifier's report (F2): the agent commits `f1 = v2` on `c2` and
+    /// deletes it on `c3`, a branch is cut at `c2`, and the arrival **is** an ancestor —
+    /// but `v2` was never accepted, so the record's baseline for `f1` is still `v1`, which
+    /// is not what the departed tip holds. Folding it would make content that was never on
+    /// screen the seen state. `q` is refused twice over: the record's baseline for it is
+    /// absent while the departed tip has it, and `v2`/`w1` are seen state in no record and
+    /// in no commit the root was first sighted at.
+    #[test]
+    fn ops_switch_branch_does_not_fold_content_the_record_never_saw() {
+        let mut repo = FixtureRepo::new("ops-switch-fold-unseen").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        h.ledger.seen_branch = Some("main".into());
+        let seen = h.ledger.seen_tree.clone();
+        repo.write("f1", "v2\n");
+        repo.write("q", "w1\n");
+        let c2 = repo.commit("c2: f1 = v2, q added").unwrap();
+        repo.remove("f1");
+        repo.remove("q");
+        repo.commit("c3: f1 and q deleted").unwrap();
+        repo.git(&["branch", "mid", &c2]).unwrap();
+        repo.checkout("mid").unwrap();
+
+        let out = h.ops_on("main").switch_branch("mid", &NoFault).unwrap();
+        assert!(out.happened);
+        assert_eq!(out.first_sight_from.as_deref(), Some("main"));
+        assert_eq!(
+            h.ledger.seen_tree, seen,
+            "neither path is folded, so the copy's tree stands as it is"
+        );
+        let mut paths: Vec<String> = h
+            .scan()
+            .pile
+            .rows
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.path).into_owned())
+            .collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec!["f1".to_string(), "q".to_string()],
+            "both differing paths over-show on the branch just arrived on"
+        );
+    }
+
+    /// The other half of R2: the two branches have diverged, and the branch just left is
+    /// itself the merge-base (it committed nothing after the cut), so no path differs
+    /// between the departed tip and the fold's target and the copy stands as it is. The
+    /// over-show §2 allows is what the user sees.
+    #[test]
+    fn ops_switch_branch_copies_without_a_fold_when_the_departed_tip_is_the_merge_base() {
+        let mut repo = FixtureRepo::new("ops-switch-copy").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        h.ledger.seen_branch = Some("main".into());
+        // Two branches off main, each with a commit of its own: neither tip is in the
+        // other's history.
+        repo.checkout_b("feat-a").unwrap();
+        repo.write("a1", "a\n");
+        repo.commit("a1 on feat-a").unwrap();
+        repo.checkout("main").unwrap();
+        repo.checkout_b("feat-b").unwrap();
+        repo.write("b1", "b\n");
+        repo.commit("b1 on feat-b").unwrap();
+
+        repo.checkout("feat-a").unwrap();
+        let before = h.ledger.clone();
+        let out = h.ops_on("main").switch_branch("feat-a", &NoFault).unwrap();
+        assert!(out.happened);
+        assert_eq!(out.first_sight_from.as_deref(), Some("main"));
+        assert_eq!(
+            h.ledger.seen_tree, before.seen_tree,
+            "a plain copy: the seen tree is the one just left"
+        );
+        assert_eq!(h.ledger.overrides, before.overrides);
+        assert_eq!(
+            h.ledger.seen_at, before.seen_at,
+            "and `seen_at` is copied, not restamped: it is what the upstream range is \
+             computed from"
+        );
+    }
+
+    /// D25's shape at the ops layer, the case the ancestor form got wrong: the record
+    /// accepted `p` on `feat` at `c2`, the arrival `feat2` was cut from `c1` and has a
+    /// commit of its own, so the two tips have diverged and `M = c1`. `p` differs between
+    /// `feat`'s tip and `M`, its baseline is exactly what `feat`'s tip holds, so it folds
+    /// back to `c1`'s entry (absent) and the override is spent: no deletion row for work
+    /// the user accepted. `d`, which only the arrival has, is not in that set and shows.
+    #[test]
+    fn ops_switch_branch_folds_to_the_merge_base_when_the_tips_have_diverged() {
+        let mut repo = FixtureRepo::new("ops-switch-mergebase").unwrap();
+        repo.checkout_b("feat").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        h.ledger.seen_branch = Some("feat".into());
+        repo.write("p", "accepted\n");
+        repo.commit("c2: p on feat").unwrap();
+        let r = rendered(&h, b"p");
+        assert!(h.ops_on("feat").accept_file(&r, &NoFault).unwrap().ok());
+        assert!(h.ledger.overrides.contains_key("p"));
+
+        // One shell line, no scan in between: back to the shared ancestor, a branch of its
+        // own, a commit on it.
+        repo.checkout("main").unwrap();
+        repo.checkout_b("feat2").unwrap();
+        repo.write("d", "new work\n");
+        repo.commit("c3: d on feat2").unwrap();
+
+        let out = h.ops_on("feat").switch_branch("feat2", &NoFault).unwrap();
+        assert!(out.happened);
+        assert_eq!(out.first_sight_from.as_deref(), Some("feat"));
+        assert!(
+            !h.ledger.overrides.contains_key("p"),
+            "p folded onto the merge-base, so the override that held it is spent"
+        );
+        let paths: Vec<String> = h
+            .scan()
+            .pile
+            .rows
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.path).into_owned())
+            .collect();
+        assert_eq!(
+            paths,
+            vec!["d".to_string()],
+            "the arrival's own commit shows and nothing else does"
+        );
+    }
+
+    /// No merge-base at all (two root commits): there is no common point to fold onto, so
+    /// the copy stands exactly as it is, overrides included.
+    #[test]
+    fn ops_switch_branch_copies_without_a_fold_when_the_histories_are_unrelated() {
+        let mut repo = FixtureRepo::new("ops-switch-unrelated").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        h.ledger.seen_branch = Some("main".into());
+        repo.write("n1", "new\n");
+        repo.commit("n1 on main").unwrap();
+        let r = rendered(&h, b"n1");
+        assert!(h.ops_on("main").accept_file(&r, &NoFault).unwrap().ok());
+        let before = h.ledger.clone();
+
+        repo.git(&["checkout", "-q", "--orphan", "alone"]).unwrap();
+        for seed in ["f1", "f2", "f3", "n1"] {
+            repo.remove(seed);
+        }
+        repo.write("solo", "unrelated\n");
+        repo.commit("a root commit of its own").unwrap();
+
+        let out = h.ops_on("main").switch_branch("alone", &NoFault).unwrap();
+        assert!(out.happened);
+        assert_eq!(out.first_sight_from.as_deref(), Some("main"));
+        assert_eq!(
+            h.ledger.seen_tree, before.seen_tree,
+            "a plain copy: the seen tree is the one just left"
+        );
+        assert_eq!(h.ledger.overrides, before.overrides);
+    }
+
+    /// R2's seen-state target, clause (a): the merge-base is reachable from the commit the
+    /// root was first sighted at, so everything committed there was in the repository
+    /// before lastcall ever looked at it and is safe to baseline. `f1` was accepted on
+    /// `main` — so the record has finished with it there — and folds back to the entry the
+    /// first-sight commit holds; the branch's own commit is not in the differing set and
+    /// shows.
+    #[test]
+    fn ops_switch_branch_folds_when_the_merge_base_is_before_the_first_sight() {
+        let mut repo = FixtureRepo::new("ops-switch-seen-a").unwrap();
+        let c1 = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_owned();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        h.ledger.seen_branch = Some("main".into());
+        assert_eq!(
+            h.ledger.first_sight_head.as_ref().map(Oid::as_str),
+            Some(c1.as_str()),
+            "the first sight is at c1"
+        );
+        repo.write("f1", "v2\n");
+        repo.commit("c2: f1 = v2 on main").unwrap();
+        let r = rendered(&h, b"f1");
+        assert!(h.ops_on("main").accept_file(&r, &NoFault).unwrap().ok());
+        assert!(h.ledger.overrides.contains_key("f1"));
+
+        repo.git(&["branch", "cut", &c1]).unwrap();
+        repo.checkout("cut").unwrap();
+        repo.write("d", "new work\n");
+        repo.commit("d on cut").unwrap();
+
+        let out = h.ops_on("main").switch_branch("cut", &NoFault).unwrap();
+        assert!(out.happened);
+        assert_eq!(out.first_sight_from.as_deref(), Some("main"));
+        assert_eq!(out.fold_skipped, None, "the fold ran");
+        assert!(
+            !h.ledger.overrides.contains_key("f1"),
+            "f1 folded onto the first-sight commit's entry, so the override is spent"
+        );
+        let paths: Vec<String> = h
+            .scan()
+            .pile
+            .rows
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.path).into_owned())
+            .collect();
+        assert_eq!(paths, vec!["d".to_string()]);
+    }
+
+    /// R2's seen-state target, clause (b): the merge-base is *after* the first sight, so
+    /// clause (a) cannot help, but a parked record composes exactly the entry the
+    /// merge-base holds — the user accepted `f1 = v2` on `main` and that record is still
+    /// parked — so it is seen state and the fold takes it. Without (b) this branch would
+    /// list `f1` as modified against a version the user accepted two branches ago.
+    #[test]
+    fn ops_switch_branch_folds_when_a_parked_record_already_holds_the_entry() {
+        let mut repo = FixtureRepo::new("ops-switch-seen-b").unwrap();
+        let c1 = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_owned();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        h.ledger.seen_branch = Some("main".into());
+        repo.write("f1", "v2\n");
+        let c2 = repo.commit("c2: f1 = v2 on main").unwrap();
+        let r = rendered(&h, b"f1");
+        assert!(h.ops_on("main").accept_file(&r, &NoFault).unwrap().ok());
+
+        // `mid` starts at the same commit, so its first sight folds nothing and its record
+        // is `main`'s copy. `main` is parked holding `f1 = v2`.
+        repo.git(&["branch", "mid", &c2]).unwrap();
+        repo.checkout("mid").unwrap();
+        h.ops_on("main").switch_branch("mid", &NoFault).unwrap();
+        assert!(h.ledger.branches.contains_key("main"));
+        repo.write("f1", "v3\n");
+        repo.commit("c3: f1 = v3 on mid").unwrap();
+        let r = rendered(&h, b"f1");
+        assert!(h.ops_on("mid").accept_file(&r, &NoFault).unwrap().ok());
+
+        repo.git(&["branch", "other", &c2]).unwrap();
+        repo.checkout("other").unwrap();
+        let out = h.ops_on("mid").switch_branch("other", &NoFault).unwrap();
+        assert!(out.happened);
+        assert_eq!(out.first_sight_from.as_deref(), Some("mid"));
+        assert_eq!(out.fold_skipped, None);
+        assert_ne!(
+            h.ledger.first_sight_head.as_ref().map(Oid::as_str),
+            Some(c2.as_str()),
+            "the merge-base is after the first sight, so clause (a) is not what folded it"
+        );
+        assert_eq!(
+            h.ledger.first_sight_head.as_ref().map(Oid::as_str),
+            Some(c1.as_str())
+        );
+        assert!(
+            !h.ledger.overrides.contains_key("f1"),
+            "f1 folded onto the merge-base's entry, which `main`'s parked record holds"
+        );
+        assert!(
+            h.scan().pile.is_empty(),
+            "nothing pending: the branch's content is the version the user accepted"
+        );
+    }
+
+    /// The refusal the target is for: the merge-base's entry is seen state nowhere. `main`
+    /// accepted `f1 = v2` and then `f1 = v3`, so no record still holds `v2`, and the
+    /// merge-base is well after the first sight. A branch cut at `v2` shows it once, which
+    /// is the over-show §2 allows and §11 records; folding it would baseline a version the
+    /// ledger has no evidence was ever on a screen.
+    #[test]
+    fn ops_switch_branch_refuses_the_fold_when_the_entry_is_seen_state_nowhere() {
+        let mut repo = FixtureRepo::new("ops-switch-seen-none").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        h.ledger.seen_branch = Some("main".into());
+        repo.write("f1", "v2\n");
+        let c2 = repo.commit("c2: f1 = v2 on main").unwrap();
+        let r = rendered(&h, b"f1");
+        assert!(h.ops_on("main").accept_file(&r, &NoFault).unwrap().ok());
+        repo.write("f1", "v3\n");
+        repo.commit("c3: f1 = v3 on main").unwrap();
+        let r = rendered(&h, b"f1");
+        assert!(h.ops_on("main").accept_file(&r, &NoFault).unwrap().ok());
+        let before = h.ledger.clone();
+
+        repo.git(&["branch", "mid", &c2]).unwrap();
+        repo.checkout("mid").unwrap();
+        let out = h.ops_on("main").switch_branch("mid", &NoFault).unwrap();
+        assert!(out.happened);
+        assert_eq!(out.first_sight_from.as_deref(), Some("main"));
+        assert_eq!(
+            out.fold_skipped, None,
+            "the fold ran and refused the path: that is not a skip"
+        );
+        assert_eq!(
+            h.ledger.seen_tree, before.seen_tree,
+            "nothing folded, so the copy's tree stands"
+        );
+        assert_eq!(h.ledger.overrides, before.overrides);
+        let paths: Vec<String> = h
+            .scan()
+            .pile
+            .rows
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.path).into_owned())
+            .collect();
+        assert_eq!(paths, vec!["f1".to_string()], "the over-show, once");
+    }
+
+    /// A parked record that has seen nothing vouches for nothing (verifier round four, F1).
+    /// Its seen tree is `None`, which the scan reads as "everything on disk is new"; read
+    /// as "every path is absent" it would let clause (b) fold an unaccepted deletion to
+    /// absent. Here `main` deletes `f1`, never accepts the deletion, and restores it; a
+    /// branch cut at the deleting commit must show `f1` as deleted, whatever a treeless
+    /// record parked beside it says.
+    #[test]
+    fn ops_switch_branch_refuses_the_fold_when_a_parked_record_has_seen_nothing() {
+        let mut repo = FixtureRepo::new("ops-switch-seen-treeless").unwrap();
+        let c1 = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_owned();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        h.ledger.seen_branch = Some("main".into());
+        h.ledger.branches.insert(
+            "ghost".into(),
+            BranchRecord {
+                seen_tree: None,
+                seen_at: h.ledger.seen_at.clone(),
+                overrides: BTreeMap::new(),
+                undo: Vec::new(),
+                parked_at: "2026-09-16T00:00:00Z".into(),
+            },
+        );
+        repo.git(&["rm", "-q", "f1"]).unwrap();
+        let c2 = repo
+            .commit("c2: f1 removed on main, never accepted")
+            .unwrap();
+        repo.git(&["checkout", &c1, "--", "f1"]).unwrap();
+        repo.commit("c3: f1 restored on main").unwrap();
+        assert!(
+            h.scan().pile.is_empty(),
+            "the restored entry is the first-sight entry"
+        );
+        let before = h.ledger.clone();
+
+        repo.git(&["branch", "cut", &c2]).unwrap();
+        repo.checkout("cut").unwrap();
+        let out = h.ops_on("main").switch_branch("cut", &NoFault).unwrap();
+        assert!(out.happened);
+        assert_eq!(out.first_sight_from.as_deref(), Some("main"));
+        assert_eq!(out.fold_skipped, None, "the fold ran and refused the path");
+        assert_eq!(
+            h.ledger.seen_tree, before.seen_tree,
+            "f1 absent at the merge-base is seen state nowhere: the copy's tree stands"
+        );
+        assert_eq!(h.ledger.overrides, before.overrides);
+        let paths: Vec<String> = h
+            .scan()
+            .pile
+            .rows
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.path).into_owned())
+            .collect();
+        assert_eq!(
+            paths,
+            vec!["f1".to_string()],
+            "the deletion nobody accepted shows"
+        );
+    }
+
+    /// A state file older than `first_sight_head` knows no first-sight commit, so clause
+    /// (a) never holds for it and the records alone decide. The same shape that folds in
+    /// `ops_switch_branch_folds_when_the_merge_base_is_before_the_first_sight` keeps its
+    /// copy here, which over-shows and hides nothing. Not a skip: the fold ran.
+    #[test]
+    fn ops_switch_branch_never_folds_through_an_unknown_first_sight_head() {
+        let mut repo = FixtureRepo::new("ops-switch-seen-unknown").unwrap();
+        let c1 = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_owned();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        h.ledger.seen_branch = Some("main".into());
+        h.ledger.first_sight_head = None;
+        repo.write("f1", "v2\n");
+        repo.commit("c2: f1 = v2 on main").unwrap();
+        let r = rendered(&h, b"f1");
+        assert!(h.ops_on("main").accept_file(&r, &NoFault).unwrap().ok());
+        let before = h.ledger.clone();
+
+        repo.git(&["branch", "cut", &c1]).unwrap();
+        repo.checkout("cut").unwrap();
+        let out = h.ops_on("main").switch_branch("cut", &NoFault).unwrap();
+        assert!(out.happened);
+        assert_eq!(
+            out.fold_skipped, None,
+            "an unknown first-sight head is not a skipped fold"
+        );
+        assert_eq!(h.ledger.seen_tree, before.seen_tree);
+        assert_eq!(h.ledger.overrides, before.overrides);
+        let paths: Vec<String> = h
+            .scan()
+            .pile
+            .rows
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.path).into_owned())
+            .collect();
+        assert_eq!(paths, vec!["f1".to_string()]);
+    }
+
+    /// R3's prune: a parked record whose branch is gone goes with it, and only that one.
+    #[test]
+    fn ops_switch_branch_prunes_only_parked_names_without_refs() {
+        let repo = FixtureRepo::new("ops-switch-prune").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        h.ledger.seen_branch = Some("main".into());
+        for b in ["run-1", "run-2"] {
+            repo.checkout_b(b).unwrap();
+            repo.checkout("main").unwrap();
+            repo.checkout(b).unwrap();
+            h.ops_on("main").switch_branch(b, &NoFault).unwrap();
+            repo.checkout("main").unwrap();
+            h.ops_on(b).switch_branch("main", &NoFault).unwrap();
+        }
+        assert_eq!(
+            h.ledger.branches.keys().collect::<Vec<_>>(),
+            ["run-1", "run-2"]
+        );
+        repo.git(&["branch", "-D", "run-1"]).unwrap();
+        repo.checkout("run-2").unwrap();
+        h.ops_on("main").switch_branch("run-2", &NoFault).unwrap();
+        assert_eq!(
+            h.ledger.branches.keys().collect::<Vec<_>>(),
+            ["main"],
+            "run-1's ref is gone, run-2's record is in force, main is parked"
+        );
+    }
+
+    /// R4: a detached or unreadable `HEAD` never moves the record in force. The engine's
+    /// sync stops before it gets here; this is the second gate, under the lock, for the
+    /// case where git moved while the switch waited for it.
+    #[test]
+    fn ops_switch_branch_is_a_no_op_at_a_detached_or_unreadable_head() {
+        let repo = FixtureRepo::new("ops-switch-detached").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        h.ledger.seen_branch = Some("main".into());
+        let before = h.ledger.clone();
+
+        repo.git(&["checkout", "-q", "--detach"]).unwrap();
+        let out = h.ops_on("main").switch_branch("feat", &NoFault).unwrap();
+        assert!(!out.happened && out.first_sight_from.is_none());
+        assert_eq!(h.ledger, before, "detached: nothing moved");
+
+        let head = h.git_dir.join("HEAD");
+        let saved = std::fs::read(&head).unwrap();
+        std::fs::remove_file(&head).unwrap();
+        let out = h.ops_on("main").switch_branch("feat", &NoFault).unwrap();
+        assert!(!out.happened);
+        assert_eq!(h.ledger, before, "no HEAD to read: nothing moved");
+        std::fs::write(&head, saved).unwrap();
+    }
+
+    /// R5, D22's shape: work staged under one branch is refused once another process has
+    /// switched the record in force, and the refusal names the branch that is in force now.
+    #[test]
+    fn ops_accept_is_refused_after_another_ops_switched_the_branch() {
+        let mut repo = FixtureRepo::new("ops-switch-refuse").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut a = Harness::new(&repo, &state);
+        let mut b = Harness::new(&repo, &state);
+        a.ledger.seen_branch = Some("main".into());
+        b.ledger.seen_branch = Some("main".into());
+        repo.checkout_b("feat/z").unwrap();
+        repo.write("z1", "z\n");
+        repo.commit("z1 on feat/z").unwrap();
+        let r = rendered(&b, b"z1");
+
+        a.ops_on("main").switch_branch("feat/z", &NoFault).unwrap();
+        repo.checkout("main").unwrap();
+        a.ops_on("feat/z").switch_branch("main", &NoFault).unwrap();
+
+        let out = b.ops_on("feat/z").accept_file(&r, &NoFault).unwrap();
+        assert!(!out.ok());
+        assert_eq!(
+            out.refused[0].to_string(),
+            "branch changed under this accept (now main); try again"
+        );
+        assert!(!out.written, "nothing written");
+        let disk = match ledger::load(&b.paths, &b.clock).unwrap() {
+            LoadResult::Loaded { ledger, .. } => ledger,
+            other => panic!("{other:?}"),
+        };
+        assert!(!disk.overrides.contains_key("z1"));
+        assert_eq!(disk.seen_branch.as_deref(), Some("main"));
+    }
+
+    /// A fold folds the record in force. A parked record is a record, not a pile: nothing
+    /// in it is a compaction input and nothing in it changes.
+    #[test]
+    fn ops_compaction_after_a_switch_touches_the_record_in_force_only() {
+        let mut repo = FixtureRepo::new("ops-switch-compact").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        h.ledger.seen_branch = Some("main".into());
+        repo.write("f1", "main edit\n");
+        let r = rendered(&h, b"f1");
+        assert!(h.ops_on("main").accept_file(&r, &NoFault).unwrap().ok());
+
+        repo.checkout_b("feat/c").unwrap();
+        repo.write("f2", "feat edit\n");
+        repo.commit("f2 on feat/c").unwrap();
+        h.ops_on("main").switch_branch("feat/c", &NoFault).unwrap();
+        let r = rendered(&h, b"f2");
+        assert!(h.ops_on("feat/c").accept_file(&r, &NoFault).unwrap().ok());
+        let parked = h.ledger.branches["main"].clone();
+
+        h.ops_on("feat/c").compact(&NoFault).unwrap();
+        assert!(h.ledger.overrides.is_empty(), "the record in force folded");
+        assert_eq!(
+            h.ledger.branches["main"], parked,
+            "main's parked record is untouched, overrides and seen tree both"
+        );
+        assert!(h.scan().pile.is_empty());
+    }
+
+    /// R3 and R7: the undo stack travels with its record. An arriving branch's first sight
+    /// starts with an empty one, and the stack the branch left comes back with it.
+    #[test]
+    fn ops_undo_after_a_switch_pops_the_record_in_force_stack() {
+        let repo = FixtureRepo::new("ops-switch-undo").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        h.ledger.seen_branch = Some("main".into());
+        repo.write("f1", "main edit\n");
+        let r = rendered(&h, b"f1");
+        assert!(h.ops_on("main").accept_file(&r, &NoFault).unwrap().ok());
+        assert_eq!(h.ledger.undo.len(), 1);
+
+        repo.checkout_b("feat/u").unwrap();
+        h.ops_on("main").switch_branch("feat/u", &NoFault).unwrap();
+        assert!(h.ledger.undo.is_empty(), "a first sight starts clean");
+        let out = h.ops_on("feat/u").undo(&NoFault).unwrap();
+        assert_eq!(
+            out.refused[0].to_string(),
+            Refused::NothingToUndo.to_string()
+        );
+
+        repo.checkout("main").unwrap();
+        h.ops_on("feat/u").switch_branch("main", &NoFault).unwrap();
+        assert_eq!(h.ledger.undo.len(), 1, "main's stack came back with it");
+        assert!(h.ops_on("main").undo(&NoFault).unwrap().ok());
+        assert!(h.ledger.undo.is_empty());
+        assert!(
+            !h.ledger.overrides.contains_key("f1"),
+            "and it undid main's accept"
+        );
+    }
+
+    /// The compaction trigger counts the record in force, so a repository with many
+    /// branches does not compact early on the sum of all of them.
+    #[test]
+    fn ops_blob_override_count_counts_the_record_in_force_only() {
+        let repo = FixtureRepo::new("ops-switch-count").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        h.ledger.seen_branch = Some("main".into());
+        repo.write("f1", "one\n");
+        repo.write("f2", "two\n");
+        for p in [b"f1".as_slice(), b"f2".as_slice()] {
+            let r = rendered(&h, p);
+            assert!(h.ops_on("main").accept_file(&r, &NoFault).unwrap().ok());
+        }
+        assert_eq!(h.ledger.blob_override_count(), 2);
+
+        repo.checkout_b("feat/n").unwrap();
+        repo.git(&["checkout", "-q", "--", "."]).unwrap();
+        h.ops_on("main").switch_branch("feat/n", &NoFault).unwrap();
+        // The copy carries main's two overrides; one more here makes three in force.
+        assert_eq!(h.ledger.branches["main"].overrides.len(), 2);
+        repo.write("f3", "three\n");
+        let r = rendered(&h, b"f3");
+        assert!(h.ops_on("feat/n").accept_file(&r, &NoFault).unwrap().ok());
+        assert_eq!(
+            h.ledger.blob_override_count(),
+            3,
+            "the record in force only: main's parked two are not added in"
+        );
     }
 
     #[test]
@@ -1840,7 +3119,7 @@ mod tests {
         assert_eq!(pile_lines(&pile), vec!["f1", "f2", "f3"]);
         let rows: Vec<Rendered> = pile.rows.iter().map(Rendered::of).collect();
         repo.write("f3", "moved\n");
-        let out = h.ops().accept_group(&rows, &NoFault).unwrap();
+        let out = h.ops().accept_group(&rows, None, &NoFault).unwrap();
         assert_eq!(out.refused.len(), 1);
         assert!(matches!(&out.refused[0], Refused::Moved { path, .. } if path == b"f3"));
         assert!(out.written, "one write for the rows that passed");
@@ -3027,7 +4306,7 @@ mod tests {
         repo.write("f3", "three\n");
         repo.write("grouped", "g2\n");
         let rows = vec![rendered(&h, b"f3"), rendered(&h, b"grouped")];
-        assert!(h.ops().accept_group(&rows, &NoFault).unwrap().ok());
+        assert!(h.ops().accept_group(&rows, None, &NoFault).unwrap().ok());
         assert_eq!(top(&h).op, UndoOp::AcceptGroup);
         assert_eq!(
             top(&h).paths.keys().cloned().collect::<Vec<_>>(),
@@ -3316,18 +4595,26 @@ mod tests {
             keys,
             // `serde_json::Value` keys come back sorted, not in document order.
             [
+                // R2's seen-state target: this harness first-sights like the engine does,
+                // so the commit it was first sighted at is on the wire. It is the other
+                // field that is simply omitted when there is nothing to say.
+                "first_sight_head",
                 "kind",
                 "overrides",
                 "root",
                 "schema_version",
                 "seen_at",
+                // R6: the record in force names its branch on every write, tri-state and
+                // never skipped, so a 1.1 reader's `null` and this build's absent-key are
+                // told apart. `branches` is the one that is omitted when empty.
+                "seen_branch",
                 "seen_tree"
             ],
             "a ledger with neither an undo stack nor a snooze writes neither field"
         );
         let (parsed, notices) = ledger::parse(raw.as_bytes()).unwrap();
         assert!(notices.is_empty(), "{notices:?}");
-        assert_eq!(parsed.schema_version, "1.1");
+        assert_eq!(parsed.schema_version, "1.2");
         assert!(parsed.undo.is_empty());
         assert_eq!(parsed.snoozed_until, None);
     }
@@ -3528,6 +4815,8 @@ mod tests {
                     index: &self.index,
                     repo: None,
                     paths: &self.paths,
+                    branch: None,
+                    git_dir: None,
                     ledger: &mut self.ledger,
                     tree: &mut self.tree,
                     clock: &self.clock,

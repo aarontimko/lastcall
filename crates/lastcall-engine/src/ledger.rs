@@ -28,9 +28,11 @@ use crate::git::{Mode, Oid};
 use crate::paths::RepoPaths;
 use crate::store::RootKind;
 
-/// `1.1` since Amendment v1.7: `Override.flags` beside the 1.0 `flag` mirror. Only the
-/// **major** gates readability ([`parse`]), so a 1.0 build still opens a 1.1 file.
-pub const SCHEMA_VERSION: &str = "1.1";
+/// `1.2` since Amendment v1.12: [`Ledger::seen_branch`] and [`Ledger::branches`] beside
+/// the record in force, which stays flattened at the top level. `1.1` (Amendment v1.7)
+/// added `Override.flags` beside the 1.0 `flag` mirror. Only the **major** gates
+/// readability ([`parse`]), so a 1.0 build still opens a 1.2 file.
+pub const SCHEMA_VERSION: &str = "1.2";
 
 /// Lock retry policy: 40 × 50 ms = 2 s, then the operation errors — never write unlocked.
 ///
@@ -376,11 +378,16 @@ impl<'de> Deserialize<'de> for Override {
     }
 }
 
-fn deserialize_double_option<'de, D>(d: D) -> Result<Option<Option<Oid>>, D::Error>
+/// `null` → `Some(None)`, a value → `Some(Some(v))`, and the field being **absent** →
+/// `None` (serde's `default`). Two fields need that three-way distinction: an override's
+/// `blob` (flag-only, seen-as-absent, or an oid) and the ledger's `seen_branch` (a 1.1
+/// file, a record made at a detached HEAD, or a branch name).
+fn deserialize_double_option<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
 where
     D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
 {
-    Option::<Oid>::deserialize(d).map(Some)
+    Option::<T>::deserialize(d).map(Some)
 }
 
 impl Override {
@@ -388,6 +395,26 @@ impl Override {
     pub fn is_empty(&self) -> bool {
         self.blob.is_none() && self.flags.is_empty()
     }
+}
+
+/// One branch's parked seen record (Amendment v1.12, R3): everything the record in force
+/// carries, plus when the branch was left.
+///
+/// The record **in force** is deliberately *not* one of these — it stays flattened at the
+/// top level of the document (R6) so a 1.1 binary opening a 1.2 file still reads the
+/// baseline of the branch it is on. `overrides` are parsed strictly here: a parked record
+/// whose shape does not load is dropped with a notice (that branch first-sights again at
+/// its next checkout, an over-show), which is why [`LedgerWire::branches`] holds raw JSON.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BranchRecord {
+    pub seen_tree: Option<Oid>,
+    pub seen_at: SeenAt,
+    #[serde(default)]
+    pub overrides: BTreeMap<String, Override>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub undo: Vec<UndoEntry>,
+    /// When the branch was last left (ISO-8601 UTC).
+    pub parked_at: String,
 }
 
 /// The wire shape: overrides as raw JSON so one unparsable entry cannot sink the file.
@@ -398,8 +425,26 @@ struct LedgerWire {
     kind: RootKind,
     seen_tree: Option<Oid>,
     seen_at: SeenAt,
+    /// Which branch the top-level record belongs to (Amendment v1.12, R6).
+    /// `Option<Option<String>>` so *absent* — a file a 1.1 binary wrote, whose record the
+    /// first sync adopts for whatever branch `HEAD` names — stays distinguishable from
+    /// `null`, which a 1.2 binary writes for a record made at a detached HEAD or for a
+    /// draft root. **No `skip_serializing_if`:** once the document is 1.2 the field is
+    /// always there, so the distinction survives every rewrite.
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    seen_branch: Option<Option<String>>,
+    /// The commit the root was first sighted at (Amendment v1.12, R2's seen-state target).
+    /// Omitted when unknown, so a 1.1 file and a 1.2 file written before the field both
+    /// read as `None` and rewrite byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    first_sight_head: Option<Oid>,
     #[serde(default)]
     overrides: BTreeMap<String, serde_json::Value>,
+    /// The parked records (Amendment v1.12). Omitted when empty, so a root that has only
+    /// ever been on one branch rewrites exactly as it did before this phase; raw JSON for
+    /// the same reason `overrides` is.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    branches: BTreeMap<String, serde_json::Value>,
     /// Amendment v1.11, additive. Omitted when the root is not snoozed, so a ledger that
     /// never met a Phase 10 binary is byte-identical after a rewrite.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -418,7 +463,23 @@ pub struct Ledger {
     pub kind: RootKind,
     pub seen_tree: Option<Oid>,
     pub seen_at: SeenAt,
+    /// The branch whose record is in force (Amendment v1.12, R1): the name in
+    /// `<git_dir>/HEAD`. `None` for a draft root and for a record made at a detached HEAD.
+    pub seen_branch: Option<String>,
+    /// The commit this root was first sighted at (R2's seen-state target): set once, at
+    /// the root's first sight, and never changed by an accept, a switch, an adoption, a
+    /// rename or a compaction. It belongs to the root, not to a branch, so no
+    /// [`BranchRecord`] carries it. `None` when the root was first sighted at an unborn
+    /// head, when it is a draft root, or when the state file predates the field.
+    pub first_sight_head: Option<Oid>,
     pub overrides: BTreeMap<String, Override>,
+    /// One parked record per branch this root has been checked out on while lastcall
+    /// watched, never including [`Ledger::seen_branch`] (R3).
+    pub branches: BTreeMap<String, BranchRecord>,
+    /// The file carried no `seen_branch` field at all (a 1.1 binary wrote it), so the
+    /// first sync adopts `HEAD`'s branch as this record's owner with no switch and no fold
+    /// (R6). In memory only: it is never written, and `false` the moment a sync has run.
+    pub adopt_branch: bool,
     /// Overrides whose shape we could not parse: retained verbatim, rewritten on save, and
     /// ignored by baseline resolution (the path resolves to the tree).
     pub unparsable: BTreeMap<String, serde_json::Value>,
@@ -438,7 +499,11 @@ impl Ledger {
             kind,
             seen_tree,
             seen_at,
+            seen_branch: None,
+            first_sight_head: None,
             overrides: BTreeMap::new(),
+            branches: BTreeMap::new(),
+            adopt_branch: false,
             unparsable: BTreeMap::new(),
             snoozed_until: None,
             undo: Vec::new(),
@@ -485,7 +550,20 @@ impl Ledger {
             kind: self.kind,
             seen_tree: self.seen_tree.clone(),
             seen_at: self.seen_at.clone(),
+            // Always `Some(..)`, so the field is always written: see `LedgerWire`.
+            seen_branch: Some(self.seen_branch.clone()),
+            first_sight_head: self.first_sight_head.clone(),
             overrides,
+            branches: self
+                .branches
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        serde_json::to_value(v).expect("branch record is serializable"),
+                    )
+                })
+                .collect(),
             snoozed_until: self.snoozed_until.clone(),
             undo: self.undo.clone(),
         }
@@ -507,13 +585,31 @@ impl Ledger {
                 }
             }
         }
+        let mut branches = BTreeMap::new();
+        for (name, value) in wire.branches {
+            match serde_json::from_value::<BranchRecord>(value) {
+                Ok(r) => {
+                    branches.insert(name, r);
+                }
+                Err(e) => notices.push(format!(
+                    "the parked seen record for branch {name:?} has an unreadable shape ({e}); \
+                     that branch starts again at its next checkout"
+                )),
+            }
+        }
         Self {
             schema_version: wire.schema_version,
             root: wire.root,
             kind: wire.kind,
             seen_tree: wire.seen_tree,
             seen_at: wire.seen_at,
+            // Absent (a 1.1 file) and `null` (a 1.2 file whose record was made detached)
+            // both read as `None` in memory; only the first asks for the adoption.
+            adopt_branch: wire.seen_branch.is_none(),
+            seen_branch: wire.seen_branch.flatten(),
+            first_sight_head: wire.first_sight_head,
             overrides,
+            branches,
             unparsable,
             snoozed_until: wire.snoozed_until,
             undo: wire.undo,
@@ -913,7 +1009,7 @@ mod tests {
         let l = sample();
         let json = l.to_json();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["schema_version"], "1.1");
+        assert_eq!(v["schema_version"], "1.2");
         assert_eq!(v["kind"], "git");
         assert_eq!(v["seen_tree"], oid('a').as_str());
         assert_eq!(v["seen_at"]["head_commit"], oid('b').as_str());
@@ -952,10 +1048,10 @@ mod tests {
             l.overrides["f2"].flags.is_empty(),
             "a null flag is no flags"
         );
-        // The rewrite gains the `flags` list — and says so: what is written is a 1.1
-        // document, so it is stamped 1.1 (F8), not the 1.0 it was read as.
+        // The rewrite gains the `flags` list — and says so: what is written is a 1.2
+        // document, so it is stamped 1.2 (F8), not the 1.0 it was read as.
         let v: serde_json::Value = serde_json::from_str(&l.to_json()).unwrap();
-        assert_eq!(v["schema_version"], "1.1");
+        assert_eq!(v["schema_version"], "1.2");
         assert_eq!(v["overrides"]["f1"]["flags"][0]["note"], "look");
         assert_eq!(
             v["overrides"]["f1"]["flag"]["note"], "look",
@@ -973,7 +1069,7 @@ mod tests {
     /// not understand.
     #[test]
     fn ledger_write_always_stamps_the_current_schema_version() {
-        assert_eq!(SCHEMA_VERSION, "1.1");
+        assert_eq!(SCHEMA_VERSION, "1.2");
         let stamp = |json: &str| -> serde_json::Value {
             let (l, _) = parse(json.as_bytes()).unwrap();
             serde_json::from_str(&l.to_json()).unwrap()
@@ -985,15 +1081,15 @@ mod tests {
             "seen_at":{"head_commit":null,"branch":null,"at":"x"},
             "overrides":{"f1":{"flag":{"note":"look","created_at":"t"},"updated_at":"t"}}}"#,
         );
-        assert_eq!(older["schema_version"], "1.1");
+        assert_eq!(older["schema_version"], "1.2");
 
         // Newer: a minor version this build does not know. It loads (deliberately), but
-        // what we write back is 1.1 and is stamped 1.1.
+        // what we write back is 1.2 and is stamped 1.2.
         let newer = stamp(
             r#"{"schema_version":"1.7","root":"/r","kind":"draft","seen_tree":null,
             "seen_at":{"head_commit":null,"branch":null,"at":"x"},"overrides":{},"future":true}"#,
         );
-        assert_eq!(newer["schema_version"], "1.1");
+        assert_eq!(newer["schema_version"], "1.2");
         assert!(newer.get("future").is_none());
 
         // And a ledger built in memory, never read from disk at all.
@@ -1008,7 +1104,7 @@ mod tests {
             },
         );
         let v: serde_json::Value = serde_json::from_str(&fresh.to_json()).unwrap();
-        assert_eq!(v["schema_version"], "1.1");
+        assert_eq!(v["schema_version"], "1.2");
     }
 
     /// The dual write: `flag` mirrors `flags[0]` without its hunk, `flags` carries all of
@@ -1040,7 +1136,7 @@ mod tests {
         );
         let json = l.to_json();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["schema_version"], "1.1");
+        assert_eq!(v["schema_version"], "1.2");
         let o = &v["overrides"]["many"];
         assert_eq!(o["flag"]["note"], "first", "the 1.0 mirror is flags[0]");
         assert!(
@@ -1099,6 +1195,182 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// Amendment v1.12's wire shape: `seen_branch` at the top level and two parked records
+    /// under `branches`, through a full write and read.
+    #[test]
+    fn ledger_1_2_round_trips_two_parked_records() {
+        let mut l = sample();
+        l.seen_branch = Some("feat/w".into());
+        let rec = |tree: char, at: &str| BranchRecord {
+            seen_tree: Some(oid(tree)),
+            seen_at: SeenAt {
+                head_commit: Some(oid(tree)),
+                branch: Some("ignored".into()),
+                at: at.into(),
+            },
+            overrides: BTreeMap::from([(
+                "p".to_string(),
+                Override {
+                    blob: Some(Some(oid('e'))),
+                    mode: Some(Mode::Regular),
+                    flags: Vec::new(),
+                    updated_at: at.into(),
+                },
+            )]),
+            undo: Vec::new(),
+            parked_at: at.into(),
+        };
+        l.branches.insert("main".into(), rec('a', "t1"));
+        l.branches.insert("run-1".into(), rec('b', "t2"));
+
+        let json = l.to_json();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["schema_version"], "1.2");
+        assert_eq!(v["seen_branch"], "feat/w");
+        assert_eq!(v["branches"]["main"]["seen_tree"], oid('a').as_str());
+        assert_eq!(v["branches"]["run-1"]["parked_at"], "t2");
+        assert_eq!(
+            v["branches"]["main"]["overrides"]["p"]["blob"],
+            oid('e').as_str()
+        );
+        assert!(
+            v["branches"]["main"].get("undo").is_none(),
+            "an empty undo stack is omitted inside a parked record too"
+        );
+
+        let (back, notices) = parse(json.as_bytes()).unwrap();
+        assert!(notices.is_empty(), "{notices:?}");
+        assert_eq!(back.seen_branch.as_deref(), Some("feat/w"));
+        assert_eq!(back.branches, l.branches);
+        assert!(!back.adopt_branch, "a 1.2 file names its branch");
+        assert_eq!(back.to_json(), json, "and the second write is identical");
+    }
+
+    /// R6's other half: a root that has only ever been on one branch gains exactly one key
+    /// over its 1.1 self, and rewrites byte-for-byte from then on — with and without the
+    /// first-sight head, which is the other field this schema omits when it has nothing to
+    /// say (R2's seen-state target).
+    #[test]
+    fn ledger_1_2_with_no_parked_records_rewrites_byte_identical() {
+        let mut l = sample();
+        l.seen_branch = Some("main".into());
+        let once = l.to_json();
+        assert!(
+            !once.contains("\"branches\""),
+            "no parked records, no field: {once}"
+        );
+        assert!(
+            !once.contains("\"first_sight_head\""),
+            "an unknown first-sight head is omitted, so a file written before the field \
+             rewrites unchanged: {once}"
+        );
+        let (back, notices) = parse(once.as_bytes()).unwrap();
+        assert!(notices.is_empty(), "{notices:?}");
+        assert!(back.branches.is_empty());
+        assert!(back.first_sight_head.is_none());
+        assert_eq!(back.to_json(), once, "rewrite is byte-identical");
+
+        // And the same for the shape that has it.
+        let mut with_head = l.clone();
+        with_head.first_sight_head = Some(oid('d'));
+        let text = with_head.to_json();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["first_sight_head"], oid('d').as_str());
+        let (back, notices) = parse(text.as_bytes()).unwrap();
+        assert!(notices.is_empty(), "{notices:?}");
+        assert_eq!(back.first_sight_head, Some(oid('d')));
+        assert_eq!(back.to_json(), text, "rewrite is byte-identical");
+
+        // And the detached case is `null`, not an absent key: a reader must be able to tell
+        // "this record belongs to no branch" from "a 1.1 binary wrote this".
+        let mut detached = l.clone();
+        detached.seen_branch = None;
+        let text = detached.to_json();
+        assert!(text.contains("\"seen_branch\": null"), "{text}");
+        let (back, _) = parse(text.as_bytes()).unwrap();
+        assert!(back.seen_branch.is_none());
+        assert!(
+            !back.adopt_branch,
+            "an explicit null is this build saying the record belongs to no branch, which \
+             is not the same thing as a 1.1 binary having no field to say it with"
+        );
+    }
+
+    /// D21's fixture as a string: the file a 1.1 binary wrote has neither field, loads
+    /// clean, and asks to be adopted.
+    #[test]
+    fn ledger_1_1_file_has_no_branch_and_asks_to_be_adopted() {
+        let json = r#"{"schema_version":"1.1","root":"/r","kind":"git","seen_tree":null,
+            "seen_at":{"head_commit":null,"branch":null,"at":"x"},
+            "overrides":{"f1":{"blob":null,"flags":[],"updated_at":"t"}}}"#;
+        let (l, notices) = parse(json.as_bytes()).unwrap();
+        assert!(notices.is_empty(), "{notices:?}");
+        assert!(l.seen_branch.is_none());
+        assert!(l.branches.is_empty());
+        assert!(l.adopt_branch, "the missing field is the adoption signal");
+        assert!(
+            l.first_sight_head.is_none(),
+            "a file older than the field knows no first-sight head, and R2's clause (a) \
+             simply never holds for it"
+        );
+        assert!(l.overrides.contains_key("f1"), "nothing else moved");
+        // The adoption itself is `RootState::sync_branch`'s, and is not written until the
+        // next ordinary write; what this build writes is 1.2 and says so.
+        let v: serde_json::Value = serde_json::from_str(&l.to_json()).unwrap();
+        assert_eq!(v["schema_version"], "1.2");
+        assert!(v["seen_branch"].is_null());
+    }
+
+    /// R2's seen-state target is additive: a 1.2 file written before `first_sight_head`
+    /// existed reads as `None` — the same answer a 1.1 file gives — and no parked record
+    /// carries one, because the commit the root was first sighted at belongs to the root
+    /// and not to any branch.
+    #[test]
+    fn ledger_a_1_2_file_without_a_first_sight_head_reads_as_none() {
+        let json = r#"{"schema_version":"1.2","root":"/r","kind":"git","seen_tree":null,
+            "seen_at":{"head_commit":null,"branch":null,"at":"x"},"seen_branch":"main",
+            "overrides":{},
+            "branches":{"old":{"seen_tree":null,"seen_at":{"head_commit":null,"branch":null,
+                               "at":"x"},"overrides":{},"parked_at":"t"}}}"#;
+        let (l, notices) = parse(json.as_bytes()).unwrap();
+        assert!(notices.is_empty(), "{notices:?}");
+        assert!(l.first_sight_head.is_none());
+        assert_eq!(l.seen_branch.as_deref(), Some("main"));
+        let v: serde_json::Value = serde_json::from_str(&l.to_json()).unwrap();
+        assert!(
+            v.get("first_sight_head").is_none(),
+            "and the rewrite does not invent one"
+        );
+        assert!(
+            v["branches"]["old"].get("first_sight_head").is_none(),
+            "a parked record never carries it"
+        );
+    }
+
+    /// A parked record whose shape this build cannot read costs that branch its record,
+    /// never the file: the branch starts again at its next checkout, which over-shows.
+    #[test]
+    fn ledger_an_unparsable_parked_record_is_dropped_with_a_notice() {
+        let json = r#"{"schema_version":"1.2","root":"/r","kind":"git","seen_tree":null,
+            "seen_at":{"head_commit":null,"branch":null,"at":"x"},"seen_branch":"main",
+            "overrides":{},
+            "branches":{"bad":{"seen_tree":42},
+                        "good":{"seen_tree":null,"seen_at":{"head_commit":null,"branch":null,
+                                "at":"x"},"overrides":{},"parked_at":"t"}}}"#;
+        let (l, notices) = parse(json.as_bytes()).unwrap();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(
+            notices[0]
+                .starts_with("the parked seen record for branch \"bad\" has an unreadable shape"),
+            "{}",
+            notices[0]
+        );
+        assert!(notices[0].ends_with("that branch starts again at its next checkout"));
+        assert!(l.branches.contains_key("good"));
+        assert!(!l.branches.contains_key("bad"));
+        assert_eq!(l.seen_branch.as_deref(), Some("main"));
     }
 
     #[test]

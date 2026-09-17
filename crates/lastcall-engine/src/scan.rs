@@ -142,6 +142,14 @@ pub struct Pile {
     /// the TUI never compares wall clocks of its own; design review F4).
     #[serde(default)]
     pub snoozed_until: Option<String>,
+    /// The branch whose record this pile was computed against (the ledger's `seen_branch`,
+    /// Amendment v1.12). An accept-all or a group accept carries the snapshot the user
+    /// saw, and R5 is about exactly that: a snapshot rendered under one branch must not be
+    /// written into another's record, even after the `Ops` has adopted it. `None` for a
+    /// draft root, for a record that belongs to no branch, and for a pile built by hand in
+    /// a test. Additive: older JSON without it reads as `None`.
+    #[serde(default)]
+    pub seen_branch: Option<String>,
 }
 
 impl Pile {
@@ -603,6 +611,7 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
             // Stamped by the engine (`scan_root`), which owns the clock the expiry needs.
             undo: 0,
             snoozed_until: None,
+            seen_branch: inputs.ledger.seen_branch.clone(),
         },
         nested_repos,
         hash_calls: store.git().hash_object_calls() - calls_before,
@@ -869,15 +878,29 @@ pub(crate) mod fixture_tests {
         pub(crate) case_insensitive: bool,
         pub(crate) clock: FixedClock,
         pub(crate) compaction_threshold: usize,
+        /// The fixture's `.git`, for the tests that drive the branch switch.
+        pub(crate) git_dir: std::path::PathBuf,
     }
 
     impl Harness {
+        /// [`Harness::ops`] with R5's two fields filled in: the branch the op stages its
+        /// work under, and the git dir whose `HEAD` says which branch is really in force.
+        pub(crate) fn ops_on(&mut self, branch: &str) -> Ops<'_> {
+            let git_dir = self.git_dir.clone();
+            let mut ops = self.ops();
+            ops.branch = Some(branch.to_owned());
+            ops.git_dir = Some(git_dir);
+            ops
+        }
+
         pub(crate) fn ops(&mut self) -> Ops<'_> {
             Ops {
                 store: &self.store,
                 index: &self.index,
                 repo: Some(&self.repo_git),
                 paths: &self.paths,
+                branch: None,
+                git_dir: None,
                 ledger: &mut self.ledger,
                 tree: &mut self.tree_entries,
                 clock: &self.clock,
@@ -898,11 +921,18 @@ pub(crate) mod fixture_tests {
             let (store, _) =
                 Store::open(&env, repo.path(), RootKind::Git, &paths, Some(&facts)).unwrap();
             let exclude = repo_git.git_path("info/exclude").unwrap();
+            let git_dir = repo_git
+                .git_path("HEAD")
+                .unwrap()
+                .parent()
+                .expect("a git dir above HEAD")
+                .to_path_buf();
             let index =
                 PrivateIndex::new(store.git().clone(), &paths, RootKind::Git, Some(exclude));
             let tree = Oid::parse(repo.git(&["rev-parse", "HEAD^{tree}"]).unwrap().trim()).unwrap();
             let tree_entries = store.ls_tree(&tree).unwrap();
-            let ledger = Ledger::new(
+            let head_commit = Oid::parse(repo.git(&["rev-parse", "HEAD"]).unwrap().trim()).unwrap();
+            let mut ledger = Ledger::new(
                 repo.path(),
                 RootKind::Git,
                 Some(tree),
@@ -912,6 +942,11 @@ pub(crate) mod fixture_tests {
                     at: "2026-01-01T00:00:00Z".into(),
                 },
             );
+            // What `engine::first_sight` sets for a git root: the commit the root was first
+            // sighted at, which R2's seen-state target asks about. The ops tests build their
+            // ledger by hand, so without this every fixture would look like a state file
+            // older than the field.
+            ledger.first_sight_head = Some(head_commit);
             let mut b = globset::GlobSetBuilder::new();
             b.add(globset::Glob::new("**/Cargo.lock").unwrap());
             b.add(globset::Glob::new("Cargo.lock").unwrap());
@@ -926,6 +961,7 @@ pub(crate) mod fixture_tests {
                 paths,
                 clock: FixedClock::at_unix(1_800_000_000),
                 compaction_threshold: 500,
+                git_dir,
             }
         }
 

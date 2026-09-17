@@ -21,19 +21,28 @@ lc_init() {
       v="$(git -C "$LC_R" config --get "$k" 2>/dev/null || true)"; [ -n "$v" ] && git --git-dir="$LC_STATE/objects" config "$k" "$v"
     done
   fi
-  : > "$LC_STATE/seen_tree"; : > "$LC_STATE/seen_head"
+  mkdir -p "$LC_STATE/branches"
+  : > "$LC_STATE/seen_tree"; : > "$LC_STATE/seen_head"; : > "$LC_STATE/seen_branch"
+  : > "$LC_STATE/first_sight_head"
 }
 # all plumbing runs against OUR store with R as the work tree and OUR index
 lcg() { GIT_DIR="$LC_STATE/objects" GIT_WORK_TREE="$LC_R" GIT_INDEX_FILE="$LC_STATE/index" git -c core.excludesfile=/dev/null "$@"; }
+# the same, over a caller-named index file (the temp index of a fold)
+lcgi() { local idx="$1"; shift; GIT_DIR="$LC_STATE/objects" GIT_WORK_TREE="$LC_R" GIT_INDEX_FILE="$idx" git -c core.excludesfile=/dev/null "$@"; }
 rg()  { git -C "$LC_R" "$@"; }   # the user's repo
 enc() { printf '%s' "$1" | sed 's|/|%2F|g'; }
 
 lc_first_sight() {
   if [ "$LC_KIND" = git ] && rg rev-parse -q --verify HEAD >/dev/null 2>&1; then
     rg rev-parse 'HEAD^{tree}' > "$LC_STATE/seen_tree"; rg rev-parse HEAD > "$LC_STATE/seen_head"
+    # R2's seen-state target: the commit the root was first sighted at, written once here
+    # and never again. Empty at an unborn head and for a draft root, which makes clause (a)
+    # never hold rather than making anything fail.
+    rg rev-parse HEAD > "$LC_STATE/first_sight_head"
   elif [ "$LC_KIND" = draft ] && [ "${LC_DRAFT_INITIAL:-seen}" = seen ]; then
     lc_write_tree_of_disk > "$LC_STATE/seen_tree"
   else : > "$LC_STATE/seen_tree"; fi
+  lc_head_branch > "$LC_STATE/seen_branch"
   lc_seed_index
 }
 lc_seed_index() {
@@ -46,6 +55,185 @@ lc_write_tree_of_disk() {   # tree of current disk content (draft first sight)
   ( cd "$LC_R" && find . -type f ! -path './.git/*' | sed 's|^\./||' | sort | while read -r p; do
       GIT_DIR="$LC_STATE/objects" GIT_WORK_TREE="$LC_R" GIT_INDEX_FILE="$tmp" git add -f -- "$p"; done )
   GIT_DIR="$LC_STATE/objects" GIT_WORK_TREE="$LC_R" GIT_INDEX_FILE="$tmp" git write-tree
+}
+
+# ---------- branches (spec §6.4 per-branch records, Amendment v1.12) ----------
+# One record per branch the repo has been checked out on while lastcall watched; exactly
+# one is in force (the one $LC_STATE/seen_branch names, which is the branch <git_dir>/HEAD
+# names). A parked record is a directory $LC_STATE/branches/<enc name>/ holding the same
+# files the record in force keeps at the top of $LC_STATE.
+
+# R1: the branch name in <git_dir>/HEAD, or empty (detached, unborn-and-unnamed, missing,
+# mid-write, or a draft root) — one file read, never a git process that resolves HEAD.
+lc_head_branch() {
+  [ "$LC_KIND" = git ] || return 0
+  local gd; gd="$(rg rev-parse --path-format=absolute --git-dir 2>/dev/null)" || return 0
+  [ -r "$gd/HEAD" ] || return 0
+  sed -n 's|^ref: refs/heads/||p' "$gd/HEAD" 2>/dev/null | head -1
+}
+lc_parked() {   # the parked branch names, sorted, joined by |
+  ls "$LC_STATE/branches" 2>/dev/null | sed 's|%2F|/|g' | LC_ALL=C sort | tr '\n' '|' | sed 's/|$//'
+}
+# R3: drop every parked name that has no ref. for-each-ref prints full names (%(refname),
+# never %(refname:short), which a same-named tag can shadow); if it fails the prune is
+# skipped for this switch, which is the fail-open side (an over-show, never a hide).
+lc_branch_prune() {
+  [ -d "$LC_STATE/branches" ] || return 0
+  local refs; refs="$(rg for-each-ref --format='%(refname)' refs/heads 2>/dev/null)" || return 0
+  local d n
+  for d in "$LC_STATE/branches"/*; do
+    [ -d "$d" ] || continue
+    n="$(basename "$d" | sed 's|%2F|/|g')"
+    printf '%s\n' "$refs" | grep -qx "refs/heads/$n" || rm -rf "$d"
+  done
+}
+# One commit-or-tree's entry for exactly one path, as "<mode> <oid>" or ABSENT, read
+# through the named runner (rg = the user's repo, lcg = our store). A path that names a
+# **directory** there is ABSENT: the engine reads the whole tree with `ls-tree -r`, whose
+# map holds the blobs under that name and not the name itself, and writing a 040000 entry
+# into the fold's index is how the twin used to disagree with it (verifier F4).
+lc_entry() {   # lc_entry <rg|lcg> <rev-or-tree> <path>
+  local run="$1" rev="$2" p="$3" line mode
+  line="$("$run" ls-tree "$rev" -- "$p" 2>/dev/null | head -1)"
+  [ -z "$line" ] && { echo ABSENT; return; }
+  mode="$(printf '%s' "$line" | awk '{print $1}')"
+  [ "$mode" = 040000 ] && { echo ABSENT; return; }
+  printf '%s' "$line" | awk '{print $1" "$3}'
+}
+# One record's composed baseline for one path, as "<mode> <oid>" or ABSENT: the override's
+# blob and mode, else that record's seen tree's entry, else absent. The record is named by
+# its directory, and the record in force is $LC_STATE itself — one composer for the record
+# in force and for every parked record, so R2's seen-state target cannot disagree with
+# itself about what a baseline is.
+lc_rec_base() {   # lc_rec_base <record dir> <path>
+  local d="$1" p="$2" o b m t
+  o="$d/overrides/$(enc "$p")"
+  if [ -f "$o" ]; then
+    b="$(cat "$o")"
+    [ "$b" = null ] && { echo ABSENT; return; }
+    m=100644; [ -f "$o.mode" ] && m="$(cat "$o.mode")"
+    echo "$m $b"; return
+  fi
+  t="$(cat "$d/seen_tree" 2>/dev/null)"
+  # A record with no seen tree has seen nothing; without an override naming the path it
+  # composes no baseline at all, never ABSENT (verifier round four, F1: read as ABSENT, a
+  # parked record that had lost its tree vouched for an unaccepted deletion).
+  [ -z "$t" ] && { echo UNKNOWN; return; }
+  lc_entry lcg "$t" "$p"
+}
+# R2's second half: arriving on B from A's record, when refs/heads/A still exists and the
+# two tips have a merge-base M (the same commit and "B behind A" both give M = B's head).
+# Of the paths that differ between A's tip and M, a path is folded onto M's entry only when
+# both hold:
+#   1. the record's composed baseline for it equals A's tip entry — the user has finished
+#      with that path on the branch they left;
+#   2. M's entry is already seen state, which is (a) M reachable from the commit the root
+#      was first sighted at, so it was committed before lastcall ever looked, or (b) some
+#      other record composes exactly that entry as its own baseline.
+# A folded path takes M's entry (absent at M -> removed from the record) and loses its
+# override; every other differing path keeps the copy's baseline and over-shows. A gitlink
+# is left alone.
+lc_branch_fold() {
+  local a="$1"
+  rg rev-parse -q --verify "refs/heads/$a" >/dev/null 2>&1 || return 0
+  local bh; bh="$(rg rev-parse -q --verify HEAD 2>/dev/null)" || return 0
+  [ -n "$bh" ] || return 0
+  local mb; mb="$(rg merge-base "refs/heads/$a" "$bh" 2>/dev/null)" || return 0
+  [ -n "$mb" ] || return 0
+  local paths; paths="$(rg diff-tree -r -z --name-only "refs/heads/$a" "$mb" 2>/dev/null | tr '\0' '\n' | grep -v '^$')"
+  [ -n "$paths" ] || return 0
+  # (a), asked once for the whole fold and only now that there is something to fold.
+  local fsh=""; [ -f "$LC_STATE/first_sight_head" ] && fsh="$(cat "$LC_STATE/first_sight_head")"
+  local cov=0
+  if [ -n "$fsh" ] && rg merge-base --is-ancestor "$mb" "$fsh" >/dev/null 2>&1; then cov=1; fi
+  # (b): the parked records to ask, built only when (a) did not settle the fold. The record
+  # just parked is left out — it is the same record as the copy now in force, and rule 1
+  # has already required base == tipA while every path here differs between tipA and M, so
+  # it could never match.
+  local recs="" d
+  if [ "$cov" = 0 ]; then
+    for d in "$LC_STATE/branches"/*; do
+      [ -d "$d" ] || continue
+      [ "$(basename "$d")" = "$(enc "$a")" ] && continue
+      recs="$recs$d
+"
+    done
+  fi
+  local t; t="$(cat "$LC_STATE/seen_tree")"
+  local folded="$LC_STATE/fold.paths" info="$LC_STATE/fold.info"
+  : > "$folded"; : > "$info"
+  printf '%s\n' "$paths" | while IFS= read -r p; do
+    local tipm base tipa seen r
+    tipm="$(lc_entry rg "$mb" "$p")"
+    case "$tipm" in 160000\ *) continue;; esac
+    base="$(lc_rec_base "$LC_STATE" "$p")"
+    # The record in force composes against its tree, empty when it has none, as the engine's
+    # Ops does; only a parked record's UNKNOWN stays UNKNOWN and matches nothing below.
+    [ "$base" = UNKNOWN ] && base=ABSENT
+    tipa="$(lc_entry rg "refs/heads/$a" "$p")"
+    [ "$base" = "$tipa" ] || continue
+    seen="$cov"
+    if [ "$seen" = 0 ] && [ -n "$recs" ]; then
+      while IFS= read -r r; do
+        [ -n "$r" ] || continue
+        [ "$(lc_rec_base "$r" "$p")" = "$tipm" ] && { seen=1; break; }
+      done <<INNER
+$recs
+INNER
+    fi
+    [ "$seen" = 1 ] || continue
+    printf '%s\n' "$p" >> "$folded"
+    if [ "$tipm" = ABSENT ]; then printf '0 0000000000000000000000000000000000000000\t%s\n' "$p" >> "$info"
+    else printf '%s\t%s\n' "$tipm" "$p" >> "$info"; fi
+  done
+  if [ -s "$info" ]; then
+    local tmp="$LC_STATE/index.fold"; rm -f "$tmp"
+    if [ -n "$t" ]; then lcgi "$tmp" read-tree "$t"; else lcgi "$tmp" read-tree --empty; fi
+    lcgi "$tmp" update-index --index-info < "$info"
+    lcgi "$tmp" write-tree > "$LC_STATE/seen_tree"
+    while IFS= read -r p; do
+      rm -f "$LC_STATE/overrides/$(enc "$p")" "$LC_STATE/overrides/$(enc "$p").mode"
+    done < "$folded"
+    rm -f "$tmp"
+  fi
+  rm -f "$folded" "$info"
+}
+# The sync every entry point that reads or writes state runs first (R1, R2, R3).
+lc_branch_sync() {
+  [ "$LC_KIND" = git ] || return 0
+  local name; name="$(lc_head_branch)"
+  [ -n "$name" ] || return 0                                  # R4: detached/unborn/unreadable = no switch
+  local cur=""; [ -f "$LC_STATE/seen_branch" ] && cur="$(cat "$LC_STATE/seen_branch")"
+  if [ -z "$cur" ]; then echo "$name" > "$LC_STATE/seen_branch"; return 0; fi   # R6: adopt, no fold
+  [ "$cur" = "$name" ] && return 0
+  # R3 rename: the record in force is re-labelled when its own ref is gone. No park, no
+  # first sight, no fold.
+  # ...and only when the name it moved to has no parked record of its own: a checkout of a
+  # branch we have been on before is a switch, never a re-label, whatever became of the ref
+  # we left (verifier F4).
+  if ! rg rev-parse -q --verify "refs/heads/$cur" >/dev/null 2>&1 \
+     && [ ! -d "$LC_STATE/branches/$(enc "$name")" ]; then
+    echo "$name" > "$LC_STATE/seen_branch"; lc_branch_prune; return 0
+  fi
+  local pd="$LC_STATE/branches/$(enc "$cur")"                 # R3: park the record we leave
+  rm -rf "$pd"; mkdir -p "$pd/overrides"
+  cp "$LC_STATE/seen_tree" "$pd/seen_tree"; cp "$LC_STATE/seen_head" "$pd/seen_head"
+  cp "$LC_STATE"/overrides/* "$pd/overrides/" 2>/dev/null || true
+  local nd="$LC_STATE/branches/$(enc "$name")"
+  rm -f "$LC_STATE"/overrides/* 2>/dev/null || true
+  if [ -d "$nd" ]; then                                       # R3: the parked record comes back
+    cp "$nd/seen_tree" "$LC_STATE/seen_tree"; cp "$nd/seen_head" "$LC_STATE/seen_head"
+    cp "$nd/overrides/"* "$LC_STATE/overrides/" 2>/dev/null || true
+    rm -rf "$nd"
+  else                                                        # R2: a copy of the record just left...
+    cp "$pd/seen_tree" "$LC_STATE/seen_tree"
+    cp "$pd/overrides/"* "$LC_STATE/overrides/" 2>/dev/null || true
+    rg rev-parse HEAD > "$LC_STATE/seen_head" 2>/dev/null || : > "$LC_STATE/seen_head"
+    lc_branch_fold "$cur"                                     # ...then the ancestor fold
+  fi
+  echo "$name" > "$LC_STATE/seen_branch"
+  lc_branch_prune
+  lc_seed_index
 }
 
 # ---------- content ----------
@@ -61,6 +249,7 @@ lc_tree_blob() { local t; t="$(cat "$LC_STATE/seen_tree")"; [ -z "$t" ] && { ech
 lc_tree_mode() { local t; t="$(cat "$LC_STATE/seen_tree")"; [ -z "$t" ] && { echo EMPTY; return; }
   lcg ls-tree "$t" -- "$1" | awk '{print $1}' | { read -r x; echo "${x:-EMPTY}"; }; }
 lc_baseline() {  # override blob | tree blob | EMPTY   ("null" override = ABSENT)
+  lc_branch_sync
   local o="$LC_STATE/overrides/$(enc "$1")"
   if [ -f "$o" ]; then local b; b="$(cat "$o")"; [ "$b" = null ] && echo ABSENT || echo "$b"; else lc_tree_blob "$1"; fi
 }
@@ -109,6 +298,7 @@ lc_upstream_paths() {   # emits lines "path U" (changed only by upstream commits
     if grep -qx "$p" "$tmpl" || grep -qx "$p" "$tmpm"; then echo "$p M"; else echo "$p U"; fi; done
 }
 lc_pile() {   # sorted lines: "path" or "path upstream" or "path mixed"
+  lc_branch_sync
   local ups="$LC_STATE/ups.tmp"; lc_upstream_paths > "$ups"
   lc_candidates | while read -r p; do
     [ -n "$(lc_pending_p "$p")" ] || continue
@@ -123,11 +313,12 @@ lc_pile() {   # sorted lines: "path" or "path upstream" or "path mixed"
 }
 
 # ---------- operations ----------
-lc_accept_file() { local p="$1" cur; cur="$(lc_hash "$p")"   # (harness: rendered == live unless caller passes a blob)
+lc_accept_file() { lc_branch_sync; local p="$1" cur; cur="$(lc_hash "$p")"   # (harness: rendered == live unless caller passes a blob)
   [ -n "${2:-}" ] && cur="$2"
   if [ "$cur" = ABSENT ]; then echo null > "$LC_STATE/overrides/$(enc "$p")"; else echo "$cur" > "$LC_STATE/overrides/$(enc "$p")"; lc_mode "$p" > "$LC_STATE/overrides/$(enc "$p").mode"; fi
   [ "$cur" = "$(lc_tree_blob "$p")" ] && [ "$(lc_mode "$p")" = "$(lc_tree_mode "$p")" ] && rm -f "$LC_STATE/overrides/$(enc "$p")" "$LC_STATE/overrides/$(enc "$p").mode"; true; }
 lc_accept_all() {   # build tree from rendered blobs: baseline-composed = current content for pending, else baseline
+  lc_branch_sync
   local tmp="$LC_STATE/index.tmp"; rm -f "$tmp"
   local t; t="$(cat "$LC_STATE/seen_tree")"
   if [ -n "$t" ]; then GIT_DIR="$LC_STATE/objects" GIT_WORK_TREE="$LC_R" GIT_INDEX_FILE="$tmp" git read-tree "$t"; else GIT_DIR="$LC_STATE/objects" GIT_WORK_TREE="$LC_R" GIT_INDEX_FILE="$tmp" git read-tree --empty; fi
@@ -141,7 +332,7 @@ lc_accept_all() {   # build tree from rendered blobs: baseline-composed = curren
   lc_seed_index
 }
 lc_snapshot_rendered() { mkdir -p "$LC_STATE/rendered"; local p; for p in "$@"; do lc_hash "$p" > "$LC_STATE/rendered/$(enc "$p")"; done; }
-lc_restart() { lc_seed_index; }   # everything else is recomputed
+lc_restart() { lc_branch_sync; lc_seed_index; }   # everything else is recomputed (an offline switch lands here)
 
 # ---------- discovery (search_depth, D12) ----------
 # lc_discover PARENT DEPTH -> the directories holding a .git entry that discovery lists at
@@ -167,6 +358,10 @@ lc_discover() {
 PASS=0; FAIL=0
 assert_pile() {   # assert_pile "scenario" "expected lines joined by |"
   local name="$1" exp="$2" got; got="$(lc_pile | tr '\n' '|' | sed 's/|$//')"
+  if [ "$got" = "$exp" ]; then PASS=$((PASS+1)); echo "  ok   $name"; else FAIL=$((FAIL+1)); echo "  FAIL $name"; echo "       expected: [$exp]"; echo "       got:      [$got]"; fi
+}
+assert_str() {   # assert_str "scenario" "expected" "got"
+  local name="$1" exp="$2" got="$3"
   if [ "$got" = "$exp" ]; then PASS=$((PASS+1)); echo "  ok   $name"; else FAIL=$((FAIL+1)); echo "  FAIL $name"; echo "       expected: [$exp]"; echo "       got:      [$got]"; fi
 }
 assert_roots() {   # assert_roots "scenario" "expected joined by |" PARENT DEPTH
