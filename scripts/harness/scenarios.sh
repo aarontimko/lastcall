@@ -400,7 +400,11 @@ echo a2 > "$W/tree/a.md"; echo b2 > "$W/tree/sub/b.md"
 assert_pile "F5 both edits are rows" "a.md|sub/b.md"
 echo d > "$W/tree/sub/deeper/d.md"; assert_pile "F5 an add below is a row" "a.md|sub/b.md|sub/deeper/d.md"
 rm "$W/tree/sub/deeper/c.md"; assert_pile "F5 a delete below is a row" "a.md|sub/b.md|sub/deeper/c.md|sub/deeper/d.md"
+# The reader's note on a path that stays in the record: a fold folds content, never notes.
+lc_flag sub/b.md "keep an eye on this"
 lc_accept_all; assert_pile "F5 accept all" ""
+assert_str "F5 an accept-all keeps the note" "keep an eye on this" "$(cat "$S/overrides/$(enc sub/b.md).flag" 2>/dev/null)"
+assert_pile "F5 and a note on its own is not a row" ""
 
 # F6: a file of the size limit or more is never read. Size decides what is read, never what
 # is listed: a path the record holds keeps its row when it changes.
@@ -423,6 +427,24 @@ assert_str "F6 the record no longer holds it" "ABSENT" "$(lc_baseline under.bin)
 assert_str "F6 and it is counted from then on" "2" "$(lc_unread_count)"
 # A file that shrinks below the limit is read again, as a new file.
 echo shrunk > "$W/big/at_limit.bin"; assert_pile "F6 a file that shrank is read again" "at_limit.bin"
+lc_accept_file at_limit.bin; assert_pile "F6 and accepted like any other" ""
+# A file the folder has never recorded, over the limit, with the reader's note on it: the
+# note keeps its row, and accepting the whole pile lets the path go with the note kept.
+# Every fold after that leaves the record where the accept put it (verifier G1, G2).
+( cd "$W/big" && dd if=/dev/zero of=newf.bin bs=1024 count=512 2>/dev/null )
+assert_str "F6 a new large file is counted, not listed" "2" "$(lc_unread_count)"
+lc_flag newf.bin "agent says look"
+assert_pile "F6 a flagged new large file is a row" "newf.bin"
+assert_str "F6 and a row is not counted" "1" "$(lc_unread_count)"
+lc_accept_all
+assert_pile "F6 accept-all lets the flagged row go" ""
+assert_str "F6 the record let the path go" "ABSENT" "$(lc_baseline newf.bin)"
+assert_str "F6 and it is counted from then on" "2" "$(lc_unread_count)"
+assert_str "F6 the note survived the fold" "agent says look" "$(cat "$S/overrides/$(enc newf.bin).flag" 2>/dev/null)"
+lc_accept_all   # the twin's compaction is the same fold with nothing pending
+assert_pile "F6 the row stays gone through a compaction" ""
+assert_str "F6 still counted after the compaction" "2" "$(lc_unread_count)"
+assert_str "F6 and the note is still there" "agent says look" "$(cat "$S/overrides/$(enc newf.bin).flag" 2>/dev/null)"
 
 # F7: narrowing the entry trims the record by shape, once, and never by size.
 mkdir -p "$W/trim/sub"
@@ -430,16 +452,16 @@ echo a > "$W/trim/a.md"; echo b > "$W/trim/sub/b.md"
 S="$W/trim.state"; mkdir -p "$S"; lc_init "$W/trim" "$S" draft tree; lc_first_sight
 assert_str "F7 the tree was recorded" "a.md|sub/b.md" "$(lcg ls-tree -r --name-only "$(cat "$S/seen_tree")" | tr '\n' '|' | sed 's/|$//')"
 # The reader's note on the deep path: the trim drops what the record holds, never the note.
-lc_flag sub/b.md
-assert_str "F7 the note is on the deep path" "flag" "$(cat "$S/overrides/$(enc sub/b.md)" 2>/dev/null)"
+lc_flag sub/b.md "check this"
+assert_str "F7 the note is on the deep path" "check this" "$(cat "$S/overrides/$(enc sub/b.md).flag" 2>/dev/null)"
 LC_SCOPE=plain
 assert_str "F7 the trim drops the paths the folder no longer covers" "1" "$(lc_scope_trim)"
 assert_str "F7 the record is the folder's own files" "a.md" "$(lcg ls-tree -r --name-only "$(cat "$S/seen_tree")" | tr '\n' '|' | sed 's/|$//')"
-assert_str "F7 the trim keeps the note" "flag" "$(cat "$S/overrides/$(enc sub/b.md)" 2>/dev/null)"
+assert_str "F7 the trim keeps the note" "check this" "$(cat "$S/overrides/$(enc sub/b.md).flag" 2>/dev/null)"
 assert_pile "F7 nothing pending after the trim" ""
 assert_str "F7 said once, not at every scan" "0" "$(lc_scope_trim)"
 LC_SCOPE=tree
 assert_pile "F7 widening brings the path back as pending, never hidden" "sub/b.md"
-assert_str "F7 and the note is on the row that came back" "flag" "$(cat "$S/overrides/$(enc sub/b.md)" 2>/dev/null)"
+assert_str "F7 and the note is on the row that came back" "check this" "$(cat "$S/overrides/$(enc sub/b.md).flag" 2>/dev/null)"
 
 echo; echo "PASS=$PASS FAIL=$FAIL"
