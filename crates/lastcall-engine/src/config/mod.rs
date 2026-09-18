@@ -26,6 +26,13 @@ pub const MAX_SEARCH_DEPTH: u8 = 4;
 /// Default `collapse_size_bytes`: 512 KiB.
 pub const DEFAULT_COLLAPSE_SIZE_BYTES: u64 = 512 * 1024;
 
+/// Default `draft_dir_parents`: one folder above the matched folder, so a scratch folder
+/// called the same thing in two projects reads as two different rows.
+pub const DEFAULT_DRAFT_DIR_PARENTS: u8 = 1;
+
+/// The most folders above a matched folder a name may carry.
+pub const MAX_DRAFT_DIR_PARENTS: u8 = 4;
+
 /// Default `collapsed_globs`: common lockfiles (§6.1).
 pub const DEFAULT_COLLAPSED_GLOBS: &[&str] = &[
     "package-lock.json",
@@ -59,7 +66,10 @@ pub const DEFAULT_IGNORE_GLOBS: &[&str] = &[
 pub struct Config {
     /// Absolute paths to watch. Empty means "the launch cwd" (§6.1, G0 Q4).
     pub parent_dirs: Vec<PathBuf>,
-    /// Globs relative to parent dirs (e.g. `"_drafts/**"`) or absolute paths.
+    /// Globs relative to parent dirs (e.g. `"_drafts/**"`) or absolute paths. An entry
+    /// with a `/**` suffix reads the whole tree below the folder it matches; without the
+    /// suffix it reads that one folder. The pattern that picks the folder is the entry
+    /// without the suffix, so `notes/**` and `notes` match the same folders.
     pub draft_dirs: Vec<String>,
     /// What a draft root's first sight means (§6.2).
     pub draft_initial: DraftInitial,
@@ -81,6 +91,12 @@ pub struct Config {
     /// repository; up to `4`, the walk's ceiling. The walk never enters a repository or a
     /// dependency folder, so what it costs is a `read_dir` per plain folder.
     pub search_depth: u8,
+    /// How many folder names above a matched draft folder its displayed name carries
+    /// (Amendment v1.13, §6.1). `1` — the default — shows a `z_ignore` folder inside a
+    /// project called `alpha` as `alpha/z_ignore`, so two projects with the same scratch
+    /// folder name never read as one row; `0` is the folder's own name alone; up to `4`.
+    /// A folder nearer the filesystem root than the setting asks for shows what exists.
+    pub draft_dir_parents: u8,
     /// The `[herdr]` table.
     pub herdr: HerdrConfig,
     /// The `[update]` table (Amendment v1.10 item 2).
@@ -109,6 +125,7 @@ impl Default for Config {
                 .collect(),
             hide_empty_repos: false,
             search_depth: DEFAULT_SEARCH_DEPTH,
+            draft_dir_parents: DEFAULT_DRAFT_DIR_PARENTS,
             herdr: HerdrConfig::default(),
             update: UpdateConfig::default(),
             keys: BTreeMap::new(),
@@ -409,11 +426,32 @@ impl Config {
                 "search_depth must be between 1 and {MAX_SEARCH_DEPTH}"
             )));
         }
+        if self.draft_dir_parents > MAX_DRAFT_DIR_PARENTS {
+            return Err(invalid(format!(
+                "draft_dir_parents must be between 0 and {MAX_DRAFT_DIR_PARENTS}"
+            )));
+        }
         for entry in &self.draft_dirs {
             if !is_absolute_or_relative_glob(entry) {
                 return Err(invalid(format!(
                     "draft_dirs entry {entry:?} must be an absolute path or a relative glob \
                      (non-empty, no `..` components, no `~`)"
+                )));
+            }
+            let pattern = draft_entry_pattern(entry);
+            if pattern.is_empty() || pattern == "**" {
+                return Err(invalid(format!(
+                    "draft_dirs entry {entry:?} would match every folder under a parent dir: \
+                     name the folder (`notes`, `notes/**`) or use a pattern with a fixed part \
+                     (`*_drafts`, `**/notes`)"
+                )));
+            }
+            if !Path::new(entry).is_absolute()
+                && pattern.split('/').count() > MAX_SEARCH_DEPTH as usize
+            {
+                return Err(invalid(format!(
+                    "draft_dirs entry {entry:?} looks more than {MAX_SEARCH_DEPTH} folders below \
+                     a parent dir, which is as deep as the search goes"
                 )));
             }
         }
@@ -426,6 +464,33 @@ impl Config {
         }
         Ok(())
     }
+}
+
+/// The pattern a `draft_dirs` entry picks folders with: the entry without its `/**`
+/// suffix. The suffix says what the folder's record covers, never which folder it is, so
+/// `notes/**` and `notes` pick the same folders.
+pub fn draft_entry_pattern(entry: &str) -> &str {
+    entry.strip_suffix("/**").unwrap_or(entry)
+}
+
+/// Whether a `draft_dirs` entry covers the whole tree below the folder it picks.
+pub fn draft_entry_is_recursive(entry: &str) -> bool {
+    entry.ends_with("/**")
+}
+
+/// How many folder levels below a parent dir the search reads for this entry: one per
+/// component of its pattern, except that a `**` component reads to the walk's ceiling.
+/// Keeping the walk this short is why naming a folder costs one `read_dir`, not a sweep of
+/// everything below the parent dir.
+pub fn draft_entry_walk_depth(entry: &str) -> usize {
+    let pattern = draft_entry_pattern(entry);
+    if pattern.split('/').any(|component| component == "**") {
+        return MAX_SEARCH_DEPTH as usize;
+    }
+    pattern
+        .split('/')
+        .count()
+        .clamp(1, MAX_SEARCH_DEPTH as usize)
 }
 
 /// A `draft_dirs` entry is either absolute or a relative glob: non-empty, not `~`-prefixed,
@@ -914,6 +979,109 @@ nav_down = ["down", "j", "ctrl-n"]
             };
             c.validate(path).unwrap_or_else(|e| panic!("{good:?}: {e}"));
         }
+    }
+
+    /// Amendment v1.13 (§6.1): the search reads as many folder levels as the entry names,
+    /// so an entry that names more levels than the ceiling, or names nothing at all, is a
+    /// load error rather than a sweep of the whole parent dir.
+    #[test]
+    fn config_validation_rejects_draft_dir_entries_that_would_sweep_or_overshoot() {
+        let path = Path::new("/x/config.toml");
+        for bad in ["**", "**/**", "/**", "a/b/c/d/e", "a/b/c/d/e/**"] {
+            let c = Config {
+                draft_dirs: vec![bad.to_string()],
+                ..Config::default()
+            };
+            let err = c.validate(path).unwrap_err();
+            assert!(err.to_string().contains("draft_dirs"), "{bad:?}: {err}");
+            assert!(err.to_string().contains(bad), "{bad:?}: {err}");
+        }
+        // Four components is the ceiling, a `**` component is allowed beside a fixed one,
+        // and an absolute path is never walked so its own depth is its business.
+        for good in [
+            "a/b/c/d",
+            "a/b/c/d/**",
+            "**/notes",
+            "*_drafts",
+            "/a/b/c/d/e/f/notes",
+            "/a/b/c/d/e/f/notes/**",
+        ] {
+            let c = Config {
+                draft_dirs: vec![good.to_string()],
+                ..Config::default()
+            };
+            c.validate(path).unwrap_or_else(|e| panic!("{good:?}: {e}"));
+        }
+    }
+
+    /// The `/**` suffix says what a folder's record covers, never which folder it is.
+    #[test]
+    fn config_draft_entry_pattern_drops_the_recursive_suffix() {
+        for (entry, pattern, recursive) in [
+            ("notes", "notes", false),
+            ("notes/**", "notes", true),
+            ("a/*/notes", "a/*/notes", false),
+            ("a/*/notes/**", "a/*/notes", true),
+            ("/abs/notes/**", "/abs/notes", true),
+        ] {
+            assert_eq!(draft_entry_pattern(entry), pattern, "{entry:?}");
+            assert_eq!(draft_entry_is_recursive(entry), recursive, "{entry:?}");
+        }
+    }
+
+    /// One `read_dir` level per component; only a `**` component reads to the ceiling.
+    #[test]
+    fn config_draft_entry_walk_depth_is_the_component_count() {
+        for (entry, depth) in [
+            ("notes", 1),
+            ("notes/**", 1),
+            ("*_drafts", 1),
+            ("a/b", 2),
+            ("a/*/notes", 3),
+            ("a/b/c/d", 4),
+            ("**/notes", MAX_SEARCH_DEPTH as usize),
+            ("a/**/notes", MAX_SEARCH_DEPTH as usize),
+        ] {
+            assert_eq!(draft_entry_walk_depth(entry), depth, "{entry:?}");
+        }
+    }
+
+    /// Amendment v1.13 (§6.1): `draft_dir_parents` is a top-level integer, default `1`,
+    /// bounded by the same ceiling as the search, and the key is named when it is wrong.
+    #[test]
+    fn config_draft_dir_parents_defaults_to_one_and_is_bounded() {
+        assert_eq!(
+            Config::default().draft_dir_parents,
+            DEFAULT_DRAFT_DIR_PARENTS
+        );
+        assert_eq!(DEFAULT_DRAFT_DIR_PARENTS, 1);
+        let path = Path::new("/x/config.toml");
+        for ok in 0..=MAX_DRAFT_DIR_PARENTS {
+            let c = Config {
+                draft_dir_parents: ok,
+                ..Config::default()
+            };
+            c.validate(path).unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
+        for bad in [MAX_DRAFT_DIR_PARENTS + 1, 9, u8::MAX] {
+            let c = Config {
+                draft_dir_parents: bad,
+                ..Config::default()
+            };
+            let err = c.validate(path).unwrap_err();
+            assert!(
+                err.to_string().contains("draft_dir_parents"),
+                "{bad}: {err}"
+            );
+        }
+        let c: Config = toml::from_str("draft_dir_parents = 3\n").unwrap();
+        assert_eq!(c.draft_dir_parents, 3);
+        let round = toml::to_string(&c).unwrap();
+        assert_eq!(
+            toml::from_str::<Config>(&round).unwrap().draft_dir_parents,
+            3
+        );
+        assert!(toml::from_str::<Config>("draft_dir_parents = \"1\"\n").is_err());
     }
 
     #[test]

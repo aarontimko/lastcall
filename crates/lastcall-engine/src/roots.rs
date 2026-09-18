@@ -27,7 +27,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use globset::{Glob, GlobMatcher};
+use globset::{GlobBuilder, GlobMatcher};
 
 use crate::env::Env;
 use crate::git::RepoGit;
@@ -288,8 +288,8 @@ pub fn discover(inputs: &DiscoverInputs<'_>) -> Discovery {
             }
             continue;
         }
-        let matcher = match Glob::new(pattern) {
-            Ok(g) => g.compile_matcher(),
+        let matcher = match draft_matcher(pattern) {
+            Ok(m) => m,
             Err(e) => {
                 notices.push(format!(
                     "draft_dirs entry {entry:?} is not a valid glob: {e}"
@@ -414,6 +414,16 @@ pub fn main_worktree_if_linked(rg: &RepoGit) -> Option<PathBuf> {
     Some(std::fs::canonicalize(&first).unwrap_or_else(|_| PathBuf::from(first)))
 }
 
+/// The matcher for a `draft_dirs` pattern. `literal_separator(true)` keeps a `*` inside
+/// one folder name, so `notes/*` picks the folders directly inside `notes` and never
+/// something further down; only a `**` component crosses folders.
+fn draft_matcher(pattern: &str) -> Result<GlobMatcher, globset::Error> {
+    Ok(GlobBuilder::new(pattern)
+        .literal_separator(true)
+        .build()?
+        .compile_matcher())
+}
+
 /// Directories under `base` (bounded depth, skipping git internals and dependency dirs)
 /// whose base-relative path matches `glob`.
 fn matching_dirs(base: &Path, glob: &GlobMatcher) -> Vec<PathBuf> {
@@ -472,6 +482,25 @@ pub fn diff(prev: &Discovery, next: &Discovery) -> RootsChanged {
 mod tests {
     use super::*;
     use lastcall_testkit::tmp::TempDir;
+
+    /// Amendment v1.13: a `*` stays inside one folder name, so naming `notes/*` picks the
+    /// folders directly inside `notes` and nothing deeper. Only a `**` component crosses.
+    #[test]
+    fn roots_draft_matcher_keeps_a_star_inside_one_folder_name() {
+        let m = draft_matcher("notes/*").unwrap();
+        assert!(m.is_match("notes/a"));
+        assert!(!m.is_match("notes/a/b"));
+        assert!(!m.is_match("notes"));
+        let m = draft_matcher("*_drafts").unwrap();
+        assert!(m.is_match("_drafts"));
+        assert!(m.is_match("mail_drafts"));
+        assert!(!m.is_match("a/_drafts"));
+        let m = draft_matcher("**/notes").unwrap();
+        assert!(m.is_match("notes"));
+        assert!(m.is_match("a/notes"));
+        assert!(m.is_match("a/b/notes"));
+        assert!(!m.is_match("notes/a"));
+    }
 
     fn git(env: &Env, cwd: &Path, args: &[&str]) {
         let out = crate::git::base_command(env, cwd)
