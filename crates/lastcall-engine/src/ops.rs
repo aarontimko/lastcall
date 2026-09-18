@@ -300,6 +300,17 @@ impl Outcome {
     }
 }
 
+/// Whether a root-relative path has left the folder's scope: the shape test `Ops::trim`
+/// reads the record against.
+pub type OutOfScope<'a> = &'a dyn Fn(&[u8]) -> bool;
+
+/// What one fold did: the refusal that stopped it, and how many paths it dropped for
+/// being outside the folder's scope (`Ops::trim`; zero for every other fold).
+struct Folded {
+    refused: Option<Refused>,
+    dropped: usize,
+}
+
 /// Everything the ops need for one root. The engine constructs one per call.
 /// The shipping lock budget, as `Engine::ops` sets it: 40 × 50 ms = 2 s.
 pub const DEFAULT_LOCK: (u32, Duration) = (ledger::LOCK_RETRIES, ledger::LOCK_BACKOFF);
@@ -1620,7 +1631,7 @@ impl Ops<'_> {
             });
         }
         let seen_at = self.head_now();
-        match self.fold(snapshot, Some(seen_at), fault)? {
+        match self.fold(snapshot, Some(seen_at), None, fault)?.refused {
             Some(r) => Ok(Outcome {
                 refused: vec![r],
                 ..Default::default()
@@ -1639,8 +1650,38 @@ impl Ops<'_> {
         // A refusal here is not an error and not a user-visible outcome: the accept that
         // triggered the compaction already landed in the right record, and the fold that
         // would have followed is simply not run on another branch's.
-        self.fold(&Pile::empty(), None, fault)?;
+        self.fold(&Pile::empty(), None, None, fault)?;
         Ok(())
+    }
+
+    /// Drop the paths a watched folder's record holds but its scope no longer covers
+    /// (Amendment v1.13 R6), and answer how many left.
+    ///
+    /// `out_of_scope` is a **path-shape** question and nothing else: a file too large to
+    /// read is R2's unread row, reviewed once and removed by the user's own accept, never
+    /// dropped from the record behind their back.
+    ///
+    /// This goes through the same fold a compaction does, so it has compaction's
+    /// properties: the lock, the merge of another process's accepts, the temp file and the
+    /// rename, no undo entry and `seen_at` untouched. A blob override on a dropped path is
+    /// folded in first and then leaves with its path; a flag-only override stays, because
+    /// it is the user's own note and it comes back with the path if the folder is widened
+    /// again. The count is taken from the merged record under the lock, so a second
+    /// process that has already dropped some of them is not counted twice.
+    ///
+    /// A repository's record is never trimmed, and a folder with no record at all is left
+    /// alone rather than given an empty one.
+    pub fn trim(
+        &mut self,
+        out_of_scope: OutOfScope<'_>,
+        fault: &dyn FaultInjector,
+    ) -> Result<usize, OpsError> {
+        if self.ledger.kind != RootKind::Draft {
+            return Ok(0);
+        }
+        Ok(self
+            .fold(&Pile::empty(), None, Some(out_of_scope), fault)?
+            .dropped)
     }
 
     /// Reverse the most recent accept in this root (Amendment v1.11, deliverable 2).
@@ -2160,8 +2201,9 @@ impl Ops<'_> {
         &mut self,
         snapshot: &Pile,
         seen_at: Option<SeenAt>,
+        trim: Option<OutOfScope<'_>>,
         fault: &dyn FaultInjector,
-    ) -> Result<Option<Refused>, OpsError> {
+    ) -> Result<Folded, OpsError> {
         // The lock spans the whole fold: the tree is built from the on-disk ledger's
         // overrides, so another process's accepts are folded in, never dropped.
         let _lock = LedgerLock::acquire(self.paths)?;
@@ -2172,9 +2214,41 @@ impl Ops<'_> {
             self.staged.clear();
             self.pending_undo = None;
             self.merge_from_disk()?;
-            return Ok(Some(r));
+            return Ok(Folded {
+                refused: Some(r),
+                dropped: 0,
+            });
         }
         self.merge_from_disk()?;
+        // R6's paths, read off the **merged** record: the tree's own keys and any path
+        // whose override carries content. Nothing is written when none are left, so a
+        // folder whose record is already inside its scope is not rewritten, and one with
+        // no record at all keeps its `null` rather than gaining an empty tree.
+        let dropped: Vec<Vec<u8>> = match trim {
+            None => Vec::new(),
+            Some(out_of_scope) => {
+                let mut paths: Vec<Vec<u8>> = self
+                    .tree
+                    .keys()
+                    .filter(|p| out_of_scope(p))
+                    .cloned()
+                    .collect();
+                for (key, o) in self.ledger.overrides.iter() {
+                    if matches!(o.blob, Some(Some(_))) && out_of_scope(key.as_bytes()) {
+                        paths.push(key.as_bytes().to_vec());
+                    }
+                }
+                paths.sort();
+                paths.dedup();
+                paths
+            }
+        };
+        if trim.is_some() && dropped.is_empty() {
+            return Ok(Folded {
+                refused: None,
+                dropped: 0,
+            });
+        }
         // The accept-all entry, taken *before* the fold rewrites anything: the overrides
         // and the tree as they stand now are the pre-accept baselines. It lists exactly the
         // paths the fold takes from the snapshot (the row cap already bounds that list) and
@@ -2241,6 +2315,10 @@ impl Ops<'_> {
             };
             writes.insert(path, w);
         }
+        // Last, so a path that leaves the scope leaves whatever any earlier write said.
+        for path in &dropped {
+            writes.insert(path.clone(), TreeWrite::Remove { path: path.clone() });
+        }
         let writes: Vec<TreeWrite> = writes.into_values().collect();
         let new_tree = self
             .store
@@ -2267,7 +2345,10 @@ impl Ops<'_> {
         self.staged.clear();
         *self.tree = self.store.ls_tree(&new_tree)?;
         self.index.seed(Some(&new_tree))?;
-        Ok(None)
+        Ok(Folded {
+            refused: None,
+            dropped: dropped.len(),
+        })
     }
 
     /// Append a flag to `path` (A8; Amendment v1.7). Never touches `blob`.
@@ -2362,6 +2443,7 @@ mod tests {
     use crate::ledger::UNDO_CAP;
     use crate::scan::fixture_tests::Harness;
     use crate::scan::{Change, Rename, pile_lines};
+    use crate::store::DraftScope;
     use lastcall_testkit::fixture_repo::FixtureRepo;
     use lastcall_testkit::tmp::TempDir;
 
@@ -4696,6 +4778,121 @@ mod tests {
         assert_eq!(disk.snoozed_until, None);
     }
 
+    /// One folder's record and the shape predicate that decides what stays in it: a
+    /// folder watched on its own keeps only what sits directly inside it.
+    fn one_folder_only(path: &[u8]) -> bool {
+        path.contains(&b'/')
+    }
+
+    /// Amendment v1.13 R6: a record written while the folder's scope was wider is trimmed
+    /// by **path shape**, through the same fold a compaction runs, so it leaves no undo
+    /// entry and does not move `seen_at`. A blob override on a dropped path is folded in
+    /// and leaves with the path; a flag the user wrote stays.
+    #[test]
+    fn ops_trim_drops_out_of_scope_paths_and_keeps_the_users_flags() {
+        let mut d = proptests::Draft::new("lc-trim");
+        d.write("a.md", b"a\n");
+        d.write("research/b.md", b"b\n");
+        d.write("research/deep/c.md", b"c\n");
+        d.first_sight(&DraftScope::tree(u64::MAX));
+        assert_eq!(
+            d.seen_paths(),
+            vec![
+                "a.md".to_owned(),
+                "research/b.md".to_owned(),
+                "research/deep/c.md".to_owned()
+            ]
+        );
+
+        // A note on one path that is about to leave, and an accept on another so its
+        // content sits in an override rather than in the tree.
+        d.ops()
+            .flag(b"research/b.md", "check this", None, None, &NoFault)
+            .unwrap();
+        d.write("research/deep/c.md", b"c2\n");
+        let pile = d.scan();
+        let row = pile
+            .rows
+            .iter()
+            .find(|r| r.path == b"research/deep/c.md")
+            .expect("the edited file is pending");
+        let rendered = Rendered::of(row);
+        d.ops().accept_file(&rendered, &NoFault).unwrap();
+        assert!(
+            matches!(
+                d.ledger().overrides["research/deep/c.md"].blob,
+                Some(Some(_))
+            ),
+            "the accept is an override, not yet folded"
+        );
+        let undo_before = d.ledger().undo.len();
+        assert!(undo_before > 0, "the accept pushed one");
+        let seen_at_before = d.ledger().seen_at.clone();
+
+        let dropped = d.ops().trim(&one_folder_only, &NoFault).unwrap();
+        assert_eq!(dropped, 2, "`research/b.md` and `research/deep/c.md`");
+        assert_eq!(d.seen_paths(), vec!["a.md".to_owned()]);
+        assert_eq!(
+            d.ledger().undo.len(),
+            undo_before,
+            "a trim is not an accept: no undo entry"
+        );
+        assert_eq!(d.ledger().seen_at, seen_at_before, "`seen_at` untouched");
+        assert!(
+            !d.ledger().overrides.contains_key("research/deep/c.md"),
+            "the blob override left with its path"
+        );
+        let kept = &d.ledger().overrides["research/b.md"];
+        assert!(kept.blob.is_none() && kept.mode.is_none());
+        assert_eq!(kept.flags.len(), 1, "the user's own note stays");
+
+        // The record is inside the scope now, so a second trim finds nothing to do.
+        assert_eq!(d.ops().trim(&one_folder_only, &NoFault).unwrap(), 0);
+        assert_eq!(d.seen_paths(), vec!["a.md".to_owned()]);
+    }
+
+    /// A record already inside its scope is not rewritten, and a folder with no record at
+    /// all keeps its `null` rather than gaining an empty tree.
+    #[test]
+    fn ops_trim_writes_nothing_when_there_is_nothing_outside_the_scope() {
+        let mut d = proptests::Draft::new("lc-trim-noop");
+        d.write("a.md", b"a\n");
+        d.first_sight(&DraftScope::plain(u64::MAX));
+        let seen_before = d.ledger().seen_tree.clone();
+        assert_eq!(d.ops().trim(&one_folder_only, &NoFault).unwrap(), 0);
+        assert_eq!(d.ledger().seen_tree, seen_before);
+
+        // A folder whose first sight has not happened yet: still pending afterwards.
+        let mut d = proptests::Draft::new("lc-trim-pending");
+        d.write("research/b.md", b"b\n");
+        assert!(d.ledger().seen_tree.is_none());
+        d.ops()
+            .flag(b"research/b.md", "note", None, None, &NoFault)
+            .unwrap();
+        assert_eq!(d.ops().trim(&one_folder_only, &NoFault).unwrap(), 0);
+        assert!(
+            d.ledger().seen_tree.is_none(),
+            "no record, so nothing to trim and no empty tree written"
+        );
+        assert_eq!(d.ledger().overrides["research/b.md"].flags.len(), 1);
+    }
+
+    /// A repository's record is never trimmed: its scope is the repository, and the paths
+    /// in it come from git.
+    #[test]
+    fn ops_trim_never_touches_a_repositorys_record() {
+        let mut d = proptests::Draft::new("lc-trim-git");
+        d.write("a.md", b"a\n");
+        d.write("research/b.md", b"b\n");
+        d.first_sight(&DraftScope::tree(u64::MAX));
+        d.make_git_root();
+        assert_eq!(d.ops().trim(&one_folder_only, &NoFault).unwrap(), 0);
+        assert_eq!(
+            d.seen_paths(),
+            vec!["a.md".to_owned(), "research/b.md".to_owned()]
+        );
+    }
+
     /// Kickoff deliverable 8 (ii)/(iii): property tests over one draft root per test — a
     /// private store on a temp dir, no user repo, the `RootKind::Draft` plumbing exactly as
     /// the engine opens one. Each case rewrites the file set and resets the ledger to first
@@ -4789,7 +4986,38 @@ mod tests {
             }
 
             pub(super) fn write(&self, name: &str, bytes: &[u8]) {
-                std::fs::write(self.root.join(name), bytes).unwrap();
+                let path = self.root.join(name);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, bytes).unwrap();
+            }
+
+            /// Make the disk under `scope` this folder's first sight.
+            pub(super) fn first_sight(&mut self, scope: &crate::store::DraftScope) {
+                let seen = self.store.tree_of_disk(scope, &[]).unwrap();
+                self.tree = self.store.ls_tree(&seen).unwrap();
+                self.ledger = Ledger::new(&self.root, RootKind::Draft, Some(seen), Self::seen_at());
+                ledger::save(&self.paths, &self.ledger).unwrap();
+            }
+
+            /// The record's paths, as the ledger on disk has them.
+            pub(super) fn seen_paths(&self) -> Vec<String> {
+                let Some(seen) = self.ledger.seen_tree.as_ref() else {
+                    return Vec::new();
+                };
+                self.store
+                    .ls_tree(seen)
+                    .unwrap()
+                    .keys()
+                    .map(|k| String::from_utf8_lossy(k).into_owned())
+                    .collect()
+            }
+
+            pub(super) fn ledger(&self) -> &Ledger {
+                &self.ledger
+            }
+
+            pub(super) fn make_git_root(&mut self) {
+                self.ledger.kind = RootKind::Git;
             }
 
             fn set(&self, name: &str, content: Option<&[u8]>) {

@@ -393,6 +393,28 @@ impl RootState {
         }
     }
 
+    /// The ops one scope trim runs through (Amendment v1.13 R6). Like `switch_ops` it is
+    /// not an accept: nothing is staged and the compaction threshold cannot be reached, so
+    /// the field has no meaningful value here.
+    fn trim_ops<'a>(&'a mut self, clock: &'a dyn Clock) -> Ops<'a> {
+        Ops {
+            store: &self.store,
+            index: &self.index,
+            repo: self.repo.as_ref(),
+            paths: &self.paths,
+            branch: self.ledger.seen_branch.clone(),
+            git_dir: None,
+            ledger: &mut self.ledger,
+            tree: &mut self.tree,
+            clock,
+            compaction_threshold: usize::MAX,
+            case_insensitive: self.case_insensitive,
+            staged: BTreeMap::new(),
+            pending_undo: None,
+            lock: crate::ops::DEFAULT_LOCK,
+        }
+    }
+
     pub fn seen_head(&self) -> Option<&Oid> {
         self.ledger.seen_at.head_commit.as_ref()
     }
@@ -1098,6 +1120,23 @@ fn scan_root(state: &mut RootState, ctx: &ScanCtx) -> Result<Pile, EngineError> 
     // R1: which record is in force, before a single baseline is read. A scan that arrives
     // on file events alone, with no head inspection behind it, still sees the switch.
     state.sync_branch(ctx.clock.as_ref());
+    // R6: a record written while the folder's scope was wider still holds paths the scope
+    // no longer covers. They are never candidates, and the private index would otherwise
+    // carry and `lstat` every one of them at every scan, so the record is trimmed to the
+    // scope first. Path shape only: a large file is R2's unread row, never a silent drop.
+    // The test is an in-memory pass over the record's own keys, so a scan of a folder
+    // already inside its scope pays no syscall for it.
+    let mut trimmed = 0usize;
+    if let Some(scope) = state.scope.clone() {
+        let excluded = state.excluded_dirs.clone();
+        let out_of_scope =
+            |p: &[u8]| !scope.admits_shape(p) || crate::store::under_excluded(p, &excluded);
+        if state.tree.keys().any(|p| out_of_scope(p)) {
+            trimmed = state
+                .trim_ops(ctx.clock.as_ref())
+                .trim(&out_of_scope, &NoFault)?;
+        }
+    }
     let out = scan::scan(&ScanInputs {
         store: &state.store,
         index: &state.index,
@@ -1117,6 +1156,13 @@ fn scan_root(state: &mut RootState, ctx: &ScanCtx) -> Result<Pile, EngineError> 
     // The two per-root ledger facts the reducer may never read for itself (design review
     // F8), stamped here rather than inside `scan` because the expiry needs a wall clock and
     // the engine owns the injected one.
+    if trimmed > 0 {
+        pile.notices.push(format!(
+            "{} path{} outside the root's scope dropped from its record",
+            crate::count::with_thousands(trimmed),
+            if trimmed == 1 { "" } else { "s" }
+        ));
+    }
     pile.undo = state.ledger.undo.len();
     pile.snoozed_until = ledger::snooze_active(state.ledger.snoozed_until.as_deref(), ctx.now);
     if out.nested_repos != state.nested_repos {
