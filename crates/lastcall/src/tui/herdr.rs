@@ -486,7 +486,7 @@ pub fn derive_scope_with(
             }
             return Some(Scope {
                 label,
-                roots: scoped,
+                roots: with_watched_folders(roots, scoped),
             });
         }
     }
@@ -504,8 +504,33 @@ pub fn derive_scope_with(
     }
     Some(Scope {
         label,
-        roots: scoped,
+        roots: with_watched_folders(roots, scoped),
     })
+}
+
+/// A scope plus the watched folders that live inside it. A watched folder carries no badge
+/// and no pane need sit in it, so neither arm above can place one, yet a repository's
+/// scratch folder is part of the work on that repository: hiding it behind `w` hid the one
+/// thing the pane was opened to review. A folder joins when the deepest root around it is
+/// in the scope, so one inside an unscoped nested repository stays out. Parents sort before
+/// children, which lets a folder inside a folder follow it in a single pass.
+fn with_watched_folders(roots: &[RootMeta], mut scoped: BTreeSet<PathBuf>) -> BTreeSet<PathBuf> {
+    let mut folders: Vec<&RootMeta> = roots
+        .iter()
+        .filter(|m| m.kind == lastcall_engine::store::RootKind::Draft)
+        .collect();
+    folders.sort_by(|a, b| a.path.cmp(&b.path));
+    for folder in folders {
+        let around = roots
+            .iter()
+            .map(|m| m.path.as_path())
+            .filter(|root| *root != folder.path && folder.path.starts_with(root))
+            .max_by_key(|root| root.components().count());
+        if around.is_some_and(|root| scoped.contains(root)) {
+            scoped.insert(folder.path.clone());
+        }
+    }
+    scoped
 }
 
 // ------------------------------------------------------------------------------------------
@@ -1332,6 +1357,106 @@ mod tests {
                 .into_iter()
                 .collect::<BTreeSet<_>>(),
             "the checkout plus what its badges link, and not beta"
+        );
+    }
+
+    /// A watched folder inside a scoped repository belongs to that repository's work: the
+    /// sponsor's Phase 12 run opened a pane in a repository whose `z_ignore` and
+    /// `z_ignore/research` were watched, and the scope hid both. Both arms of the
+    /// derivation keep them; a watched folder inside an unscoped repository stays hidden.
+    #[test]
+    fn herdr_scope_keeps_the_watched_folders_inside_a_scoped_root() {
+        let draft = |path: &str| RootMeta {
+            kind: lastcall_engine::store::RootKind::Draft,
+            ..meta(path, None)
+        };
+        let roots = vec![
+            meta(A, None),
+            meta(B, None),
+            draft("/W/alpha/z_ignore"),
+            draft("/W/alpha/z_ignore/research"),
+            draft("/W/beta/z_ignore"),
+            draft("/W/alphabet"),
+        ];
+        let want: BTreeSet<PathBuf> = [A, "/W/alpha/z_ignore", "/W/alpha/z_ignore/research"]
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+
+        let mut provenance = cache(vec![]);
+        provenance
+            .workspaces
+            .insert("w1".to_owned(), workspace("w1", "alpha", Some(A)));
+        let scope = derive_scope(&provenance, &roots, "w1").expect("provenance");
+        assert_eq!(scope.roots, want, "the provenance arm");
+
+        let mut fallback = cache(vec![pane("p1", "w1", A, None, "idle")]);
+        fallback
+            .workspaces
+            .insert("w1".to_owned(), workspace("w1", "alpha", None));
+        let scope = derive_scope(&fallback, &roots, "w1").expect("pane cwd");
+        assert_eq!(scope.roots, want, "the pane-cwd arm");
+    }
+
+    /// The deepest root around a watched folder decides: inside a nested repository it
+    /// follows that repository, in with it under provenance and out with it when only a
+    /// pane in the outer repository placed the scope.
+    #[test]
+    fn herdr_scope_watched_folder_follows_the_repository_around_it() {
+        let inner = "/W/alpha/vendor/nested/z_ignore";
+        let roots = vec![
+            meta(A, None),
+            meta(NESTED, Some(Badge::NestedIn(PathBuf::from(A)))),
+            RootMeta {
+                kind: lastcall_engine::store::RootKind::Draft,
+                ..meta(inner, None)
+            },
+        ];
+        let mut provenance = cache(vec![]);
+        provenance
+            .workspaces
+            .insert("w1".to_owned(), workspace("w1", "alpha", Some(A)));
+        let scope = derive_scope(&provenance, &roots, "w1").expect("provenance");
+        assert!(
+            scope.roots.contains(Path::new(inner)),
+            "in with the nested repository"
+        );
+
+        let mut fallback = cache(vec![pane("p1", "w1", A, None, "idle")]);
+        fallback
+            .workspaces
+            .insert("w1".to_owned(), workspace("w1", "alpha", None));
+        let scope = derive_scope(&fallback, &roots, "w1").expect("pane cwd");
+        assert!(
+            !scope.roots.contains(Path::new(inner)),
+            "out with the nested repository"
+        );
+    }
+
+    /// A pane sitting inside a watched folder scopes to that folder and to the watched
+    /// folders inside it, and does not reach up to the repository around it.
+    #[test]
+    fn herdr_scope_from_inside_a_watched_folder_does_not_reach_up() {
+        let draft = |path: &str| RootMeta {
+            kind: lastcall_engine::store::RootKind::Draft,
+            ..meta(path, None)
+        };
+        let roots = vec![
+            meta(A, None),
+            draft("/W/alpha/z_ignore"),
+            draft("/W/alpha/z_ignore/research"),
+        ];
+        let mut cache = cache(vec![pane("p1", "w1", "/W/alpha/z_ignore", None, "idle")]);
+        cache
+            .workspaces
+            .insert("w1".to_owned(), workspace("w1", "notes", None));
+        let scope = derive_scope(&cache, &roots, "w1").expect("pane cwd");
+        assert_eq!(
+            scope.roots,
+            ["/W/alpha/z_ignore", "/W/alpha/z_ignore/research"]
+                .into_iter()
+                .map(PathBuf::from)
+                .collect::<BTreeSet<_>>()
         );
     }
 

@@ -39,6 +39,10 @@ binary rather than for the commit log.
 
 ### Fixed
 
+- **Inside a herdr pane, the workspace scope no longer hides a repository's watched folders.**
+  A watched folder such as `repo/z_ignore` now stays listed with the repository it lives
+  in; before, only `w` brought it back. A watched folder inside a repository the scope
+  hides is still hidden with it.
 - Files of exactly `collapse_size_bytes` collapse, as the docs said. Until now the limit
   itself was read as an ordinary diff.
 
