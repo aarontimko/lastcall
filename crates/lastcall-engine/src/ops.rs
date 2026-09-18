@@ -1643,6 +1643,10 @@ impl Ops<'_> {
         // A deletion row has no file to save into, and a symlink's "content" is its target:
         // writing bytes at it would either follow the link or replace it, and neither is an
         // edit of the row the user was looking at.
+        // An unread row has no oid either, and its file is very much there.
+        if rendered.unread {
+            return refuse(not_editable("over the size limit, so it was not read"));
+        }
         if rendered.oid.is_none() {
             return refuse(not_editable("the file is gone"));
         }

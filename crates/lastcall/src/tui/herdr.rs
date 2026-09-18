@@ -1373,8 +1373,9 @@ mod tests {
         let roots = vec![
             meta(A, None),
             meta(B, None),
-            draft("/W/alpha/z_ignore"),
+            // Child before parent: the inner folder joins only once the outer one has.
             draft("/W/alpha/z_ignore/research"),
+            draft("/W/alpha/z_ignore"),
             draft("/W/beta/z_ignore"),
             draft("/W/alphabet"),
         ];

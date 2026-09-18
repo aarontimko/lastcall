@@ -1494,7 +1494,10 @@ impl Engine {
                     hunks,
                     index,
                 } => ops.accept_hunk(rendered, hunks, *index, fault),
-                AcceptRequest::File(rendered) if rendered.oid.is_none() => {
+                // An unread row is not a deletion, whatever `oid` says on it: nothing was
+                // read. `accept_file` lets the path go; the restore dispatch below has the
+                // same guard.
+                AcceptRequest::File(rendered) if rendered.oid.is_none() && !rendered.unread => {
                     ops.accept_deletion(rendered, fault)
                 }
                 AcceptRequest::File(rendered) => ops.accept_file(rendered, fault),
@@ -1637,6 +1640,10 @@ impl Engine {
         // The same two rows `Ops::save_file` refuses outright: a deletion has no file to
         // open, and a symlink's content is its target — opening it would edit whatever it
         // points at, which is not the row on screen.
+        // An unread row has no oid either, and its file is very much there.
+        if rendered.unread {
+            return Err(not_editable("over the size limit, so it was not read"));
+        }
         if rendered.oid.is_none() {
             return Err(not_editable("the file is gone"));
         }
@@ -4118,6 +4125,64 @@ pub(crate) mod tests {
         );
         assert!(engine.root(&draft).unwrap().ledger.seen_tree.is_some());
         assert!(engine.scan(&draft).unwrap().is_empty());
+    }
+
+    /// The sponsor's Phase 12 run, step 8: a recorded file grew past the size limit, showed
+    /// as an unread row, and `a` answered "still present; deletion not accepted". An unread
+    /// row carries no oid because nothing was read, and the request dispatch took "no oid"
+    /// for a deletion before `Ops::stage_file` could see `unread`. The restore dispatch had
+    /// the guard (verifier F3); the accept dispatch did not, and every unread-accept test
+    /// called `Ops` directly. This one goes through the door the TUI uses.
+    #[test]
+    fn engine_accept_of_an_unread_row_releases_it_and_is_not_a_deletion() {
+        let repo = FixtureRepo::new("eng-unread-accept").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let drafts = repo.parent_dir().join("_drafts");
+        std::fs::create_dir_all(&drafts).unwrap();
+        std::fs::write(drafts.join("plan.md"), "small\n").unwrap();
+        let config = Config {
+            draft_dirs: vec!["_drafts".to_owned()],
+            draft_initial: DraftInitial::Seen,
+            collapse_size_bytes: 64,
+            ..Config::default()
+        };
+        let mut engine = open_engine(&repo, &state, config);
+        let draft = engine
+            .roots()
+            .iter()
+            .find(|r| r.kind == RootKind::Draft)
+            .map(|r| r.path.clone())
+            .expect("a draft root");
+        assert!(engine.scan(&draft).unwrap().is_empty());
+        std::fs::write(drafts.join("plan.md"), "x".repeat(200)).unwrap();
+        let (rendered, row) = rendered_row(&mut engine, &draft, b"plan.md");
+        assert!(matches!(
+            row.collapsed,
+            Some(crate::scan::Collapsed::Unread { .. })
+        ));
+        assert!(rendered.unread && rendered.oid.is_none(), "the premise");
+
+        let accepted = engine
+            .accept(&draft, AcceptRequest::File(rendered))
+            .unwrap();
+        assert!(
+            accepted.outcome.refused.is_empty(),
+            "{:?}",
+            accepted.outcome.refused
+        );
+        assert!(engine.scan(&draft).unwrap().row(b"plan.md").is_none());
+        assert!(drafts.join("plan.md").exists(), "the file is never touched");
+
+        let undone = engine.undo(&draft).unwrap();
+        assert!(undone.outcome.ok(), "{:?}", undone.outcome.refused);
+        let back = undone
+            .pile
+            .row(b"plan.md")
+            .expect("undo brings the row back");
+        assert!(matches!(
+            back.collapsed,
+            Some(crate::scan::Collapsed::Unread { .. })
+        ));
     }
 
     /// Amendment v1.13 R6 (verifier F2): the trim's trigger has to look at the overrides

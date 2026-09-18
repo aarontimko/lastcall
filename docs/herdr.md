@@ -120,7 +120,8 @@ scope: <workspace> · 3 repos hidden (w shows all)
 
 A watched folder (`draft_dirs`) is listed with the repository it lives in: the scratch folder
 of a repository in the scope is in the scope, and one inside a hidden repository is hidden
-with it.
+with it. A pane sitting inside a watched folder scopes to that folder alone. A watched folder
+outside every repository is hidden by any scope; `w` shows it.
 
 `w` turns it off and on for the session. `scope = "all"` under `[herdr]` starts it off, and
 the welcome on your first launch inside a herdr session offers to write that line for you. A
