@@ -289,10 +289,24 @@ impl UndoOp {
 /// `Absent` on a path the seen tree has and back to `Empty` on a path it does not — which
 /// is exactly the distinction, recovered from the tree rather than stored (design review
 /// F1, Phase 7's F17 rule).
+///
+/// The one baseline the tree cannot answer for is a watched folder's **release**: a `null`
+/// with a note on a path the record never held, which the collapse would send back to
+/// `Empty` and leave as a flag-only override, i.e. as *the record holds this path* (verifier
+/// H1). `released` records that case and nothing else. It is written only when true, so an
+/// entry from a repository, and every entry written before this field existed, is the same
+/// two keys it always was.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UndoPath {
     pub baseline: Option<Oid>,
     pub mode: Option<Mode>,
+    #[serde(default, skip_serializing_if = "is_not_set")]
+    pub released: bool,
+}
+
+/// `skip_serializing_if` for a flag that is absent from the document unless it is true.
+fn is_not_set(b: &bool) -> bool {
+    !*b
 }
 
 /// One reversible operation, newest last. Serialised last in the document.

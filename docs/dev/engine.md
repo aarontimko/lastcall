@@ -793,6 +793,15 @@ F1):
   `Empty` again and a later `shift-u` writes a zero-byte file instead of unlinking the
   user's first-sight draft (Phase 7's F17 rule).
 
+One baseline the tree cannot answer for, so the record carries it: inside a watched folder a
+`null` with a note on a path the tree does not have is a **release**, the shape a fold keeps,
+and the third rule above would collapse it to the note alone, which the size rule reads as
+*the record holds this path* and the accepted row would be back. `UndoPath` therefore has
+`released`, set when the override the op replaced was one a fold would have kept, and the
+undo of such a path replays through `set_override_released`. A repository writes it never,
+the field is omitted unless it is true, and an entry written before it existed loads as
+`false`, so no record on disk changes shape.
+
 Flags survive an undo and `updated_at` is stamped by `set_override` itself. There is no live
 CAS: a file that moved since the accept is exactly what the user wants back on screen. An
 empty stack is a `Refused::NothingToUndo`, never an error. `Ops::undo_preview` returns

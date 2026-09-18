@@ -566,6 +566,19 @@ impl Ops<'_> {
         keys: impl Iterator<Item = String>,
     ) -> BTreeMap<String, UndoPath> {
         let keys: Vec<String> = keys.collect();
+        // The record as it stands *before* the op, which is the one place the release can
+        // be read off: `Baseline::Absent` says nothing about the note beside it (H1).
+        let kind = ledger.kind;
+        let released: BTreeSet<String> = keys
+            .iter()
+            .filter(|k| {
+                ledger
+                    .overrides
+                    .get(k.as_str())
+                    .is_some_and(|o| o.survives_fold(kind))
+            })
+            .cloned()
+            .collect();
         let mut resolver =
             BaselineResolver::new(ledger, tree, self.store, keys.iter().map(|k| k.as_bytes()));
         keys.iter()
@@ -574,10 +587,12 @@ impl Ops<'_> {
                     Baseline::Present { oid, mode } => UndoPath {
                         baseline: Some(oid),
                         mode: Some(mode),
+                        released: false,
                     },
                     Baseline::Absent | Baseline::Empty => UndoPath {
                         baseline: None,
                         mode: None,
+                        released: released.contains(k),
                     },
                 };
                 (k.clone(), rec)
@@ -1772,7 +1787,14 @@ impl Ops<'_> {
                 });
             };
             for (key, rec) in &entry.paths {
-                self.set_override(key, rec.baseline.clone(), rec.mode);
+                // A release goes back as a release: the collapse would leave the note alone
+                // on the path, which the size rule reads as *the record holds it* and the
+                // row nobody asked for would be back (verifier H1).
+                if rec.released {
+                    self.set_override_released(key);
+                } else {
+                    self.set_override(key, rec.baseline.clone(), rec.mode);
+                }
             }
             let tmp = ledger::write_tmp(self.paths, self.ledger)?;
             fault.at(FaultPoint::AfterLedgerTmpWrite);
@@ -5187,6 +5209,93 @@ mod tests {
             "one real blob override does not pass a threshold of 1"
         );
         assert_still_released(&d, "and the release is untouched");
+    }
+
+    /// H1, the reachable sequence: release the flagged large file, watch it shrink under
+    /// the limit, accept its content, then undo that accept. The undo has to put the
+    /// *release* back, not the flag-only shape the "same as the tree" collapse would leave,
+    /// or the row returns the moment the file grows again although nobody undid the
+    /// release.
+    #[test]
+    fn ops_undo_of_a_later_accept_puts_the_release_back() {
+        let (mut d, pile) = flagged_unread_draft("lc-h1-undo-accept");
+        release_the_row(&mut d, &pile);
+        assert_still_released(&d, "after the accept");
+
+        d.write("big.bin", b"small\n");
+        let pile = d.scan_at(UNREAD_LIMIT);
+        let r = Rendered::of(
+            pile.row(b"big.bin")
+                .expect("the shrunk file is a row again"),
+        );
+        assert!(d.ops().accept_file(&r, &NoFault).unwrap().ok());
+        assert!(
+            matches!(d.ledger().overrides["big.bin"].blob, Some(Some(_))),
+            "the content accept records the blob"
+        );
+
+        assert!(d.ops().undo(&NoFault).unwrap().ok());
+        d.write("big.bin", &vec![b'z'; 3_000]);
+        assert_still_released(&d, "after the undo of the content accept");
+    }
+
+    /// H1 again, through a fold's undo entry: an accept-all over a pile that still lists
+    /// the released row (the snapshot the user had on screen before the single accept
+    /// landed) records the path in its entry, so the undo of that accept-all must not
+    /// collapse the release either.
+    #[test]
+    fn ops_undo_of_a_stale_accept_all_keeps_the_release() {
+        let (mut d, stale) = flagged_unread_draft("lc-h1-undo-fold");
+        release_the_row(&mut d, &stale);
+        assert!(d.ops().accept_all(&stale, &NoFault).unwrap().ok());
+        assert_still_released(&d, "after the accept-all over the stale pile");
+
+        assert!(d.ops().undo(&NoFault).unwrap().ok());
+        assert_still_released(&d, "after the undo of that accept-all");
+    }
+
+    /// The other half of the same rule: a repository writes no release, so its undo record
+    /// gains no key on disk and an accepted deletion with a note replays through the
+    /// collapse exactly as it did before (Phase 7's F17 rule).
+    #[test]
+    fn ops_undo_on_a_repository_records_nothing_new_and_still_collapses() {
+        let mut d = proptests::Draft::new("lc-h1-undo-git");
+        d.write("a.md", b"a\n");
+        d.first_sight(&DraftScope::tree(u64::MAX));
+        d.make_git_root();
+        assert!(
+            d.ops()
+                .flag(b"a.md", "check this", None, None, &NoFault)
+                .unwrap()
+                .ok()
+        );
+
+        // The recorded file goes and the user accepts the deletion, note and all: a `null`
+        // on a path the seen tree does hold.
+        std::fs::remove_file(d.root.join("a.md")).unwrap();
+        let pile = d.scan();
+        let r = Rendered::of(pile.row(b"a.md").expect("the deletion is a row"));
+        assert!(d.ops().accept_deletion(&r, &NoFault).unwrap().ok());
+        assert_eq!(d.ledger().overrides["a.md"].blob, Some(None));
+        let rec = &d.ledger().undo.last().expect("the accept pushed one").paths["a.md"];
+        assert!(!rec.released, "a repository never records a release");
+        let json = serde_json::to_string(rec).unwrap();
+        assert!(
+            !json.contains("released"),
+            "and the record on disk is the two fields it always was: {json}"
+        );
+
+        assert!(d.ops().undo(&NoFault).unwrap().ok());
+        let o = &d.ledger().overrides["a.md"];
+        assert!(
+            o.blob.is_none() && o.flags.len() == 1,
+            "the baseline equals the tree, so the override collapses to the note alone"
+        );
+        assert_eq!(
+            pile_lines(&d.scan()),
+            vec!["a.md".to_owned()],
+            "and the deletion is pending again"
+        );
     }
 
     /// Kickoff deliverable 8 (ii)/(iii): property tests over one draft root per test — a
