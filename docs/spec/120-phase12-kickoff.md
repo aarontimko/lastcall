@@ -88,11 +88,11 @@ Conventions as in `01-scenarios.md`: the root is `R`, `seen` is the record in fo
 
 ## Gate checklist (mirrors `00-spec.md` §8 "Phase 12")
 
-- [ ] F4 to F9 frozen as PROPOSED (Amendment v1.13) and corrected by the review fold; harness green with F4, F5, F6 and the F7 trim (count stated); `scenario_f4` to `scenario_f8` and the F9 unit tests named in the report; F1 to F3 unchanged.
-- [ ] Engine: the scope and size predicate shared by first sight and the scan, the `lstat` pass before the row cap, the unread row for a recorded large file; every file under exactly one root (the exclusion rule); the plain listing proven not to walk the tree; the trim through `Ops::trim` by path shape with no undo entry; the bounded walk with `literal_separator`; the name from the deepest base; `validate` for the new key, the deep entry and the bare `**`; the ladder boundary.
-- [ ] TUI: the fixture home parameter with zero frame changes in its own commit; the path line and the renamed rows regenerated in one commit; PTY assertions updated; no snapshot carries a temp path (asserted).
-- [ ] Docs: config table, review-loop, engine.md, README clauses, CHANGELOG `## Unreleased`; the em-dash grep empty; no personal detail in the diff.
-- [ ] Standing: unit floor 734 grows (count and split); integration, harness, prepush, PTY, snapshot counts stated; the real-herdr subset green; `just audit` in CI only.
+- [x] F4 to F9 frozen as PROPOSED (Amendment v1.13) and corrected by the review fold; harness green with F4, F5, F6 and the F7 trim (count stated); `scenario_f4` to `scenario_f8` and the F9 unit tests named in the report; F1 to F3 unchanged. **Closed 2026-09-18**, evidence in `00-spec.md` §8.
+- [x] Engine: the scope and size predicate shared by first sight and the scan, the `lstat` pass before the row cap, the unread row for a recorded large file; every file under exactly one root (the exclusion rule); the plain listing proven not to walk the tree; the trim through `Ops::trim` by path shape with no undo entry; the bounded walk with `literal_separator`; the name from the deepest base; `validate` for the new key, the deep entry and the bare `**`; the ladder boundary. **Closed 2026-09-18**, after three verifier rounds (§10).
+- [x] TUI: the fixture home parameter with zero frame changes in its own commit; the path line and the renamed rows regenerated in one commit; PTY assertions updated; no snapshot carries a temp path (asserted). **Closed 2026-09-18.**
+- [x] Docs: config table, review-loop, engine.md, README clauses, CHANGELOG `## Unreleased`; the em-dash grep empty; no personal detail in the diff. **Closed 2026-09-18.**
+- [x] Standing: unit floor 734 grows (count and split); integration, harness, prepush, PTY, snapshot counts stated; the real-herdr subset green; `just audit` in CI only. **Closed 2026-09-18:** 776 = 344 + 20 + 375 + 37; integration 131; harness 217; prepush 150; PTY 49 + 1, snapshots 62 + 1.
 - [ ] **[sponsor]** on the sponsor's own machine: `draft_dirs = ["z_ignore", "z_ignore/research"]` over the sponsor's repositories, the rows named `<repo>/z_ignore`, the path line on selection, no large-file blobs in the state directory, the tool responsive; the sponsor's words in §10.
 - [ ] Amendment v1.13 ratified by the merge; §10 close-out entry with the judgment-call list; `v0.4.0` release PR and tag (the sponsor's).
 
