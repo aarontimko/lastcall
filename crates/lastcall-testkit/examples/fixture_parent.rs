@@ -48,7 +48,7 @@ fn main() -> ExitCode {
         eprintln!("fixture_parent: create {}: {e}", state_dir.display());
         return ExitCode::from(1);
     }
-    let built = match fixture_parent::build(&parent, &state_dir) {
+    let built = match fixture_parent::build(&parent, &state_dir, &state_dir.join("home")) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("fixture_parent: {e}");

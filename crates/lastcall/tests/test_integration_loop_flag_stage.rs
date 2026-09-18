@@ -87,7 +87,8 @@ async fn loop_flag_with_one_agent_reaches_pane_send_text() {
     let w_dir = TempDir::new("lc-loop-flag");
     let state = TempDir::new("lc-loop-flag-state");
     let parent = w_dir.join("W");
-    let built = fixture_parent::build(&parent, state.path()).expect("the fixture builds");
+    let built = fixture_parent::build(&parent, state.path(), &state.join("home"))
+        .expect("the fixture builds");
     let env = engine_env_for(&parent, &built.home, state.path());
     let engine = open_engine(&parent, &env, state.path(), fixture_parent::config());
 

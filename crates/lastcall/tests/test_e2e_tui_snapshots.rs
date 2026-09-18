@@ -53,7 +53,7 @@ impl Scene {
         let tmp = TempDir::new("lc-tui");
         let parent = tmp.join("W");
         let state = tmp.join("state");
-        let built = fixture_parent::build(&parent, &state).expect("fixture builds");
+        let built = fixture_parent::build(&parent, &state, tmp.path()).expect("fixture builds");
         let env = engine_env_for(&built.parent, &built.home, &state);
         Scene {
             _tmp: tmp,

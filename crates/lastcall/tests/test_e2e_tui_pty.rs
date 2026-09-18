@@ -147,7 +147,7 @@ impl Fixture {
         let w = TempDir::new("lc-pty-w");
         let state = TempDir::new("lc-pty-state");
         let parent = w.join("W");
-        let built = fixture_parent::build(&parent, state.path()).expect("fixture builds");
+        let built = fixture_parent::build(&parent, state.path(), w.path()).expect("fixture builds");
         let config = state.join("config.toml");
         fixture_parent::write_config(&config, &parent).expect("config written");
         Fixture {
@@ -170,7 +170,7 @@ impl Fixture {
         let w = TempDir::new("lc-pty-w");
         let state = TempDir::new("lc-pty-state");
         let parent = w.join("W");
-        let built = fixture_parent::build(&parent, state.path()).expect("fixture builds");
+        let built = fixture_parent::build(&parent, state.path(), w.path()).expect("fixture builds");
         let drafts = fixture_parent::add_draft_root(&built, state.path(), baseline)
             .expect("the scene's fourth root");
         let config = state.join("config.toml");
