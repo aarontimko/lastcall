@@ -283,6 +283,19 @@ lc_baseline() {  # override blob | tree blob | EMPTY   ("null" override = ABSENT
 lc_verify_oid() { lcg cat-file -e "$1" 2>/dev/null; }
 
 # ---------- scan ----------
+# The reader's note on a path, and nothing else: an override that carries no baseline, so
+# the path's baseline is still whatever the seen tree says (ledger `blob` absent).
+lc_flag() {   # lc_flag PATH
+  echo flag > "$LC_STATE/overrides/$(enc "$1")"; rm -f "$LC_STATE/overrides/$(enc "$1").mode"; }
+# Does this path's override carry a baseline of its own, that is a blob or the `null` that
+# lets the path go? A flag-only override carries neither.
+lc_override_has_baseline() {   # lc_override_has_baseline PATH
+  local o="$LC_STATE/overrides/$(enc "$1")" b
+  [ -f "$o" ] || return 1
+  b="$(cat "$o")"
+  [ "$b" = null ] && return 0
+  printf '%s' "$b" | grep -qE '^[0-9a-f]{40}$'
+}
 # Does the record hold content for this path? The override's blob first (`null` is the
 # record letting the path go, which holds nothing), then the seen tree.
 lc_record_holds() {   # lc_record_holds PATH
@@ -346,7 +359,11 @@ TREE
   fi
   while IFS= read -r p; do
     [ -n "$p" ] || continue
-    lc_in_shape "$p" || out="$out$p
+    lc_in_shape "$p" && continue
+    # A flag-only override is the reader's note, not a baseline: there is nothing for the
+    # trim to drop at that path, so it is neither dropped nor counted (verifier F5).
+    lc_override_has_baseline "$p" || continue
+    out="$out$p
 "
   done <<OVER
 $(ls "$LC_STATE/overrides" 2>/dev/null | sed 's|\.mode$||;s|%2F|/|g' | sort -u)
@@ -363,6 +380,9 @@ OVER
     rm -f "$tmp"
   fi
   printf '%s\n' "$out" | while IFS= read -r p; do
+    # The path leaves the record, but the note on it stays: a flag-only override survives
+    # the trim, here as in the engine (verifier F5).
+    lc_override_has_baseline "$p" || continue
     rm -f "$LC_STATE/overrides/$(enc "$p")" "$LC_STATE/overrides/$(enc "$p").mode"
   done
   lc_seed_index

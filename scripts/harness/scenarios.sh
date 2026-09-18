@@ -429,12 +429,17 @@ mkdir -p "$W/trim/sub"
 echo a > "$W/trim/a.md"; echo b > "$W/trim/sub/b.md"
 S="$W/trim.state"; mkdir -p "$S"; lc_init "$W/trim" "$S" draft tree; lc_first_sight
 assert_str "F7 the tree was recorded" "a.md|sub/b.md" "$(lcg ls-tree -r --name-only "$(cat "$S/seen_tree")" | tr '\n' '|' | sed 's/|$//')"
+# The reader's note on the deep path: the trim drops what the record holds, never the note.
+lc_flag sub/b.md
+assert_str "F7 the note is on the deep path" "flag" "$(cat "$S/overrides/$(enc sub/b.md)" 2>/dev/null)"
 LC_SCOPE=plain
 assert_str "F7 the trim drops the paths the folder no longer covers" "1" "$(lc_scope_trim)"
 assert_str "F7 the record is the folder's own files" "a.md" "$(lcg ls-tree -r --name-only "$(cat "$S/seen_tree")" | tr '\n' '|' | sed 's/|$//')"
+assert_str "F7 the trim keeps the note" "flag" "$(cat "$S/overrides/$(enc sub/b.md)" 2>/dev/null)"
 assert_pile "F7 nothing pending after the trim" ""
 assert_str "F7 said once, not at every scan" "0" "$(lc_scope_trim)"
 LC_SCOPE=tree
 assert_pile "F7 widening brings the path back as pending, never hidden" "sub/b.md"
+assert_str "F7 and the note is on the row that came back" "flag" "$(cat "$S/overrides/$(enc sub/b.md)" 2>/dev/null)"
 
 echo; echo "PASS=$PASS FAIL=$FAIL"
