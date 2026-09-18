@@ -275,8 +275,8 @@ fn scenario_d8_binary_and_oversize_collapse() {
 }
 
 /// D8 at the **frozen default** `collapse_size_bytes` (512 KiB, no override): the 2 MB
-/// binary and the 600 KiB generated file of the scenario, plus the boundary the code's
-/// strict `>` defines — 524,288 bytes is not collapsed, 524,289 is. Phase 6 gate item 3.
+/// binary and the 600 KiB generated file of the scenario, plus the boundary the setting
+/// defines: 524,287 bytes is not collapsed, 524,288 is. Phase 6 gate item 3.
 #[test]
 fn scenario_d8_binary_and_oversize_at_the_frozen_default() {
     const LIMIT: usize = 512 * 1024; // 524,288
@@ -287,6 +287,8 @@ fn scenario_d8_binary_and_oversize_at_the_frozen_default() {
     let line = |c: char| format!("{}\n", std::iter::repeat_n(c, 31).collect::<String>());
     let at_limit: String = std::iter::repeat_n(line('a'), LIMIT / 32).collect();
     assert_eq!(at_limit.len(), LIMIT);
+    // One byte under: the last line loses its terminator.
+    let under_limit = at_limit[..LIMIT - 1].to_owned();
 
     // A 2 MB PNG-shaped blob: the magic, then the IHDR length word whose NUL bytes land
     // inside the binary probe window (git's heuristic is a NUL in the first 8,000 bytes).
@@ -311,6 +313,7 @@ fn scenario_d8_binary_and_oversize_at_the_frozen_default() {
         &[
             ("img.png", "placeholder\n"),
             ("generated.txt", "seed\n"),
+            ("under_limit.txt", under_limit.as_str()),
             ("at_limit.txt", at_limit.as_str()),
             ("over_limit.txt", at_limit.as_str()),
         ],
@@ -323,7 +326,12 @@ fn scenario_d8_binary_and_oversize_at_the_frozen_default() {
 
     s.repo.write("img.png", &png);
     s.repo.write("generated.txt", &generated);
-    // Exactly at the limit on both sides: `>` is strict, so this is a normal hunk row.
+    // One byte under the limit on both sides: a normal hunk row.
+    let mut changed_under = under_limit.clone();
+    changed_under.replace_range(0..32, &line('b'));
+    assert_eq!(changed_under.len(), LIMIT - 1);
+    s.repo.write("under_limit.txt", &changed_under);
+    // Exactly at the limit on both sides: the limit is the first size that collapses.
     let mut changed_at_limit = at_limit.clone();
     changed_at_limit.replace_range(0..32, &line('b'));
     assert_eq!(changed_at_limit.len(), LIMIT);
@@ -336,7 +344,7 @@ fn scenario_d8_binary_and_oversize_at_the_frozen_default() {
     let pile = assert_pile!(
         s.engine,
         s.root,
-        "at_limit.txt|generated.txt|img.png|over_limit.txt"
+        "at_limit.txt|generated.txt|img.png|over_limit.txt|under_limit.txt"
     );
     assert_eq!(
         pile.row(b"img.png").unwrap().collapsed,
@@ -349,20 +357,30 @@ fn scenario_d8_binary_and_oversize_at_the_frozen_default() {
         "a 600 KiB text file is over the 512 KiB default"
     );
     assert_eq!(
-        pile.row(b"at_limit.txt").unwrap().collapsed,
+        pile.row(b"under_limit.txt").unwrap().collapsed,
         None,
-        "524,288 bytes is not over 524,288"
+        "524,287 bytes is under the 524,288 limit"
     );
     assert!(
-        !pile.row(b"at_limit.txt").unwrap().hunks.is_empty(),
-        "a row at the boundary keeps its hunks"
+        !pile.row(b"under_limit.txt").unwrap().hunks.is_empty(),
+        "a row below the boundary keeps its hunks"
+    );
+    assert_eq!(
+        pile.row(b"at_limit.txt").unwrap().collapsed,
+        Some(Collapsed::Size),
+        "524,288 bytes is the limit, and the limit collapses"
     );
     assert_eq!(
         pile.row(b"over_limit.txt").unwrap().collapsed,
         Some(Collapsed::Size),
         "524,289 bytes is over the limit"
     );
-    for path in [&b"img.png"[..], b"generated.txt", b"over_limit.txt"] {
+    for path in [
+        &b"img.png"[..],
+        b"generated.txt",
+        b"at_limit.txt",
+        b"over_limit.txt",
+    ] {
         let row = pile.row(path).unwrap();
         assert!(
             row.hunks.is_empty(),
