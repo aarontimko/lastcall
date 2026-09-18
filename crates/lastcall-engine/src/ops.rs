@@ -14,7 +14,7 @@
 //! that is consulted after the object write and after the ledger temp write. Production
 //! passes [`NoFault`]; the testkit's implementation SIGKILLs the process (E1).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
@@ -2152,14 +2152,22 @@ impl Ops<'_> {
         fault.at(FaultPoint::AfterObjectWrite);
         self.ledger.seen_tree = Some(new_tree);
         let now = self.clock.now_iso8601();
+        let kind = self.ledger.kind;
         for w in &writes {
             let (TreeWrite::Set { path, .. } | TreeWrite::Remove { path }) = w;
             let Ok(key) = std::str::from_utf8(path) else {
                 continue;
             };
             if let Some(o) = self.ledger.overrides.get_mut(key) {
-                if o.blob.is_some() || o.mode.is_some() {
-                    o.blob = None;
+                // The same rule the fold's clearing loop runs (verifier G1): an override
+                // collapses only when the new tree now says what it said. A switch is a
+                // repository's business and `survives_fold` answers `false` for one, so
+                // this is the two loops agreeing rather than a second behaviour.
+                let keep = matches!(w, TreeWrite::Remove { .. }) && o.survives_fold(kind);
+                if (o.blob.is_some() && !keep) || o.mode.is_some() {
+                    if !keep {
+                        o.blob = None;
+                    }
                     o.mode = None;
                     o.updated_at = now.clone();
                 }
@@ -2367,10 +2375,65 @@ impl Ops<'_> {
         fault.at(FaultPoint::AfterObjectWrite);
 
         self.ledger.seen_tree = Some(new_tree.clone());
+        // R2's releases, which are the one thing a fold cannot fold into the tree (verifier
+        // G1). Two kinds arrive here, and both end as `blob: null` on a path the new tree
+        // does not hold, with the user's note still on it:
+        //
+        // - one this fold is making, because an accept-all is an accept: a row the folder
+        //   did not read is accepted by letting its path go, exactly as `stage_file` does
+        //   for a single accept. Only a path that already carries an override is touched,
+        //   which is the flagged case; an unflagged unread row needs no record at all and
+        //   the `retain` below clears whatever it leaves empty.
+        // - one the record already carries, from an earlier single accept.
+        //
+        // Both are read off the new tree, so the rule is the same one the clearing loop
+        // has always run: an override collapses only when its baseline is now what the
+        // tree says. A repository's record has no releases of this shape, so its folds are
+        // byte-for-byte what they were.
+        let mut releases: BTreeSet<String> = BTreeSet::new();
+        if self.ledger.kind == RootKind::Draft {
+            let mut candidates: BTreeSet<String> = self
+                .ledger
+                .overrides
+                .iter()
+                .filter(|(_, o)| o.survives_fold(RootKind::Draft))
+                .map(|(k, _)| k.clone())
+                .collect();
+            for row in &snapshot.rows {
+                if matches!(row.collapsed, Some(crate::scan::Collapsed::Unread { .. }))
+                    && let Ok(k) = std::str::from_utf8(&row.path)
+                    && self
+                        .ledger
+                        .overrides
+                        .get(k)
+                        .is_some_and(|o| !o.flags.is_empty())
+                {
+                    candidates.insert(k.to_owned());
+                }
+            }
+            if !candidates.is_empty() {
+                let entries = self.store.ls_tree(&new_tree)?;
+                releases = candidates
+                    .into_iter()
+                    .filter(|k| !entries.contains_key(k.as_bytes()))
+                    .collect();
+            }
+        }
         let now = self.clock.now_iso8601();
-        self.ledger.overrides.retain(|_, o| {
-            if o.blob.is_some() || o.mode.is_some() {
-                o.blob = None;
+        for key in &releases {
+            if let Some(o) = self.ledger.overrides.get_mut(key)
+                && o.blob != Some(None)
+            {
+                o.blob = Some(None);
+                o.updated_at = now.clone();
+            }
+        }
+        self.ledger.overrides.retain(|key, o| {
+            let keep = releases.contains(key);
+            if (o.blob.is_some() && !keep) || o.mode.is_some() {
+                if !keep {
+                    o.blob = None;
+                }
                 o.mode = None;
                 o.updated_at = now.clone();
             }
@@ -4971,6 +5034,137 @@ mod tests {
         );
     }
 
+    /// R2's size limit for the release tests: small enough that a few kilobytes of fixture
+    /// is a file too large to read.
+    const UNREAD_LIMIT: u64 = 1_024;
+
+    /// The draft root the release rule is about: `a.md` in the record, `big.bin` never
+    /// recorded, over the limit and carrying the user's note. Answers the folder and the
+    /// pile that holds the unread row.
+    fn flagged_unread_draft(name: &str) -> (proptests::Draft, Pile) {
+        let mut d = proptests::Draft::new(name);
+        d.write("a.md", b"a\n");
+        d.first_sight(&DraftScope::tree(u64::MAX));
+        d.write("big.bin", &vec![b'x'; 3_000]);
+        assert!(
+            d.ops()
+                .flag(b"big.bin", "check this", None, None, &NoFault)
+                .unwrap()
+                .ok()
+        );
+        let pile = d.scan_at(UNREAD_LIMIT);
+        let row = pile
+            .row(b"big.bin")
+            .expect("the flagged large file has a row");
+        assert!(
+            matches!(row.collapsed, Some(crate::scan::Collapsed::Unread { .. })),
+            "R2's unread row: {:?}",
+            row.collapsed
+        );
+        (d, pile)
+    }
+
+    /// Accept the unread row on its own, which releases the path.
+    fn release_the_row(d: &mut proptests::Draft, pile: &Pile) {
+        let r = Rendered::of(pile.row(b"big.bin").expect("the row"));
+        assert!(d.ops().accept_file(&r, &NoFault).unwrap().ok());
+    }
+
+    /// The record let the path go and the note is still there: no row, the file counted in
+    /// the one notice, the override still a release.
+    fn assert_still_released(d: &proptests::Draft, when: &str) {
+        let pile = d.scan_at(UNREAD_LIMIT);
+        assert!(
+            pile.rows.is_empty(),
+            "{when}: the accepted row came back: {:?}",
+            pile_lines(&pile)
+        );
+        assert_eq!(
+            pile.notices,
+            vec!["1 file over 1 KiB not read".to_owned()],
+            "{when}: the file is counted, not shown"
+        );
+        let o = d
+            .ledger()
+            .overrides
+            .get("big.bin")
+            .unwrap_or_else(|| panic!("{when}: the override is gone"));
+        assert_eq!(o.blob, Some(None), "{when}: still a release");
+        assert_eq!(o.flags.len(), 1, "{when}: the note stays");
+    }
+
+    /// G1, order (a): the release outlives an accept-all over some *other* pending file.
+    /// A fold that collapsed it to flag-only would leave the shape `record_holds` reads as
+    /// "the record holds this path", and the row the user accepted would be back.
+    #[test]
+    fn ops_a_release_with_a_note_survives_an_accept_all_over_another_file() {
+        let (mut d, pile) = flagged_unread_draft("lc-g1-accept-all");
+        release_the_row(&mut d, &pile);
+        assert_still_released(&d, "after the accept");
+        d.write("a.md", b"a2\n");
+        let pile = d.scan_at(UNREAD_LIMIT);
+        assert_eq!(pile_lines(&pile), vec!["a.md".to_owned()]);
+        assert!(d.ops().accept_all(&pile, &NoFault).unwrap().ok());
+        assert_still_released(&d, "after the accept-all");
+        assert_still_released(&d, "and on the scan after that");
+    }
+
+    /// G1, order (b): the bounded compaction runs on its own once enough blob overrides
+    /// pile up, and it must not undo the user's accept either.
+    #[test]
+    fn ops_a_release_with_a_note_survives_a_compaction() {
+        let (mut d, pile) = flagged_unread_draft("lc-g1-compact");
+        release_the_row(&mut d, &pile);
+        d.ops().compact(&NoFault).unwrap();
+        assert_still_released(&d, "after the compaction");
+    }
+
+    /// G1, order (c): an accept-all whose pile still holds the unread row — the snapshot
+    /// the user had on screen before the single accept landed.
+    #[test]
+    fn ops_a_release_with_a_note_survives_an_accept_all_that_holds_the_row() {
+        let (mut d, pile) = flagged_unread_draft("lc-g1-accept-all-row");
+        release_the_row(&mut d, &pile);
+        assert!(d.ops().accept_all(&pile, &NoFault).unwrap().ok());
+        assert_still_released(&d, "after the accept-all over the row itself");
+    }
+
+    /// And the same accept-all *is* the release when nothing has released the row yet: a
+    /// pile the user accepts wholesale lets the unread path go exactly as a single accept
+    /// of that row does, note and all.
+    #[test]
+    fn ops_accept_all_releases_a_flagged_unread_row() {
+        let (mut d, pile) = flagged_unread_draft("lc-g1-accept-all-fresh");
+        assert!(d.ops().accept_all(&pile, &NoFault).unwrap().ok());
+        assert_still_released(&d, "after the accept-all");
+    }
+
+    /// The counted consequence: `blob_override_count` is the number of overrides a fold
+    /// would fold away, so a release the fold keeps is not one of them. Counting it would
+    /// put the record permanently over the compaction threshold and make every later
+    /// accept re-run a compaction that changes nothing.
+    #[test]
+    fn ops_a_kept_release_does_not_compact_the_next_accept() {
+        let (mut d, pile) = flagged_unread_draft("lc-g1-threshold");
+        release_the_row(&mut d, &pile);
+        assert_eq!(
+            d.ledger().blob_override_count(),
+            0,
+            "the kept release is not an override a fold would fold away"
+        );
+        d.set_threshold(1);
+        d.write("a.md", b"a2\n");
+        let pile = d.scan_at(UNREAD_LIMIT);
+        let r = Rendered::of(pile.row(b"a.md").expect("the edited file is pending"));
+        let out = d.ops().accept_file(&r, &NoFault).unwrap();
+        assert!(out.ok());
+        assert!(
+            !out.compacted,
+            "one real blob override does not pass a threshold of 1"
+        );
+        assert_still_released(&d, "and the release is untouched");
+    }
+
     /// Kickoff deliverable 8 (ii)/(iii): property tests over one draft root per test — a
     /// private store on a temp dir, no user repo, the `RootKind::Draft` plumbing exactly as
     /// the engine opens one. Each case rewrites the file set and resets the ledger to first
@@ -5004,6 +5198,7 @@ mod tests {
             paths: RepoPaths,
             globs: GlobSet,
             clock: FixedClock,
+            threshold: usize,
         }
 
         impl Draft {
@@ -5033,7 +5228,13 @@ mod tests {
                     paths,
                     globs: GlobSet::empty(),
                     clock: FixedClock::at_unix(1_800_000_000),
+                    threshold: 500,
                 }
+            }
+
+            /// The compaction trigger, for the tests that are about it.
+            pub(super) fn set_threshold(&mut self, n: usize) {
+                self.threshold = n;
             }
 
             /// The whole folder, no size limit: what these tests snapshot.
@@ -5116,6 +5317,21 @@ mod tests {
             }
 
             pub(super) fn scan(&self) -> Pile {
+                self.scan_with(None, 1 << 20)
+            }
+
+            /// A scan under R2's size rule with the limit set where the test wants it, so
+            /// an unread row costs a few kilobytes of fixture rather than a megabyte.
+            pub(super) fn scan_at(&self, collapse_size_bytes: u64) -> Pile {
+                let scope = crate::store::DraftScope::tree(collapse_size_bytes);
+                self.scan_with(Some(&scope), collapse_size_bytes)
+            }
+
+            fn scan_with(
+                &self,
+                scope: Option<&crate::store::DraftScope>,
+                collapse_size_bytes: u64,
+            ) -> Pile {
                 crate::scan::scan(&ScanInputs {
                     store: &self.store,
                     index: &self.index,
@@ -5125,8 +5341,8 @@ mod tests {
                     tree: &self.tree,
                     case_insensitive: false,
                     collapsed_globs: &self.globs,
-                    scope: None,
-                    collapse_size_bytes: 1 << 20,
+                    scope,
+                    collapse_size_bytes,
                     excluded_dirs: &[],
                     index_tmp: &self.paths.index_tmp,
                     row_cap: DEFAULT_ROW_CAP,
@@ -5146,7 +5362,7 @@ mod tests {
                     ledger: &mut self.ledger,
                     tree: &mut self.tree,
                     clock: &self.clock,
-                    compaction_threshold: 500,
+                    compaction_threshold: self.threshold,
                     case_insensitive: false,
                     staged: BTreeMap::new(),
                     pending_undo: None,

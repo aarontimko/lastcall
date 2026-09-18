@@ -712,6 +712,89 @@ fn scenario_f6_a_flagged_new_file_that_grows() {
     let pile = assert_pile!(s.engine, draft, "newf.txt", "F1 undo");
     assert_eq!(pile.row(b"newf.txt").unwrap().flags.len(), 1);
     assert!(notices_about(&pile, "not read").is_empty());
+
+    // Verifier G1: the accept has to survive every fold. A fold that cleared the release
+    // would leave the note as a flag-only override, which the record reads as "this path is
+    // mine", and the row the user accepted would be back on the next scan.
+    let released = |s: &Fresh, path: &str, when: &str| {
+        let rs = s.engine.root(&draft).unwrap();
+        let o = &rs.ledger.overrides[path];
+        assert_eq!(o.blob, Some(None), "G1 {path} {when}: still a release");
+        assert_eq!(o.flags.len(), 1, "G1 {path} {when}: the note stays");
+    };
+
+    // (a) an accept-all over some other pending file.
+    assert!(accept_file(&mut s, &draft, "newf.txt").ok());
+    released(&s, "newf.txt", "after the accept");
+    s.repo.write("z_ignore/a.md", "a2\n");
+    let pile = assert_pile!(s.engine, draft, "a.md", "G1 another file is pending");
+    assert!(
+        s.engine
+            .ops(&draft)
+            .unwrap()
+            .accept_all(&pile, &NoFault)
+            .unwrap()
+            .ok()
+    );
+    let pile = assert_pile!(s.engine, draft, "", "G1 after an accept-all");
+    assert_eq!(
+        notices_about(&pile, "not read"),
+        vec!["1 file over 512 KiB not read"],
+        "G1: counted, not shown"
+    );
+    released(&s, "newf.txt", "after an accept-all over another file");
+
+    // (b) the bounded compaction, which runs on its own once enough overrides pile up.
+    s.engine.ops(&draft).unwrap().compact(&NoFault).unwrap();
+    let pile = assert_pile!(s.engine, draft, "", "G1 after a compaction");
+    assert_eq!(
+        notices_about(&pile, "not read"),
+        vec!["1 file over 512 KiB not read"]
+    );
+    released(&s, "newf.txt", "after a compaction");
+
+    // (c) an accept-all over a pile that holds an unread row itself: a second flagged file
+    // the folder never recorded, already over the limit. The accept-all is the accept, so
+    // it lets the path go exactly as the single accept did, note and all.
+    s.repo.write("z_ignore/other.bin", vec![b'z'; max]);
+    assert!(
+        s.engine
+            .ops(&draft)
+            .unwrap()
+            .flag(b"other.bin", "this one too", None, None, &NoFault)
+            .unwrap()
+            .ok()
+    );
+    let pile = assert_pile!(s.engine, draft, "other.bin", "G1 a second unread row");
+    assert!(matches!(
+        pile.row(b"other.bin").unwrap().collapsed,
+        Some(lastcall_engine::scan::Collapsed::Unread { .. })
+    ));
+    assert!(
+        s.engine
+            .ops(&draft)
+            .unwrap()
+            .accept_all(&pile, &NoFault)
+            .unwrap()
+            .ok()
+    );
+    let pile = assert_pile!(s.engine, draft, "", "G1 after the accept-all over the row");
+    assert_eq!(
+        notices_about(&pile, "not read"),
+        vec!["2 files over 512 KiB not read"]
+    );
+    released(&s, "newf.txt", "after the third fold");
+    released(&s, "other.bin", "after the accept-all that released it");
+    assert_eq!(recorded(&s, &draft), vec!["a.md".to_owned()]);
+
+    // And a restart reads the same record back off disk.
+    s.restart();
+    let pile = assert_pile!(s.engine, draft, "", "G1 after a restart");
+    assert_eq!(
+        notices_about(&pile, "not read"),
+        vec!["2 files over 512 KiB not read"]
+    );
+    released(&s, "newf.txt", "after a restart");
 }
 
 #[test]
