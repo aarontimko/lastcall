@@ -32,7 +32,8 @@ binary rather than for the commit log.
 
 - `draft_dir_parents` says how many parent folder names a watched folder carries in the list,
   one by default, so two folders of the same name are told apart: `repo/z_ignore` rather than
-  `z_ignore`. Use `0` for the bare name, up to `4` for more.
+  `z_ignore`. `0` is the folder's path relative to where it was found, which is the bare name
+  for an entry such as `notes` and `a/notes` for one such as `*/notes`; up to `4` for more.
 - Selecting a repository's or a folder's own row shows where it is, on a dim second line
   above the pane, with your home directory written as `~`.
 
