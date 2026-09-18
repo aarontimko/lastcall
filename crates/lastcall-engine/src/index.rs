@@ -149,9 +149,15 @@ impl PrivateIndex {
         let tmp = self
             .index_tree
             .with_extension(format!("tree.{}-{n}.tmp", std::process::id()));
-        std::fs::write(&tmp, marker).map_err(|e| io_err(&tmp, e))?;
-        std::fs::rename(&tmp, &self.index_tree).map_err(|e| io_err(&tmp, e))?;
-        Ok(())
+        // A failed write leaves nothing behind: the name is new each time, so a leftover
+        // would not be overwritten by the next attempt (a full disk, one orphan per scan).
+        let written = std::fs::write(&tmp, marker)
+            .and_then(|()| std::fs::rename(&tmp, &self.index_tree))
+            .map_err(|e| io_err(&tmp, e));
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        written
     }
 
     /// `update-index -q --refresh --ignore-submodules`; the exit status is ignored (non-zero
@@ -338,7 +344,25 @@ mod tests {
                 w.join().unwrap();
             }
         });
-        assert_eq!(index.recorded_tree(), Some(Some(tree)));
+        assert_eq!(index.recorded_tree(), Some(Some(tree.clone())));
+
+        // No temp file outlives its write, and a write that fails removes its own.
+        let leftovers = |dir: &Path| -> Vec<String> {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name.ends_with(".tmp"))
+                .collect()
+        };
+        let dir = index.index_tree.parent().unwrap().to_path_buf();
+        assert_eq!(leftovers(&dir), Vec::<String>::new());
+        std::fs::remove_file(&index.index_tree).unwrap();
+        std::fs::create_dir(&index.index_tree).unwrap();
+        std::fs::write(index.index_tree.join("in-the-way"), "x").unwrap();
+        index
+            .write_marker(Some(&tree))
+            .expect_err("rename over a non-empty folder fails");
+        assert_eq!(leftovers(&dir), Vec::<String>::new());
     }
 
     #[test]

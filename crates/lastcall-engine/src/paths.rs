@@ -227,6 +227,8 @@ mod tests {
         assert!(!is_temp_index_name("index..tmp"));
         assert!(!is_temp_index_name("index.4321.tmp.bak"));
         assert!(!is_temp_index_name("index.a12.tmp"));
+        // The index marker's temp file (`index.rs`) must never be swept as a temp index.
+        assert!(!is_temp_index_name("index.tree.4321-7.tmp"));
         assert!(!is_temp_index_name("ledger.json"));
     }
 
