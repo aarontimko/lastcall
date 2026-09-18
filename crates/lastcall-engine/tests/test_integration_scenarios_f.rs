@@ -746,6 +746,48 @@ fn scenario_f7_scope_change_trims_and_widens() {
         pile.row(b"research/b.md").unwrap().change,
         lastcall_engine::scan::Change::Added
     );
+
+    // Verifier F2: a single-file accept of a deep new file puts it in the record as an
+    // override alone, with the seen tree none the wiser. Narrowing the entry again must
+    // drop it on the very next scan, not leave it for a later fold to spring on the
+    // reader.
+    s.repo.write("z_ignore/research/new.md", "n\n");
+    assert!(accept_file(&mut s, &draft, "research/new.md").ok());
+    {
+        let rs = s.engine.root(&draft).unwrap();
+        assert!(
+            !rs.tree.contains_key(b"research/new.md".as_slice()),
+            "F2: the seen tree never held the deep path"
+        );
+        assert!(
+            matches!(
+                rs.ledger.overrides.get("research/new.md").map(|o| &o.blob),
+                Some(Some(Some(_)))
+            ),
+            "F2: the accept is an override, not a tree entry"
+        );
+    }
+    s.restart_with(draft_config(&["z_ignore"]));
+    let pile = s.engine.scan(&draft).unwrap();
+    assert_eq!(
+        notices_about(&pile, "outside the root's scope"),
+        vec!["1 path outside the root's scope dropped from its record"],
+        "F2: the trim fires for an override the tree never held"
+    );
+    assert!(
+        !s.engine
+            .root(&draft)
+            .unwrap()
+            .ledger
+            .overrides
+            .contains_key("research/new.md"),
+        "F2: and the out-of-scope override is gone"
+    );
+    let pile = s.engine.scan(&draft).unwrap();
+    assert!(
+        notices_about(&pile, "outside the root's scope").is_empty(),
+        "F2: said once, with no surprise left for a later fold"
+    );
 }
 
 #[test]

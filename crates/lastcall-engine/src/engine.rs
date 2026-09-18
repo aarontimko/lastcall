@@ -1145,7 +1145,15 @@ fn scan_root(state: &mut RootState, ctx: &ScanCtx) -> Result<Pile, EngineError> 
         let excluded = state.excluded_dirs.clone();
         let out_of_scope =
             |p: &[u8]| !scope.admits_shape(p) || crate::store::under_excluded(p, &excluded);
-        if state.tree.keys().any(|p| out_of_scope(p)) {
+        // The record in force is the seen tree composed with the overrides, so a path the
+        // tree never held but an override sets still has to be trimmed (verifier F2).
+        let held_outside = state.tree.keys().any(|p| out_of_scope(p))
+            || state
+                .ledger
+                .overrides
+                .iter()
+                .any(|(k, o)| matches!(o.blob, Some(Some(_))) && out_of_scope(k.as_bytes()));
+        if held_outside {
             trimmed = state
                 .trim_ops(ctx.clock.as_ref())
                 .trim(&out_of_scope, &NoFault)?;
@@ -4095,6 +4103,81 @@ pub(crate) mod tests {
         );
         assert!(engine.root(&draft).unwrap().ledger.seen_tree.is_some());
         assert!(engine.scan(&draft).unwrap().is_empty());
+    }
+
+    /// Amendment v1.13 R6 (verifier F2): the trim's trigger has to look at the overrides
+    /// too. A single-file accept of a path the seen tree never held leaves the record
+    /// holding it in an override alone, and narrowing the scope must still drop it on the
+    /// very next scan rather than waiting for some later fold to surprise the reader.
+    #[test]
+    fn engine_scope_trim_fires_for_a_blob_override_outside_the_scope() {
+        let repo = FixtureRepo::new("eng-trim-over").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let drafts = repo.parent_dir().join("_drafts");
+        std::fs::create_dir_all(&drafts).unwrap();
+        std::fs::write(drafts.join("n1.md"), "one\n").unwrap();
+        let wide = Config {
+            draft_dirs: vec!["_drafts/**".to_owned()],
+            draft_initial: DraftInitial::Seen,
+            ..Config::default()
+        };
+        let narrow = Config {
+            draft_dirs: vec!["_drafts".to_owned()],
+            ..wide.clone()
+        };
+        let mut engine = open_engine(&repo, &state, wide);
+        let draft = engine
+            .roots()
+            .iter()
+            .find(|r| r.kind == RootKind::Draft)
+            .map(|r| r.path.clone())
+            .expect("a draft root");
+        assert!(engine.scan(&draft).unwrap().is_empty());
+        std::fs::create_dir_all(drafts.join("sub")).unwrap();
+        std::fs::write(drafts.join("sub/new.md"), "n\n").unwrap();
+        let pile = engine.scan(&draft).unwrap();
+        let rendered = Rendered::of(pile.row(b"sub/new.md").expect("the deep row"));
+        assert!(
+            engine
+                .ops(&draft)
+                .unwrap()
+                .accept_file(&rendered, &NoFault)
+                .unwrap()
+                .refused
+                .is_empty()
+        );
+        {
+            // The premise: the accept wrote an override, and the seen tree itself still
+            // knows nothing about the deep path.
+            let r = engine.root(&draft).unwrap();
+            assert!(!r.tree.contains_key(b"sub/new.md".as_slice()));
+            assert!(matches!(
+                r.ledger.overrides.get("sub/new.md").map(|o| &o.blob),
+                Some(Some(Some(_)))
+            ));
+        }
+        drop(engine);
+
+        let mut engine = open_engine(&repo, &state, narrow);
+        let pile = engine.scan(&draft).unwrap();
+        assert!(
+            pile.notices
+                .iter()
+                .any(|n| n == "1 path outside the root's scope dropped from its record"),
+            "{:?}",
+            pile.notices
+        );
+        assert!(
+            !engine
+                .root(&draft)
+                .unwrap()
+                .ledger
+                .overrides
+                .contains_key("sub/new.md"),
+            "the out-of-scope override is gone"
+        );
+        // And no later fold has a surprise left to deliver.
+        assert!(engine.scan(&draft).unwrap().notices.is_empty());
     }
 
     #[test]
