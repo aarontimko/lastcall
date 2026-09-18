@@ -1,6 +1,5 @@
 ---
 source: crates/lastcall/tests/test_e2e_tui_snapshots.rs
-assertion_line: 180
 expression: frame
 ---
 "editing src/parse.rs · line 22/63 · unsaved                                                         "
@@ -17,7 +16,7 @@ expression: frame
 "│  A u2  +2 −0  [mixed]    │  10     pub line: usize,                                              │"
 "│  upstream · 1 file       │  11 }                                                                 │"
 "│──────────────────────────│  12                                                                   │"
-"│notes                     │  13 /// Parse `text` into one record per `key = value` line.          │"
+"│W/notes                   │  13 /// Parse `text` into one record per `key = value` line.          │"
 "│  draft · 1 file          │  14 ///                                                               │"
 "│  M n2.md  +2 −0          │  15 /// Blank lines and `#` comments are skipped. A line without a `=→│"
 "│                          │  16 /// error: it is simply not a record, which keeps the parser tota→│"

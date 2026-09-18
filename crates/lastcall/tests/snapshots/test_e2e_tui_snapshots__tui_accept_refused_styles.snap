@@ -57,7 +57,7 @@ expression: style
 13 1..27 Reset Reset DIM
 13 27..28 Cyan Reset -
 14 0..1 Cyan Reset -
-14 1..6 Reset Reset BOLD
+14 1..8 Reset Reset BOLD
 14 27..28 Cyan Reset -
 14 28..58 Green Reset -
 15 0..1 Cyan Reset -

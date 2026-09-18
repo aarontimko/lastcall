@@ -319,13 +319,22 @@ fn scenario_f4_plain_entry_reads_one_folder() {
     s.restart();
     assert_pile!(s.engine, draft, "", "F4 restart");
 
-    // The report names nothing below the folder.
-    let json = lastcall_engine::status::StatusReport::build(&mut s.engine, None)
-        .expect("status")
-        .to_json();
+    // The report names nothing below the folder, calls the folder what the nav calls it,
+    // and its JSON keeps the shape it has always had (R7: no new key).
+    let report = lastcall_engine::status::StatusReport::build(&mut s.engine, None).expect("status");
+    let json = report.to_json();
     assert!(
         !json.contains("research/"),
         "F4: no path below the folder in the report: {json}"
+    );
+    assert!(
+        !json.contains("\"name\""),
+        "F4: the JSON report gained no key: {json}"
+    );
+    assert!(
+        report.render_human().contains("repo1/z_ignore (draft)"),
+        "F4: the text report uses the engine's name: {}",
+        report.render_human()
     );
 }
 

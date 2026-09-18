@@ -120,7 +120,12 @@ fn root_named(engine: &Engine, name: &str) -> PathBuf {
 fn app_of(engine: &mut Engine) -> App {
     let mut app = App::new();
     app.handle(Action::Resize(W, H));
-    let metas = engine.roots().into_iter().map(RootMeta::of).collect();
+    let home = engine.home_shown().map(std::path::Path::to_path_buf);
+    let metas = engine
+        .roots()
+        .into_iter()
+        .map(|r| RootMeta::of(r, home.as_deref()))
+        .collect();
     app.sync_roots(metas);
     for (root, seq, result) in engine.scan_all() {
         let pile = result.expect("scan succeeds");
@@ -176,9 +181,20 @@ fn draw(app: &App, w: u16, h: u16) -> (String, String) {
 }
 
 /// Pin `<name>_frame` and `<name>_styles`; the frame must also be reproducible.
+///
+/// No frame may carry a temporary directory. Every scene builds under one, so a frame that
+/// shows an absolute path would pin this machine's own into the repository and change from
+/// run to run; the header collapses the scene's home to `~`, and this is the check that it
+/// really did (R5).
 fn snapshot(name: &str, app: &App, w: u16, h: u16) {
     let (frame, style) = draw(app, w, h);
     assert_eq!(draw(app, w, h).0, frame, "{name}: screen = f(App, area)");
+    for temp in ["/var/", "/private/"] {
+        assert!(
+            !frame.contains(temp),
+            "{name}: a frame must not carry a temporary path ({temp}):\n{frame}"
+        );
+    }
     insta::assert_snapshot!(format!("{name}_frame"), frame);
     insta::assert_snapshot!(format!("{name}_styles"), style);
 }
@@ -2272,12 +2288,18 @@ fn tui_tour_empty() {
     // The fixture has three roots; the card's condition needs fourteen. The extra eleven
     // are metas and empty piles, which is all the nav draws — no repository on disk is
     // needed to render a repository with nothing pending.
-    let mut metas: Vec<RootMeta> = engine.roots().into_iter().map(RootMeta::of).collect();
+    let home = engine.home_shown().map(std::path::Path::to_path_buf);
+    let mut metas: Vec<RootMeta> = engine
+        .roots()
+        .into_iter()
+        .map(|r| RootMeta::of(r, home.as_deref()))
+        .collect();
     let parent = metas[0].parent.clone();
     for i in 0..11 {
         let name = format!("repo{i:02}");
         metas.push(RootMeta {
             path: parent.join(&name),
+            path_shown: format!("~/W/{name}"),
             name,
             kind: RootKind::Git,
             parent: parent.clone(),

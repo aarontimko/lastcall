@@ -16,7 +16,7 @@ expression: frame
 "│  A u2  +2 −0  [mix│                                                          │                   │"
 "│  upstream · 1 file│ this rewrite loses the guard                             │                   │"
 "│───────────────────│ why?▌                                                    │                   │"
-"│notes              │                                                          │                   │"
+"│W/notes            │                                                          │                   │"
 "│  draft · 1 file   │                                                          │                   │"
 "│  M n2.md  +2 −0   │                                                          │                   │"
 "│                   │                                                          │                   │"

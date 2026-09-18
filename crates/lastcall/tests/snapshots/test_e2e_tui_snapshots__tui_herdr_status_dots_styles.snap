@@ -49,7 +49,7 @@ expression: style
 13 27..28 Cyan Reset -
 14 0..1 Cyan Reset -
 14 1..3 Yellow Reset -
-14 3..8 Reset Reset BOLD
+14 3..10 Reset Reset BOLD
 14 27..28 Cyan Reset -
 15 0..1 Cyan Reset -
 15 27..28 Cyan Reset -

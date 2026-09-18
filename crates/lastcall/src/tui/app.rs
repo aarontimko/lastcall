@@ -59,8 +59,11 @@ pub const EDITOR_GUTTER: usize = 5;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RootMeta {
     pub path: PathBuf,
-    /// Basename of `path`.
+    /// What the nav calls this root: a repository's folder name, or a watched folder's
+    /// name with as many parent folders as the configuration asks for.
     pub name: String,
+    /// `path` as the header shows it, with the home folder written `~`.
+    pub path_shown: String,
     pub kind: RootKind,
     pub parent: PathBuf,
     pub badge: Option<Badge>,
@@ -72,10 +75,13 @@ pub struct RootMeta {
 }
 
 impl RootMeta {
-    pub fn of(root: &RootState) -> Self {
+    /// `home` is the engine's canonicalized home (`Engine::home_shown`), the only thing
+    /// `path_shown` needs that a `RootState` does not carry.
+    pub fn of(root: &RootState, home: Option<&Path>) -> Self {
         Self {
             path: root.path.clone(),
             name: root.name(),
+            path_shown: collapse_home(&root.path, home),
             kind: root.kind,
             parent: root.parent.clone(),
             badge: root.badge.clone(),
@@ -4729,6 +4735,27 @@ pub fn basename(p: &Path) -> String {
         .unwrap_or_else(|| p.to_string_lossy().into_owned())
 }
 
+/// `path` with the home folder written `~`, which is how the header shows where a root is.
+///
+/// A prefix match on whole components only: `/home/user2` is not inside `/home/user`, and
+/// the home itself is `~`. With no home known, or a home of `/`, the path is shown as it
+/// is — a `~` that stood for the whole filesystem would say nothing.
+pub fn collapse_home(path: &Path, home: Option<&Path>) -> String {
+    let shown = path.to_string_lossy().into_owned();
+    let Some(home) = home else { return shown };
+    let home = home.to_string_lossy();
+    if home.is_empty() || home == "/" {
+        return shown;
+    }
+    if shown == home {
+        return "~".to_owned();
+    }
+    match shown.strip_prefix(&format!("{home}/")) {
+        Some(rest) => format!("~/{rest}"),
+        None => shown,
+    }
+}
+
 /// Deterministic three-root fixture for the binary crate's unit tests (no git, no files:
 /// the piles are the recorded JSON that the engine's serde derives enable).
 #[cfg(test)]
@@ -4752,6 +4779,7 @@ pub(crate) mod testfix {
         RootMeta {
             path: root(name),
             name: name.to_owned(),
+            path_shown: format!("~/W/{name}"),
             kind: if draft {
                 RootKind::Draft
             } else {
@@ -4962,6 +4990,38 @@ mod tests {
     /// Phase 6 deliverable 4: `e` is silent where it has nothing to do — a binary row
     /// (never expandable), a row that is not collapsed at all, a group, and a row already
     /// expanded. No effect means no engine work; `Changed::No` means no draw.
+    /// R5: the header's path line writes the home folder `~`, and a folder that merely
+    /// starts with the same letters is not inside it.
+    #[test]
+    fn app_collapse_home_matches_whole_components_only() {
+        let home = Path::new("/home/u");
+        assert_eq!(
+            collapse_home(Path::new("/home/u/w/notes"), Some(home)),
+            "~/w/notes"
+        );
+        assert_eq!(collapse_home(Path::new("/home/u"), Some(home)), "~");
+        assert_eq!(
+            collapse_home(Path::new("/home/u2/w"), Some(home)),
+            "/home/u2/w",
+            "a different home of the same prefix is not inside this one"
+        );
+        assert_eq!(
+            collapse_home(Path::new("/srv/w"), Some(home)),
+            "/srv/w",
+            "outside the home: shown as it is"
+        );
+        assert_eq!(
+            collapse_home(Path::new("/srv/w"), None),
+            "/srv/w",
+            "no home known: shown as it is"
+        );
+        assert_eq!(
+            collapse_home(Path::new("/srv/w"), Some(Path::new("/"))),
+            "/srv/w",
+            "a home of `/` would make `~` mean nothing"
+        );
+    }
+
     #[test]
     fn app_expand_is_a_no_op_off_a_collapsed_row() {
         let mut app = three_roots();

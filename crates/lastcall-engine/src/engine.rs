@@ -591,6 +591,12 @@ pub struct Engine {
     /// How many times discovery re-ran after open (a budget probe for tests).
     discovery_runs: u64,
     git_version: String,
+    /// The home directory the paths shown to the user are collapsed to `~` against,
+    /// canonicalized once here. A home reached through a symlink (`/home/u` pointing at
+    /// `/data/u`) would otherwise never match a root path, which is always canonical, and
+    /// every path shown would be the long one. The raw value is the fallback when it will
+    /// not canonicalize, which is the answer that was right before this existed.
+    home_shown: Option<PathBuf>,
     /// Engine-global scan sequence number: `+1` per pile [`Engine::scan`] produces, whichever
     /// root; every publisher of a pile carries it so a consumer can drop a pile older than
     /// one it already holds (a `scan_all` result arriving after an accept's rescan).
@@ -638,6 +644,9 @@ impl Engine {
             pending_nested: Vec::new(),
             discovery_runs: 0,
             git_version,
+            home_shown: env
+                .home()
+                .map(|h| std::fs::canonicalize(h).unwrap_or_else(|_| h.to_path_buf())),
             scan_seq: 0,
         };
         let started = std::time::Instant::now();
@@ -653,6 +662,11 @@ impl Engine {
 
     pub fn env(&self) -> &Env {
         &self.env
+    }
+
+    /// The canonicalized home directory, for collapsing a path shown to the user to `~`.
+    pub fn home_shown(&self) -> Option<&Path> {
+        self.home_shown.as_deref()
     }
 
     pub fn config(&self) -> &Config {

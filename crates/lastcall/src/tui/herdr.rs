@@ -1073,6 +1073,7 @@ pub(crate) mod testfix {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default(),
             parent: path.parent().unwrap_or(Path::new("/")).to_path_buf(),
+            path_shown: path.to_string_lossy().into_owned(),
             path,
             kind: lastcall_engine::store::RootKind::Git,
             badge,

@@ -16,7 +16,7 @@ expression: frame
 "│ │                                                                         │  │"
 "│ │ > Keep listing every repository                                         │  │"
 "│─│   Start with the empty ones hidden, and remember that                   │  │"
-"│n│     (writes hide_empty_repos = true)                                    │  │"
+"│W│     (writes hide_empty_repos = true)                                    │  │"
 "│ │                                                                         │  │"
 "│─│ enter  choose          q  skip the rest                                 │  │"
 "│r└─────────────────────────────────────────────────────────────────────────┘  │"

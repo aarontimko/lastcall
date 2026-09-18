@@ -58,7 +58,7 @@ expression: style
 12 27..28 Cyan Reset -
 12 28..31 Green Reset -
 12 99..100 Cyan Reset -
-13 1..6 Reset Reset BOLD
+13 1..8 Reset Reset BOLD
 13 27..28 Cyan Reset -
 13 28..32 Green Reset -
 13 99..100 Cyan Reset -

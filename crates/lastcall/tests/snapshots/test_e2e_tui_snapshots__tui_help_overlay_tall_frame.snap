@@ -16,7 +16,7 @@ expression: frame
 "│  A u2  +2 −0  │ a              accept the hunk under the cursor                  │               │"
 "│  upstream · 1 │ A              accept the whole file or repo                     │               │"
 "│───────────────│ Ctrl-A         accept everything listed                          │               │"
-"│notes          │ u              restore the hunk                                  │               │"
+"│W/notes        │ u              restore the hunk                                  │               │"
 "│  draft · 1 fil│ U              restore the whole file                            │               │"
 "│  M n2.md  +2 −│ z              undo the last accept                              │               │"
 "│               │ Home           first entry / top of diff                         │               │"

@@ -95,7 +95,12 @@ async fn loop_flag_with_one_agent_reaches_pane_send_text() {
     // The app the loop would hold after its first refresh: the engine's own roots and its
     // own piles, nothing hand-written.
     let mut engine = engine;
-    let metas: Vec<RootMeta> = engine.roots().iter().map(|r| RootMeta::of(r)).collect();
+    let home = engine.home_shown().map(std::path::Path::to_path_buf);
+    let metas: Vec<RootMeta> = engine
+        .roots()
+        .iter()
+        .map(|r| RootMeta::of(r, home.as_deref()))
+        .collect();
     let alpha: PathBuf = metas
         .iter()
         .find(|m| m.name == "alpha")

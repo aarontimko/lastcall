@@ -16,7 +16,7 @@ expression: frame
 "│  A u│ a              accept the hunk under the cursor                  │     │"
 "│  ups│ A              accept the whole file or repo                     │     │"
 "│─────│ Ctrl-A         accept everything listed                          │     │"
-"│notes│ u              restore the hunk                                  │     │"
+"│W/not│ u              restore the hunk                                  │     │"
 "│  dra│ U              restore the whole file                            │     │"
 "│  M n│ z              undo the last accept                              │     │"
 "│     │ … 22 more keys (97 columns shows all)                            │     │"

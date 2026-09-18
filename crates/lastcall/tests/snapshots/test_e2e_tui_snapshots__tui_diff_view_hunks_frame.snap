@@ -14,7 +14,7 @@ expression: frame
 "│  A u2  +2 −0  [mixed]    │ line 46                                                               │"
 "│  upstream · 1 file       │ line 47                                                               │"
 "│──────────────────────────│ line 48                                                               │"
-"│notes                     │                                                                       │"
+"│W/notes                   │                                                                       │"
 "│  draft · 1 file          │@@ -75,6 +75,6 @@                       [a accept] [u restore] [m flag]│"
 "│  M n2.md  +2 −0          │ line 75                                                               │"
 "│                          │ line 76                                                               │"
