@@ -315,13 +315,19 @@ fn under_any(path: &[u8], dirs: &[Vec<u8>]) -> bool {
 /// An override that records the path as *absent* (an accepted deletion) is not an entry:
 /// there is nothing left to show, which is exactly the state accepting an unread row
 /// leaves behind.
+///
+/// A **flag-only** override counts (verifier F1). R2(b) says an override of any kind means
+/// the record holds the path, and the reason is the reader's: a file somebody has flagged
+/// must not leave the screen when it grows, or the flag goes with it into a ledger nothing
+/// on screen can reach.
 fn record_holds(inputs: &ScanInputs<'_>, path: &[u8]) -> bool {
     let over = std::str::from_utf8(path)
         .ok()
         .and_then(|s| inputs.ledger.overrides.get(s));
-    match over.and_then(|o| o.blob.as_ref()) {
-        Some(Some(_)) => true,
-        Some(None) => false,
+    match over.map(|o| &o.blob) {
+        Some(Some(Some(_))) => true,
+        Some(Some(None)) => false,
+        Some(None) => true,
         None => inputs.tree.contains_key(path),
     }
 }
@@ -549,11 +555,10 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
                 }),
                 Baseline::Absent | Baseline::Empty => None,
             };
-            let flags = std::str::from_utf8(path)
+            let over = std::str::from_utf8(path)
                 .ok()
-                .and_then(|s| inputs.ledger.overrides.get(s))
-                .map(|o| o.flags.clone())
-                .unwrap_or_default();
+                .and_then(|s| inputs.ledger.overrides.get(s));
+            let flags = over.map(|o| o.flags.clone()).unwrap_or_default();
             let is_conflicted = conflicted.contains(path);
             let lossy = String::from_utf8_lossy(path).into_owned();
             if std::str::from_utf8(path).is_err() {
@@ -563,17 +568,23 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
             }
 
             if unread.contains(path) {
-                let Some(base) = base_entry else {
-                    // The record's entry cannot be read back (its object was pruned), so
-                    // there is nothing for a row to stand on: the file is simply one this
-                    // folder is not reading.
-                    over_size += 1;
-                    continue;
+                // Two ways to have no baseline. A path the user has flagged and the folder
+                // never recorded is an **added** unread row, so the flag stays on screen
+                // (verifier F1); a path whose recorded entry cannot be read back (its
+                // object was pruned) has nothing for a row to stand on, and the file is
+                // simply one this folder is not reading.
+                let change = match (&base_entry, over.is_some()) {
+                    (Some(_), _) => Change::Modified,
+                    (None, true) => Change::Added,
+                    (None, false) => {
+                        over_size += 1;
+                        continue;
+                    }
                 };
                 rows.push(Row {
                     path: path.clone(),
-                    change: Change::Modified,
-                    baseline: Some(base),
+                    change,
+                    baseline: base_entry,
                     current: None,
                     added: 0,
                     deleted: 0,
@@ -1003,6 +1014,25 @@ mod tests {
             std::fs::write(path, vec![b'x'; bytes]).unwrap();
         }
 
+        /// A flag on a path and nothing else: the override carries no blob, exactly as
+        /// `m` leaves it (verifier F1).
+        fn flag(&mut self, name: &str, note: &str) {
+            self.ledger.overrides.insert(
+                name.to_owned(),
+                crate::ledger::Override {
+                    blob: None,
+                    mode: None,
+                    flags: vec![crate::ledger::Flag {
+                        note: note.to_owned(),
+                        created_at: "2026-01-01T00:00:00Z".into(),
+                        hunk: None,
+                        summary: None,
+                    }],
+                    updated_at: "2026-01-01T00:00:00Z".into(),
+                },
+            );
+        }
+
         /// First sight under `scope`: what the folder records is what it reads.
         fn first_sight(&mut self, scope: &DraftScope) {
             let seen = self.store.tree_of_disk(scope, &[]).unwrap();
@@ -1126,6 +1156,55 @@ mod tests {
         assert_eq!(row_paths(&out), vec!["a.md".to_owned()]);
         assert_eq!(out.pile.rows[0].change, Change::Deleted);
         assert!(unread_notices(&out).is_empty());
+    }
+
+    /// Verifier F1: an override of **any** kind means the record holds the path, so a file
+    /// the reader has flagged keeps its row when it grows past the limit even though the
+    /// folder never recorded its content. Without this the flag goes with the row, into a
+    /// ledger nothing on screen can reach.
+    #[test]
+    fn scan_watched_folder_keeps_a_flagged_new_file_that_grows() {
+        let max = 1024u64;
+        let mut w = Watched::new(max);
+        w.write("a.md", 4);
+        w.first_sight(&DraftScope::plain(max));
+        w.write("newf.txt", 10);
+        w.flag("newf.txt", "agent says look");
+
+        // Small: an ordinary added row, carrying the flag.
+        let out = w.scan(&DraftScope::plain(max));
+        assert_eq!(row_paths(&out), vec!["newf.txt".to_owned()]);
+        assert_eq!(out.pile.rows[0].change, Change::Added);
+        assert!(unread_notices(&out).is_empty());
+
+        // Grown to the limit: still a row, now an unread one, still carrying the flag.
+        w.write("newf.txt", max as usize);
+        let out = w.scan(&DraftScope::plain(max));
+        assert_eq!(row_paths(&out), vec!["newf.txt".to_owned()]);
+        let row = &out.pile.rows[0];
+        assert_eq!(row.change, Change::Added, "the record holds no content");
+        assert_eq!(row.collapsed, Some(Collapsed::Unread { over_bytes: max }));
+        assert!(row.baseline.is_none() && row.current.is_none());
+        assert!(row.hunks.is_empty());
+        assert_eq!((row.added, row.deleted), (0, 0));
+        assert_eq!(
+            row.flags
+                .iter()
+                .map(|f| f.note.as_str())
+                .collect::<Vec<_>>(),
+            vec!["agent says look"],
+            "the flag is on the row, not stranded in the ledger"
+        );
+        assert!(
+            unread_notices(&out).is_empty(),
+            "a row is not counted, so the notice stays at zero"
+        );
+
+        // An unflagged file of the same size next to it is the counted case.
+        w.write("big.bin", max as usize);
+        let out = w.scan(&DraftScope::plain(max));
+        assert_eq!(row_paths(&out), vec!["newf.txt".to_owned()]);
+        assert_eq!(unread_notices(&out), vec!["1 file over 1 KiB not read"]);
     }
 
     /// The scope filter runs over every candidate list, whichever one named the path: a

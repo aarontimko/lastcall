@@ -477,6 +477,27 @@ impl Ops<'_> {
     }
 
     fn set_override(&mut self, key: &str, blob: Option<Oid>, mode: Option<Mode>) {
+        self.set_override_with(key, blob, mode, false);
+    }
+
+    /// Record the path as gone from the record even when the record held nothing at it.
+    ///
+    /// Accepting an unread row is the reader's decision to let the path go, and it is the
+    /// one release that must survive the "same as the tree" collapse below: a folder that
+    /// never recorded the file has no tree entry to compare against, and collapsing the
+    /// release to "no override" would leave a flag-only override, which the size rule reads
+    /// as *the record holds it* and would put the row straight back (verifier F1).
+    fn set_override_released(&mut self, key: &str) {
+        self.set_override_with(key, None, None, true);
+    }
+
+    fn set_override_with(
+        &mut self,
+        key: &str,
+        blob: Option<Oid>,
+        mode: Option<Mode>,
+        released: bool,
+    ) {
         let prior = self.ledger.overrides.get(key).cloned();
         if let Some(p) = &mut self.pending_undo {
             // First touch only: an op that sets the same path twice still has one baseline.
@@ -484,11 +505,12 @@ impl Ops<'_> {
         }
         let path = key.as_bytes();
         let tree = self.tree_entry(path);
-        let equals_tree = match (&blob, &tree) {
-            (Some(b), Some(t)) => *b == t.oid && mode.is_none_or(|m| m == t.mode),
-            (None, None) => true,
-            _ => false,
-        };
+        let equals_tree = !released
+            && match (&blob, &tree) {
+                (Some(b), Some(t)) => *b == t.oid && mode.is_none_or(|m| m == t.mode),
+                (None, None) => true,
+                _ => false,
+            };
         let now = self.clock.now_iso8601();
         let entry = self
             .ledger
@@ -767,7 +789,7 @@ impl Ops<'_> {
             // on disk untouched. No content CAS, because there is no content on this
             // side — not reading it is the point.
             self.begin_undo(UndoOp::AcceptFile);
-            self.set_override(&key, None, None);
+            self.set_override_released(&key);
             return Ok(());
         }
         if rendered.oid.is_none() {

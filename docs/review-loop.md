@@ -158,7 +158,9 @@ Inside a watched folder the size limit decides what is read rather than what is 
 file at or over the limit is never opened, so nothing large is hashed to produce a diff. One
 the folder has recorded before keeps its row when it changes and reads `not read (over
 512 KiB)`, with no diff and no counts; `a` accepts it like any other row, and `z` puts it
-back. The rest are counted in a single line, `3 files over 512 KiB not read`, instead of a
+back. A file the folder has never recorded keeps its row the same way once it carries a
+flag, so flagging something is enough to keep it in front of you however large it grows.
+The rest are counted in a single line, `3 files over 512 KiB not read`, instead of a
 row each.
 
 ## 3. Accept

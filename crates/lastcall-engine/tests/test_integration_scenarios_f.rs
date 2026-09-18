@@ -606,6 +606,87 @@ fn scenario_f6_a_record_that_already_holds_a_large_file() {
     );
 }
 
+/// Verifier F1: a file the folder has never recorded but the reader has flagged keeps its
+/// row when it grows past the limit. Accepting it lets the path go (counted from then on,
+/// the note kept on the override); undo brings the row back.
+#[test]
+fn scenario_f6_a_flagged_new_file_that_grows() {
+    let max = Config::default().collapse_size_bytes as usize;
+    let repo = f_repo("repo1", true);
+    let mut s = Fresh::over(
+        repo,
+        draft_config(&["z_ignore"]),
+        EngineOptions::default(),
+        true,
+    );
+    let draft = std::fs::canonicalize(s.repo.path().join("z_ignore")).unwrap();
+    s.repo.write("z_ignore/newf.txt", "new\n");
+    let pile = assert_pile!(s.engine, draft, "newf.txt", "F1 a new file");
+    assert_eq!(
+        pile.row(b"newf.txt").unwrap().change,
+        lastcall_engine::scan::Change::Added
+    );
+    assert!(
+        s.engine
+            .ops(&draft)
+            .unwrap()
+            .flag(b"newf.txt", "agent says look", None, None, &NoFault)
+            .unwrap()
+            .ok()
+    );
+
+    // It grows past the limit. The content is never read, and the row stays with its note.
+    s.repo.write("z_ignore/newf.txt", vec![b'x'; max]);
+    let pile = assert_pile!(s.engine, draft, "newf.txt", "F1 the flagged file grew");
+    let row = pile.row(b"newf.txt").unwrap();
+    assert_eq!(
+        row.change,
+        lastcall_engine::scan::Change::Added,
+        "F1: the record holds no content for it"
+    );
+    assert!(matches!(
+        row.collapsed,
+        Some(lastcall_engine::scan::Collapsed::Unread { .. })
+    ));
+    assert!(row.baseline.is_none() && row.current.is_none());
+    assert_eq!(
+        row.flags.len(),
+        1,
+        "F1: the note is on the row, not stranded in the ledger"
+    );
+    assert!(
+        notices_about(&pile, "not read").is_empty(),
+        "F1: a row is not counted"
+    );
+    let grown_oid = s.repo.git(&["hash-object", "z_ignore/newf.txt"]).unwrap();
+    let grown_oid = lastcall_engine::git::Oid::parse(grown_oid.trim()).unwrap();
+    assert!(
+        !s.engine.root(&draft).unwrap().store.exists(&grown_oid),
+        "F1: still never read"
+    );
+
+    // Accepting it lets the path go: counted from then on, and the note is kept.
+    assert!(accept_file(&mut s, &draft, "newf.txt").ok());
+    let pile = assert_pile!(s.engine, draft, "", "F1 accepted");
+    assert_eq!(
+        notices_about(&pile, "not read"),
+        vec!["1 file over 512 KiB not read"]
+    );
+    assert_eq!(
+        s.engine.root(&draft).unwrap().ledger.overrides["newf.txt"]
+            .flags
+            .len(),
+        1,
+        "F1: accepting a row never drops the reader's note"
+    );
+
+    // And undo puts the row back, note and all.
+    assert!(s.engine.ops(&draft).unwrap().undo(&NoFault).unwrap().ok());
+    let pile = assert_pile!(s.engine, draft, "newf.txt", "F1 undo");
+    assert_eq!(pile.row(b"newf.txt").unwrap().flags.len(), 1);
+    assert!(notices_about(&pile, "not read").is_empty());
+}
+
 #[test]
 fn scenario_f7_scope_change_trims_and_widens() {
     let repo = f_repo("repo1", true);
