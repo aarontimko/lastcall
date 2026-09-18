@@ -709,7 +709,12 @@ fn spawn_input(
 }
 
 fn root_metas(engine: &Engine) -> Vec<RootMeta> {
-    engine.roots().iter().map(|r| RootMeta::of(r)).collect()
+    let home = engine.home_shown().map(std::path::Path::to_path_buf);
+    engine
+        .roots()
+        .iter()
+        .map(|r| RootMeta::of(r, home.as_deref()))
+        .collect()
 }
 
 /// `Effect::Refresh`: scan every root off the UI task, one `Local::Pile` per root, then

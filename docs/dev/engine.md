@@ -272,8 +272,14 @@ directory is also asked for its worktrees, one `git worktree list` per repositor
 on top of the badge pass's `rev-parse`, so a parent of a hundred clones pays a hundred more
 git processes each time. Discovery runs at open and again on the watcher's
 30-second backstop, under the engine lock, so depth 3 or 4 wants a narrow `parent_dirs` and
-not a home directory. The draft-glob walk (`matching_dirs`) is a separate walk and is
-unchanged.
+not a home directory. The draft-glob walk (`matching_dirs`) is a separate walk, and since
+Phase 12 it is bounded by the entry: below each base it reads exactly as many levels as the
+pattern has components (`z_ignore` one, `z_ignore/research` two), so `search_depth` is not
+what makes it deep and a wide tree under every repository is not re-read on every tick. Only
+an entry with a `**` *component* walks to `MAX_SEARCH_DEPTH`; the `/**` suffix is a scope
+switch, not a component. The matcher is built with `literal_separator(true)`, so one
+component is one level and `*` cannot cross `/`. An entry of five or more components, or a
+bare `**`, is a `validate` error rather than a silent no-match.
 
 **Changing it while running.** `Engine::set_search_depth(depth)` clamps to `1..=4` and sets
 the value the next `rescan` uses; it discovers nothing by itself. The TUI pairs it with
@@ -300,10 +306,71 @@ draft root nested inside a repo (a gitignored `_drafts/`) is the interesting cas
 scan drops `others` entries under it (pipeline step 3) so one edit is one row, in the draft
 root, once.
 
+**What a watched folder covers (Phase 12).** `DiscoveredRoot` carries a `DraftScope`,
+re-evaluated at every discovery (open and each rescan) and carried onto an already-open
+root. A plain entry is non-recursive: the regular files and symlinks directly inside the
+directory, and `DraftScope::admits_shape` is the whole test (no `/` in the root-relative
+path). A `/**` entry is recursive: the tree below the directory, minus `.git`, minus nested
+repositories, minus what any draft root inside it reads. Two entries matching one directory
+merge and the wider one wins, whatever order they were written in. A scope change is never a
+first sight: the ledger is kept, and the trim below brings it into line.
+
+**The exclusion rule is a pair, not a prefix.** `excluded_dirs` is a list of
+`(dir, recursive)` and `store::under_excluded` reads the flag: a recursive inner root takes
+the whole directory from its enclosing root, a plain one takes only that directory's direct
+files, so a file below a plain inner folder is still reviewed by the enclosing root rather
+than by nobody. The watcher's `classify_path` still routes by the longest root prefix, so an
+event under the inner folder wakes the inner root even when the file belongs to the outer
+one; the 30-second backstop marks every root due, so that costs latency and never hides a
+change.
+
+**Size decides what is read, never what is listed.** Inside a scope, `DraftScope::too_big`
+reads the `symlink_metadata` size (never following a link, so a symlink's own size is its
+link text and is always read) and a file at or above `collapse_size_bytes` is never hashed,
+never copied into the store and never written into a first-sight tree. A path the record
+does not hold is only counted, and the root gets one notice per scan,
+`1 file over 512 KiB not read`, which replaces the previous scan's instead of accumulating.
+A path the record does hold keeps its row when it changes:
+`Collapsed::Unread { over_bytes }`, no current side and no hunks, rendered as
+`not read (over 512 KiB)`. Accepting it writes a `Remove` for the path, after which it is a
+never-recorded large file, silent and counted; undo restores the entry and the row. A row is
+never also counted, and a file that shrinks below the limit is read again.
+
+**The `lstat` pass, and where it has to sit.** The size filter has to run *before* the row
+cap, or a file the folder is not reading would take one of the 10,000 rows, so a draft scan
+pays one `symlink_metadata` per candidate ahead of the cap. The answers are handed down to
+`Store::hash_paths_with`, so the syscall is paid once per candidate per scan rather than
+twice: a root with 100,000 changed paths pays 100,000 of them, tens of milliseconds warm. A
+candidate with nothing at it is a deletion, never a large file. Git roots pay none of this;
+`ScanInputs::scope` is `None` for them and the candidates pass straight through.
+
+**The trim is what bounds the listing.** A record written under a wider scope is valid, and
+its out-of-scope paths are never candidates whatever list names them (the scope filter sits
+after all three candidate sources). `Ops::trim` drops them, by path shape only and never by
+size, through the same private `fold` that compaction uses: lock, merge, tmp and rename, one
+`Remove` per path, no undo entry and `seen_at` untouched. Flag-only overrides on dropped
+paths are kept, since they are the user's own notes, are not candidates after the filter,
+and return with the path if the scope widens later. A release with a note on it is kept
+whole for the same reason a fold keeps one: the trim runs through `fold`, so the `null`
+stays beside the note and the path the reader let go does not come back as a row when the
+scope widens again. One notice says how many went. Keeping
+them instead would not be neutral: `ls-files --others --directory` descends into any
+directory that still has index entries beneath it, so the private index has to stop carrying
+them for the listing to stay cheap.
+
+**One `read_dir` for a plain folder.** `Index::others_args` adds `--directory` for a
+non-recursive scope, so git answers with the folder names it finds instead of opening them,
+and deliberately never `--no-empty-directory`, which is the flag that would send it inside
+each one to see whether it is empty. Under `--directory` git names an ordinary folder
+exactly as it names another repository, so `others` asks each reported folder for a `.git`
+entry of either shape before calling it a nested repo; an `lstat` that fails for any reason
+other than "not there" answers yes, which leaves the folder alone.
+
 **A collapsed row is one accept, not a diff.** `render_content` (step 7) runs a ladder and
 returns *before* hunks are computed: `collapsed_globs` (the nine common lockfiles by
 default) → binary (a NUL byte in the first 8,000 of either side) → size (either side
-**strictly larger** than `collapse_size_bytes`, default 512 KiB). The row carries its
+**at or above** `collapse_size_bytes`, default 512 KiB, which is what `config.md` has said
+since Phase 3). The row carries its
 `+added −removed` counts and a `Collapsed` tag, no `Hunk`s, and a mode-only change never
 synthesises one on a collapsed row (the early return is above that synthesis). Accepting is
 whole-row by construction: there is no hunk to point `a` at.
@@ -728,6 +795,15 @@ F1):
 - a `null` on a path the tree does **not** have drops the override, so the path resolves to
   `Empty` again and a later `shift-u` writes a zero-byte file instead of unlinking the
   user's first-sight draft (Phase 7's F17 rule).
+
+One baseline the tree cannot answer for, so the record carries it: inside a watched folder a
+`null` with a note on a path the tree does not have is a **release**, the shape a fold keeps,
+and the third rule above would collapse it to the note alone, which the size rule reads as
+*the record holds this path* and the accepted row would be back. `UndoPath` therefore has
+`released`, set when the override the op replaced was one a fold would have kept, and the
+undo of such a path replays through `set_override_released`. A repository writes it never,
+the field is omitted unless it is true, and an entry written before it existed loads as
+`false`, so no record on disk changes shape.
 
 Flags survive an undo and `updated_at` is stamped by `set_override` itself. There is no live
 CAS: a file that moved since the accept is exactly what the user wants back on screen. An

@@ -248,6 +248,29 @@ hooks-install:
     @echo "hooks installed: core.hooksPath=.githooks (pre-commit, pre-push)"
 
 # ---------------------------------------------------------------------------------------
+# Merging and releasing (scripts/release.py has the detail; docs/dev/operations.md the
+# procedure). `merge` and `release-tag` send to GitHub and are the maintainer's: they refuse
+# inside an agent's shell. RELEASE_DRY_RUN=1 in front of any of the three runs the checks
+# and prints what it would send.
+#
+#   a change:   push the branch, open its pull request  ->  just merge
+#   a release:  just release-prep 0.4.0  ->  push, pull request  ->  just merge
+#               ->  just release-tag
+# ---------------------------------------------------------------------------------------
+
+# From an up-to-date main: the release branch and its one five-file commit. Pushes nothing.
+release-prep VERSION:
+    python3 scripts/release.py prep {{quote(VERSION)}}
+
+# This branch's pull request, or the numbered one: required checks, one yes, merge, main pulled.
+merge NUMBER="":
+    python3 scripts/release.py merge {{quote(NUMBER)}}
+
+# On the merged main: the checks release.yml would fail on later, one yes, the tag, its push.
+release-tag:
+    python3 scripts/release.py tag
+
+# ---------------------------------------------------------------------------------------
 # Probes and demos (built-artifact passes exercise the release binary)
 # ---------------------------------------------------------------------------------------
 

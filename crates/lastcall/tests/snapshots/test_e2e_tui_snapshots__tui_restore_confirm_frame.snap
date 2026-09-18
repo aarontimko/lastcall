@@ -16,7 +16,7 @@ expression: frame
 "│  A u2  +2 −0  [mixed]    │                                                                       │"
 "│  upstream · 1 file       │    ┌ restore ────────────────────────┐                                │"
 "│──────────────────────────│    │ Restore f1 · 1 hunk?            │                                │"
-"│notes                     │    │                                 │                                │"
+"│W/notes                   │    │                                 │                                │"
 "│  draft · 1 file          │    │ y / ⏎ confirm    n / Esc cancel │                                │"
 "│  M n2.md  +2 −0          │    └─────────────────────────────────┘                                │"
 "│                          │                                                                       │"

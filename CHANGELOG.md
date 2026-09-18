@@ -5,6 +5,43 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html). A version's s
 exactly what its GitHub release notes carry, so it is written for the people installing the
 binary rather than for the commit log.
 
+## Unreleased
+
+### Changed
+
+- **A plain `draft_dirs` entry now reviews the files in that folder only; add `/**` to review
+  the folder and everything below it.** A watched folder that has grown a deep tree of
+  scratch files no longer puts the whole of it on your screen. A record written by an earlier
+  version is trimmed to the folder at the next scan, with the notice `N paths outside the
+  root's scope dropped from its record`; widening the entry again brings those files back as
+  new.
+- **Watched folders no longer read files of `collapse_size_bytes` (512 KiB by default) and
+  larger.** Nothing that big is opened, so a captured archive or a model file cannot turn
+  into a screenful of diff. A file lastcall had already recorded still shows once when it
+  changes, as a row reading `not read (over 512 KiB)` that you accept like any other; the
+  rest are counted in a single line, `3 files over 512 KiB not read`.
+- `*` in a `draft_dirs` entry no longer matches across `/`, so `notes/*` means the folders
+  directly inside `notes` and nothing deeper. A `**` component still reaches further.
+- A `draft_dirs` entry a 0.3.0 binary accepted is now refused at start, with a message naming
+  the entry: `**` or `/**` on its own, which would have watched every folder under a parent
+  directory, and a relative entry more than four folders below one, which is deeper than the
+  search ever looks. Name the folder instead (`notes`, `notes/**`) or give the pattern a fixed
+  part (`*_drafts`, `**/notes`).
+
+### Added
+
+- `draft_dir_parents` says how many parent folder names a watched folder carries in the list,
+  one by default, so two folders of the same name are told apart: `repo/z_ignore` rather than
+  `z_ignore`. `0` is the folder's path relative to where it was found, which is the bare name
+  for an entry such as `notes` and `a/notes` for one such as `*/notes`; up to `4` for more.
+- Selecting a repository's or a folder's own row shows where it is, on a dim second line
+  above the pane, with your home directory written as `~`.
+
+### Fixed
+
+- Files of exactly `collapse_size_bytes` collapse, as the docs said. Until now the limit
+  itself was read as an ordinary diff.
+
 ## 0.3.0 - 2026-09-17
 
 ### Changed

@@ -4,9 +4,9 @@ expression: frame
 ---
 "lastcall  1 repo · 3 files · 5 hunks  herdr 0.8.2  [Accept All]                           watching W"
 "┌──────────────────────────┬───────────────────────────────────────────────────────────────────────┐"
-"│alpha                     │notes  draft · 1 file                                                  │"
-"│  main · 3 files          │  M n2.md  +2 −0                                                       │"
-"│  M f1  +1 −1             │                                                                       │"
+"│alpha                     │W/notes  draft · 1 file                                                │"
+"│  main · 3 files          │~/W/notes                                                              │"
+"│  M f1  +1 −1             │  M n2.md  +2 −0                                                       │"
 "│  M f2  +1 −0             │                                                                       │"
 "│  M parse.rs  +10 −2      │                                                                       │"
 "│                          │                                                                       │"

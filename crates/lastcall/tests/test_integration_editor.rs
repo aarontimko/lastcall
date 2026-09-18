@@ -89,7 +89,8 @@ fn editor_launch_lands_at_the_right_line() {
     let w = TempDir::new("lc-edit-w");
     let state = TempDir::new("lc-edit-state");
     let parent = w.join("W");
-    let built = fixture_parent::build(&parent, state.path()).expect("fixture builds");
+    let built =
+        fixture_parent::build(&parent, state.path(), &state.join("home")).expect("fixture builds");
     let config = state.join("config.toml");
     fixture_parent::write_config(&config, &parent).expect("config written");
 

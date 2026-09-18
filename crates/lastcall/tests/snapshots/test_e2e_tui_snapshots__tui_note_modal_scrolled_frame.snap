@@ -16,7 +16,7 @@ expression: frame
 "│  A u2  +2 −0  [mix│                                                          │                   │"
 "│  upstream · 1 file│ note line 3                                              │                   │"
 "│───────────────────│ note line 4                                              │                   │"
-"│notes              │ note line 5                                              │                   │"
+"│W/notes            │ note line 5                                              │                   │"
 "│  draft · 1 file   │ note line 6                                              │                   │"
 "│  M n2.md  +2 −0   │ note line 7▌                                             │                   │"
 "│                   │                                                          │                   │"

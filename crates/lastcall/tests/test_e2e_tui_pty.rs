@@ -147,7 +147,7 @@ impl Fixture {
         let w = TempDir::new("lc-pty-w");
         let state = TempDir::new("lc-pty-state");
         let parent = w.join("W");
-        let built = fixture_parent::build(&parent, state.path()).expect("fixture builds");
+        let built = fixture_parent::build(&parent, state.path(), w.path()).expect("fixture builds");
         let config = state.join("config.toml");
         fixture_parent::write_config(&config, &parent).expect("config written");
         Fixture {
@@ -170,7 +170,7 @@ impl Fixture {
         let w = TempDir::new("lc-pty-w");
         let state = TempDir::new("lc-pty-state");
         let parent = w.join("W");
-        let built = fixture_parent::build(&parent, state.path()).expect("fixture builds");
+        let built = fixture_parent::build(&parent, state.path(), w.path()).expect("fixture builds");
         let drafts = fixture_parent::add_draft_root(&built, state.path(), baseline)
             .expect("the scene's fourth root");
         let config = state.join("config.toml");
@@ -991,7 +991,7 @@ fn pty_accept_loop_and_restart() {
 /// §6.7 (Amendment v1.9), deliverable 2, through the real binary: `t` names its own
 /// inverse on the hint line; accepting a repo's last file lands the cursor on the repo's
 /// **own name row** — the repo is still on the nav, now a name-and-branch row with nothing
-/// under it, and the pane reads `nothing pending in notes`; `t` then hides it and `t`
+/// under it, and the pane reads `nothing pending in W/notes`; `t` then hides it and `t`
 /// brings it back.
 ///
 /// Two things shape the order. The bottom row is the **status** line while a status is
@@ -1035,7 +1035,7 @@ fn pty_accept_last_file_lands_on_the_repo_row_then_t_hides_it() {
     pty.send(b"A").expect("A");
     pty.wait_for(OVERLOADED, |s| {
         let t = s.contents();
-        status_is(s, "accepted n2.md") && t.contains("nothing pending in notes")
+        status_is(s, "accepted n2.md") && t.contains("nothing pending in W/notes")
     })
     .unwrap_or_else(|e| {
         panic!(
@@ -1048,7 +1048,7 @@ fn pty_accept_last_file_lands_on_the_repo_row_then_t_hides_it() {
     assert!(!text.contains("M n2.md"), "the file row is gone: {text}");
     assert!(text.contains("3 repos · 5 files"), "{text}");
     let row = pty
-        .find_row(|r| r.starts_with("\u{2502}notes"))
+        .find_row(|r| r.starts_with("\u{2502}W/notes"))
         .unwrap_or_else(|| panic!("notes is still on the nav:\n{text}"));
     assert!(
         pty.inverse_at(row, 1),
@@ -1059,14 +1059,14 @@ fn pty_accept_last_file_lands_on_the_repo_row_then_t_hides_it() {
     pty.send(b"t").expect("t");
     pty.wait_for(Duration::from_secs(5), |s| {
         let t = s.contents();
-        !t.contains("notes") && t.contains("2 repos · 5 files")
+        !t.contains("W/notes") && t.contains("2 repos · 5 files")
     })
     .unwrap_or_else(|e| panic!("`t` hides the empty repo: {e}\n{}", pty.screen_text()));
 
     pty.send(b"t").expect("t again");
     pty.wait_for(Duration::from_secs(5), |s| {
         let t = s.contents();
-        t.contains("notes") && t.contains("3 repos · 5 files")
+        t.contains("W/notes") && t.contains("3 repos · 5 files")
     })
     .unwrap_or_else(|e| panic!("`t` brings it back: {e}\n{}", pty.screen_text()));
 
@@ -1356,8 +1356,8 @@ fn pty_draft_root_hunk_accept_and_restart() {
     );
     let text = pty.screen_text();
     assert!(
-        text.contains("_drafts"),
-        "the draft root is in the nav:\n{text}"
+        text.contains("alpha/_drafts"),
+        "the draft root is in the nav, named below its repository:\n{text}"
     );
     assert!(
         text.contains("draft · 1 file"),
@@ -4136,7 +4136,7 @@ fn pty_herdr_scope_toggle_and_the_agent_picker() {
     pty.send(b"w").expect("w");
     pty.wait_for(Duration::from_secs(5), |s| {
         let text = s.contents();
-        text.contains("3 repos · ") && text.contains("beta") && text.contains("notes")
+        text.contains("3 repos · ") && text.contains("beta") && text.contains("W/notes")
     })
     .unwrap_or_else(|e| panic!("`w` shows every repo: {e}\n{}", pty.screen_text()));
     pty.send(b"w").expect("w back");
@@ -4235,7 +4235,7 @@ fn pty_undo_file() {
     select_until(&mut pty, "n2.md  M ");
     pty.send(b"A").expect("A");
     pty.wait_for(OVERLOADED, |s| {
-        status_is(s, "accepted n2.md") && s.contents().contains("nothing pending in notes")
+        status_is(s, "accepted n2.md") && s.contents().contains("nothing pending in W/notes")
     })
     .unwrap_or_else(|e| panic!("the accept: {e}\n{}", pty.screen_text()));
     assert_eq!(undo_depth(&fx, "notes"), 1, "one entry on disk");
@@ -4269,7 +4269,7 @@ fn pty_undo_file() {
     // A second `z` has nothing left, and says so rather than reaching further back.
     pty.send(b"z").expect("z again");
     pty.wait_for(Duration::from_secs(5), |s| {
-        status_is(s, "nothing to undo in notes")
+        status_is(s, "nothing to undo in W/notes")
     })
     .unwrap_or_else(|e| panic!("the empty stack: {e}\n{}", pty.screen_text()));
 

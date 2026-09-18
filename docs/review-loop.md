@@ -39,7 +39,7 @@ discovered 3 repos, checking status…
 
 ✓ alpha  main
   beta  main
-  notes  draft
+  W/notes  draft
 
 1 of 3 checked · 4 files pending so far · 3s
 ```
@@ -70,7 +70,7 @@ lastcall  3 repos · 6 files · 8 hunks  standalone  [Accept All]               
 │  A u2  +2 −0  [mixed]    │                                                                       │
 │  upstream · 1 file       │                                                                       │
 │──────────────────────────│                                                                       │
-│notes                     │                                                                       │
+│W/notes                   │                                                                       │
 │  draft · 1 file          │                                                                       │
 │  M n2.md  +2 −0          │                                                                       │
 └──────────────────────────┴───────────────────────────────────────────────────────────────────────┘
@@ -85,6 +85,17 @@ Two labels are worth knowing on sight. **`[upstream]`** means every line in that
 arrived from a fetch, so it is somebody else's work and not the agent's. **`[mixed]`**
 means some of it did and some of it did not. They are a hint about who to ask, not a
 restriction: the keys all work the same.
+
+A watched folder that is not a repository carries the folder above it in its name, so the
+`W/notes` row says which `notes` it is when more than one is being watched. Selecting that
+row puts the folder's own location on a dim second line under the name, with your home
+directory written as `~`. How many parent folders a name carries is `draft_dir_parents` in
+[`config.md`](config.md); a repository keeps its own directory name either way.
+
+What such a folder covers is the entry that matched it. `notes` is the files in `notes/`
+and nothing below it, and `notes/**` is the folder and everything below it. Work outside
+that is left alone and never listed, so a deep scratch folder cannot fill the pane with
+rows nobody asked to review.
 
 `↑` and `↓` move one entry at a time. `Home` and `End` (Fn-Left and Fn-Right on a Mac laptop
 keyboard) jump to the first and the last entry of the whole list, and `{` and `}` jump to the previous and the next repository's own row,
@@ -122,7 +133,7 @@ lastcall  3 repos · 4 files · 6 hunks  standalone  [Accept All]               
 │  A u2  +2 −0  [mixed]    │ line 46                                                               │
 │  upstream · 1 file       │ line 47                                                               │
 │──────────────────────────│ line 48                                                               │
-│notes                     │                                                                       │
+│W/notes                   │                                                                       │
 │  draft · 1 file          │@@ -75,6 +75,6 @@                       [a accept] [u restore] [m flag]│
 │  M n2.md  +2 −0          │ line 75                                                               │
 │                          │ line 76                                                               │
@@ -142,6 +153,15 @@ A lockfile, a file over 512 KiB, or anything with a NUL byte early in it appears
 single collapsed row saying how big it is rather than a screenful of noise. `e` expands it
 into real hunks if you actually want to look. Which files collapse is configurable:
 [`config.md`](config.md).
+
+Inside a watched folder the size limit decides what is read rather than what is listed. A
+file at or over the limit is never opened, so nothing large is hashed to produce a diff. One
+the folder has recorded before keeps its row when it changes and reads `not read (over
+512 KiB)`, with no diff and no counts; `a` accepts it like any other row, and `z` puts it
+back. A file the folder has never recorded keeps its row the same way once it carries a
+flag, so flagging something is enough to keep it in front of you however large it grows.
+The rest are counted in a single line, `3 files over 512 KiB not read`, instead of a
+row each.
 
 ## 3. Accept
 
@@ -183,7 +203,7 @@ in the program, the file form asks:
 ```text
 │  upstream · 1 file       │    ┌ restore ────────────────────────┐                                │
 │──────────────────────────│    │ Restore f1 · 1 hunk?            │                                │
-│notes                     │    │                                 │                                │
+│W/notes                   │    │                                 │                                │
 │  draft · 1 file          │    │ y / ⏎ confirm    n / Esc cancel │                                │
 │  M n2.md  +2 −0          │    └─────────────────────────────────┘                                │
 ```
@@ -204,7 +224,9 @@ Three things to know:
   holding open in a merge conflict, and one whose bytes git's own filters do not reproduce
   exactly (a line-ending conversion or a clean filter that is not round trip safe) are all
   refused rather than written over. The status line names the file and the reason, and the
-  row stays where it was.
+  row stays where it was. A row the folder never read is one of those refusals: there is
+  nothing recorded to put back, so it is not asked about at all and the status line says
+  `not read; restore is not offered`.
 
 ## 5. Flag
 
@@ -216,7 +238,7 @@ When a change is wrong, `m` opens a note on the hunk:
 │  A u2  +2 −0  [mix│                                                          │                   │
 │  upstream · 1 file│ this rewrite loses the guard                             │                   │
 │───────────────────│ why?▌                                                    │                   │
-│notes              │                                                          │                   │
+│W/notes            │                                                          │                   │
 │  draft · 1 file   │                                                          │                   │
 │  M n2.md  +2 −0   │                                                          │                   │
 │                   │                                                          │                   │
@@ -257,7 +279,7 @@ editing src/parse.rs · line 21/62
 │  A u2  +2 −0  [mixed]    │  10     pub line: usize,                                              │
 │  upstream · 1 file       │  11 }                                                                 │
 │──────────────────────────│  12                                                                   │
-│notes                     │  13 /// Parse `text` into one record per `key = value` line.          │
+│W/notes                   │  13 /// Parse `text` into one record per `key = value` line.          │
 │  draft · 1 file          │  14 ///                                                               │
 │  M n2.md  +2 −0          │  15 /// Blank lines and `#` comments are skipped. A line without a `=→│
 │                          │  16 /// error: it is simply not a record, which keeps the parser tota→│
@@ -294,7 +316,7 @@ the file.
 
 ```text
 │──────────────────────────│@@ -51,4 +53,10 @@                      [a accept] [u restore] [m flag]│
-│notes                     │         assert_eq!(recor copied to clipboard                          │
+│W/notes                   │         assert_eq!(recor copied to clipboard                          │
 │  draft · 1 file          │         assert_eq!(records[0].line, 3);                               │
 ```
 

@@ -317,8 +317,13 @@ fn edit(path: &Path, contents: &str) -> std::io::Result<()> {
 }
 
 /// Build the fixture under `parent` (created if missing) with the engine's state in
-/// `state_dir`. `parent` is never removed by this crate.
-pub fn build(parent: &Path, state_dir: &Path) -> Result<Built, GitError> {
+/// `state_dir` and `HOME` at `home`. `parent` is never removed by this crate.
+///
+/// `home` is a parameter because a scene that renders a path wants the paths it shows to
+/// sit below the home it isolates: a scene passing the temp dir that holds `parent` gets
+/// `~/W/…`, while one that wants the home out of the way passes `state_dir.join("home")`.
+/// Nothing is created there; the engine's environment is what reads it.
+pub fn build(parent: &Path, state_dir: &Path, home: &Path) -> Result<Built, GitError> {
     let mut alpha = FixtureRepo::new_in(TempDir::adopt(parent), "alpha")?;
     let mut beta = FixtureRepo::new_in(TempDir::adopt(parent), "beta")?;
     let notes = parent.join(DRAFT_DIR);
@@ -340,7 +345,7 @@ pub fn build(parent: &Path, state_dir: &Path) -> Result<Built, GitError> {
     alpha.commit("add the config parser")?;
 
     // First sight of all three roots, before any history operation.
-    let home = state_dir.join("home");
+    let home = home.to_path_buf();
     let env = engine_env_for(parent, &home, state_dir);
     let mut engine = open_engine(parent, &env, state_dir, config());
     let roots = engine.scan_all();

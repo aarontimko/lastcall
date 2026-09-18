@@ -90,6 +90,15 @@ impl Fresh {
         );
     }
 
+    /// `lc_restart` with a different configuration: what a user editing the config file
+    /// and starting the tool again does. There is no reload seam, so this is the only way
+    /// a scope change reaches an open root, and `restart` on its own reuses the stored
+    /// configuration (`over` would build a new state dir and lose the record).
+    pub fn restart_with(&mut self, config: Config) {
+        self.config = config;
+        self.restart();
+    }
+
     pub fn scan(&mut self) -> Pile {
         self.engine.scan(&self.root).expect("scan")
     }

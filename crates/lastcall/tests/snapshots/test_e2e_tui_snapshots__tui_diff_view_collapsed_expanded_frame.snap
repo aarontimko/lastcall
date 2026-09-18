@@ -14,7 +14,7 @@ expression: frame
 "│  A u2  +2 −0  [mixed]    │-    "pkg-4": { "version": "1.0.4" },                                  │"
 "│  upstream · 1 file       │-    "pkg-5": { "version": "1.0.5" },                                  │"
 "│──────────────────────────│-    "pkg-6": { "version": "1.0.6" },                                  │"
-"│notes                     │-    "pkg-7": { "version": "1.0.7" },                                  │"
+"│W/notes                   │-    "pkg-7": { "version": "1.0.7" },                                  │"
 "│  draft · 1 file          │-    "pkg-8": { "version": "1.0.8" },                                  │"
 "│  M n2.md  +2 −0          │-    "pkg-9": { "version": "1.0.9" },                                  │"
 "│                          │-    "pkg-10": { "version": "1.0.10" },                                │"

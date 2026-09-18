@@ -376,4 +376,113 @@ S="$W/notes.state"; mkdir -p "$S"; lc_init "$W/notes" "$S" draft; lc_first_sight
 echo changed > "$W/notes/n2.md"; echo new > "$W/notes/n9.md"; assert_pile "F3 draft edits pending" "n2.md|n9.md"; lc_accept_all; assert_pile "F3 accept all" ""
 LC_DRAFT_INITIAL=pending; S="$W/notes2.state"; mkdir -p "$S" "$W/notes2"; echo a > "$W/notes2/a"; lc_init "$W/notes2" "$S" draft; lc_first_sight; assert_pile "F2 draft_initial=pending" "a"; unset LC_DRAFT_INITIAL
 
+# F4: a plain entry covers the folder's own files. What is below it is not the folder's,
+# whether it is edited, added or deleted.
+mkdir -p "$W/plain/sub/deeper"
+echo a > "$W/plain/a.md"; echo b > "$W/plain/sub/b.md"; echo c > "$W/plain/sub/deeper/c.md"
+S="$W/plain.state"; mkdir -p "$S"; lc_init "$W/plain" "$S" draft plain; lc_first_sight
+assert_str "F4 first sight records the folder's own files" "a.md" "$(lcg ls-tree -r --name-only "$(cat "$S/seen_tree")" | tr '\n' '|' | sed 's/|$//')"
+assert_pile "F4 plain first sight (seen)" ""
+echo a2 > "$W/plain/a.md"; echo b2 > "$W/plain/sub/b.md"
+assert_pile "F4 the folder's own file, not the one below it" "a.md"
+echo d > "$W/plain/sub/deeper/d.md"; assert_pile "F4 an add below is not a row" "a.md"
+rm "$W/plain/sub/b.md"; assert_pile "F4 a delete below is not a row" "a.md"
+lc_accept_file a.md; assert_pile "F4 accept" ""
+lc_restart; assert_pile "F4 restart" ""
+
+# F5: the same folder watched with `/**` covers its tree.
+mkdir -p "$W/tree/sub/deeper"
+echo a > "$W/tree/a.md"; echo b > "$W/tree/sub/b.md"; echo c > "$W/tree/sub/deeper/c.md"
+S="$W/tree.state"; mkdir -p "$S"; lc_init "$W/tree" "$S" draft tree; lc_first_sight
+assert_str "F5 first sight records the tree" "a.md|sub/b.md|sub/deeper/c.md" "$(lcg ls-tree -r --name-only "$(cat "$S/seen_tree")" | tr '\n' '|' | sed 's/|$//')"
+assert_pile "F5 tree first sight (seen)" ""
+echo a2 > "$W/tree/a.md"; echo b2 > "$W/tree/sub/b.md"
+assert_pile "F5 both edits are rows" "a.md|sub/b.md"
+echo d > "$W/tree/sub/deeper/d.md"; assert_pile "F5 an add below is a row" "a.md|sub/b.md|sub/deeper/d.md"
+rm "$W/tree/sub/deeper/c.md"; assert_pile "F5 a delete below is a row" "a.md|sub/b.md|sub/deeper/c.md|sub/deeper/d.md"
+# The reader's note on a path that stays in the record: a fold folds content, never notes.
+lc_flag sub/b.md "keep an eye on this"
+lc_accept_all; assert_pile "F5 accept all" ""
+assert_str "F5 an accept-all keeps the note" "keep an eye on this" "$(cat "$S/overrides/$(enc sub/b.md).flag" 2>/dev/null)"
+assert_pile "F5 and a note on its own is not a row" ""
+
+# F6: a file of the size limit or more is never read. Size decides what is read, never what
+# is listed: a path the record holds keeps its row when it changes.
+mkdir -p "$W/big"
+echo small > "$W/big/small.md"
+( cd "$W/big" && dd if=/dev/zero of=at_limit.bin bs=1024 count=512 2>/dev/null )
+( cd "$W/big" && dd if=/dev/zero of=under.bin bs=1 count=524287 2>/dev/null )
+S="$W/big.state"; mkdir -p "$S"; lc_init "$W/big" "$S" draft plain; lc_first_sight
+assert_str "F6 the file at the limit is not recorded" "small.md|under.bin" "$(lcg ls-tree -r --name-only "$(cat "$S/seen_tree")" | tr '\n' '|' | sed 's/|$//')"
+assert_pile "F6 first sight leaves it out, and not pending either" ""
+assert_str "F6 it is counted instead" "1" "$(lc_unread_count)"
+echo edit > "$W/big/small.md"; assert_pile "F6 a small file is a row as usual" "small.md"
+lc_accept_file small.md; assert_pile "F6 accept" ""
+# The recorded file grows past the limit: still a row, because the record holds it.
+( cd "$W/big" && dd if=/dev/zero of=under.bin bs=1024 count=512 2>/dev/null )
+assert_pile "F6 a recorded file that grew is still a row" "under.bin"
+assert_str "F6 a row is not counted" "1" "$(lc_unread_count)"
+lc_accept_unread under.bin; assert_pile "F6 accepting the row lets the path go" ""
+assert_str "F6 the record no longer holds it" "ABSENT" "$(lc_baseline under.bin)"
+assert_str "F6 and it is counted from then on" "2" "$(lc_unread_count)"
+# A file that shrinks below the limit is read again, as a new file.
+echo shrunk > "$W/big/at_limit.bin"; assert_pile "F6 a file that shrank is read again" "at_limit.bin"
+lc_accept_file at_limit.bin; assert_pile "F6 and accepted like any other" ""
+# A file the folder has never recorded, over the limit, with the reader's note on it: the
+# note keeps its row, and accepting the whole pile lets the path go with the note kept.
+# Every fold after that leaves the record where the accept put it (verifier G1, G2).
+( cd "$W/big" && dd if=/dev/zero of=newf.bin bs=1024 count=512 2>/dev/null )
+assert_str "F6 a new large file is counted, not listed" "2" "$(lc_unread_count)"
+lc_flag newf.bin "agent says look"
+assert_pile "F6 a flagged new large file is a row" "newf.bin"
+assert_str "F6 and a row is not counted" "1" "$(lc_unread_count)"
+lc_accept_all
+assert_pile "F6 accept-all lets the flagged row go" ""
+assert_str "F6 the record let the path go" "ABSENT" "$(lc_baseline newf.bin)"
+assert_str "F6 and it is counted from then on" "2" "$(lc_unread_count)"
+assert_str "F6 the note survived the fold" "agent says look" "$(cat "$S/overrides/$(enc newf.bin).flag" 2>/dev/null)"
+lc_accept_all   # the twin's compaction is the same fold with nothing pending
+assert_pile "F6 the row stays gone through a compaction" ""
+assert_str "F6 still counted after the compaction" "2" "$(lc_unread_count)"
+assert_str "F6 and the note is still there" "agent says look" "$(cat "$S/overrides/$(enc newf.bin).flag" 2>/dev/null)"
+
+# F7: narrowing the entry trims the record by shape, once, and never by size.
+mkdir -p "$W/trim/sub"
+echo a > "$W/trim/a.md"; echo b > "$W/trim/sub/b.md"
+S="$W/trim.state"; mkdir -p "$S"; lc_init "$W/trim" "$S" draft tree; lc_first_sight
+assert_str "F7 the tree was recorded" "a.md|sub/b.md" "$(lcg ls-tree -r --name-only "$(cat "$S/seen_tree")" | tr '\n' '|' | sed 's/|$//')"
+# The reader's note on the deep path: the trim drops what the record holds, never the note.
+lc_flag sub/b.md "check this"
+assert_str "F7 the note is on the deep path" "check this" "$(cat "$S/overrides/$(enc sub/b.md).flag" 2>/dev/null)"
+LC_SCOPE=plain
+assert_str "F7 the trim drops the paths the folder no longer covers" "1" "$(lc_scope_trim)"
+assert_str "F7 the record is the folder's own files" "a.md" "$(lcg ls-tree -r --name-only "$(cat "$S/seen_tree")" | tr '\n' '|' | sed 's/|$//')"
+assert_str "F7 the trim keeps the note" "check this" "$(cat "$S/overrides/$(enc sub/b.md).flag" 2>/dev/null)"
+assert_pile "F7 nothing pending after the trim" ""
+assert_str "F7 said once, not at every scan" "0" "$(lc_scope_trim)"
+LC_SCOPE=tree
+assert_pile "F7 widening brings the path back as pending, never hidden" "sub/b.md"
+assert_str "F7 and the note is on the row that came back" "check this" "$(cat "$S/overrides/$(enc sub/b.md).flag" 2>/dev/null)"
+
+# F7 again, over a path the reader let go: the trim is a fold, so a release with a note on it
+# is kept whole rather than counted and dropped. Were it dropped, the note would be all that
+# is left, the record would read as holding the path again, and widening the entry would put
+# the accepted row back (verifier H2).
+mkdir -p "$W/trimrel/sub"
+echo a > "$W/trimrel/a.md"; echo k > "$W/trimrel/sub/k.md"
+S="$W/trimrel.state"; mkdir -p "$S"; lc_init "$W/trimrel" "$S" draft tree; lc_first_sight
+( cd "$W/trimrel" && dd if=/dev/zero of=sub/big.bin bs=1024 count=512 2>/dev/null )
+lc_flag sub/big.bin "deep and large"
+assert_pile "F7 the flagged large file under the folder is a row" "sub/big.bin"
+lc_accept_unread sub/big.bin
+assert_pile "F7 accepting it lets the path go" ""
+assert_str "F7 the record let it go" "ABSENT" "$(lc_baseline sub/big.bin)"
+LC_SCOPE=plain
+assert_str "F7 the trim counts the recorded path only, never the release" "1" "$(lc_scope_trim)"
+assert_str "F7 the release is still a release after the trim" "null" "$(cat "$S/overrides/$(enc sub/big.bin)" 2>/dev/null)"
+assert_str "F7 and its note is still there" "deep and large" "$(cat "$S/overrides/$(enc sub/big.bin).flag" 2>/dev/null)"
+LC_SCOPE=tree
+assert_pile "F7 widening brings back the recorded path, not the one let go" "sub/k.md"
+assert_str "F7 and the file let go is counted again" "1" "$(lc_unread_count)"
+
 echo; echo "PASS=$PASS FAIL=$FAIL"

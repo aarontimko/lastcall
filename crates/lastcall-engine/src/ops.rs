@@ -14,7 +14,7 @@
 //! that is consulted after the object write and after the ledger temp write. Production
 //! passes [`NoFault`]; the testkit's implementation SIGKILLs the process (E1).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
@@ -82,6 +82,10 @@ pub struct Rendered {
     /// The baseline mode alongside it: a mode-only hunk (D1) moves the mode and not the
     /// oid, so the hunk CAS must cover both.
     pub baseline_mode: Option<Mode>,
+    /// A row for a file over the size limit, which is listed but never read. Accepting it
+    /// drops the path from the record and leaves the file alone; there is no content to
+    /// compare, so it carries no CAS of its own.
+    pub unread: bool,
 }
 
 impl Rendered {
@@ -92,6 +96,7 @@ impl Rendered {
             mode: row.current.as_ref().map(|e| e.mode),
             baseline: row.baseline.as_ref().map(|e| e.oid.clone()),
             baseline_mode: row.baseline.as_ref().map(|e| e.mode),
+            unread: matches!(row.collapsed, Some(crate::scan::Collapsed::Unread { .. })),
         }
     }
 }
@@ -140,6 +145,11 @@ pub enum Refused {
     /// that is no longer the one this root is on, so nothing is written and the staged work
     /// is dropped. `now` is the branch the ledger or `HEAD` names instead.
     BranchChanged { now: String },
+    /// The row was never read, because the file is at or over the size limit (R2). There is
+    /// no content on this side to put back and no baseline the reader has seen, so a
+    /// restore is refused rather than being read as the deletion that `oid: None` means on
+    /// every other row (verifier F3).
+    NotRead { path: Vec<u8> },
     /// The hunk list handed to `restore_hunk` does not reassemble the rendered content, so
     /// "everything but hunk k" would silently drop whatever is missing from it (verifier
     /// F3). The one refusal that is about the *caller's* view rather than the file.
@@ -195,6 +205,11 @@ impl Refused {
             Refused::NothingToUndo => "nothing to undo".to_string(),
             Refused::Conflicted { path } => {
                 format!("{}: unresolved merge conflict; not {verb}", lossy(path))
+            }
+            // The verb is fixed here too: the size rule's own accept is what clears an
+            // unread row, so a restore is the only operation that can raise this.
+            Refused::NotRead { path } => {
+                format!("{}: not read; restore is not offered", lossy(path))
             }
             Refused::Incomplete { path } => {
                 format!(
@@ -293,6 +308,17 @@ impl Outcome {
     pub fn ok(&self) -> bool {
         self.refused.is_empty()
     }
+}
+
+/// Whether a root-relative path has left the folder's scope: the shape test `Ops::trim`
+/// reads the record against.
+pub type OutOfScope<'a> = &'a dyn Fn(&[u8]) -> bool;
+
+/// What one fold did: the refusal that stopped it, and how many paths it dropped for
+/// being outside the folder's scope (`Ops::trim`; zero for every other fold).
+struct Folded {
+    refused: Option<Refused>,
+    dropped: usize,
 }
 
 /// Everything the ops need for one root. The engine constructs one per call.
@@ -461,6 +487,27 @@ impl Ops<'_> {
     }
 
     fn set_override(&mut self, key: &str, blob: Option<Oid>, mode: Option<Mode>) {
+        self.set_override_with(key, blob, mode, false);
+    }
+
+    /// Record the path as gone from the record even when the record held nothing at it.
+    ///
+    /// Accepting an unread row is the reader's decision to let the path go, and it is the
+    /// one release that must survive the "same as the tree" collapse below: a folder that
+    /// never recorded the file has no tree entry to compare against, and collapsing the
+    /// release to "no override" would leave a flag-only override, which the size rule reads
+    /// as *the record holds it* and would put the row straight back (verifier F1).
+    fn set_override_released(&mut self, key: &str) {
+        self.set_override_with(key, None, None, true);
+    }
+
+    fn set_override_with(
+        &mut self,
+        key: &str,
+        blob: Option<Oid>,
+        mode: Option<Mode>,
+        released: bool,
+    ) {
         let prior = self.ledger.overrides.get(key).cloned();
         if let Some(p) = &mut self.pending_undo {
             // First touch only: an op that sets the same path twice still has one baseline.
@@ -468,11 +515,12 @@ impl Ops<'_> {
         }
         let path = key.as_bytes();
         let tree = self.tree_entry(path);
-        let equals_tree = match (&blob, &tree) {
-            (Some(b), Some(t)) => *b == t.oid && mode.is_none_or(|m| m == t.mode),
-            (None, None) => true,
-            _ => false,
-        };
+        let equals_tree = !released
+            && match (&blob, &tree) {
+                (Some(b), Some(t)) => *b == t.oid && mode.is_none_or(|m| m == t.mode),
+                (None, None) => true,
+                _ => false,
+            };
         let now = self.clock.now_iso8601();
         let entry = self
             .ledger
@@ -518,6 +566,19 @@ impl Ops<'_> {
         keys: impl Iterator<Item = String>,
     ) -> BTreeMap<String, UndoPath> {
         let keys: Vec<String> = keys.collect();
+        // The record as it stands *before* the op, which is the one place the release can
+        // be read off: `Baseline::Absent` says nothing about the note beside it (H1).
+        let kind = ledger.kind;
+        let released: BTreeSet<String> = keys
+            .iter()
+            .filter(|k| {
+                ledger
+                    .overrides
+                    .get(k.as_str())
+                    .is_some_and(|o| o.survives_fold(kind))
+            })
+            .cloned()
+            .collect();
         let mut resolver =
             BaselineResolver::new(ledger, tree, self.store, keys.iter().map(|k| k.as_bytes()));
         keys.iter()
@@ -526,10 +587,12 @@ impl Ops<'_> {
                     Baseline::Present { oid, mode } => UndoPath {
                         baseline: Some(oid),
                         mode: Some(mode),
+                        released: false,
                     },
                     Baseline::Absent | Baseline::Empty => UndoPath {
                         baseline: None,
                         mode: None,
+                        released: released.contains(k),
                     },
                 };
                 (k.clone(), rec)
@@ -746,6 +809,14 @@ impl Ops<'_> {
     /// set; a refusal leaves the ledger untouched.
     fn stage_file(&mut self, rendered: &Rendered) -> Result<(), Refused> {
         let key = Self::key(&rendered.path)?;
+        if rendered.unread {
+            // A file over the size limit: the record lets the path go and the file stays
+            // on disk untouched. No content CAS, because there is no content on this
+            // side — not reading it is the point.
+            self.begin_undo(UndoOp::AcceptFile);
+            self.set_override_released(&key);
+            return Ok(());
+        }
         if rendered.oid.is_none() {
             return self.stage_deletion(rendered);
         }
@@ -1265,6 +1336,14 @@ impl Ops<'_> {
                 ..Default::default()
             })
         };
+        // Ahead of everything, including the deletion shortcut below: an unread row is not
+        // a deletion, whatever `oid` says on it, and there is nothing to put back (verifier
+        // G3). `restore_file` refuses the same way for the same reason (F3).
+        if rendered.unread {
+            return refuse(Refused::NotRead {
+                path: rendered.path.clone(),
+            });
+        }
         // A deletion row renders as one hunk with its own control (as accept does).
         if rendered.oid.is_none() {
             return self.restore_deletion(rendered, fault);
@@ -1376,6 +1455,15 @@ impl Ops<'_> {
                 ..Default::default()
             })
         };
+        // R2 (verifier F3): `oid: None` means "deleted" on every row but this one, where it
+        // means the folder never read the file. Nothing was read, so there is nothing to
+        // put back, and the deletion route below would remove a file the reader has never
+        // seen the contents of. Refuse, and say so in those words.
+        if rendered.unread {
+            return refuse(Refused::NotRead {
+                path: rendered.path.clone(),
+            });
+        }
         if rendered.oid.is_none() {
             return self.restore_deletion(rendered, fault);
         }
@@ -1607,7 +1695,7 @@ impl Ops<'_> {
             });
         }
         let seen_at = self.head_now();
-        match self.fold(snapshot, Some(seen_at), fault)? {
+        match self.fold(snapshot, Some(seen_at), None, fault)?.refused {
             Some(r) => Ok(Outcome {
                 refused: vec![r],
                 ..Default::default()
@@ -1626,8 +1714,38 @@ impl Ops<'_> {
         // A refusal here is not an error and not a user-visible outcome: the accept that
         // triggered the compaction already landed in the right record, and the fold that
         // would have followed is simply not run on another branch's.
-        self.fold(&Pile::empty(), None, fault)?;
+        self.fold(&Pile::empty(), None, None, fault)?;
         Ok(())
+    }
+
+    /// Drop the paths a watched folder's record holds but its scope no longer covers
+    /// (Amendment v1.13 R6), and answer how many left.
+    ///
+    /// `out_of_scope` is a **path-shape** question and nothing else: a file too large to
+    /// read is R2's unread row, reviewed once and removed by the user's own accept, never
+    /// dropped from the record behind their back.
+    ///
+    /// This goes through the same fold a compaction does, so it has compaction's
+    /// properties: the lock, the merge of another process's accepts, the temp file and the
+    /// rename, no undo entry and `seen_at` untouched. A blob override on a dropped path is
+    /// folded in first and then leaves with its path; a flag-only override stays, because
+    /// it is the user's own note and it comes back with the path if the folder is widened
+    /// again. The count is taken from the merged record under the lock, so a second
+    /// process that has already dropped some of them is not counted twice.
+    ///
+    /// A repository's record is never trimmed, and a folder with no record at all is left
+    /// alone rather than given an empty one.
+    pub fn trim(
+        &mut self,
+        out_of_scope: OutOfScope<'_>,
+        fault: &dyn FaultInjector,
+    ) -> Result<usize, OpsError> {
+        if self.ledger.kind != RootKind::Draft {
+            return Ok(0);
+        }
+        Ok(self
+            .fold(&Pile::empty(), None, Some(out_of_scope), fault)?
+            .dropped)
     }
 
     /// Reverse the most recent accept in this root (Amendment v1.11, deliverable 2).
@@ -1669,7 +1787,14 @@ impl Ops<'_> {
                 });
             };
             for (key, rec) in &entry.paths {
-                self.set_override(key, rec.baseline.clone(), rec.mode);
+                // A release goes back as a release: the collapse would leave the note alone
+                // on the path, which the size rule reads as *the record holds it* and the
+                // row nobody asked for would be back (verifier H1).
+                if rec.released {
+                    self.set_override_released(key);
+                } else {
+                    self.set_override(key, rec.baseline.clone(), rec.mode);
+                }
             }
             let tmp = ledger::write_tmp(self.paths, self.ledger)?;
             fault.at(FaultPoint::AfterLedgerTmpWrite);
@@ -2057,14 +2182,22 @@ impl Ops<'_> {
         fault.at(FaultPoint::AfterObjectWrite);
         self.ledger.seen_tree = Some(new_tree);
         let now = self.clock.now_iso8601();
+        let kind = self.ledger.kind;
         for w in &writes {
             let (TreeWrite::Set { path, .. } | TreeWrite::Remove { path }) = w;
             let Ok(key) = std::str::from_utf8(path) else {
                 continue;
             };
             if let Some(o) = self.ledger.overrides.get_mut(key) {
-                if o.blob.is_some() || o.mode.is_some() {
-                    o.blob = None;
+                // The same rule the fold's clearing loop runs (verifier G1): an override
+                // collapses only when the new tree now says what it said. A switch is a
+                // repository's business and `survives_fold` answers `false` for one, so
+                // this is the two loops agreeing rather than a second behaviour.
+                let keep = matches!(w, TreeWrite::Remove { .. }) && o.survives_fold(kind);
+                if (o.blob.is_some() && !keep) || o.mode.is_some() {
+                    if !keep {
+                        o.blob = None;
+                    }
                     o.mode = None;
                     o.updated_at = now.clone();
                 }
@@ -2147,8 +2280,9 @@ impl Ops<'_> {
         &mut self,
         snapshot: &Pile,
         seen_at: Option<SeenAt>,
+        trim: Option<OutOfScope<'_>>,
         fault: &dyn FaultInjector,
-    ) -> Result<Option<Refused>, OpsError> {
+    ) -> Result<Folded, OpsError> {
         // The lock spans the whole fold: the tree is built from the on-disk ledger's
         // overrides, so another process's accepts are folded in, never dropped.
         let _lock = LedgerLock::acquire(self.paths)?;
@@ -2159,9 +2293,41 @@ impl Ops<'_> {
             self.staged.clear();
             self.pending_undo = None;
             self.merge_from_disk()?;
-            return Ok(Some(r));
+            return Ok(Folded {
+                refused: Some(r),
+                dropped: 0,
+            });
         }
         self.merge_from_disk()?;
+        // R6's paths, read off the **merged** record: the tree's own keys and any path
+        // whose override carries content. Nothing is written when none are left, so a
+        // folder whose record is already inside its scope is not rewritten, and one with
+        // no record at all keeps its `null` rather than gaining an empty tree.
+        let dropped: Vec<Vec<u8>> = match trim {
+            None => Vec::new(),
+            Some(out_of_scope) => {
+                let mut paths: Vec<Vec<u8>> = self
+                    .tree
+                    .keys()
+                    .filter(|p| out_of_scope(p))
+                    .cloned()
+                    .collect();
+                for (key, o) in self.ledger.overrides.iter() {
+                    if matches!(o.blob, Some(Some(_))) && out_of_scope(key.as_bytes()) {
+                        paths.push(key.as_bytes().to_vec());
+                    }
+                }
+                paths.sort();
+                paths.dedup();
+                paths
+            }
+        };
+        if trim.is_some() && dropped.is_empty() {
+            return Ok(Folded {
+                refused: None,
+                dropped: 0,
+            });
+        }
         // The accept-all entry, taken *before* the fold rewrites anything: the overrides
         // and the tree as they stand now are the pre-accept baselines. It lists exactly the
         // paths the fold takes from the snapshot (the row cap already bounds that list) and
@@ -2228,6 +2394,10 @@ impl Ops<'_> {
             };
             writes.insert(path, w);
         }
+        // Last, so a path that leaves the scope leaves whatever any earlier write said.
+        for path in &dropped {
+            writes.insert(path.clone(), TreeWrite::Remove { path: path.clone() });
+        }
         let writes: Vec<TreeWrite> = writes.into_values().collect();
         let new_tree = self
             .store
@@ -2235,10 +2405,69 @@ impl Ops<'_> {
         fault.at(FaultPoint::AfterObjectWrite);
 
         self.ledger.seen_tree = Some(new_tree.clone());
+        // R2's releases, which are the one thing a fold cannot fold into the tree (verifier
+        // G1). Two kinds arrive here, and both end as `blob: null` on a path the new tree
+        // does not hold, with the user's note still on it:
+        //
+        // - one this fold is making, because an accept-all is an accept: a row the folder
+        //   did not read is accepted by letting its path go, exactly as `stage_file` does
+        //   for a single accept. Only a path that already carries an override is touched,
+        //   which is the flagged case; an unflagged unread row needs no record at all and
+        //   the `retain` below clears whatever it leaves empty.
+        // - one the record already carries, from an earlier single accept.
+        //
+        // Both are read off the new tree, so the rule is the same one the clearing loop
+        // has always run: an override collapses only when its baseline is now what the
+        // tree says. A repository's record has no releases of this shape, so its folds are
+        // byte-for-byte what they were.
+        let mut releases: BTreeSet<String> = BTreeSet::new();
+        // The new tree's entries, listed at most once per fold: the release rule reads them
+        // and so does the cache at the end, and a second `ls-tree` of the same oid would be
+        // a git process the fold does not need (verifier H5).
+        let mut entries: Option<TreeEntries> = None;
+        if self.ledger.kind == RootKind::Draft {
+            let mut candidates: BTreeSet<String> = self
+                .ledger
+                .overrides
+                .iter()
+                .filter(|(_, o)| o.survives_fold(RootKind::Draft))
+                .map(|(k, _)| k.clone())
+                .collect();
+            for row in &snapshot.rows {
+                if matches!(row.collapsed, Some(crate::scan::Collapsed::Unread { .. }))
+                    && let Ok(k) = std::str::from_utf8(&row.path)
+                    && self
+                        .ledger
+                        .overrides
+                        .get(k)
+                        .is_some_and(|o| !o.flags.is_empty())
+                {
+                    candidates.insert(k.to_owned());
+                }
+            }
+            if !candidates.is_empty() {
+                let listed = entries.insert(self.store.ls_tree(&new_tree)?);
+                releases = candidates
+                    .into_iter()
+                    .filter(|k| !listed.contains_key(k.as_bytes()))
+                    .collect();
+            }
+        }
         let now = self.clock.now_iso8601();
-        self.ledger.overrides.retain(|_, o| {
-            if o.blob.is_some() || o.mode.is_some() {
-                o.blob = None;
+        for key in &releases {
+            if let Some(o) = self.ledger.overrides.get_mut(key)
+                && o.blob != Some(None)
+            {
+                o.blob = Some(None);
+                o.updated_at = now.clone();
+            }
+        }
+        self.ledger.overrides.retain(|key, o| {
+            let keep = releases.contains(key);
+            if (o.blob.is_some() && !keep) || o.mode.is_some() {
+                if !keep {
+                    o.blob = None;
+                }
                 o.mode = None;
                 o.updated_at = now.clone();
             }
@@ -2252,9 +2481,15 @@ impl Ops<'_> {
         ledger::commit_tmp(self.paths, &tmp)?;
         drop(_lock);
         self.staged.clear();
-        *self.tree = self.store.ls_tree(&new_tree)?;
+        *self.tree = match entries {
+            Some(listed) => listed,
+            None => self.store.ls_tree(&new_tree)?,
+        };
         self.index.seed(Some(&new_tree))?;
-        Ok(None)
+        Ok(Folded {
+            refused: None,
+            dropped: dropped.len(),
+        })
     }
 
     /// Append a flag to `path` (A8; Amendment v1.7). Never touches `blob`.
@@ -2349,6 +2584,7 @@ mod tests {
     use crate::ledger::UNDO_CAP;
     use crate::scan::fixture_tests::Harness;
     use crate::scan::{Change, Rename, pile_lines};
+    use crate::store::DraftScope;
     use lastcall_testkit::fixture_repo::FixtureRepo;
     use lastcall_testkit::tmp::TempDir;
 
@@ -3109,6 +3345,7 @@ mod tests {
             mode: None,
             baseline: h.tree_entries.get(&b"f2"[..]).map(|(_, o)| o.clone()),
             baseline_mode: h.tree_entries.get(&b"f2"[..]).map(|(m, _)| *m),
+            unread: false,
         };
         let out = h.ops().accept_deletion(&r2, &NoFault).unwrap();
         assert!(matches!(out.refused[0], Refused::StillPresent { .. }), "A7");
@@ -3484,6 +3721,59 @@ mod tests {
             std::fs::read(repo.path().join("f1")).unwrap(),
             b"moved on\n",
             "a refused restore leaves the working file exactly as it was"
+        );
+        assert!(temp_ghosts(repo.path()).is_empty());
+    }
+
+    /// R2 (verifier F3): a row the folder never read has no content on this side, which is
+    /// exactly why `oid` is `None` on it. Routing it into the deletion restore would
+    /// delete the large file the size rule deliberately left alone, so the restore is
+    /// refused instead and says why.
+    #[test]
+    fn ops_restore_refuses_an_unread_row_and_leaves_the_file_alone() {
+        let repo = FixtureRepo::new("ops-restore-unread").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        repo.write("f1", "grown past the limit\n");
+        let unread = Rendered {
+            path: b"f1".to_vec(),
+            oid: None,
+            mode: None,
+            baseline: h.tree_entries.get(&b"f1"[..]).map(|(_, o)| o.clone()),
+            baseline_mode: h.tree_entries.get(&b"f1"[..]).map(|(m, _)| *m),
+            unread: true,
+        };
+        let out = h.ops().restore_file(&unread, &NoFault).unwrap();
+        assert_eq!(out.refused.len(), 1, "{out:?}");
+        assert!(
+            matches!(&out.refused[0], Refused::NotRead { path } if path == b"f1"),
+            "{out:?}"
+        );
+        assert_eq!(
+            out.refused[0].message("restored"),
+            "f1: not read; restore is not offered"
+        );
+        assert!(!out.written, "no ledger write");
+        assert_eq!(
+            std::fs::read(repo.path().join("f1")).unwrap(),
+            b"grown past the limit\n",
+            "the bytes the folder never read are still there"
+        );
+        assert!(temp_ghosts(repo.path()).is_empty());
+
+        // Verifier G3: the same refusal whichever request arrives. An unread row has no
+        // hunks, so a hunk restore against one took the `oid: None` shortcut to the
+        // deletion route and answered "still present; deletion not restored" instead.
+        let out = h.ops().restore_hunk(&unread, &[], 0, &NoFault).unwrap();
+        assert_eq!(out.refused.len(), 1, "{out:?}");
+        assert_eq!(
+            out.refused[0].message("restored"),
+            "f1: not read; restore is not offered"
+        );
+        assert!(!out.written);
+        assert_eq!(
+            std::fs::read(repo.path().join("f1")).unwrap(),
+            b"grown past the limit\n"
         );
         assert!(temp_ghosts(repo.path()).is_empty());
     }
@@ -4682,6 +4972,494 @@ mod tests {
         assert_eq!(disk.snoozed_until, None);
     }
 
+    /// One folder's record and the shape predicate that decides what stays in it: a
+    /// folder watched on its own keeps only what sits directly inside it.
+    fn one_folder_only(path: &[u8]) -> bool {
+        path.contains(&b'/')
+    }
+
+    /// Amendment v1.13 R6: a record written while the folder's scope was wider is trimmed
+    /// by **path shape**, through the same fold a compaction runs, so it leaves no undo
+    /// entry and does not move `seen_at`. A blob override on a dropped path is folded in
+    /// and leaves with the path; a flag the user wrote stays.
+    #[test]
+    fn ops_trim_drops_out_of_scope_paths_and_keeps_the_users_flags() {
+        let mut d = proptests::Draft::new("lc-trim");
+        d.write("a.md", b"a\n");
+        d.write("research/b.md", b"b\n");
+        d.write("research/deep/c.md", b"c\n");
+        d.first_sight(&DraftScope::tree(u64::MAX));
+        assert_eq!(
+            d.seen_paths(),
+            vec![
+                "a.md".to_owned(),
+                "research/b.md".to_owned(),
+                "research/deep/c.md".to_owned()
+            ]
+        );
+
+        // A note on one path that is about to leave, and an accept on another so its
+        // content sits in an override rather than in the tree.
+        d.ops()
+            .flag(b"research/b.md", "check this", None, None, &NoFault)
+            .unwrap();
+        d.write("research/deep/c.md", b"c2\n");
+        let pile = d.scan();
+        let row = pile
+            .rows
+            .iter()
+            .find(|r| r.path == b"research/deep/c.md")
+            .expect("the edited file is pending");
+        let rendered = Rendered::of(row);
+        d.ops().accept_file(&rendered, &NoFault).unwrap();
+        assert!(
+            matches!(
+                d.ledger().overrides["research/deep/c.md"].blob,
+                Some(Some(_))
+            ),
+            "the accept is an override, not yet folded"
+        );
+        let undo_before = d.ledger().undo.len();
+        assert!(undo_before > 0, "the accept pushed one");
+        let seen_at_before = d.ledger().seen_at.clone();
+
+        let dropped = d.ops().trim(&one_folder_only, &NoFault).unwrap();
+        assert_eq!(dropped, 2, "`research/b.md` and `research/deep/c.md`");
+        assert_eq!(d.seen_paths(), vec!["a.md".to_owned()]);
+        assert_eq!(
+            d.ledger().undo.len(),
+            undo_before,
+            "a trim is not an accept: no undo entry"
+        );
+        assert_eq!(d.ledger().seen_at, seen_at_before, "`seen_at` untouched");
+        assert!(
+            !d.ledger().overrides.contains_key("research/deep/c.md"),
+            "the blob override left with its path"
+        );
+        let kept = &d.ledger().overrides["research/b.md"];
+        assert!(kept.blob.is_none() && kept.mode.is_none());
+        assert_eq!(kept.flags.len(), 1, "the user's own note stays");
+
+        // The record is inside the scope now, so a second trim finds nothing to do.
+        assert_eq!(d.ops().trim(&one_folder_only, &NoFault).unwrap(), 0);
+        assert_eq!(d.seen_paths(), vec!["a.md".to_owned()]);
+    }
+
+    /// A record already inside its scope is not rewritten, and a folder with no record at
+    /// all keeps its `null` rather than gaining an empty tree.
+    #[test]
+    fn ops_trim_writes_nothing_when_there_is_nothing_outside_the_scope() {
+        let mut d = proptests::Draft::new("lc-trim-noop");
+        d.write("a.md", b"a\n");
+        d.first_sight(&DraftScope::plain(u64::MAX));
+        let seen_before = d.ledger().seen_tree.clone();
+        assert_eq!(d.ops().trim(&one_folder_only, &NoFault).unwrap(), 0);
+        assert_eq!(d.ledger().seen_tree, seen_before);
+
+        // A folder whose first sight has not happened yet: still pending afterwards.
+        let mut d = proptests::Draft::new("lc-trim-pending");
+        d.write("research/b.md", b"b\n");
+        assert!(d.ledger().seen_tree.is_none());
+        d.ops()
+            .flag(b"research/b.md", "note", None, None, &NoFault)
+            .unwrap();
+        assert_eq!(d.ops().trim(&one_folder_only, &NoFault).unwrap(), 0);
+        assert!(
+            d.ledger().seen_tree.is_none(),
+            "no record, so nothing to trim and no empty tree written"
+        );
+        assert_eq!(d.ledger().overrides["research/b.md"].flags.len(), 1);
+    }
+
+    /// A repository's record is never trimmed: its scope is the repository, and the paths
+    /// in it come from git.
+    #[test]
+    fn ops_trim_never_touches_a_repositorys_record() {
+        let mut d = proptests::Draft::new("lc-trim-git");
+        d.write("a.md", b"a\n");
+        d.write("research/b.md", b"b\n");
+        d.first_sight(&DraftScope::tree(u64::MAX));
+        d.make_git_root();
+        assert_eq!(d.ops().trim(&one_folder_only, &NoFault).unwrap(), 0);
+        assert_eq!(
+            d.seen_paths(),
+            vec!["a.md".to_owned(), "research/b.md".to_owned()]
+        );
+    }
+
+    /// R2's size limit for the release tests: small enough that a few kilobytes of fixture
+    /// is a file too large to read.
+    const UNREAD_LIMIT: u64 = 1_024;
+
+    /// The draft root the release rule is about: `a.md` in the record, `big.bin` never
+    /// recorded, over the limit and carrying the user's note. Answers the folder and the
+    /// pile that holds the unread row.
+    fn flagged_unread_draft(name: &str) -> (proptests::Draft, Pile) {
+        let mut d = proptests::Draft::new(name);
+        d.write("a.md", b"a\n");
+        d.first_sight(&DraftScope::tree(u64::MAX));
+        d.write("big.bin", &vec![b'x'; 3_000]);
+        assert!(
+            d.ops()
+                .flag(b"big.bin", "check this", None, None, &NoFault)
+                .unwrap()
+                .ok()
+        );
+        let pile = d.scan_at(UNREAD_LIMIT);
+        let row = pile
+            .row(b"big.bin")
+            .expect("the flagged large file has a row");
+        assert!(
+            matches!(row.collapsed, Some(crate::scan::Collapsed::Unread { .. })),
+            "R2's unread row: {:?}",
+            row.collapsed
+        );
+        (d, pile)
+    }
+
+    /// Accept the unread row on its own, which releases the path.
+    fn release_the_row(d: &mut proptests::Draft, pile: &Pile) {
+        let r = Rendered::of(pile.row(b"big.bin").expect("the row"));
+        assert!(d.ops().accept_file(&r, &NoFault).unwrap().ok());
+    }
+
+    /// The record let the path go and the note is still there: no row, the file counted in
+    /// the one notice, the override still a release.
+    fn assert_still_released(d: &proptests::Draft, when: &str) {
+        let pile = d.scan_at(UNREAD_LIMIT);
+        assert!(
+            pile.rows.is_empty(),
+            "{when}: the accepted row came back: {:?}",
+            pile_lines(&pile)
+        );
+        assert_eq!(
+            pile.notices,
+            vec!["1 file over 1 KiB not read".to_owned()],
+            "{when}: the file is counted, not shown"
+        );
+        let o = d
+            .ledger()
+            .overrides
+            .get("big.bin")
+            .unwrap_or_else(|| panic!("{when}: the override is gone"));
+        assert_eq!(o.blob, Some(None), "{when}: still a release");
+        assert_eq!(o.flags.len(), 1, "{when}: the note stays");
+    }
+
+    /// G1, order (a): the release outlives an accept-all over some *other* pending file.
+    /// A fold that collapsed it to flag-only would leave the shape `record_holds` reads as
+    /// "the record holds this path", and the row the user accepted would be back.
+    #[test]
+    fn ops_a_release_with_a_note_survives_an_accept_all_over_another_file() {
+        let (mut d, pile) = flagged_unread_draft("lc-g1-accept-all");
+        release_the_row(&mut d, &pile);
+        assert_still_released(&d, "after the accept");
+        d.write("a.md", b"a2\n");
+        let pile = d.scan_at(UNREAD_LIMIT);
+        assert_eq!(pile_lines(&pile), vec!["a.md".to_owned()]);
+        assert!(d.ops().accept_all(&pile, &NoFault).unwrap().ok());
+        assert_still_released(&d, "after the accept-all");
+        assert_still_released(&d, "and on the scan after that");
+    }
+
+    /// G1, order (b): the bounded compaction runs on its own once enough blob overrides
+    /// pile up, and it must not undo the user's accept either.
+    #[test]
+    fn ops_a_release_with_a_note_survives_a_compaction() {
+        let (mut d, pile) = flagged_unread_draft("lc-g1-compact");
+        release_the_row(&mut d, &pile);
+        d.ops().compact(&NoFault).unwrap();
+        assert_still_released(&d, "after the compaction");
+    }
+
+    /// G1, order (c): an accept-all whose pile still holds the unread row — the snapshot
+    /// the user had on screen before the single accept landed.
+    #[test]
+    fn ops_a_release_with_a_note_survives_an_accept_all_that_holds_the_row() {
+        let (mut d, pile) = flagged_unread_draft("lc-g1-accept-all-row");
+        release_the_row(&mut d, &pile);
+        assert!(d.ops().accept_all(&pile, &NoFault).unwrap().ok());
+        assert_still_released(&d, "after the accept-all over the row itself");
+    }
+
+    /// And the same accept-all *is* the release when nothing has released the row yet: a
+    /// pile the user accepts wholesale lets the unread path go exactly as a single accept
+    /// of that row does, note and all.
+    #[test]
+    fn ops_accept_all_releases_a_flagged_unread_row() {
+        let (mut d, pile) = flagged_unread_draft("lc-g1-accept-all-fresh");
+        assert!(d.ops().accept_all(&pile, &NoFault).unwrap().ok());
+        assert_still_released(&d, "after the accept-all");
+    }
+
+    /// The counted consequence: `blob_override_count` is the number of overrides a fold
+    /// would fold away, so a release the fold keeps is not one of them. Counting it would
+    /// put the record permanently over the compaction threshold and make every later
+    /// accept re-run a compaction that changes nothing.
+    #[test]
+    fn ops_a_kept_release_does_not_compact_the_next_accept() {
+        let (mut d, pile) = flagged_unread_draft("lc-g1-threshold");
+        release_the_row(&mut d, &pile);
+        assert_eq!(
+            d.ledger().blob_override_count(),
+            0,
+            "the kept release is not an override a fold would fold away"
+        );
+        d.set_threshold(1);
+        d.write("a.md", b"a2\n");
+        let pile = d.scan_at(UNREAD_LIMIT);
+        let r = Rendered::of(pile.row(b"a.md").expect("the edited file is pending"));
+        let out = d.ops().accept_file(&r, &NoFault).unwrap();
+        assert!(out.ok());
+        assert!(
+            !out.compacted,
+            "one real blob override does not pass a threshold of 1"
+        );
+        assert_still_released(&d, "and the release is untouched");
+    }
+
+    /// H1, the reachable sequence: release the flagged large file, watch it shrink under
+    /// the limit, accept its content, then undo that accept. The undo has to put the
+    /// *release* back, not the flag-only shape the "same as the tree" collapse would leave,
+    /// or the row returns the moment the file grows again although nobody undid the
+    /// release.
+    #[test]
+    fn ops_undo_of_a_later_accept_puts_the_release_back() {
+        let (mut d, pile) = flagged_unread_draft("lc-h1-undo-accept");
+        release_the_row(&mut d, &pile);
+        assert_still_released(&d, "after the accept");
+
+        d.write("big.bin", b"small\n");
+        let pile = d.scan_at(UNREAD_LIMIT);
+        let r = Rendered::of(
+            pile.row(b"big.bin")
+                .expect("the shrunk file is a row again"),
+        );
+        assert!(d.ops().accept_file(&r, &NoFault).unwrap().ok());
+        assert!(
+            matches!(d.ledger().overrides["big.bin"].blob, Some(Some(_))),
+            "the content accept records the blob"
+        );
+
+        assert!(d.ops().undo(&NoFault).unwrap().ok());
+        d.write("big.bin", &vec![b'z'; 3_000]);
+        assert_still_released(&d, "after the undo of the content accept");
+    }
+
+    /// H1 again, through a fold's undo entry: an accept-all over a pile that still lists
+    /// the released row (the snapshot the user had on screen before the single accept
+    /// landed) records the path in its entry, so the undo of that accept-all must not
+    /// collapse the release either.
+    #[test]
+    fn ops_undo_of_a_stale_accept_all_keeps_the_release() {
+        let (mut d, stale) = flagged_unread_draft("lc-h1-undo-fold");
+        release_the_row(&mut d, &stale);
+        assert!(d.ops().accept_all(&stale, &NoFault).unwrap().ok());
+        assert_still_released(&d, "after the accept-all over the stale pile");
+
+        assert!(d.ops().undo(&NoFault).unwrap().ok());
+        assert_still_released(&d, "after the undo of that accept-all");
+    }
+
+    /// The other half of the same rule: a repository writes no release, so its undo record
+    /// gains no key on disk and an accepted deletion with a note replays through the
+    /// collapse exactly as it did before (Phase 7's F17 rule).
+    #[test]
+    fn ops_undo_on_a_repository_records_nothing_new_and_still_collapses() {
+        let mut d = proptests::Draft::new("lc-h1-undo-git");
+        d.write("a.md", b"a\n");
+        d.first_sight(&DraftScope::tree(u64::MAX));
+        d.make_git_root();
+        assert!(
+            d.ops()
+                .flag(b"a.md", "check this", None, None, &NoFault)
+                .unwrap()
+                .ok()
+        );
+
+        // The recorded file goes and the user accepts the deletion, note and all: a `null`
+        // on a path the seen tree does hold.
+        std::fs::remove_file(d.root.join("a.md")).unwrap();
+        let pile = d.scan();
+        let r = Rendered::of(pile.row(b"a.md").expect("the deletion is a row"));
+        assert!(d.ops().accept_deletion(&r, &NoFault).unwrap().ok());
+        assert_eq!(d.ledger().overrides["a.md"].blob, Some(None));
+        let rec = &d.ledger().undo.last().expect("the accept pushed one").paths["a.md"];
+        assert!(!rec.released, "a repository never records a release");
+        let json = serde_json::to_string(rec).unwrap();
+        assert!(
+            !json.contains("released"),
+            "and the record on disk is the two fields it always was: {json}"
+        );
+
+        assert!(d.ops().undo(&NoFault).unwrap().ok());
+        let o = &d.ledger().overrides["a.md"];
+        assert!(
+            o.blob.is_none() && o.flags.len() == 1,
+            "the baseline equals the tree, so the override collapses to the note alone"
+        );
+        assert_eq!(
+            pile_lines(&d.scan()),
+            vec!["a.md".to_owned()],
+            "and the deletion is pending again"
+        );
+    }
+
+    /// H3, clause one of `survives_fold`: **a repository is not a watched folder.** An
+    /// accepted deletion with a note on it is a `null` beside a flag there too, and it is
+    /// counted toward compaction and folded away like every other override. Nothing else
+    /// in the tier says so, so dropping the `RootKind::Draft` test would change a
+    /// repository's record on disk and no test would notice.
+    #[test]
+    fn ops_a_repositorys_accepted_deletion_with_a_note_counts_and_folds_away() {
+        let mut d = proptests::Draft::new("lc-h3-git-null");
+        d.write("a.md", b"a\n");
+        d.write("f.txt", b"f\n");
+        d.first_sight(&DraftScope::tree(u64::MAX));
+        d.make_git_root();
+        assert!(
+            d.ops()
+                .flag(b"f.txt", "agent says look", None, None, &NoFault)
+                .unwrap()
+                .ok()
+        );
+        std::fs::remove_file(d.root.join("f.txt")).unwrap();
+        let pile = d.scan();
+        let r = Rendered::of(pile.row(b"f.txt").expect("the deletion is a row"));
+        assert!(d.ops().accept_deletion(&r, &NoFault).unwrap().ok());
+        assert_eq!(d.ledger().overrides["f.txt"].blob, Some(None));
+        assert_eq!(
+            d.ledger().blob_override_count(),
+            1,
+            "a repository counts a `null` toward its compaction"
+        );
+
+        d.write("a.md", b"a2\n");
+        let pile = d.scan();
+        assert!(d.ops().accept_all(&pile, &NoFault).unwrap().ok());
+        let o = &d.ledger().overrides["f.txt"];
+        assert!(
+            o.blob.is_none() && o.mode.is_none() && o.flags.len() == 1,
+            "the fold takes the deletion into the tree and leaves the note alone: {o:?}"
+        );
+        assert_eq!(d.seen_paths(), vec!["a.md".to_owned()]);
+        assert_eq!(d.ledger().blob_override_count(), 0);
+        assert!(d.scan().rows.is_empty());
+    }
+
+    /// H3, clause two: **a release is a `null`, never an accepted blob.** A note on a file
+    /// whose content the reader accepted still counts toward compaction, so a folder full
+    /// of flagged accepts compacts on schedule instead of growing forever.
+    #[test]
+    fn ops_a_flagged_content_accept_still_counts_toward_compaction() {
+        let mut d = proptests::Draft::new("lc-h3-flagged-content");
+        d.write("a.md", b"a\n");
+        d.first_sight(&DraftScope::tree(u64::MAX));
+        assert!(
+            d.ops()
+                .flag(b"a.md", "check this", None, None, &NoFault)
+                .unwrap()
+                .ok()
+        );
+        d.set_threshold(0);
+        d.write("a.md", b"a2\n");
+        let pile = d.scan();
+        let r = Rendered::of(pile.row(b"a.md").expect("the edited file is pending"));
+        let out = d.ops().accept_file(&r, &NoFault).unwrap();
+        assert!(out.ok());
+        assert!(
+            out.compacted,
+            "one flagged blob override is over a threshold of 0"
+        );
+        assert_eq!(d.ledger().blob_override_count(), 0, "the fold folded it in");
+        assert_eq!(d.ledger().overrides["a.md"].flags.len(), 1);
+    }
+
+    /// H3, clause three: **the note is what makes a release worth keeping.** A reader who
+    /// lets an unread row go without writing anything about it leaves nothing to come back
+    /// to, so the next fold collapses that override like any other and the record stops
+    /// carrying the path at all.
+    #[test]
+    fn ops_an_unflagged_release_is_folded_away_like_any_other_override() {
+        let mut d = proptests::Draft::new("lc-h3-unflagged");
+        d.write("a.md", b"a\n");
+        d.write("big.bin", b"n\n");
+        d.first_sight(&DraftScope::tree(u64::MAX));
+        assert_eq!(
+            d.seen_paths(),
+            vec!["a.md".to_owned(), "big.bin".to_owned()],
+            "both files are in the record while the file is small"
+        );
+
+        // The recorded file grows past the limit: a row, because the record holds it, and
+        // nobody has written a note on it.
+        d.write("big.bin", &vec![b'x'; 3_000]);
+        let pile = d.scan_at(UNREAD_LIMIT);
+        let row = pile
+            .row(b"big.bin")
+            .expect("the recorded large file is a row");
+        assert!(matches!(
+            row.collapsed,
+            Some(crate::scan::Collapsed::Unread { .. })
+        ));
+        assert!(
+            d.ops()
+                .accept_file(&Rendered::of(row), &NoFault)
+                .unwrap()
+                .ok()
+        );
+        assert_eq!(d.ledger().overrides["big.bin"].blob, Some(None));
+        assert_eq!(
+            d.ledger().blob_override_count(),
+            1,
+            "with no note on it, the release is an override a fold folds away"
+        );
+
+        d.write("a.md", b"a2\n");
+        let pile = d.scan_at(UNREAD_LIMIT);
+        assert!(d.ops().accept_all(&pile, &NoFault).unwrap().ok());
+        assert!(
+            !d.ledger().overrides.contains_key("big.bin"),
+            "nothing left to keep: {:?}",
+            d.ledger().overrides
+        );
+        assert_eq!(d.ledger().blob_override_count(), 0);
+        assert_eq!(d.seen_paths(), vec!["a.md".to_owned()]);
+        let pile = d.scan_at(UNREAD_LIMIT);
+        assert!(pile.rows.is_empty());
+        assert_eq!(pile.notices, vec!["1 file over 1 KiB not read".to_owned()]);
+    }
+
+    /// H3, the fold's own half of the rule: a release is kept only while the new tree does
+    /// **not** hold the path. The file shrinks back under the limit, the reader accepts it
+    /// as content through an accept-all, and the tree gains the path: keeping the `null`
+    /// beside it would mean the record let go of a path it holds, and the row would never
+    /// clear.
+    #[test]
+    fn ops_a_release_collapses_once_the_fold_puts_the_path_back_in_the_tree() {
+        let (mut d, pile) = flagged_unread_draft("lc-h3-shrunk");
+        release_the_row(&mut d, &pile);
+        assert_still_released(&d, "after the accept");
+
+        d.write("big.bin", b"small\n");
+        let pile = d.scan_at(UNREAD_LIMIT);
+        assert_eq!(pile_lines(&pile), vec!["big.bin".to_owned()]);
+        assert!(d.ops().accept_all(&pile, &NoFault).unwrap().ok());
+
+        let o = &d.ledger().overrides["big.bin"];
+        assert!(
+            o.blob.is_none() && o.mode.is_none() && o.flags.len() == 1,
+            "the tree holds the content now, so only the note is left: {o:?}"
+        );
+        assert_eq!(
+            d.seen_paths(),
+            vec!["a.md".to_owned(), "big.bin".to_owned()]
+        );
+        let pile = d.scan_at(UNREAD_LIMIT);
+        assert!(pile.rows.is_empty(), "{:?}", pile_lines(&pile));
+        assert!(pile.notices.is_empty(), "{:?}", pile.notices);
+    }
+
     /// Kickoff deliverable 8 (ii)/(iii): property tests over one draft root per test — a
     /// private store on a temp dir, no user repo, the `RootKind::Draft` plumbing exactly as
     /// the engine opens one. Each case rewrites the file set and resets the ledger to first
@@ -4715,6 +5493,7 @@ mod tests {
             paths: RepoPaths,
             globs: GlobSet,
             clock: FixedClock,
+            threshold: usize,
         }
 
         impl Draft {
@@ -4744,7 +5523,18 @@ mod tests {
                     paths,
                     globs: GlobSet::empty(),
                     clock: FixedClock::at_unix(1_800_000_000),
+                    threshold: 500,
                 }
+            }
+
+            /// The compaction trigger, for the tests that are about it.
+            pub(super) fn set_threshold(&mut self, n: usize) {
+                self.threshold = n;
+            }
+
+            /// The whole folder, no size limit: what these tests snapshot.
+            fn scope() -> crate::store::DraftScope {
+                crate::store::DraftScope::tree(u64::MAX)
             }
 
             fn seen_at() -> SeenAt {
@@ -4763,14 +5553,49 @@ mod tests {
                 for (name, bytes) in files {
                     self.write(name, bytes);
                 }
-                let seen = self.store.tree_of_disk().unwrap();
+                let seen = self.store.tree_of_disk(&Self::scope(), &[]).unwrap();
                 self.tree = self.store.ls_tree(&seen).unwrap();
                 self.ledger = Ledger::new(&self.root, RootKind::Draft, Some(seen), Self::seen_at());
                 ledger::save(&self.paths, &self.ledger).unwrap();
             }
 
             pub(super) fn write(&self, name: &str, bytes: &[u8]) {
-                std::fs::write(self.root.join(name), bytes).unwrap();
+                let path = self.root.join(name);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, bytes).unwrap();
+            }
+
+            /// Make the disk under `scope` this folder's first sight.
+            pub(super) fn first_sight(&mut self, scope: &crate::store::DraftScope) {
+                let seen = self.store.tree_of_disk(scope, &[]).unwrap();
+                self.tree = self.store.ls_tree(&seen).unwrap();
+                self.ledger = Ledger::new(&self.root, RootKind::Draft, Some(seen), Self::seen_at());
+                ledger::save(&self.paths, &self.ledger).unwrap();
+            }
+
+            /// The record's paths, as the ledger on disk has them.
+            pub(super) fn seen_paths(&self) -> Vec<String> {
+                let Some(seen) = self.ledger.seen_tree.as_ref() else {
+                    return Vec::new();
+                };
+                self.store
+                    .ls_tree(seen)
+                    .unwrap()
+                    .keys()
+                    .map(|k| String::from_utf8_lossy(k).into_owned())
+                    .collect()
+            }
+
+            pub(super) fn ledger(&self) -> &Ledger {
+                &self.ledger
+            }
+
+            /// Re-label the record as a repository's, on disk as well as in memory: an op
+            /// merges the ledger from disk under its lock, so a kind set only in memory
+            /// would be read back as the folder's on the very next accept.
+            pub(super) fn make_git_root(&mut self) {
+                self.ledger.kind = RootKind::Git;
+                ledger::save(&self.paths, &self.ledger).unwrap();
             }
 
             fn set(&self, name: &str, content: Option<&[u8]>) {
@@ -4791,6 +5616,21 @@ mod tests {
             }
 
             pub(super) fn scan(&self) -> Pile {
+                self.scan_with(None, 1 << 20)
+            }
+
+            /// A scan under R2's size rule with the limit set where the test wants it, so
+            /// an unread row costs a few kilobytes of fixture rather than a megabyte.
+            pub(super) fn scan_at(&self, collapse_size_bytes: u64) -> Pile {
+                let scope = crate::store::DraftScope::tree(collapse_size_bytes);
+                self.scan_with(Some(&scope), collapse_size_bytes)
+            }
+
+            fn scan_with(
+                &self,
+                scope: Option<&crate::store::DraftScope>,
+                collapse_size_bytes: u64,
+            ) -> Pile {
                 crate::scan::scan(&ScanInputs {
                     store: &self.store,
                     index: &self.index,
@@ -4800,7 +5640,8 @@ mod tests {
                     tree: &self.tree,
                     case_insensitive: false,
                     collapsed_globs: &self.globs,
-                    collapse_size_bytes: 1 << 20,
+                    scope,
+                    collapse_size_bytes,
                     excluded_dirs: &[],
                     index_tmp: &self.paths.index_tmp,
                     row_cap: DEFAULT_ROW_CAP,
@@ -4820,7 +5661,7 @@ mod tests {
                     ledger: &mut self.ledger,
                     tree: &mut self.tree,
                     clock: &self.clock,
-                    compaction_threshold: 500,
+                    compaction_threshold: self.threshold,
                     case_insensitive: false,
                     staged: BTreeMap::new(),
                     pending_undo: None,

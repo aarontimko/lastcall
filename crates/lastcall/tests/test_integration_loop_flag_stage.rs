@@ -87,14 +87,20 @@ async fn loop_flag_with_one_agent_reaches_pane_send_text() {
     let w_dir = TempDir::new("lc-loop-flag");
     let state = TempDir::new("lc-loop-flag-state");
     let parent = w_dir.join("W");
-    let built = fixture_parent::build(&parent, state.path()).expect("the fixture builds");
+    let built = fixture_parent::build(&parent, state.path(), &state.join("home"))
+        .expect("the fixture builds");
     let env = engine_env_for(&parent, &built.home, state.path());
     let engine = open_engine(&parent, &env, state.path(), fixture_parent::config());
 
     // The app the loop would hold after its first refresh: the engine's own roots and its
     // own piles, nothing hand-written.
     let mut engine = engine;
-    let metas: Vec<RootMeta> = engine.roots().iter().map(|r| RootMeta::of(r)).collect();
+    let home = engine.home_shown().map(std::path::Path::to_path_buf);
+    let metas: Vec<RootMeta> = engine
+        .roots()
+        .iter()
+        .map(|r| RootMeta::of(r, home.as_deref()))
+        .collect();
     let alpha: PathBuf = metas
         .iter()
         .find(|m| m.name == "alpha")

@@ -31,7 +31,7 @@ use crate::ops::{self, FaultInjector, NoFault, Ops, OpsError, Outcome, Refused, 
 use crate::paths::{Layout, ParentId, ParentMeta, RepoPaths, RootId};
 use crate::roots::{self, Badge, DiscoverInputs, Discovery, RootsChanged};
 use crate::scan::{self, Entry, Pile, Row, ScanError, ScanInputs};
-use crate::store::{Current, RepoFacts, RootKind, Store, StoreError};
+use crate::store::{Current, DraftScope, ExcludedDir, RepoFacts, RootKind, Store, StoreError};
 use crate::upstream::{self, Classifier};
 
 /// The oldest git the engine accepts (`--path-format=absolute`, `ls-files --others -z`
@@ -200,6 +200,13 @@ pub struct RootState {
     pub kind: RootKind,
     pub parent: PathBuf,
     pub badge: Option<Badge>,
+    /// What every surface shows for this root, as discovery decided it: a repository's own
+    /// folder name, and a watched folder's name with the folders above it that
+    /// `draft_dir_parents` asks for.
+    pub name: String,
+    /// `Some` for a watched folder: how much of it this root covers and the size at which
+    /// it stops reading a file. `None` for a repository.
+    pub scope: Option<DraftScope>,
     pub paths: RepoPaths,
     pub store: Store,
     pub index: PrivateIndex,
@@ -210,8 +217,9 @@ pub struct RootState {
     pub head: HeadState,
     pub classifier: Classifier,
     pub case_insensitive: bool,
-    /// Root-relative draft roots inside this git root (their untracked files are theirs).
-    pub excluded_dirs: Vec<Vec<u8>>,
+    /// Root-relative folders inside this root that another root looks after (their files
+    /// are theirs), with whether the whole tree below each belongs there.
+    pub excluded_dirs: Vec<ExcludedDir>,
     /// Notices from open (kept until the root is reopened).
     pub notices: Vec<String>,
     pub last_pile: Option<Pile>,
@@ -385,15 +393,34 @@ impl RootState {
         }
     }
 
+    /// The ops one scope trim runs through (Amendment v1.13 R6). Like `switch_ops` it is
+    /// not an accept: nothing is staged and the compaction threshold cannot be reached, so
+    /// the field has no meaningful value here.
+    fn trim_ops<'a>(&'a mut self, clock: &'a dyn Clock) -> Ops<'a> {
+        Ops {
+            store: &self.store,
+            index: &self.index,
+            repo: self.repo.as_ref(),
+            paths: &self.paths,
+            branch: self.ledger.seen_branch.clone(),
+            git_dir: None,
+            ledger: &mut self.ledger,
+            tree: &mut self.tree,
+            clock,
+            compaction_threshold: usize::MAX,
+            case_insensitive: self.case_insensitive,
+            staged: BTreeMap::new(),
+            pending_undo: None,
+            lock: crate::ops::DEFAULT_LOCK,
+        }
+    }
+
     pub fn seen_head(&self) -> Option<&Oid> {
         self.ledger.seen_at.head_commit.as_ref()
     }
 
     pub fn name(&self) -> String {
-        self.path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| self.path.to_string_lossy().into_owned())
+        self.name.clone()
     }
 }
 
@@ -564,6 +591,12 @@ pub struct Engine {
     /// How many times discovery re-ran after open (a budget probe for tests).
     discovery_runs: u64,
     git_version: String,
+    /// The home directory the paths shown to the user are collapsed to `~` against,
+    /// canonicalized once here. A home reached through a symlink (`/home/u` pointing at
+    /// `/data/u`) would otherwise never match a root path, which is always canonical, and
+    /// every path shown would be the long one. The raw value is the fallback when it will
+    /// not canonicalize, which is the answer that was right before this existed.
+    home_shown: Option<PathBuf>,
     /// Engine-global scan sequence number: `+1` per pile [`Engine::scan`] produces, whichever
     /// root; every publisher of a pile carries it so a consumer can drop a pile older than
     /// one it already holds (a `scan_all` result arriving after an accept's rescan).
@@ -611,6 +644,9 @@ impl Engine {
             pending_nested: Vec::new(),
             discovery_runs: 0,
             git_version,
+            home_shown: env
+                .home()
+                .map(|h| std::fs::canonicalize(h).unwrap_or_else(|_| h.to_path_buf())),
             scan_seq: 0,
         };
         let started = std::time::Instant::now();
@@ -626,6 +662,11 @@ impl Engine {
 
     pub fn env(&self) -> &Env {
         &self.env
+    }
+
+    /// The canonicalized home directory, for collapsing a path shown to the user to `~`.
+    pub fn home_shown(&self) -> Option<&Path> {
+        self.home_shown.as_deref()
     }
 
     pub fn config(&self) -> &Config {
@@ -733,6 +774,8 @@ impl Engine {
             draft_dirs: &self.config.draft_dirs,
             nested: &nested,
             search_depth: self.config.search_depth,
+            collapse_size_bytes: self.config.collapse_size_bytes,
+            draft_dir_parents: self.config.draft_dir_parents,
         });
         let changed = roots::diff(&self.discovery, &next);
         for n in &next.notices {
@@ -782,17 +825,18 @@ impl Engine {
                     .push(format!("{}: cannot open: {e}", d.path.display())),
             }
         }
-        // Badges and excluded draft dirs can change with the root set.
+        // Badges, names, scopes and who looks after what can all change with the root set:
+        // an open root that has not had a first sight yet still picks up the current
+        // answer, which is what makes a config change visible after a restart without a
+        // root having to be re-opened.
         let discovery = self.discovery.clone();
         for root in self.roots.values_mut() {
             if let Some(d) = discovery.get(&root.path) {
                 root.badge = d.badge.clone();
+                root.name = d.name.clone();
+                root.scope = d.scope.clone();
+                root.excluded_dirs = d.excluded_dirs.clone();
             }
-            root.excluded_dirs = if root.kind == RootKind::Git {
-                discovery.draft_dirs_inside(&root.path)
-            } else {
-                Vec::new()
-            };
         }
         Ok(changed)
     }
@@ -987,6 +1031,7 @@ fn open_root_with(ctx: &OpenCtx<'_>, d: &roots::DiscoveredRoot) -> Result<RootSt
                                 &store,
                                 &head,
                                 ctx.draft_initial,
+                                d.scope.as_ref().map(|s| (s, d.excluded_dirs.as_slice())),
                                 clock,
                             )?;
                             ledger::save(&paths, &l)?;
@@ -1015,6 +1060,8 @@ fn open_root_with(ctx: &OpenCtx<'_>, d: &roots::DiscoveredRoot) -> Result<RootSt
         kind: d.kind,
         parent: d.parent.clone(),
         badge: d.badge.clone(),
+        name: d.name.clone(),
+        scope: d.scope.clone(),
         case_insensitive: scan::probe_case_insensitive(&d.path),
         paths,
         store,
@@ -1024,7 +1071,7 @@ fn open_root_with(ctx: &OpenCtx<'_>, d: &roots::DiscoveredRoot) -> Result<RootSt
         tree,
         head,
         classifier: Classifier::default(),
-        excluded_dirs: Vec::new(),
+        excluded_dirs: d.excluded_dirs.clone(),
         notices,
         last_pile: None,
         nested_repos: Vec::new(),
@@ -1087,6 +1134,31 @@ fn scan_root(state: &mut RootState, ctx: &ScanCtx) -> Result<Pile, EngineError> 
     // R1: which record is in force, before a single baseline is read. A scan that arrives
     // on file events alone, with no head inspection behind it, still sees the switch.
     state.sync_branch(ctx.clock.as_ref());
+    // R6: a record written while the folder's scope was wider still holds paths the scope
+    // no longer covers. They are never candidates, and the private index would otherwise
+    // carry and `lstat` every one of them at every scan, so the record is trimmed to the
+    // scope first. Path shape only: a large file is R2's unread row, never a silent drop.
+    // The test is an in-memory pass over the record's own keys, so a scan of a folder
+    // already inside its scope pays no syscall for it.
+    let mut trimmed = 0usize;
+    if let Some(scope) = state.scope.clone() {
+        let excluded = state.excluded_dirs.clone();
+        let out_of_scope =
+            |p: &[u8]| !scope.admits_shape(p) || crate::store::under_excluded(p, &excluded);
+        // The record in force is the seen tree composed with the overrides, so a path the
+        // tree never held but an override sets still has to be trimmed (verifier F2).
+        let held_outside = state.tree.keys().any(|p| out_of_scope(p))
+            || state
+                .ledger
+                .overrides
+                .iter()
+                .any(|(k, o)| matches!(o.blob, Some(Some(_))) && out_of_scope(k.as_bytes()));
+        if held_outside {
+            trimmed = state
+                .trim_ops(ctx.clock.as_ref())
+                .trim(&out_of_scope, &NoFault)?;
+        }
+    }
     let out = scan::scan(&ScanInputs {
         store: &state.store,
         index: &state.index,
@@ -1097,6 +1169,7 @@ fn scan_root(state: &mut RootState, ctx: &ScanCtx) -> Result<Pile, EngineError> 
         case_insensitive: state.case_insensitive,
         collapsed_globs: &ctx.collapsed,
         collapse_size_bytes: ctx.collapse_size_bytes,
+        scope: state.scope.as_ref(),
         excluded_dirs: &state.excluded_dirs,
         index_tmp: &state.paths.index_tmp,
         row_cap: ctx.row_cap,
@@ -1105,6 +1178,13 @@ fn scan_root(state: &mut RootState, ctx: &ScanCtx) -> Result<Pile, EngineError> 
     // The two per-root ledger facts the reducer may never read for itself (design review
     // F8), stamped here rather than inside `scan` because the expiry needs a wall clock and
     // the engine owns the injected one.
+    if trimmed > 0 {
+        pile.notices.push(format!(
+            "{} path{} outside the root's scope dropped from its record",
+            crate::count::with_thousands(trimmed),
+            if trimmed == 1 { "" } else { "s" }
+        ));
+    }
     pile.undo = state.ledger.undo.len();
     pile.snoozed_until = ledger::snooze_active(state.ledger.snoozed_until.as_deref(), ctx.now);
     if out.nested_repos != state.nested_repos {
@@ -1462,16 +1542,31 @@ impl Engine {
     ) -> Result<Restored, EngineError> {
         let result = {
             let mut ops = self.ops(root)?;
-            match &req {
-                RestoreRequest::Hunk {
-                    rendered,
-                    hunks,
-                    index,
-                } => ops.restore_hunk(rendered, hunks, *index, fault),
-                RestoreRequest::File(rendered) if rendered.oid.is_none() => {
-                    ops.restore_deletion(rendered, fault)
+            // An unread row is not a deletion, whatever `oid` says on it: nothing was read,
+            // so there is nothing to put back and the file must not be removed. The check
+            // sits ahead of both arms, so every request gets that answer and not the
+            // deletion route's (verifier F3, hoisted for the hunk arm by G3); `restore_file`
+            // and `restore_hunk` refuse the same way for a caller that skips the engine.
+            let (RestoreRequest::Hunk { rendered, .. } | RestoreRequest::File(rendered)) = &req;
+            if rendered.unread {
+                Ok(Outcome {
+                    refused: vec![Refused::NotRead {
+                        path: rendered.path.clone(),
+                    }],
+                    ..Default::default()
+                })
+            } else {
+                match &req {
+                    RestoreRequest::Hunk {
+                        rendered,
+                        hunks,
+                        index,
+                    } => ops.restore_hunk(rendered, hunks, *index, fault),
+                    RestoreRequest::File(rendered) if rendered.oid.is_none() => {
+                        ops.restore_deletion(rendered, fault)
+                    }
+                    RestoreRequest::File(rendered) => ops.restore_file(rendered, fault),
                 }
-                RestoreRequest::File(rendered) => ops.restore_file(rendered, fault),
             }
         };
         let outcome = match result {
@@ -1945,6 +2040,10 @@ fn first_sight(
     store: &Store,
     head: &HeadState,
     draft_initial: DraftInitial,
+    // `Some` for a watched folder: how much of it this root covers, and the folders
+    // inside it another root looks after. `None` for a repository, whose first sight
+    // comes from `HEAD`.
+    watched: Option<(&DraftScope, &[ExcludedDir])>,
     clock: &dyn Clock,
 ) -> Result<Ledger, EngineError> {
     let seen_tree = match kind {
@@ -1960,7 +2059,12 @@ fn first_sight(
             None => None,
         },
         RootKind::Draft => match draft_initial {
-            DraftInitial::Seen => Some(store.tree_of_disk()?),
+            // Only what the folder covers, and nothing at or above the size limit: a
+            // first sight of a folder holding a disk image never copies it.
+            DraftInitial::Seen => match watched {
+                Some((scope, excluded)) => Some(store.tree_of_disk(scope, excluded)?),
+                None => None,
+            },
             DraftInitial::Pending => None,
         },
     };
@@ -2247,6 +2351,9 @@ pub(crate) mod tests {
             kind: RootKind::Git,
             parent: std::fs::canonicalize(repo.parent_dir()).unwrap(),
             badge: None,
+            scope: None,
+            name: "budget".to_owned(),
+            excluded_dirs: Vec::new(),
         };
         drop(engine);
         let engine = Engine::open(&loaded, &resolved, &env, EngineOptions::default()).unwrap();
@@ -4011,6 +4118,81 @@ pub(crate) mod tests {
         );
         assert!(engine.root(&draft).unwrap().ledger.seen_tree.is_some());
         assert!(engine.scan(&draft).unwrap().is_empty());
+    }
+
+    /// Amendment v1.13 R6 (verifier F2): the trim's trigger has to look at the overrides
+    /// too. A single-file accept of a path the seen tree never held leaves the record
+    /// holding it in an override alone, and narrowing the scope must still drop it on the
+    /// very next scan rather than waiting for some later fold to surprise the reader.
+    #[test]
+    fn engine_scope_trim_fires_for_a_blob_override_outside_the_scope() {
+        let repo = FixtureRepo::new("eng-trim-over").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let drafts = repo.parent_dir().join("_drafts");
+        std::fs::create_dir_all(&drafts).unwrap();
+        std::fs::write(drafts.join("n1.md"), "one\n").unwrap();
+        let wide = Config {
+            draft_dirs: vec!["_drafts/**".to_owned()],
+            draft_initial: DraftInitial::Seen,
+            ..Config::default()
+        };
+        let narrow = Config {
+            draft_dirs: vec!["_drafts".to_owned()],
+            ..wide.clone()
+        };
+        let mut engine = open_engine(&repo, &state, wide);
+        let draft = engine
+            .roots()
+            .iter()
+            .find(|r| r.kind == RootKind::Draft)
+            .map(|r| r.path.clone())
+            .expect("a draft root");
+        assert!(engine.scan(&draft).unwrap().is_empty());
+        std::fs::create_dir_all(drafts.join("sub")).unwrap();
+        std::fs::write(drafts.join("sub/new.md"), "n\n").unwrap();
+        let pile = engine.scan(&draft).unwrap();
+        let rendered = Rendered::of(pile.row(b"sub/new.md").expect("the deep row"));
+        assert!(
+            engine
+                .ops(&draft)
+                .unwrap()
+                .accept_file(&rendered, &NoFault)
+                .unwrap()
+                .refused
+                .is_empty()
+        );
+        {
+            // The premise: the accept wrote an override, and the seen tree itself still
+            // knows nothing about the deep path.
+            let r = engine.root(&draft).unwrap();
+            assert!(!r.tree.contains_key(b"sub/new.md".as_slice()));
+            assert!(matches!(
+                r.ledger.overrides.get("sub/new.md").map(|o| &o.blob),
+                Some(Some(Some(_)))
+            ));
+        }
+        drop(engine);
+
+        let mut engine = open_engine(&repo, &state, narrow);
+        let pile = engine.scan(&draft).unwrap();
+        assert!(
+            pile.notices
+                .iter()
+                .any(|n| n == "1 path outside the root's scope dropped from its record"),
+            "{:?}",
+            pile.notices
+        );
+        assert!(
+            !engine
+                .root(&draft)
+                .unwrap()
+                .ledger
+                .overrides
+                .contains_key("sub/new.md"),
+            "the out-of-scope override is gone"
+        );
+        // And no later fold has a surprise left to deliver.
+        assert!(engine.scan(&draft).unwrap().notices.is_empty());
     }
 
     #[test]

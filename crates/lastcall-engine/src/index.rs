@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use crate::git::{self, DiffEntry, GitError, Oid, StoreGit};
 use crate::paths::RepoPaths;
-use crate::store::RootKind;
+use crate::store::{DraftScope, RootKind};
 
 const LOCK_RETRIES: u32 = 3;
 const LOCK_BACKOFF: Duration = Duration::from_millis(50);
@@ -204,7 +204,28 @@ impl PrivateIndex {
 
     /// `ls-files -c core.ignorecase=false --others -z` with the user's excludes for git
     /// roots (`--exclude-standard` + `--exclude-from=<user info/exclude>`), none for drafts.
-    pub fn others(&self) -> Result<Vec<Other>, IndexError> {
+    pub fn others(&self, scope: Option<&DraftScope>) -> Result<Vec<Other>, IndexError> {
+        let args = self.others_args(scope);
+        let out = self.git.run(&args)?;
+        Ok(git::split_nul(&out)
+            .into_iter()
+            .filter_map(|rec| {
+                if let Some(dir) = rec.strip_suffix(b"/") {
+                    // Only a folder with a `.git` entry is another repository. Under
+                    // `--directory` git names ordinary folders the same way, so without
+                    // this check an untracked scratch folder would be reported as a
+                    // repository and then opened as one.
+                    self.is_repo_dir(dir)
+                        .then(|| Other::NestedRepo(dir.to_vec()))
+                } else {
+                    Some(Other::File(rec.to_vec()))
+                }
+            })
+            .collect())
+    }
+
+    /// The arguments `others` runs, kept apart so a test can read them.
+    fn others_args(&self, scope: Option<&DraftScope>) -> Vec<String> {
         let mut args: Vec<String> = vec![
             "-c".into(),
             "core.ignorecase=false".into(),
@@ -220,17 +241,31 @@ impl PrivateIndex {
                 args.push(format!("--exclude-from={}", f.display()));
             }
         }
-        let out = self.git.run(&args)?;
-        Ok(git::split_nul(&out)
-            .into_iter()
-            .map(|rec| {
-                if rec.ends_with(b"/") {
-                    Other::NestedRepo(rec[..rec.len() - 1].to_vec())
-                } else {
-                    Other::File(rec.to_vec())
-                }
-            })
-            .collect())
+        // A folder watched on its own: `--directory` makes git answer with the folder
+        // names it finds rather than opening them, so the listing costs one `read_dir`
+        // however much sits below. Deliberately **without** `--no-empty-directory`: that
+        // flag is what would make git look inside each one to see whether it is empty.
+        if scope.is_some_and(|s| !s.recursive) {
+            args.push("--directory".into());
+        }
+        args
+    }
+
+    /// Whether the root-relative folder `dir` holds a `.git` entry of either shape. An
+    /// `lstat` that fails for any reason other than "not there" answers `true`: reporting
+    /// a folder we cannot read as another repository leaves it alone, which is the safe
+    /// direction.
+    fn is_repo_dir(&self, dir: &[u8]) -> bool {
+        use std::os::unix::ffi::OsStrExt;
+        let full = self
+            .git
+            .root()
+            .join(std::ffi::OsStr::from_bytes(dir))
+            .join(".git");
+        match std::fs::symlink_metadata(&full) {
+            Ok(_) => true,
+            Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+        }
     }
 
     /// `ls-files --stage -z` of the private index (the case rule needs the index's names).
@@ -301,7 +336,7 @@ mod tests {
         index.seed(Some(&tree)).unwrap();
         assert!(index.refresh());
         assert!(index.diff_files().unwrap().is_empty());
-        assert!(index.others().unwrap().is_empty());
+        assert!(index.others(None).unwrap().is_empty());
 
         repo.write("f1", "changed\n");
         repo.remove("f3");
@@ -316,7 +351,7 @@ mod tests {
             diff.iter().map(|d| (d.status, d.path.as_slice())).collect();
         got.sort();
         assert_eq!(got, vec![('D', &b"f3"[..]), ('M', &b"f1"[..])]);
-        let others = index.others().unwrap();
+        let others = index.others(None).unwrap();
         assert_eq!(
             others,
             vec![
@@ -324,6 +359,79 @@ mod tests {
                 Other::File(b"new.txt".to_vec()),
             ],
             "user info/exclude honored, nested repo reported as a dir"
+        );
+    }
+
+    /// Amendment v1.13 R1, R2 and design review F6: a folder watched on its own is listed
+    /// with `--directory`, so git names the folders it finds instead of opening them, and
+    /// never with `--no-empty-directory`, which is the flag that would make it look inside.
+    /// A named folder is another repository only when it holds a `.git`.
+    #[test]
+    fn index_others_for_a_watched_folder_names_folders_and_checks_for_a_dot_git() {
+        let dir = TempDir::new("lc-index-draft");
+        let root = dir.mkdir("notes");
+        dir.write("notes/a.md", "a\n");
+        dir.write("notes/sub/b.md", "b\n");
+        dir.write("notes/sub/deep/c.md", "c\n");
+        let state = dir.mkdir("state");
+        let env = crate::env::Env::empty(dir.path())
+            .with_home(dir.mkdir("home"))
+            .with_var("GIT_CONFIG_GLOBAL", "/dev/null")
+            .with_var("GIT_CONFIG_SYSTEM", "/dev/null")
+            .with_var("GIT_CONFIG_NOSYSTEM", "1");
+        assert!(
+            crate::git::base_command(&env, &root)
+                .args(["init", "-q", "nested"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        dir.write("notes/nested/x", "x\n");
+        let paths = RepoPaths::under(state.join("repo"));
+        let (store, _) = Store::open(&env, &root, RootKind::Draft, &paths, None).unwrap();
+        let index = PrivateIndex::new(store.git().clone(), &paths, RootKind::Draft, None);
+        index.ensure(None).unwrap();
+        index.refresh();
+
+        let plain = DraftScope::plain(1 << 20);
+        let tree = DraftScope::tree(1 << 20);
+        let args = index.others_args(Some(&plain));
+        assert!(
+            args.iter().any(|a| a == "--directory"),
+            "a folder watched on its own is named, not opened: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a == "--no-empty-directory"),
+            "that flag is what would open each folder: {args:?}"
+        );
+        assert!(
+            !index
+                .others_args(Some(&tree))
+                .iter()
+                .any(|a| a == "--directory"),
+            "the tree scope keeps the existing walk"
+        );
+        assert!(
+            !index.others_args(None).iter().any(|a| a == "--directory"),
+            "a repository keeps the existing walk"
+        );
+
+        assert_eq!(
+            index.others(Some(&plain)).unwrap(),
+            vec![
+                Other::File(b"a.md".to_vec()),
+                Other::NestedRepo(b"nested".to_vec()),
+            ],
+            "`sub/` is an ordinary folder outside the scope, never a repository"
+        );
+        assert_eq!(
+            index.others(Some(&tree)).unwrap(),
+            vec![
+                Other::File(b"a.md".to_vec()),
+                Other::NestedRepo(b"nested".to_vec()),
+                Other::File(b"sub/b.md".to_vec()),
+                Other::File(b"sub/deep/c.md".to_vec()),
+            ]
         );
     }
 }

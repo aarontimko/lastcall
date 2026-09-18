@@ -39,6 +39,98 @@ pub enum RootKind {
     Draft,
 }
 
+/// A folder another root looks after, as a root-relative path, with whether everything
+/// below it belongs there (`true`, a folder watched with its whole tree) or only the files
+/// directly inside it (`false`, a folder watched on its own).
+pub type ExcludedDir = (Vec<u8>, bool);
+
+/// What one watched folder's record covers (Amendment v1.13).
+///
+/// Naming a folder covers the files directly inside it. Adding `/**` covers the tree below
+/// it as well, minus anything a repository or a more specific entry looks after. Either
+/// way a file at or above `max_bytes` is listed but never read, so pointing lastcall at a
+/// folder that happens to hold a disk image or a video never turns into copying it.
+///
+/// One value answers the question for every surface that asks it — the first sight's disk
+/// walk, a scan's candidate list and the trim that prunes a record after the setting
+/// changes — so the three can never disagree about what belongs to a folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DraftScope {
+    /// Whether the tree below the folder is covered too.
+    pub recursive: bool,
+    /// `collapse_size_bytes`: a regular file this big or bigger is never read.
+    pub max_bytes: u64,
+}
+
+impl DraftScope {
+    /// The folder on its own.
+    pub fn plain(max_bytes: u64) -> Self {
+        Self {
+            recursive: false,
+            max_bytes,
+        }
+    }
+
+    /// The folder and the tree below it.
+    pub fn tree(max_bytes: u64) -> Self {
+        Self {
+            recursive: true,
+            max_bytes,
+        }
+    }
+
+    /// Whether `rel`'s **shape** is covered: a folder watched on its own covers only what
+    /// sits directly inside it. Size is a separate question on purpose — what a folder
+    /// lists and what it reads are not the same thing, so a file that grew past the limit
+    /// keeps its row instead of vanishing.
+    pub fn admits_shape(&self, rel: &[u8]) -> bool {
+        self.recursive || !rel.contains(&b'/')
+    }
+
+    /// Whether `rel` is covered **and** small enough to read, given its `lstat`.
+    pub fn admits(&self, rel: &[u8], meta: &std::fs::Metadata) -> bool {
+        self.admits_shape(rel) && !self.too_big(meta)
+    }
+
+    /// Whether this file is at or above the size at which reading stops. A symlink's own
+    /// size is the text of the link, which is always short enough; a folder is not a file.
+    pub fn too_big(&self, meta: &std::fs::Metadata) -> bool {
+        meta.file_type().is_file() && meta.len() >= self.max_bytes
+    }
+}
+
+/// Whether `rel` sits under one of the folders another root looks after. A folder watched
+/// on its own only claims its direct children, so the tree below it is still this root's.
+pub fn under_excluded(rel: &[u8], excluded: &[ExcludedDir]) -> bool {
+    excluded.iter().any(|(dir, recursive)| {
+        rel.len() > dir.len()
+            && rel.starts_with(dir)
+            && rel[dir.len()] == b'/'
+            && (*recursive || !rel[dir.len() + 1..].contains(&b'/'))
+    })
+}
+
+/// Whether the whole tree below `rel` belongs to another root, so the walk need not open
+/// it at all.
+fn dir_fully_excluded(rel: &[u8], excluded: &[ExcludedDir]) -> bool {
+    excluded.iter().any(|(dir, recursive)| {
+        *recursive
+            && (rel == dir.as_slice()
+                || (rel.len() > dir.len() && rel.starts_with(dir) && rel[dir.len()] == b'/'))
+    })
+}
+
+/// One `lstat` answer, kept so the size rule and the hashing pass can share it instead of
+/// each paying its own syscall.
+#[derive(Debug, Clone)]
+pub enum MetaOf {
+    Present(std::fs::Metadata),
+    /// Nothing at the path: a recorded file that has been deleted.
+    Absent,
+    /// The `lstat` itself failed, with the reason to show.
+    Failed(String),
+}
+
 /// Config keys copied from the user's repo into the store (§6.1).
 pub const COPIED_CONFIG_KEYS: &[&str] = &[
     "core.autocrlf",
@@ -362,28 +454,47 @@ impl Store {
     /// symlinks, directories and names `--stdin-paths` would misread take the single-path
     /// route.
     pub fn hash_paths(&self, rels: &[Vec<u8>]) -> Vec<Current> {
+        let metas: Vec<MetaOf> = rels.iter().map(|rel| self.lstat(rel)).collect();
+        self.hash_paths_with(rels, &metas)
+    }
+
+    /// One `symlink_metadata`, never following a link.
+    pub fn lstat(&self, rel: &[u8]) -> MetaOf {
+        let full = self.git.root().join(OsStr::from_bytes(rel));
+        match std::fs::symlink_metadata(&full) {
+            Ok(m) => MetaOf::Present(m),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => MetaOf::Absent,
+            Err(e) => MetaOf::Failed(e.to_string()),
+        }
+    }
+
+    /// [`Store::hash_paths`] over `lstat` answers the caller already has. A watched folder
+    /// has to know every candidate's size before it decides which ones to read, so it does
+    /// that pass itself and hands the results here rather than paying for them twice.
+    pub fn hash_paths_with(&self, rels: &[Vec<u8>], metas: &[MetaOf]) -> Vec<Current> {
+        assert_eq!(rels.len(), metas.len(), "one lstat answer per path");
         let mut out: Vec<Option<Current>> = vec![None; rels.len()];
         let mut batch: Vec<usize> = Vec::new();
-        let mut metas: Vec<Option<std::fs::Metadata>> = Vec::with_capacity(rels.len());
-        for (i, rel) in rels.iter().enumerate() {
-            let full = self.git.root().join(OsStr::from_bytes(rel));
-            match std::fs::symlink_metadata(&full) {
-                Ok(m) => {
-                    if m.file_type().is_file() && Self::batchable(rel) {
+        let metas: Vec<Option<std::fs::Metadata>> = metas
+            .iter()
+            .enumerate()
+            .map(|(i, m)| match m {
+                MetaOf::Present(m) => {
+                    if m.file_type().is_file() && Self::batchable(&rels[i]) {
                         batch.push(i);
                     }
-                    metas.push(Some(m));
+                    Some(m.clone())
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                MetaOf::Absent => {
                     out[i] = Some(Current::Absent);
-                    metas.push(None);
+                    None
                 }
-                Err(e) => {
-                    out[i] = Some(Current::Unhashable(e.to_string()));
-                    metas.push(None);
+                MetaOf::Failed(reason) => {
+                    out[i] = Some(Current::Unhashable(reason.clone()));
+                    None
                 }
-            }
-        }
+            })
+            .collect();
         if !batch.is_empty() {
             let mut stdin = Vec::new();
             for &i in &batch {
@@ -616,12 +727,21 @@ impl Store {
         Ok(())
     }
 
-    /// A tree of the current disk content (draft first sight): a temp index,
+    /// A tree of the current disk content (a watched folder's first sight): a temp index,
     /// `update-index --add -z --stdin` over the file list (which writes the blobs), then
     /// `write-tree`. Never `git add`. Skips `.git` entries and nested repositories.
-    pub fn tree_of_disk(&self) -> Result<Oid, StoreError> {
+    ///
+    /// `scope` says how much of the folder this is: without `recursive` only the files
+    /// directly inside it, and either way nothing at or above `scope.max_bytes` — a large
+    /// file is never copied into the store, which is what keeps a first sight of a folder
+    /// holding a disk image cheap. `excluded` are the folders other roots look after.
+    pub fn tree_of_disk(
+        &self,
+        scope: &DraftScope,
+        excluded: &[ExcludedDir],
+    ) -> Result<Oid, StoreError> {
         let mut files: Vec<Vec<u8>> = Vec::new();
-        walk_files(self.git.root(), Path::new(""), &mut files)?;
+        walk_files(self.git.root(), Path::new(""), scope, excluded, &mut files)?;
         files.sort();
         let _ = std::fs::remove_file(&self.index_tmp);
         self.seed_tmp_index(None)?;
@@ -645,7 +765,13 @@ impl Store {
     }
 }
 
-fn walk_files(root: &Path, rel: &Path, out: &mut Vec<Vec<u8>>) -> Result<(), StoreError> {
+fn walk_files(
+    root: &Path,
+    rel: &Path,
+    scope: &DraftScope,
+    excluded: &[ExcludedDir],
+    out: &mut Vec<Vec<u8>>,
+) -> Result<(), StoreError> {
     let dir = root.join(rel);
     let entries = std::fs::read_dir(&dir).map_err(|e| io_err(&dir, e))?;
     for entry in entries {
@@ -655,19 +781,29 @@ fn walk_files(root: &Path, rel: &Path, out: &mut Vec<Vec<u8>>) -> Result<(), Sto
             continue;
         }
         let child_rel = rel.join(&name);
+        let child_bytes = child_rel.as_os_str().as_bytes().to_vec();
+        // `DirEntry::metadata` is an `lstat` on unix: a symlink's own size, never its
+        // target's.
         let meta = match entry.metadata() {
             Ok(m) => m,
             Err(_) => continue,
         };
         let ft = meta.file_type();
         if ft.is_dir() {
-            // A nested repository is another root (D9).
-            if root.join(&child_rel).join(".git").exists() {
+            // A nested repository is another root (D9), and so is a folder watched with
+            // its whole tree: neither is opened here.
+            if !scope.recursive
+                || dir_fully_excluded(&child_bytes, excluded)
+                || root.join(&child_rel).join(".git").exists()
+            {
                 continue;
             }
-            walk_files(root, &child_rel, out)?;
-        } else if ft.is_file() || ft.is_symlink() {
-            out.push(child_rel.as_os_str().as_bytes().to_vec());
+            walk_files(root, &child_rel, scope, excluded, out)?;
+        } else if (ft.is_file() || ft.is_symlink())
+            && scope.admits(&child_bytes, &meta)
+            && !under_excluded(&child_bytes, excluded)
+        {
+            out.push(child_bytes);
         }
     }
     Ok(())
@@ -1002,12 +1138,128 @@ pub(crate) mod tests {
         let (store, notices) = Store::open(&env, &root, RootKind::Draft, &paths, None).unwrap();
         assert!(notices.is_empty());
         assert!(!store.dir().join("objects/info/alternates").exists());
-        let tree = store.tree_of_disk().unwrap();
+        let tree = store
+            .tree_of_disk(&DraftScope::tree(u64::MAX), &[])
+            .unwrap();
         let entries = store.ls_tree(&tree).unwrap();
         let paths: Vec<&[u8]> = entries.keys().map(Vec::as_slice).collect();
         assert_eq!(paths, vec![&b"a.md"[..], &b"l"[..], &b"sub/b.md"[..]]);
         assert_eq!(entries[&b"l"[..]].0, Mode::Symlink);
         assert!(store.exists(&entries[&b"a.md"[..]].1), "blobs were written");
+    }
+
+    /// Amendment v1.13 R1 and R2: a folder watched on its own records the files directly
+    /// inside it, a folder watched with its whole tree records the tree, and neither
+    /// records a file at or above the size at which reading stops. The boundary is
+    /// at-or-above: `max_bytes - 1` is recorded and `max_bytes` is not.
+    #[test]
+    fn store_tree_of_disk_under_each_scope_and_the_size_boundary() {
+        let dir = TempDir::new("lc-draft-scope");
+        let root = dir.mkdir("notes");
+        let max = 4096u64;
+        dir.write("notes/a.md", "a\n");
+        std::fs::write(root.join("just_under.bin"), vec![b'x'; max as usize - 1]).unwrap();
+        std::fs::write(root.join("at_limit.bin"), vec![b'x'; max as usize]).unwrap();
+        dir.write("notes/sub/b.md", "b\n");
+        std::fs::write(root.join("sub/big.bin"), vec![b'x'; max as usize]).unwrap();
+        // A symlink's own size is the text of the link, so a link to a large file is read.
+        std::os::unix::fs::symlink("at_limit.bin", root.join("link_to_big")).unwrap();
+        let state = dir.mkdir("state");
+        let env = Env::empty(dir.path()).with_home(dir.mkdir("home"));
+        let paths = RepoPaths::under(state.join("repo"));
+        let (store, _) = Store::open(&env, &root, RootKind::Draft, &paths, None).unwrap();
+        let recorded = |scope: &DraftScope, excluded: &[ExcludedDir]| -> Vec<String> {
+            let tree = store.tree_of_disk(scope, excluded).unwrap();
+            store
+                .ls_tree(&tree)
+                .unwrap()
+                .keys()
+                .map(|k| String::from_utf8_lossy(k).into_owned())
+                .collect()
+        };
+
+        assert_eq!(
+            recorded(&DraftScope::plain(max), &[]),
+            vec![
+                "a.md".to_owned(),
+                "just_under.bin".to_owned(),
+                "link_to_big".to_owned(),
+            ],
+            "one folder, and nothing at the limit"
+        );
+        assert_eq!(
+            recorded(&DraftScope::tree(max), &[]),
+            vec![
+                "a.md".to_owned(),
+                "just_under.bin".to_owned(),
+                "link_to_big".to_owned(),
+                "sub/b.md".to_owned(),
+            ],
+            "the tree, still nothing at the limit"
+        );
+        // A folder another root looks after is not this root's, whether that root reads its
+        // tree or only its direct files.
+        assert!(
+            !recorded(&DraftScope::tree(max), &[(b"sub".to_vec(), true)])
+                .contains(&"sub/b.md".to_owned())
+        );
+        assert!(
+            !recorded(&DraftScope::tree(max), &[(b"sub".to_vec(), false)])
+                .contains(&"sub/b.md".to_owned())
+        );
+    }
+
+    /// The size predicate on its own, at the boundary and on the shapes that are not
+    /// regular files.
+    #[test]
+    fn store_draft_scope_predicate_at_the_boundary() {
+        let dir = TempDir::new("lc-scope-pred");
+        let root = dir.mkdir("r");
+        std::fs::write(root.join("under"), vec![b'x'; 99]).unwrap();
+        std::fs::write(root.join("at"), vec![b'x'; 100]).unwrap();
+        dir.mkdir("r/d");
+        std::os::unix::fs::symlink("at", root.join("l")).unwrap();
+        let meta = |n: &str| std::fs::symlink_metadata(root.join(n)).unwrap();
+        let scope = DraftScope::plain(100);
+        assert!(!scope.too_big(&meta("under")));
+        assert!(scope.too_big(&meta("at")), "at the limit is not read");
+        assert!(!scope.too_big(&meta("d")), "a folder is not a file");
+        assert!(
+            !scope.too_big(&meta("l")),
+            "a symlink carries its link text"
+        );
+
+        assert!(scope.admits(b"a.md", &meta("under")));
+        assert!(
+            !scope.admits(b"sub/a.md", &meta("under")),
+            "one folder only"
+        );
+        assert!(!scope.admits(b"a.md", &meta("at")));
+        assert!(DraftScope::tree(100).admits(b"sub/a.md", &meta("under")));
+        // Shape and size are separate questions: what a folder lists is not what it reads.
+        assert!(scope.admits_shape(b"a.md"));
+        assert!(!scope.admits_shape(b"sub/a.md"));
+        assert!(DraftScope::tree(100).admits_shape(b"sub/deep/a.md"));
+    }
+
+    /// A folder watched on its own claims its direct children only, so the tree below it
+    /// still belongs to the root above (design review F2, scenario F8).
+    #[test]
+    fn store_under_excluded_reads_the_recursive_flag() {
+        let recursive = [(b"research".to_vec(), true)];
+        let plain = [(b"research".to_vec(), false)];
+        assert!(under_excluded(b"research/b.md", &recursive));
+        assert!(under_excluded(b"research/deep/c.md", &recursive));
+        assert!(under_excluded(b"research/b.md", &plain));
+        assert!(
+            !under_excluded(b"research/deep/c.md", &plain),
+            "the inner root reads nothing below its own folder"
+        );
+        assert!(!under_excluded(b"research", &plain), "the folder itself");
+        assert!(
+            !under_excluded(b"researchy/b.md", &plain),
+            "prefix, not path"
+        );
     }
 
     /// The contract deliverable 1 rests on: the oid a save records **before** it writes is

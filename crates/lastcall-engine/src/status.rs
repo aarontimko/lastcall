@@ -73,6 +73,12 @@ pub struct RootStatus {
     /// deadline that has already passed. Additive in v1.11 (`status_version` stays 1).
     pub snoozed_until: Option<String>,
     pub notices: Vec<String>,
+    /// What the text report calls this root: the engine's own name for it, which for a
+    /// watched folder carries the folders above it. Deliberately **not** serialized: the
+    /// JSON report is a frozen shape (R7), and `root` already carries the path this is
+    /// derived from.
+    #[serde(skip)]
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -240,10 +246,16 @@ impl RootStatus {
             undo: pile.map(|p| p.undo).unwrap_or(0),
             snoozed_until: pile.and_then(|p| p.snoozed_until.clone()),
             notices,
+            name: root.name(),
         }
     }
 
+    /// The name the text report shows. The engine's name when there is one; the path's last
+    /// component otherwise, which is what a report built by hand in a test gets.
     pub fn name(&self) -> String {
+        if !self.name.is_empty() {
+            return self.name.clone();
+        }
         Path::new(&self.root)
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -403,6 +415,7 @@ pub fn row_line(row: &RowStatus) -> String {
         Some(Collapsed::Glob) => s.push_str("  (collapsed)"),
         Some(Collapsed::Binary) => s.push_str("  (binary)"),
         Some(Collapsed::Size) => s.push_str("  (large)"),
+        Some(Collapsed::Unread { .. }) => s.push_str("  (not read)"),
         None => s.push_str(&format!("  +{} −{}", row.added, row.deleted)),
     }
     match row.annotation {

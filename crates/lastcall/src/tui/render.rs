@@ -895,10 +895,15 @@ fn render_nav(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
         } else {
             bold()
         };
-        spans.push(Span::styled(view.meta.name.clone(), name_style));
+        // A watched folder's name can carry folders above it (`repo/z_ignore`), so a name
+        // wider than the column is cut at the **head**: the tail is the folder itself,
+        // which is the half that tells two rows apart.
+        let used: usize = spans.iter().map(|s| s.content.width()).sum();
+        let name = ellipsize_head(&view.meta.name, width.saturating_sub(used));
+        spans.push(Span::styled(name.clone(), name_style));
         let remote = view.meta.remote.as_deref().filter(|_| app.show_remote);
         if let Some(remote) = remote {
-            let budget = width.saturating_sub(view.meta.name.width() + 2);
+            let budget = width.saturating_sub(name.width() + 2);
             if budget >= 2 {
                 spans.push(Span::raw("  "));
                 spans.push(Span::styled(ellipsize(remote, budget), dim()));
@@ -1261,6 +1266,15 @@ fn render_main(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
                     spans.push(Span::raw(format!("  {label}")));
                 }
                 lines.push(Line::from(spans));
+                // R5: where this root actually is, under the two lines that say what it
+                // is. A name can be a folder name two repositories share, and a watched
+                // folder's name is a name the configuration chose, so the answer to
+                // "which one is this?" has to be on the pane rather than in the reader's
+                // memory. Dim, and for a root of any kind — an empty one too.
+                lines.push(Line::from(Span::styled(
+                    view.meta.path_shown.clone(),
+                    dim(),
+                )));
                 push_notices(&mut lines, view.notices());
                 for row in view.rows() {
                     lines.push(nav_row_line(row, true, usize::MAX));
@@ -1550,6 +1564,9 @@ fn render_row_body(
                 Collapsed::Glob => "glob",
                 Collapsed::Binary => "binary",
                 Collapsed::Size => "size",
+                // The label carries the limit the config set, so the line says why the
+                // content is missing without the reader going looking for the number.
+                Collapsed::Unread { .. } => "unread",
             };
             let tail = if kind == Collapsed::Binary {
                 " · not expandable"
@@ -1564,15 +1581,26 @@ fn render_row_body(
                 }
                 _ => String::new(),
             };
-            let mut line = single(
-                format!(
-                    "collapsed ({name}) · +{} −{}{tail}{mode}",
-                    with_thousands(row.added),
-                    with_thousands(row.deleted)
+            // A file too large to read has no counts to print and nothing to expand: the
+            // line is the label alone, so the row says what happened and stops there.
+            let mut line = match kind {
+                Collapsed::Unread { over_bytes } => single(
+                    format!(
+                        "not read (over {}){mode}",
+                        lastcall_engine::scan::size_limit_label(over_bytes)
+                    ),
+                    dim(),
                 ),
-                dim(),
-            );
-            if kind != Collapsed::Binary {
+                _ => single(
+                    format!(
+                        "collapsed ({name}) · +{} −{}{tail}{mode}",
+                        with_thousands(row.added),
+                        with_thousands(row.deleted)
+                    ),
+                    dim(),
+                ),
+            };
+            if !matches!(kind, Collapsed::Binary | Collapsed::Unread { .. }) {
                 let control = format!("[{} expand]", control_key(app, "expand"));
                 if let Some(x) = right_align(&mut line, &control, area.width, dim()) {
                     hits.targets.push((
@@ -4635,6 +4663,56 @@ mod tests {
         assert!(
             !frame.contains("09:00:00"),
             "the time of day is noise here: {frame}"
+        );
+    }
+
+    /// R5: the pane for a selected root says where that root is, with the home folder
+    /// written `~`. A name is a folder name two repositories can share, and a watched
+    /// folder's name is one the configuration chose, so the path is the line that answers
+    /// "which one is this?".
+    #[test]
+    fn render_a_selected_root_shows_where_it_is() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(120, 30));
+        app.select(Some(Selection::Root(root("notes"))));
+        let (frame, _) = frame_of(&app, 120, 30);
+        assert!(frame.contains("~/W/notes"), "the path line: {frame}");
+        // And for a root with nothing pending, whose first line is the empty sentence.
+        app.apply(pile_event_seq(
+            "notes",
+            2,
+            lastcall_engine::scan::Pile::default(),
+        ));
+        let (frame, _) = frame_of(&app, 120, 30);
+        assert!(
+            frame.contains("nothing pending in notes") && frame.contains("~/W/notes"),
+            "an empty root shows its path too: {frame}"
+        );
+    }
+
+    /// A watched folder's name can carry the folders above it, so a name wider than the nav
+    /// column is cut at the head: the tail is the folder itself.
+    #[test]
+    fn render_nav_cuts_a_long_root_name_at_the_head() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(120, 30));
+        app.nav_width = 20;
+        let long = "a-very-long-parent-folder/notes";
+        if let Some(view) = app.roots.get_mut(&root("notes")) {
+            view.meta.name = long.to_owned();
+        }
+        let (frame, _) = frame_of(&app, 120, 30);
+        assert!(
+            frame.contains("…"),
+            "a name wider than the column is cut: {frame}"
+        );
+        assert!(
+            !frame.contains("a-very-long-parent-folder/notes"),
+            "the whole name does not fit, so it is not there: {frame}"
+        );
+        assert!(
+            frame.contains("notes"),
+            "the tail survives the cut: {frame}"
         );
     }
 

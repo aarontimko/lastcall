@@ -80,8 +80,8 @@ expression: style
 13 34..66 Reset Reset BOLD
 13 67..68 Cyan Reset -
 13 99..100 Cyan Reset -
-14 1..6 Reset Reset BOLD|DIM
-14 6..27 Reset Reset DIM
+14 1..8 Reset Reset BOLD|DIM
+14 8..27 Reset Reset DIM
 14 27..28 Cyan Reset -
 14 28..32 Reset Reset DIM
 14 32..33 Cyan Reset -

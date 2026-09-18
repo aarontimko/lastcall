@@ -53,7 +53,7 @@ impl Scene {
         let tmp = TempDir::new("lc-tui");
         let parent = tmp.join("W");
         let state = tmp.join("state");
-        let built = fixture_parent::build(&parent, &state).expect("fixture builds");
+        let built = fixture_parent::build(&parent, &state, tmp.path()).expect("fixture builds");
         let env = engine_env_for(&built.parent, &built.home, &state);
         Scene {
             _tmp: tmp,
@@ -120,7 +120,12 @@ fn root_named(engine: &Engine, name: &str) -> PathBuf {
 fn app_of(engine: &mut Engine) -> App {
     let mut app = App::new();
     app.handle(Action::Resize(W, H));
-    let metas = engine.roots().into_iter().map(RootMeta::of).collect();
+    let home = engine.home_shown().map(std::path::Path::to_path_buf);
+    let metas = engine
+        .roots()
+        .into_iter()
+        .map(|r| RootMeta::of(r, home.as_deref()))
+        .collect();
     app.sync_roots(metas);
     for (root, seq, result) in engine.scan_all() {
         let pile = result.expect("scan succeeds");
@@ -176,9 +181,20 @@ fn draw(app: &App, w: u16, h: u16) -> (String, String) {
 }
 
 /// Pin `<name>_frame` and `<name>_styles`; the frame must also be reproducible.
+///
+/// No frame may carry a temporary directory. Every scene builds under one, so a frame that
+/// shows an absolute path would pin this machine's own into the repository and change from
+/// run to run; the header collapses the scene's home to `~`, and this is the check that it
+/// really did (R5).
 fn snapshot(name: &str, app: &App, w: u16, h: u16) {
     let (frame, style) = draw(app, w, h);
     assert_eq!(draw(app, w, h).0, frame, "{name}: screen = f(App, area)");
+    for temp in ["/var/", "/private/"] {
+        assert!(
+            !frame.contains(temp),
+            "{name}: a frame must not carry a temporary path ({temp}):\n{frame}"
+        );
+    }
     insta::assert_snapshot!(format!("{name}_frame"), frame);
     insta::assert_snapshot!(format!("{name}_styles"), style);
 }
@@ -455,9 +471,9 @@ fn tui_nav_collapsed_lockfile() {
 }
 
 /// Phase 6 gate item 3(b): the two size/binary collapse classes at the **frozen default**
-/// `collapse_size_bytes` (512 KiB), with the boundary row beside them — 524,288 bytes is
-/// not collapsed and keeps its hunks, 524,289 is `Size`, the PNG is `Binary`. The diff view
-/// is on the binary row.
+/// `collapse_size_bytes` (512 KiB), with the boundary row beside them — 524,287 bytes is
+/// not collapsed and keeps its hunks, 524,288 is the first size that is `Size`, the PNG is
+/// `Binary`. The diff view is on the binary row.
 #[test]
 fn tui_nav_collapsed_binary_and_size() {
     const LIMIT: usize = 512 * 1024;
@@ -465,6 +481,8 @@ fn tui_nav_collapsed_binary_and_size() {
     let line = |c: char| format!("{}\n", std::iter::repeat_n(c, 31).collect::<String>());
     let at_limit: String = std::iter::repeat_n(line('a'), LIMIT / 32).collect();
     assert_eq!(at_limit.len(), LIMIT);
+    // One byte under: the last line loses its terminator.
+    let under_limit = at_limit[..LIMIT - 1].to_owned();
     let mut png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR".to_vec();
     png.resize(2 * 1024 * 1024, b'\x42');
 
@@ -474,6 +492,7 @@ fn tui_nav_collapsed_binary_and_size() {
         .commit_files(
             &[
                 ("img.png", "placeholder\n"),
+                ("under_limit.txt", under_limit.as_str()),
                 ("at_limit.txt", at_limit.as_str()),
                 ("over_limit.txt", at_limit.as_str()),
             ],
@@ -486,21 +505,27 @@ fn tui_nav_collapsed_binary_and_size() {
     mark_seen(&mut engine, &alpha);
 
     alpha_repo.write("img.png", &png);
+    let mut changed_under = under_limit.clone();
+    changed_under.replace_range(0..32, &line('b'));
+    alpha_repo.write("under_limit.txt", &changed_under);
     let mut changed_at_limit = at_limit.clone();
     changed_at_limit.replace_range(0..32, &line('b'));
     alpha_repo.write("at_limit.txt", &changed_at_limit);
     alpha_repo.write("over_limit.txt", format!("{at_limit}x"));
 
     let mut app = app_of(&mut engine);
-    select_row(&mut app, &alpha, "at_limit.txt");
+    select_row(&mut app, &alpha, "under_limit.txt");
     let boundary = app.selected_row().unwrap();
-    assert_eq!(
-        boundary.collapsed, None,
-        "524,288 bytes is not over the limit"
-    );
+    assert_eq!(boundary.collapsed, None, "524,287 bytes is under the limit");
     assert!(
         !boundary.hunks.is_empty(),
         "the boundary row keeps its hunks"
+    );
+    select_row(&mut app, &alpha, "at_limit.txt");
+    assert_eq!(
+        app.selected_row().unwrap().collapsed,
+        Some(Collapsed::Size),
+        "the limit itself collapses"
     );
     select_row(&mut app, &alpha, "over_limit.txt");
     assert_eq!(
@@ -2263,12 +2288,18 @@ fn tui_tour_empty() {
     // The fixture has three roots; the card's condition needs fourteen. The extra eleven
     // are metas and empty piles, which is all the nav draws — no repository on disk is
     // needed to render a repository with nothing pending.
-    let mut metas: Vec<RootMeta> = engine.roots().into_iter().map(RootMeta::of).collect();
+    let home = engine.home_shown().map(std::path::Path::to_path_buf);
+    let mut metas: Vec<RootMeta> = engine
+        .roots()
+        .into_iter()
+        .map(|r| RootMeta::of(r, home.as_deref()))
+        .collect();
     let parent = metas[0].parent.clone();
     for i in 0..11 {
         let name = format!("repo{i:02}");
         metas.push(RootMeta {
             path: parent.join(&name),
+            path_shown: format!("~/W/{name}"),
             name,
             kind: RootKind::Git,
             parent: parent.clone(),

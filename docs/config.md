@@ -55,17 +55,23 @@ the session.
 | key | default | what it does |
 |---|---|---|
 | `parent_dirs` | `[]`, meaning the directory you launched in | absolute paths. Every git repository directly under each one is watched, and a repository sitting untracked inside one of those is listed too, with a badge. A repository one plain folder deeper (for example `worktrees/<name>`) is reached with `search_depth`, or with its own entry here when it lives somewhere else entirely. |
-| `draft_dirs` | `[]` | directories that are **not** git repositories, each reviewed as a root of its own. Globs relative to a parent directory (`"_drafts/**"`, `"notes"`) or absolute paths. |
-| `draft_initial` | `"seen"` | what the first sight of a draft root means. `seen` starts from zero, so only changes made after that are pending. `pending` treats everything already there as pending. |
+| `draft_dirs` | `[]` | folders that are **not** git repositories, each reviewed as a root of its own. Entries are relative to a parent directory (`"notes"`, `"*/scratch"`) or absolute paths. A plain entry reviews **the files in that folder**, and nothing below it; add `/**` to review the folder and everything below it, minus any git repository inside it and anything an inner entry of its own already reviews. `*` matches within one folder name and never across a `/`; `**` as a whole component reaches up to four folders down, and an entry may name at most four folders. A file of `collapse_size_bytes` or more is never read in a watched folder, whatever the shape: it is counted in one notice instead. |
+| `draft_dir_parents` | `1` | how many folders above a watched folder its name shows, `0` to `4`. With `1`, a `z_ignore` folder inside a repository is listed as `repo/z_ignore`, which is what tells two folders of the same name apart. `0` is the matched folder's path relative to the directory it was found under, so an entry of `notes` shows `notes` and an entry of `*/notes` shows `a/notes`. |
+| `draft_initial` | `"seen"` | what the first sight of a watched folder means. `seen` starts from zero, so only changes made after that are pending. `pending` treats everything already there as pending. |
 | `collapsed_globs` | the nine common lockfiles | paths shown as one collapsed row instead of a wall of hunks. The default list is `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `Cargo.lock`, `poetry.lock`, `uv.lock`, `Gemfile.lock`, `go.sum`, `composer.lock`. Setting the key replaces the list. |
-| `collapse_size_bytes` | `524288` (512 KiB) | files at or above this size collapse too. Must be greater than zero. A file with a NUL byte in its first 8,000 is binary and collapses whatever this says. |
+| `collapse_size_bytes` | `524288` (512 KiB) | files at or above this size collapse too. Must be greater than zero. A file with a NUL byte in its first 8,000 is binary and collapses whatever this says. This is also the size at which a file in a watched folder stops being read at all, so raising it to see larger diffs in your repositories also makes watched folders read larger files, and their records grow with them. |
 | `ignore_globs` | `.git/**`, `node_modules/**`, `target/**`, `vendor/**`, `.venv/**` | these scope the filesystem watcher only. An ignored path never wakes a scan, but the next scan still reports a tracked edit under it, so this is a noise filter and not a way to hide changes. |
 | `hide_empty_repos` | `false` | what the `t` toggle starts as. `false` lists every repository under a parent directory, whether it has anything pending or not. `true` opens with the empty ones hidden, except one carrying an agent flag. `t` flips it for the session, and the headless commands are unaffected. The welcome on your first launch offers to write `true` here for you. |
 | `search_depth` | `1` | how many folders below each parent directory are read for a repository. `1` is the repositories directly inside it, `2` also reads one plain folder further, such as `worktrees/<name>`, and lists a worktree kept inside a listed repository (one git call per listed repository, each rescan), up to `4`. The walk never enters a repository or a dependency folder such as `node_modules`, `target`, `.venv` or `vendor`, and it runs again every thirty seconds, so `3` and `4` want a narrow parent directory rather than a home directory. The welcome on your first launch offers to write `2` here for you. The key is new in this release: a 0.1.0 binary refuses a config file that has it, so delete the line before going back to that version. |
 
 ```toml
 parent_dirs = ["/home/me/src"]
-draft_dirs = ["_drafts/**", "notes"]
+draft_dirs = [
+  "notes",            # the files in notes/, and nothing below it
+  "_drafts/**",       # _drafts/ and everything below it
+  "*/z_ignore",       # the scratch folder of each repository, its own files only
+]
+draft_dir_parents = 1  # listed as `repo/z_ignore`, not `z_ignore`
 draft_initial = "seen"
 collapsed_globs = ["package-lock.json", "Cargo.lock", "*.min.js"]
 collapse_size_bytes = 524288

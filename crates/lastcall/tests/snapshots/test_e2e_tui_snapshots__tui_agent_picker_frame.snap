@@ -16,7 +16,7 @@ expression: frame
 "│  A u2  +2 −0  [mixed]    │    ┌ send to ────────────────────────┐                                │"
 "│  upstream · 1 file       │    │ flagged f1 hunk 1 — send to:    │                                │"
 "│──────────────────────────│    │                                 │                                │"
-"│notes                     │    │   claude · lastcall · blocked   │                                │"
+"│W/notes                   │    │   claude · lastcall · blocked   │                                │"
 "│  draft · 1 file          │    │ ▸ codex · spike · working       │                                │"
 "│  M n2.md  +2 −0          │    │                                 │                                │"
 "│                          │    │ ↑↓ choose   ⏎ send   Esc cancel │                                │"

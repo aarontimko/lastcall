@@ -289,10 +289,24 @@ impl UndoOp {
 /// `Absent` on a path the seen tree has and back to `Empty` on a path it does not — which
 /// is exactly the distinction, recovered from the tree rather than stored (design review
 /// F1, Phase 7's F17 rule).
+///
+/// The one baseline the tree cannot answer for is a watched folder's **release**: a `null`
+/// with a note on a path the record never held, which the collapse would send back to
+/// `Empty` and leave as a flag-only override, i.e. as *the record holds this path* (verifier
+/// H1). `released` records that case and nothing else. It is written only when true, so an
+/// entry from a repository, and every entry written before this field existed, is the same
+/// two keys it always was.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UndoPath {
     pub baseline: Option<Oid>,
     pub mode: Option<Mode>,
+    #[serde(default, skip_serializing_if = "is_not_set")]
+    pub released: bool,
+}
+
+/// `skip_serializing_if` for a flag that is absent from the document unless it is true.
+fn is_not_set(b: &bool) -> bool {
+    !*b
 }
 
 /// One reversible operation, newest last. Serialised last in the document.
@@ -394,6 +408,22 @@ impl Override {
     /// Whether the override still carries anything worth storing.
     pub fn is_empty(&self) -> bool {
         self.blob.is_none() && self.flags.is_empty()
+    }
+
+    /// Whether a fold has to leave this override's `blob` where it is (verifier G1).
+    ///
+    /// A fold folds every override into the seen tree and then clears it, because the tree
+    /// now says what the override said. One shape cannot be folded away: R2's release of a
+    /// path in a **watched folder** — `blob: null` on a file too large to read — when the
+    /// user's note is still on it. The tree cannot hold "seen as absent", so clearing the
+    /// blob would leave a flag-only override, which the scan reads as "the record holds
+    /// this path" and shows again. The note has to survive every fold (R6) and so does the
+    /// accept, so the release stays.
+    ///
+    /// The caller adds the other half of the test: the new tree does not hold the path.
+    /// A repository's record never takes this branch, so its folds are what they were.
+    pub fn survives_fold(&self, kind: RootKind) -> bool {
+        kind == RootKind::Draft && matches!(self.blob, Some(None)) && !self.flags.is_empty()
     }
 }
 
@@ -510,9 +540,16 @@ impl Ledger {
         }
     }
 
-    /// Overrides that carry a `blob` field (the compaction trigger counts these).
+    /// Overrides a fold would fold away (the compaction trigger counts these).
+    ///
+    /// Every override that carries a `blob`, minus the releases a fold has to keep
+    /// (verifier G1): counting those would hold the record permanently over the threshold
+    /// and make every later accept re-run a compaction that changes nothing.
     pub fn blob_override_count(&self) -> usize {
-        self.overrides.values().filter(|o| o.blob.is_some()).count()
+        self.overrides
+            .values()
+            .filter(|o| o.blob.is_some() && !o.survives_fold(self.kind))
+            .count()
     }
 
     /// Push one undo entry, dropping the oldest past [`UNDO_CAP`].

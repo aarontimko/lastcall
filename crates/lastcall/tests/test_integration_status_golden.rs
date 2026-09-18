@@ -26,7 +26,8 @@ const GOLDEN: &str = concat!(
 fn status_json(parallelism: usize) -> String {
     let w = TempDir::new("lc-golden-w");
     let state = TempDir::new("lc-golden-state");
-    let built = fixture_parent::build(w.path(), state.path()).expect("fixture builds");
+    let built =
+        fixture_parent::build(w.path(), state.path(), &state.join("home")).expect("fixture builds");
     let config = state.join("config.toml");
     fixture_parent::write_config(&config, w.path()).unwrap();
 
