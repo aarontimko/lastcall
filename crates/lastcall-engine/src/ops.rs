@@ -2421,6 +2421,10 @@ impl Ops<'_> {
         // tree says. A repository's record has no releases of this shape, so its folds are
         // byte-for-byte what they were.
         let mut releases: BTreeSet<String> = BTreeSet::new();
+        // The new tree's entries, listed at most once per fold: the release rule reads them
+        // and so does the cache at the end, and a second `ls-tree` of the same oid would be
+        // a git process the fold does not need (verifier H5).
+        let mut entries: Option<TreeEntries> = None;
         if self.ledger.kind == RootKind::Draft {
             let mut candidates: BTreeSet<String> = self
                 .ledger
@@ -2442,10 +2446,10 @@ impl Ops<'_> {
                 }
             }
             if !candidates.is_empty() {
-                let entries = self.store.ls_tree(&new_tree)?;
+                let listed = entries.insert(self.store.ls_tree(&new_tree)?);
                 releases = candidates
                     .into_iter()
-                    .filter(|k| !entries.contains_key(k.as_bytes()))
+                    .filter(|k| !listed.contains_key(k.as_bytes()))
                     .collect();
             }
         }
@@ -2477,7 +2481,10 @@ impl Ops<'_> {
         ledger::commit_tmp(self.paths, &tmp)?;
         drop(_lock);
         self.staged.clear();
-        *self.tree = self.store.ls_tree(&new_tree)?;
+        *self.tree = match entries {
+            Some(listed) => listed,
+            None => self.store.ls_tree(&new_tree)?,
+        };
         self.index.seed(Some(&new_tree))?;
         Ok(Folded {
             refused: None,
