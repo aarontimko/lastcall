@@ -5298,6 +5298,161 @@ mod tests {
         );
     }
 
+    /// H3, clause one of `survives_fold`: **a repository is not a watched folder.** An
+    /// accepted deletion with a note on it is a `null` beside a flag there too, and it is
+    /// counted toward compaction and folded away like every other override. Nothing else
+    /// in the tier says so, so dropping the `RootKind::Draft` test would change a
+    /// repository's record on disk and no test would notice.
+    #[test]
+    fn ops_a_repositorys_accepted_deletion_with_a_note_counts_and_folds_away() {
+        let mut d = proptests::Draft::new("lc-h3-git-null");
+        d.write("a.md", b"a\n");
+        d.write("f.txt", b"f\n");
+        d.first_sight(&DraftScope::tree(u64::MAX));
+        d.make_git_root();
+        assert!(
+            d.ops()
+                .flag(b"f.txt", "agent says look", None, None, &NoFault)
+                .unwrap()
+                .ok()
+        );
+        std::fs::remove_file(d.root.join("f.txt")).unwrap();
+        let pile = d.scan();
+        let r = Rendered::of(pile.row(b"f.txt").expect("the deletion is a row"));
+        assert!(d.ops().accept_deletion(&r, &NoFault).unwrap().ok());
+        assert_eq!(d.ledger().overrides["f.txt"].blob, Some(None));
+        assert_eq!(
+            d.ledger().blob_override_count(),
+            1,
+            "a repository counts a `null` toward its compaction"
+        );
+
+        d.write("a.md", b"a2\n");
+        let pile = d.scan();
+        assert!(d.ops().accept_all(&pile, &NoFault).unwrap().ok());
+        let o = &d.ledger().overrides["f.txt"];
+        assert!(
+            o.blob.is_none() && o.mode.is_none() && o.flags.len() == 1,
+            "the fold takes the deletion into the tree and leaves the note alone: {o:?}"
+        );
+        assert_eq!(d.seen_paths(), vec!["a.md".to_owned()]);
+        assert_eq!(d.ledger().blob_override_count(), 0);
+        assert!(d.scan().rows.is_empty());
+    }
+
+    /// H3, clause two: **a release is a `null`, never an accepted blob.** A note on a file
+    /// whose content the reader accepted still counts toward compaction, so a folder full
+    /// of flagged accepts compacts on schedule instead of growing forever.
+    #[test]
+    fn ops_a_flagged_content_accept_still_counts_toward_compaction() {
+        let mut d = proptests::Draft::new("lc-h3-flagged-content");
+        d.write("a.md", b"a\n");
+        d.first_sight(&DraftScope::tree(u64::MAX));
+        assert!(
+            d.ops()
+                .flag(b"a.md", "check this", None, None, &NoFault)
+                .unwrap()
+                .ok()
+        );
+        d.set_threshold(0);
+        d.write("a.md", b"a2\n");
+        let pile = d.scan();
+        let r = Rendered::of(pile.row(b"a.md").expect("the edited file is pending"));
+        let out = d.ops().accept_file(&r, &NoFault).unwrap();
+        assert!(out.ok());
+        assert!(
+            out.compacted,
+            "one flagged blob override is over a threshold of 0"
+        );
+        assert_eq!(d.ledger().blob_override_count(), 0, "the fold folded it in");
+        assert_eq!(d.ledger().overrides["a.md"].flags.len(), 1);
+    }
+
+    /// H3, clause three: **the note is what makes a release worth keeping.** A reader who
+    /// lets an unread row go without writing anything about it leaves nothing to come back
+    /// to, so the next fold collapses that override like any other and the record stops
+    /// carrying the path at all.
+    #[test]
+    fn ops_an_unflagged_release_is_folded_away_like_any_other_override() {
+        let mut d = proptests::Draft::new("lc-h3-unflagged");
+        d.write("a.md", b"a\n");
+        d.write("big.bin", b"n\n");
+        d.first_sight(&DraftScope::tree(u64::MAX));
+        assert_eq!(
+            d.seen_paths(),
+            vec!["a.md".to_owned(), "big.bin".to_owned()],
+            "both files are in the record while the file is small"
+        );
+
+        // The recorded file grows past the limit: a row, because the record holds it, and
+        // nobody has written a note on it.
+        d.write("big.bin", &vec![b'x'; 3_000]);
+        let pile = d.scan_at(UNREAD_LIMIT);
+        let row = pile
+            .row(b"big.bin")
+            .expect("the recorded large file is a row");
+        assert!(matches!(
+            row.collapsed,
+            Some(crate::scan::Collapsed::Unread { .. })
+        ));
+        assert!(
+            d.ops()
+                .accept_file(&Rendered::of(row), &NoFault)
+                .unwrap()
+                .ok()
+        );
+        assert_eq!(d.ledger().overrides["big.bin"].blob, Some(None));
+        assert_eq!(
+            d.ledger().blob_override_count(),
+            1,
+            "with no note on it, the release is an override a fold folds away"
+        );
+
+        d.write("a.md", b"a2\n");
+        let pile = d.scan_at(UNREAD_LIMIT);
+        assert!(d.ops().accept_all(&pile, &NoFault).unwrap().ok());
+        assert!(
+            !d.ledger().overrides.contains_key("big.bin"),
+            "nothing left to keep: {:?}",
+            d.ledger().overrides
+        );
+        assert_eq!(d.ledger().blob_override_count(), 0);
+        assert_eq!(d.seen_paths(), vec!["a.md".to_owned()]);
+        let pile = d.scan_at(UNREAD_LIMIT);
+        assert!(pile.rows.is_empty());
+        assert_eq!(pile.notices, vec!["1 file over 1 KiB not read".to_owned()]);
+    }
+
+    /// H3, the fold's own half of the rule: a release is kept only while the new tree does
+    /// **not** hold the path. The file shrinks back under the limit, the reader accepts it
+    /// as content through an accept-all, and the tree gains the path: keeping the `null`
+    /// beside it would mean the record let go of a path it holds, and the row would never
+    /// clear.
+    #[test]
+    fn ops_a_release_collapses_once_the_fold_puts_the_path_back_in_the_tree() {
+        let (mut d, pile) = flagged_unread_draft("lc-h3-shrunk");
+        release_the_row(&mut d, &pile);
+        assert_still_released(&d, "after the accept");
+
+        d.write("big.bin", b"small\n");
+        let pile = d.scan_at(UNREAD_LIMIT);
+        assert_eq!(pile_lines(&pile), vec!["big.bin".to_owned()]);
+        assert!(d.ops().accept_all(&pile, &NoFault).unwrap().ok());
+
+        let o = &d.ledger().overrides["big.bin"];
+        assert!(
+            o.blob.is_none() && o.mode.is_none() && o.flags.len() == 1,
+            "the tree holds the content now, so only the note is left: {o:?}"
+        );
+        assert_eq!(
+            d.seen_paths(),
+            vec!["a.md".to_owned(), "big.bin".to_owned()]
+        );
+        let pile = d.scan_at(UNREAD_LIMIT);
+        assert!(pile.rows.is_empty(), "{:?}", pile_lines(&pile));
+        assert!(pile.notices.is_empty(), "{:?}", pile.notices);
+    }
+
     /// Kickoff deliverable 8 (ii)/(iii): property tests over one draft root per test — a
     /// private store on a temp dir, no user repo, the `RootKind::Draft` plumbing exactly as
     /// the engine opens one. Each case rewrites the file set and resets the ledger to first
@@ -5428,8 +5583,12 @@ mod tests {
                 &self.ledger
             }
 
+            /// Re-label the record as a repository's, on disk as well as in memory: an op
+            /// merges the ledger from disk under its lock, so a kind set only in memory
+            /// would be read back as the folder's on the very next accept.
             pub(super) fn make_git_root(&mut self) {
                 self.ledger.kind = RootKind::Git;
+                ledger::save(&self.paths, &self.ledger).unwrap();
             }
 
             fn set(&self, name: &str, content: Option<&[u8]>) {
