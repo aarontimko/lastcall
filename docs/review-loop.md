@@ -224,7 +224,9 @@ Three things to know:
   holding open in a merge conflict, and one whose bytes git's own filters do not reproduce
   exactly (a line-ending conversion or a clean filter that is not round trip safe) are all
   refused rather than written over. The status line names the file and the reason, and the
-  row stays where it was.
+  row stays where it was. A row the folder never read is one of those refusals: there is
+  nothing recorded to put back, so it is not asked about at all and the status line says
+  `not read; restore is not offered`.
 
 ## 5. Flag
 

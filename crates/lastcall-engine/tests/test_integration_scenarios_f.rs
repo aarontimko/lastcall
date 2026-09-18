@@ -597,6 +597,33 @@ fn scenario_f6_a_record_that_already_holds_a_large_file() {
         Some(lastcall_engine::scan::Collapsed::Unread { .. })
     ));
     assert!(notices_about(&pile, "not read").is_empty());
+
+    // Verifier F3: restore is not offered on that row. It was never read, so there is
+    // nothing to put back, and the engine must not read `oid: None` as a deletion and
+    // remove the file the size rule deliberately left alone.
+    let rendered = Rendered::of(pile.row(b"big.bin").unwrap());
+    let out = s
+        .engine
+        .restore(
+            &draft,
+            lastcall_engine::engine::RestoreRequest::File(rendered),
+        )
+        .expect("restore call");
+    assert_eq!(
+        out.outcome
+            .refused
+            .iter()
+            .map(|r| r.message("restored"))
+            .collect::<Vec<_>>(),
+        vec!["big.bin: not read; restore is not offered".to_owned()]
+    );
+    assert!(!out.outcome.written);
+    assert_eq!(
+        std::fs::read(s.repo.path().join("z_ignore/big.bin")).unwrap(),
+        vec![b'y'; max],
+        "F3: the bytes the folder never read are untouched"
+    );
+
     assert!(accept_file(&mut s, &draft, "big.bin").ok());
     let pile = assert_pile!(s.engine, draft, "", "accepted");
     assert_eq!(recorded(&s, &draft), vec!["a.md".to_owned()]);

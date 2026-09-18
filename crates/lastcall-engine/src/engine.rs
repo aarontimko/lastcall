@@ -1548,7 +1548,10 @@ impl Engine {
                     hunks,
                     index,
                 } => ops.restore_hunk(rendered, hunks, *index, fault),
-                RestoreRequest::File(rendered) if rendered.oid.is_none() => {
+                // An unread row is not a deletion, whatever `oid` says on it: nothing was
+                // read, so there is nothing to put back and the file must not be removed.
+                // `restore_file` is the one place that refusal lives (verifier F3).
+                RestoreRequest::File(rendered) if rendered.oid.is_none() && !rendered.unread => {
                     ops.restore_deletion(rendered, fault)
                 }
                 RestoreRequest::File(rendered) => ops.restore_file(rendered, fault),

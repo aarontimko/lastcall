@@ -2936,6 +2936,23 @@ impl App {
             self.set_status(NOTHING_TO_RESTORE);
             return (Changed::Yes, None);
         }
+        // R2 (verifier F3): a row the folder never read has nothing to put back, so the
+        // question would be a promise the engine refuses anyway. Say the engine's own
+        // words and ask nothing.
+        if self
+            .roots
+            .get(scope.root())
+            .and_then(|v| v.row(scope.path()))
+            .is_some_and(|r| matches!(r.collapsed, Some(Collapsed::Unread { .. })))
+        {
+            self.set_status(
+                Refused::NotRead {
+                    path: scope.path().to_vec(),
+                }
+                .message("restored"),
+            );
+            return (Changed::Yes, None);
+        }
         if matches!(scope, RestoreScope::File { .. }) {
             self.confirm = Some(Confirm {
                 scope: ConfirmScope::Restore(scope),
@@ -7988,6 +8005,33 @@ mod tests {
             panic!("y starts it: {effect:?}");
         };
         assert!(matches!(reqs[0].1, RestoreRequest::File(_)), "{reqs:?}");
+    }
+
+    /// R2 (verifier F3): a row the folder never read has nothing to put back, so `shift-u`
+    /// on it asks nothing at all and the status line carries the engine's own refusal
+    /// rather than a question the restore could not have honoured.
+    #[test]
+    fn app_restore_of_an_unread_row_asks_nothing_and_says_why() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        let mut p = alpha_collapsed(Collapsed::Unread {
+            over_bytes: 512 * 1024,
+        });
+        p.rows[0].current = None;
+        app.apply(pile_event_seq("alpha", 1, p));
+        app.select(Some(row("alpha", "f1")));
+
+        let (changed, effect) = app.handle(Action::RestoreFile);
+        assert_eq!((changed, effect), (Changed::Yes, None));
+        assert!(app.confirm.is_none(), "no question is asked");
+        assert!(app.restoring.is_none(), "and nothing starts");
+        assert_eq!(status(&app), "f1: not read; restore is not offered");
+
+        // `u` on the same row is the whole file (it has no hunks), and answers the same.
+        let (_, effect) = app.handle(Action::Restore);
+        assert!(effect.is_none(), "{effect:?}");
+        assert!(app.confirm.is_none());
+        assert_eq!(status(&app), "f1: not read; restore is not offered");
     }
 
     /// Restoring a file that is not in the baseline **removes** it, so the question says

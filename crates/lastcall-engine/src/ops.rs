@@ -145,6 +145,11 @@ pub enum Refused {
     /// that is no longer the one this root is on, so nothing is written and the staged work
     /// is dropped. `now` is the branch the ledger or `HEAD` names instead.
     BranchChanged { now: String },
+    /// The row was never read, because the file is at or over the size limit (R2). There is
+    /// no content on this side to put back and no baseline the reader has seen, so a
+    /// restore is refused rather than being read as the deletion that `oid: None` means on
+    /// every other row (verifier F3).
+    NotRead { path: Vec<u8> },
     /// The hunk list handed to `restore_hunk` does not reassemble the rendered content, so
     /// "everything but hunk k" would silently drop whatever is missing from it (verifier
     /// F3). The one refusal that is about the *caller's* view rather than the file.
@@ -200,6 +205,11 @@ impl Refused {
             Refused::NothingToUndo => "nothing to undo".to_string(),
             Refused::Conflicted { path } => {
                 format!("{}: unresolved merge conflict; not {verb}", lossy(path))
+            }
+            // The verb is fixed here too: the size rule's own accept is what clears an
+            // unread row, so a restore is the only operation that can raise this.
+            Refused::NotRead { path } => {
+                format!("{}: not read; restore is not offered", lossy(path))
             }
             Refused::Incomplete { path } => {
                 format!(
@@ -1422,6 +1432,15 @@ impl Ops<'_> {
                 ..Default::default()
             })
         };
+        // R2 (verifier F3): `oid: None` means "deleted" on every row but this one, where it
+        // means the folder never read the file. Nothing was read, so there is nothing to
+        // put back, and the deletion route below would remove a file the reader has never
+        // seen the contents of. Refuse, and say so in those words.
+        if rendered.unread {
+            return refuse(Refused::NotRead {
+                path: rendered.path.clone(),
+            });
+        }
         if rendered.oid.is_none() {
             return self.restore_deletion(rendered, fault);
         }
@@ -3602,6 +3621,43 @@ mod tests {
             std::fs::read(repo.path().join("f1")).unwrap(),
             b"moved on\n",
             "a refused restore leaves the working file exactly as it was"
+        );
+        assert!(temp_ghosts(repo.path()).is_empty());
+    }
+
+    /// R2 (verifier F3): a row the folder never read has no content on this side, which is
+    /// exactly why `oid` is `None` on it. Routing it into the deletion restore would
+    /// delete the large file the size rule deliberately left alone, so the restore is
+    /// refused instead and says why.
+    #[test]
+    fn ops_restore_refuses_an_unread_row_and_leaves_the_file_alone() {
+        let repo = FixtureRepo::new("ops-restore-unread").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        repo.write("f1", "grown past the limit\n");
+        let unread = Rendered {
+            path: b"f1".to_vec(),
+            oid: None,
+            mode: None,
+            baseline: h.tree_entries.get(&b"f1"[..]).map(|(_, o)| o.clone()),
+            baseline_mode: h.tree_entries.get(&b"f1"[..]).map(|(m, _)| *m),
+            unread: true,
+        };
+        let out = h.ops().restore_file(&unread, &NoFault).unwrap();
+        assert_eq!(out.refused.len(), 1, "{out:?}");
+        assert!(
+            matches!(&out.refused[0], Refused::NotRead { path } if path == b"f1"),
+            "{out:?}"
+        );
+        assert_eq!(
+            out.refused[0].message("restored"),
+            "f1: not read; restore is not offered"
+        );
+        assert!(!out.written, "no ledger write");
+        assert_eq!(
+            std::fs::read(repo.path().join("f1")).unwrap(),
+            b"grown past the limit\n",
+            "the bytes the folder never read are still there"
         );
         assert!(temp_ghosts(repo.path()).is_empty());
     }
