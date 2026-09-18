@@ -140,6 +140,20 @@ Legend for the harness column: **H** = verifiable with the git-plumbing harness 
 
 **F3 — Non-git draft dir.** Setup: `~/notes` (no `.git` anywhere above). Expect: same behavior as F1 using our private store as the repository and `~/notes` as the work tree. *(H)*
 
+*F4 to F9 are PROPOSED with Amendment v1.13 (Phase 12, kickoff `120-phase12-kickoff.md` R1 to R7). Paths are root-relative; a draft root's "scope" is the files a plain entry (one folder) or a `/**` entry (the tree) admits, never a regular file at or above `collapse_size_bytes`, never a nested repository or another draft root inside it.*
+
+**F4 — A plain entry reads one folder.** Setup: parent `W`, repo `W/repo1` with `.gitignore` `z_ignore/`, files `z_ignore/a.md`, `z_ignore/research/b.md`, `z_ignore/research/deep/c.md`; `draft_dirs = ["z_ignore"]`. Expect: one draft root at `W/repo1/z_ignore` named `repo1/z_ignore`; first sight (`seen`) records `a.md` only; pile `[]`. Action: edit `research/b.md` and `a.md` → pile `[a.md]`; add `research/deep/d.md` → unchanged; delete `research/b.md` → unchanged; accept `a.md` → `[]`; restart → `[]`. `status --json` lists no path under `research/`. *(H, I)*
+
+**F5 — `/**` opts into the tree.** Setup as F4 with `draft_dirs = ["z_ignore/**"]`. Expect: first sight records `a.md`, `research/b.md`, `research/deep/c.md`; F4's edits give `[a.md, research/b.md]`, the add gives `research/deep/d.md`, the delete shows `research/b.md` as a deletion. *(H, I)*
+
+**F6 — A large file is never read.** Setup as F4 plus `z_ignore/big.bin` of exactly `collapse_size_bytes` bytes and `z_ignore/small.bin` one byte below; `draft_dirs = ["z_ignore"]`. Expect: first sight records `a.md` and `small.bin`, not `big.bin`; the private store holds no blob of `big.bin`'s content; the root's notice reads `repo1/z_ignore: 1 file over 512 KiB not read`. Action: append one byte to `small.bin` (now at the threshold) → pile `[]`, notice `2 files …`; truncate `big.bin` to 10 bytes → pile `[big.bin]` (new), notice `1 file …`; a second large file → `2 files …`, one notice line, never two. Variant: `draft_dirs = ["z_ignore/**"]` and `research/huge.bin` at the threshold → not read, counted. *(H, I)*
+
+**F7 — Scope change without a restart.** Setup as F5 (recursive; first sight recorded the tree). Action: the entry becomes `"z_ignore"`, rescan. Expect: no first sight (`seen_at` unchanged); the record is trimmed to `a.md`, notice `repo1/z_ignore: 2 paths outside the root's scope dropped from its record`, no undo entry; pile `[]`. Then the entry becomes `"z_ignore/**"` again, rescan → `research/b.md` and `research/deep/c.md` pending as new (over-show, never hidden). *(H: the trim; I)*
+
+**F8 — Nested draft roots do not double-list.** Setup as F4 with `draft_dirs = ["z_ignore/**", "z_ignore/research"]`. Expect: two roots, `repo1/z_ignore` (tree) and `repo1/z_ignore/research` (one folder); `research/b.md` belongs to the inner root only; `research/deep/c.md` belongs to neither and is never a row; `a.md` belongs to the outer. An edit to `research/b.md` shows under `repo1/z_ignore/research` and not under `repo1/z_ignore`. *(I)*
+
+**F9 — Names and the walk.** Setup: parent `W`; repos `W/repo1` and `W/repo2`, each with `z_ignore/` and `z_ignore/research/`; `W/notes/` directly under the parent; `draft_dirs = ["z_ignore", "z_ignore/research", "notes"]`. Expect with `draft_dir_parents` unset (`1`): `repo1/z_ignore`, `repo1/z_ignore/research`, `repo2/z_ignore`, `repo2/z_ignore/research`, `W/notes`; with `0`: `z_ignore`, `z_ignore/research` (twice each; the path line tells them apart), `notes`; with `2`: `W/repo1/z_ignore` and so on. The walk: with `["z_ignore"]` and a directory `W/repo1/deep/deeper/z_ignore`, no root is discovered there (one level); with `["**/z_ignore"]` it is. `draft_dir_parents = 5` and a five-component entry are config errors naming the key. *(unit)*
+
 ## G. herdr integration (mock server unless marked S)
 
 **G1 — Bootstrap.** Expect: subscribe → ack → snapshot → resync-if-buffered; no event applied as state. *(E)*
