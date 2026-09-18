@@ -804,8 +804,8 @@ fn render_content(
     if row.collapsed.is_none() {
         if is_binary(&old) || is_binary(&new) {
             row.collapsed = Some(Collapsed::Binary);
-        } else if old.len() as u64 > inputs.collapse_size_bytes
-            || new.len() as u64 > inputs.collapse_size_bytes
+        } else if old.len() as u64 >= inputs.collapse_size_bytes
+            || new.len() as u64 >= inputs.collapse_size_bytes
         {
             row.collapsed = Some(Collapsed::Size);
         }
@@ -1347,6 +1347,32 @@ pub(crate) mod fixture_tests {
             };
             super::scan(&inputs).unwrap()
         }
+    }
+
+    /// `collapse_size_bytes` has read as at-or-above in `docs/config.md` since the key was
+    /// added; the ladder compared it with `>`, so a file of exactly that size showed its
+    /// hunks (design review F11). The boundary is the size itself.
+    #[test]
+    fn scan_a_file_of_exactly_collapse_size_bytes_collapses() {
+        let repo = FixtureRepo::new("scan-ladder").unwrap();
+        let state = TempDir::new("lc-scan-ladder");
+        let h = Harness::new(&repo, &state);
+        // The harness's limit is 1 KiB.
+        repo.write("f1", "x".repeat(1023));
+        let out = h.scan();
+        assert_eq!(out.pile.rows.len(), 1);
+        assert_eq!(
+            out.pile.rows[0].collapsed, None,
+            "one byte below the limit still shows its hunks"
+        );
+        repo.write("f1", "x".repeat(1024));
+        let out = h.scan();
+        assert_eq!(out.pile.rows.len(), 1);
+        assert_eq!(
+            out.pile.rows[0].collapsed,
+            Some(Collapsed::Size),
+            "at the limit the row collapses, as the config docs say"
+        );
     }
 
     #[test]
