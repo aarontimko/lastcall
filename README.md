@@ -30,7 +30,8 @@ morning.
   herdr you still get the whole review loop; the note goes to a file instead.
 - **An agent writes prose for you in a directory that is not a repository.** Notes, a
   draft for a wiki page, a document you will paste somewhere else. Point `draft_dirs` at
-  the directory and lastcall reviews it the same way, with no git involved.
+  the directory and lastcall reviews the files in it the same way, with no git involved;
+  add `/**` to the entry to take everything below it too.
 
 ## Who it is not for
 
@@ -51,7 +52,8 @@ opinion about your branches.
   updated live as files change. Branch groups, `+added −removed` counts per file, and the
   selected file's diff beside the list.
 - **Directories that are not repositories.** Notes, drafts, anything an agent writes
-  outside git: list them in `draft_dirs` and they get the same ledger, hunk by hunk.
+  outside git: list them in `draft_dirs` and they get the same ledger, hunk by hunk. An
+  entry is that one folder; `/**` on the end is the folder and everything below it.
 - **Four answers per hunk.** `a` accepts it, `u` puts it back, `m` flags it with a note,
   `i` opens the file for editing right there. Accepting is what shrinks the list, and it
   survives a restart.
