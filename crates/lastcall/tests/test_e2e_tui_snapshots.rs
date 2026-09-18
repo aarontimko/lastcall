@@ -455,9 +455,9 @@ fn tui_nav_collapsed_lockfile() {
 }
 
 /// Phase 6 gate item 3(b): the two size/binary collapse classes at the **frozen default**
-/// `collapse_size_bytes` (512 KiB), with the boundary row beside them — 524,288 bytes is
-/// not collapsed and keeps its hunks, 524,289 is `Size`, the PNG is `Binary`. The diff view
-/// is on the binary row.
+/// `collapse_size_bytes` (512 KiB), with the boundary row beside them — 524,287 bytes is
+/// not collapsed and keeps its hunks, 524,288 is the first size that is `Size`, the PNG is
+/// `Binary`. The diff view is on the binary row.
 #[test]
 fn tui_nav_collapsed_binary_and_size() {
     const LIMIT: usize = 512 * 1024;
@@ -465,6 +465,8 @@ fn tui_nav_collapsed_binary_and_size() {
     let line = |c: char| format!("{}\n", std::iter::repeat_n(c, 31).collect::<String>());
     let at_limit: String = std::iter::repeat_n(line('a'), LIMIT / 32).collect();
     assert_eq!(at_limit.len(), LIMIT);
+    // One byte under: the last line loses its terminator.
+    let under_limit = at_limit[..LIMIT - 1].to_owned();
     let mut png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR".to_vec();
     png.resize(2 * 1024 * 1024, b'\x42');
 
@@ -474,6 +476,7 @@ fn tui_nav_collapsed_binary_and_size() {
         .commit_files(
             &[
                 ("img.png", "placeholder\n"),
+                ("under_limit.txt", under_limit.as_str()),
                 ("at_limit.txt", at_limit.as_str()),
                 ("over_limit.txt", at_limit.as_str()),
             ],
@@ -486,21 +489,27 @@ fn tui_nav_collapsed_binary_and_size() {
     mark_seen(&mut engine, &alpha);
 
     alpha_repo.write("img.png", &png);
+    let mut changed_under = under_limit.clone();
+    changed_under.replace_range(0..32, &line('b'));
+    alpha_repo.write("under_limit.txt", &changed_under);
     let mut changed_at_limit = at_limit.clone();
     changed_at_limit.replace_range(0..32, &line('b'));
     alpha_repo.write("at_limit.txt", &changed_at_limit);
     alpha_repo.write("over_limit.txt", format!("{at_limit}x"));
 
     let mut app = app_of(&mut engine);
-    select_row(&mut app, &alpha, "at_limit.txt");
+    select_row(&mut app, &alpha, "under_limit.txt");
     let boundary = app.selected_row().unwrap();
-    assert_eq!(
-        boundary.collapsed, None,
-        "524,288 bytes is not over the limit"
-    );
+    assert_eq!(boundary.collapsed, None, "524,287 bytes is under the limit");
     assert!(
         !boundary.hunks.is_empty(),
         "the boundary row keeps its hunks"
+    );
+    select_row(&mut app, &alpha, "at_limit.txt");
+    assert_eq!(
+        app.selected_row().unwrap().collapsed,
+        Some(Collapsed::Size),
+        "the limit itself collapses"
     );
     select_row(&mut app, &alpha, "over_limit.txt");
     assert_eq!(
