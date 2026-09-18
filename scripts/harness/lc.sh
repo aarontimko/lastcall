@@ -307,6 +307,17 @@ lc_override_has_baseline() {   # lc_override_has_baseline PATH
   [ "$b" = null ] && return 0
   printf '%s' "$b" | grep -qE '^[0-9a-f]{40}$'
 }
+# The one override a fold keeps whole: inside a watched folder, the record letting a path go
+# (`null`) with the reader's note beside it. A fold that dropped it would leave the note
+# alone, which reads as "the record holds this path", and the row the reader accepted would
+# come back. The trim is a fold, so it keeps it too (verifier H2).
+lc_survives_fold() {   # lc_survives_fold PATH
+  [ "$LC_KIND" = draft ] || return 1
+  local o
+  o="$LC_STATE/overrides/$(enc "$1")"
+  [ -f "$o" ] || return 1
+  [ "$(cat "$o")" = null ] && lc_has_flag "$1"
+}
 # Does the record hold content for this path? The override's blob first (`null` is the
 # record letting the path go, which holds nothing), then a note with no baseline under it
 # (which keeps the path in front of the reader), then the seen tree.
@@ -374,7 +385,9 @@ TREE
     [ -n "$p" ] || continue
     lc_in_shape "$p" && continue
     # A note on its own is not a baseline: there is nothing for the trim to drop at that
-    # path, so it is neither dropped nor counted (verifier F5).
+    # path, so it is neither dropped nor counted (verifier F5). A release the reader wrote
+    # a note on is not one either: the fold keeps it, and the trim is a fold (verifier H2).
+    lc_survives_fold "$p" && continue
     lc_override_has_baseline "$p" || continue
     out="$out$p
 "
@@ -394,7 +407,9 @@ OVER
   fi
   printf '%s\n' "$out" | while IFS= read -r p; do
     # The path leaves the record, but the note on it stays: it is a file of its own and the
-    # trim never touches it, here as in the engine (verifier F5).
+    # trim never touches it, here as in the engine (verifier F5). A release with a note
+    # stays whole for the same reason the fold keeps it (verifier H2).
+    lc_survives_fold "$p" && continue
     lc_override_has_baseline "$p" || continue
     rm -f "$LC_STATE/overrides/$(enc "$p")" "$LC_STATE/overrides/$(enc "$p").mode"
   done

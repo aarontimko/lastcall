@@ -464,4 +464,25 @@ LC_SCOPE=tree
 assert_pile "F7 widening brings the path back as pending, never hidden" "sub/b.md"
 assert_str "F7 and the note is on the row that came back" "check this" "$(cat "$S/overrides/$(enc sub/b.md).flag" 2>/dev/null)"
 
+# F7 again, over a path the reader let go: the trim is a fold, so a release with a note on it
+# is kept whole rather than counted and dropped. Were it dropped, the note would be all that
+# is left, the record would read as holding the path again, and widening the entry would put
+# the accepted row back (verifier H2).
+mkdir -p "$W/trimrel/sub"
+echo a > "$W/trimrel/a.md"; echo k > "$W/trimrel/sub/k.md"
+S="$W/trimrel.state"; mkdir -p "$S"; lc_init "$W/trimrel" "$S" draft tree; lc_first_sight
+( cd "$W/trimrel" && dd if=/dev/zero of=sub/big.bin bs=1024 count=512 2>/dev/null )
+lc_flag sub/big.bin "deep and large"
+assert_pile "F7 the flagged large file under the folder is a row" "sub/big.bin"
+lc_accept_unread sub/big.bin
+assert_pile "F7 accepting it lets the path go" ""
+assert_str "F7 the record let it go" "ABSENT" "$(lc_baseline sub/big.bin)"
+LC_SCOPE=plain
+assert_str "F7 the trim counts the recorded path only, never the release" "1" "$(lc_scope_trim)"
+assert_str "F7 the release is still a release after the trim" "null" "$(cat "$S/overrides/$(enc sub/big.bin)" 2>/dev/null)"
+assert_str "F7 and its note is still there" "deep and large" "$(cat "$S/overrides/$(enc sub/big.bin).flag" 2>/dev/null)"
+LC_SCOPE=tree
+assert_pile "F7 widening brings back the recorded path, not the one let go" "sub/k.md"
+assert_str "F7 and the file let go is counted again" "1" "$(lc_unread_count)"
+
 echo; echo "PASS=$PASS FAIL=$FAIL"

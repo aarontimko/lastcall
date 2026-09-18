@@ -350,7 +350,10 @@ after all three candidate sources). `Ops::trim` drops them, by path shape only a
 size, through the same private `fold` that compaction uses: lock, merge, tmp and rename, one
 `Remove` per path, no undo entry and `seen_at` untouched. Flag-only overrides on dropped
 paths are kept, since they are the user's own notes, are not candidates after the filter,
-and return with the path if the scope widens later. One notice says how many went. Keeping
+and return with the path if the scope widens later. A release with a note on it is kept
+whole for the same reason a fold keeps one: the trim runs through `fold`, so the `null`
+stays beside the note and the path the reader let go does not come back as a row when the
+scope widens again. One notice says how many went. Keeping
 them instead would not be neutral: `ls-files --others --directory` descends into any
 directory that still has index entries beneath it, so the private index has to stop carrying
 them for the listing to stay cheap.
