@@ -84,10 +84,13 @@ pub enum Collapsed {
     },
 }
 
-/// A size limit as a reader's line: whole KiB where it divides, bytes otherwise.
+/// A size limit as a reader's line: whole KiB where it divides, bytes otherwise, and
+/// `1 byte` rather than `1 bytes` at the one size where the plural is wrong (verifier F7).
 pub fn size_limit_label(bytes: u64) -> String {
     if bytes.is_multiple_of(1024) {
         format!("{} KiB", with_thousands((bytes / 1024) as usize))
+    } else if bytes == 1 {
+        "1 byte".to_owned()
     } else {
         format!("{} bytes", with_thousands(bytes as usize))
     }
@@ -956,6 +959,10 @@ mod tests {
         assert_eq!(size_limit_label(1_048_576), "1,024 KiB");
         assert_eq!(size_limit_label(1_000), "1,000 bytes");
         assert_eq!(size_limit_label(1_500), "1,500 bytes");
+        // One byte is one byte (verifier F7). The rest of the vocabulary is plural.
+        assert_eq!(size_limit_label(1), "1 byte");
+        assert_eq!(size_limit_label(2), "2 bytes");
+        assert_eq!(size_limit_label(1_024), "1 KiB");
     }
 
     /// A watched folder, its record and its private index: the shape the size rule and the
