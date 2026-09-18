@@ -294,6 +294,13 @@ lc_verify_oid() { lcg cat-file -e "$1" 2>/dev/null; }
 # note only          = .flag alone          (the record still holds whatever the tree says)
 # released with note = `null` + .flag       (let go, and the note survives the fold)
 # accepted content   = oid (+ .mode)        (folded into the tree at the next accept-all)
+#
+# The suffixes are the twin's own convention and its one representational limit: a real file
+# whose name ends in `.flag` or `.mode` is indistinguishable from a marker beside its
+# neighbour, so the twin cannot model one and every fixture name here avoids those two
+# endings (verifier H4). The engine has no such limit: the ledger keeps the note in a field
+# of the override, not in a second file. Giving the markers their own directories would lift
+# it, and `.mode` predates this phase, so that is a change for its own branch.
 lc_flag() {   # lc_flag PATH [NOTE]
   printf '%s\n' "${2:-note}" > "$LC_STATE/overrides/$(enc "$1").flag"; }
 lc_has_flag() {   # lc_has_flag PATH
@@ -322,7 +329,11 @@ lc_survives_fold() {   # lc_survives_fold PATH
 # record letting the path go, which holds nothing), then a note with no baseline under it
 # (which keeps the path in front of the reader), then the seen tree.
 lc_record_holds() {   # lc_record_holds PATH
-  local p="$1" o="$LC_STATE/overrides/$(enc "$p")"
+  # Two statements, not one: `local p="$1" o="...$(enc "$p")"` is a single command, so the
+  # `$p` in the second word is expanded before the first is assigned and reads the caller's
+  # `p`, which aborts under `set -u` in a caller that has none (verifier H4).
+  local p o
+  p="$1"; o="$LC_STATE/overrides/$(enc "$p")"
   if [ -f "$o" ]; then [ "$(cat "$o")" != null ]; return; fi
   lc_has_flag "$p" && return 0
   local t; t="$(cat "$LC_STATE/seen_tree")"
