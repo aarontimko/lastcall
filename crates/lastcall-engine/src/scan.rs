@@ -30,7 +30,7 @@ use crate::git::{self, GitError, Mode, Oid, RepoGit};
 use crate::hunks::{self, Hunk};
 use crate::index::{IndexError, Other, PrivateIndex};
 use crate::ledger::{Baseline, BaselineResolver, Flag, Ledger, TreeEntries};
-use crate::store::{Current, Store, StoreError};
+use crate::store::{Current, DraftScope, ExcludedDir, MetaOf, Store, StoreError, under_excluded};
 
 /// Git's binary heuristic: a NUL within the first 8000 bytes.
 const BINARY_PROBE: usize = 8000;
@@ -76,6 +76,21 @@ pub enum Collapsed {
     Glob,
     Binary,
     Size,
+    /// A file in a watched folder that is at or above the size limit and is already in the
+    /// folder's record: it keeps its row, and the row says the content was not read. The
+    /// limit travels with the row so every surface prints the number the config set.
+    Unread {
+        over_bytes: u64,
+    },
+}
+
+/// A size limit as a reader's line: whole KiB where it divides, bytes otherwise.
+pub fn size_limit_label(bytes: u64) -> String {
+    if bytes.is_multiple_of(1024) {
+        format!("{} KiB", with_thousands((bytes / 1024) as usize))
+    } else {
+        format!("{} bytes", with_thousands(bytes as usize))
+    }
 }
 
 /// D5 pairing: the added row carries `From`, the deleted row carries `To`.
@@ -202,9 +217,12 @@ pub struct ScanInputs<'a> {
     /// live): the rest of the candidates, in path order, are neither hashed nor diffed,
     /// only counted in [`Pile::omitted`].
     pub row_cap: usize,
-    /// Root-relative directories owned by other roots (draft roots inside this one); only
-    /// `others` entries beneath them are excluded.
-    pub excluded_dirs: &'a [Vec<u8>],
+    /// `Some` for a watched folder: how much of it this root covers, and the size at which
+    /// it stops reading. `None` for a repository.
+    pub scope: Option<&'a DraftScope>,
+    /// Root-relative folders other roots look after (a watched folder inside this one),
+    /// with whether the whole tree below each belongs there.
+    pub excluded_dirs: &'a [ExcludedDir],
     /// `<repo>/index.tmp`, for D5 rename pairing.
     pub index_tmp: &'a Path,
 }
@@ -289,6 +307,25 @@ fn under_any(path: &[u8], dirs: &[Vec<u8>]) -> bool {
         .any(|d| path.len() > d.len() && path.starts_with(d) && path[d.len()] == b'/')
 }
 
+/// Whether the record holds an entry for `path` — an accepted content, else the seen
+/// tree's entry. The same order [`BaselineResolver::baseline`] resolves in, answered
+/// without reading any object, because the size rule has to know before the row cap
+/// whether a large file is one the user has already had on a screen.
+///
+/// An override that records the path as *absent* (an accepted deletion) is not an entry:
+/// there is nothing left to show, which is exactly the state accepting an unread row
+/// leaves behind.
+fn record_holds(inputs: &ScanInputs<'_>, path: &[u8]) -> bool {
+    let over = std::str::from_utf8(path)
+        .ok()
+        .and_then(|s| inputs.ledger.overrides.get(s));
+    match over.and_then(|o| o.blob.as_ref()) {
+        Some(Some(_)) => true,
+        Some(None) => false,
+        None => inputs.tree.contains_key(path),
+    }
+}
+
 fn is_binary(bytes: &[u8]) -> bool {
     bytes[..bytes.len().min(BINARY_PROBE)].contains(&0)
 }
@@ -316,7 +353,7 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
             inputs.index.diff_files()?
         }
     };
-    let others = inputs.index.others()?;
+    let others = inputs.index.others(inputs.scope)?;
     let mut nested_repos: Vec<Vec<u8>> = others
         .iter()
         .filter_map(|o| match o {
@@ -386,7 +423,7 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
     for o in &others {
         if let Other::File(p) = o
             && !under_any(p, &nested_repos)
-            && !under_any(p, inputs.excluded_dirs)
+            && !under_excluded(p, inputs.excluded_dirs)
         {
             candidates.insert(p.clone());
         }
@@ -412,6 +449,46 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
                     .is_ok()
         })
         .collect();
+
+    // 2b. The scope and the size limit of a watched folder (Amendment v1.13); a
+    // repository passes through untouched.
+    //
+    // One `lstat` per candidate, **before** the row cap: a file the folder is not reading
+    // must not take one of the cap's rows, and the answers are handed down to the hashing
+    // pass so the syscall is paid once per candidate per scan rather than twice.
+    //
+    // A file at or above the limit is never read. It still gets a row when the folder's
+    // record already holds an entry for it — the whole point of F1's fold: a file that
+    // grew past the limit after it was recorded must not disappear off the screen — and is
+    // only counted otherwise. A path with nothing at it is a deletion, not a large file.
+    let mut meta_of: HashMap<Vec<u8>, MetaOf> = HashMap::new();
+    let mut unread: HashSet<Vec<u8>> = HashSet::new();
+    let mut over_size = 0usize;
+    let candidates: Vec<Vec<u8>> = match inputs.scope {
+        None => candidates,
+        Some(scope) => {
+            let mut kept: Vec<Vec<u8>> = Vec::with_capacity(candidates.len());
+            for p in candidates {
+                if !scope.admits_shape(&p) || under_excluded(&p, inputs.excluded_dirs) {
+                    continue;
+                }
+                let meta = store.lstat(&p);
+                if let MetaOf::Present(m) = &meta
+                    && scope.too_big(m)
+                {
+                    if record_holds(inputs, &p) {
+                        unread.insert(p.clone());
+                    } else {
+                        over_size += 1;
+                        continue;
+                    }
+                }
+                meta_of.insert(p.clone(), meta);
+                kept.push(p);
+            }
+            kept
+        }
+    };
 
     // 3. The row cap, decided before any hashing: override paths (flags live there) are
     // always materialised; every other candidate — diff-files, others, case-rule and
@@ -441,8 +518,23 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
     };
 
     // Current side hashed in one batch per call; a row per path whose sides differ.
+    let over_bytes = inputs.collapse_size_bytes;
     let mut materialise = |paths: &[Vec<u8>], rows: &mut Vec<Row>| {
-        let currents = store.hash_paths(paths);
+        // A file over the limit is handed on as "nothing there", which is how it reaches
+        // the hashing pass without being hashed: its row is built from the record alone.
+        let metas: Vec<MetaOf> = paths
+            .iter()
+            .map(|p| {
+                if unread.contains(p) {
+                    return MetaOf::Absent;
+                }
+                match meta_of.get(p) {
+                    Some(m) => m.clone(),
+                    None => store.lstat(p),
+                }
+            })
+            .collect();
+        let currents = store.hash_paths_with(paths, &metas);
         for (path, current) in paths.iter().zip(currents) {
             let current = if forced_absent.contains(path) {
                 Current::Absent
@@ -468,6 +560,31 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
                 notices.push(format!(
                     "{lossy}: non-UTF-8 path; shown pending, accept is refused in v1"
                 ));
+            }
+
+            if unread.contains(path) {
+                let Some(base) = base_entry else {
+                    // The record's entry cannot be read back (its object was pruned), so
+                    // there is nothing for a row to stand on: the file is simply one this
+                    // folder is not reading.
+                    over_size += 1;
+                    continue;
+                };
+                rows.push(Row {
+                    path: path.clone(),
+                    change: Change::Modified,
+                    baseline: Some(base),
+                    current: None,
+                    added: 0,
+                    deleted: 0,
+                    hunks: Vec::new(),
+                    annotation: None,
+                    conflicted: is_conflicted,
+                    collapsed: Some(Collapsed::Unread { over_bytes }),
+                    flags,
+                    rename: None,
+                });
+                continue;
             }
 
             let (change, cur_entry) = match current {
@@ -533,6 +650,8 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
     let mut wanted: Vec<Oid> = rows
         .iter()
         .filter(|r| !matches!(r.change, Change::Typechange | Change::Unreadable))
+        // An unread row has no content to diff, and its recorded blob may itself be large.
+        .filter(|r| !matches!(r.collapsed, Some(Collapsed::Unread { .. })))
         .flat_map(|r| [&r.baseline, &r.current])
         .flatten()
         .map(|e| e.oid.clone())
@@ -603,6 +722,16 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
             with_thousands(inputs.row_cap)
         ));
     }
+    // One line per scan, with the count as it stands now: it replaces the last scan's
+    // line rather than adding to it, and there is no line at all when nothing was skipped.
+    if over_size > 0 {
+        notices.push(format!(
+            "{} file{} over {} not read",
+            with_thousands(over_size),
+            if over_size == 1 { "" } else { "s" },
+            size_limit_label(inputs.collapse_size_bytes)
+        ));
+    }
     Ok(ScanOutput {
         pile: Pile {
             rows,
@@ -628,6 +757,10 @@ fn render_content(
     row: &mut Row,
     notices: &mut Vec<String>,
 ) -> Result<(), ScanError> {
+    // An unread row already carries its verdict, and it is the truer one.
+    if matches!(row.collapsed, Some(Collapsed::Unread { .. })) {
+        return Ok(());
+    }
     if inputs
         .collapsed_globs
         .is_match(Path::new(OsStr::from_bytes(&row.path)))
@@ -799,6 +932,227 @@ pub fn pile_lines(pile: &Pile) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::PrivateIndex;
+    use crate::ledger::{Ledger, SeenAt};
+    use crate::paths::RepoPaths;
+    use crate::store::RootKind;
+    use lastcall_testkit::tmp::TempDir;
+
+    /// The size limit as the notices print it.
+    #[test]
+    fn scan_size_limit_label_reads_in_whole_kib_where_it_divides() {
+        assert_eq!(size_limit_label(524_288), "512 KiB");
+        assert_eq!(size_limit_label(1_048_576), "1,024 KiB");
+        assert_eq!(size_limit_label(1_000), "1,000 bytes");
+        assert_eq!(size_limit_label(1_500), "1,500 bytes");
+    }
+
+    /// A watched folder, its record and its private index: the shape the size rule and the
+    /// scope filter are read against (Amendment v1.13 R1, R2).
+    struct Watched {
+        dir: TempDir,
+        root: PathBuf,
+        store: Store,
+        index: PrivateIndex,
+        ledger: Ledger,
+        tree: TreeEntries,
+        globs: globset::GlobSet,
+        paths: RepoPaths,
+        max: u64,
+    }
+
+    impl Watched {
+        fn new(max: u64) -> Self {
+            let dir = TempDir::new("lc-scan-draft");
+            let root = dir.mkdir("notes");
+            let state = dir.mkdir("state");
+            let env = crate::env::Env::empty(dir.path())
+                .with_home(dir.mkdir("home"))
+                .with_var("GIT_CONFIG_GLOBAL", "/dev/null")
+                .with_var("GIT_CONFIG_SYSTEM", "/dev/null")
+                .with_var("GIT_CONFIG_NOSYSTEM", "1");
+            let paths = RepoPaths::under(state.join("repo"));
+            let (store, _) = Store::open(&env, &root, RootKind::Draft, &paths, None).unwrap();
+            let index = PrivateIndex::new(store.git().clone(), &paths, RootKind::Draft, None);
+            let ledger = Ledger::new(
+                &root,
+                RootKind::Draft,
+                None,
+                SeenAt {
+                    head_commit: None,
+                    branch: None,
+                    at: "2026-01-01T00:00:00Z".into(),
+                },
+            );
+            Self {
+                dir,
+                root,
+                store,
+                index,
+                ledger,
+                tree: TreeEntries::new(),
+                globs: globset::GlobSetBuilder::new().build().unwrap(),
+                paths,
+                max,
+            }
+        }
+
+        fn write(&self, name: &str, bytes: usize) {
+            let path = self.root.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, vec![b'x'; bytes]).unwrap();
+        }
+
+        /// First sight under `scope`: what the folder records is what it reads.
+        fn first_sight(&mut self, scope: &DraftScope) {
+            let seen = self.store.tree_of_disk(scope, &[]).unwrap();
+            self.tree = self.store.ls_tree(&seen).unwrap();
+            self.ledger.seen_tree = Some(seen);
+        }
+
+        fn scan(&self, scope: &DraftScope) -> ScanOutput {
+            super::scan(&ScanInputs {
+                store: &self.store,
+                index: &self.index,
+                repo: None,
+                ledger: &self.ledger,
+                seen_tree: self.ledger.seen_tree.as_ref(),
+                tree: &self.tree,
+                case_insensitive: false,
+                collapsed_globs: &self.globs,
+                scope: Some(scope),
+                collapse_size_bytes: self.max,
+                excluded_dirs: &[],
+                index_tmp: &self.paths.index_tmp,
+                row_cap: crate::engine::DEFAULT_ROW_CAP,
+            })
+            .unwrap()
+        }
+    }
+
+    fn row_paths(out: &ScanOutput) -> Vec<String> {
+        out.pile
+            .rows
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.path).into_owned())
+            .collect()
+    }
+
+    fn unread_notices(out: &ScanOutput) -> Vec<String> {
+        out.pile
+            .notices
+            .iter()
+            .filter(|n| n.contains("not read"))
+            .cloned()
+            .collect()
+    }
+
+    /// Amendment v1.13 R2 with design review F1 and F3: a folder never reads a large file,
+    /// counts the ones it has never recorded in one notice, and keeps a row for one its
+    /// record already holds so a file that grew past the limit cannot vanish.
+    #[test]
+    fn scan_watched_folder_never_reads_a_large_file_and_never_hides_a_recorded_one() {
+        let max = 1024u64;
+        let mut w = Watched::new(max);
+        w.write("a.md", 4);
+        w.write("grown.bin", 10);
+        w.write("big.bin", max as usize);
+        w.write("sub/b.md", 4);
+        w.first_sight(&DraftScope::plain(max));
+
+        // What first sight recorded: the folder's own small files, and nothing else.
+        let recorded: Vec<String> = w
+            .tree
+            .keys()
+            .map(|k| String::from_utf8_lossy(k).into_owned())
+            .collect();
+        assert_eq!(recorded, vec!["a.md".to_owned(), "grown.bin".to_owned()]);
+
+        let out = w.scan(&DraftScope::plain(max));
+        assert!(row_paths(&out).is_empty(), "nothing pending at first sight");
+        assert_eq!(unread_notices(&out), vec!["1 file over 1 KiB not read"]);
+
+        // A recorded file that grows past the limit keeps its row, and the row says the
+        // content was not read: no current side, no hunks, and it is not counted.
+        w.write("grown.bin", max as usize);
+        let out = w.scan(&DraftScope::plain(max));
+        assert_eq!(row_paths(&out), vec!["grown.bin".to_owned()]);
+        let row = &out.pile.rows[0];
+        assert_eq!(row.collapsed, Some(Collapsed::Unread { over_bytes: max }));
+        assert!(row.current.is_none(), "no current-side hash");
+        assert!(
+            row.baseline.is_some(),
+            "the record is what the row stands on"
+        );
+        assert!(row.hunks.is_empty());
+        assert_eq!((row.added, row.deleted), (0, 0));
+        assert_eq!(
+            unread_notices(&out),
+            vec!["1 file over 1 KiB not read"],
+            "a row is not counted"
+        );
+
+        // One line per scan with the count as it stands, never two.
+        w.write("big2.bin", max as usize + 5);
+        let out = w.scan(&DraftScope::plain(max));
+        assert_eq!(unread_notices(&out), vec!["2 files over 1 KiB not read"]);
+
+        // A file that shrinks below the limit is read again, and the count falls.
+        w.write("grown.bin", 12);
+        let out = w.scan(&DraftScope::plain(max));
+        assert_eq!(row_paths(&out), vec!["grown.bin".to_owned()]);
+        assert!(
+            out.pile.rows[0].collapsed.is_none(),
+            "read as an edit again"
+        );
+        assert_eq!(unread_notices(&out), vec!["2 files over 1 KiB not read"]);
+
+        // Nothing left over the limit: no line at all.
+        std::fs::remove_file(w.root.join("big.bin")).unwrap();
+        std::fs::remove_file(w.root.join("big2.bin")).unwrap();
+        let out = w.scan(&DraftScope::plain(max));
+        assert!(unread_notices(&out).is_empty());
+    }
+
+    /// A recorded path with nothing at it is a deletion, never a large file.
+    #[test]
+    fn scan_watched_folder_counts_no_deletion_as_a_large_file() {
+        let max = 1024u64;
+        let mut w = Watched::new(max);
+        w.write("a.md", 4);
+        w.first_sight(&DraftScope::plain(max));
+        std::fs::remove_file(w.root.join("a.md")).unwrap();
+        let out = w.scan(&DraftScope::plain(max));
+        assert_eq!(row_paths(&out), vec!["a.md".to_owned()]);
+        assert_eq!(out.pile.rows[0].change, Change::Deleted);
+        assert!(unread_notices(&out).is_empty());
+    }
+
+    /// The scope filter runs over every candidate list, whichever one named the path: a
+    /// folder watched on its own never shows a file below it, and the tree scope does.
+    #[test]
+    fn scan_watched_folder_scope_filters_every_candidate_list() {
+        let max = 1024u64;
+        let mut w = Watched::new(max);
+        w.write("a.md", 4);
+        w.write("sub/b.md", 4);
+        w.first_sight(&DraftScope::tree(max));
+
+        // A record written under the wider scope: `sub/b.md` is in the tree, so
+        // `diff-files` names it as well as the untracked listing.
+        w.write("a.md", 6);
+        w.write("sub/b.md", 6);
+        assert_eq!(
+            row_paths(&w.scan(&DraftScope::tree(max))),
+            vec!["a.md".to_owned(), "sub/b.md".to_owned()]
+        );
+        assert_eq!(
+            row_paths(&w.scan(&DraftScope::plain(max))),
+            vec!["a.md".to_owned()],
+            "one folder only, whatever list named the path"
+        );
+        assert!(w.dir.path().exists());
+    }
 
     #[test]
     fn scan_parse_name_status_renames() {
@@ -967,7 +1321,10 @@ pub(crate) mod fixture_tests {
 
         /// Make the current disk state the seen tree.
         pub(crate) fn mark_seen(&mut self) {
-            let seen = self.store.tree_of_disk().unwrap();
+            let seen = self
+                .store
+                .tree_of_disk(&DraftScope::tree(u64::MAX), &[])
+                .unwrap();
             self.tree_entries = self.store.ls_tree(&seen).unwrap();
             self.ledger.seen_tree = Some(seen);
         }
@@ -982,6 +1339,7 @@ pub(crate) mod fixture_tests {
                 tree: &self.tree_entries,
                 case_insensitive: self.case_insensitive,
                 collapsed_globs: &self.globs,
+                scope: None,
                 collapse_size_bytes: 1024,
                 excluded_dirs: &[],
                 index_tmp: &self.paths.index_tmp,

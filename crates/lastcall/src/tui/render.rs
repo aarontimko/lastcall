@@ -1550,6 +1550,9 @@ fn render_row_body(
                 Collapsed::Glob => "glob",
                 Collapsed::Binary => "binary",
                 Collapsed::Size => "size",
+                // The label carries the limit the config set, so the line says why the
+                // content is missing without the reader going looking for the number.
+                Collapsed::Unread { .. } => "unread",
             };
             let tail = if kind == Collapsed::Binary {
                 " · not expandable"
@@ -1564,15 +1567,26 @@ fn render_row_body(
                 }
                 _ => String::new(),
             };
-            let mut line = single(
-                format!(
-                    "collapsed ({name}) · +{} −{}{tail}{mode}",
-                    with_thousands(row.added),
-                    with_thousands(row.deleted)
+            // A file too large to read has no counts to print and nothing to expand: the
+            // line is the label alone, so the row says what happened and stops there.
+            let mut line = match kind {
+                Collapsed::Unread { over_bytes } => single(
+                    format!(
+                        "not read (over {}){mode}",
+                        lastcall_engine::scan::size_limit_label(over_bytes)
+                    ),
+                    dim(),
                 ),
-                dim(),
-            );
-            if kind != Collapsed::Binary {
+                _ => single(
+                    format!(
+                        "collapsed ({name}) · +{} −{}{tail}{mode}",
+                        with_thousands(row.added),
+                        with_thousands(row.deleted)
+                    ),
+                    dim(),
+                ),
+            };
+            if !matches!(kind, Collapsed::Binary | Collapsed::Unread { .. }) {
                 let control = format!("[{} expand]", control_key(app, "expand"));
                 if let Some(x) = right_align(&mut line, &control, area.width, dim()) {
                     hits.targets.push((

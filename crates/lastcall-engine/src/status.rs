@@ -403,6 +403,7 @@ pub fn row_line(row: &RowStatus) -> String {
         Some(Collapsed::Glob) => s.push_str("  (collapsed)"),
         Some(Collapsed::Binary) => s.push_str("  (binary)"),
         Some(Collapsed::Size) => s.push_str("  (large)"),
+        Some(Collapsed::Unread { .. }) => s.push_str("  (not read)"),
         None => s.push_str(&format!("  +{} −{}", row.added, row.deleted)),
     }
     match row.annotation {

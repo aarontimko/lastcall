@@ -10,6 +10,18 @@
 //! `badge: nested_in`. Roots are never forgotten by the state dir: a removed root keeps its
 //! ledger.
 //!
+//! A watched folder carries three things discovery decides once (Amendment v1.13):
+//!
+//! - its **scope**: the folder on its own, or the tree below it when the entry ends `/**`,
+//!   and either way the size at which it stops reading a file;
+//! - its **name**: its path below the deepest base that contains it, prefixed with the
+//!   last `draft_dir_parents` folders of that base, so two projects with a scratch folder
+//!   of the same name never read as one row, whatever order the entries are written in;
+//! - the folders another root looks after, so the two never list the same file.
+//!
+//! The walk that finds them reads exactly as many folder levels as an entry names, and
+//! only a `**` component reads to the ceiling.
+//!
 //! `search_depth` (Amendment v1.11) switches on two further mechanisms, both at `2` and
 //! above and neither at `1`:
 //!
@@ -25,13 +37,14 @@
 //!    `R/.worktrees/wt` a row without walking inside `R`, from any launch directory.
 
 use std::collections::BTreeMap;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use globset::{GlobBuilder, GlobMatcher};
 
 use crate::env::Env;
 use crate::git::RepoGit;
-use crate::store::RootKind;
+use crate::store::{DraftScope, ExcludedDir, RootKind};
 
 /// How a root relates to another (status JSON `badge`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +65,35 @@ pub struct DiscoveredRoot {
     /// contains it, else its own parent directory.
     pub parent: PathBuf,
     pub badge: Option<Badge>,
+    /// `Some` for a watched folder: how much of it this root covers and the size at which
+    /// it stops reading. `None` for a repository.
+    pub scope: Option<DraftScope>,
+    /// The name every surface shows for this root: a repository's own folder name, and a
+    /// watched folder's name with as many folders above it as `draft_dir_parents` asks
+    /// for, so two projects with a scratch folder of the same name never read as one row.
+    pub name: String,
+    /// Folders inside this root that another root looks after, with whether the whole tree
+    /// below each belongs there. A repository hands over every watched folder inside it; a
+    /// folder watched with its whole tree hands over the ones inside that; a folder watched
+    /// on its own hands over nothing, because a subfolder is already outside what it covers.
+    pub excluded_dirs: Vec<ExcludedDir>,
+}
+
+/// A repository root, named by its own folder.
+fn git_root(path: PathBuf, parent: PathBuf, badge: Option<Badge>) -> DiscoveredRoot {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    DiscoveredRoot {
+        path,
+        kind: RootKind::Git,
+        parent,
+        badge,
+        scope: None,
+        name,
+        excluded_dirs: Vec::new(),
+    }
 }
 
 /// The result of one discovery pass.
@@ -71,16 +113,23 @@ impl Discovery {
         self.roots.iter().find(|r| r.path == path)
     }
 
-    /// Draft roots that lie inside `git_root`, as root-relative byte paths (the git root's
-    /// `others` entries beneath them belong to the draft root).
-    pub fn draft_dirs_inside(&self, git_root: &Path) -> Vec<Vec<u8>> {
+    /// Watched folders that lie inside `root`, as root-relative byte paths with whether
+    /// the whole tree below each belongs to them (the enclosing root's `others` entries
+    /// beneath them belong to the watched folder, not to it).
+    pub fn excluded_inside(&self, root: &Path) -> Vec<ExcludedDir> {
         use std::os::unix::ffi::OsStrExt;
         self.roots
             .iter()
             .filter(|r| r.kind == RootKind::Draft)
-            .filter_map(|r| r.path.strip_prefix(git_root).ok())
-            .filter(|rel| !rel.as_os_str().is_empty())
-            .map(|rel| rel.as_os_str().as_bytes().to_vec())
+            .filter_map(|r| {
+                let rel = r.path.strip_prefix(root).ok()?;
+                (!rel.as_os_str().is_empty()).then(|| {
+                    (
+                        rel.as_os_str().as_bytes().to_vec(),
+                        r.scope.as_ref().is_some_and(|s| s.recursive),
+                    )
+                })
+            })
             .collect()
     }
 }
@@ -111,6 +160,12 @@ pub struct DiscoverInputs<'a> {
     /// reads, and the switch on the inside-a-repository worktree listing. `1` is level 1
     /// alone, which is what every release before Amendment v1.11 did.
     pub search_depth: u8,
+    /// `Config::collapse_size_bytes`: the size at which a watched folder stops reading a
+    /// file, carried on each watched folder's scope.
+    pub collapse_size_bytes: u64,
+    /// `Config::draft_dir_parents`: how many folders above a watched folder its name
+    /// carries (Amendment v1.13).
+    pub draft_dir_parents: u8,
 }
 
 const WALK_DEPTH: usize = crate::config::MAX_SEARCH_DEPTH as usize;
@@ -141,12 +196,9 @@ pub fn discover(inputs: &DiscoverInputs<'_>) -> Discovery {
             continue;
         }
         if let Some(top) = toplevel(inputs.env, p) {
-            roots.entry(top.clone()).or_insert(DiscoveredRoot {
-                path: top.clone(),
-                kind: RootKind::Git,
-                parent: parent_of(&top),
-                badge: None,
-            });
+            roots
+                .entry(top.clone())
+                .or_insert_with(|| git_root(top.clone(), parent_of(&top), None));
             // A parent inside a repository *is* that repository, and nothing is walked
             // under it: level 1 is what it always was. Its own linked worktrees still
             // arrive through mechanism 2 below.
@@ -224,12 +276,7 @@ pub fn discover(inputs: &DiscoverInputs<'_>) -> Discovery {
         let parent = parent_of(&canon);
         roots.insert(
             canon.clone(),
-            DiscoveredRoot {
-                path: canon,
-                kind: RootKind::Git,
-                parent,
-                badge: Some(Badge::NestedIn(outer.clone())),
-            },
+            git_root(canon, parent, Some(Badge::NestedIn(outer.clone()))),
         );
     }
 
@@ -249,11 +296,8 @@ pub fn discover(inputs: &DiscoverInputs<'_>) -> Discovery {
             // repository falls back to its own parent, and the worktree follows it).
             let parent = roots[&main].parent.clone();
             for path in worktrees_inside(inputs.env, &main) {
-                roots.entry(path.clone()).or_insert(DiscoveredRoot {
-                    path,
-                    kind: RootKind::Git,
-                    parent: parent.clone(),
-                    badge: Some(Badge::WorktreeOf(main.clone())),
+                roots.entry(path.clone()).or_insert_with(|| {
+                    git_root(path, parent.clone(), Some(Badge::WorktreeOf(main.clone())))
                 });
             }
         }
@@ -267,22 +311,22 @@ pub fn discover(inputs: &DiscoverInputs<'_>) -> Discovery {
         }
     }
 
-    // Draft roots.
-    let git_roots: Vec<PathBuf> = roots.keys().cloned().collect();
+    // Watched folders. Every entry is collected first and the folders are recorded
+    // afterwards, so a folder two entries both name gets one row with the wider of the two
+    // scopes — and its name never depends on which entry the config happens to list first.
+    let mut bases: Vec<PathBuf> = parents.clone();
+    bases.extend(roots.keys().cloned());
+    let mut watched: BTreeMap<PathBuf, bool> = BTreeMap::new();
     for entry in inputs.draft_dirs {
-        let pattern = entry.strip_suffix("/**").unwrap_or(entry);
+        let pattern = crate::config::draft_entry_pattern(entry);
+        let recursive = crate::config::draft_entry_is_recursive(entry);
         if Path::new(pattern).is_absolute() {
             let path = Path::new(pattern);
             if let Ok(canon) = std::fs::canonicalize(path)
                 && canon.is_dir()
             {
-                let parent = parent_of(&canon);
-                roots.entry(canon.clone()).or_insert(DiscoveredRoot {
-                    path: canon,
-                    kind: RootKind::Draft,
-                    parent,
-                    badge: None,
-                });
+                let wider = watched.entry(canon).or_insert(false);
+                *wider |= recursive;
             } else {
                 notices.push(format!("draft dir {} does not exist", path.display()));
             }
@@ -297,25 +341,118 @@ pub fn discover(inputs: &DiscoverInputs<'_>) -> Discovery {
                 continue;
             }
         };
-        let mut bases: Vec<PathBuf> = parents.clone();
-        bases.extend(git_roots.iter().cloned());
-        for base in bases {
-            for dir in matching_dirs(&base, &matcher) {
-                let parent = parent_of(&dir);
-                roots.entry(dir.clone()).or_insert(DiscoveredRoot {
-                    path: dir,
-                    kind: RootKind::Draft,
-                    parent,
-                    badge: None,
-                });
+        // As many folder levels as the entry names, no more: naming `notes` reads one
+        // level below each base, and only a `**` component reads to the ceiling.
+        let walk = crate::config::draft_entry_walk_depth(entry);
+        for base in &bases {
+            for dir in matching_dirs(base, &matcher, walk) {
+                let wider = watched.entry(dir).or_insert(false);
+                *wider |= recursive;
             }
         }
+    }
+    for (dir, recursive) in watched {
+        if roots.contains_key(&dir) {
+            // A repository is already looking after it; its own rules win.
+            continue;
+        }
+        let parent = parent_of(&dir);
+        let name = watched_name(&bases, &dir, inputs.draft_dir_parents);
+        roots.insert(
+            dir.clone(),
+            DiscoveredRoot {
+                path: dir,
+                kind: RootKind::Draft,
+                parent,
+                badge: None,
+                scope: Some(DraftScope {
+                    recursive,
+                    max_bytes: inputs.collapse_size_bytes,
+                }),
+                name,
+                excluded_dirs: Vec::new(),
+            },
+        );
     }
 
     // Sorted by path bytes (the status JSON order), not component-wise.
     let mut roots: Vec<DiscoveredRoot> = roots.into_values().collect();
     roots.sort_by(|a, b| a.path.as_os_str().cmp(b.path.as_os_str()));
+
+    // Who looks after what. A repository hands over every watched folder inside it, and a
+    // folder watched with its whole tree hands over the ones inside that; a folder watched
+    // on its own hands over nothing, since a subfolder is already outside what it covers.
+    let claims: Vec<(PathBuf, bool)> = roots
+        .iter()
+        .filter(|r| r.kind == RootKind::Draft)
+        .map(|r| {
+            (
+                r.path.clone(),
+                r.scope.as_ref().is_some_and(|s| s.recursive),
+            )
+        })
+        .collect();
+    for root in &mut roots {
+        let hands_over = match &root.scope {
+            None => true,
+            Some(scope) => scope.recursive,
+        };
+        if !hands_over {
+            continue;
+        }
+        root.excluded_dirs = claims
+            .iter()
+            .filter(|(path, _)| *path != root.path && path.starts_with(&root.path))
+            .filter_map(|(path, recursive)| {
+                let rel = path.strip_prefix(&root.path).ok()?;
+                let bytes = rel.as_os_str().as_bytes().to_vec();
+                (!bytes.is_empty()).then_some((bytes, *recursive))
+            })
+            .collect();
+    }
     Discovery { roots, notices }
+}
+
+/// The name a watched folder shows: its path below the **deepest** base that contains it
+/// (a parent dir, or a repository discovery found), prefixed with the last `parents`
+/// folder names of that base and joined with `/`.
+///
+/// Reading the name off the deepest containing base, rather than off whichever entry
+/// happened to match it, is what keeps the name the same however the entries and the
+/// parent dirs are ordered. A folder no base contains is named by its own last
+/// `1 + parents` folders, and one nearer the filesystem root than that shows what exists.
+fn watched_name(bases: &[PathBuf], dir: &Path, parents: u8) -> String {
+    use std::path::Component;
+    let parents = usize::from(parents);
+    let normal = |c: Component<'_>| match c {
+        Component::Normal(n) => Some(n.to_string_lossy().into_owned()),
+        _ => None,
+    };
+    let last = |names: &[String], n: usize| -> Vec<String> {
+        names[names.len().saturating_sub(n)..].to_vec()
+    };
+    let base = bases
+        .iter()
+        .filter(|b| b.as_path() != dir && dir.starts_with(b))
+        .max_by_key(|b| b.as_os_str().len());
+    let mut parts: Vec<String> = Vec::new();
+    match base {
+        Some(base) => {
+            let head: Vec<String> = base.components().filter_map(normal).collect();
+            parts.extend(last(&head, parents));
+            if let Ok(rel) = dir.strip_prefix(base) {
+                parts.extend(rel.components().filter_map(normal));
+            }
+        }
+        None => {
+            let own: Vec<String> = dir.components().filter_map(normal).collect();
+            parts.extend(last(&own, parents + 1));
+        }
+    }
+    if parts.is_empty() {
+        return dir.display().to_string();
+    }
+    parts.join("/")
 }
 
 /// The configured parent dir that contains `path`, else `path`'s own parent directory —
@@ -347,12 +484,9 @@ fn record_git_root(
     match toplevel(env, dir) {
         Some(top) => {
             let parent = file_under(parents, &top);
-            roots.entry(top.clone()).or_insert(DiscoveredRoot {
-                path: top,
-                kind: RootKind::Git,
-                parent,
-                badge: None,
-            });
+            roots
+                .entry(top.clone())
+                .or_insert_with(|| git_root(top, parent, None));
         }
         None => notices.push(format!(
             "{}: has a .git entry but git cannot open it; skipped",
@@ -424,12 +558,16 @@ fn draft_matcher(pattern: &str) -> Result<GlobMatcher, globset::Error> {
         .compile_matcher())
 }
 
-/// Directories under `base` (bounded depth, skipping git internals and dependency dirs)
-/// whose base-relative path matches `glob`.
-fn matching_dirs(base: &Path, glob: &GlobMatcher) -> Vec<PathBuf> {
+/// Directories under `base` whose base-relative path matches `glob`, reading exactly
+/// `depth` folder levels and skipping git internals and dependency folders.
+///
+/// `depth` is the entry's own reach (one level per component, the ceiling for a `**`
+/// component), so naming a folder costs a `read_dir` of each base and nothing more.
+fn matching_dirs(base: &Path, glob: &GlobMatcher, depth: usize) -> Vec<PathBuf> {
+    let depth = depth.clamp(1, WALK_DEPTH);
     let mut out = Vec::new();
     let mut stack: Vec<(PathBuf, usize)> = vec![(base.to_path_buf(), 0)];
-    while let Some((dir, depth)) = stack.pop() {
+    while let Some((dir, level)) = stack.pop() {
         let Ok(rd) = std::fs::read_dir(&dir) else {
             continue;
         };
@@ -451,8 +589,8 @@ fn matching_dirs(base: &Path, glob: &GlobMatcher) -> Vec<PathBuf> {
             {
                 out.push(canon);
             }
-            if depth + 1 < WALK_DEPTH {
-                stack.push((path, depth + 1));
+            if level + 1 < depth {
+                stack.push((path, level + 1));
             }
         }
     }
@@ -482,6 +620,9 @@ pub fn diff(prev: &Discovery, next: &Discovery) -> RootsChanged {
 mod tests {
     use super::*;
     use lastcall_testkit::tmp::TempDir;
+
+    /// The size limit the tests hand discovery; nothing here turns on its value.
+    const TEST_MAX: u64 = crate::config::DEFAULT_COLLAPSE_SIZE_BYTES;
 
     /// Amendment v1.13: a `*` stays inside one folder name, so naming `notes/*` picks the
     /// folders directly inside `notes` and nothing deeper. Only a `**` component crosses.
@@ -556,6 +697,8 @@ mod tests {
             draft_dirs: &["_drafts/**".to_owned()],
             nested: &[(canon("beta"), parent.join("beta/vendor/lib"))],
             search_depth: 1,
+            collapse_size_bytes: TEST_MAX,
+            draft_dir_parents: 1,
         });
         assert_eq!(d.notices, Vec::<String>::new());
         assert_eq!(
@@ -593,10 +736,10 @@ mod tests {
             Some(Badge::NestedIn(canon("beta")))
         );
         assert_eq!(
-            d.draft_dirs_inside(&canon("alpha")),
-            vec![b"_drafts".to_vec()]
+            d.excluded_inside(&canon("alpha")),
+            vec![(b"_drafts".to_vec(), true)]
         );
-        assert!(d.draft_dirs_inside(&canon("beta")).is_empty());
+        assert!(d.excluded_inside(&canon("beta")).is_empty());
     }
 
     /// Scenario D12's fixture, as a discovery pass at each depth: the plain-folder walk
@@ -650,6 +793,8 @@ mod tests {
                 draft_dirs: &[],
                 nested: &[],
                 search_depth: depth,
+                collapse_size_bytes: TEST_MAX,
+                draft_dir_parents: 1,
             })
         };
 
@@ -738,6 +883,8 @@ mod tests {
                 draft_dirs: &[],
                 nested: &[],
                 search_depth: depth,
+                collapse_size_bytes: TEST_MAX,
+                draft_dir_parents: 1,
             })
         };
 
@@ -802,6 +949,8 @@ mod tests {
             draft_dirs: &[elsewhere.to_string_lossy().into_owned()],
             nested: &[],
             search_depth: 1,
+            collapse_size_bytes: TEST_MAX,
+            draft_dir_parents: 1,
         });
         let repo_c = std::fs::canonicalize(&repo).unwrap();
         let notes_c = std::fs::canonicalize(&elsewhere).unwrap();
@@ -825,8 +974,239 @@ mod tests {
             draft_dirs: &[],
             nested: &[],
             search_depth: 1,
+            collapse_size_bytes: TEST_MAX,
+            draft_dir_parents: 1,
         });
         assert!(missing.roots.is_empty());
         assert_eq!(missing.notices.len(), 1);
+    }
+
+    /// The fixture every name and scope test below reads: a parent dir called `git` with a
+    /// repository `repo1` in it, a watched folder inside the repository and another folder
+    /// inside that, and a `notes` folder directly under the parent.
+    struct NameFixture {
+        dir: TempDir,
+        env: Env,
+        parent: PathBuf,
+    }
+
+    impl NameFixture {
+        fn new() -> Self {
+            let dir = TempDir::new("lc-roots-name");
+            let env = test_env(&dir);
+            let parent = dir.mkdir("git");
+            init_repo(&env, &parent.join("repo1"));
+            init_repo(&env, &parent.join("repo2"));
+            dir.mkdir("git/repo1/z_ignore/research");
+            dir.mkdir("git/repo2/z_ignore");
+            dir.mkdir("git/notes/a/b");
+            dir.mkdir("git/deep/down/notes");
+            Self { dir, env, parent }
+        }
+
+        fn canon(&self, rel: &str) -> PathBuf {
+            std::fs::canonicalize(self.parent.join(rel)).unwrap()
+        }
+
+        fn discover(&self, entries: &[&str], parents: u8) -> Discovery {
+            let owned: Vec<String> = entries.iter().map(|e| (*e).to_owned()).collect();
+            discover(&DiscoverInputs {
+                env: &self.env,
+                parent_dirs: std::slice::from_ref(&self.parent),
+                draft_dirs: &owned,
+                nested: &[],
+                search_depth: 1,
+                collapse_size_bytes: TEST_MAX,
+                draft_dir_parents: parents,
+            })
+        }
+
+        /// `(name, recursive)` per watched folder, keyed by the parent-relative path.
+        fn watched(&self, d: &Discovery) -> BTreeMap<String, (String, bool)> {
+            d.roots
+                .iter()
+                .filter(|r| r.kind == RootKind::Draft)
+                .map(|r| {
+                    let rel = r
+                        .path
+                        .strip_prefix(std::fs::canonicalize(&self.parent).unwrap())
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|_| r.path.display().to_string());
+                    (
+                        rel,
+                        (
+                            r.name.clone(),
+                            r.scope.as_ref().is_some_and(|s| s.recursive),
+                        ),
+                    )
+                })
+                .collect()
+        }
+    }
+
+    /// Amendment v1.13 R4's worked examples: the name is the folder's path below the
+    /// **deepest** base that contains it, with `draft_dir_parents` folders of that base in
+    /// front, so a scratch folder of the same name in two projects reads as two rows.
+    #[test]
+    fn roots_draft_names_come_from_the_deepest_containing_base() {
+        let fx = NameFixture::new();
+        let d = fx.discover(&["**/z_ignore", "z_ignore/research", "notes"], 1);
+        let got = fx.watched(&d);
+        assert_eq!(
+            got.keys().cloned().collect::<Vec<_>>(),
+            vec![
+                "notes".to_owned(),
+                "repo1/z_ignore".to_owned(),
+                "repo1/z_ignore/research".to_owned(),
+                "repo2/z_ignore".to_owned(),
+            ]
+        );
+        // Found under the parent dir as `repo1/z_ignore` and under the repository as
+        // `z_ignore`: the repository is the deeper base, so the name reads the same way
+        // whichever entry matched it (design review F4).
+        assert_eq!(got["repo1/z_ignore"].0, "repo1/z_ignore");
+        assert_eq!(got["repo1/z_ignore/research"].0, "repo1/z_ignore/research");
+        assert_eq!(got["repo2/z_ignore"].0, "repo2/z_ignore");
+        // No special case for the parent dir: its own last folder is the prefix.
+        assert_eq!(got["notes"].0, "git/notes");
+
+        // `0` is the path below the base alone, `2` reaches one folder further up.
+        let flat = fx.watched(&fx.discover(&["**/z_ignore", "notes"], 0));
+        assert_eq!(flat["repo1/z_ignore"].0, "z_ignore");
+        assert_eq!(flat["notes"].0, "notes");
+        let wide = fx.watched(&fx.discover(&["notes"], 2));
+        let parent_name = std::fs::canonicalize(&fx.parent).unwrap();
+        let grand = parent_name
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(wide["notes"].0, format!("{grand}/git/notes"));
+    }
+
+    /// A glob names the folder it matched, not its pattern text.
+    #[test]
+    fn roots_draft_name_of_a_glob_is_the_matched_folder() {
+        let fx = NameFixture::new();
+        fx.dir.mkdir("git/repo1/_drafts");
+        let got = fx.watched(&fx.discover(&["_dr*"], 1));
+        assert_eq!(got["repo1/_drafts"].0, "repo1/_drafts");
+    }
+
+    /// An absolute entry for a folder no base contains is named by its own last
+    /// `1 + draft_dir_parents` folders.
+    #[test]
+    fn roots_draft_name_of_a_folder_outside_every_base() {
+        let fx = NameFixture::new();
+        let outside = fx.dir.mkdir("elsewhere/scratch");
+        let canon = std::fs::canonicalize(&outside).unwrap();
+        let entry = canon.to_string_lossy().into_owned();
+        let d = fx.discover(&[&entry], 1);
+        assert_eq!(d.get(&canon).unwrap().name, "elsewhere/scratch");
+        let d = fx.discover(&[&entry], 0);
+        assert_eq!(d.get(&canon).unwrap().name, "scratch");
+    }
+
+    /// Two entries naming one folder: one row, the wider scope, the same name whichever
+    /// order the config lists them in (design review F4).
+    #[test]
+    fn roots_draft_entry_order_changes_neither_the_name_nor_the_scope() {
+        let fx = NameFixture::new();
+        let forward = fx.watched(&fx.discover(&["**/z_ignore", "z_ignore/**"], 1));
+        let backward = fx.watched(&fx.discover(&["z_ignore/**", "**/z_ignore"], 1));
+        assert_eq!(forward, backward);
+        assert_eq!(
+            forward["repo1/z_ignore"],
+            ("repo1/z_ignore".to_owned(), true),
+            "the wider of the two scopes wins"
+        );
+        let plain = fx.watched(&fx.discover(&["**/z_ignore"], 1));
+        assert!(!plain["repo1/z_ignore"].1, "a plain entry is one folder");
+    }
+
+    /// Amendment v1.13 R3 and design review F9: the walk reads exactly as many folder
+    /// levels as the entry names, and only a `**` component reads to the ceiling.
+    #[test]
+    fn roots_draft_walk_reads_only_the_levels_the_entry_names() {
+        let fx = NameFixture::new();
+        let deep = fx.canon("deep/down/notes");
+        let shallow = fx.canon("notes");
+
+        let one = fx.discover(&["notes"], 1);
+        assert!(one.get(&shallow).is_some());
+        assert!(
+            one.get(&deep).is_none(),
+            "a one-component entry reads one level below each base"
+        );
+
+        let three = fx.discover(&["*/*/notes"], 1);
+        assert!(three.get(&deep).is_some());
+        assert!(
+            three.get(&shallow).is_none(),
+            "the pattern has to match the whole relative path"
+        );
+
+        let any = fx.discover(&["**/notes"], 1);
+        assert!(
+            any.get(&deep).is_some(),
+            "a ** component reads to the ceiling"
+        );
+        assert!(any.get(&shallow).is_some());
+
+        // `notes/*` is the folders directly inside `notes`, never something deeper.
+        let inside = fx.discover(&["notes/*"], 1);
+        let watched: Vec<PathBuf> = inside
+            .roots
+            .iter()
+            .filter(|r| r.kind == RootKind::Draft)
+            .map(|r| r.path.clone())
+            .collect();
+        assert_eq!(watched, vec![fx.canon("notes/a")]);
+        assert!(inside.get(&fx.canon("notes/a/b")).is_none());
+    }
+
+    /// The exclusion rule (design review F2): a repository hands over every watched folder
+    /// inside it, a folder watched with its whole tree hands over the ones inside that, and
+    /// a folder watched on its own hands over nothing.
+    #[test]
+    fn roots_excluded_dirs_carry_whether_the_whole_tree_is_handed_over() {
+        let fx = NameFixture::new();
+        let repo1 = fx.canon("repo1");
+        let outer = fx.canon("repo1/z_ignore");
+        let inner = fx.canon("repo1/z_ignore/research");
+
+        let d = fx.discover(&["**/z_ignore/**", "z_ignore/research"], 1);
+        assert_eq!(
+            d.get(&repo1).unwrap().excluded_dirs,
+            vec![
+                (b"z_ignore".to_vec(), true),
+                (b"z_ignore/research".to_vec(), false),
+            ],
+            "a repository hands over every watched folder inside it"
+        );
+        assert_eq!(
+            d.excluded_inside(&repo1),
+            d.get(&repo1).unwrap().excluded_dirs
+        );
+        assert_eq!(
+            d.get(&outer).unwrap().excluded_dirs,
+            vec![(b"research".to_vec(), false)],
+            "the tree scope hands over the folder inside it"
+        );
+        assert!(d.get(&inner).unwrap().excluded_dirs.is_empty());
+
+        // The same two folders, the outer one watched on its own: it hands over nothing,
+        // because a subfolder is already outside what it covers.
+        let d = fx.discover(&["**/z_ignore", "z_ignore/research"], 1);
+        assert!(d.get(&outer).unwrap().excluded_dirs.is_empty());
+        assert_eq!(
+            d.get(&repo1).unwrap().excluded_dirs,
+            vec![
+                (b"z_ignore".to_vec(), false),
+                (b"z_ignore/research".to_vec(), false),
+            ]
+        );
     }
 }

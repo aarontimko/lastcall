@@ -82,6 +82,10 @@ pub struct Rendered {
     /// The baseline mode alongside it: a mode-only hunk (D1) moves the mode and not the
     /// oid, so the hunk CAS must cover both.
     pub baseline_mode: Option<Mode>,
+    /// A row for a file over the size limit, which is listed but never read. Accepting it
+    /// drops the path from the record and leaves the file alone; there is no content to
+    /// compare, so it carries no CAS of its own.
+    pub unread: bool,
 }
 
 impl Rendered {
@@ -92,6 +96,7 @@ impl Rendered {
             mode: row.current.as_ref().map(|e| e.mode),
             baseline: row.baseline.as_ref().map(|e| e.oid.clone()),
             baseline_mode: row.baseline.as_ref().map(|e| e.mode),
+            unread: matches!(row.collapsed, Some(crate::scan::Collapsed::Unread { .. })),
         }
     }
 }
@@ -746,6 +751,14 @@ impl Ops<'_> {
     /// set; a refusal leaves the ledger untouched.
     fn stage_file(&mut self, rendered: &Rendered) -> Result<(), Refused> {
         let key = Self::key(&rendered.path)?;
+        if rendered.unread {
+            // A file over the size limit: the record lets the path go and the file stays
+            // on disk untouched. No content CAS, because there is no content on this
+            // side — not reading it is the point.
+            self.begin_undo(UndoOp::AcceptFile);
+            self.set_override(&key, None, None);
+            return Ok(());
+        }
         if rendered.oid.is_none() {
             return self.stage_deletion(rendered);
         }
@@ -3109,6 +3122,7 @@ mod tests {
             mode: None,
             baseline: h.tree_entries.get(&b"f2"[..]).map(|(_, o)| o.clone()),
             baseline_mode: h.tree_entries.get(&b"f2"[..]).map(|(m, _)| *m),
+            unread: false,
         };
         let out = h.ops().accept_deletion(&r2, &NoFault).unwrap();
         assert!(matches!(out.refused[0], Refused::StillPresent { .. }), "A7");
@@ -4747,6 +4761,11 @@ mod tests {
                 }
             }
 
+            /// The whole folder, no size limit: what these tests snapshot.
+            fn scope() -> crate::store::DraftScope {
+                crate::store::DraftScope::tree(u64::MAX)
+            }
+
             fn seen_at() -> SeenAt {
                 SeenAt {
                     head_commit: None,
@@ -4763,7 +4782,7 @@ mod tests {
                 for (name, bytes) in files {
                     self.write(name, bytes);
                 }
-                let seen = self.store.tree_of_disk().unwrap();
+                let seen = self.store.tree_of_disk(&Self::scope(), &[]).unwrap();
                 self.tree = self.store.ls_tree(&seen).unwrap();
                 self.ledger = Ledger::new(&self.root, RootKind::Draft, Some(seen), Self::seen_at());
                 ledger::save(&self.paths, &self.ledger).unwrap();
@@ -4800,6 +4819,7 @@ mod tests {
                     tree: &self.tree,
                     case_insensitive: false,
                     collapsed_globs: &self.globs,
+                    scope: None,
                     collapse_size_bytes: 1 << 20,
                     excluded_dirs: &[],
                     index_tmp: &self.paths.index_tmp,
