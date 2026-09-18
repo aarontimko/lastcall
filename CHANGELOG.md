@@ -22,6 +22,11 @@ binary rather than for the commit log.
   rest are counted in a single line, `3 files over 512 KiB not read`.
 - `*` in a `draft_dirs` entry no longer matches across `/`, so `notes/*` means the folders
   directly inside `notes` and nothing deeper. A `**` component still reaches further.
+- A `draft_dirs` entry a 0.3.0 binary accepted is now refused at start, with a message naming
+  the entry: `**` or `/**` on its own, which would have watched every folder under a parent
+  directory, and a relative entry more than four folders below one, which is deeper than the
+  search ever looks. Name the folder instead (`notes`, `notes/**`) or give the pattern a fixed
+  part (`*_drafts`, `**/notes`).
 
 ### Added
 
