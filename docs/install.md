@@ -23,7 +23,7 @@ Every release publishes four binaries and a `SHA256SUMS` file:
 Pick the one for your machine, check it, and put it on your `PATH`:
 
 ```sh
-version=0.3.0
+version=0.4.0
 target=aarch64-apple-darwin        # see the table above
 base=https://github.com/aarontimko/lastcall/releases/download/v$version
 
@@ -73,7 +73,7 @@ Requires [rustup](https://rustup.rs) and `git`. The repository pins its toolchai
 `rust-toolchain.toml`, and rustup installs it on first use.
 
 ```sh
-cargo install --git https://github.com/aarontimko/lastcall --tag v0.3.0 lastcall
+cargo install --git https://github.com/aarontimko/lastcall --tag v0.4.0 lastcall
 ```
 
 That puts `lastcall` in `~/.cargo/bin`. To upgrade later, run the same line with the tag of
