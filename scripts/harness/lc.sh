@@ -8,9 +8,15 @@ export GIT_COMMITTER_NAME="Me" GIT_COMMITTER_EMAIL="me@example.com"
 export LC_USER_EMAIL="me@example.com"
 
 # ---------- store / ledger ----------
-# lc_init R STATE KIND   (KIND = git | draft)
+# lc_init R STATE KIND SCOPE   (KIND = git | draft; SCOPE = plain | tree, drafts only)
+#
+# SCOPE is the shape of what a watched folder covers (spec §F, Amendment v1.13): `plain` is
+# the folder's own files, `tree` is the folder and everything below it. LC_DRAFT_MAX_BYTES
+# is the size at which a file stops being read; it is a size, so it never decides what is
+# listed, only what is hashed into the record.
 lc_init() {
-  LC_R="$1"; LC_STATE="$2"; LC_KIND="${3:-git}"
+  LC_R="$1"; LC_STATE="$2"; LC_KIND="${3:-git}"; LC_SCOPE="${4:-plain}"
+  LC_DRAFT_MAX_BYTES="${LC_DRAFT_MAX_BYTES:-524288}"
   mkdir -p "$LC_STATE/overrides"
   git init -q --bare "$LC_STATE/objects"
   if [ "$LC_KIND" = git ]; then
@@ -50,11 +56,32 @@ lc_seed_index() {
   local t; t="$(cat "$LC_STATE/seen_tree")"
   if [ -n "$t" ]; then lcg read-tree "$t"; else lcg read-tree --empty; fi
 }
-lc_write_tree_of_disk() {   # tree of current disk content (draft first sight)
+# Tree of the current disk content a watched folder covers (its first sight). Two rules,
+# both of them here because first sight and the scan must agree about them:
+#   - the shape: `plain` reads the folder's own files (`-maxdepth 1`), `tree` reads
+#     everything below it, minus anything inside a repository of its own;
+#   - the size: a file of LC_DRAFT_MAX_BYTES or more is not read, so `-size -Nc` (fewer
+#     than N bytes) is the test, and at-or-above is out. A symlink's own size is the length
+#     of its link text, which is what `find` stats without `-L`.
+lc_write_tree_of_disk() {
   local tmp="$LC_STATE/index.tmp"; rm -f "$tmp"
-  ( cd "$LC_R" && find . -type f ! -path './.git/*' | sed 's|^\./||' | sort | while read -r p; do
+  local depth=(); [ "${LC_SCOPE:-plain}" = plain ] && depth=(-maxdepth 1)
+  ( cd "$LC_R" && find . "${depth[@]+${depth[@]}}" -name .git -prune -o \
+      \( -type f -o -type l \) -size "-${LC_DRAFT_MAX_BYTES:-524288}c" -print |
+    sed 's|^\./||' | sort | while read -r p; do
       GIT_DIR="$LC_STATE/objects" GIT_WORK_TREE="$LC_R" GIT_INDEX_FILE="$tmp" git add -f -- "$p"; done )
   GIT_DIR="$LC_STATE/objects" GIT_WORK_TREE="$LC_R" GIT_INDEX_FILE="$tmp" git write-tree
+}
+# The shape half of the scope, on its own: the only thing the trim (R6) is allowed to use.
+lc_in_shape() {   # lc_in_shape PATH
+  [ "${LC_SCOPE:-plain}" = tree ] && return 0
+  case "$1" in */*) return 1;; *) return 0;; esac
+}
+# The size half: true when the file at PATH is small enough to be read. A path with nothing
+# there is not a size question (a deletion is always a row), so it passes.
+lc_small_enough() {   # lc_small_enough PATH
+  [ -e "$LC_R/$1" ] || [ -L "$LC_R/$1" ] || return 0
+  [ -n "$(find "$LC_R/$1" -maxdepth 0 -size "-${LC_DRAFT_MAX_BYTES:-524288}c" 2>/dev/null)" ]
 }
 
 # ---------- branches (spec §6.4 per-branch records, Amendment v1.12) ----------
@@ -256,13 +283,90 @@ lc_baseline() {  # override blob | tree blob | EMPTY   ("null" override = ABSENT
 lc_verify_oid() { lcg cat-file -e "$1" 2>/dev/null; }
 
 # ---------- scan ----------
-lc_candidates() {
+# Does the record hold content for this path? The override's blob first (`null` is the
+# record letting the path go, which holds nothing), then the seen tree.
+lc_record_holds() {   # lc_record_holds PATH
+  local p="$1" o="$LC_STATE/overrides/$(enc "$p")"
+  if [ -f "$o" ]; then [ "$(cat "$o")" != null ]; return; fi
+  local t; t="$(cat "$LC_STATE/seen_tree")"
+  [ -n "$t" ] || return 1
+  [ -n "$(lcg ls-tree "$t" -- "$p" 2>/dev/null)" ]
+}
+# The scope filter of a watched folder's scan: the shape decides what the folder covers,
+# and the size decides only what may be *read*, so a path the record already holds stays a
+# candidate whatever its size (a recorded file that grew past the threshold is still a row,
+# which says it was not read). A large file the record does not hold is counted, not listed.
+lc_draft_candidate() {   # lc_draft_candidate PATH
+  lc_in_shape "$1" || return 1
+  lc_small_enough "$1" && return 0
+  lc_record_holds "$1"
+}
+lc_raw_candidates() {   # the three sources, before the scope filter
   lcg update-index -q --refresh --ignore-submodules >/dev/null 2>&1 || true
   { lcg diff-files --name-only -z | tr '\0' '\n'
     if [ "$LC_KIND" = git ]; then lcg ls-files --others --exclude-standard -z | tr '\0' '\n'
     else lcg ls-files --others -z | tr '\0' '\n'; fi
-    ls "$LC_STATE/overrides" 2>/dev/null | sed 's|%2F|/|g'
-  } | grep -v '^$' | sort -u | { if [ "$LC_KIND" = git ]; then rg ls-files -v -z 2>/dev/null | tr '\0' '\n' | awk '/^S /{print substr($0,3)}' > "$LC_STATE/skip.tmp"; grep -vxF -f "$LC_STATE/skip.tmp" 2>/dev/null || cat; else cat; fi; }
+    ls "$LC_STATE/overrides" 2>/dev/null | sed 's|%2F|/|g;s|\.mode$||'
+  } | grep -v '^$' | sort -u
+}
+lc_candidates() {
+  lc_raw_candidates |
+    { if [ "$LC_KIND" = draft ]; then
+        while IFS= read -r p; do lc_draft_candidate "$p" && printf '%s\n' "$p"; done
+      else cat; fi; } |
+    { if [ "$LC_KIND" = git ]; then rg ls-files -v -z 2>/dev/null | tr '\0' '\n' | awk '/^S /{print substr($0,3)}' > "$LC_STATE/skip.tmp"; grep -vxF -f "$LC_STATE/skip.tmp" 2>/dev/null || cat; else cat; fi; }
+}
+# The paths a scan counts instead of listing: inside the folder's shape, too big to read,
+# and not held by the record. One line in the pile says how many there are.
+lc_unread_count() {
+  [ "$LC_KIND" = draft ] || { echo 0; return; }
+  lc_raw_candidates | { local n=0 p
+    while IFS= read -r p; do
+      lc_in_shape "$p" || continue
+      lc_small_enough "$p" && continue
+      lc_record_holds "$p" && continue
+      n=$((n + 1))
+    done; echo "$n"; }
+}
+# R6's trim: the record of a watched folder loses every path the folder's shape no longer
+# covers, by shape alone and never by size. Prints the number of paths dropped. The time
+# the folder was last reviewed is not touched, and nothing is dropped when everything the
+# record holds is already inside the scope.
+lc_scope_trim() {
+  local t; t="$(cat "$LC_STATE/seen_tree")"
+  local out="" p
+  if [ -n "$t" ]; then
+    while IFS= read -r p; do
+      [ -n "$p" ] || continue
+      lc_in_shape "$p" || out="$out$p
+"
+    done <<TREE
+$(lcg ls-tree -r --name-only "$t")
+TREE
+  fi
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    lc_in_shape "$p" || out="$out$p
+"
+  done <<OVER
+$(ls "$LC_STATE/overrides" 2>/dev/null | sed 's|\.mode$||;s|%2F|/|g' | sort -u)
+OVER
+  out="$(printf '%s' "$out" | grep -v '^$' | sort -u)"
+  [ -n "$out" ] || { echo 0; return; }
+  if [ -n "$t" ]; then
+    local tmp="$LC_STATE/index.trim"; rm -f "$tmp"
+    lcgi "$tmp" read-tree "$t"
+    printf '%s\n' "$out" | while IFS= read -r p; do
+      printf '0 0000000000000000000000000000000000000000\t%s\n' "$p"
+    done | lcgi "$tmp" update-index --index-info
+    lcgi "$tmp" write-tree > "$LC_STATE/seen_tree"
+    rm -f "$tmp"
+  fi
+  printf '%s\n' "$out" | while IFS= read -r p; do
+    rm -f "$LC_STATE/overrides/$(enc "$p")" "$LC_STATE/overrides/$(enc "$p").mode"
+  done
+  lc_seed_index
+  printf '%s\n' "$out" | grep -c .
 }
 lc_pending_p() {   # prints "path" if pending (content OR mode differs), with resolution failure -> over-show
   local p="$1" base cur bm cm
@@ -317,6 +421,10 @@ lc_accept_file() { lc_branch_sync; local p="$1" cur; cur="$(lc_hash "$p")"   # (
   [ -n "${2:-}" ] && cur="$2"
   if [ "$cur" = ABSENT ]; then echo null > "$LC_STATE/overrides/$(enc "$p")"; else echo "$cur" > "$LC_STATE/overrides/$(enc "$p")"; lc_mode "$p" > "$LC_STATE/overrides/$(enc "$p").mode"; fi
   [ "$cur" = "$(lc_tree_blob "$p")" ] && [ "$(lc_mode "$p")" = "$(lc_tree_mode "$p")" ] && rm -f "$LC_STATE/overrides/$(enc "$p")" "$LC_STATE/overrides/$(enc "$p").mode"; true; }
+# Accepting the row of a file that was not read: the record lets the path go and the file
+# stays on disk untouched. There is no content CAS, because not reading it is the point.
+lc_accept_unread() { lc_branch_sync; local p="$1"
+  echo null > "$LC_STATE/overrides/$(enc "$p")"; rm -f "$LC_STATE/overrides/$(enc "$p").mode"; }
 lc_accept_all() {   # build tree from rendered blobs: baseline-composed = current content for pending, else baseline
   lc_branch_sync
   local tmp="$LC_STATE/index.tmp"; rm -f "$tmp"

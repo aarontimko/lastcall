@@ -376,4 +376,65 @@ S="$W/notes.state"; mkdir -p "$S"; lc_init "$W/notes" "$S" draft; lc_first_sight
 echo changed > "$W/notes/n2.md"; echo new > "$W/notes/n9.md"; assert_pile "F3 draft edits pending" "n2.md|n9.md"; lc_accept_all; assert_pile "F3 accept all" ""
 LC_DRAFT_INITIAL=pending; S="$W/notes2.state"; mkdir -p "$S" "$W/notes2"; echo a > "$W/notes2/a"; lc_init "$W/notes2" "$S" draft; lc_first_sight; assert_pile "F2 draft_initial=pending" "a"; unset LC_DRAFT_INITIAL
 
+# F4: a plain entry covers the folder's own files. What is below it is not the folder's,
+# whether it is edited, added or deleted.
+mkdir -p "$W/plain/sub/deeper"
+echo a > "$W/plain/a.md"; echo b > "$W/plain/sub/b.md"; echo c > "$W/plain/sub/deeper/c.md"
+S="$W/plain.state"; mkdir -p "$S"; lc_init "$W/plain" "$S" draft plain; lc_first_sight
+assert_str "F4 first sight records the folder's own files" "a.md" "$(lcg ls-tree -r --name-only "$(cat "$S/seen_tree")" | tr '\n' '|' | sed 's/|$//')"
+assert_pile "F4 plain first sight (seen)" ""
+echo a2 > "$W/plain/a.md"; echo b2 > "$W/plain/sub/b.md"
+assert_pile "F4 the folder's own file, not the one below it" "a.md"
+echo d > "$W/plain/sub/deeper/d.md"; assert_pile "F4 an add below is not a row" "a.md"
+rm "$W/plain/sub/b.md"; assert_pile "F4 a delete below is not a row" "a.md"
+lc_accept_file a.md; assert_pile "F4 accept" ""
+lc_restart; assert_pile "F4 restart" ""
+
+# F5: the same folder watched with `/**` covers its tree.
+mkdir -p "$W/tree/sub/deeper"
+echo a > "$W/tree/a.md"; echo b > "$W/tree/sub/b.md"; echo c > "$W/tree/sub/deeper/c.md"
+S="$W/tree.state"; mkdir -p "$S"; lc_init "$W/tree" "$S" draft tree; lc_first_sight
+assert_str "F5 first sight records the tree" "a.md|sub/b.md|sub/deeper/c.md" "$(lcg ls-tree -r --name-only "$(cat "$S/seen_tree")" | tr '\n' '|' | sed 's/|$//')"
+assert_pile "F5 tree first sight (seen)" ""
+echo a2 > "$W/tree/a.md"; echo b2 > "$W/tree/sub/b.md"
+assert_pile "F5 both edits are rows" "a.md|sub/b.md"
+echo d > "$W/tree/sub/deeper/d.md"; assert_pile "F5 an add below is a row" "a.md|sub/b.md|sub/deeper/d.md"
+rm "$W/tree/sub/deeper/c.md"; assert_pile "F5 a delete below is a row" "a.md|sub/b.md|sub/deeper/c.md|sub/deeper/d.md"
+lc_accept_all; assert_pile "F5 accept all" ""
+
+# F6: a file of the size limit or more is never read. Size decides what is read, never what
+# is listed: a path the record holds keeps its row when it changes.
+mkdir -p "$W/big"
+echo small > "$W/big/small.md"
+( cd "$W/big" && dd if=/dev/zero of=at_limit.bin bs=1024 count=512 2>/dev/null )
+( cd "$W/big" && dd if=/dev/zero of=under.bin bs=1 count=524287 2>/dev/null )
+S="$W/big.state"; mkdir -p "$S"; lc_init "$W/big" "$S" draft plain; lc_first_sight
+assert_str "F6 the file at the limit is not recorded" "small.md|under.bin" "$(lcg ls-tree -r --name-only "$(cat "$S/seen_tree")" | tr '\n' '|' | sed 's/|$//')"
+assert_pile "F6 first sight leaves it out, and not pending either" ""
+assert_str "F6 it is counted instead" "1" "$(lc_unread_count)"
+echo edit > "$W/big/small.md"; assert_pile "F6 a small file is a row as usual" "small.md"
+lc_accept_file small.md; assert_pile "F6 accept" ""
+# The recorded file grows past the limit: still a row, because the record holds it.
+( cd "$W/big" && dd if=/dev/zero of=under.bin bs=1024 count=512 2>/dev/null )
+assert_pile "F6 a recorded file that grew is still a row" "under.bin"
+assert_str "F6 a row is not counted" "1" "$(lc_unread_count)"
+lc_accept_unread under.bin; assert_pile "F6 accepting the row lets the path go" ""
+assert_str "F6 the record no longer holds it" "ABSENT" "$(lc_baseline under.bin)"
+assert_str "F6 and it is counted from then on" "2" "$(lc_unread_count)"
+# A file that shrinks below the limit is read again, as a new file.
+echo shrunk > "$W/big/at_limit.bin"; assert_pile "F6 a file that shrank is read again" "at_limit.bin"
+
+# F7: narrowing the entry trims the record by shape, once, and never by size.
+mkdir -p "$W/trim/sub"
+echo a > "$W/trim/a.md"; echo b > "$W/trim/sub/b.md"
+S="$W/trim.state"; mkdir -p "$S"; lc_init "$W/trim" "$S" draft tree; lc_first_sight
+assert_str "F7 the tree was recorded" "a.md|sub/b.md" "$(lcg ls-tree -r --name-only "$(cat "$S/seen_tree")" | tr '\n' '|' | sed 's/|$//')"
+LC_SCOPE=plain
+assert_str "F7 the trim drops the paths the folder no longer covers" "1" "$(lc_scope_trim)"
+assert_str "F7 the record is the folder's own files" "a.md" "$(lcg ls-tree -r --name-only "$(cat "$S/seen_tree")" | tr '\n' '|' | sed 's/|$//')"
+assert_pile "F7 nothing pending after the trim" ""
+assert_str "F7 said once, not at every scan" "0" "$(lc_scope_trim)"
+LC_SCOPE=tree
+assert_pile "F7 widening brings the path back as pending, never hidden" "sub/b.md"
+
 echo; echo "PASS=$PASS FAIL=$FAIL"
