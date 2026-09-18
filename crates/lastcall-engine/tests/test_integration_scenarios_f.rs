@@ -624,6 +624,35 @@ fn scenario_f6_a_record_that_already_holds_a_large_file() {
         "F3: the bytes the folder never read are untouched"
     );
 
+    // Verifier G3: the hunk request gets the same answer. The row has no hunks to point
+    // at, and the refusal must say why rather than talk about a deletion.
+    let rendered = Rendered::of(pile.row(b"big.bin").unwrap());
+    let out = s
+        .engine
+        .restore(
+            &draft,
+            lastcall_engine::engine::RestoreRequest::Hunk {
+                rendered,
+                hunks: Vec::new(),
+                index: 0,
+            },
+        )
+        .expect("restore call");
+    assert_eq!(
+        out.outcome
+            .refused
+            .iter()
+            .map(|r| r.message("restored"))
+            .collect::<Vec<_>>(),
+        vec!["big.bin: not read; restore is not offered".to_owned()]
+    );
+    assert!(!out.outcome.written);
+    assert_eq!(
+        std::fs::read(s.repo.path().join("z_ignore/big.bin")).unwrap(),
+        vec![b'y'; max],
+        "G3: and the bytes are still untouched"
+    );
+
     assert!(accept_file(&mut s, &draft, "big.bin").ok());
     let pile = assert_pile!(s.engine, draft, "", "accepted");
     assert_eq!(recorded(&s, &draft), vec!["a.md".to_owned()]);

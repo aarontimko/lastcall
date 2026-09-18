@@ -1321,6 +1321,14 @@ impl Ops<'_> {
                 ..Default::default()
             })
         };
+        // Ahead of everything, including the deletion shortcut below: an unread row is not
+        // a deletion, whatever `oid` says on it, and there is nothing to put back (verifier
+        // G3). `restore_file` refuses the same way for the same reason (F3).
+        if rendered.unread {
+            return refuse(Refused::NotRead {
+                path: rendered.path.clone(),
+            });
+        }
         // A deletion row renders as one hunk with its own control (as accept does).
         if rendered.oid.is_none() {
             return self.restore_deletion(rendered, fault);
@@ -3721,6 +3729,22 @@ mod tests {
             std::fs::read(repo.path().join("f1")).unwrap(),
             b"grown past the limit\n",
             "the bytes the folder never read are still there"
+        );
+        assert!(temp_ghosts(repo.path()).is_empty());
+
+        // Verifier G3: the same refusal whichever request arrives. An unread row has no
+        // hunks, so a hunk restore against one took the `oid: None` shortcut to the
+        // deletion route and answered "still present; deletion not restored" instead.
+        let out = h.ops().restore_hunk(&unread, &[], 0, &NoFault).unwrap();
+        assert_eq!(out.refused.len(), 1, "{out:?}");
+        assert_eq!(
+            out.refused[0].message("restored"),
+            "f1: not read; restore is not offered"
+        );
+        assert!(!out.written);
+        assert_eq!(
+            std::fs::read(repo.path().join("f1")).unwrap(),
+            b"grown past the limit\n"
         );
         assert!(temp_ghosts(repo.path()).is_empty());
     }

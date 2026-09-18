@@ -1542,19 +1542,31 @@ impl Engine {
     ) -> Result<Restored, EngineError> {
         let result = {
             let mut ops = self.ops(root)?;
-            match &req {
-                RestoreRequest::Hunk {
-                    rendered,
-                    hunks,
-                    index,
-                } => ops.restore_hunk(rendered, hunks, *index, fault),
-                // An unread row is not a deletion, whatever `oid` says on it: nothing was
-                // read, so there is nothing to put back and the file must not be removed.
-                // `restore_file` is the one place that refusal lives (verifier F3).
-                RestoreRequest::File(rendered) if rendered.oid.is_none() && !rendered.unread => {
-                    ops.restore_deletion(rendered, fault)
+            // An unread row is not a deletion, whatever `oid` says on it: nothing was read,
+            // so there is nothing to put back and the file must not be removed. The check
+            // sits ahead of both arms, so every request gets that answer and not the
+            // deletion route's (verifier F3, hoisted for the hunk arm by G3); `restore_file`
+            // and `restore_hunk` refuse the same way for a caller that skips the engine.
+            let (RestoreRequest::Hunk { rendered, .. } | RestoreRequest::File(rendered)) = &req;
+            if rendered.unread {
+                Ok(Outcome {
+                    refused: vec![Refused::NotRead {
+                        path: rendered.path.clone(),
+                    }],
+                    ..Default::default()
+                })
+            } else {
+                match &req {
+                    RestoreRequest::Hunk {
+                        rendered,
+                        hunks,
+                        index,
+                    } => ops.restore_hunk(rendered, hunks, *index, fault),
+                    RestoreRequest::File(rendered) if rendered.oid.is_none() => {
+                        ops.restore_deletion(rendered, fault)
+                    }
+                    RestoreRequest::File(rendered) => ops.restore_file(rendered, fault),
                 }
-                RestoreRequest::File(rendered) => ops.restore_file(rendered, fault),
             }
         };
         let outcome = match result {
