@@ -27,6 +27,7 @@ just snapshots-update       # rewrite the TUI snapshots, then prove they pass; r
 just test-prepush           # what the pre-push hook runs: integration tier + 64-case proptests
 just hooks-install          # pre-commit = just lint && just test-unit; pre-push = just test-prepush
 just install-smoke          # docs/install.md's steps, executed in a container (Docker; exits 2 without it)
+just release-prep 0.4.0     # the release branch and its one five-file commit; pushes nothing
 ```
 
 Probes against the built binary: `just probe-config`, `just probe-hello`, `just probe-status`,
@@ -121,7 +122,8 @@ The standing handoff written when the last gate closed: how a release is cut (ha
 the crate version equal to the tag), the weekly jobs and what to do when each goes red,
 the invariants that must not drift, what is deferred, and where the evidence for every
 gate lives. Read it before cutting a release or answering a Dependabot, compat or scan
-result.
+result. `just merge` and `just release-tag` merge and tag, so they are the maintainer's and
+refuse inside an agent's shell; `just release-prep` is the half an agent may run.
 
 ### The performance baseline: `docs/dev/bench.md`
 

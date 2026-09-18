@@ -16,7 +16,23 @@ the scans run on every pull request, and Dependabot files version bumps weekly.
 ## Cutting a release
 
 Releases are cut by hand for the whole v0.1 line (ruling P14 in
-`docs/spec/99-phase9b-release-kickoff.md`). The steps, in order:
+`docs/spec/99-phase9b-release-kickoff.md`). By hand means a person decides each step, not
+that each step is typed out: three `just` targets carry the commands and the checks
+(`scripts/release.py`: Python 3, standard library only). The whole release from a green
+`main`:
+
+```sh
+just release-prep 0.4.0    # step 1's branch and commit; pushes nothing
+git push -u origin release/v0.4.0
+                           # then the pull request is opened (gh pr create, or the web page)
+just merge                 # required checks green, one yes, the merge commit, main pulled
+just release-tag           # step 2's checks, one yes, the tag, its push, the run watched
+```
+
+`just merge` is also how any other pull request reaches `main`: run it on the branch, or
+give it the number. `merge` and `release-tag` refuse inside an agent's shell (see the house
+rules below); `RELEASE_DRY_RUN=1` in front of any of the three runs the checks, prints what
+it would send and sends nothing. What the targets do, in order:
 
 1. A pull request sets `[workspace.package].version` in `Cargo.toml`, runs
    `cargo update --workspace` so the lockfile follows, and adds the version's section to
