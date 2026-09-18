@@ -39,6 +39,14 @@ binary rather than for the commit log.
 
 ### Fixed
 
+- **Inside a herdr pane, the workspace scope no longer hides a repository's watched folders.**
+  A watched folder such as `repo/z_ignore` now stays listed with the repository it lives
+  in; before, `w` was the usual way to bring it back. A watched folder inside a repository
+  the scope hides is still hidden with it, unless a pane sits in the folder itself.
+- **Accepting a file that was too large to read works.** The row of a recorded file that grew
+  past `collapse_size_bytes` refused `a` with "still present; deletion not accepted": the
+  accept was routed as a deletion. It now lets the path go, as the docs said, and the inline
+  editor says the file was not read instead of "the file is gone".
 - Files of exactly `collapse_size_bytes` collapse, as the docs said. Until now the limit
   itself was read as an ordinary diff.
 
