@@ -47,6 +47,9 @@ binary rather than for the commit log.
   past `collapse_size_bytes` refused `a` with "still present; deletion not accepted": the
   accept was routed as a deletion. It now lets the path go, as the docs said, and the inline
   editor says the file was not read instead of "the file is gone".
+- Two lastcall processes that rebuild their view of the same repository at the same moment
+  no longer risk one of them failing that scan with "No such file or directory". Both wrote
+  one shared temp file beside the private index; each write now has its own.
 - Files of exactly `collapse_size_bytes` collapse, as the docs said. Until now the limit
   itself was read as an ordinary diff.
 

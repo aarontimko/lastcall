@@ -14,6 +14,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::git::{self, DiffEntry, GitError, Oid, StoreGit};
@@ -132,14 +133,31 @@ impl PrivateIndex {
             None => vec!["read-tree", "--empty"],
         };
         self.run_with_lock_retry(&args)?;
+        self.write_marker(seen_tree)
+    }
+
+    /// Record the tree the index was seeded from: temp file, then `rename`.
+    fn write_marker(&self, seen_tree: Option<&Oid>) -> Result<(), IndexError> {
         let marker = match seen_tree {
             Some(t) => format!("{t}\n"),
             None => "empty\n".to_string(),
         };
-        let tmp = self.index_tree.with_extension("tree.tmp");
-        std::fs::write(&tmp, marker).map_err(|e| io_err(&tmp, e))?;
-        std::fs::rename(&tmp, &self.index_tree).map_err(|e| io_err(&tmp, e))?;
-        Ok(())
+        // One name per process and per write: two seeds of one root at the same moment
+        // must never share a temp file, or the second `rename` finds it already moved.
+        static WRITES: AtomicU64 = AtomicU64::new(0);
+        let n = WRITES.fetch_add(1, Ordering::Relaxed);
+        let tmp = self
+            .index_tree
+            .with_extension(format!("tree.{}-{n}.tmp", std::process::id()));
+        // A failed write leaves nothing behind: the name is new each time, so a leftover
+        // would not be overwritten by the next attempt (a full disk, one orphan per scan).
+        let written = std::fs::write(&tmp, marker)
+            .and_then(|()| std::fs::rename(&tmp, &self.index_tree))
+            .map_err(|e| io_err(&tmp, e));
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        written
     }
 
     /// `update-index -q --refresh --ignore-submodules`; the exit status is ignored (non-zero
@@ -302,6 +320,49 @@ mod tests {
         let index = PrivateIndex::new(store.git().clone(), &paths, RootKind::Git, Some(exclude));
         let tree = Oid::parse(repo.git(&["rev-parse", "HEAD^{tree}"]).unwrap().trim()).unwrap();
         (store, index, tree)
+    }
+
+    /// Two seeds of one root at the same moment (two lastcall processes, or two engines in
+    /// one) each write the marker. With one shared temp name the second `rename` found its
+    /// temp file already moved and the scan failed with "No such file or directory".
+    #[test]
+    fn index_marker_writes_at_the_same_moment_both_succeed() {
+        let repo = FixtureRepo::new("idx-marker").unwrap();
+        let state = TempDir::new("lc-index-marker");
+        let (_store, index, tree) = setup(&repo, &state);
+        std::thread::scope(|s| {
+            let writers: Vec<_> = (0..2)
+                .map(|_| {
+                    s.spawn(|| {
+                        for _ in 0..500 {
+                            index.write_marker(Some(&tree)).unwrap();
+                        }
+                    })
+                })
+                .collect();
+            for w in writers {
+                w.join().unwrap();
+            }
+        });
+        assert_eq!(index.recorded_tree(), Some(Some(tree.clone())));
+
+        // No temp file outlives its write, and a write that fails removes its own.
+        let leftovers = |dir: &Path| -> Vec<String> {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name.ends_with(".tmp"))
+                .collect()
+        };
+        let dir = index.index_tree.parent().unwrap().to_path_buf();
+        assert_eq!(leftovers(&dir), Vec::<String>::new());
+        std::fs::remove_file(&index.index_tree).unwrap();
+        std::fs::create_dir(&index.index_tree).unwrap();
+        std::fs::write(index.index_tree.join("in-the-way"), "x").unwrap();
+        index
+            .write_marker(Some(&tree))
+            .expect_err("rename over a non-empty folder fails");
+        assert_eq!(leftovers(&dir), Vec::<String>::new());
     }
 
     #[test]
