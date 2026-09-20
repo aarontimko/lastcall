@@ -39,7 +39,8 @@ expression: style
 8 28..84 Green Reset -
 8 99..100 Cyan Reset -
 9 27..28 Cyan Reset -
-9 28..53 Green Reset -
+9 28..29 Green Reset DIM
+9 29..53 Green Reset -
 9 99..100 Cyan Reset -
 10 9..11 Green Reset -
 10 12..14 Red Reset -
