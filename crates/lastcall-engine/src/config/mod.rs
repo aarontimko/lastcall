@@ -97,6 +97,8 @@ pub struct Config {
     /// folder name never read as one row; `0` is the folder's own name alone; up to `4`.
     /// A folder nearer the filesystem root than the setting asks for shows what exists.
     pub draft_dir_parents: u8,
+    /// The `[ui]` table (Amendment v1.14).
+    pub ui: UiConfig,
     /// The `[herdr]` table.
     pub herdr: HerdrConfig,
     /// The `[update]` table (Amendment v1.10 item 2).
@@ -126,6 +128,7 @@ impl Default for Config {
             hide_empty_repos: false,
             search_depth: DEFAULT_SEARCH_DEPTH,
             draft_dir_parents: DEFAULT_DRAFT_DIR_PARENTS,
+            ui: UiConfig::default(),
             herdr: HerdrConfig::default(),
             update: UpdateConfig::default(),
             keys: BTreeMap::new(),
@@ -206,6 +209,25 @@ impl Default for HerdrConfig {
             toast: true,
             scope: HerdrScope::default(),
         }
+    }
+}
+
+/// The `[ui]` table (§6.1, Amendment v1.14).
+///
+/// No `derive(Default)`: `wrap` defaults to `true`, which a derive cannot express.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)] // required on config types; see `Config`
+pub struct UiConfig {
+    /// Visual word wrap in the diff pane. Default `true`: a review tool that clips the end
+    /// of a line asks the reader to accept text they have not read. Engine-side only as a
+    /// value the binary reads; nothing here changes what a scan or `status` reports, and
+    /// the TUI's own toggle (`c` / `alt-z`) is for the session only and writes nothing.
+    pub wrap: bool,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self { wrap: true }
     }
 }
 
@@ -582,6 +604,9 @@ ignore_globs = [".git/**"]
 hide_empty_repos = true
 search_depth = 3
 
+[ui]
+wrap = false
+
 [herdr]
 mode = "on"
 session = "work"
@@ -620,6 +645,7 @@ nav_down = ["down", "j", "ctrl-n"]
         assert_eq!(c.ignore_globs, vec![".git/**"]);
         assert!(c.hide_empty_repos);
         assert_eq!(c.search_depth, 3);
+        assert!(!c.ui.wrap);
         assert_eq!(c.herdr.mode, HerdrMode::On);
         assert_eq!(c.herdr.session.as_deref(), Some("work"));
         assert!(!c.update.check);
@@ -1193,6 +1219,43 @@ nav_down = ["down", "j", "ctrl-n"]
         assert!(matches!(err, ConfigError::Parse { .. }), "{err}");
 
         let (env, _) = env_with_config(&dir, "[update]\nchek = true\n");
+        let err = load(&env).unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{err}");
+    }
+
+    /// Amendment v1.14 (§6.1): `[ui] wrap` is a bool that defaults to **true**, so a
+    /// config file written before this release wraps, and `lastcall config` prints the
+    /// table. A wrong type and an unknown key in the table are load errors.
+    #[test]
+    fn config_ui_wrap_defaults_true_and_round_trips() {
+        assert!(
+            Config::default().ui.wrap,
+            "a review tool wraps out of the box"
+        );
+        // A file from before the table loads, wrapping.
+        let old: Config = toml::from_str("parent_dirs = []\n").unwrap();
+        assert!(old.ui.wrap);
+        // And so does an empty table.
+        let empty: Config = toml::from_str("[ui]\n").unwrap();
+        assert!(empty.ui.wrap);
+
+        let off: Config = toml::from_str("[ui]\nwrap = false\n").unwrap();
+        assert!(!off.ui.wrap);
+        let text = toml::to_string_pretty(&off).unwrap();
+        assert!(text.contains("[ui]"), "{text}");
+        assert!(text.contains("wrap = false"), "{text}");
+        assert_eq!(toml::from_str::<Config>(&text).unwrap(), off);
+        let printed = toml::to_string_pretty(&Config::default()).unwrap();
+        assert!(printed.contains("[ui]"), "{printed}");
+        assert!(printed.contains("wrap = true"), "{printed}");
+
+        let dir = TempDir::new("lc-config");
+        let (env, _) = env_with_config(&dir, "[ui]\nwrap = \"yes\"\n");
+        let err = load(&env).unwrap_err();
+        assert!(matches!(err, ConfigError::Parse { .. }), "{err}");
+        assert!(err.to_string().contains("expected a boolean"), "{err}");
+
+        let (env, _) = env_with_config(&dir, "[ui]\nwrapp = true\n");
         let err = load(&env).unwrap_err();
         assert!(err.to_string().contains("unknown field"), "{err}");
     }
