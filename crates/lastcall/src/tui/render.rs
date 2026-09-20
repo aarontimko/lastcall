@@ -1985,6 +1985,9 @@ pub(super) fn key_label(spec: &str) -> String {
         // row shows. The key itself is what the reader is looking for; the modifier is a
         // prefix on it, not a different spelling of it.
         s if s.starts_with("alt-") => format!("Alt-{}", key_label(&s[4..])),
+        // What a Mac sends for Option-z when the terminal does not make Option an Alt. The
+        // reader is looking for the key they press, so the character is the footnote.
+        "Ω" => "Opt-z (Ω)".into(),
         s => s.to_owned(),
     }
 }

@@ -5278,6 +5278,14 @@ fn pty_wrap_toggles_and_alt_z_is_not_an_undo() {
         "and the accept is still there to undo"
     );
 
+    // Option-z on a Mac whose terminal does not send Option as Alt (the out-of-the-box
+    // setting, and what the sponsor's run found): the terminal sends the character, `Ω`,
+    // as its two UTF-8 bytes. It is the same key to the reader, so it is the same action.
+    pty.send("\u{03A9}".as_bytes()).expect("option-z");
+    pty.wait_for(Duration::from_secs(5), |s| s.contents().contains(tail))
+        .unwrap_or_else(|e| panic!("Option-z wraps again: {e}\n{}", pty.screen_text()));
+    assert_eq!(undo_depth(&fx, "alpha"), 1);
+
     let since = pty.raw().len();
     pty.send(b"q").expect("q");
     let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");

@@ -6,7 +6,9 @@
 //! Key spec grammar: optional `ctrl-` / `alt-` / `shift-` prefixes, then a single character
 //! or a named key (`up down left right pageup pagedown home end enter esc tab backtab space
 //! backspace delete f1..f12`). Specs are case-insensitive (`Ctrl-C` = `ctrl-c`, `K` = `k`);
-//! an upper-case letter is spelled `shift-k`, and `shift-tab` is `backtab`. Matching is
+//! an upper-case letter is spelled `shift-k`, and `shift-tab` is `backtab`. The folding is
+//! ASCII's: a character outside it is the key as typed (`Ω` is what a Mac sends for
+//! Option-z, and it is not `ω`). Matching is
 //! exact after that normalization, on both the spec and the terminal's key event
 //! ([`Key::parse`] and [`Key::of`] apply the same folding).
 
@@ -72,7 +74,7 @@ pub enum Action {
     /// scope (the default) or drops the ones with nothing pending and no agent flag
     /// (§6.7, Amendment v1.9 item 4).
     HideEmpty,
-    /// `c` / `alt-z`: flip [`crate::tui::app::App::wrap`] — the diff pane either wraps a
+    /// `c` / Option-z (`Ω` or `alt-z`): flip [`crate::tui::app::App::wrap`] — the diff pane either wraps a
     /// long line onto as many rows as it needs (the default) or clips it at the pane's
     /// edge as every release before this one did (Phase 13, Amendment v1.14).
     ///
@@ -520,7 +522,11 @@ pub const DEFAULT_KEYMAP: &[(&str, &[&str])] = &[
     // escape delivers `Esc` then `z`, which is `back` then `undo`. The plain key is `c`
     // (clip or wrap) and it is **first**, because `hints` shows an action's first key and
     // `c` is the one that works everywhere. The sponsor ruled out `shift-w`.
-    ("wrap", &["c", "alt-z"]),
+    // `Ω` is Option-z itself on a Mac whose terminal does not send Option as Alt, which is
+    // how a Mac terminal is set up out of the box (the sponsor's run, both in a herdr pane
+    // and outside one): the VS Code key should work there without a settings change. The
+    // help overlay spells it `Opt-z (Ω)`.
+    ("wrap", &["c", "Ω", "alt-z"]),
     ("snooze", &["s"]),
     ("show_snoozed", &["shift-s"]),
     ("help", &["?"]),
@@ -724,7 +730,7 @@ impl Key {
     /// Parse one key spec (see the module docs for the grammar). The error is the reason,
     /// without the spec itself; [`KeymapError::BadSpec`] adds the action and the spec.
     pub fn parse(spec: &str) -> Result<Key, String> {
-        let lower = spec.trim().to_lowercase();
+        let lower = spec.trim().to_ascii_lowercase();
         if lower.is_empty() {
             return Err("empty key spec".to_owned());
         }
@@ -1283,6 +1289,24 @@ mod tests {
             to_action(&key_code(KeyCode::Char('z'), KeyModifiers::ALT), &km),
             Some(Action::ToggleWrap),
             "`alt-z`, the wrap key everywhere else"
+        );
+        // Option-z on a Mac that does not send Option as Alt: the character itself, which
+        // crossterm reports with SHIFT because it is an upper-case letter.
+        for mods in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+            assert_eq!(
+                to_action(&key_code(KeyCode::Char('\u{03A9}'), mods), &km),
+                Some(Action::ToggleWrap),
+                "Option-z as a Mac sends it, {mods:?}"
+            );
+        }
+        assert_eq!(
+            Key::parse("\u{03A9}").map(|k| k.spec()),
+            Ok("\u{03A9}".to_owned())
+        );
+        assert_ne!(
+            Key::parse("\u{03A9}"),
+            Key::parse("\u{03C9}"),
+            "not case-folded"
         );
 
         let km = Keymap::from_config(&keys(&[("wrap", &["x"])])).unwrap();
