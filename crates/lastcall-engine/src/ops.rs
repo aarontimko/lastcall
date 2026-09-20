@@ -2483,13 +2483,21 @@ impl Ops<'_> {
         let tmp = ledger::write_tmp(self.paths, self.ledger)?;
         fault.at(FaultPoint::AfterLedgerTmpWrite);
         ledger::commit_tmp(self.paths, &tmp)?;
+        // The seed goes **inside** the lock (Phase 13 deliverable B): the ledger this fold
+        // just committed is the one on disk, so this is the one seed that needs no check,
+        // and holding the lock across it is what stops another process's seed interleaving
+        // with it. Best effort: an accept that is already on disk must never be reported
+        // as failed because a cache could not be rebuilt, so a failure leaves no marker
+        // (the next scan reseeds) and the fold still returns `Ok`.
+        if self.index.seed_committed(&_lock, Some(&new_tree)).is_err() {
+            self.index.forget_marker();
+        }
         drop(_lock);
         self.staged.clear();
         *self.tree = match entries {
             Some(listed) => listed,
             None => self.store.ls_tree(&new_tree)?,
         };
-        self.index.seed(Some(&new_tree))?;
         Ok(Folded {
             refused: None,
             dropped: dropped.len(),
@@ -5649,6 +5657,7 @@ mod tests {
                     excluded_dirs: &[],
                     index_tmp: &self.paths.index_tmp,
                     row_cap: DEFAULT_ROW_CAP,
+                    retry_on_reseed: false,
                 })
                 .unwrap()
                 .pile

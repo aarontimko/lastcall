@@ -34,6 +34,7 @@ use super::input::{Action, EditKey, EditorKey, Keymap, NoteKey, PickKey, SnoozeK
 use super::render::key_label;
 use super::textbuf::{TextBuf, Wrap};
 use super::tour::{Card, EMPTY_CARD_MIN, Tour};
+use super::wrap;
 use unicode_width::UnicodeWidthStr;
 
 /// The columns the bottom line keeps for the status text or the hints beside the notice
@@ -1022,6 +1023,15 @@ impl AcceptFailed {
     }
 }
 
+/// How a live selection's far end is being moved ([`App::move_sel_cursor`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pace {
+    /// A line, a page or a wheel step: never past a line that was not drawn.
+    Step,
+    /// `nav_top` / `nav_bottom`: the reader asked for the end by name.
+    Jump,
+}
+
 /// A live line selection in the diff pane (deliverable 9): both ends are **absolute diff
 /// line indices** into [`App::view_hunks`], and either may be the larger.
 ///
@@ -1092,6 +1102,35 @@ pub struct App {
     /// nothing pending as a name-and-branch row. While `true` those rows go, except a repo
     /// whose agent wants attention. Independent of the herdr scope (`w`).
     pub hide_empty: bool,
+    /// `Ω` / `alt-z` (Phase 13, Amendment v1.14): visual word wrap in the diff pane. Seeded
+    /// from `[ui] wrap`, whose default is `true` — a review tool that clips the end of a
+    /// line asks the reader to accept text they have not read. Session state like
+    /// [`App::hide_empty`]: the key flips it for this run and nothing is written to disk.
+    pub wrap: bool,
+    /// Whether this is a Mac build, the nearest thing the binary knows to "the keyboard in
+    /// front of the reader is a Mac's". It decides one thing: the hint line names the wrap
+    /// key as `Opt-z` there and as `Alt-z` anywhere else. Only the label can be off (a Mac
+    /// reading a Linux box over ssh sees `Alt-z`); both keys are bound either way. The
+    /// loop sets it from the build target; `false` everywhere else, so a frame in a test
+    /// is the same on every machine.
+    pub mac_keys: bool,
+    /// The diff body's size as the **last frame drew it** (columns, rows), copied out of
+    /// `HitMap::diff_body` by [`crate::tui::run::Ui::rendered`] beside `nav_top`.
+    ///
+    /// The reducer's keep-visible arithmetic has to measure rows the way the renderer laid
+    /// them out, and `page_rows()` is only an approximation of the body (the pane also
+    /// draws the file header and sometimes notices above it). `None` before the first
+    /// frame, after a `Resize` — up to `DRAIN_CAP` events fold before the next draw, so a
+    /// size from before it would be the wrong one — and whenever the frame drew no hunks;
+    /// [`App::diff_body_size`] then falls back to [`App::diff_cols`] and the plain body's
+    /// rows less [`Self::diff_short`].
+    pub diff_size: Option<(u16, u16)>,
+    /// How many rows shorter than the plain fallback the last drawn body was: a root's
+    /// notices and the expansion's own header take rows the fallback cannot see
+    /// (re-verification R3). It outlives a resize, which changes the terminal and not what
+    /// is stacked above the body, so the fallback errs short, never tall: a page that is too
+    /// short shows a line twice, one that is too tall passes a line that was never drawn.
+    pub diff_short: u16,
     /// `shift-s` (Amendment v1.11): while `true` the snoozed repositories are listed too,
     /// each with a `snoozed until <date>` suffix on its branch line, and `s` on one of them
     /// wakes it. Session state like `hide_empty`, never written back.
@@ -1225,6 +1264,10 @@ impl App {
             full_paths: false,
             show_remote: false,
             hide_empty: false,
+            wrap: true,
+            mac_keys: false,
+            diff_size: None,
+            diff_short: 0,
             show_snoozed: false,
             nav_anchor: None,
             help: false,
@@ -2605,13 +2648,62 @@ impl App {
     /// the same rectangle — the loop feeds both from one resize event — so the window the
     /// reducer clamps to is the window the reader sees.
     fn editor_cols(&self) -> usize {
-        let inner = if self.nav_visible() {
+        usize::from(self.main_inner_cols())
+            .saturating_sub(EDITOR_GUTTER)
+            .max(1)
+    }
+
+    /// The diff pane's inner width: [`Self::editor_cols`] without the editor's gutter,
+    /// which the diff does not have.
+    ///
+    /// The **fallback** for the body's columns when no frame has reported them yet
+    /// (Phase 13). It is the same rectangle the renderer computes — `render` takes the
+    /// main pane's `Block::inner`, and this is that arithmetic written out — so the width
+    /// the reducer wraps at is the width the reader sees.
+    pub(super) fn diff_cols(&self) -> usize {
+        usize::from(self.main_inner_cols()).max(1)
+    }
+
+    /// The main pane's inner columns, from the size the last `Resize` reported: the frame
+    /// minus the nav and the borders. Shared by [`Self::editor_cols`] and
+    /// [`Self::diff_cols`] so the two can never drift apart.
+    fn main_inner_cols(&self) -> u16 {
+        if self.nav_visible() {
             let w = self.nav_width.min(self.size.0.saturating_sub(20));
             self.size.0.saturating_sub(w + 1)
         } else {
             self.size.0.saturating_sub(2)
-        };
-        usize::from(inner).saturating_sub(EDITOR_GUTTER).max(1)
+        }
+    }
+
+    /// The diff body's `(columns, rows)` for the layout: what the last frame drew, or the
+    /// fallback when no frame has reported one (Phase 13).
+    ///
+    /// The fallback is one row short of [`Self::page_rows`]: the pane's content area is
+    /// that tall, and its first row is the file's header, not the body (code verification
+    /// F4; `render_diff_body_fallback_is_what_the_renderer_draws` holds the two together).
+    pub(super) fn diff_body_size(&self) -> (u16, u16) {
+        self.diff_size.unwrap_or((
+            self.diff_cols() as u16,
+            self.plain_body_rows()
+                .saturating_sub(self.diff_short)
+                .max(1),
+        ))
+    }
+
+    /// The body's rows in the plain main view: the pane's content area less the file's
+    /// header row.
+    fn plain_body_rows(&self) -> u16 {
+        self.page_rows().saturating_sub(1).max(1) as u16
+    }
+
+    /// A frame's report of the diff body it drew (`None`: it drew no hunks). The loop calls
+    /// this after every draw.
+    pub(super) fn measured_diff_body(&mut self, size: Option<(u16, u16)>) {
+        self.diff_size = size;
+        if let Some((_, rows)) = size {
+            self.diff_short = self.plain_body_rows().saturating_sub(rows);
+        }
     }
 
     /// Scroll the editor's buffer so the caret is inside the window (F19). Called after
@@ -3725,7 +3817,10 @@ impl App {
         let span = diff_lines(self.view_hunks()) as isize;
         let delta = if down { span } else { -span };
         if self.sel.is_some() {
-            self.move_sel_cursor(delta)
+            // A jump is asked for by name and passes what is between, with a selection as
+            // without one (re-verification R1: clamped like a page, `v End` stopped after
+            // one screen and `y` copied seventeen lines of eighty-one).
+            self.move_sel_cursor(delta, Pace::Jump)
         } else {
             self.scroll_by(delta)
         }
@@ -3783,6 +3878,55 @@ impl App {
         Changed::Yes
     }
 
+    /// A forward scroll of `delta` lines that cannot skip one (Phase 13, design review F13
+    /// and F16).
+    ///
+    /// A line may now be several rows tall, so "scroll by a page" can no longer mean "add
+    /// the body's row count to the line index": that would step straight over lines that
+    /// were never drawn. The new top is at most **one past the last line that was fully on
+    /// screen**, which is exactly one line forward when only the top line fitted, and it
+    /// always moves at least one line so a page key at a tall line still makes progress.
+    /// [`Self::scroll_by`] does the clamping to the diff's end, unchanged.
+    fn scroll_forward(&mut self, delta: usize) -> Changed {
+        let at = self.diff.scroll;
+        let target = {
+            let (cols, rows) = self.diff_body_size();
+            let hunks = self.view_hunks();
+            let last = wrap::last_full_line(hunks, at, cols, rows, self.wrap).unwrap_or(at);
+            at.saturating_add(delta).min(last + 1).max(at + 1)
+        };
+        self.scroll_by(target as isize - at as isize)
+    }
+
+    /// A page up: the lowest top line from which the current top line is still **fully** on
+    /// screen (a backward fill), and at least one line.
+    ///
+    /// Not page down's inverse. With rows of different heights the two cannot be, and no
+    /// test may claim they are; what page up promises is that the line the reader was
+    /// looking at is still whole on the screen they land on.
+    fn scroll_page_up(&mut self) -> Changed {
+        let at = self.diff.scroll;
+        let target = {
+            let (cols, rows) = self.diff_body_size();
+            let hunks = self.view_hunks();
+            wrap::page_up_top(hunks, at, cols, rows, self.wrap)
+        };
+        self.scroll_by(target as isize - at as isize)
+    }
+
+    /// `delta` lines back, but never above the page-up top: the old top line is still whole
+    /// on the screen this lands on, so every line between the two tops is drawn.
+    fn scroll_back(&mut self, delta: usize) -> Changed {
+        let at = self.diff.scroll;
+        let target = {
+            let (cols, rows) = self.diff_body_size();
+            let hunks = self.view_hunks();
+            let floor = wrap::page_up_top(hunks, at, cols, rows, self.wrap);
+            at.saturating_sub(delta).max(floor)
+        };
+        self.scroll_by(target as isize - at as isize)
+    }
+
     /// Move a live selection's far end `delta` lines and scroll only as far as it takes to
     /// keep that end on screen.
     ///
@@ -3792,24 +3936,50 @@ impl App {
     /// lines being selected off the top of the pane, one per keystroke. So while `v` is
     /// live the selection's own end is the cursor, and `v j j y` copies the three lines the
     /// reader can see.
-    fn move_sel_cursor(&mut self, delta: isize) -> Changed {
-        let (Some(sel), rows) = (self.sel, self.page_rows()) else {
+    fn move_sel_cursor(&mut self, delta: isize, pace: Pace) -> Changed {
+        let Some(sel) = self.sel else {
             return Changed::No;
         };
         let max = diff_lines(self.view_hunks()).saturating_sub(1) as isize;
-        let next = (sel.cursor as isize + delta).clamp(0, max) as usize;
+        let mut next = (sel.cursor as isize + delta).clamp(0, max) as usize;
         if next == sel.cursor {
             return Changed::No;
+        }
+        // Phase 13: "on screen" is a statement about rows, and a line can be several of
+        // them, so the smallest scroll that keeps the moving end **whole** comes from the
+        // same layout the renderer draws, not from a line count against `page_rows`.
+        let at = self.diff.scroll;
+        let (cols, rows) = self.diff_body_size();
+        let hunks = self.view_hunks();
+        let mut scroll = wrap::keep_visible(hunks, at, next, cols, rows, self.wrap);
+        if self.wrap && pace == Pace::Step {
+            // The no-skip rule holds under a selection too (code verification F3): a page or
+            // a wheel step is counted in lines, and a page of wrapped lines is more rows
+            // than the body has. The new top is never past the line after the last one that
+            // was whole on screen, nor above the page-up top, and the moving end stops where
+            // that leaves it whole.
+            if scroll > at {
+                let limit =
+                    wrap::last_full_line(hunks, at, cols, rows, true).map_or(at + 1, |l| l + 1);
+                if scroll > limit {
+                    scroll = limit;
+                    let whole =
+                        wrap::last_full_line(hunks, scroll, cols, rows, true).unwrap_or(scroll);
+                    next = whole.max(sel.cursor + 1).min(next);
+                }
+            } else if scroll < at {
+                let floor = wrap::page_up_top(hunks, at, cols, rows, true);
+                if scroll < floor {
+                    scroll = floor;
+                    next = floor;
+                }
+            }
         }
         self.sel = Some(Sel {
             cursor: next,
             ..sel
         });
-        self.diff.scroll = self
-            .diff
-            .scroll
-            .min(next)
-            .max(next.saturating_sub(rows.saturating_sub(1)));
+        self.diff.scroll = scroll;
         Changed::Yes
     }
 
@@ -3996,18 +4166,23 @@ impl App {
             NavNextRoot => self.jump_root(true),
             // In the diff with a selection running, these keys move its far end
             // (deliverable 9); with none, they scroll the pane as they always have.
-            NavUp if self.sel.is_some() => self.move_sel_cursor(-1),
-            NavDown if self.sel.is_some() => self.move_sel_cursor(1),
-            NavPageUp if self.sel.is_some() => self.move_sel_cursor(-page),
-            NavPageDown if self.sel.is_some() => self.move_sel_cursor(page),
-            ScrollUp(n) if self.sel.is_some() => self.move_sel_cursor(-(n as isize)),
-            ScrollDown(n) if self.sel.is_some() => self.move_sel_cursor(n as isize),
+            NavUp if self.sel.is_some() => self.move_sel_cursor(-1, Pace::Step),
+            NavDown if self.sel.is_some() => self.move_sel_cursor(1, Pace::Step),
+            NavPageUp if self.sel.is_some() => self.move_sel_cursor(-page, Pace::Step),
+            NavPageDown if self.sel.is_some() => self.move_sel_cursor(page, Pace::Step),
+            ScrollUp(n) if self.sel.is_some() => self.move_sel_cursor(-(n as isize), Pace::Step),
+            ScrollDown(n) if self.sel.is_some() => self.move_sel_cursor(n as isize, Pace::Step),
             NavUp => self.scroll_by(-1),
             NavDown => self.scroll_by(1),
-            NavPageUp => self.scroll_by(-page),
-            NavPageDown => self.scroll_by(page),
-            ScrollUp(n) => self.scroll_by(-(n as isize)),
-            ScrollDown(n) => self.scroll_by(n as isize),
+            // Phase 13: the forward moves are clamped so they cannot step over a line that
+            // was never drawn, and page up is a backward fill rather than page down's
+            // inverse. The wheel up is clamped to that same fill: three lines back can be
+            // more rows than the body has, and the line just above the old top would then
+            // never come on screen (code verification, found while closing F6).
+            NavPageUp => self.scroll_page_up(),
+            NavPageDown => self.scroll_forward(page as usize),
+            ScrollUp(n) => self.scroll_back(n as usize),
+            ScrollDown(n) => self.scroll_forward(n as usize),
             Open => match self.selection.clone() {
                 Some(Selection::Row(..)) | Some(Selection::Group(..)) => {
                     self.set_focus(Focus::Diff)
@@ -4082,6 +4257,13 @@ impl App {
             HideEmpty => {
                 self.hide_empty = !self.hide_empty;
                 self.reconcile_selection();
+                Changed::Yes
+            }
+            // Phase 13: the scroll is a line index and keeps its value, so the line the
+            // reader was at is still the top line after the flip (ruling 1). Nothing is
+            // written to disk: `[ui] wrap` is the opening answer, this is the session's.
+            ToggleWrap => {
+                self.wrap = !self.wrap;
                 Changed::Yes
             }
             Refresh => {
@@ -4213,6 +4395,11 @@ impl App {
             }
             Resize(w, h) => {
                 self.size = (w, h);
+                // Phase 13: the body's reported size belongs to the frame that drew it,
+                // and that frame is now the wrong shape. `run.rs` drops the hit map at the
+                // same point for the same reason; until the next draw the layout uses the
+                // fallback rather than a stale rectangle.
+                self.diff_size = None;
                 // F19: the editor's window is the frame's, so a resize that shrinks it must
                 // scroll the caret back into view before the next draw.
                 self.clamp_editor();
@@ -4511,6 +4698,9 @@ impl App {
             return Changed::No;
         }
         self.nav_width = next;
+        // The body is narrower or wider now: the last frame's measure is wrong until the
+        // next one reports, and the fallback follows `nav_width` (code verification F9).
+        self.diff_size = None;
         Changed::Yes
     }
 
@@ -4907,6 +5097,25 @@ pub(crate) mod testfix {
     /// alpha's pile with `f1` given a second (cloned) hunk, for hunk-cursor tests.
     pub fn alpha_two_hunks() -> Pile {
         alpha_hunks(2)
+    }
+
+    /// alpha's pile with `f1` given one hunk whose body is the `lines` named, all context
+    /// lines. The wrap tests need bodies whose widths they chose.
+    pub fn alpha_texts(lines: &[&str]) -> Pile {
+        let mut p = pile("alpha");
+        let mut h = p.rows[0].hunks[0].clone();
+        h.index = 0;
+        h.lines = lines
+            .iter()
+            .map(|t| {
+                (
+                    lastcall_engine::hunks::Tag::Context,
+                    format!("{t}\n").into_bytes(),
+                )
+            })
+            .collect();
+        p.rows[0].hunks = vec![h];
+        p
     }
 
     /// alpha's pile with `f1` given `n` (cloned, re-indexed) hunks.
@@ -10746,6 +10955,378 @@ mod tests {
                 Some(Effect::TourWrite(Setting::HideEmptyRepos))
             ),
             "clamped to the last row"
+        );
+    }
+
+    // --- word wrap in the diff pane (Phase 13, deliverable A) ----------------------------
+
+    /// An app on `f1` with the diff focused and the body's geometry already written back,
+    /// as a frame would have written it.
+    fn wrapping(lines: &[&str], cols: u16, rows: u16) -> App {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        assert_eq!(
+            app.apply(pile_event("alpha", alpha_texts(lines))).0,
+            Changed::Yes
+        );
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::FocusToggle);
+        assert_eq!(app.effective_focus(), Focus::Diff);
+        app.diff_size = Some((cols, rows));
+        app
+    }
+
+    /// Heights 1 (header), 1, 3, 3, 3, 5 at eleven columns: the uneven body the no-skip
+    /// rules are about.
+    fn uneven_app() -> App {
+        let app = wrapping(
+            &[
+                "short",
+                &"x".repeat(30),
+                &"y".repeat(30),
+                &"z".repeat(30),
+                &"w".repeat(50),
+            ],
+            11,
+            10,
+        );
+        assert_eq!(diff_lines(app.view_hunks()), 6);
+        app
+    }
+
+    #[test]
+    fn app_wrap_page_down_never_steps_over_a_line() {
+        let mut app = uneven_app();
+        // Rows 1 + 1 + 3 + 3 = 8 of ten fit, so lines 0..=3 are whole and the next top is
+        // line 4 — not line 0 + 10.
+        assert_eq!(app.handle(Action::NavPageDown).0, Changed::Yes);
+        assert_eq!(app.diff.scroll, 4);
+        // From line 4: 3 + 5 = 8 fits, so the next top is one past line 5, clamped to the
+        // last line.
+        app.handle(Action::NavPageDown);
+        assert_eq!(app.diff.scroll, 5);
+        assert_eq!(app.handle(Action::NavPageDown).0, Changed::No, "the end");
+    }
+
+    #[test]
+    fn app_wrap_page_up_keeps_the_top_line_whole() {
+        let mut app = uneven_app();
+        app.diff.scroll = 5;
+        assert_eq!(app.handle(Action::NavPageUp).0, Changed::Yes);
+        // 5 + 3 = 8 of ten rows; 5 + 3 + 3 would be eleven.
+        assert_eq!(app.diff.scroll, 4);
+        app.handle(Action::NavPageUp);
+        assert_eq!(
+            app.diff.scroll, 1,
+            "3 + 3 + 3 = 9 fits, + 1 more would be ten"
+        );
+        app.handle(Action::NavPageUp);
+        assert_eq!(app.diff.scroll, 0);
+        assert_eq!(app.handle(Action::NavPageUp).0, Changed::No);
+    }
+
+    #[test]
+    fn app_wrap_a_wheel_step_of_three_lands_on_a_line_that_was_drawn() {
+        let mut app = uneven_app();
+        // Three lines forward from the top is line 3, which was fully drawn, so the wheel
+        // takes it as asked.
+        assert_eq!(app.handle(Action::ScrollDown(3)).0, Changed::Yes);
+        assert_eq!(app.diff.scroll, 3);
+        // From line 3 only lines 3 and 4 fit (3 + 3 = 6, + 5 = 11), so a step of three is
+        // clamped to one past line 4 rather than skipping line 5's neighbours.
+        app.handle(Action::ScrollDown(3));
+        assert_eq!(app.diff.scroll, 5);
+    }
+
+    /// Eight five-row lines under a header in a ten-row body: nowhere near the end of the
+    /// diff, so a clamp cannot coincide with the end-of-diff clamp (code verification F6,
+    /// the mutant that turned the wheel back into `scroll_by`).
+    fn tall_app() -> App {
+        let line = "w".repeat(50);
+        let lines: Vec<&str> = std::iter::repeat_n(line.as_str(), 8).collect();
+        let app = wrapping(&lines, 11, 10);
+        assert_eq!(diff_lines(app.view_hunks()), 9);
+        app
+    }
+
+    #[test]
+    fn app_wrap_a_wheel_step_is_clamped_in_the_middle_of_a_diff() {
+        let mut app = tall_app();
+        // Header + one five-row line is six of ten; a second would be eleven. Lines 0 and
+        // 1 were whole, so three lines forward stops at line 2: line 2 was never drawn.
+        assert_eq!(app.handle(Action::ScrollDown(3)).0, Changed::Yes);
+        assert_eq!(app.diff.scroll, 2);
+        app.handle(Action::ScrollDown(3));
+        assert_eq!(app.diff.scroll, 4, "two five-row lines a step, no more");
+        app.handle(Action::ScrollUp(3));
+        assert_eq!(
+            app.diff.scroll, 3,
+            "back only as far as keeps the old top whole: from line 2, line 3 would not be drawn"
+        );
+    }
+
+    /// Every line the body shows whole from the app's top line.
+    fn whole_lines(app: &App) -> std::ops::RangeInclusive<usize> {
+        whole_lines_with(app, true)
+    }
+
+    fn whole_lines_with(app: &App, wrap: bool) -> std::ops::RangeInclusive<usize> {
+        let (cols, rows) = app.diff_body_size();
+        let last = wrap::last_full_line(app.view_hunks(), app.diff.scroll, cols, rows, wrap)
+            .expect("the top line fits whole");
+        app.diff.scroll..=last
+    }
+
+    /// Code verification F3, on the verifier's own fixture: eighty lines of 152 characters in
+    /// a 71 by 25 body. A page under a live selection is counted in lines, and 26 of these
+    /// lines are 78 rows, so before the fix lines 9..=18 were never on screen.
+    #[test]
+    fn app_wrap_paging_under_a_selection_never_steps_over_a_line() {
+        let line = "abcdefg ".repeat(19);
+        let lines: Vec<&str> = std::iter::repeat_n(line.as_str(), 80).collect();
+        let mut app = wrapping(&lines, 71, 25);
+        assert_eq!(app.handle(Action::Select).0, Changed::Yes);
+        let mut seen = *whole_lines(&app).end();
+        let mut pages = 0;
+        while app.handle(Action::NavPageDown).0 == Changed::Yes {
+            let now = whole_lines(&app);
+            assert!(
+                *now.start() <= seen + 1,
+                "lines {}..{} were never drawn",
+                seen + 1,
+                now.start()
+            );
+            let cursor = app.sel.expect("live").cursor;
+            assert!(now.contains(&cursor), "the moving end is whole on screen");
+            seen = *now.end();
+            pages += 1;
+            assert!(pages < 200, "every page makes progress");
+        }
+        assert_eq!(app.sel.expect("live").cursor, 80, "and it reaches the end");
+        // The way back, and the wheel both ways, keep the same promise.
+        let mut top_seen = app.diff.scroll;
+        for action in [
+            Action::NavPageUp,
+            Action::ScrollUp(3),
+            Action::NavPageUp,
+            Action::NavPageUp,
+        ] {
+            app.handle(action);
+            let now = whole_lines(&app);
+            assert!(
+                *now.end() + 1 >= top_seen,
+                "lines {}..{top_seen} were never drawn",
+                now.end() + 1
+            );
+            top_seen = *now.start();
+        }
+        let mut app = wrapping(&lines, 71, 25);
+        app.handle(Action::Select);
+        let mut seen = *whole_lines(&app).end();
+        for _ in 0..40 {
+            app.handle(Action::ScrollDown(3));
+            let now = whole_lines(&app);
+            assert!(*now.start() <= seen + 1, "the wheel stepped over a line");
+            seen = *now.end();
+        }
+    }
+
+    /// Re-verification R1: the jumps are not pages. `v End` selects to the last line and
+    /// `v Home` back to the first, wrapped or not, exactly as they did before the phase.
+    #[test]
+    fn app_wrap_the_jumps_under_a_selection_reach_the_ends() {
+        let line = "abcdefg ".repeat(19);
+        let lines: Vec<&str> = std::iter::repeat_n(line.as_str(), 80).collect();
+        for wrap in [true, false] {
+            let mut app = wrapping(&lines, 71, 25);
+            app.wrap = wrap;
+            app.handle(Action::Select);
+            assert_eq!(app.handle(Action::NavBottom).0, Changed::Yes);
+            let sel = app.sel.expect("live");
+            assert_eq!(sel.range(), (0, 80), "wrap {wrap}: every line is selected");
+            assert!(
+                whole_lines_with(&app, wrap).contains(&80),
+                "wrap {wrap}: and the far end is on screen"
+            );
+            let copied = String::from_utf8(app.copy_payload().expect("a payload")).expect("utf-8");
+            assert_eq!(copied.lines().count(), 81, "wrap {wrap}");
+            app.handle(Action::NavTop);
+            assert_eq!(app.sel.expect("live").cursor, 0, "wrap {wrap}: and back");
+            assert_eq!(app.diff.scroll, 0);
+        }
+    }
+
+    /// Re-verification R5: dragging the divider changes the body's width, so the last
+    /// frame's measure is forgotten with it.
+    #[test]
+    fn app_wrap_a_nav_width_change_forgets_the_measured_body() {
+        let mut app = uneven_app();
+        assert!(app.diff_size.is_some());
+        let before = app.nav_width;
+        assert_eq!(app.set_nav_width(before + 7), Changed::Yes);
+        assert_eq!(app.diff_size, None);
+        app.diff_size = Some((11, 10));
+        assert_eq!(
+            app.set_nav_width(before + 7),
+            Changed::No,
+            "no change, no forgetting"
+        );
+        assert_eq!(app.diff_size, Some((11, 10)));
+    }
+
+    /// Re-verification R3: what is stacked above the body (a root's notices, the
+    /// expansion's header) outlives a resize, so the fallback stays as much shorter than the
+    /// plain body as the last frame was, and a page in the same batch as the resize cannot
+    /// pass rows that will not be drawn.
+    #[test]
+    fn app_wrap_the_fallback_remembers_how_short_the_last_body_was() {
+        let mut app = uneven_app();
+        app.handle(Action::Resize(100, 30));
+        let plain = app.diff_body_size();
+        // A frame with three rows of notices above the body.
+        app.measured_diff_body(Some((plain.0, plain.1 - 3)));
+        app.handle(Action::Resize(100, 30));
+        assert_eq!(app.diff_size, None);
+        assert_eq!(app.diff_body_size(), (plain.0, plain.1 - 3));
+        app.handle(Action::Resize(100, 40));
+        assert_eq!(
+            app.diff_body_size().1,
+            plain.1 + 10 - 3,
+            "taller, still three short"
+        );
+        // A frame that drew no hunks says nothing about the stack.
+        app.measured_diff_body(None);
+        assert_eq!(app.diff_body_size().1, plain.1 + 10 - 3);
+        app.measured_diff_body(Some((plain.0, plain.1 + 10)));
+        app.handle(Action::Resize(100, 30));
+        assert_eq!(app.diff_body_size(), plain, "and a plain frame clears it");
+    }
+
+    #[test]
+    fn app_wrap_forward_moves_always_move_at_least_one_line() {
+        // A body of four rows caps every line at one row, but even a body too short to
+        // hold the top line whole must still make progress.
+        let mut app = uneven_app();
+        app.diff_size = Some((11, 4));
+        let before = app.diff.scroll;
+        assert_eq!(app.handle(Action::ScrollDown(1)).0, Changed::Yes);
+        assert_eq!(app.diff.scroll, before + 1);
+        assert_eq!(app.handle(Action::NavPageDown).0, Changed::Yes);
+        assert!(app.diff.scroll > before + 1);
+    }
+
+    #[test]
+    fn app_wrap_a_selection_over_a_five_row_line_keeps_that_line_whole() {
+        let mut app = uneven_app();
+        assert_eq!(app.handle(Action::Select).0, Changed::Yes);
+        for _ in 0..5 {
+            app.handle(Action::NavDown);
+        }
+        assert_eq!(
+            app.sel.expect("live").cursor,
+            5,
+            "the far end walked to the tall line"
+        );
+        // Line 5 is five rows; from a top of line 4 its three-row neighbour plus it is
+        // eight of ten, so the pane moved to 4 and no further.
+        assert_eq!(app.diff.scroll, 4);
+        let text = app.copy_payload().expect("a payload");
+        assert_eq!(
+            String::from_utf8(text).expect("utf-8").lines().count(),
+            6,
+            "the header the cursor began on down to the tall line, whole"
+        );
+    }
+
+    #[test]
+    fn app_wrap_the_hunk_key_still_puts_the_header_at_the_top_row() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        let mut p = alpha_texts(&["a", &"x".repeat(60)]);
+        let second = p.rows[0].hunks[0].clone();
+        p.rows[0]
+            .hunks
+            .push(lastcall_engine::hunks::Hunk { index: 1, ..second });
+        app.apply(pile_event("alpha", p));
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::FocusToggle);
+        app.diff_size = Some((11, 10));
+        let offsets = hunk_offsets(app.view_hunks());
+        assert_eq!(app.handle(Action::HunkNext).0, Changed::Yes);
+        assert_eq!(
+            app.diff.scroll, offsets[1],
+            "the second header is the top line"
+        );
+        let table = wrap::layout(app.view_hunks(), app.diff.scroll, 11, 10, true);
+        assert_eq!(table[0].line, offsets[1], "and the top row is that header");
+    }
+
+    #[test]
+    fn app_wrap_toggle_flips_the_flag_and_leaves_the_scroll_alone() {
+        let mut app = uneven_app();
+        app.diff.scroll = 3;
+        assert!(app.wrap, "wrap is on out of the box");
+        assert_eq!(app.handle(Action::ToggleWrap), (Changed::Yes, None));
+        assert!(!app.wrap);
+        assert_eq!(
+            app.diff.scroll, 3,
+            "the line the reader was on did not move"
+        );
+        assert_eq!(app.handle(Action::ToggleWrap).0, Changed::Yes);
+        assert!(app.wrap);
+        assert_eq!(app.diff.scroll, 3);
+    }
+
+    #[test]
+    fn app_wrap_off_a_page_is_what_the_body_shows() {
+        let mut app = uneven_app();
+        app.wrap = false;
+        // Ten rows, ten lines: only six exist, so a page down lands on the last.
+        assert_eq!(app.handle(Action::NavPageDown).0, Changed::Yes);
+        assert_eq!(app.diff.scroll, 5);
+        app.handle(Action::NavPageUp);
+        assert_eq!(app.diff.scroll, 0, "a body of ten holds all six lines");
+    }
+
+    #[test]
+    fn app_wrap_resize_forgets_the_measured_body() {
+        let mut app = uneven_app();
+        assert_eq!(app.diff_size, Some((11, 10)));
+        app.handle(Action::Resize(120, 40));
+        assert_eq!(app.diff_size, None, "the next frame measures it again");
+        // And the fallback is the arithmetic the editor uses, never zero.
+        let (cols, rows) = app.diff_body_size();
+        assert_eq!(cols as usize, app.diff_cols());
+        assert!(cols > 0 && rows > 0);
+    }
+
+    /// `y` copies **lines**, so a wrapped one comes off the clipboard whole: no row break
+    /// became a newline, and a capped line brings back the text the cap hid rather than
+    /// the marker that stood in for it.
+    #[test]
+    fn app_wrap_copy_takes_a_wrapped_and_a_capped_line_whole() {
+        let long = "lorem ipsum ".repeat(30);
+        let huge = "x".repeat(4000);
+        let mut app = wrapping(&["short", &long, &huge], 40, 12);
+        // The wrapped line on its own.
+        app.diff.scroll = 2;
+        assert_eq!(app.handle(Action::Select).0, Changed::Yes);
+        let one = String::from_utf8(app.copy_payload().expect("a payload")).expect("utf-8");
+        assert_eq!(one, format!(" {long}\n"), "one line, one newline");
+        assert!(!one.contains('…'), "no marker on the clipboard");
+
+        // The capped one: the pane showed nine of its rows, the clipboard has all 4000
+        // characters.
+        app.sel = None;
+        app.diff.scroll = 3;
+        app.handle(Action::Select);
+        let all = String::from_utf8(app.copy_payload().expect("a payload")).expect("utf-8");
+        assert_eq!(all, format!(" {huge}\n"));
+        let table = wrap::layout(app.view_hunks(), 3, 40, 12, true);
+        assert!(
+            table.len() < 12,
+            "and the pane did cap it: {} rows",
+            table.len()
         );
     }
 }

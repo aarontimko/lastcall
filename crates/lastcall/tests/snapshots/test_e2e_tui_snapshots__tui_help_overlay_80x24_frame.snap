@@ -19,7 +19,7 @@ expression: frame
 "│W/not│ u              restore the hunk                                  │     │"
 "│  dra│ U              restore the whole file                            │     │"
 "│  M n│ z              undo the last accept                              │     │"
-"│     │ … 22 more keys (97 columns shows all)                            │     │"
+"│     │ … 23 more keys (97 columns shows all)                            │     │"
 "│     │ q / Ctrl-C     quit                                              │     │"
 "│     │ ^J is a newline in the note (⇧⏎ needs a kitty-protocol terminal) │     │"
 "│     │ shift+drag selects text (mouse capture is on) · v/y copies       │     │"

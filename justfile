@@ -428,6 +428,19 @@ probe-tui-slow:
     echo "--- slow git on PATH: SLOWGIT_MS=${SLOWGIT_MS:-800} per scan call, ${SLOWGIT_SLOW_REPO} at SLOWGIT_SLOW_MS=${SLOWGIT_SLOW_MS:-2500} ---"
     just probe-tui
 
+# A packaged hands-on run (docs/dev/tryout.md): release build, a sandbox of repositories and
+# a config under the temp directory, the numbered steps, then the TUI over it. `just tryout
+# list` names the scenarios. The real state and config directories are never touched. The
+# name is checked before the build, so a typo costs nothing.
+tryout SCENARIO="list" *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ {{quote(SCENARIO)}} != list ]; then
+        python3 scripts/tryout.py {{quote(SCENARIO)}} --check
+        cargo build --release -p lastcall
+    fi
+    python3 scripts/tryout.py {{quote(SCENARIO)}} {{ARGS}}
+
 # The performance baseline (docs/dev/bench.md; not a gate): the four scenarios of
 # crates/lastcall/tests/test_bench.rs — 100 clones / 4,000 rows, one 100,000-line diff, a
 # 1,000-file burst under watch, a 50,000-file drop against the row cap — on the RELEASE

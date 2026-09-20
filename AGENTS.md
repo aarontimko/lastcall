@@ -21,6 +21,7 @@ just test-scenarios         # the docs/spec/01-scenarios.md suites (real git, te
 just probe-status           # release binary: status + status --json over a three-root fixture
 just probe-tui              # release binary: the interactive TUI over the same fixture (--poll 1)
 just probe-tui-screen       # the PTY harness's transcript of the live-update demo (3 s)
+just tryout wrap            # a packaged hands-on run: sandbox repos + config + numbered steps, then the TUI (docs/dev/tryout.md)
 just probe-tui-slow         # probe-tui with the scans stretched (scripts/slowgit): the launch hold at scale
 just bench                  # the performance baseline on the release build (docs/dev/bench.md; ~4 min; not a gate)
 just snapshots-update       # rewrite the TUI snapshots, then prove they pass; read every diff
@@ -74,6 +75,13 @@ index,scan,ops,engine,watcher}.rs`.
 
 The one-command-plus-three-steps sponsor recipe for the Gate 1 `[sponsor]` item, the
 `just probe-hello` automated proxy, and the protocol-20/21 note.
+
+### Packaged hands-on runs: `docs/dev/tryout.md`
+
+`just tryout <scenario>` builds a throwaway sandbox (repositories, watched folders, config,
+state) and hands a person numbered steps and one command, so a hands-on gate item costs them
+no setup. Read it before writing a phase's hands-on gate or adding a scenario to
+`scripts/tryout.py`; the real state and config directories are never touched.
 
 ### The TUI: `docs/dev/tui.md`
 

@@ -36,6 +36,7 @@ expression: frame
 "│               │ e              expand a collapsed file                           │               │"
 "│               │ f              full paths                                        │               │"
 "│               │ o              show org/repo                                     │               │"
+"│               │ Opt-z (Ω) / Alt-z wrap long lines                                │               │"
 "│               │ s              snooze this repo                                  │               │"
 "│               │ S              show / hide snoozed repos                         │               │"
 "│               │ ?              this help                                         │               │"

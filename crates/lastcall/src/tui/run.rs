@@ -391,9 +391,21 @@ impl Ui {
     /// last frame's diff body. Absolute, not a screen row: the pane is drawn from
     /// `App::diff.scroll`, and a selection outlives the scrolling that follows it.
     fn diff_line_at(&self, x: u16, y: u16) -> Option<usize> {
-        let rect = self.hits.as_ref()?.diff_body?;
-        rect.contains(ratatui::layout::Position::new(x, y))
-            .then(|| self.app.diff.scroll + (y - rect.y) as usize)
+        let hits = self.hits.as_ref()?;
+        let rect = hits.diff_body?;
+        if !rect.contains(ratatui::layout::Position::new(x, y)) {
+            return None;
+        }
+        // Phase 13: the row table, not `scroll + (y - rect.y)` — a line can be several
+        // rows, and every row of a wrapped line answers that line. A row inside the body
+        // but past the table's end is the blank area under a short diff: it answers the
+        // last line, which is what `SelectTo`'s clamp already made of it (design review
+        // F14), so a drag that ends below the diff still extends to the end.
+        let row = (y - rect.y) as usize;
+        match hits.diff_rows.get(row) {
+            Some(&line) => Some(line),
+            None => hits.diff_rows.last().copied(),
+        }
     }
 
     fn editor_text_at(&self, x: u16, y: u16) -> Option<(u16, u16)> {
@@ -446,6 +458,13 @@ impl Ui {
         if let Some(top) = hits.nav_top {
             self.app.nav_top = top;
         }
+        // Phase 13: the diff body's real size, for the reducer's keep-visible arithmetic.
+        // Unlike `nav_top` a `None` is taken: it means this frame drew no hunks, and the
+        // fallback (`diff_cols` / `page_rows`) is the right answer then. Whichever of the
+        // two call sites drew — a row's own hunks, or a collapsed row's shorter expansion
+        // — reported its own rectangle, so the size is the one that was laid out.
+        self.app
+            .measured_diff_body(hits.diff_body.map(|r| (r.width, r.height)));
         self.hits = Some(hits);
     }
 }
@@ -1566,6 +1585,9 @@ pub struct Launch {
     /// `hide_empty_repos` from the config file (§6.1, Amendment v1.9): the app's opening
     /// answer to `t`. The key flips it for the session; nothing writes it back.
     pub hide_empty: bool,
+    /// `[ui] wrap` from the config file (Amendment v1.14): the app's opening answer to
+    /// Option-z (`Ω`, or `alt-z`). The key flips it for the session; nothing writes it back.
+    pub wrap: bool,
     /// The once-a-day update check, or `None` when `[update] check = false`. Started on a
     /// detached thread the moment the launch hold ends, never before the first frame and
     /// never on the launch path (kickoff deliverable 2.6).
@@ -1575,6 +1597,17 @@ pub struct Launch {
     /// tour touches is touched from this loop; the reducer holds only which card is on
     /// screen.
     pub tour: tour::Plan,
+}
+
+/// The UI as the config opens it: `[roots] hide_empty` and `[ui] wrap` are the reducer's
+/// opening answers, and the keys change them from there for the session only. Its own
+/// function so a test can hold the routing (code verification F6: nothing failed when the
+/// `wrap` line was deleted from `run`, which no test can call).
+fn opening_ui(keymap: Keymap, hide_empty: bool, wrap: bool) -> Ui {
+    let mut ui = Ui::new(App::new(), keymap);
+    ui.app.hide_empty = hide_empty;
+    ui.app.wrap = wrap;
+    ui
 }
 
 pub fn run(
@@ -1587,6 +1620,7 @@ pub fn run(
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let Launch {
         hide_empty,
+        wrap,
         daily_check,
         tour,
     } = launch;
@@ -1599,11 +1633,11 @@ pub fn run(
     };
     let mut guard = term::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let mut ui = Ui::new(App::new(), keymap);
+    let mut ui = opening_ui(keymap, hide_empty, wrap);
+    ui.app.mac_keys = cfg!(target_os = "macos");
     // Asked once, inside `enter`, before the input thread exists; the app reads the cached
     // answer so the note modal promises `⇧⏎` only where it works (ruling P9).
     ui.app.enhanced = term::keyboard_enhanced();
-    ui.app.hide_empty = hide_empty;
     let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Event>();
     // Both are replaced wholesale by an `$EDITOR` suspend, which joins the thread and opens
     // a fresh channel; `reader` is `None` only while that handover is in flight.
@@ -3213,5 +3247,117 @@ mod tests {
         ui.app.help = true;
         assert_eq!(ui.event(&key(KeyCode::Down)), (Changed::Yes, None));
         assert_eq!(ui.app.tour.as_ref().expect("open").row, 1);
+    }
+
+    // --- word wrap in the diff pane (Phase 13, deliverable A) ----------------------------
+
+    /// A `Ui` on `f1` whose hunk body is `lines`, with the diff focused and one frame
+    /// already drawn (so the hit map and the body's geometry exist).
+    fn wrapping_ui(lines: &[&str]) -> Ui {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.apply(pile_event("alpha", alpha_texts(lines)));
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Open);
+        let mut ui = Ui::new(app, Keymap::defaults());
+        render_into(&mut ui);
+        ui
+    }
+
+    /// F14: the hit map answers with the row table, so a press on the *third* row of a
+    /// wrapped line still names that line. Before this phase the answer was
+    /// `scroll + (y - rect.y)`, which on a wrapped pane names a line further down the
+    /// diff than the one under the pointer.
+    #[test]
+    fn run_wrap_a_press_on_a_continuation_row_names_the_line_it_continues() {
+        let mut ui = wrapping_ui(&["short", &"x".repeat(400), "tail"]);
+        let hits = ui.hits.as_ref().expect("a frame");
+        let body = hits.diff_body.expect("the body");
+        let rows: Vec<u16> = hits
+            .diff_rows
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| **l == 2)
+            .map(|(i, _)| body.y + i as u16)
+            .collect();
+        assert!(rows.len() > 2, "line 2 wrapped: {rows:?}");
+        let third = rows[2];
+        assert_eq!(ui.diff_line_at(body.x + 3, third), Some(2));
+        // And the press the reducer sees is that line, not the row's distance from the top.
+        assert_ne!(
+            2,
+            ui.app.diff.scroll + (third - body.y) as usize,
+            "the pre-phase arithmetic would have answered differently"
+        );
+        ui.event(&mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            body.x + 3,
+            third,
+        ));
+        assert_eq!(ui.app.press_line, Some(2));
+    }
+
+    /// A press in the blank area under a short diff answers the last line, so a drag that
+    /// runs off the bottom still selects to the end.
+    #[test]
+    fn run_wrap_a_press_below_the_diff_answers_its_last_line() {
+        let ui = wrapping_ui(&["a", "b"]);
+        let hits = ui.hits.as_ref().expect("a frame");
+        let body = hits.diff_body.expect("the body");
+        let last = *hits.diff_rows.last().expect("rows");
+        assert!(
+            (hits.diff_rows.len() as u16) < body.height,
+            "the diff is shorter than the pane"
+        );
+        let blank = body.y + hits.diff_rows.len() as u16;
+        assert_eq!(ui.diff_line_at(body.x, blank), Some(last));
+        assert_eq!(ui.diff_line_at(body.x, body.bottom() - 1), Some(last));
+        assert_eq!(ui.diff_line_at(body.x, body.bottom()), None, "outside it");
+    }
+
+    /// F17: the frame measures the diff body and writes it back, so the next key's
+    /// scrolling asks the layout about the pane the reader is actually looking at.
+    #[test]
+    fn run_wrap_the_frame_writes_the_diff_body_size_back() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.apply(pile_event("alpha", alpha_texts(&["a", "b"])));
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Open);
+        let mut ui = Ui::new(app, Keymap::defaults());
+        assert_eq!(ui.app.diff_size, None, "nothing measured yet");
+        render_into(&mut ui);
+        let body = ui
+            .hits
+            .as_ref()
+            .expect("a frame")
+            .diff_body
+            .expect("a body");
+        assert_eq!(ui.app.diff_size, Some((body.width, body.height)));
+        // A resize forgets it until the next frame measures again.
+        ui.event(&Event::Resize(80, 24));
+        assert_eq!(ui.app.diff_size, None);
+    }
+
+    /// The config's opening answer reaches the reducer, and the key flips it from there.
+    #[test]
+    fn run_wrap_the_launch_flag_sets_the_apps_opening_answer() {
+        assert!(wrapping_ui(&["a"]).app.wrap, "true out of the box");
+        // What `run` opens with, given `Launch::wrap` from `[ui] wrap = false`.
+        for (hide_empty, wrap) in [(false, true), (true, false), (false, false)] {
+            let ui = opening_ui(Keymap::default(), hide_empty, wrap);
+            assert_eq!((ui.app.hide_empty, ui.app.wrap), (hide_empty, wrap));
+        }
+        let mut ui = wrapping_ui(&["a"]);
+        ui.app.wrap = opening_ui(Keymap::default(), false, false).app.wrap;
+        assert!(!ui.app.wrap);
+        assert_eq!(
+            ui.event(&Event::Key(KeyEvent::new(
+                KeyCode::Char('z'),
+                KeyModifiers::ALT
+            ))),
+            (Changed::Yes, None)
+        );
+        assert!(ui.app.wrap, "`alt-z` flips it for the session");
     }
 }

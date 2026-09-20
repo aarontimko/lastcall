@@ -97,7 +97,9 @@ hunk_next = ["n", "ctrl-n"]
 character or a named key: `up down left right pageup pagedown home end enter esc tab
 backtab space backspace delete f1` through `f12`. Specs are case-insensitive, so `Ctrl-C`
 and `ctrl-c` are the same thing and `K` is `k`. An upper-case letter is written `shift-k`,
-and shift with tab is `backtab`.
+and shift with tab is `backtab`. That holds for ASCII letters only: any other character is
+the key exactly as written, so `Ω` and `ω` are two different keys and each is written as
+the character the keyboard sends.
 
 **The actions**, with what they do and what they are bound to out of the box:
 
@@ -119,6 +121,7 @@ and shift with tab is `backtab`.
 | `expand` | `e` | expand a collapsed file into real hunks |
 | `toggle_full_paths` | `f` | full paths instead of basenames |
 | `toggle_remote` | `o` | show `org/repo` instead of the directory name |
+| `wrap` | `Ω`, `alt-z` | wrap long lines in the diff, or clip them at the pane's edge |
 | `hide_empty` | `t` | hide or show repositories with nothing pending |
 | `snooze` | `s` | set a repository aside for a number of days |
 | `show_snoozed` | `shift-s` | show or hide the repositories that are set aside |
@@ -150,6 +153,16 @@ bound to Option and an arrow: iTerm2 and herdr panes send that as
 escape prefix can deliver Option-Up as three separate keys, and the third of them is `A`.
 Use `{` and `}` there; they are bound to the same two actions and work everywhere.
 
+`wrap` has no plain key by default: Option-z (`alt-z`) is the wrap key in VS Code
+and the editors built on it, wrapping is on by default, and the letters still unbound are
+kept for actions to come. A Mac terminal as it is set up out of the box does not send
+Option as Alt; it sends the character the keyboard makes, and for Option-z on a US layout
+that is `Ω`. So `Ω` is bound too, and Option-z works on a Mac with no settings change; the
+help overlay shows it as `Opt-z (Ω)`. On another layout Option-z is a different character:
+bind that one, `wrap = ["alt-z", "<it>"]`. A character outside ASCII is taken as typed, so
+`Ω` and `ω` are different keys. A terminal that splits the escape delivers `Esc` then `z`,
+and `z` is undo: there, give wrap a plain key of your own, `wrap = ["c"]` in `[keys]`.
+
 The confirmation modal's own keys, `y` and `enter` to confirm, `n` and `esc` to cancel, are
 not rebindable in this version.
 
@@ -157,6 +170,26 @@ not rebindable in this version.
 before you are in a full screen: an action name that does not exist, a spec the grammar
 cannot parse, and a key bound to two actions once your entries are merged with the
 defaults. Each error names the offending entry.
+
+## `[ui]`
+
+| key | default | what it does |
+|---|---|---|
+| `wrap` | `true` | what the wrap toggle (Option-z, `alt-z`) starts as. `true` wraps a diff line too long for the pane onto as many rows as it needs, breaking at a space where there is one. `false` opens clipping it at the pane's edge, the way versions before 0.5.0 did. Option-z (`alt-z` off a Mac) flips it for the session, and nothing is written back. |
+
+```toml
+[ui]
+wrap = true
+```
+
+A line still cannot take the whole pane: past a few rows short of it the line stops and the
+last row ends in a dim count of the characters not shown, so whatever follows the line is
+always reachable. `y` copies lines, not rows, so a line that was wrapped or cut short on
+screen arrives on the clipboard whole, with no break in it. The pane never scrolls
+sideways, and the in-place editor (`i`) does not wrap.
+
+`[ui]` is new in 0.5.0: a 0.4.0 binary refuses a config file that has the table, so delete
+it before going back to that version.
 
 ## `[herdr]`
 

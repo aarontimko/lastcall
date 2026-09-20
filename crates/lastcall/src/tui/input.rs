@@ -6,7 +6,9 @@
 //! Key spec grammar: optional `ctrl-` / `alt-` / `shift-` prefixes, then a single character
 //! or a named key (`up down left right pageup pagedown home end enter esc tab backtab space
 //! backspace delete f1..f12`). Specs are case-insensitive (`Ctrl-C` = `ctrl-c`, `K` = `k`);
-//! an upper-case letter is spelled `shift-k`, and `shift-tab` is `backtab`. Matching is
+//! an upper-case letter is spelled `shift-k`, and `shift-tab` is `backtab`. The folding is
+//! ASCII's: a character outside it is the key as typed (`Ω` is what a Mac sends for
+//! Option-z, and it is not `ω`). Matching is
 //! exact after that normalization, on both the spec and the terminal's key event
 //! ([`Key::parse`] and [`Key::of`] apply the same folding).
 
@@ -72,6 +74,14 @@ pub enum Action {
     /// scope (the default) or drops the ones with nothing pending and no agent flag
     /// (§6.7, Amendment v1.9 item 4).
     HideEmpty,
+    /// Option-z (`Ω`, or `alt-z`): flip [`crate::tui::app::App::wrap`] — the diff pane either wraps a
+    /// long line onto as many rows as it needs (the default) or clips it at the pane's
+    /// edge as every release before this one did (Phase 13, Amendment v1.14).
+    ///
+    /// Named `ToggleWrap` and not `Wrap` because `Wrap` is already
+    /// [`crate::tui::textbuf::Wrap`], which the reducer imports; the `[keys]` action name
+    /// is `wrap`, the way `scope` is [`Action::ScopeToggle`].
+    ToggleWrap,
     /// Ask the loop for a rescan (`Effect::Refresh`); ignored while one is running.
     Refresh,
     Help,
@@ -506,6 +516,18 @@ pub const DEFAULT_KEYMAP: &[(&str, &[&str])] = &[
     ("expand", &["e"]),
     ("toggle_full_paths", &["f"]),
     ("toggle_remote", &["o"]),
+    // Phase 13 (Amendment v1.14). `alt-z` is the binding VS Code readers already know.
+    // `Ω` is Option-z itself on a Mac whose terminal does not send Option as Alt, which is
+    // how a Mac terminal is set up out of the box (the sponsor's run, both in a herdr pane
+    // and outside one): the VS Code key should work there without a settings change. The
+    // help overlay spells it `Opt-z (Ω)`, and the hint line names whichever of the two the
+    // machine's keyboard has (`App::mac_keys`).
+    // There is no plain key, by the sponsor's ruling: wrap is on by default and rarely
+    // toggled, and the unbound letters are worth more to actions still to come. It first
+    // shipped to the sponsor with `c` as a plain twin, for the keyboards whose Option-z is
+    // another character and the links slow enough to split `Esc z`; those readers bind a
+    // key of their own with `[keys] wrap`. The sponsor had already ruled out `shift-w`.
+    ("wrap", &["Ω", "alt-z"]),
     ("snooze", &["s"]),
     ("show_snoozed", &["shift-s"]),
     ("help", &["?"]),
@@ -558,6 +580,7 @@ impl Action {
             "toggle_full_paths" => Action::ToggleFullPaths,
             "toggle_remote" => Action::ToggleRemote,
             "hide_empty" => Action::HideEmpty,
+            "wrap" => Action::ToggleWrap,
             "snooze" => Action::Snooze,
             "show_snoozed" => Action::ShowSnoozed,
             "accept" => Action::Accept,
@@ -606,6 +629,11 @@ impl Action {
             "toggle_remote" => "show org/repo",
             // 23 columns: the overlay caps a description at 30 (design review F15).
             "hide_empty" => "hide / show empty repos",
+            // 15 columns, inside the overlay's 30-column cap. Its two keys (`Opt-z (Ω) /
+            // Alt-z`, 17 columns) run past the 14-column key field, which pads and never
+            // cuts: the row is still inside the overlay's column. It says what the key is
+            // for, not what the key does right now: the hint line is where the state is told.
+            "wrap" => "wrap long lines",
             // Amendment v1.11. Every description is capped at 30 columns by the overlay
             // (design review F15), which is why these say `this repo` and not `this
             // repository`. `snooze` is shorter still, for the same reason `edit_external`
@@ -704,7 +732,7 @@ impl Key {
     /// Parse one key spec (see the module docs for the grammar). The error is the reason,
     /// without the spec itself; [`KeymapError::BadSpec`] adds the action and the spec.
     pub fn parse(spec: &str) -> Result<Key, String> {
-        let lower = spec.trim().to_lowercase();
+        let lower = spec.trim().to_ascii_lowercase();
         if lower.is_empty() {
             return Err("empty key spec".to_owned());
         }
@@ -1245,12 +1273,97 @@ mod tests {
         ));
     }
 
+    /// Amendment v1.14: `wrap` is an action like every other one — two default keys, a
+    /// help row inside the overlay's column, a `[keys]` override that replaces both, and a
+    /// clash with a key already spoken for that names both actions rather than picking one.
+    #[test]
+    fn keys_config_accepts_the_wrap_action() {
+        assert_eq!(Action::from_name("wrap"), Some(Action::ToggleWrap));
+        let described = Action::describe("wrap");
+        assert!(!described.is_empty(), "wrap has no help row");
+        assert!(
+            described.chars().count() <= 30,
+            "{described:?} would cost the overlay its second column"
+        );
+        let km = Keymap::defaults();
+        assert_eq!(
+            to_action(&key('c'), &km),
+            None,
+            "no plain key: the sponsor kept the letters for actions still to come"
+        );
+        assert_eq!(
+            to_action(&key_code(KeyCode::Char('z'), KeyModifiers::ALT), &km),
+            Some(Action::ToggleWrap),
+            "`alt-z`, the wrap key everywhere else"
+        );
+        // Option-z on a Mac that does not send Option as Alt: the character itself, which
+        // crossterm reports with SHIFT because it is an upper-case letter.
+        for mods in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+            assert_eq!(
+                to_action(&key_code(KeyCode::Char('\u{03A9}'), mods), &km),
+                Some(Action::ToggleWrap),
+                "Option-z as a Mac sends it, {mods:?}"
+            );
+        }
+        assert_eq!(
+            Key::parse("\u{03A9}").map(|k| k.spec()),
+            Ok("\u{03A9}".to_owned())
+        );
+        assert_ne!(
+            Key::parse("\u{03A9}"),
+            Key::parse("\u{03C9}"),
+            "not case-folded"
+        );
+
+        let km = Keymap::from_config(&keys(&[("wrap", &["x"])])).unwrap();
+        assert_eq!(to_action(&key('x'), &km), Some(Action::ToggleWrap));
+        assert_eq!(
+            to_action(
+                &key_code(KeyCode::Char('\u{03A9}'), KeyModifiers::SHIFT),
+                &km
+            ),
+            None,
+            "both defaults replaced"
+        );
+        assert_eq!(
+            to_action(&key_code(KeyCode::Char('z'), KeyModifiers::ALT), &km),
+            None
+        );
+        let table = km.table();
+        let wrap = table.iter().find(|(n, _)| n == "wrap").expect("a help row");
+        assert_eq!(
+            wrap.1,
+            vec!["x".to_owned()],
+            "and the overlay shows the new key"
+        );
+
+        // `alt-z` taken by a second action is a `Duplicate` that names both.
+        let err = Keymap::from_config(&keys(&[("copy", &["alt-z"])])).unwrap_err();
+        assert_eq!(
+            err,
+            KeymapError::Duplicate {
+                spec: "alt-z".into(),
+                first: "copy".into(),
+                second: "wrap".into()
+            }
+        );
+        assert!(err.to_string().contains("copy") && err.to_string().contains("wrap"));
+        // Moving `wrap` out of the way first is how the reader keeps `alt-z` for copy, and
+        // a plain key of their own is the same entry.
+        let km = Keymap::from_config(&keys(&[("copy", &["alt-z"]), ("wrap", &["c"])])).unwrap();
+        assert_eq!(
+            to_action(&key_code(KeyCode::Char('z'), KeyModifiers::ALT), &km),
+            Some(Action::Copy)
+        );
+        assert_eq!(to_action(&key('c'), &km), Some(Action::ToggleWrap));
+    }
+
     #[test]
     fn input_override_replaces_defaults_rather_than_appending() {
-        // `c`, not `v` or `z`: `v` is `select`'s default since deliverable 9 and `z` is
+        // `,`, not `v` or `z`: `v` is `select`'s default since deliverable 9 and `z` is
         // `undo`'s since Amendment v1.11, and binding either to a second action is the
         // `Duplicate` this test is not about.
-        let km = Keymap::from_config(&keys(&[("quit", &["x"]), ("scroll_up", &["c"])])).unwrap();
+        let km = Keymap::from_config(&keys(&[("quit", &["x"]), ("scroll_up", &[","])])).unwrap();
         assert_eq!(to_action(&key('x'), &km), Some(Action::Quit));
         assert_eq!(to_action(&key('q'), &km), None, "q no longer quits");
         assert_eq!(
@@ -1258,7 +1371,7 @@ mod tests {
             None,
             "ctrl-c no longer quits either: the entry replaced both defaults"
         );
-        assert_eq!(to_action(&key('c'), &km), Some(Action::ScrollUp(1)));
+        assert_eq!(to_action(&key(','), &km), Some(Action::ScrollUp(1)));
         let table = km.table();
         let quit = table.iter().position(|(n, _)| n == "quit").unwrap();
         assert_eq!(table[quit].1, vec!["x".to_owned()]);
@@ -1269,7 +1382,7 @@ mod tests {
         );
         assert_eq!(
             table.last().unwrap(),
-            &("scroll_up".to_owned(), vec!["c".to_owned()]),
+            &("scroll_up".to_owned(), vec![",".to_owned()]),
             "a newly bound action is appended"
         );
         let untouched = table.iter().find(|(n, _)| n == "nav_up").unwrap();
@@ -1787,6 +1900,7 @@ mod tests {
             (Action::ToggleFullPaths, "key"),
             (Action::ToggleRemote, "key"),
             (Action::HideEmpty, "key"),
+            (Action::ToggleWrap, "key"),
             (Action::Refresh, "key"),
             (Action::Help, "key"),
             (Action::Quit, "key"),
@@ -1858,6 +1972,7 @@ mod tests {
             | Action::ToggleFullPaths
             | Action::ToggleRemote
             | Action::HideEmpty
+            | Action::ToggleWrap
             | Action::Refresh
             | Action::Help
             | Action::Quit
@@ -1891,9 +2006,9 @@ mod tests {
             | Action::Ack
             | Action::Jump
             | Action::ScopeToggle
-            | Action::Herdr(_) => 53,
+            | Action::Herdr(_) => 54,
         };
-        assert_eq!(table.len(), 53);
+        assert_eq!(table.len(), 54);
     }
 
     #[test]

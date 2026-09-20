@@ -5,6 +5,54 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html). A version's s
 exactly what its GitHub release notes carry, so it is written for the people installing the
 binary rather than for the commit log.
 
+## Unreleased
+
+### Added
+
+- **A diff line too long for the pane now wraps onto as many rows as it needs, instead of
+  being cut at the pane's edge.** The whole line is on the screen, so a wide diff no longer
+  hides the end of what changed, and there is still nothing to scroll sideways. A line long
+  enough to fill the pane on its own stops a few rows short and ends in a dim `… +N` marker
+  counting the characters not drawn, so whatever follows it is always at least partly
+  visible.
+- Option-z on a Mac, `alt-z` elsewhere (the VS Code key), turns wrapping off and on while
+  you read. Clipped is the old behaviour, with the line cut at the edge; the line you were
+  on stays the line you are on either way.
+  The key changes nothing on disk, so the next launch is whatever your config says.
+- `[ui] wrap` in `config.toml` chooses how lastcall opens, `true` by default. Set it to
+  `false` to open clipped.
+- Copying is unchanged in both modes: `y` puts whole lines on the clipboard, with no row
+  break turned into a newline and no `… +N` marker.
+
+### Changed
+
+- `alt-z` and `Ω` (what a Mac sends for Option-z) are now bound to the new `wrap` action,
+  which has no plain key: `[keys] wrap = ["..."]` gives it one (the entry replaces the
+  defaults, so name every key you want). A config
+  that already binds one of them to something else no longer loads, with an error naming
+  the key and both actions; give the other action a different key, or move `wrap`.
+- In a `[keys]` entry only ASCII letters ignore case now. A character outside ASCII is the
+  key exactly as written, so `"Ä"` no longer means `"ä"`: write the character the keyboard
+  sends.
+- A config file with a `[ui]` table is refused by 0.4.0 and earlier, which do not know the
+  table. Remove it before going back to an older binary.
+
+### Fixed
+
+- **Two lastcall processes on one repository could leave a change unlisted.** When one pane
+  accepted a file at the same moment another pane refreshed its picture of the repository,
+  the shared cache of what you have already seen could end up holding one snapshot under a
+  label naming a different one. A file accepted in the first pane and then put back to its
+  earlier content was then missing from the list, in both panes, until something else
+  refreshed the cache. The cache is now rebuilt only while the same lock every write takes
+  is held, and only from the snapshot the record on disk names. The fix holds once every
+  lastcall process on that repository runs the new version, so restart open panes after
+  upgrading.
+- **A page down or up in the right pane moved one line too far.** The page was counted
+  from the whole pane, whose first row is the file's header, so each page passed one line
+  that was never on the screen, and more under a root's notices. A page is now the rows
+  the pane really shows, wrapped or clipped. `home` and `end` are unchanged.
+
 ## 0.4.0 - 2026-09-18
 
 ### Changed

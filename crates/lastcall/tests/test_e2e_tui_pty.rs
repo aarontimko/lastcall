@@ -5199,3 +5199,99 @@ fn tui_tour_quit_writes_marker() {
     );
     assert!(marker.contains("\"shown_at\":"), "{marker}");
 }
+
+// ---- Phase 13 deliverable A: word wrap in the diff pane -----------------------------------
+
+/// Deliverable A through the real binary: the pane wraps out of the box, `alt-z` clips
+/// and wraps again, and `Esc z` arriving as **one write** is `alt-z`, the wrap key, rather
+/// than `Esc` followed by `z`, the undo.
+///
+/// The fixture's middle hunk carries a line wider than the pane, so the question "did it
+/// wrap" is answered by whether the end of that line is on the screen at all — the same
+/// thing a reader is asking. The undo half is not a detail: `alt-z` is delivered by a
+/// terminal as `Esc z`, and a loop that took the two bytes apart would accept the `z` as
+/// an undo of whatever was accepted last. The scene accepts a hunk first, so the ledger's
+/// undo depth is the witness: one before the bytes, one after.
+#[test]
+fn pty_wrap_toggles_and_alt_z_is_not_an_undo() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let Some(mut pty) = fx.spawn_tui(&bin()) else {
+        return;
+    };
+    wait_first_piles(&mut pty);
+    wait_watching(&mut pty);
+    open_parse_rs_hunk_2(&mut pty);
+
+    // The tail of the fixture's long line: on the screen only because the pane wrapped it.
+    let tail = r#"starts_with("//")"#;
+    let text = pty.screen_text();
+    assert!(
+        text.contains(tail),
+        "the pane wraps out of the box, so the end of the long line is drawn:\n{text}"
+    );
+    assert_eq!(
+        undo_depth(&fx, "alpha"),
+        0,
+        "nothing accepted in this scene"
+    );
+
+    // `alt-z` clips: the pane is the one this phase replaced, and the tail is gone.
+    pty.send(b"\x1bz").expect("alt-z");
+    pty.wait_for(Duration::from_secs(5), |s| !s.contents().contains(tail))
+        .unwrap_or_else(|e| panic!("`alt-z` clips: {e}\n{}", pty.screen_text()));
+    // And again: the toggle is a toggle.
+    pty.send(b"\x1bz").expect("alt-z again");
+    pty.wait_for(Duration::from_secs(5), |s| s.contents().contains(tail))
+        .unwrap_or_else(|e| panic!("`alt-z` wraps again: {e}\n{}", pty.screen_text()));
+    // A plain `c` is nobody's key (the sponsor kept the letters for actions still to come):
+    // had it clipped, the wait after the accept below would never see the tail.
+    pty.send(b"c").expect("c");
+
+    // Something for an undo to take (code verification F8: on an empty stack "the depth
+    // did not change" holds whether or not the `z` was read as an undo). Hunk 1 is
+    // accepted; the long line is in the hunk after it and stays on the screen.
+    pty.send(b"p").expect("p");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        let (_, cols) = s.size();
+        s.rows(0, cols)
+            .find(|r| r.contains("@@ -"))
+            .is_some_and(|r| header_text(&r).starts_with("@@ -1,"))
+    })
+    .unwrap_or_else(|e| panic!("`p` is back on hunk 1: {e}\n{}", pty.screen_text()));
+    pty.send(b"a").expect("a");
+    pty.wait_for(OVERLOADED, |s| {
+        s.contents().contains("accepted src/parse.rs") && s.contents().contains(tail)
+    })
+    .unwrap_or_else(|e| panic!("hunk 1 accepted: {e}\n{}", pty.screen_text()));
+    assert_eq!(undo_depth(&fx, "alpha"), 1, "one accept to undo");
+
+    // `Esc z` in one write is `alt-z`.
+    pty.send(b"\x1bz").expect("alt-z");
+    pty.wait_for(Duration::from_secs(5), |s| !s.contents().contains(tail))
+        .unwrap_or_else(|e| panic!("`alt-z` clips: {e}\n{}", pty.screen_text()));
+    let text = pty.screen_text();
+    assert!(
+        !text.contains("undid accept") && !text.contains("nothing to undo"),
+        "the `z` was never read as an undo:\n{text}"
+    );
+    assert_eq!(
+        undo_depth(&fx, "alpha"),
+        1,
+        "and the accept is still there to undo"
+    );
+
+    // Option-z on a Mac whose terminal does not send Option as Alt (the out-of-the-box
+    // setting, and what the sponsor's run found): the terminal sends the character, `Ω`,
+    // as its two UTF-8 bytes. It is the same key to the reader, so it is the same action.
+    pty.send("\u{03A9}".as_bytes()).expect("option-z");
+    pty.wait_for(Duration::from_secs(5), |s| s.contents().contains(tail))
+        .unwrap_or_else(|e| panic!("Option-z wraps again: {e}\n{}", pty.screen_text()));
+    assert_eq!(undo_depth(&fx, "alpha"), 1);
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}
