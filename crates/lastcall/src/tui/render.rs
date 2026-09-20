@@ -4957,6 +4957,36 @@ mod tests {
         }
     }
 
+    /// Re-verification R3: a root's notices take rows off the top of the body, and they are
+    /// still there after a resize. The fallback keeps the last frame's shortfall, so a page
+    /// key folded into the same pass as the resize pages by the body that will be drawn
+    /// (the probe's input: three notices at 100x30, fallback 25 rows over a drawn 22).
+    #[test]
+    fn render_diff_body_fallback_is_short_by_what_the_last_frame_stacked_above_it() {
+        let lines: Vec<String> = (0..60).map(|i| format!("line {i}")).collect();
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        for wrap in [true, false] {
+            let mut app = wrapped(&lines);
+            app.wrap = wrap;
+            app.roots.get_mut(&root("alpha")).unwrap().pile.notices =
+                (0..3).map(|i| format!("notice {i}")).collect();
+            let (_, hits) = drawn(&app, 100, 30);
+            let real = hits.diff_body.map(|r| (r.width, r.height));
+            assert_eq!(real, Some((71, 22)));
+            app.measured_diff_body(real);
+            app.handle(Action::Resize(100, 30));
+            assert_eq!(app.diff_size, None);
+            assert_eq!(Some(app.diff_body_size()), real, "wrap {wrap}");
+            app.focus = Focus::Diff;
+            app.handle(Action::NavPageDown);
+            assert!(
+                app.diff.scroll <= 22,
+                "wrap {wrap}: no line is passed undrawn, top {}",
+                app.diff.scroll
+            );
+        }
+    }
+
     /// F12: every character of a line reaches the buffer, whatever it is made of. The
     /// renderer clips at the pane's width, so a row measured wrongly loses its tail
     /// silently; this is the test that would catch it.

@@ -188,11 +188,13 @@ pub(super) fn wrap_rows(text: &str, width: usize, max_rows: usize) -> (Vec<(usiz
         // ratatui draws nothing of a symbol that does not fit, so it is parted by characters
         // into rows of its own. Each piece is measured as it will be drawn, alone.
         if first.cells > width && first.end - first.start > 1 {
-            for piece in split_cluster(text, first, width) {
-                if out.len() == max_rows {
-                    return (out, true);
-                }
-                out.push(piece);
+            // Only as many pieces as the caller has rows left for: a cluster can be most of
+            // a megabyte, and parting all of it was most of a second (re-verification R2).
+            let room = max_rows - out.len();
+            let (pieces, cut) = split_cluster(text, first, width, room);
+            out.extend(pieces);
+            if cut {
+                return (out, true);
             }
             continue;
         }
@@ -225,8 +227,14 @@ pub(super) fn wrap_rows(text: &str, width: usize, max_rows: usize) -> (Vec<(usiz
 }
 
 /// An over-wide cluster as char ranges that each fit in `width` cells where a single
-/// character can: as many characters as fit, measured together, per range.
-fn split_cluster(text: &str, cluster: Cluster, width: usize) -> Vec<(usize, usize)> {
+/// character can: as many characters as fit, measured together, per range. At most `room`
+/// ranges; the flag says the cluster had more.
+fn split_cluster(
+    text: &str,
+    cluster: Cluster,
+    width: usize,
+    room: usize,
+) -> (Vec<(usize, usize)>, bool) {
     let mut out = Vec::new();
     let mut piece = String::new();
     let mut start = cluster.start;
@@ -238,6 +246,9 @@ fn split_cluster(text: &str, cluster: Cluster, width: usize) -> Vec<(usize, usiz
     {
         piece.push(ch);
         if piece.chars().count() > 1 && cells(&piece) > width {
+            if out.len() == room {
+                return (out, true);
+            }
             out.push((start, at));
             start = at;
             piece.clear();
@@ -245,8 +256,11 @@ fn split_cluster(text: &str, cluster: Cluster, width: usize) -> Vec<(usize, usiz
         }
         at += 1;
     }
+    if out.len() == room {
+        return (out, true);
+    }
     out.push((start, at));
-    out
+    (out, false)
 }
 
 /// The cap for a body `rows` tall: how many rows one line may take (ruling 2).
@@ -605,6 +619,21 @@ mod tests {
             check("aaa\u{26A0}\u{FE0F}", 4),
             ["aaa", "\u{26A0}\u{FE0F}"],
             "the emoji goes to the next row whole"
+        );
+    }
+
+    /// `cells` is ratatui's count, not a string's width (re-verification R6): the cap's
+    /// marker is fitted with it, so it has to agree with what is drawn.
+    #[test]
+    fn wrap_cells_counts_what_ratatui_draws() {
+        use unicode_width::UnicodeWidthStr;
+        for (text, drawn) in [("\u{FF76}\u{FF9E}", 2), ("\u{0644}\u{0627}", 2), ("abc", 3)] {
+            assert_eq!(cells(text), drawn, "{text:?}");
+        }
+        assert_eq!(
+            "\u{FF76}\u{FF9E}".width(),
+            1,
+            "the premise: a string measures less"
         );
     }
 

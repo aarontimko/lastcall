@@ -463,7 +463,8 @@ impl Ui {
         // fallback (`diff_cols` / `page_rows`) is the right answer then. Whichever of the
         // two call sites drew — a row's own hunks, or a collapsed row's shorter expansion
         // — reported its own rectangle, so the size is the one that was laid out.
-        self.app.diff_size = hits.diff_body.map(|r| (r.width, r.height));
+        self.app
+            .measured_diff_body(hits.diff_body.map(|r| (r.width, r.height)));
         self.hits = Some(hits);
     }
 }
