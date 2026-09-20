@@ -150,9 +150,9 @@ Every bracketed control on the right is also a click target, and every one of th
 key. Use whichever you prefer.
 
 A line too long for the pane is wrapped onto as many rows as it needs, broken at a space
-where there is one, so the end of a long line is on the screen with the rest of it. `c` (or `alt-z`) turns
-that off and back on for the session, and `[ui] wrap` in [`config.md`](config.md) decides
-which way it opens. A single line will not take the whole pane: past a few rows short of
+where there is one, so the end of a long line is on the screen with the rest of it. `c`
+(or `alt-z`) turns that off and back on for the session, and `[ui] wrap` in
+[`config.md`](config.md) decides which way it opens. A single line will not take the whole pane: past a few rows short of
 it the line stops and the last row ends in a dim count of what is not shown, so the lines
 under it stay reachable. Copying is unaffected either way, because `y` copies lines and
 not rows.

@@ -152,10 +152,10 @@ escape prefix can deliver Option-Up as three separate keys, and the third of the
 Use `{` and `}` there; they are bound to the same two actions and work everywhere.
 
 `wrap` has the same shape for the same reason: `alt-z` is the wrap key in VS Code and the
-editors built on it, and `c` is its plain twin. A terminal that does not send Option as Meta sends a plain letter
-for Option-z, and nothing happens. A terminal that splits the escape delivers `Esc` then
-`z`, and `z` is undo, so use `c` there, or put `wrap = ["c"]` in `[keys]` and leave
-Option out of it.
+editors built on it, and `c` is its plain twin. A terminal that does not send Option as
+Meta sends a plain letter for Option-z, and nothing happens. A terminal that splits the
+escape delivers `Esc` then `z`, and `z` is undo, so use `c` there, or put `wrap = ["c"]`
+in `[keys]` and leave Option out of it.
 
 The confirmation modal's own keys, `y` and `enter` to confirm, `n` and `esc` to cancel, are
 not rebindable in this version.

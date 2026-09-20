@@ -42,6 +42,10 @@ binary rather than for the commit log.
   is held, and only from the snapshot the record on disk names. The fix holds once every
   lastcall process on that repository runs the new version, so restart open panes after
   upgrading.
+- **A page down or up in the right pane moved one line too far.** The page was counted
+  from the whole pane, whose first row is the file's header, so each page passed one line
+  that was never on the screen, and more under a root's notices. A page is now the rows
+  the pane really shows, wrapped or clipped. `home` and `end` are unchanged.
 
 ## 0.4.0 - 2026-09-18
 

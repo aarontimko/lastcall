@@ -965,9 +965,11 @@ line 40 after a resize or a toggle.
 
 - `wrap_rows(text, width, max_rows) -> (Vec<(usize, usize)>, bool)` breaks after the last
   whitespace that fits and hard-breaks a word that never will. It stops after `max_rows`
-  (the pane passes the cap) and the flag says whether text was left over, so a megabyte
-  line costs a few rows of work per frame and not a megabyte of it. `wrap_words` is the
-  unbounded form the tests use.
+  (the pane passes the cap) and the flag says whether text was left over, so the wrapping
+  of a megabyte line is a few rows of work per frame and not a megabyte of it (the line is
+  still copied and counted once a frame, well under a millisecond), and parting one
+  over-wide cluster stops at the same bound. `wrap_words` is the unbounded form the tests
+  use.
   **A row is measured the way ratatui draws it, not the way a string measures.** ratatui
   draws grapheme by grapheme and gives each one its own `CellWidth`; the width of the row
   as one string is a different number for some scripts (an Arabic lam and alef measure one
@@ -1005,7 +1007,10 @@ line 40 after a resize or a toggle.
   at least one line so a tall line still makes progress. The wheel up (`scroll_back`) is
   clamped to the page-up fill for the same reason, and `move_sel_cursor` applies both
   clamps while a selection is live, where a page is counted in lines and a page of wrapped
-  lines is more rows than the body has. `scroll_page_up` is a backward
+  lines is more rows than the body has. The clamps are for a `Pace::Step`; `home` and `end`
+  are a `Pace::Jump`, which says "take me there" and is not a page, so `v` `end` selects
+  to the last line as it always did
+  (`app_wrap_the_jumps_under_a_selection_reach_the_ends`). `scroll_page_up` is a backward
   fill and **not** page down's inverse: with rows of different heights the two cannot be,
   and what it promises is that the line the reader was on is still whole on the screen
   they land on. `keep_visible` is what `move_sel_cursor` uses in place of a `page_rows`
@@ -1016,11 +1021,17 @@ the nav offset, and `Action::Resize` and a nav-width change clear it; `App::diff
 falls back to `diff_cols()` (the same inner arithmetic `editor_cols()` uses, factored into
 `main_inner_cols` so the two cannot drift) and `page_rows() - 1` (the pane's first row is
 the file's header, not the body; `render_diff_body_fallback_is_what_the_renderer_draws`
-holds the fallback equal to the drawn body at every size). So the reducer asks the layout
-about the pane the reader is actually looking at, and never about a pane of zero. A banner
-appearing or the expansion replacing the main body inside one event batch can still leave
-the last frame's size for the keys in that batch; the next frame corrects it, and the
-layout is recomputed from the scroll on every draw, so nothing is stored wrong.
+holds the fallback equal to the drawn body of the plain main view at every size) **less
+`App::diff_short`**: a root's notices and the expansion's own lines are stacked above the
+body too, and they outlive a resize, so `measured_diff_body` remembers how many rows
+shorter than plain the last drawn body was and the fallback stays that much shorter
+(`render_diff_body_fallback_is_short_by_what_the_last_frame_stacked_above_it`). A stale
+shortfall errs short, and a page that is too short passes nothing. So the reducer asks the
+layout about the pane the reader is actually looking at, and never about a pane of zero.
+What is left: notices arriving, or the expansion replacing the main body, inside one
+event batch leave the last frame's size for the keys in that batch; the next frame
+corrects it, and the layout is recomputed from the scroll on every draw, so nothing is
+stored wrong.
 
 **A continuation row** repeats the line's gutter mark in the line's colour, **dim**, so a
 wrapped `+` line does not read as several added lines; the text keeps its full colour, and
