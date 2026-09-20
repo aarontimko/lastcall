@@ -43,6 +43,14 @@ pub enum ScanError {
     Index(#[from] IndexError),
     #[error(transparent)]
     Store(#[from] StoreError),
+    /// The private index was reseeded by another process between this scan's reads of it
+    /// (Phase 13 deliverable B, item 5). A reseed between `diff-files` and `ls-files
+    /// --others` can drop a path that is pending under both trees, and a one-shot
+    /// `lastcall status` has no next scan to correct it, so the scan says so instead.
+    /// The engine loops [`crate::engine`]'s `scan_root`; on exhaustion the pile comes back
+    /// with a notice, never as an error.
+    #[error("the private index was reseeded during this scan")]
+    IndexMoved,
 }
 
 /// An (oid, mode) pair as rendered.
@@ -228,6 +236,10 @@ pub struct ScanInputs<'a> {
     pub excluded_dirs: &'a [ExcludedDir],
     /// `<repo>/index.tmp`, for D5 rename pairing.
     pub index_tmp: &'a Path,
+    /// Whether a reseed noticed under this scan is worth another attempt. The engine sets
+    /// it on every attempt but the last; on the last one the scan keeps the pile it built
+    /// and says so in a notice, which is what every scan did before Phase 13.
+    pub retry_on_reseed: bool,
 }
 
 /// What a scan produced besides the pile.
@@ -339,6 +351,14 @@ fn is_binary(bytes: &[u8]) -> bool {
     bytes[..bytes.len().min(BINARY_PROBE)].contains(&0)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Between `diff_files` and `others`: the window schedule S2 opens, where a reseed
+    /// costs a path that is pending under both trees (Phase 13 deliverable B).
+    pub(crate) static DIFF_FILES_HOOK: crate::testhook::TestHook<()> =
+        const { crate::testhook::TestHook::new() };
+}
+
 /// Run one scan.
 pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
     let store = inputs.store;
@@ -347,7 +367,7 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
     let calls_before = store.git().hash_object_calls();
 
     // 1. Index refresh and enumeration.
-    inputs.index.ensure(inputs.seen_tree)?;
+    let mut marker = inputs.index.ensure(inputs.seen_tree)?.marker;
     let refreshed = inputs.index.refresh();
     if !refreshed {
         notices.push("index.lock held by another process; scanned without refresh".into());
@@ -358,11 +378,27 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
             // The private index is a cache: a torn or truncated file is rebuilt from the
             // seen tree and the scan tries once more.
             notices.push(format!("private index unreadable ({e}); reseeded"));
-            inputs.index.seed(inputs.seen_tree)?;
+            marker = inputs.index.reseed(inputs.seen_tree)?;
             inputs.index.diff_files()?
         }
     };
+    #[cfg(test)]
+    DIFF_FILES_HOOK.with(|h| h.fire(()));
     let others = inputs.index.others(inputs.scope)?;
+    // The two reads above are one picture of the index, and a reseed between them can
+    // omit a path that is pending under the reader's tree *and* under the new one. The
+    // marker is replaced by rename at every seed, so its identity says whether this scan
+    // read one index or two.
+    if inputs.index.marker_id() != marker {
+        if inputs.retry_on_reseed {
+            return Err(ScanError::IndexMoved);
+        }
+        notices.push(
+            "the private index was reseeded while this root was scanned; \
+             the list is refreshed by the next scan"
+                .into(),
+        );
+    }
     let mut nested_repos: Vec<Vec<u8>> = others
         .iter()
         .filter_map(|o| match o {
@@ -1062,6 +1098,7 @@ mod tests {
                 excluded_dirs: &[],
                 index_tmp: &self.paths.index_tmp,
                 row_cap: crate::engine::DEFAULT_ROW_CAP,
+                retry_on_reseed: false,
             })
             .unwrap()
         }
@@ -1430,6 +1467,7 @@ pub(crate) mod fixture_tests {
                 excluded_dirs: &[],
                 index_tmp: &self.paths.index_tmp,
                 row_cap: crate::engine::DEFAULT_ROW_CAP,
+                retry_on_reseed: false,
             };
             super::scan(&inputs).unwrap()
         }

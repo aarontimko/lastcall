@@ -257,13 +257,16 @@ impl RootState {
         if now == self.ledger_stamp {
             return;
         }
-        self.ledger_stamp = now;
         let Ok(bytes) = std::fs::read(&self.paths.ledger) else {
             return;
         };
         let Ok((mut fresh, _)) = ledger::parse(&bytes) else {
             return;
         };
+        // The stamp is stored only now (Phase 13 deliverable B, item 3(iii)): storing it
+        // before the read let a failed read or parse leave a new stamp over old content,
+        // and the next reload then saw nothing to do.
+        self.ledger_stamp = now;
         if fresh.seen_tree != self.ledger.seen_tree {
             self.tree = match &fresh.seen_tree {
                 Some(t) if self.store.exists(t) => match self.store.ls_tree(t) {
@@ -1129,7 +1132,48 @@ fn trace_scan_done(root: &Path, started: &std::time::Instant, rows: usize, seq: 
     );
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Between `trim` and `scan::scan`: where another process's fold lands after this
+    /// scan has already reloaded the ledger (Phase 13 deliverable B).
+    pub(crate) static SCAN_ROOT_HOOK: crate::testhook::TestHook<()> =
+        const { crate::testhook::TestHook::new() };
+}
+
+/// How many times [`scan_root`] runs its body when the ledger or the private index moved
+/// under it (Phase 13 deliverable B, item 6). One retry is enough for the case that
+/// exists: the body reloads the ledger first, so the second pass scans against whatever
+/// the other process committed. A lock-held reload would not be simpler, because
+/// `sync_branch` and `trim` take the ledger lock themselves.
+const SCAN_ATTEMPTS: u32 = 2;
+
+/// Whether an error says this scan raced another process's write and should be repeated.
+fn moved_under_this_scan(e: &EngineError) -> bool {
+    matches!(
+        e,
+        EngineError::Scan(ScanError::IndexMoved)
+            | EngineError::Scan(ScanError::Index(IndexError::LedgerMoved))
+    )
+}
+
 fn scan_root(state: &mut RootState, ctx: &ScanCtx) -> Result<Pile, EngineError> {
+    let mut attempt = 1;
+    loop {
+        let last = attempt == SCAN_ATTEMPTS;
+        match scan_root_once(state, ctx, !last) {
+            Err(e) if !last && moved_under_this_scan(&e) => attempt += 1,
+            // On exhaustion `LedgerMoved` is the answer; `IndexMoved` cannot reach here,
+            // because the last attempt keeps its pile and reports a notice instead.
+            other => return other,
+        }
+    }
+}
+
+fn scan_root_once(
+    state: &mut RootState,
+    ctx: &ScanCtx,
+    retry_on_reseed: bool,
+) -> Result<Pile, EngineError> {
     state.reload_ledger_if_changed();
     // R1: which record is in force, before a single baseline is read. A scan that arrives
     // on file events alone, with no head inspection behind it, still sees the switch.
@@ -1159,6 +1203,8 @@ fn scan_root(state: &mut RootState, ctx: &ScanCtx) -> Result<Pile, EngineError> 
                 .trim(&out_of_scope, &NoFault)?;
         }
     }
+    #[cfg(test)]
+    SCAN_ROOT_HOOK.with(|h| h.fire(()));
     let out = scan::scan(&ScanInputs {
         store: &state.store,
         index: &state.index,
@@ -1173,6 +1219,7 @@ fn scan_root(state: &mut RootState, ctx: &ScanCtx) -> Result<Pile, EngineError> 
         excluded_dirs: &state.excluded_dirs,
         index_tmp: &state.paths.index_tmp,
         row_cap: ctx.row_cap,
+        retry_on_reseed,
     })?;
     let mut pile = out.pile;
     // The two per-root ledger facts the reducer may never read for itself (design review
@@ -2106,6 +2153,8 @@ pub(crate) mod tests {
     use crate::store::tests::fixture_env;
     use lastcall_testkit::fixture_repo::FixtureRepo;
     use lastcall_testkit::tmp::TempDir;
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
     use std::time::Duration;
 
     /// A `Loaded`/`Resolved` pair watching the fixture's parent dir.
@@ -2990,6 +3039,703 @@ pub(crate) mod tests {
                 "scan {i} disagrees with the first scan"
             );
         }
+    }
+
+    /// Records every seed the private index runs while it lives: the tree seeded, and
+    /// whether the ledger lock was held at that moment. A second handle asking for the
+    /// lock with a zero budget answers `LockBusy` only while somebody holds it, and the
+    /// lock is not re-entrant even inside one process, so that is a statement about
+    /// `flock` and never about a sleep. The seam is cleared on drop, so a failing
+    /// assertion cannot leave it armed for the next test on this thread.
+    struct SeedWatch {
+        seeds: Rc<RefCell<Vec<Seed>>>,
+    }
+
+    /// One seed as the seam saw it: the tree, and whether the ledger lock was held.
+    type Seed = (Option<Oid>, bool);
+
+    impl SeedWatch {
+        fn arm(paths: &RepoPaths) -> Self {
+            let seeds: Rc<RefCell<Vec<Seed>>> = Rc::new(RefCell::new(Vec::new()));
+            crate::index::SEED_HOOK.with(|h| {
+                let seeds = seeds.clone();
+                let paths = paths.clone();
+                h.set(move |tree| {
+                    let held = LedgerLock::acquire_with(&paths, 0, Duration::ZERO);
+                    let under_lock = matches!(held, Err(LedgerError::LockBusy { .. }));
+                    seeds.borrow_mut().push((tree, under_lock));
+                });
+            });
+            Self { seeds }
+        }
+
+        fn seeds(&self) -> Vec<Seed> {
+            self.seeds.borrow().clone()
+        }
+    }
+
+    impl Drop for SeedWatch {
+        fn drop(&mut self) {
+            crate::index::SEED_HOOK.with(|h| h.clear());
+        }
+    }
+
+    /// Phase 13 deliverable B, item 1: the fold's seed happens **before** the ledger lock
+    /// is dropped. The seam between `read-tree` and the marker write asks a second handle
+    /// for the lock with a zero budget: while the fold holds it, that is `LockBusy`.
+    #[test]
+    fn engine_fold_seeds_the_index_before_it_drops_the_ledger_lock() {
+        let repo = FixtureRepo::new("eng-fold-lock").unwrap();
+        let state = TempDir::new("lc-eng-fold-lock");
+        repo.write("f1", "edited\n");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let root = only_root(&engine);
+        let paths = engine.root(&root).unwrap().paths.clone();
+        let pile = engine.scan(&root).unwrap();
+
+        let watch = SeedWatch::arm(&paths);
+        let acc = engine.accept(&root, AcceptRequest::All(pile)).unwrap();
+        assert!(acc.outcome.ok() && acc.pile.is_empty());
+        let folded = ledger_tree_on_disk(&engine, &root);
+        assert_eq!(
+            watch.seeds(),
+            vec![(folded, true)],
+            "the fold's seed must run under the ledger lock"
+        );
+        drop(watch);
+        assert!(
+            LedgerLock::acquire_with(&paths, ledger::LOCK_RETRIES, ledger::LOCK_BACKOFF).is_ok(),
+            "and the guard is gone by the time the accept returns"
+        );
+    }
+
+    /// Phase 13 deliverable B, item 1(b): `ensure`'s stale path takes the lock itself and
+    /// releases it before it returns, so `scan.rs` never holds a guard.
+    #[test]
+    fn engine_a_stale_scan_seeds_under_the_ledger_lock() {
+        let repo = FixtureRepo::new("eng-ensure-lock").unwrap();
+        let state = TempDir::new("lc-eng-ensure-lock");
+        repo.write("f1", "edited\n");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let root = only_root(&engine);
+        let paths = engine.root(&root).unwrap().paths.clone();
+        assert!(
+            engine.root(&root).unwrap().index.marker_id().is_none(),
+            "the premise: nothing has seeded this index yet"
+        );
+
+        let watch = SeedWatch::arm(&paths);
+        let pile = engine.scan(&root).unwrap();
+        assert!(pile.row(b"f1").is_some(), "{:?}", scan::pile_lines(&pile));
+        let seen = engine.root(&root).unwrap().ledger.seen_tree.clone();
+        assert_eq!(
+            watch.seeds(),
+            vec![(seen, true)],
+            "one seed, and it held the ledger lock"
+        );
+        drop(watch);
+        assert!(
+            LedgerLock::acquire_with(&paths, ledger::LOCK_RETRIES, ledger::LOCK_BACKOFF).is_ok(),
+            "no guard outlived `ensure`"
+        );
+    }
+
+    /// Phase 13 deliverable B, item 3: a scan whose ledger is out of date must not seed the
+    /// tree it still believes in. Between A's reload and A's `ensure`, engine B folds and
+    /// the accepted file goes back to its old content: A's record says that content is
+    /// seen, B's says it is not. A must scan against the ledger on disk and list the file.
+    #[test]
+    fn engine_a_stale_scan_reloads_instead_of_seeding_its_own_tree() {
+        let repo = FixtureRepo::new("eng-stale-seed").unwrap();
+        let state = TempDir::new("lc-eng-stale-seed");
+        let original = std::fs::read(repo.path().join("f1")).unwrap();
+        repo.write("f1", "accepted by the other pane\nsecond line\n");
+        let mut a = open_engine(&repo, &state, Config::default());
+        let mut b = open_engine(&repo, &state, Config::default());
+        let root = only_root(&a);
+        assert!(a.scan(&root).unwrap().row(b"f1").is_some());
+
+        let paths = a.root(&root).unwrap().paths.clone();
+        let watch = SeedWatch::arm(&paths);
+        let f1 = repo.path().join("f1");
+        SCAN_ROOT_HOOK.with(|h| {
+            let root_b = root.clone();
+            let mut once = false;
+            h.set(move |()| {
+                if once {
+                    return;
+                }
+                once = true;
+                let pile = b.scan(&root_b).unwrap();
+                b.accept(&root_b, AcceptRequest::All(pile)).unwrap();
+                std::fs::write(&f1, &original).unwrap();
+            });
+        });
+        let pile = a.scan(&root).unwrap();
+        SCAN_ROOT_HOOK.with(|h| h.clear());
+
+        let after = ledger_tree_on_disk(&a, &root);
+        assert!(
+            pile.row(b"f1").is_some(),
+            "the put-back file is pending against the ledger on disk: {:?}",
+            scan::pile_lines(&pile)
+        );
+        assert_eq!(
+            a.root(&root).unwrap().index.recorded_tree(),
+            Some(after.clone()),
+            "the marker still names the tree the ledger on disk names"
+        );
+        assert!(
+            watch
+                .seeds()
+                .iter()
+                .all(|(t, locked)| *t == after && *locked),
+            "every seed named the tree the ledger names, under the lock: {:?}",
+            watch.seeds()
+        );
+    }
+
+    /// The seen tree `ledger.json` names on disk right now.
+    fn ledger_tree_on_disk(engine: &Engine, root: &Path) -> Option<Oid> {
+        let paths = engine.root(root).unwrap().paths.clone();
+        let bytes = std::fs::read(&paths.ledger).unwrap();
+        ledger::parse(&bytes).unwrap().0.seen_tree
+    }
+
+    /// The bytes of `index`, `index.tree` and `ledger.json`.
+    type IndexLedgerBytes = (Vec<u8>, Vec<u8>, Vec<u8>);
+
+    /// The three files a refusing scan must not write.
+    fn index_ledger_snapshot(paths: &RepoPaths) -> IndexLedgerBytes {
+        (
+            std::fs::read(&paths.index).unwrap(),
+            std::fs::read(&paths.index_tree).unwrap(),
+            std::fs::read(&paths.ledger).unwrap(),
+        )
+    }
+
+    /// Phase 13 deliverable B, item 6: `LedgerMoved` loops the whole of `scan_root`, and
+    /// the loop is bounded. A pane that is beaten to the ledger on every attempt gives up
+    /// with the typed error, having written nothing: the ledger the other engine left, the
+    /// index it left and the marker it left are all byte-identical afterwards.
+    #[test]
+    fn engine_a_ledger_that_moves_on_every_attempt_gives_up_after_the_bound() {
+        let repo = FixtureRepo::new("eng-moved-bound").unwrap();
+        let state = TempDir::new("lc-eng-moved-bound");
+        repo.write("f1", "one\n");
+        let mut a = open_engine(&repo, &state, Config::default());
+        let mut b = open_engine(&repo, &state, Config::default());
+        let root = only_root(&a);
+        let paths = a.root(&root).unwrap().paths.clone();
+        a.scan(&root).unwrap();
+        let stale = a.root(&root).unwrap().ledger.seen_tree.clone();
+
+        let calls = Rc::new(Cell::new(0u32));
+        let left: Rc<RefCell<Option<IndexLedgerBytes>>> = Rc::new(RefCell::new(None));
+        let watch = SeedWatch::arm(&paths);
+        SCAN_ROOT_HOOK.with(|h| {
+            let calls = calls.clone();
+            let left = left.clone();
+            let paths = paths.clone();
+            let root_b = root.clone();
+            let f1 = repo.path().join("f1");
+            h.set(move |()| {
+                let n = calls.get() + 1;
+                calls.set(n);
+                std::fs::write(&f1, format!("moved {n}\n")).unwrap();
+                let pile = b.scan(&root_b).unwrap();
+                b.accept(&root_b, AcceptRequest::All(pile)).unwrap();
+                *left.borrow_mut() = Some(index_ledger_snapshot(&paths));
+            });
+        });
+        let err = a.scan(&root).unwrap_err();
+        SCAN_ROOT_HOOK.with(|h| h.clear());
+
+        assert!(
+            matches!(
+                err,
+                EngineError::Scan(ScanError::Index(IndexError::LedgerMoved))
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            calls.get(),
+            SCAN_ATTEMPTS,
+            "the bound, and not one more pass"
+        );
+        assert_eq!(
+            index_ledger_snapshot(&paths),
+            left.borrow().clone().expect("the other engine folded"),
+            "A refused and wrote nothing"
+        );
+        assert!(
+            !watch.seeds().iter().any(|(t, _)| *t == stale),
+            "A never ran `read-tree` on the tree it still believed in: {:?}",
+            watch.seeds()
+        );
+        assert_eq!(
+            watch.seeds().len(),
+            calls.get() as usize,
+            "the only seeds were the other engine's folds: {:?}",
+            watch.seeds()
+        );
+    }
+
+    /// Phase 13 deliverable B, item 3: the comparison is the seen tree and never the
+    /// stamp. A flag raised in another pane rewrites `ledger.json` and moves its stamp
+    /// without moving the tree, so a scan that finds a stale marker seeds straight away
+    /// and never retries. Written on the stamp, this scan would loop and then fail.
+    #[test]
+    fn engine_a_stale_marker_with_only_a_flag_written_seeds_with_no_retry() {
+        let repo = FixtureRepo::new("eng-flag-seed").unwrap();
+        let state = TempDir::new("lc-eng-flag-seed");
+        repo.write("f1", "edited\n");
+        let mut a = open_engine(&repo, &state, Config::default());
+        let mut b = open_engine(&repo, &state, Config::default());
+        let root = only_root(&a);
+        let paths = a.root(&root).unwrap().paths.clone();
+        assert!(a.scan(&root).unwrap().row(b"f1").is_some());
+        let stamp_before = ledger::stamp(&paths);
+        let tree = a.root(&root).unwrap().ledger.seen_tree.clone();
+
+        let calls = Rc::new(Cell::new(0u32));
+        let watch = SeedWatch::arm(&paths);
+        SCAN_ROOT_HOOK.with(|h| {
+            let calls = calls.clone();
+            let root_b = root.clone();
+            let marker = paths.index_tree.clone();
+            h.set(move |()| {
+                calls.set(calls.get() + 1);
+                b.flag(&root_b, b"f1", "the other pane wants a word", None, None)
+                    .unwrap();
+                // The flag's own rescan reseeds the marker; take it away again, so the
+                // scan under test is the one with work to do.
+                std::fs::remove_file(&marker).unwrap();
+            });
+        });
+        let pile = a.scan(&root).unwrap();
+        SCAN_ROOT_HOOK.with(|h| h.clear());
+
+        assert_eq!(calls.get(), 1, "one attempt: there was nothing to retry");
+        assert!(pile.row(b"f1").is_some(), "{:?}", scan::pile_lines(&pile));
+        assert_eq!(
+            watch.seeds().last(),
+            Some(&(tree.clone(), true)),
+            "the stale marker was seeded, under the lock: {:?}",
+            watch.seeds()
+        );
+        assert_ne!(
+            ledger::stamp(&paths),
+            stamp_before,
+            "the flag did move the stamp"
+        );
+        assert_eq!(
+            ledger_tree_on_disk(&a, &root),
+            tree,
+            "and left the tree exactly where it was"
+        );
+    }
+
+    /// The second design review's schedule S2, at the seam it opens. A file added in the
+    /// working tree is in `others` and not in `diff_files`; between the two reads another
+    /// pane folds it into the seen tree and the file is then edited, so the reseeded index
+    /// answers `others` with nothing and the reader's own `diff_files` never saw it. That
+    /// omission is a hide, and a one-shot `lastcall status` has no next scan to correct
+    /// it. The marker's identity catches it and the scan is repeated.
+    #[test]
+    fn engine_a_reseed_between_diff_files_and_others_is_retried() {
+        let repo = FixtureRepo::new("eng-s2").unwrap();
+        let state = TempDir::new("lc-eng-s2");
+        let mut a = open_engine(&repo, &state, Config::default());
+        let mut b = open_engine(&repo, &state, Config::default());
+        let root = only_root(&a);
+        let added = repo.path().join("new.txt");
+        std::fs::write(&added, "added in the working tree\n").unwrap();
+        assert!(a.scan(&root).unwrap().row(b"new.txt").is_some());
+
+        let calls = Rc::new(Cell::new(0u32));
+        crate::scan::DIFF_FILES_HOOK.with(|h| {
+            let calls = calls.clone();
+            let root_b = root.clone();
+            let added = added.clone();
+            h.set(move |()| {
+                let n = calls.get() + 1;
+                calls.set(n);
+                if n > 1 {
+                    return;
+                }
+                let pile = b.scan(&root_b).unwrap();
+                b.accept(&root_b, AcceptRequest::All(pile)).unwrap();
+                std::fs::write(&added, "added in the working tree\nand then edited\n").unwrap();
+            });
+        });
+        let pile = a.scan(&root).unwrap();
+        crate::scan::DIFF_FILES_HOOK.with(|h| h.clear());
+
+        assert_eq!(
+            calls.get(),
+            2,
+            "the first pass was thrown away and repeated"
+        );
+        assert!(
+            pile.row(b"new.txt").is_some(),
+            "the retry lists the edited path: {:?}",
+            scan::pile_lines(&pile)
+        );
+        assert!(
+            !pile.notices.iter().any(|n| n.contains("reseeded while")),
+            "a successful retry needs no notice: {:?}",
+            pile.notices
+        );
+    }
+
+    /// Item 6's other half: on exhaustion `IndexMoved` is **not** an error. The last
+    /// attempt keeps its pile and says in a notice that the next scan refreshes the list,
+    /// which is what every scan already does, so nothing new reaches `accept_with` or
+    /// `lastcall status`.
+    #[test]
+    fn engine_a_reseed_on_every_attempt_returns_the_pile_with_a_notice() {
+        let repo = FixtureRepo::new("eng-s2-out").unwrap();
+        let state = TempDir::new("lc-eng-s2-out");
+        let mut a = open_engine(&repo, &state, Config::default());
+        let mut b = open_engine(&repo, &state, Config::default());
+        let root = only_root(&a);
+        a.scan(&root).unwrap();
+
+        let calls = Rc::new(Cell::new(0u32));
+        crate::scan::DIFF_FILES_HOOK.with(|h| {
+            let calls = calls.clone();
+            let root_b = root.clone();
+            let f1 = repo.path().join("f1");
+            h.set(move |()| {
+                let n = calls.get() + 1;
+                calls.set(n);
+                std::fs::write(&f1, format!("folded away {n}\n")).unwrap();
+                let pile = b.scan(&root_b).unwrap();
+                b.accept(&root_b, AcceptRequest::All(pile)).unwrap();
+            });
+        });
+        let pile = a.scan(&root).unwrap();
+        crate::scan::DIFF_FILES_HOOK.with(|h| h.clear());
+
+        assert_eq!(calls.get(), SCAN_ATTEMPTS, "both attempts raced");
+        assert!(
+            pile.notices.iter().any(|n| n
+                == "the private index was reseeded while this root was scanned; \
+                    the list is refreshed by the next scan"),
+            "{:?}",
+            pile.notices
+        );
+    }
+
+    /// Design review F1, both orientations. Two engines on one repository, one after the
+    /// other: a file accepted in one pane and then put back to the content the other pane
+    /// still records must be listed by both. These pass before the fix as well, because
+    /// `scan_root` reloads the ledger first; they guard the behaviour the index fix is
+    /// there to protect, they do not prove the fix.
+    #[test]
+    fn engine_two_engines_list_a_change_put_back_after_an_accept_in_both_orientations() {
+        let repo = FixtureRepo::new("eng-putback").unwrap();
+        let state = TempDir::new("lc-eng-putback");
+        let f1 = repo.path().join("f1");
+        let f2 = repo.path().join("f2");
+        let f1_before = std::fs::read(&f1).unwrap();
+        let f2_before = std::fs::read(&f2).unwrap();
+        let mut a = open_engine(&repo, &state, Config::default());
+        let mut b = open_engine(&repo, &state, Config::default());
+        let root = only_root(&a);
+        assert!(a.scan(&root).unwrap().is_empty());
+        assert!(b.scan(&root).unwrap().is_empty());
+
+        // Modify, accept in A, put the old content back.
+        repo.write("f1", "edited in the working tree\nsecond line\n");
+        let pile = a.scan(&root).unwrap();
+        assert!(pile.row(b"f1").is_some());
+        assert!(
+            a.accept(&root, AcceptRequest::All(pile))
+                .unwrap()
+                .outcome
+                .ok()
+        );
+        std::fs::write(&f1, &f1_before).unwrap();
+        for (who, engine) in [("A", &mut a), ("B", &mut b)] {
+            let pile = engine.scan(&root).unwrap();
+            assert!(
+                pile.row(b"f1").is_some(),
+                "{who} lists the put-back file: {:?}",
+                scan::pile_lines(&pile)
+            );
+        }
+
+        // Delete, accept in B, recreate with the old content.
+        std::fs::remove_file(&f2).unwrap();
+        let pile = b.scan(&root).unwrap();
+        assert!(pile.row(b"f2").is_some());
+        assert!(
+            b.accept(&root, AcceptRequest::All(pile))
+                .unwrap()
+                .outcome
+                .ok()
+        );
+        std::fs::write(&f2, &f2_before).unwrap();
+        for (who, engine) in [("B", &mut b), ("A", &mut a)] {
+            let pile = engine.scan(&root).unwrap();
+            assert!(
+                pile.row(b"f2").is_some(),
+                "{who} lists the recreated file: {:?}",
+                scan::pile_lines(&pile)
+            );
+        }
+    }
+
+    /// Item 2: the fold's seed is best effort. The accept is committed before the seed is
+    /// attempted, so a seed that cannot run must not turn a finished accept into an error;
+    /// what it must do is leave **no** marker, rather than one naming a tree the index
+    /// does not hold.
+    ///
+    /// Git's own `index.lock` is what makes the seed fail: `read-tree` takes it and gives
+    /// up after three short tries. An unwritable `index` would not do it, because
+    /// `read-tree` renames over the file. The fold is driven through `Ops::accept_all`
+    /// rather than `Engine::accept`, whose rescan (`engine.rs:1520`, today's behaviour and
+    /// not this phase's) would fail on the same held lock and hide the contract under test.
+    #[test]
+    fn engine_fold_whose_seed_fails_still_accepts_and_leaves_no_marker() {
+        let repo = FixtureRepo::new("eng-seed-fails").unwrap();
+        let state = TempDir::new("lc-eng-seed-fails");
+        repo.write("f1", "edited\n");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let root = only_root(&engine);
+        let paths = engine.root(&root).unwrap().paths.clone();
+        let pile = engine.scan(&root).unwrap();
+        assert!(pile.row(b"f1").is_some());
+        let before = ledger_tree_on_disk(&engine, &root);
+
+        let git_lock = paths.repo_dir.join("index.lock");
+        std::fs::write(&git_lock, b"held by somebody else\n").unwrap();
+        let outcome = {
+            let mut ops = engine.ops(&root).unwrap();
+            ops.accept_all(&pile, &NoFault).unwrap()
+        };
+        assert!(outcome.ok(), "{:?}", outcome.refused);
+        let after = ledger_tree_on_disk(&engine, &root);
+        assert_ne!(after, before, "the accept was committed");
+        assert!(
+            !paths.index_tree.exists(),
+            "no marker is better than one naming a tree the index does not hold"
+        );
+
+        std::fs::remove_file(&git_lock).unwrap();
+        let pile = engine.scan(&root).unwrap();
+        assert!(pile.is_empty(), "{:?}", scan::pile_lines(&pile));
+        assert_eq!(
+            engine.root(&root).unwrap().index.recorded_tree(),
+            Some(after),
+            "the next scan seeded it again"
+        );
+    }
+
+    /// The scan's other seeding site: a marker that is fresh over an index that cannot be
+    /// read. The `DIRC` header is intact so `ensure` declines the work, `diff_files`
+    /// fails, and the retry reseeds under the lock and scans. The retry also has to hand
+    /// the new marker back, or the identity check at the end of the scan would call the
+    /// scan's own repair a reseed by somebody else.
+    #[test]
+    fn engine_unreadable_index_retry_reseeds_under_the_lock() {
+        let repo = FixtureRepo::new("eng-torn-index").unwrap();
+        let state = TempDir::new("lc-eng-torn-index");
+        repo.write("f1", "edited\n");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let root = only_root(&engine);
+        let paths = engine.root(&root).unwrap().paths.clone();
+        assert!(engine.scan(&root).unwrap().row(b"f1").is_some());
+        let marker = engine.root(&root).unwrap().index.marker_id();
+
+        let mut torn = b"DIRC".to_vec();
+        torn.extend(std::iter::repeat_n(0xABu8, 60));
+        std::fs::write(&paths.index, &torn).unwrap();
+
+        let watch = SeedWatch::arm(&paths);
+        let pile = engine.scan(&root).unwrap();
+        let seen = engine.root(&root).unwrap().ledger.seen_tree.clone();
+        assert!(
+            pile.notices
+                .iter()
+                .any(|n| n.starts_with("private index unreadable")),
+            "{:?}",
+            pile.notices
+        );
+        assert_eq!(
+            watch.seeds(),
+            vec![(seen, true)],
+            "one reseed, and it held the ledger lock"
+        );
+        assert!(pile.row(b"f1").is_some(), "{:?}", scan::pile_lines(&pile));
+        assert_ne!(
+            engine.root(&root).unwrap().index.marker_id(),
+            marker,
+            "the reseed replaced the marker"
+        );
+        assert!(
+            !pile.notices.iter().any(|n| n.contains("reseeded while")),
+            "and the scan knew it was its own doing: {:?}",
+            pile.notices
+        );
+    }
+
+    /// Item 8's self-block hunt. A scan of a narrowed draft root trims its record, and the
+    /// trim is a fold, which now seeds under the ledger lock from inside the scan. The
+    /// scan must complete (no deadlock: the lock is released before `scan::scan` runs) and
+    /// the fold's seed must be the only one, because the `ensure` that follows finds the
+    /// marker naming the tree the fold just committed.
+    #[test]
+    fn engine_a_scan_whose_trim_folds_seeds_the_index_once_in_the_fold() {
+        let repo = FixtureRepo::new("eng-trim-seed").unwrap();
+        let state = TempDir::new("lc-eng-trim-seed");
+        let drafts = repo.parent_dir().join("_drafts");
+        std::fs::create_dir_all(drafts.join("sub")).unwrap();
+        std::fs::write(drafts.join("n1.md"), "one\n").unwrap();
+        std::fs::write(drafts.join("sub/deep.md"), "deep\n").unwrap();
+        let wide = Config {
+            draft_dirs: vec!["_drafts/**".to_owned()],
+            draft_initial: DraftInitial::Seen,
+            ..Config::default()
+        };
+        let narrow = Config {
+            draft_dirs: vec!["_drafts".to_owned()],
+            ..wide.clone()
+        };
+        let draft = {
+            let mut engine = open_engine(&repo, &state, wide);
+            let draft = engine
+                .roots()
+                .iter()
+                .find(|r| r.kind == RootKind::Draft)
+                .map(|r| r.path.clone())
+                .expect("a draft root");
+            assert!(engine.scan(&draft).unwrap().is_empty());
+            assert!(
+                engine
+                    .root(&draft)
+                    .unwrap()
+                    .tree
+                    .contains_key(b"sub/deep.md".as_slice()),
+                "the premise: the wide record holds the deep path"
+            );
+            draft
+        };
+
+        let mut engine = open_engine(&repo, &state, narrow);
+        let paths = engine.root(&draft).unwrap().paths.clone();
+        let watch = SeedWatch::arm(&paths);
+        let pile = engine.scan(&draft).unwrap();
+        let seeds = watch.seeds();
+        assert!(
+            pile.notices
+                .iter()
+                .any(|n| n == "1 path outside the root's scope dropped from its record"),
+            "the premise: the trim ran: {:?}",
+            pile.notices
+        );
+        assert_eq!(
+            seeds,
+            vec![(engine.root(&draft).unwrap().ledger.seen_tree.clone(), true)],
+            "seeded once, by the fold, under the lock"
+        );
+    }
+
+    /// Item 7: a busy ledger lock on the stale path is the existing `LockBusy`, and a
+    /// fresh scan does not ask for the lock at all. The budget is set to zero rather than
+    /// waiting out the shipping two seconds. The root is a git root with no branch switch
+    /// pending and nothing to trim, so `sync_branch` and `trim` take no lock of their own.
+    #[test]
+    fn engine_a_stale_scan_is_busy_under_a_held_lock_and_a_fresh_scan_is_not() {
+        let repo = FixtureRepo::new("eng-busy-seed").unwrap();
+        let state = TempDir::new("lc-eng-busy-seed");
+        repo.write("f1", "edited\n");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let root = only_root(&engine);
+        let paths = engine.root(&root).unwrap().paths.clone();
+        assert!(engine.scan(&root).unwrap().row(b"f1").is_some());
+        engine
+            .roots
+            .get_mut(&root)
+            .unwrap()
+            .index
+            .set_lock_budget((0, Duration::ZERO));
+
+        let held = LedgerLock::acquire_with(&paths, 0, Duration::ZERO).unwrap();
+        assert!(
+            engine.scan(&root).unwrap().row(b"f1").is_some(),
+            "a fresh scan reads the marker and the index and asks for no lock"
+        );
+
+        let index_before = std::fs::read(&paths.index).unwrap();
+        std::fs::remove_file(&paths.index_tree).unwrap();
+        let err = engine.scan(&root).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                EngineError::Scan(ScanError::Index(IndexError::Ledger(
+                    LedgerError::LockBusy { retries: 0, path }
+                ))) if *path == paths.lock
+            ),
+            "{err:?}"
+        );
+        assert!(!paths.index_tree.exists(), "the refusal touched nothing");
+        assert_eq!(std::fs::read(&paths.index).unwrap(), index_before);
+        drop(held);
+        // Back to a budget that can wait: a lock this thread has dropped still reads as
+        // busy for a few milliseconds now and then under a loaded test run, and the
+        // shipping budget is two seconds precisely so that a scan does not care.
+        engine
+            .roots
+            .get_mut(&root)
+            .unwrap()
+            .index
+            .set_lock_budget((ledger::LOCK_RETRIES, ledger::LOCK_BACKOFF));
+        assert!(
+            engine.scan(&root).unwrap().row(b"f1").is_some(),
+            "and the same scan succeeds once the lock is free"
+        );
+    }
+
+    /// Item 3(iii): a failed read or parse must not leave a new stamp over old content.
+    /// With the stamp stored first, the next reload saw nothing to do and the engine kept
+    /// a baseline the disk had already replaced, which is exactly the staleness the seed
+    /// check exists to catch.
+    #[test]
+    fn engine_reload_ledger_keeps_the_old_stamp_when_the_read_or_parse_fails() {
+        let repo = FixtureRepo::new("eng-reload-stamp").unwrap();
+        let state = TempDir::new("lc-eng-reload-stamp");
+        repo.write("f1", "edited\n");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let root = only_root(&engine);
+        let paths = engine.root(&root).unwrap().paths.clone();
+        engine.scan(&root).unwrap();
+        let good = std::fs::read(&paths.ledger).unwrap();
+        let state = engine.roots.get_mut(&root).unwrap();
+        let before = state.ledger_stamp;
+        let tree = state.ledger.seen_tree.clone();
+        assert!(before.is_some(), "the premise");
+
+        std::fs::remove_file(&paths.ledger).unwrap();
+        state.reload_ledger_if_changed();
+        assert_eq!(state.ledger_stamp, before, "a read failure keeps the stamp");
+        assert_eq!(state.ledger.seen_tree, tree, "and the loaded record stands");
+
+        std::fs::write(&paths.ledger, b"{ not json at all").unwrap();
+        state.reload_ledger_if_changed();
+        assert_eq!(state.ledger_stamp, before, "a parse failure keeps it too");
+        assert_eq!(state.ledger.seen_tree, tree);
+
+        std::fs::write(&paths.ledger, &good).unwrap();
+        state.reload_ledger_if_changed();
+        assert_eq!(
+            state.ledger_stamp,
+            ledger::stamp(&paths),
+            "and the reload runs again the moment the file parses"
+        );
+        assert_eq!(state.ledger.seen_tree, tree);
     }
 
     #[test]
