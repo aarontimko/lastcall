@@ -24,13 +24,13 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::app::{
     self, AcceptAnswer, AcceptScope, App, Editor, Focus, MIN_SIZE, NAV_MIN_COLS, RootView,
-    Selection, Target, annotation_name, diff_lines, hunk_header, hunk_offsets, plural,
-    restore_question,
+    Selection, Target, annotation_name, diff_lines, hunk_header, plural, restore_question,
 };
 use super::herdr::{Dot, Link};
 use super::input::{Action, MODAL_KEYS};
 use super::textbuf::Wrap;
 use super::tour::{Kind as TourLine, MIN_COLS as TOUR_MIN_COLS};
+use super::wrap;
 
 pub const TOO_SMALL: &str = "too small: 40×10 min";
 /// The note modal's box: wide enough for a sentence, narrow enough to sit over the diff.
@@ -164,6 +164,15 @@ pub struct HitMap {
     /// is narrower than `Target::DiffBody`, which covers the whole pane including the
     /// expansion header and the empty states.
     pub diff_body: Option<Rect>,
+    /// One **diff line index per drawn body row**, top to bottom (Phase 13): the row table
+    /// that replaces the old `scroll + (y - rect.y)`, which assumed one line is one row.
+    ///
+    /// It carries every row the body drew — hunk headers, text rows, the continuation rows
+    /// of a wrapped line and the blank separators — so a click on a header still answers
+    /// `Target::DiffHunk` and a press on a separator answers what it always did. Every row
+    /// of a wrapped line carries that line's index, so clicking any part of it selects the
+    /// whole line. Empty when the frame drew no hunks, exactly as `diff_body` is `None`.
+    pub diff_rows: Vec<usize>,
 }
 
 impl HitMap {
@@ -547,6 +556,11 @@ fn render_status(app: &App, buf: &mut Buffer, area: Rect) {
 /// `help` and `quit` are not in the list at all: they are pinned, so a cut line always says
 /// where the rest of the keys are.
 const HINT_DROP_ORDER: &[&str] = &[
+    // Phase 13, and first of all: the diff pane's wrap toggle is named in the help overlay
+    // and the pane itself shows whether it is on, so a full line gives it up before it
+    // gives up anything that was on the line before this phase. That is also what keeps
+    // every existing 100-column frame unchanged (design review F25).
+    "wrap",
     "copy",
     "select",
     "refresh",
@@ -715,6 +729,17 @@ pub fn hints(app: &App, width: u16) -> String {
         .is_some()
         .then(|| first("scope").map(|k| format!("{k} scope")))
         .flatten();
+    // Phase 13 (Amendment v1.14): `c clip` while the pane is wrapping, `c wrap` while it
+    // is clipping. Offered only where the pane has hunks, because with none there is
+    // nothing to wrap and the key would flip a setting the reader cannot see.
+    let wrap_hint = (!app.view_hunks().is_empty())
+        .then(|| {
+            first("wrap").map(|k| {
+                let verb = if app.wrap { "clip" } else { "wrap" };
+                format!("{k} {verb}")
+            })
+        })
+        .flatten();
     // §6.7 (Amendment v1.9): the label follows the state, so the line promises what the
     // key will do rather than naming the setting it flips. The help overlay names the key
     // at every width, which is what a line too narrow to carry it falls back on.
@@ -795,6 +820,12 @@ pub fn hints(app: &App, width: u16) -> String {
         // have — and the help overlay and its mouse note name them at every width.
         ("select", select_hint),
         ("copy", copy_hint),
+        // Phase 13, beside the diff pane's other two: the verb follows the state, as
+        // `hide_empty`'s and `snooze`'s do, so the line promises what the key will do
+        // rather than naming the setting it flips. Offered only where there are hunks to
+        // wrap, and **first** in `HINT_DROP_ORDER`, so a full line at 100 columns is
+        // exactly the line it was before this phase.
+        ("wrap", wrap_hint),
         ("help", first("help").map(|k| format!("{k} help"))),
         ("quit", first("quit").map(|k| format!("{k} quit"))),
     ]
@@ -1688,31 +1719,33 @@ fn render_hunks(
         return;
     }
     let total = diff_lines(hunks);
-    let offsets = hunk_offsets(hunks);
     let scroll = app.diff.scroll.min(total.saturating_sub(1));
     let current = app.diff.hunk.min(hunks.len() - 1);
     // Deliverable 9: where a mouse press or drag turns into a diff line, and the inclusive
     // line range a live selection covers.
     hits.diff_body = Some(area);
     let selected = app.sel.map(|s| s.range());
-    // The hunk containing `scroll`, and the line within it.
-    let mut h = offsets.partition_point(|&o| o <= scroll).saturating_sub(1);
-    let mut within = scroll - offsets[h];
-    let mut y = 0u16;
-    while y < area.height && h < hunks.len() {
+    // Phase 13: **the** mapping from diff lines to screen rows, the same one the hit map
+    // and the reducer's keep-visible arithmetic ask. The renderer no longer walks the
+    // hunks itself, so there is no second answer to keep in step with this one.
+    let rows = wrap::layout(hunks, scroll, area.width, area.height, app.wrap);
+    hits.diff_rows = rows.iter().map(|r| r.line).collect();
+    for (y, row) in rows.iter().enumerate() {
+        let y = y as u16;
+        let (h, within) = (row.hunk, row.within);
         let hunk = &hunks[h];
-        let height = super::app::hunk_height(hunk);
-        let block = super::app::hunk_block(hunks, h);
-        while within < block && y < area.height {
-            // `block` is the hunk's own lines plus, for every hunk but the last, the blank
-            // separator line: nothing to draw, it just spaces the sections apart.
-            if within >= height {
-                within += 1;
-                y += 1;
-                continue;
+        // The blank separator between two hunks: nothing to draw, it just spaces the
+        // sections apart. It stays in the row table above, so a press on it answers the
+        // line it always answered.
+        let mut line = match &row.part {
+            wrap::Part::Blank => continue,
+            wrap::Part::Whole => hunk_line(hunk, within, h == current),
+            wrap::Part::Slice { start, end, marker } => {
+                hunk_row(hunk, within, *start, *end, marker.as_deref())
             }
-            let mut line = hunk_line(hunk, within, h == current);
-            let row_rect = Rect::new(area.x, area.y + y, area.width, 1);
+        };
+        let row_rect = Rect::new(area.x, area.y + y, area.width, 1);
+        {
             if within == 0 {
                 hits.targets.push((row_rect, Target::DiffHunk(h)));
                 let style = if h == current {
@@ -1757,11 +1790,9 @@ fn render_hunks(
                 }
             }
             // Last, and over the hunk band: a selection is the reader's own mark, and it
-            // reads as one run across the pane whatever is underneath it.
-            if selected.is_some_and(|(a, b)| {
-                let at = offsets[h] + within;
-                at >= a && at <= b
-            }) {
+            // reads as one run across the pane whatever is underneath it. Keyed on the
+            // row's **line**, so a band covers every row of a line it covers.
+            if selected.is_some_and(|(a, b)| row.line >= a && row.line <= b) {
                 band(
                     &mut line,
                     area.width,
@@ -1769,11 +1800,7 @@ fn render_hunks(
                 );
             }
             buf.set_line(area.x, area.y + y, &line, area.width);
-            within += 1;
-            y += 1;
         }
-        h += 1;
-        within = 0;
     }
 }
 
@@ -1882,7 +1909,43 @@ fn hunk_line(hunk: &Hunk, i: usize, current: bool) -> Line<'static> {
     }
 }
 
-fn line_text(bytes: &[u8]) -> String {
+/// One **row** of a wrapped text line: the gutter mark, the slice of the line's text this
+/// row carries, and the cap's marker when this is the last row of a line that was cut.
+///
+/// For the whole line with no marker it builds exactly what [`hunk_line`] builds, which is
+/// what makes "wrap off is cell-identical to the renderer before this phase" true by
+/// construction rather than by a test that happens to pass: the gutter and the colour are
+/// the line's own, repeated, and the only thing a continuation row loses is the leading
+/// indentation, which a narrow pane cannot spare.
+fn hunk_row(
+    hunk: &Hunk,
+    within: usize,
+    start: usize,
+    end: usize,
+    marker: Option<&str>,
+) -> Line<'static> {
+    let (tag, bytes) = &hunk.lines[within - 1];
+    let text = line_text(bytes);
+    let slice: String = text
+        .chars()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .collect();
+    let body = format!("{}{slice}", wrap::gutter_of(*tag));
+    let mut line = match tag {
+        Tag::Context => Line::from(body),
+        Tag::Insert => Line::from(Span::styled(body, green())),
+        Tag::Delete => Line::from(Span::styled(body, red())),
+    };
+    if let Some(marker) = marker {
+        // Dim, never the line's green or red (design review F15): a marker in the line's
+        // own colour reads as content the agent wrote.
+        line.spans.push(Span::styled(marker.to_owned(), dim()));
+    }
+    line
+}
+
+pub(super) fn line_text(bytes: &[u8]) -> String {
     let mut s = String::from_utf8_lossy(bytes).into_owned();
     while s.ends_with('\n') || s.ends_with('\r') {
         s.pop();
@@ -3321,7 +3384,28 @@ mod tests {
             nav_line,
             "↑↓ select  ⏎ open  n/p hunk  a accept hunk  A accept file  ^A accept all  t hide empty  Tab focus  r refresh  ? help  q quit"
         );
-        assert_eq!(hints(&app, 200), nav_line, "124 is the whole nav line");
+        // Phase 13: with eight more columns the line also says what `c` will do, and the
+        // verb follows the state. `wrap` is **first** in `HINT_DROP_ORDER`, so it is the
+        // first hint off the line and every width below this one reads exactly as it did
+        // before the phase (design review F25) — which is what the rest of this test,
+        // unchanged from Phase 12, pins.
+        assert_eq!(
+            hints(&app, 132),
+            "↑↓ select  ⏎ open  n/p hunk  a accept hunk  A accept file  ^A accept all  t hide empty  Tab focus  r refresh  c clip  ? help  q quit"
+        );
+        assert_eq!(
+            hints(&app, 200),
+            hints(&app, 132),
+            "132 is the whole nav line"
+        );
+        assert_eq!(hints(&app, 131), nav_line, "the wrap hint goes first");
+        app.handle(Action::ToggleWrap);
+        assert!(
+            hints(&app, 132).contains("c wrap"),
+            "the verb follows the state: {}",
+            hints(&app, 132)
+        );
+        app.handle(Action::ToggleWrap);
         // Ruling R4: one hint at a time, from the right end of `HINT_DROP_ORDER` — so a
         // column short of the whole line the nav keeps everything but `r refresh`.
         assert_eq!(
@@ -3351,7 +3435,16 @@ mod tests {
             hints(&app, 142),
             "↑↓ scroll  ← back  n/p hunk  a accept hunk  A accept file  ^A accept all  t hide empty  Tab focus  r refresh  v select  y copy  ? help  q quit"
         );
-        assert_eq!(hints(&app, 142), hints(&app, 200), "142 is the whole line");
+        assert_eq!(
+            hints(&app, 150),
+            hints(&app, 200),
+            "150 is the whole line once the wrap hint is on it"
+        );
+        assert_eq!(
+            hints(&app, 142),
+            hints(&app, 149),
+            "and it is the first off it"
+        );
         assert_eq!(
             hints(&app, 141),
             "↑↓ scroll  ← back  n/p hunk  a accept hunk  A accept file  ^A accept all  t hide empty  Tab focus  r refresh  v select  ? help  q quit",
@@ -4741,5 +4834,199 @@ mod tests {
         app.handle(Action::SnoozeEdit(SnoozeKey::Cancel));
         let (frame, _) = frame_of(&app, 100, 30);
         assert!(!frame.contains("day(s)"), "{frame}");
+    }
+
+    // --- word wrap in the diff pane (Phase 13, deliverable A) ----------------------------
+
+    /// Draw `app` and hand back the buffer and the hit map, so a wrap test can ask both
+    /// what was drawn and which line each row belongs to.
+    fn drawn(app: &App, w: u16, h: u16) -> (Buffer, HitMap) {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let mut hits = HitMap::default();
+        terminal.draw(|f| hits = render(app, f)).unwrap();
+        (terminal.backend().buffer().clone(), hits)
+    }
+
+    /// An app on `f1` whose single hunk's body is `lines`, diff focused.
+    fn wrapped(lines: &[&str]) -> App {
+        let mut app = three_roots();
+        app.apply(pile_event("alpha", alpha_texts(lines)));
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Open);
+        app.handle(Action::Resize(100, 30));
+        app
+    }
+
+    /// The symbols of row `y` across `rect`, wide characters included (their second cell
+    /// carries an empty symbol, so a plain concatenation is the text).
+    fn row_text(buf: &Buffer, rect: Rect, y: u16) -> String {
+        (rect.x..rect.right())
+            .map(|x| buf[(x, y)].symbol())
+            .collect()
+    }
+
+    /// The rows the hit map says belong to diff line `line`.
+    fn rows_of(hits: &HitMap, line: usize) -> Vec<u16> {
+        let body = hits.diff_body.expect("the diff body");
+        hits.diff_rows
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| **l == line)
+            .map(|(i, _)| body.y + i as u16)
+            .collect()
+    }
+
+    /// A continuation row is still the line it continues: the same gutter mark and the
+    /// same colour, so a wrapped insertion does not turn into context half way down.
+    #[test]
+    fn render_wrap_continuation_rows_keep_the_gutter_and_the_colour() {
+        let mut app = wrapped(&["a"]);
+        // One long insertion, the only body line of the hunk.
+        let hunk = &mut app.selected_row().expect("f1").hunks[0].clone();
+        hunk.lines = vec![(
+            Tag::Insert,
+            format!("{}\n", "lorem ipsum ".repeat(20)).into_bytes(),
+        )];
+        let mut p = pile("alpha");
+        p.rows[0].hunks = vec![hunk.clone()];
+        app.apply(pile_event("alpha", p));
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Open);
+
+        let (buf, hits) = drawn(&app, 100, 30);
+        let body = hits.diff_body.expect("the body");
+        let rows = rows_of(&hits, 1);
+        assert!(rows.len() > 2, "the line wrapped: {rows:?}");
+        for y in rows {
+            let text = row_text(&buf, body, y);
+            assert!(text.starts_with('+'), "row {y}: {text:?}");
+            assert_eq!(buf[(body.x, y)].fg, Color::Green, "row {y} is an insertion");
+            assert_eq!(buf[(body.x + 1, y)].fg, Color::Green, "and so is its text");
+        }
+    }
+
+    /// F12: every character of a line reaches the buffer, whatever it is made of. The
+    /// renderer clips at the pane's width, so a row measured wrongly loses its tail
+    /// silently; this is the test that would catch it.
+    #[test]
+    fn render_wrap_puts_every_character_of_a_line_on_the_screen() {
+        let text = concat!(
+            "\u{4F60}\u{597D}\u{4E16}\u{754C} ",
+            "\u{26A0}\u{FE0F} warning ",
+            "e\u{0301}te\u{0301} ",
+            "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467} family ",
+            "\u{65E5}\u{672C}\u{8A9E}\u{306E}\u{30C6}\u{30AD}\u{30B9}\u{30C8}",
+        );
+        let text = &text.repeat(4);
+        let app = wrapped(&[text]);
+        let (buf, hits) = drawn(&app, 100, 30);
+        let body = hits.diff_body.expect("the body");
+        let rows = rows_of(&hits, 1);
+        assert!(rows.len() > 1, "it wrapped");
+        let mut drawn_text = String::new();
+        for y in rows {
+            let row = row_text(&buf, body, y);
+            let row = row
+                .strip_prefix(' ')
+                .expect("the context gutter")
+                .to_owned();
+            drawn_text.push_str(row.trim_end());
+        }
+        // Trailing whitespace is what a row break ate; everything else is there, in order.
+        let want: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        let got: String = drawn_text.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(got, want, "drew {drawn_text:?}");
+    }
+
+    /// The selection band is a statement about lines, so it covers every row of one.
+    #[test]
+    fn render_wrap_the_selection_band_covers_every_row_of_a_line() {
+        let mut app = wrapped(&["short", &"x".repeat(400)]);
+        app.handle(Action::NavDown);
+        app.handle(Action::NavDown);
+        app.handle(Action::Select);
+        let (buf, hits) = drawn(&app, 100, 30);
+        let body = hits.diff_body.expect("the body");
+        let rows = rows_of(&hits, 2);
+        assert!(rows.len() > 1, "the selected line wrapped: {rows:?}");
+        for y in &rows {
+            for x in body.x..body.right() {
+                assert!(
+                    buf[(x, *y)].modifier.contains(Modifier::REVERSED),
+                    "({x}, {y}) is outside the band"
+                );
+            }
+        }
+        // And it stops at the line's last row.
+        let after = rows[rows.len() - 1] + 1;
+        if after < body.bottom() {
+            assert!(!buf[(body.x, after)].modifier.contains(Modifier::REVERSED));
+        }
+    }
+
+    /// The header's own row still carries its controls, with a wrapped line underneath.
+    #[test]
+    fn render_wrap_a_header_keeps_its_controls_over_a_wrapped_line() {
+        let app = wrapped(&[&"x".repeat(400)]);
+        let (buf, hits) = drawn(&app, 100, 30);
+        let body = hits.diff_body.expect("the body");
+        assert_eq!(hits.diff_rows[0], 0, "the header is the first row");
+        let header = row_text(&buf, body, body.y);
+        assert!(header.contains("@@ -"), "{header:?}");
+        assert!(
+            header.contains("accept"),
+            "the controls are there: {header:?}"
+        );
+        assert!(rows_of(&hits, 1).len() > 1, "and the line below it wrapped");
+    }
+
+    /// A line the cap cut ends in a dim marker naming how much is not shown.
+    #[test]
+    fn render_wrap_the_caps_marker_is_dim_and_counts() {
+        // A body line far taller than the pane: 4000 characters in a pane under 100 wide.
+        let app = wrapped(&["x".repeat(4000).as_str()]);
+        let (buf, hits) = drawn(&app, 100, 30);
+        let body = hits.diff_body.expect("the body");
+        let rows = rows_of(&hits, 1);
+        let last = *rows.last().expect("rows");
+        let text = row_text(&buf, body, last);
+        let at = text
+            .find(" … +")
+            .unwrap_or_else(|| panic!("a marker in {text:?}"));
+        let marker_x = body.x + at as u16;
+        assert!(
+            buf[(marker_x + 1, last)].modifier.contains(Modifier::DIM),
+            "the marker is dim: {}",
+            styles(&buf)
+        );
+        assert!(
+            !buf[(body.x, last)].modifier.contains(Modifier::DIM),
+            "but the text it follows is not"
+        );
+        // The cap leaves room for what comes after the line.
+        assert!(
+            rows.len() < body.height as usize,
+            "{} rows of {}",
+            rows.len(),
+            body.height
+        );
+    }
+
+    /// With wrap off the row table is the pre-phase one: row = line, from the scroll.
+    #[test]
+    fn render_wrap_off_gives_one_row_per_line() {
+        let mut app = wrapped(&["short", &"x".repeat(400), "tail"]);
+        app.handle(Action::ToggleWrap);
+        assert!(!app.wrap);
+        let (buf, hits) = drawn(&app, 100, 30);
+        let body = hits.diff_body.expect("the body");
+        assert_eq!(
+            hits.diff_rows[..4],
+            [0, 1, 2, 3],
+            "one row per line, in order"
+        );
+        let long = row_text(&buf, body, body.y + 2);
+        assert!(long.starts_with(" xxx"), "clipped, not wrapped: {long:?}");
+        assert_eq!(row_text(&buf, body, body.y + 3).trim(), "tail");
     }
 }

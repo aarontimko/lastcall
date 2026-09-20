@@ -80,6 +80,7 @@ pub fn run(poll: Option<u64>, tour: bool) -> Result<ExitCode, Box<dyn std::error
         plan,
         run::Launch {
             hide_empty: loaded.config.hide_empty_repos,
+            wrap: loaded.config.ui.wrap,
             daily_check: daily_check(&loaded),
             tour,
         },

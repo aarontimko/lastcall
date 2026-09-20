@@ -7,6 +7,8 @@
 //! - `input`  — the `Action` vocabulary and `DEFAULT_KEYMAP`, `to_action(Event, &Keymap)`
 //!   and `Keymap::from_config` (the `[keys]` table).
 //! - `textbuf` — the editable text buffer the note modal and the inline editor share.
+//! - `wrap`   — the diff pane's word wrap and the one mapping from diff lines to screen
+//!   rows, asked by the renderer, the hit map and the reducer alike (Phase 13).
 //! - `render` — `render(&App, frame) -> HitMap`, plus `styles(&Buffer)` for the snapshot tier.
 //! - `tour`   — the first-launch welcome overlay: the marker, the cards, and the one
 //!   sanctioned config write behind them (Amendment v1.11).
@@ -31,3 +33,4 @@ pub mod run;
 pub mod term;
 pub mod textbuf;
 pub mod tour;
+pub mod wrap;
