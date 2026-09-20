@@ -2339,3 +2339,122 @@ fn tui_tour_empty() {
     app.handle(Action::Resize(80, 24));
     snapshot("tui_tour_empty_80x24", &app, 80, 24);
 }
+
+// --- word wrap in the diff pane (Phase 13, deliverable A) --------------------------------
+
+/// Prose the pane has to break on a space.
+const WRAP_PROSE: &str = "the reviewer gets to read this line all the way to its end, because the pane wrapped it instead of cutting it off wherever the window happened to stop";
+/// One token with nothing to break on: the pane has to cut it mid-word or lose it.
+const WRAP_TOKEN: &str = "crates/lastcall/src/tui/wrap.rs::layout::a_single_unbroken_token_that_no_whitespace_will_ever_break_for_us";
+
+/// alpha's `f1` as twelve short lines, seen, then edited so lines 3 and 6 are longer than
+/// any pane this suite draws. Returns the app with the diff open on it.
+fn wrap_scene(scene: &Scene, engine: &mut Engine, long: &[(usize, String)]) -> App {
+    let repo = scene.repo("alpha");
+    let base: Vec<String> = (1..=12).map(|i| format!("line {i}")).collect();
+    repo.write("f1", format!("{}\n", base.join("\n")));
+    repo.git(&["add", "f1"]).unwrap();
+    let mut repo = repo;
+    repo.commit("agent: f1 for the wrap scenes").unwrap();
+    *engine = scene.engine();
+    let alpha = root_named(engine, "alpha");
+    mark_seen(engine, &alpha);
+
+    let mut edited = base.clone();
+    for (at, text) in long {
+        edited[at - 1] = text.clone();
+    }
+    repo.write("f1", format!("{}\n", edited.join("\n")));
+    let mut app = app_of(engine);
+    select_row(&mut app, &alpha, "f1");
+    app.handle(Action::Open);
+    app
+}
+
+/// Deliverable A: a line longer than the pane is wrapped rather than cut. The prose line
+/// breaks after the last space that fits; the token line, which has no space to break on,
+/// is cut at the pane's edge and continued on the row below. Continuation rows keep the
+/// insertion's `+` and its green.
+#[test]
+fn tui_wrap_long_lines() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let app = wrap_scene(
+        &scene,
+        &mut engine,
+        &[(3, WRAP_PROSE.to_owned()), (6, WRAP_TOKEN.to_owned())],
+    );
+    assert!(app.wrap, "wrap is the opening answer");
+    let (frame, _) = draw(&app, W, H);
+    assert!(
+        frame.contains("happened to stop"),
+        "the end of the prose line is on the screen:\n{frame}"
+    );
+    snapshot("tui_wrap_long_lines", &app, W, H);
+    // The same diff in a narrower window: more rows per line, the same last words.
+    let mut narrow = app.clone();
+    narrow.handle(Action::Resize(80, 24));
+    let (narrow_frame, _) = draw(&narrow, 80, 24);
+    assert!(
+        narrow_frame.matches("+the reviewer").count() == 1
+            && narrow_frame.contains("wrapped it instead"),
+        "the same line, over more rows:\n{narrow_frame}"
+    );
+    snapshot("tui_wrap_long_lines_80x24", &narrow, 80, 24);
+}
+
+/// The toggle: `c` clips, which is the pane as it was before this phase, and it is the
+/// same frame `[ui] wrap = false` gives at launch.
+#[test]
+fn tui_wrap_clipped() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = wrap_scene(
+        &scene,
+        &mut engine,
+        &[(3, WRAP_PROSE.to_owned()), (6, WRAP_TOKEN.to_owned())],
+    );
+    let wrapping = app.clone();
+    app.handle(Action::ToggleWrap);
+    assert!(!app.wrap);
+    let (frame, _) = draw(&app, W, H);
+    assert!(
+        !frame.contains("happened to stop"),
+        "clipped, so the tail is off the screen:\n{frame}"
+    );
+    snapshot("tui_wrap_clipped", &app, W, H);
+
+    // What `[ui] wrap = false` does: the flag is the app's opening answer and nothing
+    // else, so a pane that launched clipped is the pane that was toggled to it.
+    let mut launched = wrapping;
+    launched.wrap = false;
+    assert_eq!(draw(&launched, W, H), draw(&app, W, H));
+    launched.handle(Action::Resize(80, 24));
+    snapshot("tui_wrap_off_at_launch_80x24", &launched, 80, 24);
+}
+
+/// The cap: a line far taller than the pane takes all but three of its rows and ends in a
+/// dim marker counting the characters it did not show, so whatever follows the line is
+/// still reachable.
+#[test]
+fn tui_wrap_capped_line() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = wrap_scene(&scene, &mut engine, &[(3, "payload ".repeat(400))]);
+    // Scroll the long line to the top of the pane, which is where a reader meets it: the
+    // cap is a promise about the rest of the body, and the body has to be under it.
+    for _ in 0..4 {
+        app.handle(Action::NavDown);
+    }
+    assert_eq!(app.diff.scroll, 4, "the long line is the first one drawn");
+    let (frame, _) = draw(&app, W, H);
+    assert!(
+        frame.contains(" … +"),
+        "the marker is on the frame:\n{frame}"
+    );
+    assert!(
+        frame.contains(" line 4"),
+        "and the line after the capped one is still reachable:\n{frame}"
+    );
+    snapshot("tui_wrap_capped_line", &app, W, H);
+}
