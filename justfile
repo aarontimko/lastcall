@@ -258,6 +258,15 @@ hooks-install:
 #               ->  just release-tag
 # ---------------------------------------------------------------------------------------
 
+# A packaged hands-on run (docs/dev/tryout.md): release build, a sandbox of repositories and
+# a config under the temp directory, the numbered steps, then the TUI over it. `just tryout
+# list` names the scenarios. The real state and config directories are never touched.
+tryout SCENARIO="list" *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ {{quote(SCENARIO)}} != list ]; then cargo build --release -p lastcall; fi
+    python3 scripts/tryout.py {{quote(SCENARIO)}} {{ARGS}}
+
 # From an up-to-date main: the release branch and its one five-file commit. Pushes nothing.
 release-prep VERSION:
     python3 scripts/release.py prep {{quote(VERSION)}}
