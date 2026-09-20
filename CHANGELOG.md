@@ -7,6 +7,30 @@ binary rather than for the commit log.
 
 ## Unreleased
 
+### Added
+
+- **A diff line too long for the pane now wraps onto as many rows as it needs, instead of
+  being cut at the pane's edge.** The whole line is on the screen, so a wide diff no longer
+  hides the end of what changed, and there is still nothing to scroll sideways. A line long
+  enough to fill the pane on its own stops a few rows short and ends in a dim `… +N` marker
+  counting the characters not drawn, so whatever follows it is always at least partly
+  visible.
+- `c` (or `alt-z`) turns wrapping off and on while you read. Clipped is the old behaviour,
+  with the line cut at the edge; the line you were on stays the line you are on either way.
+  The key changes nothing on disk, so the next launch is whatever your config says.
+- `[ui] wrap` in `config.toml` chooses how lastcall opens, `true` by default. Set it to
+  `false` to open clipped.
+- Copying is unchanged in both modes: `y` puts whole lines on the clipboard, with no row
+  break turned into a newline and no `… +N` marker.
+
+### Changed
+
+- `c` and `alt-z` are now bound to the new `wrap` action. A config that already binds either
+  key to something else no longer loads, with an error naming the key and both actions; give
+  the other action a different key, or move `wrap` with `[keys] wrap = ["..."]`.
+- A config file with a `[ui]` table is refused by 0.4.0 and earlier, which do not know the
+  table. Remove it before going back to an older binary.
+
 ### Fixed
 
 - **Two lastcall processes on one repository could leave a change unlisted.** When one pane

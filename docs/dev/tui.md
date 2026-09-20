@@ -53,6 +53,10 @@ gate greps at the end of this page are how that is enforced).
   band across the pane (its `[a accept]` control inside the band, so it is plain which hunk
   the control takes); `app::hunk_block` is that geometry, and every scroll, offset and
   `diff_len` counts the separators (`render_hunks_are_separated_and_the_current_header_is_a_band`).
+  Which diff line is drawn on which row is not the renderer's own arithmetic: it walks
+  `wrap::layout` (`tui/wrap.rs`, "Word wrap in the diff pane" below) and publishes the same
+  row table in `HitMap.diff_rows`, so a click, a drag and the reducer's scrolling all agree
+  with what is on the screen.
   The help overlay (`?`) and the accept confirm modal are drawn last over
   everything.
 - **`input.rs` — `Action` and the keymap.** Every key, mouse gesture and the 1 s tick becomes
@@ -752,7 +756,9 @@ so the reader can see the rest of the agent's work while they type in one part o
 hunk they *entered* is tinted whole (`EDITOR_BAND_BG`, indexed 236) with its marks bold; the
 caret's line is tinted brighter (`EDITOR_CURSOR_BG`, 238). A row that runs off the right edge
 ends in a dim `→` (`EDITOR_CLIPPED`) — the editor does not wrap, and the rest of the line is
-one `End` away. The caret is drawn **reversed**, not left to the terminal's own cursor,
+one `End` away. Phase 13 wrapped the **diff** pane and deliberately left this alone: a
+caret has to have one row and one column, and an editor whose lines move under it as they
+grow is a different feature. The caret is drawn **reversed**, not left to the terminal's own cursor,
 because the frame is the only thing a snapshot and a PTY scene can see. The hint line becomes
 exactly `^S save   Esc close` (`render::EDITOR_HINTS`).
 
@@ -946,6 +952,60 @@ deliberately **not** the status line: the status carries engine notices with a 3
 a copy must not evict `saved src/parse.rs`. `tui_copy_cue` pins a frame where both are on
 screen at once.
 
+## Word wrap in the diff pane (Phase 13)
+
+`tui/wrap.rs` is the only place that answers "which diff line is on which row". The
+renderer walks its answer, the hit map publishes it, and the reducer asks it where a key
+may land. There is deliberately no second implementation: a wrap the renderer does and the
+reducer guesses at is the bug this module exists to make impossible.
+
+**The scroll stays a line index** (`DiffCursor::scroll`), not a row index. Nothing
+downstream had to learn a second coordinate system, and a reader who was on line 40 is on
+line 40 after a resize or a toggle.
+
+- `wrap_words(text, width) -> Vec<(usize, usize)>` breaks after the last whitespace that
+  fits and hard-breaks a word that never will. It measures each candidate row with
+  `UnicodeWidthStr::width` **on the row as a whole**, which is how ratatui measures what it
+  draws, rather than summing per-character widths; and it never breaks before a zero-width
+  character, so a combining mark is not orphaned onto the next row. The ranges are
+  character indices into the line, contiguous and covering it, which is the module's
+  property test (`proptests::wrap_words_keeps_every_character_and_fits_every_row`).
+  Not to be confused with `textbuf::wrap_ranges` (the inline editor's own line index) or
+  `tour::wrap` (a paragraph filler for the welcome cards); neither is reusable here.
+- `parts_of(hunk, within, cols, rows, wrap)` is the per-line answer: `Part::Whole` for a
+  header, for a line that needs one row, and for every line with wrap off (so those rows
+  are byte-identical to the pre-phase renderer by construction); `Part::Blank` for the
+  separator between hunks, which draws nothing at all, not even a selection band; and one
+  `Part::Slice` per row otherwise.
+- `layout(hunks, scroll, cols, rows, wrap)` is the row table: one entry per drawn row,
+  headers and separators included, from `scroll` until the body is full.
+- `cap(rows)` is `rows - 3`, floored at 1. A line taller than that stops there and its
+  last row ends in a dim ` … +N` marker counting the characters not drawn, so whatever
+  follows a very long line is always at least partly on screen. The count is part of the
+  marker whose width decides where to cut, so `cut_for_marker` solves the two together,
+  shrinking a whole character at a time (a wide character is never halved) and falling
+  back to a bare `…` in a pane too narrow for the count.
+- `last_full_line`, `page_up_top` and `keep_visible` are the reducer's three questions.
+  A forward move (`scroll_forward`: a page down, a wheel step) lands at most **one line
+  past the last line that was fully visible**, so nothing scrolls past unread, and always
+  at least one line so a tall line still makes progress. `scroll_page_up` is a backward
+  fill and **not** page down's inverse: with rows of different heights the two cannot be,
+  and what it promises is that the line the reader was on is still whole on the screen
+  they land on. `keep_visible` is what `move_sel_cursor` uses in place of a `page_rows`
+  line count, so a `v` selection over a five-row line scrolls as little as it can.
+
+**Geometry.** `Ui::rendered` writes the measured diff body back to `App.diff_size` beside
+the nav offset, and `Action::Resize` clears it; `App::diff_body_size` falls back to
+`diff_cols()` (the same inner arithmetic `editor_cols()` uses, factored into
+`main_inner_cols` so the two cannot drift) and `page_rows()`. So the reducer asks the
+layout about the pane the reader is actually looking at, and never about a pane of zero.
+
+**The toggle** is `Action::ToggleWrap`, action name `wrap`, keys `c` and `alt-z`, opening
+value `[ui] wrap` through `Launch`. It flips `App.wrap`, keeps `diff.scroll`, and writes
+nothing to disk. `y` is unaffected in both directions: `copy_payload` works on line text,
+so a wrapped or capped line reaches the clipboard whole, with no row break turned into a
+newline and no marker.
+
 ## Keys
 
 Defaults (`input::DEFAULT_KEYMAP`, in help-overlay order):
@@ -960,6 +1020,7 @@ Defaults (`input::DEFAULT_KEYMAP`, in help-overlay order):
 | `hunk_next` / `hunk_prev` | `n` `]` / `p` `[` | next / previous hunk (the current hunk's header is a full-width inverted band) | |
 | `toggle_full_paths` | `f` | root-relative paths instead of basenames | |
 | `toggle_remote` | `o` | show each repo's `org/repo` slug | |
+| `wrap` | `c` `alt-z` | | wrap a line too long for the pane onto as many rows as it needs, or clip it at the pane's edge; opening value `[ui] wrap`, default `true` ("Word wrap in the diff pane" above) |
 | `hide_empty` | `t` | hide / show repos with nothing pending (§6.7 Amendment v1.9); default from `hide_empty_repos`, and independent of the `w` scope | |
 | `snooze` | `s` | on a repo row: open the snooze modal (a day count), or wake a repo that is already snoozed ("The snooze modal" below); on any other row a notice, not a modal | |
 | `show_snoozed` | `shift-s` | list the snoozed repos too, each with `snoozed until <date>` on its branch line | |
@@ -1214,7 +1275,7 @@ rule adds a row. Nothing here is a promise about the final design.
 | Whole frame | below `MIN_SIZE` = 40×10 the frame is only `too small: 40×10 min` and the hit map is empty | `tui_too_small_30x8`, `render_too_small_is_one_line` |
 | Header (**Design pass D14**, confirmed as built) | `lastcall  N repos · N files · N hunks  [Accept All]` + the watch notice right-aligned; when the control and the notice do not both fit (about 60 columns) the control is dropped, **then the badge** (`^A` duplicates the control; nothing else says what is watched or whether herdr is answering); a notice that cannot fit beside the counts at all is dropped and the badge and control return, rather than leaving the right half empty. At 60 columns with the fixture's counts the ladder lands on counts + notice only — badge and control both gone (D14's earlier doc row said only the control was dropped) | `tui_narrow_60x20`, `render_narrow_header_keeps_the_notice_and_drops_the_control`, `render_header_drops_the_accept_control_before_the_herdr_badge` |
 | Nav pane | outer width `App.nav_width`, 16..=60 (default 28), draggable; hidden below `NAV_MIN_COLS` = 70 columns, when the diff takes the whole body and has focus; keeps its scroll offset across selection changes | `tui_narrow_60x20`, `tui_nav_*` |
-| Hint line (status bar) | built from the keymap, **ruling R4** (Phase 9a deliverable 4): every applicable hint is built, the whole line is tried, and while it does not fit **one hint at a time** is removed from a fixed drop order — `y copy`, `v select`, `r refresh`, `Tab focus`, `w scope`, `s snooze/wake`, `^A accept all`, `t hide/show empty`, `z undo`, `g jump`, `d ack`, `A accept file`, `n/p hunk`, the accept phrase (`HINT_DROP_ORDER`, keyed by **action name**, so a rebind moves the key and never the order). There are no width constants (D1's 110/128 were not built) and no all-or-nothing tiers. **The first two hints follow the focus** (Design pass D2, **ruling R3**, Phase 9a deliverable 3): with the nav focused the line opens `↑↓ select  ⏎ open`; with the diff focused `↑`/`↓` scroll a line and `⏎` does nothing (see Keys), so it opens `↑↓ scroll  ← back` — `back` is the keymap's own action and `←` its arrow spelling, so a rebind renames the hint (a keymap binding no arrow to `back` falls back to its first key). The two forms are exactly the same width, so no drop step moves; the 19 diff-focused frames say `↑↓ scroll  ← back`. **`? help  q quit` are never dropped and are always the last two hints on the line**, so a cut line still says where the rest of the keys are; the floor is `↑↓ select  ⏎ open  ? help  q quit` at 33 columns, inside `MIN_SIZE`'s 40. Below `NAV_MIN_COLS` = 70 the five that a nav-less frame cannot promise (`w scope`, `Tab focus`, `r refresh`, `v select`, `y copy`) are not offered whatever the arithmetic says. What is on the line follows the state: the accept phrase follows the selection (`a accept hunk  A accept file` / `a/A accept file` on a hunkless row / `A accept group` / `A accept all in <root>` on a **non-empty** repo row only — on an empty one neither key accepts anything, verifier (a) F2); `t`'s label follows the toggle (`t hide empty` while showing all, `t show empty` while hiding); `v select  y copy` only with the diff focused; `d ack` only for a ready episode and `g jump` for either flag; `w scope` only under a scope. **A hint is not offered where its key answers nothing** (Phase 9b, verifier (b) F4): `n/p hunk` and `v select  y copy` are gated on `view_hunks()` being non-empty (so a repo row, an empty repo row, the all-clean state, and a collapsed, binary, deleted or unreadable entry drop them), and `^A accept all` on `counts_of(&AcceptScope::All).files > 0` — the same predicate the accept itself uses, so the hint and the key agree by construction rather than by a second rule that can drift. An inapplicable hint is never **built**, so it is not a hint the line is short of and `HINT_DROP_ORDER` is untouched: every width step keeps the order it had. `z undo` is offered only where the selected repo's `Pile::undo` is non-zero, on the same terms — so the key and the hint agree by construction, and the hint is what tells a reader the stack has anything in it. While a confirm modal is open the line is exactly `y confirm  n cancel  q quit`. `s snooze` is offered on a repository row only, and reads `s wake` on a snoozed one that `shift-s` is showing (the maintainer's own Phase 10 run: the wake was not apparent), so the label says which of the key's two jobs it will do; on a file row `s` refuses, so it is not offered there. The Phase 7 keys (`u`, `U`, `m`, `M`) and `S` are **not** on the hint line — they live on the hunk controls, the `?` overlay and the modal's own key row. | `render_hints_drop_one_at_a_time_from_the_right`, `render_hints_keep_help_and_quit_at_every_width` (40–70), `render_hints_at_80_keep_accept_file`, `render_hints_follow_the_selection` (the 124-column nav line, the 142-column diff line with its focus-true opening, the rebound-`back` case, and every step below them), `render_hint_line_names_the_toggle_by_state`, `render_hints_and_help_follow_the_app_keymap`, `render_hints_never_promise_a_key_that_answers_nothing`, `render_hint_line_offers_z_undo_only_when_there_is_something_to_undo`, `hints_offer_snooze_on_a_repo_row_and_wake_on_a_snoozed_one`, `tui_hint_diff_focus` (142×20), `tui_undo_hint`, `tui_narrow_60x20`, `tui_nav_empty_repo_row`, `tui_status_line_head_notice` |
+| Hint line (status bar) | built from the keymap, **ruling R4** (Phase 9a deliverable 4): every applicable hint is built, the whole line is tried, and while it does not fit **one hint at a time** is removed from a fixed drop order — the wrap hint (first, so at 100 columns with a full line it is simply not shown and no existing frame moved), `y copy`, `v select`, `r refresh`, `Tab focus`, `w scope`, `s snooze/wake`, `^A accept all`, `t hide/show empty`, `z undo`, `g jump`, `d ack`, `A accept file`, `n/p hunk`, the accept phrase (`HINT_DROP_ORDER`, keyed by **action name**, so a rebind moves the key and never the order). There are no width constants (D1's 110/128 were not built) and no all-or-nothing tiers. **The first two hints follow the focus** (Design pass D2, **ruling R3**, Phase 9a deliverable 3): with the nav focused the line opens `↑↓ select  ⏎ open`; with the diff focused `↑`/`↓` scroll a line and `⏎` does nothing (see Keys), so it opens `↑↓ scroll  ← back` — `back` is the keymap's own action and `←` its arrow spelling, so a rebind renames the hint (a keymap binding no arrow to `back` falls back to its first key). The two forms are exactly the same width, so no drop step moves; the 19 diff-focused frames say `↑↓ scroll  ← back`. **`? help  q quit` are never dropped and are always the last two hints on the line**, so a cut line still says where the rest of the keys are; the floor is `↑↓ select  ⏎ open  ? help  q quit` at 33 columns, inside `MIN_SIZE`'s 40. Below `NAV_MIN_COLS` = 70 the five that a nav-less frame cannot promise (`w scope`, `Tab focus`, `r refresh`, `v select`, `y copy`) are not offered whatever the arithmetic says. What is on the line follows the state: the accept phrase follows the selection (`a accept hunk  A accept file` / `a/A accept file` on a hunkless row / `A accept group` / `A accept all in <root>` on a **non-empty** repo row only — on an empty one neither key accepts anything, verifier (a) F2); `t`'s label follows the toggle (`t hide empty` while showing all, `t show empty` while hiding); the wrap hint likewise says what the key will do, not what the pane is doing (`c clip` while wrapping, `c wrap` while clipping), and like `n/p hunk` it is gated on `view_hunks()` being non-empty; `v select  y copy` only with the diff focused; `d ack` only for a ready episode and `g jump` for either flag; `w scope` only under a scope. **A hint is not offered where its key answers nothing** (Phase 9b, verifier (b) F4): `n/p hunk` and `v select  y copy` are gated on `view_hunks()` being non-empty (so a repo row, an empty repo row, the all-clean state, and a collapsed, binary, deleted or unreadable entry drop them), and `^A accept all` on `counts_of(&AcceptScope::All).files > 0` — the same predicate the accept itself uses, so the hint and the key agree by construction rather than by a second rule that can drift. An inapplicable hint is never **built**, so it is not a hint the line is short of and `HINT_DROP_ORDER` is untouched: every width step keeps the order it had. `z undo` is offered only where the selected repo's `Pile::undo` is non-zero, on the same terms — so the key and the hint agree by construction, and the hint is what tells a reader the stack has anything in it. While a confirm modal is open the line is exactly `y confirm  n cancel  q quit`. `s snooze` is offered on a repository row only, and reads `s wake` on a snoozed one that `shift-s` is showing (the maintainer's own Phase 10 run: the wake was not apparent), so the label says which of the key's two jobs it will do; on a file row `s` refuses, so it is not offered there. The Phase 7 keys (`u`, `U`, `m`, `M`) and `S` are **not** on the hint line — they live on the hunk controls, the `?` overlay and the modal's own key row. | `render_hints_drop_one_at_a_time_from_the_right`, `render_hints_keep_help_and_quit_at_every_width` (40–70), `render_hints_at_80_keep_accept_file`, `render_hints_follow_the_selection` (the 124-column nav line, the 142-column diff line with its focus-true opening, the rebound-`back` case, and every step below them), `render_hint_line_names_the_toggle_by_state`, `render_hints_and_help_follow_the_app_keymap`, `render_hints_never_promise_a_key_that_answers_nothing`, `render_hint_line_offers_z_undo_only_when_there_is_something_to_undo`, `hints_offer_snooze_on_a_repo_row_and_wake_on_a_snoozed_one`, `tui_hint_diff_focus` (142×20), `tui_undo_hint`, `tui_narrow_60x20`, `tui_nav_empty_repo_row`, `tui_status_line_head_notice` |
 | Status bar vs hints | the latest engine notice with its age replaces the hints for `STATUS_TTL` = 30 s, then the hints return | `tui_status_line_head_notice` |
 | Scope notice | `scope: <ws> · N repos hidden (w shows all)` (43 columns) crowds the header at 100 columns — carried to the pass since Phase 5 | `tui_herdr_scope_notice`, `tui_herdr_scope_notice_with_status` |
 | File header controls | `[A accept file] [U restore file]` right-aligned as one run; a run that does not fit is retried without its last label, so a narrow pane loses the newest control first and `[A accept file]` goes last | `tui_accept_controls`, `tui_narrow_60x20` |
@@ -1425,11 +1486,17 @@ mouse event — press, drag, release, wheel — before it reaches the app at all
 the nav otherwise calls `move_selection` directly, around `handle`'s gate); only its keys,
 the `quit` keys and `Resize` get through (`run_mouse_is_dropped_under_the_modal_but_resize_passes`).
 
-**Two rectangles sit beside the target list** rather than in it, because they answer "where
-in this pane?" and not "what did I hit?": `HitMap.diff_body` (the hunk-lines rectangle,
-narrower than `Target::DiffBody`) and `HitMap.editor` (the inline editor's text area, with
-the gutter already subtracted). `run::diff_line_at` turns a press inside `diff_body` into an
-absolute diff-line index for the selection anchor, and it is read **before** `App::hit` runs
+**Two rectangles and a row table sit beside the target list** rather than in it, because
+they answer "where in this pane?" and not "what did I hit?": `HitMap.diff_body` (the
+hunk-lines rectangle, narrower than `Target::DiffBody`), `HitMap.editor` (the inline
+editor's text area, with the gutter already subtracted) and `HitMap.diff_rows`, the
+diff-line index of each drawn row of the body, in order, from the same `wrap::layout` the
+renderer walked. `run::diff_line_at` turns a press inside `diff_body` into an absolute
+diff-line index by reading `diff_rows[y - rect.y]`: `scroll + (y - rect.y)` was right only
+while a row was a line, and on a wrapped pane it names a line further down the diff than
+the one under the pointer. A row past the table's end is the blank area under a short
+diff and answers the last line, which is what `SelectTo`'s clamp already made of it, so a
+drag that runs off the bottom still selects to the end. The index is the selection anchor, and it is read **before** `App::hit` runs
 — a press on a hunk header moves `diff.scroll`, so an anchor read afterwards would name a
 different line. A press outside `diff_body` takes no anchor at all, which is exactly what
 keeps a divider drag a divider drag.
@@ -1623,5 +1690,7 @@ rg -n 'OpenOptions|File::create|fs::write' crates/lastcall/src   # tui/term.rs (
 rg -n 'e\.save\(|e\.read_rendered\(' crates/lastcall/src        # only tui/run.rs (the inline editor reaches the engine through one seam, like restore and flag)
 rg -n 'Command::new' crates/lastcall/src/tui                # only tui/run.rs's `$EDITOR` spawn (Suspend::run); nothing else in the TUI starts a process (the update path's `curl` lives in commands/update.rs, outside tui/)
 rg -n 'openat|renameat|OpenOptions|File::create|fs::write' crates/lastcall-engine/src --glob '!*test*'   # restore.rs is the only file that opens a path under a root, and config/write.rs the only one that opens `config.toml` (one `fs::write`, the temp beside the file it then renames over); every other hit writes under the state dir (the in-file `mod tests` of ops.rs, engine.rs, store.rs, index.rs, ledger.rs, roots.rs and config/write.rs account for the rest)
+rg -n 'wrap::layout|wrap_words\(' crates/lastcall/src --glob '!*/wrap.rs'   # one hit outside `mod tests`: render.rs's `render_hunks`. The reducer asks `wrap::last_full_line` / `page_up_top` / `keep_visible` instead, and nobody re-derives a row from a line
+rg -n 'scroll \+ \(y' crates/lastcall/src                  # only comments: the row table replaced that arithmetic in Phase 13
 cargo tree -e normal -p lastcall -p lastcall-engine | grep -c testkit   # 0
 ```

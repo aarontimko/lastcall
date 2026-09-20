@@ -119,6 +119,7 @@ and shift with tab is `backtab`.
 | `expand` | `e` | expand a collapsed file into real hunks |
 | `toggle_full_paths` | `f` | full paths instead of basenames |
 | `toggle_remote` | `o` | show `org/repo` instead of the directory name |
+| `wrap` | `c`, `alt-z` | wrap long lines in the diff, or clip them at the pane's edge |
 | `hide_empty` | `t` | hide or show repositories with nothing pending |
 | `snooze` | `s` | set a repository aside for a number of days |
 | `show_snoozed` | `shift-s` | show or hide the repositories that are set aside |
@@ -150,6 +151,12 @@ bound to Option and an arrow: iTerm2 and herdr panes send that as
 escape prefix can deliver Option-Up as three separate keys, and the third of them is `A`.
 Use `{` and `}` there; they are bound to the same two actions and work everywhere.
 
+`wrap` has the same shape for the same reason: `alt-z` is the wrap key in most editors, and
+`c` is its plain twin. A terminal that does not send Option as Meta sends a plain letter
+for Option-z, and nothing happens. A terminal that splits the escape delivers `Esc` then
+`z`, and `z` is undo, so use `c` there, or put `wrap = ["c"]` in `[keys]` and leave
+Option out of it.
+
 The confirmation modal's own keys, `y` and `enter` to confirm, `n` and `esc` to cancel, are
 not rebindable in this version.
 
@@ -157,6 +164,26 @@ not rebindable in this version.
 before you are in a full screen: an action name that does not exist, a spec the grammar
 cannot parse, and a key bound to two actions once your entries are merged with the
 defaults. Each error names the offending entry.
+
+## `[ui]`
+
+| key | default | what it does |
+|---|---|---|
+| `wrap` | `true` | what the `c` toggle starts as. `true` wraps a diff line too long for the pane onto as many rows as it needs, breaking at a space where there is one. `false` opens clipping it at the pane's edge, the way versions before 0.5.0 did. `c` (or `alt-z`) flips it for the session, and nothing is written back. |
+
+```toml
+[ui]
+wrap = true
+```
+
+A line still cannot take the whole pane: past a few rows short of it the line stops and the
+last row ends in a dim count of the characters not shown, so whatever follows the line is
+always reachable. `y` copies lines, not rows, so a line that was wrapped or cut short on
+screen arrives on the clipboard whole, with no break in it. The pane never scrolls
+sideways, and the in-place editor (`i`) does not wrap.
+
+`[ui]` is new in 0.5.0: a 0.4.0 binary refuses a config file that has the table, so delete
+it before going back to that version.
 
 ## `[herdr]`
 
