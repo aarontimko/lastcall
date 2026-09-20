@@ -16,7 +16,9 @@
 //! and a row is measured the way ratatui draws it.
 
 use lastcall_engine::hunks::{Hunk, Tag};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use ratatui::buffer::CellWidth;
+use ratatui::style::Style;
+use ratatui::text::Span;
 
 use super::app::{diff_lines, hunk_block, hunk_height, hunk_offsets};
 
@@ -35,11 +37,10 @@ pub(super) enum Part {
     /// by this phase), or any text line at all while wrap is off.
     Whole,
     /// The blank separator between two hunks: a row that exists, and belongs to its line
-    /// for the hit map, but draws nothing at all. Not even a selection band, which is what
-    /// the renderer did with it before this phase.
+    /// for the hit map, but draws nothing at all, as before this phase.
+    Blank,
     /// A slice of the line's text, in **char** indices into the text without its gutter
     /// mark. The renderer repeats the mark and the colour on every row.
-    Blank,
     Slice {
         start: usize,
         end: usize,
@@ -64,8 +65,85 @@ pub(super) struct Row {
     pub part: Part,
 }
 
-/// `text` broken into char ranges that each fit in `width` display columns, breaking after
-/// the last whitespace that fits and hard-breaking a run that is wider than the row.
+/// One drawn unit of a line: a grapheme cluster as ratatui segments it, with the cells
+/// ratatui gives it, in **char** indices.
+#[derive(Debug, Clone, Copy)]
+struct Cluster {
+    start: usize,
+    end: usize,
+    cells: usize,
+    /// Every character is whitespace: a row may end after it.
+    space: bool,
+}
+
+/// The cells `text` takes when ratatui draws it: the sum of its graphemes' [`CellWidth`],
+/// which is what `Buffer::set_stringn` subtracts from the row as it goes. **Not**
+/// `UnicodeWidthStr::width` of the string (code verification F1): that measures an Arabic
+/// lam and alef as one cell where ratatui draws two, and a halfwidth dakuten as none where
+/// ratatui draws one, and a row measured narrower than it draws loses its tail.
+pub(super) fn cells(text: &str) -> usize {
+    clusters(text).map(|c| c.cells).sum()
+}
+
+/// `text` as the clusters ratatui draws, lazily, so a caller that stops after a few rows
+/// never walks the rest of a megabyte line (code verification F2).
+///
+/// The segmentation is ratatui's own ([`Span::styled_graphemes`], which is also what drops
+/// control characters from the drawing), so no second opinion about what a grapheme is can
+/// exist. A control character draws nothing; it rides at the front of the cluster after it
+/// (or is a cluster of no cells at the very end), so every character still belongs to
+/// exactly one row and the ranges concatenate back to the input.
+fn clusters(text: &str) -> impl Iterator<Item = Cluster> + '_ {
+    // `styled_graphemes` borrows its span, so the walk keeps a byte offset and asks for the
+    // next grapheme of the rest each time instead of holding that iterator.
+    let mut byte = 0usize;
+    let mut at = 0usize;
+    let mut done = false;
+    std::iter::from_fn(move || {
+        if done {
+            return None;
+        }
+        let rest = &text[byte..];
+        let next = Span::raw(rest)
+            .styled_graphemes(Style::default())
+            .next()
+            .map(|g| g.symbol.len());
+        match next {
+            Some(len) => {
+                // `rest` begins with zero or more control characters, then the symbol.
+                let lead = rest
+                    .char_indices()
+                    .find(|(_, c)| !c.is_control())
+                    .map_or(rest.len(), |(i, _)| i);
+                let symbol = &rest[lead..lead + len];
+                let chars = rest[..lead + len].chars().count();
+                let cluster = Cluster {
+                    start: at,
+                    end: at + chars,
+                    cells: usize::from(symbol.cell_width()),
+                    space: symbol.chars().all(char::is_whitespace),
+                };
+                byte += lead + len;
+                at += chars;
+                Some(cluster)
+            }
+            None => {
+                done = true;
+                // Only control characters are left (or nothing).
+                let chars = rest.chars().count();
+                (chars > 0).then_some(Cluster {
+                    start: at,
+                    end: at + chars,
+                    cells: 0,
+                    space: false,
+                })
+            }
+        }
+    })
+}
+
+/// `text` broken into char ranges that each fit in `width` cells, breaking after the last
+/// whitespace that fits and hard-breaking a run that is wider than the row.
 ///
 /// Always at least one range (an empty line is one empty range), never an empty range
 /// otherwise, and the ranges concatenate back to the input: this is a diff, so nothing is
@@ -73,77 +151,102 @@ pub(super) struct Row {
 /// does not leads the next one, and a run of whitespace wider than the row breaks like an
 /// over-long word.
 ///
-/// A row's width is [`UnicodeWidthStr::width`] of the row's own text, not a sum of its
-/// characters' widths (design review F12): an emoji written with a variation selector is
-/// two cells to `Buffer::set_line` and one to a per-char sum, and drawing a row measured
-/// the second way clips its last character. A break is never placed immediately before a
-/// zero-width character (a combining mark, a variation selector, a joiner), which would
-/// strand it on the next row away from what it modifies.
+/// A row is measured in [`cells`], the way ratatui draws it, and a break falls only between
+/// the clusters ratatui draws, so a combining mark, a variation selector or a joiner never
+/// lands on the next row away from what it modifies. A cluster of no cells never starts a
+/// row of its own for the same reason.
 ///
-/// `width` of 0, and a row narrower than its own widest character, terminate: they emit one
-/// character per row rather than looping, so those rows are wider than `width` and are
-/// excluded from the "no part is wider than the row" property.
+/// A cluster wider than the whole row is parted by characters into rows of its own, because
+/// ratatui draws nothing of a symbol that does not fit. `width` of 0, and a row narrower
+/// than a single character, terminate: they emit one character per row rather than looping,
+/// so those rows are wider than `width` and are excluded from the "no part is wider than
+/// the row" property.
+#[cfg(test)]
 pub(super) fn wrap_words(text: &str, width: usize) -> Vec<(usize, usize)> {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.is_empty() {
-        return vec![(0, 0)];
+    wrap_rows(text, width, usize::MAX).0
+}
+
+/// [`wrap_words`], stopping after `max_rows` rows. The flag says whether text was left
+/// over. What the pane calls, because it never draws more than the cap and a line can be a
+/// megabyte long (code verification F2).
+pub(super) fn wrap_rows(text: &str, width: usize, max_rows: usize) -> (Vec<(usize, usize)>, bool) {
+    if text.is_empty() {
+        return (vec![(0, 0)], false);
     }
+    let mut source = clusters(text);
+    // Clusters taken for a row and handed back by a word break.
+    let mut pending: std::collections::VecDeque<Cluster> = std::collections::VecDeque::new();
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    loop {
+        let Some(first) = pending.pop_front().or_else(|| source.next()) else {
+            return (out, false);
+        };
+        if out.len() == max_rows {
+            return (out, true);
+        }
+        // One cluster wider than the whole row (a long Indic conjunct in a narrow pane):
+        // ratatui draws nothing of a symbol that does not fit, so it is parted by characters
+        // into rows of its own. Each piece is measured as it will be drawn, alone.
+        if first.cells > width && first.end - first.start > 1 {
+            for piece in split_cluster(text, first, width) {
+                if out.len() == max_rows {
+                    return (out, true);
+                }
+                out.push(piece);
+            }
+            continue;
+        }
+        // The first cluster is taken whatever it measures, so the row makes progress.
+        let mut row = vec![first];
+        let mut used = first.cells;
+        let mut last_break = first.space.then_some(1);
+        let mut overflowed = false;
+        while let Some(c) = pending.pop_front().or_else(|| source.next()) {
+            if used + c.cells > width {
+                pending.push_front(c);
+                overflowed = true;
+                break;
+            }
+            used += c.cells;
+            row.push(c);
+            if c.space {
+                last_break = Some(row.len());
+            }
+        }
+        // A word break that leaves something on the row wins over the hard break; the
+        // clusters after it go back to lead the next row.
+        if overflowed && let Some(b) = last_break.filter(|&b| b < row.len()) {
+            for c in row.drain(b..).rev() {
+                pending.push_front(c);
+            }
+        }
+        out.push((row[0].start, row[row.len() - 1].end));
+    }
+}
+
+/// An over-wide cluster as char ranges that each fit in `width` cells where a single
+/// character can: as many characters as fit, measured together, per range.
+fn split_cluster(text: &str, cluster: Cluster, width: usize) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
-    let mut start = 0usize;
-    while start < chars.len() {
-        let end = row_end(&chars, start, width);
-        out.push((start, end));
-        start = end;
+    let mut piece = String::new();
+    let mut start = cluster.start;
+    let mut at = cluster.start;
+    for ch in text
+        .chars()
+        .skip(cluster.start)
+        .take(cluster.end - cluster.start)
+    {
+        piece.push(ch);
+        if piece.chars().count() > 1 && cells(&piece) > width {
+            out.push((start, at));
+            start = at;
+            piece.clear();
+            piece.push(ch);
+        }
+        at += 1;
     }
+    out.push((start, at));
     out
-}
-
-/// Where the row beginning at `start` ends: the exclusive char index of its last character
-/// plus one. Always greater than `start`, so [`wrap_words`] terminates.
-fn row_end(chars: &[char], start: usize, width: usize) -> usize {
-    // How far the row can reach measuring the way ratatui draws it. `fits` grows one
-    // character at a time and re-measures the whole candidate, which is what makes a
-    // variation selector count for the cell it actually takes.
-    let mut fit = start;
-    let mut last_break = None;
-    let mut i = start;
-    while i < chars.len() {
-        let candidate: String = chars[start..=i].iter().collect();
-        if candidate.width() > width {
-            break;
-        }
-        fit = i + 1;
-        // A break may be taken *after* this character when it is whitespace and the next
-        // character is not a zero-width mark that belongs to it.
-        if chars[i].is_whitespace() && !starts_zero_width(chars, i + 1) {
-            last_break = Some(i + 1);
-        }
-        i += 1;
-    }
-    if fit >= chars.len() {
-        // The rest of the line fits on this row.
-        return chars.len();
-    }
-    if fit == start {
-        // Nothing fits: `width` is 0, or narrower than this one character. Emit the one
-        // character so the caller makes progress; the row is then wider than `width`.
-        return start + 1;
-    }
-    // Never break immediately before a zero-width character: it would land on the next row
-    // without the character it modifies.
-    let mut hard = fit;
-    while hard > start + 1 && starts_zero_width(chars, hard) {
-        hard -= 1;
-    }
-    match last_break {
-        // A word break that leaves something on the row wins over the hard break.
-        Some(b) if b > start && b <= fit => b,
-        _ => hard,
-    }
-}
-
-fn starts_zero_width(chars: &[char], at: usize) -> bool {
-    chars.get(at).is_some_and(|c| c.width().unwrap_or(0) == 0)
 }
 
 /// The cap for a body `rows` tall: how many rows one line may take (ruling 2).
@@ -190,34 +293,35 @@ pub(super) fn parts_of(hunk: &Hunk, within: usize, cols: u16, rows: u16, wrap: b
         return vec![Part::Whole];
     };
     let width = usize::from(cols).saturating_sub(GUTTER);
-    let ranges = wrap_words(&text, width);
-    if ranges.len() <= 1 {
+    let cap = cap(rows);
+    // Never more than the cap: the rest of a long line is counted, not wrapped.
+    let (ranges, more) = wrap_rows(&text, width, cap);
+    if ranges.len() <= 1 && !more {
         // One row: the whole line, drawn exactly as it was before this phase.
         return vec![Part::Whole];
     }
-    let total: usize = text.chars().count();
-    let cap = cap(rows);
-    let mut out: Vec<Part> = Vec::with_capacity(ranges.len().min(cap));
-    for (i, &(start, end)) in ranges.iter().enumerate() {
-        if i + 1 == cap && ranges.len() > cap {
-            let (end, marker) = cut_for_marker(&text, start, end, total, width);
-            out.push(Part::Slice {
-                start,
-                end,
-                marker: Some(marker),
-            });
-            break;
-        }
-        out.push(Part::Slice {
-            start,
-            end,
-            marker: None,
-        });
-        if i + 1 == cap {
-            break;
-        }
-    }
-    out
+    let last = ranges.len() - 1;
+    ranges
+        .iter()
+        .enumerate()
+        .map(|(i, &(start, end))| {
+            if i == last && more {
+                let total = text.chars().count();
+                let (end, marker) = cut_for_marker(&text, start, end, total, width);
+                Part::Slice {
+                    start,
+                    end,
+                    marker: Some(marker),
+                }
+            } else {
+                Part::Slice {
+                    start,
+                    end,
+                    marker: None,
+                }
+            }
+        })
+        .collect()
 }
 
 /// The cap's last row: shorten it by whole characters until the marker fits beside it, and
@@ -233,22 +337,23 @@ fn cut_for_marker(
     total: usize,
     width: usize,
 ) -> (usize, String) {
-    let chars: Vec<char> = text.chars().collect();
-    let row_width = |to: usize| chars[start..to].iter().collect::<String>().width();
-    let mut end = end;
+    // The row's own clusters, so it is shortened by what ratatui draws as one unit: a base
+    // character is never parted from its combining mark, and a wide one is never halved.
+    let row: String = text.chars().skip(start).take(end - start).collect();
+    let mut kept: Vec<Cluster> = clusters(&row).collect();
+    let mut used: usize = kept.iter().map(|c| c.cells).sum();
     loop {
+        let end = start + kept.last().map_or(0, |c| c.end);
         let marker = format!(" … +{}", total - end);
-        if row_width(end) + marker.width() <= width {
+        if used + cells(&marker) <= width {
             return (end, marker);
         }
-        if end > start {
-            end -= 1;
-            continue;
+        match kept.pop() {
+            Some(c) => used -= c.cells,
+            // The row is empty and the counted marker still does not fit: say only that
+            // something was cut.
+            None => return (start, "…".to_owned()),
         }
-        // The row is empty and the counted marker still does not fit: say only that
-        // something was cut.
-        let short = "…".to_owned();
-        return (start, short);
     }
 }
 
@@ -435,11 +540,10 @@ mod tests {
         parts
     }
 
+    /// The widest cluster of `text`, in cells: what a row has to hold for the "no part is
+    /// wider than the row" property to be owed.
     fn widest(text: &str) -> usize {
-        text.chars()
-            .map(|c| c.width().unwrap_or(0))
-            .max()
-            .unwrap_or(0)
+        clusters(text).map(|c| c.cells).max().unwrap_or(0)
     }
 
     fn check_widths(text: &str, width: usize) -> Vec<String> {
@@ -447,7 +551,7 @@ mod tests {
         if width >= widest(text) {
             for p in &parts {
                 assert!(
-                    p.width() <= width,
+                    cells(p) <= width,
                     "no part is wider than the row: {p:?} in {text:?} / {width}"
                 );
             }
@@ -466,21 +570,56 @@ mod tests {
         let word = "x".repeat(300);
         let parts = check_widths(&word, 40);
         assert_eq!(parts.len(), 8, "300 over 40 is 8 rows");
-        assert!(parts.iter().take(7).all(|p| p.width() == 40));
+        assert!(parts.iter().take(7).all(|p| cells(p) == 40));
     }
 
     #[test]
     fn wrap_never_breaks_before_a_zero_width_character() {
-        // A combining acute after `e`: the break may not land between them.
-        let text = "aaaa e\u{0301}bbb";
-        for width in 1..=12 {
-            let parts = check(text, width);
-            for p in &parts {
-                assert!(
-                    !p.starts_with('\u{0301}'),
-                    "a row may not begin with a combining mark: {parts:?} / {width}"
-                );
+        // A combining acute after `e`, a variation selector that turns a one-cell sign into
+        // a two-cell emoji, and a joiner inside a family: a break may not land inside any of
+        // them. The selector is the case that bites (code verification F6): `aaa⚠` is four
+        // cells and fits a row of four character by character, which strands the selector
+        // at the head of the next row and draws the sign there a second time, differently.
+        let texts = [
+            "aaaa e\u{0301}bbb",
+            "aaa\u{26A0}\u{FE0F}bbb\u{26A0}\u{FE0F}",
+            "aa\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}bb",
+        ];
+        for text in texts {
+            // From two cells: a row of one cannot hold the emoji at all.
+            for width in 2..=12 {
+                let parts = check(text, width);
+                for p in &parts {
+                    assert!(
+                        !p.starts_with(['\u{0301}', '\u{FE0F}', '\u{200D}']),
+                        "a row may not begin inside a cluster: {parts:?} / {width}"
+                    );
+                    assert!(
+                        !p.ends_with('\u{200D}'),
+                        "nor end inside one: {parts:?} / {width}"
+                    );
+                }
             }
+        }
+        assert_eq!(
+            check("aaa\u{26A0}\u{FE0F}", 4),
+            ["aaa", "\u{26A0}\u{FE0F}"],
+            "the emoji goes to the next row whole"
+        );
+    }
+
+    /// A cluster wider than the whole row is parted by characters rather than handed to
+    /// ratatui, which draws nothing of a symbol that does not fit.
+    #[test]
+    fn wrap_parts_a_cluster_wider_than_the_row() {
+        // A Devanagari conjunct is one cluster of three cells.
+        let conjunct = "\u{0915}\u{094D}\u{0937}\u{093F}";
+        assert_eq!(cells(conjunct), 3, "the premise");
+        let text = format!("ab{conjunct}cd");
+        let parts = check(&text, 2);
+        assert_eq!(parts.concat(), text);
+        for p in &parts {
+            assert!(cells(p) <= 2, "{p:?} is {} cells", cells(p));
         }
     }
 
@@ -513,7 +652,7 @@ mod tests {
         let text = "\u{26A0}\u{FE0F}\u{26A0}\u{FE0F}\u{26A0}\u{FE0F}";
         let parts = check(text, 4);
         for p in &parts {
-            assert!(p.width() <= 4, "{p:?} is {} cells", p.width());
+            assert!(cells(p) <= 4, "{p:?} is {} cells", cells(p));
         }
     }
 
@@ -617,10 +756,10 @@ mod tests {
         let hidden: usize = marker.trim_start_matches(" … +").parse().expect("a count");
         assert_eq!(hidden, 200 - end, "the count is the characters not shown");
         assert!(
-            (end - start) + marker.width() <= 10,
+            (end - start) + cells(marker) <= 10,
             "content and marker fit the row: {} + {}",
             end - start,
-            marker.width()
+            cells(marker)
         );
         for row in &table[..4] {
             assert!(
@@ -630,8 +769,7 @@ mod tests {
             );
         }
         // The promise of the cap: the line after it is at least partly on screen.
-        let after = layout(&hunks, 1, 11, 8, true);
-        assert!(after.len() < 8, "three rows are left for what follows");
+        assert!(table.len() < 8, "three rows are left for what follows");
     }
 
     #[test]
@@ -660,8 +798,8 @@ mod tests {
         };
         let marker = marker.as_deref().expect("a marker");
         let row: String = "世".repeat(end - start);
-        assert_eq!(row.width(), (end - start) * 2, "no character was halved");
-        assert!(row.width() + marker.width() <= 12, "{row:?} + {marker:?}");
+        assert_eq!(cells(&row), (end - start) * 2, "no character was halved");
+        assert!(cells(&row) + cells(marker) <= 12, "{row:?} + {marker:?}");
     }
 
     #[test]
@@ -818,9 +956,9 @@ mod tests {
                     // The carve-out: a row narrower than its own single character.
                     if e - s > 1 {
                         prop_assert!(
-                            row.width() <= width,
+                            cells(&row) <= width,
                             "row {:?} is {} cells in {}",
-                            row, row.width(), width
+                            row, cells(&row), width
                         );
                     }
                     rebuilt.push_str(&row);

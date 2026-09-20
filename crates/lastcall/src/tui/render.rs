@@ -1730,6 +1730,10 @@ fn render_hunks(
     // hunks itself, so there is no second answer to keep in step with this one.
     let rows = wrap::layout(hunks, scroll, area.width, area.height, app.wrap);
     hits.diff_rows = rows.iter().map(|r| r.line).collect();
+    // The wrapped line being drawn, expanded once for all of its rows: a line can be a
+    // megabyte, and expanding it again for each row was most of a frame (code verification
+    // F2).
+    let mut expanded: Option<(usize, String)> = None;
     for (y, row) in rows.iter().enumerate() {
         let y = y as u16;
         let (h, within) = (row.hunk, row.within);
@@ -1741,7 +1745,12 @@ fn render_hunks(
             wrap::Part::Blank => continue,
             wrap::Part::Whole => hunk_line(hunk, within, h == current),
             wrap::Part::Slice { start, end, marker } => {
-                hunk_row(hunk, within, *start, *end, marker.as_deref())
+                let (tag, bytes) = &hunk.lines[within - 1];
+                if expanded.as_ref().is_none_or(|(line, _)| *line != row.line) {
+                    expanded = Some((row.line, line_text(bytes)));
+                }
+                let text = expanded.as_ref().map_or("", |(_, text)| text.as_str());
+                hunk_row(*tag, text, *start, *end, marker.as_deref())
             }
         };
         let row_rect = Rect::new(area.x, area.y + y, area.width, 1);
@@ -1912,30 +1921,32 @@ fn hunk_line(hunk: &Hunk, i: usize, current: bool) -> Line<'static> {
 /// One **row** of a wrapped text line: the gutter mark, the slice of the line's text this
 /// row carries, and the cap's marker when this is the last row of a line that was cut.
 ///
-/// For the whole line with no marker it builds exactly what [`hunk_line`] builds, which is
-/// what makes "wrap off is cell-identical to the renderer before this phase" true by
-/// construction rather than by a test that happens to pass: the gutter and the colour are
-/// the line's own, repeated, and the only thing a continuation row loses is the leading
-/// indentation, which a narrow pane cannot spare.
-fn hunk_row(
-    hunk: &Hunk,
-    within: usize,
-    start: usize,
-    end: usize,
-    marker: Option<&str>,
-) -> Line<'static> {
-    let (tag, bytes) = &hunk.lines[within - 1];
-    let text = line_text(bytes);
+/// Only a line that takes more than one row comes here; a line that fits, and every line
+/// with wrap off, is a [`wrap::Part::Whole`] and goes to [`hunk_line`] untouched. The gutter
+/// and the colour are the line's own on every row, so a wrapped deletion never reads as
+/// context half way down. On a continuation row the gutter mark alone is **dim**, so a
+/// wrapped `+` line does not read as several added lines (design review F19, code
+/// verification F5); the text keeps its full colour.
+fn hunk_row(tag: Tag, text: &str, start: usize, end: usize, marker: Option<&str>) -> Line<'static> {
     let slice: String = text
         .chars()
         .skip(start)
         .take(end.saturating_sub(start))
         .collect();
-    let body = format!("{}{slice}", wrap::gutter_of(*tag));
-    let mut line = match tag {
-        Tag::Context => Line::from(body),
-        Tag::Insert => Line::from(Span::styled(body, green())),
-        Tag::Delete => Line::from(Span::styled(body, red())),
+    let colour = match tag {
+        Tag::Context => Style::new(),
+        Tag::Insert => green(),
+        Tag::Delete => red(),
+    };
+    let gutter = wrap::gutter_of(tag);
+    let mut line = if start == 0 {
+        // The first row is built the way `hunk_line` builds a whole line.
+        Line::from(Span::styled(format!("{gutter}{slice}"), colour))
+    } else {
+        Line::from(vec![
+            Span::styled(gutter.to_string(), colour.add_modifier(Modifier::DIM)),
+            Span::styled(slice, colour),
+        ])
     };
     if let Some(marker) = marker {
         // Dim, never the line's green or red (design review F15): a marker in the line's
@@ -4877,31 +4888,72 @@ mod tests {
     }
 
     /// A continuation row is still the line it continues: the same gutter mark and the
-    /// same colour, so a wrapped insertion does not turn into context half way down.
+    /// same colour, so a wrapped insertion (or deletion: code verification F6, M3) does not
+    /// turn into context half way down. Only the continuation's gutter mark is dim (F5), so
+    /// one wrapped `+` line does not read as several.
     #[test]
     fn render_wrap_continuation_rows_keep_the_gutter_and_the_colour() {
-        let mut app = wrapped(&["a"]);
-        // One long insertion, the only body line of the hunk.
-        let hunk = &mut app.selected_row().expect("f1").hunks[0].clone();
-        hunk.lines = vec![(
-            Tag::Insert,
-            format!("{}\n", "lorem ipsum ".repeat(20)).into_bytes(),
-        )];
-        let mut p = pile("alpha");
-        p.rows[0].hunks = vec![hunk.clone()];
-        app.apply(pile_event("alpha", p));
-        app.select(Some(row("alpha", "f1")));
-        app.handle(Action::Open);
+        for (tag, mark, colour) in [
+            (Tag::Insert, '+', Color::Green),
+            (Tag::Delete, '-', Color::Red),
+        ] {
+            let mut app = wrapped(&["a"]);
+            // One long changed line, the only body line of the hunk.
+            let hunk = &mut app.selected_row().expect("f1").hunks[0].clone();
+            hunk.lines = vec![(tag, format!("{}\n", "lorem ipsum ".repeat(20)).into_bytes())];
+            let mut p = pile("alpha");
+            p.rows[0].hunks = vec![hunk.clone()];
+            app.apply(pile_event("alpha", p));
+            app.select(Some(row("alpha", "f1")));
+            app.handle(Action::Open);
 
-        let (buf, hits) = drawn(&app, 100, 30);
-        let body = hits.diff_body.expect("the body");
-        let rows = rows_of(&hits, 1);
-        assert!(rows.len() > 2, "the line wrapped: {rows:?}");
-        for y in rows {
-            let text = row_text(&buf, body, y);
-            assert!(text.starts_with('+'), "row {y}: {text:?}");
-            assert_eq!(buf[(body.x, y)].fg, Color::Green, "row {y} is an insertion");
-            assert_eq!(buf[(body.x + 1, y)].fg, Color::Green, "and so is its text");
+            let (buf, hits) = drawn(&app, 100, 30);
+            let body = hits.diff_body.expect("the body");
+            let rows = rows_of(&hits, 1);
+            assert!(rows.len() > 2, "the line wrapped: {rows:?}");
+            for (i, y) in rows.into_iter().enumerate() {
+                let text = row_text(&buf, body, y);
+                assert!(text.starts_with(mark), "row {y}: {text:?}");
+                assert_eq!(buf[(body.x, y)].fg, colour, "row {y} is a {tag:?}");
+                assert_eq!(buf[(body.x + 1, y)].fg, colour, "and so is its text");
+                assert_eq!(
+                    buf[(body.x, y)].modifier.contains(Modifier::DIM),
+                    i > 0,
+                    "row {y}: only a continuation's gutter mark is dim"
+                );
+                assert!(
+                    !buf[(body.x + 1, y)].modifier.contains(Modifier::DIM),
+                    "row {y}: the text is never dim"
+                );
+            }
+        }
+    }
+
+    /// Code verification F4: before a frame has reported the body's size (the first key,
+    /// and every key folded into a batch with a resize) the reducer lays out against a
+    /// fallback, and it has to be the body the renderer then draws, at every size and nav
+    /// width, or a page could step past a row that was never drawn.
+    #[test]
+    fn render_diff_body_fallback_is_what_the_renderer_draws() {
+        for (w, h) in [
+            (40u16, 10u16),
+            (59, 20),
+            (60, 20),
+            (80, 24),
+            (100, 30),
+            (120, 40),
+            (200, 50),
+        ] {
+            for nav in [10u16, 28, 40, 90, 300] {
+                let mut app = wrapped(&["short", &"x".repeat(400), "tail"]);
+                app.nav_width = nav;
+                app.handle(Action::Resize(w, h));
+                assert_eq!(app.diff_size, None, "a resize forgets the measure");
+                let fallback = app.diff_body_size();
+                let (_, hits) = drawn(&app, w, h);
+                let real = hits.diff_body.map(|r| (r.width, r.height));
+                assert_eq!(real, Some(fallback), "{w}x{h} nav_width={nav}");
+            }
         }
     }
 
@@ -5000,7 +5052,7 @@ mod tests {
             styles(&buf)
         );
         assert!(
-            !buf[(body.x, last)].modifier.contains(Modifier::DIM),
+            !buf[(body.x + 1, last)].modifier.contains(Modifier::DIM),
             "but the text it follows is not"
         );
         // The cap leaves room for what comes after the line.
@@ -5028,5 +5080,135 @@ mod tests {
         let long = row_text(&buf, body, body.y + 2);
         assert!(long.starts_with(" xxx"), "clipped, not wrapped: {long:?}");
         assert_eq!(row_text(&buf, body, body.y + 3).trim(), "tail");
+    }
+
+    /// Read row `y` of `buf` as the symbols actually drawn.
+    fn drawn_row(buf: &Buffer, w: u16, y: u16) -> String {
+        (0..w).map(|x| buf[(x, y)].symbol().to_owned()).collect()
+    }
+
+    /// Code verification F1, the product's promise at the level it is made: with wrap on
+    /// and no cap in play, **every character of a line is on some row of the buffer**, for
+    /// the scripts where a string's width and the cells ratatui draws disagree (an Arabic
+    /// lam and alef, a halfwidth dakuten), and for everything else a row can end on. Drawn
+    /// through the real `render_hunks` into a buffer exactly as wide as the body, over all
+    /// three tags; the gutter's colour is checked on every row on the way.
+    ///
+    /// Control characters are left out of the comparison because ratatui draws them
+    /// nowhere, wrapped or not; whitespace and the two invisible format characters are left
+    /// out because a cell a wide symbol covers reads back as a space.
+    #[test]
+    fn render_wrap_every_character_is_on_some_row_in_every_script() {
+        let inputs: Vec<(&str, String)> = vec![
+            ("halfwidth-dakuten", "\u{FF76}\u{FF9E}\u{FF77}\u{FF9E}\u{FF78}\u{FF9E}".repeat(20)),
+            ("arabic-lam-alef", "\u{0644}\u{0627}".repeat(40)),
+            ("arabic-words", "\u{0644}\u{0627} \u{0633}\u{0644}\u{0627}\u{0645} ".repeat(15)),
+            ("vs16", "\u{26A0}\u{FE0F}".repeat(40)),
+            ("zwj-family", "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}".repeat(30)),
+            ("flags", "\u{1F1FA}\u{1F1F8}\u{1F1EC}\u{1F1E7}".repeat(20)),
+            ("flags-odd", format!("a{}", "\u{1F1FA}".repeat(41))),
+            ("cjk-edge-odd", format!("a{}", "\u{4E16}".repeat(60))),
+            ("cjk-edge-even", "\u{4E16}".repeat(60)),
+            ("combining", "e\u{0301}".repeat(80)),
+            ("leading-combining", format!("\u{0301}{}", "abc ".repeat(30))),
+            ("leading-dakuten", format!("\u{FF9E}{}", "abc ".repeat(30))),
+            ("nbsp", "a\u{00A0}".repeat(60)),
+            ("ideographic-space", "\u{3000}".repeat(60)),
+            ("em-space-words", "word\u{2003}".repeat(30)),
+            ("trailing-ws", format!("abc{}", " ".repeat(150))),
+            ("only-spaces", " ".repeat(150)),
+            ("tabs", "\tx\t\ty".repeat(20)),
+            ("zwsp", "ab\u{200B}".repeat(50)),
+            ("skin-tone", "\u{1F44D}\u{1F3FD}".repeat(40)),
+            ("keycap", "1\u{FE0F}\u{20E3}".repeat(40)),
+            ("hangul-jamo", "\u{1100}\u{1161}\u{11A8}".repeat(40)),
+            ("devanagari", "\u{0915}\u{094D}\u{0937}\u{093F} ".repeat(30)),
+            ("thai", "\u{0E01}\u{0E33}\u{0E19}\u{0E49}\u{0E33}".repeat(30)),
+            ("soft-hyphen", "ab\u{00AD}cd".repeat(40)),
+            ("control", "ab\u{1b}[31mcd\u{7}".repeat(20)),
+            (
+                "mixed",
+                "\u{4F60}\u{597D} \u{26A0}\u{FE0F} e\u{0301} \u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467} \u{FF76}\u{FF9E} \u{0644}\u{0627} x"
+                    .repeat(10),
+            ),
+        ];
+        let visible = |s: &str| -> String {
+            s.chars()
+                .filter(|c| {
+                    !c.is_control() && !c.is_whitespace() && *c != '\u{200B}' && *c != '\u{AD}'
+                })
+                .collect()
+        };
+        let mut app = three_roots();
+        app.wrap = true;
+        app.diff.scroll = 1;
+        let mut failures: Vec<String> = Vec::new();
+        for (name, text) in &inputs {
+            for w in [3u16, 4, 5, 7, 10, 11, 19, 20, 37, 63, 80] {
+                for tag in [Tag::Context, Tag::Insert, Tag::Delete] {
+                    let hunks = vec![Hunk {
+                        index: 0,
+                        old_range: 0..1,
+                        new_range: 0..1,
+                        lines: vec![(tag, format!("{text}\n").into_bytes())],
+                    }];
+                    // Tall enough that the cap is never in play.
+                    let area = Rect::new(0, 0, w, 400);
+                    let mut buf = Buffer::empty(area);
+                    let mut hits = HitMap::default();
+                    render_hunks(
+                        &app,
+                        &mut buf,
+                        area,
+                        &hunks,
+                        &[],
+                        HunkControls::All,
+                        &mut hits,
+                    );
+                    let table = wrap::layout(&hunks, 1, w, 400, true);
+                    assert!(
+                        !table.iter().any(|r| matches!(
+                            &r.part,
+                            wrap::Part::Slice {
+                                marker: Some(_),
+                                ..
+                            }
+                        )),
+                        "the premise: {name} at {w} is not capped"
+                    );
+                    let mut drawn = String::new();
+                    for (y, row) in table.iter().enumerate().filter(|(_, r)| r.line == 1) {
+                        let got = drawn_row(&buf, w, y as u16);
+                        let gutter = wrap::gutter_of(tag);
+                        match got.strip_prefix(gutter) {
+                            Some(rest) => drawn.push_str(rest),
+                            None => {
+                                failures.push(format!("{name} w={w} {tag:?} row={y}: no gutter"))
+                            }
+                        }
+                        let fg = buf[(0, y as u16)].fg;
+                        let coloured = match tag {
+                            Tag::Insert => fg == Color::Green,
+                            Tag::Delete => fg == Color::Red,
+                            Tag::Context => true,
+                        };
+                        if !coloured {
+                            failures
+                                .push(format!("{name} w={w} {tag:?} row={y}: gutter is {fg:?}"));
+                        }
+                        let _ = row;
+                    }
+                    let want = visible(&line_text(text.as_bytes()));
+                    if visible(&drawn) != want {
+                        failures.push(format!(
+                            "{name} w={w} {tag:?}: drew {} of {} visible characters",
+                            visible(&drawn).chars().count(),
+                            want.chars().count()
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "hidden text:\n{}", failures.join("\n"));
     }
 }

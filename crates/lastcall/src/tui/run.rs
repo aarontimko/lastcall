@@ -1598,6 +1598,17 @@ pub struct Launch {
     pub tour: tour::Plan,
 }
 
+/// The UI as the config opens it: `[roots] hide_empty` and `[ui] wrap` are the reducer's
+/// opening answers, and the keys change them from there for the session only. Its own
+/// function so a test can hold the routing (code verification F6: nothing failed when the
+/// `wrap` line was deleted from `run`, which no test can call).
+fn opening_ui(keymap: Keymap, hide_empty: bool, wrap: bool) -> Ui {
+    let mut ui = Ui::new(App::new(), keymap);
+    ui.app.hide_empty = hide_empty;
+    ui.app.wrap = wrap;
+    ui
+}
+
 pub fn run(
     engine: Engine,
     timings: EngineTimings,
@@ -1621,12 +1632,10 @@ pub fn run(
     };
     let mut guard = term::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let mut ui = Ui::new(App::new(), keymap);
+    let mut ui = opening_ui(keymap, hide_empty, wrap);
     // Asked once, inside `enter`, before the input thread exists; the app reads the cached
     // answer so the note modal promises `⇧⏎` only where it works (ruling P9).
     ui.app.enhanced = term::keyboard_enhanced();
-    ui.app.hide_empty = hide_empty;
-    ui.app.wrap = wrap;
     let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Event>();
     // Both are replaced wholesale by an `$EDITOR` suspend, which joins the thread and opens
     // a fresh channel; `reader` is `None` only while that handover is in flight.
@@ -3331,10 +3340,15 @@ mod tests {
     /// The config's opening answer reaches the reducer, and the key flips it from there.
     #[test]
     fn run_wrap_the_launch_flag_sets_the_apps_opening_answer() {
+        assert!(wrapping_ui(&["a"]).app.wrap, "true out of the box");
+        // What `run` opens with, given `Launch::wrap` from `[ui] wrap = false`.
+        for (hide_empty, wrap) in [(false, true), (true, false), (false, false)] {
+            let ui = opening_ui(Keymap::default(), hide_empty, wrap);
+            assert_eq!((ui.app.hide_empty, ui.app.wrap), (hide_empty, wrap));
+        }
         let mut ui = wrapping_ui(&["a"]);
-        assert!(ui.app.wrap, "true out of the box");
-        // What `run` does with `Launch::wrap`, which cannot be run under a test terminal.
-        ui.app.wrap = false;
+        ui.app.wrap = opening_ui(Keymap::default(), false, false).app.wrap;
+        assert!(!ui.app.wrap);
         assert_eq!(ui.event(&key(KeyCode::Char('c'))), (Changed::Yes, None));
         assert!(ui.app.wrap, "`c` flips it for the session");
     }
