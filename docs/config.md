@@ -119,7 +119,7 @@ and shift with tab is `backtab`.
 | `expand` | `e` | expand a collapsed file into real hunks |
 | `toggle_full_paths` | `f` | full paths instead of basenames |
 | `toggle_remote` | `o` | show `org/repo` instead of the directory name |
-| `wrap` | `c`, `alt-z` | wrap long lines in the diff, or clip them at the pane's edge |
+| `wrap` | `c`, `Ω`, `alt-z` | wrap long lines in the diff, or clip them at the pane's edge |
 | `hide_empty` | `t` | hide or show repositories with nothing pending |
 | `snooze` | `s` | set a repository aside for a number of days |
 | `show_snoozed` | `shift-s` | show or hide the repositories that are set aside |
@@ -151,11 +151,15 @@ bound to Option and an arrow: iTerm2 and herdr panes send that as
 escape prefix can deliver Option-Up as three separate keys, and the third of them is `A`.
 Use `{` and `}` there; they are bound to the same two actions and work everywhere.
 
-`wrap` has the same shape for the same reason: `alt-z` is the wrap key in VS Code and the
-editors built on it, and `c` is its plain twin. A terminal that does not send Option as
-Meta sends a plain letter for Option-z, and nothing happens. A terminal that splits the
-escape delivers `Esc` then `z`, and `z` is undo, so use `c` there, or put `wrap = ["c"]`
-in `[keys]` and leave Option out of it.
+`wrap` has the same shape for the same reason: Option-z (`alt-z`) is the wrap key in VS
+Code and the editors built on it, and `c` is its plain twin. A Mac terminal as it is set
+up out of the box does not send Option as Alt; it sends the character the keyboard makes,
+and for Option-z on a US layout that is `Ω`. So `Ω` is bound too, and Option-z works on a
+Mac with no settings change; the help overlay shows it as `Opt-z (Ω)`. On another layout
+Option-z is a different character: bind that one, `wrap = ["c", "alt-z", "<it>"]`. A
+character outside ASCII is taken as typed, so `Ω` and `ω` are different keys. A terminal
+that splits the escape delivers `Esc` then `z`, and `z` is undo, so use `c` there, or put
+`wrap = ["c"]` in `[keys]` and leave Option out of it.
 
 The confirmation modal's own keys, `y` and `enter` to confirm, `n` and `esc` to cancel, are
 not rebindable in this version.

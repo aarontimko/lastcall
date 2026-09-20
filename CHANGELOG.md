@@ -15,7 +15,8 @@ binary rather than for the commit log.
   enough to fill the pane on its own stops a few rows short and ends in a dim `… +N` marker
   counting the characters not drawn, so whatever follows it is always at least partly
   visible.
-- `c` (or `alt-z`) turns wrapping off and on while you read. Clipped is the old behaviour,
+- `c` (or Option-z on a Mac, `alt-z` elsewhere: the VS Code key) turns wrapping off and on
+  while you read. Clipped is the old behaviour,
   with the line cut at the edge; the line you were on stays the line you are on either way.
   The key changes nothing on disk, so the next launch is whatever your config says.
 - `[ui] wrap` in `config.toml` chooses how lastcall opens, `true` by default. Set it to
@@ -25,8 +26,8 @@ binary rather than for the commit log.
 
 ### Changed
 
-- `c` and `alt-z` are now bound to the new `wrap` action. A config that already binds either
-  key to something else no longer loads, with an error naming the key and both actions; give
+- `c`, `alt-z` and `Ω` (what a Mac sends for Option-z) are now bound to the new `wrap`
+  action. A config that already binds one of them to something else no longer loads, with an error naming the key and both actions; give
   the other action a different key, or move `wrap` with `[keys] wrap = ["..."]`.
 - A config file with a `[ui]` table is refused by 0.4.0 and earlier, which do not know the
   table. Remove it before going back to an older binary.
