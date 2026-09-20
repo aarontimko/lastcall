@@ -94,7 +94,7 @@ Conventions as in `01-scenarios.md`: the root is `R`, `seen` is the record in fo
 - [x] Docs: config table, review-loop, engine.md, README clauses, CHANGELOG `## Unreleased`; the em-dash grep empty; no personal detail in the diff. **Closed 2026-09-18.**
 - [x] Standing: unit floor 734 grows (count and split); integration, harness, prepush, PTY, snapshot counts stated; the real-herdr subset green; `just audit` in CI only. **Closed 2026-09-18:** 776 = 344 + 20 + 375 + 37; integration 131; harness 217; prepush 150; PTY 49 + 1, snapshots 62 + 1.
 - [x] **[sponsor]** on the sponsor's own machine: `draft_dirs = ["z_ignore", "z_ignore/research"]` over the sponsor's repositories, the rows named `<repo>/z_ignore`, the path line on selection, no large-file blobs in the state directory, the tool responsive; the sponsor's words in §10. **Closed 2026-09-18 as amended** in `00-spec.md` §8: run over a demonstration repository on the sponsor's machine; the run over the sponsor's own repositories is a named obligation of the first use of `v0.4.0` (§11).
-- [ ] Amendment v1.13 ratified by the merge (**done, PR #31, 2026-09-18**); §10 close-out entry with the judgment-call list; `v0.4.0` release PR and tag (the sponsor's).
+- [x] **Closed 2026-09-18, `v0.4.0` tagged by the sponsor.** Amendment v1.13 ratified by the merge (**done, PR #31, 2026-09-18**); §10 close-out entry with the judgment-call list; `v0.4.0` release PR and tag (the sponsor's).
 
 ## Operational rules
 
