@@ -18,10 +18,12 @@ just tryout wrap --no-launch  # build and print only (an agent's shell, a quick 
 just tryout wrap --in=demo  # open from inside the `demo` repository, not from its parent
 ```
 
-lastcall reads the directory it is opened from: from a parent directory it lists every
-repository underneath, and from inside one working tree that is the directory it was asked
-about. A run opens from the sandbox's `parent/` unless the scenario or `--in=` says
-otherwise; `--in=` takes any directory under `parent/` and refuses one that is not there.
+A run opens from the sandbox's `parent/`, which its config names in `parent_dirs`, so
+every repository underneath is listed. The directory lastcall is opened from decides what
+is watched only when the config names no `parent_dirs`, which is how it runs with no
+config at all. `--in=demo` sets that up: it leaves `parent_dirs` out and opens from inside
+`parent/demo`, so that working tree is the whole list. It takes any directory under
+`parent/` and refuses one that is not there, naming the sandbox it had built.
 
 It was first built by hand for the word wrap phase's hands-on gate, and that one run found
 a real defect no test had: Option-z on a Mac terminal with stock settings arrives as the
@@ -93,9 +95,10 @@ The pieces:
   `[update]` are the sandbox's own, and a table can be given once (TOML's rule): the call
   raises on either, so the mistake shows when the scenario is built and not at launch.
 - `sandbox.launch_in = "demo"` opens lastcall from inside that directory (relative to
-  `parent/`) when the thing being judged depends on where it is opened; the person's
-  `--in=` overrides it. `sandbox.name_parent = False` leaves `parent_dirs` out of the
-  config, so lastcall watches the directory it is opened from, as it does with no config.
+  `parent/`), and `sandbox.name_parent = False` leaves `parent_dirs` out of the config,
+  so lastcall watches the directory it is opened from, as it does with no config. Set
+  both when the thing being judged depends on where it is opened (with `parent_dirs`
+  named, the launch directory changes nothing). The person's `--in=` sets both.
 - `sandbox.welcome = True` leaves the first-launch welcome in place, for a scenario that is
   about the welcome.
 - The function's docstring's first line is what `just tryout list` prints.
@@ -107,7 +110,7 @@ Rules a scenario follows:
    same files and the same history (commit times aside).
 2. **Every step says what to do and what to see.** "Open `min.js`: the line ends in a dim
    ` … +N`" can pass or fail. "Check that wrapping works" cannot. What is seen must be
-   there at any terminal size: the hint line drops entries in a narrow terminal (`wrap` is
+   there at any terminal size (the help overlay folds under 97 columns, too): the hint line drops entries in a narrow terminal (`wrap` is
    the first to go, under 154 columns with the diff focused), so a step never rests on a
    hint alone.
 3. **Put a landmark at the far end of anything long.** The wrap scenario ends its long

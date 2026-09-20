@@ -16,8 +16,8 @@ binary rather than for the commit log.
   counting the characters not drawn, so whatever follows it is always at least partly
   visible.
 - Option-z on a Mac, `alt-z` elsewhere (the VS Code key), turns wrapping off and on while
-  you read. Clipped is the old behaviour,
-  with the line cut at the edge; the line you were on stays the line you are on either way.
+  you read. Clipped is the old behaviour, with the line cut at the edge; the line you were
+  on stays the line you are on either way.
   The key changes nothing on disk, so the next launch is whatever your config says.
 - `[ui] wrap` in `config.toml` chooses how lastcall opens, `true` by default. Set it to
   `false` to open clipped.
@@ -27,7 +27,8 @@ binary rather than for the commit log.
 ### Changed
 
 - `alt-z` and `Ω` (what a Mac sends for Option-z) are now bound to the new `wrap` action,
-  which has no plain key: bind one with `[keys] wrap = ["..."]` if you want it. A config
+  which has no plain key: `[keys] wrap = ["..."]` gives it one (the entry replaces the
+  defaults, so name every key you want). A config
   that already binds one of them to something else no longer loads, with an error naming
   the key and both actions; give the other action a different key, or move `wrap`.
 - In a `[keys]` entry only ASCII letters ignore case now. A character outside ASCII is the

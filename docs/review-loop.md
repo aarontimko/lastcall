@@ -104,8 +104,7 @@ does what the braces do, in terminals that send it (see [`config.md`](config.md)
 
 `t` hides repositories with nothing pending, `f` shows full paths instead of basenames,
 `o` shows `org/repo` instead of the directory name, Option-z (`alt-z` off a Mac) wraps or
-clips long diff lines,
-`?` lists every key, live, including anything you have rebound.
+clips long diff lines, `?` lists every key, live, including anything you have rebound.
 
 `s` sets one repository aside: it asks for a number of days, one by default and 365 at the
 most, and then drops it out of the list until that many days have gone by. It is a view and

@@ -1107,10 +1107,12 @@ pub struct App {
     /// line asks the reader to accept text they have not read. Session state like
     /// [`App::hide_empty`]: the key flips it for this run and nothing is written to disk.
     pub wrap: bool,
-    /// Whether the keyboard in front of the reader is a Mac's, which decides one thing: the
-    /// hint line names the wrap key as `Opt-z` there and as `Alt-z` anywhere else, so
-    /// nobody is shown a key their keyboard does not have. The loop sets it from the build
-    /// target; `false` everywhere else, so a frame in a test is the same on every machine.
+    /// Whether this is a Mac build, the nearest thing the binary knows to "the keyboard in
+    /// front of the reader is a Mac's". It decides one thing: the hint line names the wrap
+    /// key as `Opt-z` there and as `Alt-z` anywhere else. Only the label can be off (a Mac
+    /// reading a Linux box over ssh sees `Alt-z`); both keys are bound either way. The
+    /// loop sets it from the build target; `false` everywhere else, so a frame in a test
+    /// is the same on every machine.
     pub mac_keys: bool,
     /// The diff body's size as the **last frame drew it** (columns, rows), copied out of
     /// `HitMap::diff_body` by [`crate::tui::run::Ui::rendered`] beside `nav_top`.

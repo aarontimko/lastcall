@@ -12,7 +12,8 @@ setup as code, plus the numbered steps to follow and what each should show.
                                    build the sandbox and print the steps and the launch
                                    line, open nothing (what an agent or a test runs)
     tryout.py <scenario> --in=demo open lastcall from inside `parent/demo` (any path under
-                                   `parent/`) and not from `parent/` itself
+                                   `parent/`) with no `parent_dirs` in the config, so that
+                                   directory is what it watches
 
 `just tryout <scenario>` builds the release binary first and then runs this.
 
@@ -208,8 +209,8 @@ def scenario_wrap(sandbox):
         "The toggle. Press Option-z on a Mac (Alt-z elsewhere): lines clip at the edge and "
         "the ends are gone. Press it again: they are back. A plain `c` does nothing. In a "
         "terminal 154 columns wide or more the hint line also names the key, `Opt-z clip` "
-        "while wrapping and `Opt-z wrap` while clipped (`Alt-z` off a Mac); `?` lists it at "
-        "any width.",
+        "while wrapping and `Opt-z wrap` while clipped (`Alt-z` off a Mac); `?` lists it in a "
+        "terminal 97 columns wide or more.",
         "The cap. Open `min.js`: the long line stops a few rows short of the pane's bottom "
         "and ends in a dim ` … +N`. Press `v` then `y` and paste somewhere: the whole "
         "line arrives, END-OF-MINIFIED included.",
@@ -247,8 +248,14 @@ def build(name, launch_in=None):
     sandbox = Sandbox(name)
     steps = SCENARIOS[name](sandbox)
     if launch_in is not None:
+        # With `parent_dirs` naming parent/, opening from inside it changes nothing: the
+        # launch directory decides what is watched only when the config names none.
         sandbox.launch_in = launch_in
-    launch_dir = sandbox.launch_dir()
+        sandbox.name_parent = False
+    try:
+        launch_dir = sandbox.launch_dir()
+    except ValueError as err:
+        raise ValueError("%s (built so far: %s)" % (err, sandbox.base))
     sandbox.write_config()
 
     text = ["# lastcall tryout: %s" % name, "", first_line(SCENARIOS[name].__doc__), ""]
@@ -299,7 +306,7 @@ def main(argv):
     run = os.path.join(sandbox.base, "run.py")
     print(steps)
     print("sandbox: %s" % sandbox.base)
-    print("opens in: %s" % sandbox.launch_dir())
+    print("opens in: %s" % os.path.join(sandbox.parent, sandbox.launch_in).rstrip(os.sep))
     print("steps:   %s" % os.path.join(sandbox.base, "STEPS.md"))
     print("reopen:  python3 '%s'" % run)
     if "--no-launch" in flags:

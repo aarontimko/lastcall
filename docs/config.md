@@ -153,7 +153,7 @@ bound to Option and an arrow: iTerm2 and herdr panes send that as
 escape prefix can deliver Option-Up as three separate keys, and the third of them is `A`.
 Use `{` and `}` there; they are bound to the same two actions and work everywhere.
 
-`wrap` is the one action with no plain key: Option-z (`alt-z`) is the wrap key in VS Code
+`wrap` has no plain key by default: Option-z (`alt-z`) is the wrap key in VS Code
 and the editors built on it, wrapping is on by default, and the letters still unbound are
 kept for actions to come. A Mac terminal as it is set up out of the box does not send
 Option as Alt; it sends the character the keyboard makes, and for Option-z on a US layout
@@ -175,7 +175,7 @@ defaults. Each error names the offending entry.
 
 | key | default | what it does |
 |---|---|---|
-| `wrap` | `true` | what the wrap toggle (Option-z, `alt-z`) starts as. `true` wraps a diff line too long for the pane onto as many rows as it needs, breaking at a space where there is one. `false` opens clipping it at the pane's edge, the way versions before 0.5.0 did. `c` (or `alt-z`) flips it for the session, and nothing is written back. |
+| `wrap` | `true` | what the wrap toggle (Option-z, `alt-z`) starts as. `true` wraps a diff line too long for the pane onto as many rows as it needs, breaking at a space where there is one. `false` opens clipping it at the pane's edge, the way versions before 0.5.0 did. Option-z (`alt-z` off a Mac) flips it for the session, and nothing is written back. |
 
 ```toml
 [ui]

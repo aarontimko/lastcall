@@ -3731,6 +3731,31 @@ mod tests {
         !key.is_empty() && rendered.starts_with(&format!("{key} "))
     }
 
+    /// The wrap hint names a key the keyboard has, whatever `[keys] wrap` holds: `Ω` only
+    /// on a Mac, unless it is all there is, and nothing at all for an action with no key.
+    #[test]
+    fn render_wrap_hint_names_the_key_this_keyboard_has() {
+        let with = |specs: &[&str], mac: bool| {
+            let mut app = three_roots();
+            app.mac_keys = mac;
+            for (name, keys) in &mut app.keymap {
+                if name == "wrap" {
+                    *keys = specs.iter().map(|s| (*s).to_owned()).collect();
+                }
+            }
+            wrap_hint_key(&app)
+        };
+        let some = |s: &str| Some(s.to_owned());
+        assert_eq!(with(&["Ω", "alt-z"], false), some("Alt-z"));
+        assert_eq!(with(&["Ω", "alt-z"], true), some("Opt-z"));
+        assert_eq!(with(&["alt-z", "Ω"], true), some("Alt-z"), "their order");
+        assert_eq!(with(&["Ω"], false), some("Opt-z"), "all there is");
+        assert_eq!(with(&["x", "Ω"], true), some("x"));
+        assert_eq!(with(&["Ω", "x"], false), some("x"));
+        assert_eq!(with(&[], false), None);
+        assert_eq!(with(&[], true), None);
+    }
+
     /// Ruling R4's own sentence: `? help  q quit` are always the last two hints on the
     /// line, so a cut line still says where the rest of the keys are. Every width from
     /// `MIN_SIZE`'s 40 to 70 — the widths D1's constants would have left with a line that

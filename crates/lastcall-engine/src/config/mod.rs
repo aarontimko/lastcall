@@ -221,7 +221,7 @@ pub struct UiConfig {
     /// Visual word wrap in the diff pane. Default `true`: a review tool that clips the end
     /// of a line asks the reader to accept text they have not read. Engine-side only as a
     /// value the binary reads; nothing here changes what a scan or `status` reports, and
-    /// the TUI's own toggle (`c`, Option-z, `alt-z`) is for the session only and writes nothing.
+    /// the TUI's own toggle (Option-z, `alt-z`) is for the session only and writes nothing.
     pub wrap: bool,
 }
 
