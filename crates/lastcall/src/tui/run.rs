@@ -1586,7 +1586,7 @@ pub struct Launch {
     /// answer to `t`. The key flips it for the session; nothing writes it back.
     pub hide_empty: bool,
     /// `[ui] wrap` from the config file (Amendment v1.14): the app's opening answer to
-    /// `c` / `Ω` / `alt-z`. The key flips it for the session; nothing writes it back.
+    /// Option-z (`Ω`, or `alt-z`). The key flips it for the session; nothing writes it back.
     pub wrap: bool,
     /// The once-a-day update check, or `None` when `[update] check = false`. Started on a
     /// detached thread the moment the launch hold ends, never before the first frame and
@@ -1634,6 +1634,7 @@ pub fn run(
     let mut guard = term::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut ui = opening_ui(keymap, hide_empty, wrap);
+    ui.app.mac_keys = cfg!(target_os = "macos");
     // Asked once, inside `enter`, before the input thread exists; the app reads the cached
     // answer so the note modal promises `⇧⏎` only where it works (ruling P9).
     ui.app.enhanced = term::keyboard_enhanced();
@@ -3350,7 +3351,13 @@ mod tests {
         let mut ui = wrapping_ui(&["a"]);
         ui.app.wrap = opening_ui(Keymap::default(), false, false).app.wrap;
         assert!(!ui.app.wrap);
-        assert_eq!(ui.event(&key(KeyCode::Char('c'))), (Changed::Yes, None));
-        assert!(ui.app.wrap, "`c` flips it for the session");
+        assert_eq!(
+            ui.event(&Event::Key(KeyEvent::new(
+                KeyCode::Char('z'),
+                KeyModifiers::ALT
+            ))),
+            (Changed::Yes, None)
+        );
+        assert!(ui.app.wrap, "`alt-z` flips it for the session");
     }
 }

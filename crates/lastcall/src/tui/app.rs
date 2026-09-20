@@ -1102,11 +1102,16 @@ pub struct App {
     /// nothing pending as a name-and-branch row. While `true` those rows go, except a repo
     /// whose agent wants attention. Independent of the herdr scope (`w`).
     pub hide_empty: bool,
-    /// `c` / `Ω` / `alt-z` (Phase 13, Amendment v1.14): visual word wrap in the diff pane. Seeded
+    /// `Ω` / `alt-z` (Phase 13, Amendment v1.14): visual word wrap in the diff pane. Seeded
     /// from `[ui] wrap`, whose default is `true` — a review tool that clips the end of a
     /// line asks the reader to accept text they have not read. Session state like
     /// [`App::hide_empty`]: the key flips it for this run and nothing is written to disk.
     pub wrap: bool,
+    /// Whether the keyboard in front of the reader is a Mac's, which decides one thing: the
+    /// hint line names the wrap key as `Opt-z` there and as `Alt-z` anywhere else, so
+    /// nobody is shown a key their keyboard does not have. The loop sets it from the build
+    /// target; `false` everywhere else, so a frame in a test is the same on every machine.
+    pub mac_keys: bool,
     /// The diff body's size as the **last frame drew it** (columns, rows), copied out of
     /// `HitMap::diff_body` by [`crate::tui::run::Ui::rendered`] beside `nav_top`.
     ///
@@ -1258,6 +1263,7 @@ impl App {
             show_remote: false,
             hide_empty: false,
             wrap: true,
+            mac_keys: false,
             diff_size: None,
             diff_short: 0,
             show_snoozed: false,

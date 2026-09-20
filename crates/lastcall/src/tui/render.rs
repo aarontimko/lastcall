@@ -729,12 +729,15 @@ pub fn hints(app: &App, width: u16) -> String {
         .is_some()
         .then(|| first("scope").map(|k| format!("{k} scope")))
         .flatten();
-    // Phase 13 (Amendment v1.14): `c clip` while the pane is wrapping, `c wrap` while it
-    // is clipping. Offered only where the pane has hunks, because with none there is
-    // nothing to wrap and the key would flip a setting the reader cannot see.
+    // Phase 13 (Amendment v1.14): `Alt-z clip` while the pane is wrapping, `Alt-z wrap`
+    // while it is clipping. Offered only where the pane has hunks, because with none there
+    // is nothing to wrap and the key would flip a setting the reader cannot see. The key
+    // is the one this keyboard has: `Ω` is what only a Mac sends, so anywhere else the
+    // line names the first binding that is not it.
+    let wrap_key = wrap_hint_key(app);
     let wrap_hint = (!app.view_hunks().is_empty())
         .then(|| {
-            first("wrap").map(|k| {
+            wrap_key.map(|k| {
                 let verb = if app.wrap { "clip" } else { "wrap" };
                 format!("{k} {verb}")
             })
@@ -866,10 +869,31 @@ pub fn hints(app: &App, width: u16) -> String {
 
 /// `key_label` with control keys as `^X`, the hint line's compact spelling.
 fn hint_label(spec: &str) -> String {
+    // The hint line is short of room, so Option-z goes without the character the help
+    // overlay puts beside it.
+    if spec == OPTION_Z {
+        return "Opt-z".to_owned();
+    }
     match spec.strip_prefix("ctrl-") {
         Some(rest) => format!("^{}", rest.to_uppercase()),
         None => key_label(spec),
     }
+}
+
+/// What a Mac sends for Option-z when its terminal does not make Option an Alt.
+const OPTION_Z: &str = "Ω";
+
+/// The wrap key as the hint line names it: the first binding this keyboard has. `Ω` is
+/// what only a Mac sends, so anywhere else the first binding that is not it.
+fn wrap_hint_key(app: &App) -> Option<String> {
+    let specs = app.keys_for("wrap");
+    let other = specs.iter().find(|s| s.as_str() != OPTION_Z);
+    let pick = if app.mac_keys {
+        specs.first()
+    } else {
+        other.or(specs.first())
+    };
+    pick.map(|s| hint_label(s))
 }
 
 // ---- nav ---------------------------------------------------------------------------------
@@ -1987,7 +2011,7 @@ pub(super) fn key_label(spec: &str) -> String {
         s if s.starts_with("alt-") => format!("Alt-{}", key_label(&s[4..])),
         // What a Mac sends for Option-z when the terminal does not make Option an Alt. The
         // reader is looking for the key they press, so the character is the footnote.
-        "Ω" => "Opt-z (Ω)".into(),
+        OPTION_Z => "Opt-z (Ω)".into(),
         s => s.to_owned(),
     }
 }
@@ -3398,28 +3422,37 @@ mod tests {
             nav_line,
             "↑↓ select  ⏎ open  n/p hunk  a accept hunk  A accept file  ^A accept all  t hide empty  Tab focus  r refresh  ? help  q quit"
         );
-        // Phase 13: with eight more columns the line also says what `c` will do, and the
-        // verb follows the state. `wrap` is **first** in `HINT_DROP_ORDER`, so it is the
+        // Phase 13: with twelve more columns the line also says what the wrap key will do,
+        // and the verb follows the state. `wrap` is **first** in `HINT_DROP_ORDER`, so it is the
         // first hint off the line and every width below this one reads exactly as it did
         // before the phase (design review F25) — which is what the rest of this test,
         // unchanged from Phase 12, pins.
         assert_eq!(
-            hints(&app, 132),
-            "↑↓ select  ⏎ open  n/p hunk  a accept hunk  A accept file  ^A accept all  t hide empty  Tab focus  r refresh  c clip  ? help  q quit"
+            hints(&app, 136),
+            "↑↓ select  ⏎ open  n/p hunk  a accept hunk  A accept file  ^A accept all  t hide empty  Tab focus  r refresh  Alt-z clip  ? help  q quit"
         );
         assert_eq!(
             hints(&app, 200),
-            hints(&app, 132),
-            "132 is the whole nav line"
+            hints(&app, 136),
+            "136 is the whole nav line"
         );
-        assert_eq!(hints(&app, 131), nav_line, "the wrap hint goes first");
+        assert_eq!(hints(&app, 135), nav_line, "the wrap hint goes first");
         app.handle(Action::ToggleWrap);
         assert!(
-            hints(&app, 132).contains("c wrap"),
+            hints(&app, 136).contains("Alt-z wrap"),
             "the verb follows the state: {}",
-            hints(&app, 132)
+            hints(&app, 136)
         );
         app.handle(Action::ToggleWrap);
+        // The key named is the one the keyboard has: on a Mac that is Option-z, without
+        // the character the help overlay shows beside it, and the line is no wider.
+        app.mac_keys = true;
+        assert!(
+            hints(&app, 136).contains("  Opt-z clip  "),
+            "{}",
+            hints(&app, 136)
+        );
+        app.mac_keys = false;
         // Ruling R4: one hint at a time, from the right end of `HINT_DROP_ORDER` — so a
         // column short of the whole line the nav keeps everything but `r refresh`.
         assert_eq!(
@@ -3450,13 +3483,13 @@ mod tests {
             "↑↓ scroll  ← back  n/p hunk  a accept hunk  A accept file  ^A accept all  t hide empty  Tab focus  r refresh  v select  y copy  ? help  q quit"
         );
         assert_eq!(
-            hints(&app, 150),
+            hints(&app, 154),
             hints(&app, 200),
-            "150 is the whole line once the wrap hint is on it"
+            "154 is the whole line once the wrap hint is on it"
         );
         assert_eq!(
             hints(&app, 142),
-            hints(&app, 149),
+            hints(&app, 153),
             "and it is the first off it"
         );
         assert_eq!(
@@ -3688,6 +3721,7 @@ mod tests {
     fn hint_is(rendered: &str, action: &str, app: &App) -> bool {
         let key = match action {
             "hunk_next" => "n/p".to_owned(),
+            "wrap" => wrap_hint_key(app).unwrap_or_default(),
             other => app
                 .keys_for(other)
                 .first()

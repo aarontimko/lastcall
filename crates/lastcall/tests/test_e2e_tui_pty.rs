@@ -5202,8 +5202,8 @@ fn tui_tour_quit_writes_marker() {
 
 // ---- Phase 13 deliverable A: word wrap in the diff pane -----------------------------------
 
-/// Deliverable A through the real binary: the pane wraps out of the box, `c` clips and
-/// wraps again, and `Esc z` arriving as **one write** is `alt-z`, the wrap key, rather
+/// Deliverable A through the real binary: the pane wraps out of the box, `alt-z` clips
+/// and wraps again, and `Esc z` arriving as **one write** is `alt-z`, the wrap key, rather
 /// than `Esc` followed by `z`, the undo.
 ///
 /// The fixture's middle hunk carries a line wider than the pane, so the question "did it
@@ -5236,14 +5236,17 @@ fn pty_wrap_toggles_and_alt_z_is_not_an_undo() {
         "nothing accepted in this scene"
     );
 
-    // `c` clips: the pane is the one this phase replaced, and the tail is gone.
-    pty.send(b"c").expect("c");
+    // `alt-z` clips: the pane is the one this phase replaced, and the tail is gone.
+    pty.send(b"\x1bz").expect("alt-z");
     pty.wait_for(Duration::from_secs(5), |s| !s.contents().contains(tail))
-        .unwrap_or_else(|e| panic!("`c` clips: {e}\n{}", pty.screen_text()));
+        .unwrap_or_else(|e| panic!("`alt-z` clips: {e}\n{}", pty.screen_text()));
     // And again: the toggle is a toggle.
-    pty.send(b"c").expect("c again");
+    pty.send(b"\x1bz").expect("alt-z again");
     pty.wait_for(Duration::from_secs(5), |s| s.contents().contains(tail))
-        .unwrap_or_else(|e| panic!("`c` wraps again: {e}\n{}", pty.screen_text()));
+        .unwrap_or_else(|e| panic!("`alt-z` wraps again: {e}\n{}", pty.screen_text()));
+    // A plain `c` is nobody's key (the sponsor kept the letters for actions still to come):
+    // had it clipped, the wait after the accept below would never see the tail.
+    pty.send(b"c").expect("c");
 
     // Something for an undo to take (code verification F8: on an empty stack "the depth
     // did not change" holds whether or not the `z` was read as an undo). Hunk 1 is

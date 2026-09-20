@@ -74,7 +74,7 @@ pub enum Action {
     /// scope (the default) or drops the ones with nothing pending and no agent flag
     /// (§6.7, Amendment v1.9 item 4).
     HideEmpty,
-    /// `c` / Option-z (`Ω` or `alt-z`): flip [`crate::tui::app::App::wrap`] — the diff pane either wraps a
+    /// Option-z (`Ω`, or `alt-z`): flip [`crate::tui::app::App::wrap`] — the diff pane either wraps a
     /// long line onto as many rows as it needs (the default) or clips it at the pane's
     /// edge as every release before this one did (Phase 13, Amendment v1.14).
     ///
@@ -516,17 +516,18 @@ pub const DEFAULT_KEYMAP: &[(&str, &[&str])] = &[
     ("expand", &["e"]),
     ("toggle_full_paths", &["f"]),
     ("toggle_remote", &["o"]),
-    // Phase 13 (Amendment v1.14). `alt-z` is the binding VS Code readers already know, and
-    // like every other Alt binding here it needs a plain twin: a terminal without "Option
-    // as Meta" sends a letter for Option-z and nothing happens, and one that splits the
-    // escape delivers `Esc` then `z`, which is `back` then `undo`. The plain key is `c`
-    // (clip or wrap) and it is **first**, because `hints` shows an action's first key and
-    // `c` is the one that works everywhere. The sponsor ruled out `shift-w`.
+    // Phase 13 (Amendment v1.14). `alt-z` is the binding VS Code readers already know.
     // `Ω` is Option-z itself on a Mac whose terminal does not send Option as Alt, which is
     // how a Mac terminal is set up out of the box (the sponsor's run, both in a herdr pane
     // and outside one): the VS Code key should work there without a settings change. The
-    // help overlay spells it `Opt-z (Ω)`.
-    ("wrap", &["c", "Ω", "alt-z"]),
+    // help overlay spells it `Opt-z (Ω)`, and the hint line names whichever of the two the
+    // machine's keyboard has (`App::mac_keys`).
+    // There is no plain key, by the sponsor's ruling: wrap is on by default and rarely
+    // toggled, and the unbound letters are worth more to actions still to come. It first
+    // shipped to the sponsor with `c` as a plain twin, for the keyboards whose Option-z is
+    // another character and the links slow enough to split `Esc z`; those readers bind a
+    // key of their own with `[keys] wrap`. The sponsor had already ruled out `shift-w`.
+    ("wrap", &["Ω", "alt-z"]),
     ("snooze", &["s"]),
     ("show_snoozed", &["shift-s"]),
     ("help", &["?"]),
@@ -628,8 +629,8 @@ impl Action {
             "toggle_remote" => "show org/repo",
             // 23 columns: the overlay caps a description at 30 (design review F15).
             "hide_empty" => "hide / show empty repos",
-            // 15 columns, inside the overlay's 30-column cap. Its three keys (`c / Opt-z (Ω)
-            // / Alt-z`, 21 columns) run past the 14-column key field, which pads and never
+            // 15 columns, inside the overlay's 30-column cap. Its two keys (`Opt-z (Ω) /
+            // Alt-z`, 17 columns) run past the 14-column key field, which pads and never
             // cuts: the row is still inside the overlay's column. It says what the key is
             // for, not what the key does right now: the hint line is where the state is told.
             "wrap" => "wrap long lines",
@@ -1285,7 +1286,11 @@ mod tests {
             "{described:?} would cost the overlay its second column"
         );
         let km = Keymap::defaults();
-        assert_eq!(to_action(&key('c'), &km), Some(Action::ToggleWrap));
+        assert_eq!(
+            to_action(&key('c'), &km),
+            None,
+            "no plain key: the sponsor kept the letters for actions still to come"
+        );
         assert_eq!(
             to_action(&key_code(KeyCode::Char('z'), KeyModifiers::ALT), &km),
             Some(Action::ToggleWrap),
@@ -1312,7 +1317,14 @@ mod tests {
 
         let km = Keymap::from_config(&keys(&[("wrap", &["x"])])).unwrap();
         assert_eq!(to_action(&key('x'), &km), Some(Action::ToggleWrap));
-        assert_eq!(to_action(&key('c'), &km), None, "both defaults replaced");
+        assert_eq!(
+            to_action(
+                &key_code(KeyCode::Char('\u{03A9}'), KeyModifiers::SHIFT),
+                &km
+            ),
+            None,
+            "both defaults replaced"
+        );
         assert_eq!(
             to_action(&key_code(KeyCode::Char('z'), KeyModifiers::ALT), &km),
             None
@@ -1325,29 +1337,32 @@ mod tests {
             "and the overlay shows the new key"
         );
 
-        // `c` taken by a second action is a `Duplicate` that names both.
-        let err = Keymap::from_config(&keys(&[("copy", &["c"])])).unwrap_err();
+        // `alt-z` taken by a second action is a `Duplicate` that names both.
+        let err = Keymap::from_config(&keys(&[("copy", &["alt-z"])])).unwrap_err();
         assert_eq!(
             err,
             KeymapError::Duplicate {
-                spec: "c".into(),
+                spec: "alt-z".into(),
                 first: "copy".into(),
                 second: "wrap".into()
             }
         );
         assert!(err.to_string().contains("copy") && err.to_string().contains("wrap"));
-        // Moving `wrap` out of the way first is how the reader keeps `c` for copy.
-        let km = Keymap::from_config(&keys(&[("copy", &["c"]), ("wrap", &["y"])])).unwrap();
-        assert_eq!(to_action(&key('c'), &km), Some(Action::Copy));
-        assert_eq!(to_action(&key('y'), &km), Some(Action::ToggleWrap));
+        // Moving `wrap` out of the way first is how the reader keeps `alt-z` for copy, and
+        // a plain key of their own is the same entry.
+        let km = Keymap::from_config(&keys(&[("copy", &["alt-z"]), ("wrap", &["c"])])).unwrap();
+        assert_eq!(
+            to_action(&key_code(KeyCode::Char('z'), KeyModifiers::ALT), &km),
+            Some(Action::Copy)
+        );
+        assert_eq!(to_action(&key('c'), &km), Some(Action::ToggleWrap));
     }
 
     #[test]
     fn input_override_replaces_defaults_rather_than_appending() {
-        // `,`, not `v`, `z` or `c`: `v` is `select`'s default since deliverable 9, `z` is
-        // `undo`'s since Amendment v1.11 and `c` is `wrap`'s since Amendment v1.14, and
-        // binding any of them to a second action is the `Duplicate` this test is not
-        // about (the one that binds `c` on purpose is below).
+        // `,`, not `v` or `z`: `v` is `select`'s default since deliverable 9 and `z` is
+        // `undo`'s since Amendment v1.11, and binding either to a second action is the
+        // `Duplicate` this test is not about.
         let km = Keymap::from_config(&keys(&[("quit", &["x"]), ("scroll_up", &[","])])).unwrap();
         assert_eq!(to_action(&key('x'), &km), Some(Action::Quit));
         assert_eq!(to_action(&key('q'), &km), None, "q no longer quits");

@@ -1037,7 +1037,7 @@ stored wrong.
 wrapped `+` line does not read as several added lines; the text keeps its full colour, and
 the first row is built exactly as an unwrapped line is.
 
-**The toggle** is `Action::ToggleWrap`, action name `wrap`, keys `c`, `Ω` and `alt-z` (`Ω` is what a Mac sends for Option-z when
+**The toggle** is `Action::ToggleWrap`, action name `wrap`, keys `Ω` and `alt-z`, no plain key by the sponsor's ruling (the hint line names `Opt-z` where `App.mac_keys` is set and `Alt-z` elsewhere; `Ω` is what a Mac sends for Option-z when
 the terminal does not make Option an Alt; `key_label` shows it as `Opt-z (Ω)`, and
 `Key::parse` folds case for ASCII only so that it is not read as `ω`), opening
 value `[ui] wrap` through `Launch`. It flips `App.wrap`, keeps `diff.scroll`, and writes
@@ -1059,7 +1059,7 @@ Defaults (`input::DEFAULT_KEYMAP`, in help-overlay order):
 | `hunk_next` / `hunk_prev` | `n` `]` / `p` `[` | next / previous hunk (the current hunk's header is a full-width inverted band) | |
 | `toggle_full_paths` | `f` | root-relative paths instead of basenames | |
 | `toggle_remote` | `o` | show each repo's `org/repo` slug | |
-| `wrap` | `c` `Ω` `alt-z` | | wrap a line too long for the pane onto as many rows as it needs, or clip it at the pane's edge; opening value `[ui] wrap`, default `true` ("Word wrap in the diff pane" above) |
+| `wrap` | `Ω` `alt-z` | | wrap a line too long for the pane onto as many rows as it needs, or clip it at the pane's edge; opening value `[ui] wrap`, default `true` ("Word wrap in the diff pane" above) |
 | `hide_empty` | `t` | hide / show repos with nothing pending (§6.7 Amendment v1.9); default from `hide_empty_repos`, and independent of the `w` scope | |
 | `snooze` | `s` | on a repo row: open the snooze modal (a day count), or wake a repo that is already snoozed ("The snooze modal" below); on any other row a notice, not a modal | |
 | `show_snoozed` | `shift-s` | list the snoozed repos too, each with `snoozed until <date>` on its branch line | |

@@ -2403,7 +2403,7 @@ fn tui_wrap_long_lines() {
     snapshot("tui_wrap_long_lines_80x24", &narrow, 80, 24);
 }
 
-/// The toggle: `c` clips, which is the pane as it was before this phase, and it is the
+/// The toggle: the wrap key clips, which is the pane as it was before this phase, and it is the
 /// same frame `[ui] wrap = false` gives at launch.
 #[test]
 fn tui_wrap_clipped() {

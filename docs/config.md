@@ -121,7 +121,7 @@ the character the keyboard sends.
 | `expand` | `e` | expand a collapsed file into real hunks |
 | `toggle_full_paths` | `f` | full paths instead of basenames |
 | `toggle_remote` | `o` | show `org/repo` instead of the directory name |
-| `wrap` | `c`, `Ω`, `alt-z` | wrap long lines in the diff, or clip them at the pane's edge |
+| `wrap` | `Ω`, `alt-z` | wrap long lines in the diff, or clip them at the pane's edge |
 | `hide_empty` | `t` | hide or show repositories with nothing pending |
 | `snooze` | `s` | set a repository aside for a number of days |
 | `show_snoozed` | `shift-s` | show or hide the repositories that are set aside |
@@ -153,15 +153,15 @@ bound to Option and an arrow: iTerm2 and herdr panes send that as
 escape prefix can deliver Option-Up as three separate keys, and the third of them is `A`.
 Use `{` and `}` there; they are bound to the same two actions and work everywhere.
 
-`wrap` has the same shape for the same reason: Option-z (`alt-z`) is the wrap key in VS
-Code and the editors built on it, and `c` is its plain twin. A Mac terminal as it is set
-up out of the box does not send Option as Alt; it sends the character the keyboard makes,
-and for Option-z on a US layout that is `Ω`. So `Ω` is bound too, and Option-z works on a
-Mac with no settings change; the help overlay shows it as `Opt-z (Ω)`. On another layout
-Option-z is a different character: bind that one, `wrap = ["c", "alt-z", "<it>"]`. A
-character outside ASCII is taken as typed, so `Ω` and `ω` are different keys. A terminal
-that splits the escape delivers `Esc` then `z`, and `z` is undo, so use `c` there, or put
-`wrap = ["c"]` in `[keys]` and leave Option out of it.
+`wrap` is the one action with no plain key: Option-z (`alt-z`) is the wrap key in VS Code
+and the editors built on it, wrapping is on by default, and the letters still unbound are
+kept for actions to come. A Mac terminal as it is set up out of the box does not send
+Option as Alt; it sends the character the keyboard makes, and for Option-z on a US layout
+that is `Ω`. So `Ω` is bound too, and Option-z works on a Mac with no settings change; the
+help overlay shows it as `Opt-z (Ω)`. On another layout Option-z is a different character:
+bind that one, `wrap = ["alt-z", "<it>"]`. A character outside ASCII is taken as typed, so
+`Ω` and `ω` are different keys. A terminal that splits the escape delivers `Esc` then `z`,
+and `z` is undo: there, give wrap a plain key of your own, `wrap = ["c"]` in `[keys]`.
 
 The confirmation modal's own keys, `y` and `enter` to confirm, `n` and `esc` to cancel, are
 not rebindable in this version.
@@ -175,7 +175,7 @@ defaults. Each error names the offending entry.
 
 | key | default | what it does |
 |---|---|---|
-| `wrap` | `true` | what the `c` toggle starts as. `true` wraps a diff line too long for the pane onto as many rows as it needs, breaking at a space where there is one. `false` opens clipping it at the pane's edge, the way versions before 0.5.0 did. `c` (or `alt-z`) flips it for the session, and nothing is written back. |
+| `wrap` | `true` | what the wrap toggle (Option-z, `alt-z`) starts as. `true` wraps a diff line too long for the pane onto as many rows as it needs, breaking at a space where there is one. `false` opens clipping it at the pane's edge, the way versions before 0.5.0 did. `c` (or `alt-z`) flips it for the session, and nothing is written back. |
 
 ```toml
 [ui]

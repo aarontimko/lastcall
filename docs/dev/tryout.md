@@ -108,7 +108,7 @@ Rules a scenario follows:
 2. **Every step says what to do and what to see.** "Open `min.js`: the line ends in a dim
    ` … +N`" can pass or fail. "Check that wrapping works" cannot. What is seen must be
    there at any terminal size: the hint line drops entries in a narrow terminal (`wrap` is
-   the first to go, under 150 columns with the diff focused), so a step never rests on a
+   the first to go, under 154 columns with the diff focused), so a step never rests on a
    hint alone.
 3. **Put a landmark at the far end of anything long.** The wrap scenario ends its long
    lines in `THE-END-OF-THE-PROSE-LINE` and `END-OF-MINIFIED`, so "is the end visible" is

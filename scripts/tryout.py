@@ -205,10 +205,11 @@ def scenario_wrap(sandbox):
         "rows and THE-END-OF-THE-PROSE-LINE is readable; continuation rows carry a dim `+`. "
         "The Chinese and Arabic line ends in END-OF-SCRIPTS with nothing cut at the edge.",
         "Code wraps. Open `code.rs`: `// END-OF-CODE-LINE` is readable.",
-        "The toggle. Press `c`: lines clip at the edge and the ends are gone. Press `c` "
-        "again: they are back. Then Option-z on a Mac (Alt-z elsewhere): it does the same. "
-        "In a terminal 150 columns wide or more the hint line also names the key, `c clip` "
-        "while wrapping and `c wrap` while clipped; `?` lists it at any width.",
+        "The toggle. Press Option-z on a Mac (Alt-z elsewhere): lines clip at the edge and "
+        "the ends are gone. Press it again: they are back. A plain `c` does nothing. In a "
+        "terminal 154 columns wide or more the hint line also names the key, `Opt-z clip` "
+        "while wrapping and `Opt-z wrap` while clipped (`Alt-z` off a Mac); `?` lists it at "
+        "any width.",
         "The cap. Open `min.js`: the long line stops a few rows short of the pane's bottom "
         "and ends in a dim ` … +N`. Press `v` then `y` and paste somewhere: the whole "
         "line arrives, END-OF-MINIFIED included.",

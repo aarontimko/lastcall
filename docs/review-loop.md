@@ -103,7 +103,8 @@ which is quicker than walking through a long pile a line at a time. Option with 
 does what the braces do, in terminals that send it (see [`config.md`](config.md)).
 
 `t` hides repositories with nothing pending, `f` shows full paths instead of basenames,
-`o` shows `org/repo` instead of the directory name, `c` wraps or clips long diff lines,
+`o` shows `org/repo` instead of the directory name, Option-z (`alt-z` off a Mac) wraps or
+clips long diff lines,
 `?` lists every key, live, including anything you have rebound.
 
 `s` sets one repository aside: it asks for a number of days, one by default and 365 at the
@@ -150,8 +151,8 @@ Every bracketed control on the right is also a click target, and every one of th
 key. Use whichever you prefer.
 
 A line too long for the pane is wrapped onto as many rows as it needs, broken at a space
-where there is one, so the end of a long line is on the screen with the rest of it. `c`
-(or Option-z on a Mac, `alt-z` elsewhere) turns that off and back on for the session, and
+where there is one, so the end of a long line is on the screen with the rest of it.
+Option-z on a Mac, `alt-z` elsewhere, turns that off and back on for the session, and
 `[ui] wrap` in [`config.md`](config.md) decides which way it opens. A single line will not
 take the whole pane: past a few rows short of it the line stops and the last row ends in a
 dim count of what is not shown, so the lines under it stay reachable. Copying is
