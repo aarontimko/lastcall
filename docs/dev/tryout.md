@@ -15,7 +15,13 @@ TUI over the sandbox.
 just tryout list            # the scenarios, one line each
 just tryout wrap            # build, print the steps, Enter opens the TUI
 just tryout wrap --no-launch  # build and print only (an agent's shell, a quick check)
+just tryout wrap --in=demo  # open from inside the `demo` repository, not from its parent
 ```
+
+lastcall reads the directory it is opened from: from a parent directory it lists every
+repository underneath, and from inside one working tree that is the directory it was asked
+about. A run opens from the sandbox's `parent/` unless the scenario or `--in=` says
+otherwise; `--in=` takes any directory under `parent/` and refuses one that is not there.
 
 It was first built by hand for the word wrap phase's hands-on gate, and that one run found
 a real defect no test had: Option-z on a Mac terminal with stock settings arrives as the
@@ -86,6 +92,10 @@ The pieces:
   `draft_dirs` entry plus files written under it with `repo.write`. `parent_dirs` and
   `[update]` are the sandbox's own, and a table can be given once (TOML's rule): the call
   raises on either, so the mistake shows when the scenario is built and not at launch.
+- `sandbox.launch_in = "demo"` opens lastcall from inside that directory (relative to
+  `parent/`) when the thing being judged depends on where it is opened; the person's
+  `--in=` overrides it. `sandbox.name_parent = False` leaves `parent_dirs` out of the
+  config, so lastcall watches the directory it is opened from, as it does with no config.
 - `sandbox.welcome = True` leaves the first-launch welcome in place, for a scenario that is
   about the welcome.
 - The function's docstring's first line is what `just tryout list` prints.

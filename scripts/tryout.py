@@ -11,6 +11,8 @@ setup as code, plus the numbered steps to follow and what each should show.
     tryout.py <scenario> --no-launch
                                    build the sandbox and print the steps and the launch
                                    line, open nothing (what an agent or a test runs)
+    tryout.py <scenario> --in=demo open lastcall from inside `parent/demo` (any path under
+                                   `parent/`) and not from `parent/` itself
 
 `just tryout <scenario>` builds the release binary first and then runs this.
 
@@ -98,6 +100,21 @@ class Sandbox:
         # step 1 and whose choices write to the config. A scenario about the welcome itself
         # sets this to True.
         self.welcome = False
+        # Where lastcall is opened from, relative to `parent/`: "" is the parent directory
+        # (every repository under it), "demo" is inside one repository's working tree. The
+        # person's `--in=` overrides it.
+        self.launch_in = ""
+        # False leaves `parent_dirs` out of the config, so lastcall watches whatever
+        # directory it is opened from: the way it runs with no config at all.
+        self.name_parent = True
+
+    def launch_dir(self):
+        """The directory lastcall opens from; refused if it is not under `parent/`."""
+        full = os.path.realpath(os.path.join(self.parent, self.launch_in))
+        root = os.path.realpath(self.parent)
+        if not (full == root or full.startswith(root + os.sep)) or not os.path.isdir(full):
+            raise ValueError("no directory %r under the sandbox's parent/" % self.launch_in)
+        return full
 
     def repo(self, name):
         return Repo(os.path.join(self.parent, name))
@@ -123,7 +140,7 @@ class Sandbox:
     def write_config(self):
         # The daily update check is off: a hands-on run makes no network request.
         # json.dumps writes a basic string TOML reads the same way (quotes, backslashes).
-        lines = ["parent_dirs = [%s]" % json.dumps(self.parent)]
+        lines = ["parent_dirs = [%s]" % json.dumps(self.parent)] if self.name_parent else []
         lines += self.config_keys
         lines += ["", "[update]", "check = false"]
         for table in self.config_tables:
@@ -225,9 +242,12 @@ def first_line(doc):
     return (doc or "").strip().splitlines()[0]
 
 
-def build(name):
+def build(name, launch_in=None):
     sandbox = Sandbox(name)
     steps = SCENARIOS[name](sandbox)
+    if launch_in is not None:
+        sandbox.launch_in = launch_in
+    launch_dir = sandbox.launch_dir()
     sandbox.write_config()
 
     text = ["# lastcall tryout: %s" % name, "", first_line(SCENARIOS[name].__doc__), ""]
@@ -243,7 +263,7 @@ def build(name):
             "os.environ['LASTCALL_CONFIG'] = %r\n"
             "os.chdir(%r)\n"
             "os.execv(%r, ['lastcall', 'tui'])\n"
-            % (sandbox.state, sandbox.config, sandbox.parent, BINARY)
+            % (sandbox.state, sandbox.config, launch_dir, BINARY)
         )
     return sandbox, "\n".join(text)
 
@@ -256,8 +276,12 @@ def main(argv):
             print("%-12s %s" % (name, first_line(SCENARIOS[name].__doc__)))
         return 0 if args else 2
     name = args[0]
+    launch_in = None
+    for flag in [f for f in flags if f.startswith("--in=")]:
+        launch_in = flag[len("--in="):]
+        flags.remove(flag)
     if len(args) != 1 or name not in SCENARIOS or any(f not in ALLOWED_FLAGS for f in flags):
-        print("usage: tryout.py list | <scenario> [--no-launch]", file=sys.stderr)
+        print("usage: tryout.py list | <scenario> [--no-launch] [--in=<dir>]", file=sys.stderr)
         print("scenarios: " + ", ".join(sorted(SCENARIOS)), file=sys.stderr)
         return 2
     if "--check" in flags:
@@ -266,10 +290,15 @@ def main(argv):
         print("no %s: run `just tryout %s`, which builds it" % (BINARY, name), file=sys.stderr)
         return 2
 
-    sandbox, steps = build(name)
+    try:
+        sandbox, steps = build(name, launch_in)
+    except ValueError as err:
+        print("tryout: %s" % err, file=sys.stderr)
+        return 2
     run = os.path.join(sandbox.base, "run.py")
     print(steps)
     print("sandbox: %s" % sandbox.base)
+    print("opens in: %s" % sandbox.launch_dir())
     print("steps:   %s" % os.path.join(sandbox.base, "STEPS.md"))
     print("reopen:  python3 '%s'" % run)
     if "--no-launch" in flags:
