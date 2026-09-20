@@ -27,8 +27,12 @@ binary rather than for the commit log.
 ### Changed
 
 - `c`, `alt-z` and `Ω` (what a Mac sends for Option-z) are now bound to the new `wrap`
-  action. A config that already binds one of them to something else no longer loads, with an error naming the key and both actions; give
-  the other action a different key, or move `wrap` with `[keys] wrap = ["..."]`.
+  action. A config that already binds one of them to something else no longer loads, with
+  an error naming the key and both actions; give the other action a different key, or move
+  `wrap` with `[keys] wrap = ["..."]`.
+- In a `[keys]` entry only ASCII letters ignore case now. A character outside ASCII is the
+  key exactly as written, so `"Ä"` no longer means `"ä"`: write the character the keyboard
+  sends.
 - A config file with a `[ui]` table is refused by 0.4.0 and earlier, which do not know the
   table. Remove it before going back to an older binary.
 

@@ -1586,7 +1586,7 @@ pub struct Launch {
     /// answer to `t`. The key flips it for the session; nothing writes it back.
     pub hide_empty: bool,
     /// `[ui] wrap` from the config file (Amendment v1.14): the app's opening answer to
-    /// `c` / `alt-z`. The key flips it for the session; nothing writes it back.
+    /// `c` / `Ω` / `alt-z`. The key flips it for the session; nothing writes it back.
     pub wrap: bool,
     /// The once-a-day update check, or `None` when `[update] check = false`. Started on a
     /// detached thread the moment the launch hold ends, never before the first frame and

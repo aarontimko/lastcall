@@ -1102,7 +1102,7 @@ pub struct App {
     /// nothing pending as a name-and-branch row. While `true` those rows go, except a repo
     /// whose agent wants attention. Independent of the herdr scope (`w`).
     pub hide_empty: bool,
-    /// `c` / `alt-z` (Phase 13, Amendment v1.14): visual word wrap in the diff pane. Seeded
+    /// `c` / `Ω` / `alt-z` (Phase 13, Amendment v1.14): visual word wrap in the diff pane. Seeded
     /// from `[ui] wrap`, whose default is `true` — a review tool that clips the end of a
     /// line asks the reader to accept text they have not read. Session state like
     /// [`App::hide_empty`]: the key flips it for this run and nothing is written to disk.

@@ -97,7 +97,9 @@ hunk_next = ["n", "ctrl-n"]
 character or a named key: `up down left right pageup pagedown home end enter esc tab
 backtab space backspace delete f1` through `f12`. Specs are case-insensitive, so `Ctrl-C`
 and `ctrl-c` are the same thing and `K` is `k`. An upper-case letter is written `shift-k`,
-and shift with tab is `backtab`.
+and shift with tab is `backtab`. That holds for ASCII letters only: any other character is
+the key exactly as written, so `Ω` and `ω` are two different keys and each is written as
+the character the keyboard sends.
 
 **The actions**, with what they do and what they are bound to out of the box:
 

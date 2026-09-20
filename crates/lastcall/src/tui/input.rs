@@ -628,9 +628,10 @@ impl Action {
             "toggle_remote" => "show org/repo",
             // 23 columns: the overlay caps a description at 30 (design review F15).
             "hide_empty" => "hide / show empty repos",
-            // 15 columns, inside the overlay's 30-column cap, and `c / Alt-z` fits the
-            // 14-column key field. It says what the key is for, not what the key does
-            // right now: the hint line is where the state is told.
+            // 15 columns, inside the overlay's 30-column cap. Its three keys (`c / Opt-z (Ω)
+            // / Alt-z`, 21 columns) run past the 14-column key field, which pads and never
+            // cuts: the row is still inside the overlay's column. It says what the key is
+            // for, not what the key does right now: the hint line is where the state is told.
             "wrap" => "wrap long lines",
             // Amendment v1.11. Every description is capped at 30 columns by the overlay
             // (design review F15), which is why these say `this repo` and not `this
