@@ -3041,6 +3041,16 @@ pub(crate) mod tests {
         }
     }
 
+    /// Clears a test seam when it goes out of scope, so a failing assertion cannot leave
+    /// the seam armed for the next test on this thread (code verification F12).
+    struct HookGuard<F: FnMut()>(F);
+
+    impl<F: FnMut()> Drop for HookGuard<F> {
+        fn drop(&mut self) {
+            (self.0)();
+        }
+    }
+
     /// Records every seed the private index runs while it lives: the tree seeded, and
     /// whether the ledger lock was held at that moment. A second handle asking for the
     /// lock with a zero budget answers `LockBusy` only while somebody holds it, and the
@@ -3156,8 +3166,10 @@ pub(crate) mod tests {
         assert!(a.scan(&root).unwrap().row(b"f1").is_some());
 
         let paths = a.root(&root).unwrap().paths.clone();
+        let stale_tree = ledger_tree_on_disk(&a, &root);
         let watch = SeedWatch::arm(&paths);
         let f1 = repo.path().join("f1");
+        let _seam = HookGuard(|| SCAN_ROOT_HOOK.with(|h| h.clear()));
         SCAN_ROOT_HOOK.with(|h| {
             let root_b = root.clone();
             let mut once = false;
@@ -3175,6 +3187,14 @@ pub(crate) mod tests {
         SCAN_ROOT_HOOK.with(|h| h.clear());
 
         let after = ledger_tree_on_disk(&a, &root);
+        assert_ne!(
+            after, stale_tree,
+            "the seam fired: the other engine folded under this scan"
+        );
+        assert!(
+            !watch.seeds().is_empty(),
+            "and at least one seed was watched, so the `all` below is not vacuous"
+        );
         assert!(
             pile.row(b"f1").is_some(),
             "the put-back file is pending against the ledger on disk: {:?}",
@@ -3214,6 +3234,102 @@ pub(crate) mod tests {
         )
     }
 
+    /// Code verification F1: a marker that is missing when the scan ends is a seed in
+    /// flight (another process is between its `read-tree` and its marker write), so it is
+    /// never "the same marker as before", even when the scan's first look at the marker's
+    /// identity also found nothing. The first look finds nothing here because the seam
+    /// puts the marker back between the identity read and the content read.
+    #[test]
+    fn engine_a_marker_missing_at_both_ends_of_a_scan_is_not_an_unchanged_marker() {
+        let repo = FixtureRepo::new("eng-none-none").unwrap();
+        let state = TempDir::new("lc-eng-none-none");
+        let mut a = open_engine(&repo, &state, Config::default());
+        let root = only_root(&a);
+        std::fs::write(repo.path().join("new.txt"), "added\n").unwrap();
+        assert!(a.scan(&root).unwrap().row(b"new.txt").is_some());
+        let paths = a.root(&root).unwrap().paths.clone();
+        let text = std::fs::read(&paths.index_tree).unwrap();
+
+        // Absent at the identity read, present and fresh at the content read.
+        std::fs::remove_file(&paths.index_tree).unwrap();
+        let _ensure = HookGuard(|| crate::index::ENSURE_HOOK.with(|h| h.clear()));
+        crate::index::ENSURE_HOOK.with(|h| {
+            let (p, text) = (paths.index_tree.clone(), text.clone());
+            let mut once = false;
+            h.set(move |()| {
+                if !once {
+                    once = true;
+                    std::fs::write(&p, &text).unwrap();
+                }
+            });
+        });
+        // Absent again at the final check: another seed is between read-tree and its marker.
+        let calls = Rc::new(Cell::new(0u32));
+        let _diff = HookGuard(|| crate::scan::DIFF_FILES_HOOK.with(|h| h.clear()));
+        crate::scan::DIFF_FILES_HOOK.with(|h| {
+            let (calls, p) = (calls.clone(), paths.index_tree.clone());
+            h.set(move |()| {
+                calls.set(calls.get() + 1);
+                if calls.get() == 1 {
+                    let _ = std::fs::remove_file(&p);
+                }
+            });
+        });
+        let pile = a.scan(&root).unwrap();
+        assert_eq!(
+            calls.get(),
+            2,
+            "a marker missing at the end is a reseed in flight: the scan runs again"
+        );
+        assert!(pile.row(b"new.txt").is_some());
+    }
+
+    /// Code verification F3: a ledger on disk that cannot be parsed, under a stale marker,
+    /// is its own error with a message that is true. It is not `LedgerMoved`: a reload
+    /// cannot answer it, so the scan is not repeated, and nothing is touched (the file is
+    /// left for `open`'s rules, the index and its missing marker stay as they were).
+    #[test]
+    fn engine_an_unparsable_ledger_under_a_stale_marker_says_so_and_touches_nothing() {
+        let repo = FixtureRepo::new("eng-unparsable-stale").unwrap();
+        let state = TempDir::new("lc-eng-unparsable-stale");
+        repo.write("f1", "edited\n");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let root = only_root(&engine);
+        let paths = engine.root(&root).unwrap().paths.clone();
+        assert!(engine.scan(&root).unwrap().row(b"f1").is_some());
+        std::fs::write(&paths.ledger, b"{ not json").unwrap();
+        std::fs::remove_file(&paths.index_tree).unwrap();
+
+        let calls = Rc::new(Cell::new(0u32));
+        let _seam = HookGuard(|| SCAN_ROOT_HOOK.with(|h| h.clear()));
+        SCAN_ROOT_HOOK.with(|h| {
+            let calls = calls.clone();
+            h.set(move |()| calls.set(calls.get() + 1));
+        });
+        let err = engine.scan(&root).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                EngineError::Scan(ScanError::Index(IndexError::LedgerUnreadable(_)))
+            ),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("cannot be read"), "{err}");
+        assert_eq!(
+            calls.get(),
+            1,
+            "a reload cannot answer it: no second attempt"
+        );
+        assert_eq!(std::fs::read(&paths.ledger).unwrap(), b"{ not json");
+        assert!(engine.root(&root).unwrap().index.marker_id().is_none());
+
+        // A fresh marker needs no ledger check at all, so the root lists again as soon as
+        // the ledger is readable and one seed has run.
+        let l = engine.root(&root).unwrap().ledger.clone();
+        ledger::save(&paths, &l).unwrap();
+        assert!(engine.scan(&root).unwrap().row(b"f1").is_some());
+    }
+
     /// Phase 13 deliverable B, item 6: `LedgerMoved` loops the whole of `scan_root`, and
     /// the loop is bounded. A pane that is beaten to the ledger on every attempt gives up
     /// with the typed error, having written nothing: the ledger the other engine left, the
@@ -3233,6 +3349,7 @@ pub(crate) mod tests {
         let calls = Rc::new(Cell::new(0u32));
         let left: Rc<RefCell<Option<IndexLedgerBytes>>> = Rc::new(RefCell::new(None));
         let watch = SeedWatch::arm(&paths);
+        let _seam = HookGuard(|| SCAN_ROOT_HOOK.with(|h| h.clear()));
         SCAN_ROOT_HOOK.with(|h| {
             let calls = calls.clone();
             let left = left.clone();
@@ -3300,6 +3417,7 @@ pub(crate) mod tests {
 
         let calls = Rc::new(Cell::new(0u32));
         let watch = SeedWatch::arm(&paths);
+        let _seam = HookGuard(|| SCAN_ROOT_HOOK.with(|h| h.clear()));
         SCAN_ROOT_HOOK.with(|h| {
             let calls = calls.clone();
             let root_b = root.clone();
@@ -3354,6 +3472,7 @@ pub(crate) mod tests {
         assert!(a.scan(&root).unwrap().row(b"new.txt").is_some());
 
         let calls = Rc::new(Cell::new(0u32));
+        let _seam = HookGuard(|| crate::scan::DIFF_FILES_HOOK.with(|h| h.clear()));
         crate::scan::DIFF_FILES_HOOK.with(|h| {
             let calls = calls.clone();
             let root_b = root.clone();
@@ -3403,6 +3522,7 @@ pub(crate) mod tests {
         a.scan(&root).unwrap();
 
         let calls = Rc::new(Cell::new(0u32));
+        let _seam = HookGuard(|| crate::scan::DIFF_FILES_HOOK.with(|h| h.clear()));
         crate::scan::DIFF_FILES_HOOK.with(|h| {
             let calls = calls.clone();
             let root_b = root.clone();
@@ -3663,7 +3783,10 @@ pub(crate) mod tests {
             .index
             .set_lock_budget((0, Duration::ZERO));
 
-        let held = LedgerLock::acquire_with(&paths, 0, Duration::ZERO).unwrap();
+        // The shipping budget, not zero: a git child forked by an earlier step can hold a
+        // copy of the lock's descriptor until its exec (code verification F12).
+        let held =
+            LedgerLock::acquire_with(&paths, ledger::LOCK_RETRIES, ledger::LOCK_BACKOFF).unwrap();
         assert!(
             engine.scan(&root).unwrap().row(b"f1").is_some(),
             "a fresh scan reads the marker and the index and asks for no lock"

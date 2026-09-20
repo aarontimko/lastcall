@@ -56,6 +56,12 @@ pub enum IndexError {
     /// about to seed is out of date. Nothing was touched; the caller reloads and retries.
     #[error("the ledger on disk names another seen tree; reload and scan again")]
     LedgerMoved,
+    /// The ledger on disk cannot be read or parsed, so there is nothing to check the tree
+    /// against. Nothing was touched. Unlike [`IndexError::LedgerMoved`] a reload cannot
+    /// answer this, so the scan is not repeated; opening the root again applies `open`'s
+    /// rules to the file (code verification F3).
+    #[error("the ledger on disk cannot be read ({0}); restart lastcall to repair it")]
+    LedgerUnreadable(String),
 }
 
 /// Identity of `index.tree` as a reader saw it: mtime, length and inode. Every seed writes
@@ -183,17 +189,23 @@ impl PrivateIndex {
     /// between the two makes the caller's later check disagree rather than agree.
     pub fn ensure(&self, seen_tree: Option<&Oid>) -> Result<Ensured, IndexError> {
         let marker = self.marker_id();
-        if self.is_fresh(seen_tree) {
+        #[cfg(test)]
+        ENSURE_HOOK.with(|h| h.fire(()));
+        // No identity is never fresh (code verification F1): a marker that appears between
+        // this read and the content read would otherwise hand the scan `None` to compare
+        // against, and a seed in flight at the scan's end is `None` too.
+        if marker.is_some() && self.is_fresh(seen_tree) {
             return Ok(Ensured {
                 seeded: false,
                 marker,
             });
         }
         let _lock = self.ledger_lock()?;
-        if self.is_fresh(seen_tree) {
+        let marker = self.marker_id();
+        if marker.is_some() && self.is_fresh(seen_tree) {
             return Ok(Ensured {
                 seeded: false,
-                marker: self.marker_id(),
+                marker,
             });
         }
         self.seed_checked(seen_tree)?;
@@ -215,15 +227,15 @@ impl PrivateIndex {
 
     /// The fold's seed. The caller wrote `tree` into the ledger under the very lock it
     /// passes here, so the tree is the one the disk names by construction and there is
-    /// nothing to check; taking the guard by reference is what makes that a compile-time
-    /// fact rather than a comment.
+    /// nothing to check. Taking a guard by reference means no caller can seed with no lock
+    /// at all; that it is **this** root's guard is the caller's word, not the compiler's.
     pub fn seed_committed(&self, _lock: &LedgerLock, tree: Option<&Oid>) -> Result<(), IndexError> {
         self.seed(tree)
     }
 
     /// Remove the marker, best effort. A fold whose seed failed leaves **no** marker
     /// rather than one naming a tree the index does not hold.
-    pub fn forget_marker(&self) {
+    pub(crate) fn forget_marker(&self) {
         let _ = std::fs::remove_file(&self.paths.index_tree);
     }
 
@@ -248,7 +260,8 @@ impl PrivateIndex {
         if let Some(tree) = seen_tree {
             match std::fs::read(&self.paths.ledger) {
                 Ok(bytes) => {
-                    let (disk, _) = ledger::parse(&bytes).map_err(|_| IndexError::LedgerMoved)?;
+                    let (disk, _) = ledger::parse(&bytes)
+                        .map_err(|e| IndexError::LedgerUnreadable(e.to_string()))?;
                     if disk.seen_tree.as_ref() != Some(tree) {
                         return Err(IndexError::LedgerMoved);
                     }
@@ -258,9 +271,10 @@ impl PrivateIndex {
                 // has ever been folded for this root and there is no newer tree to be
                 // stale against. (A ledger being moved aside by another process is the one
                 // other way to see this, and that process is about to open the root with
-                // nothing seen, which over-shows and reseeds again.)
+                // nothing seen, which over-shows and reseeds again.) The in-crate fixtures
+                // that seed a tree with no ledger on disk pass because of this arm.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => return Err(IndexError::LedgerMoved),
+                Err(e) => return Err(IndexError::LedgerUnreadable(e.to_string())),
             }
         }
         self.seed(seen_tree)
@@ -450,6 +464,14 @@ impl PrivateIndex {
 
 #[cfg(test)]
 thread_local! {
+    /// Between `ensure`'s read of the marker's identity and its read of the marker's
+    /// content: where another process's seed can finish (code verification F1, F5).
+    pub(crate) static ENSURE_HOOK: crate::testhook::TestHook<()> =
+        const { crate::testhook::TestHook::new() };
+}
+
+#[cfg(test)]
+thread_local! {
     /// Between `read-tree` and the marker write: the window the two-seed interleave of
     /// §11 opens (Phase 13 deliverable B). The argument is the tree being seeded.
     pub(crate) static SEED_HOOK: crate::testhook::TestHook<Option<Oid>> =
@@ -580,7 +602,7 @@ mod tests {
         std::fs::write(&paths.ledger, b"{ not json").unwrap();
         assert!(matches!(
             index.ensure(Some(&tree_y)),
-            Err(IndexError::LedgerMoved)
+            Err(IndexError::LedgerUnreadable(_))
         ));
         assert_eq!(std::fs::read(&paths.ledger).unwrap(), b"{ not json");
         assert_eq!(index.recorded_tree(), Some(None), "still the empty marker");
@@ -595,12 +617,12 @@ mod tests {
     /// seeded again. A redundant `read-tree` zeroes git's stat data and forces a
     /// whole-tree content refresh, under the lock, which is the slowness Phase 12 removed.
     ///
-    /// No sleep and no fourth seam. This thread takes the lock **before** the waiter
-    /// starts, so the waiter either reads the marker while it is still absent and then
-    /// blocks on the lock (the case under test), or reads it after the seed and takes the
-    /// fast path with no lock at all. Both interleavings have the same answer, and it is
-    /// the one asserted: the waiter seeds nothing and the marker is still the one written
-    /// here, which a reseed would have replaced by `rename` and so given a new identity.
+    /// No sleep. This thread takes the lock **before** the waiter starts and seeds only
+    /// after the waiter's seam says it has read the marker's identity and found nothing
+    /// (code verification F5: without that signal a waiter scheduled late took the fast
+    /// path and the test passed with the second look deleted). The waiter then blocks on
+    /// the lock, and its second look must decline: a reseed would have replaced the marker
+    /// by `rename` and so given it a new identity.
     #[test]
     fn index_a_marker_that_turned_fresh_while_the_scan_waited_is_not_reseeded() {
         let repo = FixtureRepo::new("idx-turned-fresh").unwrap();
@@ -612,8 +634,25 @@ mod tests {
         let (ensured, seeded) = std::thread::scope(|s| {
             let lock = LedgerLock::acquire_with(&paths, ledger::LOCK_RETRIES, ledger::LOCK_BACKOFF)
                 .unwrap();
-            let waiter = s.spawn(|| index.ensure(Some(&tree)));
-            index.seed_committed(&lock, Some(&tree)).unwrap();
+            let (looked_tx, looked_rx) = std::sync::mpsc::channel::<bool>();
+            let marker_path = paths.index_tree.clone();
+            let (index, tree) = (&index, &tree);
+            let waiter = s.spawn(move || {
+                ENSURE_HOOK.with(|h| {
+                    h.set(move |()| {
+                        let _ = looked_tx.send(!marker_path.exists());
+                    })
+                });
+                let ensured = index.ensure(Some(tree));
+                ENSURE_HOOK.with(|h| h.clear());
+                ensured
+            });
+            assert_eq!(
+                looked_rx.recv(),
+                Ok(true),
+                "the waiter looked before anything was seeded"
+            );
+            index.seed_committed(&lock, Some(tree)).unwrap();
             let seeded = index.marker_id();
             drop(lock);
             (waiter.join().unwrap().unwrap(), seeded)
@@ -627,6 +666,65 @@ mod tests {
             "and it reported the marker this thread wrote"
         );
         assert_eq!(index.marker_id(), seeded, "which is still the one on disk");
+    }
+
+    /// Code verification F6: the defect's end state, asserted on the fixed code. A second
+    /// seeder that arrives inside a committed seed's window (after `read-tree`, before the
+    /// marker write) is shut out by the lock, and afterwards the index holds the tree its
+    /// marker names: a file put back to the older tree's content is listed.
+    #[test]
+    fn index_a_second_seeder_inside_a_committed_seed_is_shut_out() {
+        let repo = FixtureRepo::new("idx-interleave-fixed").unwrap();
+        let state = TempDir::new("lc-index-interleave-fixed");
+        let (store, index_b, tree_x) = setup(&repo, &state);
+        let paths = RepoPaths::under(state.join("repo"));
+        let mut index_a = PrivateIndex::new(store.git().clone(), &paths, RootKind::Git, None);
+        index_a.set_lock_budget((0, Duration::ZERO));
+        let original = std::fs::read(repo.path().join("f1")).unwrap();
+        repo.write("f1", "put back later\nsecond line\n");
+        repo.git(&["add", "-A"]).unwrap();
+        repo.git(&["commit", "-q", "-m", "y"]).unwrap();
+        let tree_y = Oid::parse(repo.git(&["rev-parse", "HEAD^{tree}"]).unwrap().trim()).unwrap();
+        std::fs::write(repo.path().join("f1"), &original).unwrap();
+        let l = Ledger::new(
+            repo.path(),
+            RootKind::Git,
+            Some(tree_y.clone()),
+            SeenAt {
+                head_commit: None,
+                branch: None,
+                at: "2026-01-01T00:00:00Z".into(),
+            },
+        );
+        let lock = LedgerLock::acquire(&paths).unwrap();
+        ledger::save(&paths, &l).unwrap();
+        let refused = std::rc::Rc::new(std::cell::Cell::new(false));
+        SEED_HOOK.with(|h| {
+            let (tree_x, refused) = (tree_x.clone(), refused.clone());
+            h.set(move |_| {
+                refused.set(matches!(
+                    index_a.ensure(Some(&tree_x)),
+                    Err(IndexError::Ledger(LedgerError::LockBusy { .. }))
+                ));
+            })
+        });
+        let seeded = index_b.seed_committed(&lock, Some(&tree_y));
+        SEED_HOOK.with(|h| h.clear());
+        seeded.unwrap();
+        drop(lock);
+        assert!(
+            refused.get(),
+            "the seam fired and the second seeder was shut out"
+        );
+        assert_eq!(index_b.recorded_tree(), Some(Some(tree_y)));
+        index_b.refresh();
+        let pending: Vec<Vec<u8>> = index_b
+            .diff_files()
+            .unwrap()
+            .into_iter()
+            .map(|d| d.path)
+            .collect();
+        assert_eq!(pending, vec![b"f1".to_vec()]);
     }
 
     /// G6: a marker that cannot be removed aborts the seed **before** `read-tree`.

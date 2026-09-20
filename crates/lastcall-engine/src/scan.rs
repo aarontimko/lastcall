@@ -389,7 +389,10 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
     // omit a path that is pending under the reader's tree *and* under the new one. The
     // marker is replaced by rename at every seed, so its identity says whether this scan
     // read one index or two.
-    if inputs.index.marker_id() != marker {
+    // A missing marker is a seed in flight and never "the same as before", whatever the
+    // first look saw (code verification F1).
+    let marker_now = inputs.index.marker_id();
+    if marker_now.is_none() || marker_now != marker {
         if inputs.retry_on_reseed {
             return Err(ScanError::IndexMoved);
         }

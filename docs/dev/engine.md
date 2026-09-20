@@ -216,8 +216,8 @@ called that index fresh, and a file accepted into the newer tree and put back to
 content was not listed: a hide, lasting until something else reseeded. Six rules replace it.
 
 - **Two doors, and the raw `seed` is private.** `seed_committed(&LedgerLock, tree)` is the
-  fold's: it takes the guard by reference, so "the caller wrote this tree under this lock"
-  is a fact the compiler checks rather than a comment. `ensure` and `reseed` are the scan's
+  fold's: it takes the guard by reference, so no caller can seed with no lock at all (that it
+  is this root's guard is the caller's word, not the compiler's). `ensure` and `reseed` are the scan's
   two sites: they acquire the ledger lock themselves, seed, and release it before they
   return, so `scan.rs` never holds a guard and none can outlive the call into a retry.
   `PrivateIndex` keeps a `RepoPaths` and a `lock_budget` (the shipping `40 × 50 ms`, with an
@@ -226,8 +226,12 @@ content was not listed: a hide, lasting until something else reseeded. Six rules
   because another pane's fold may have seeded it while this call waited and a redundant
   `read-tree` zeroes git's stat data and costs a whole-tree content refresh. Then
   `ledger.json` is read with `std::fs::read` plus `ledger::parse`, never `ledger::load`,
-  which moves an unparsable file aside. A disagreement, a read failure or a parse failure is
-  `IndexError::LedgerMoved` with nothing touched. The comparison is the **tree** and never
+  which moves an unparsable file aside. A disagreement is `IndexError::LedgerMoved` and a
+  read or parse failure is `IndexError::LedgerUnreadable`, both with nothing touched. An
+  **absent** `ledger.json` lets the seed go ahead: every writer of a seen tree saves the
+  ledger under this same lock before it seeds, so an absent file means there is no newer
+  tree to be stale against (the in-crate fixtures that seed with no ledger on disk rely on
+  this). The comparison is the **tree** and never
   the stamp: a flag, a snooze and a plain accept all move the stamp without moving the tree,
   and `reload_ledger_if_changed` now stores the stamp only after a successful read and parse
   for the same reason. An empty index (`None`) is always allowed, because it over-shows.
@@ -238,13 +242,22 @@ content was not listed: a hide, lasting until something else reseeded. Six rules
   file's identity as it read it (mtime, length and inode; every seed replaces the file by
   `rename`), and the scan stats it again after `others`. A different or missing identity
   means the index was reseeded while this scan read it, and the scan returns
-  `ScanError::IndexMoved`. Identity and not content, because a later fold can return to an
-  earlier tree. Without it, a reseed between `diff_files` and `others` can omit a path that
+  `ScanError::IndexMoved`. Missing is never "the same as before": `ensure` does not call a
+  marker fresh unless it read an identity for it, and a marker missing at the end is a seed
+  in flight whatever the first look saw. Identity and not content, because a later fold can
+  return to an earlier tree. A known limit, accepted: on a filesystem that reuses inode
+  numbers at once and stamps mtime coarsely, two seeds inside one clock tick could give the
+  same identity (the length never changes); closing that needs a marker format an older
+  binary cannot read. Without it, a reseed between `diff_files` and `others` can omit a path that
   is pending under both trees, and a one-shot `lastcall status` has no next scan to correct
   it.
 - **Both loop `scan_root`, bound 2** (reload, `sync_branch`, `trim`, scan). On exhaustion
   `LedgerMoved` is returned as the error; `IndexMoved` is not an error at all, it returns
   the last pile with a notice, so nothing new reaches an accept or `lastcall status`.
+  `LedgerUnreadable` is not repeated, because a reload cannot answer it. A busy ledger lock
+  on the stale path is `LedgerError::LockBusy` wrapped as a scan error, so the pane shows it
+  as a failed scan and not as the accept path's `ledger busy` line; both failed scans are
+  members of the scan-failure behaviours the spec's §11 records.
 - **The fold seeds before it drops the lock, best effort.** The accept is committed by then,
   so a seed that fails removes the marker instead and `Ops::fold` still returns `Ok`: an
   index with no marker is reseeded by the next scan, while an index under a marker naming a
@@ -603,6 +616,7 @@ Every rung shows *more* than the truth, never less, and says why in a notice:
 | override blob missing (E3) or override unparsable (E2) | that path resolves to the seen-tree entry |
 | `index` / `index.tree` missing, mismatched, or unreadable (empty, garbage, truncated) | reseeded from the seen tree, under the ledger lock; the pile is identical |
 | the ledger on disk names a seen tree other than the one a scan is about to seed (another process folded first) | nothing is touched; the whole scan runs again against the ledger the disk has, and only a second disagreement reaches the caller, as `LedgerMoved` |
+| `ledger.json` unreadable or unparsable while the marker is stale or missing (this rung fails the scan rather than over-showing) | nothing is touched; the scan fails with `LedgerUnreadable`, which says to restart; the next open applies `open`'s rules to the file. A fresh marker needs no ledger read, so such a root keeps listing |
 | the private index reseeded by another process between a scan's two reads of it | the whole scan runs again; a second reseed is not an error, the pile comes back with the notice `the private index was reseeded while this root was scanned; the list is refreshed by the next scan` |
 | the fold's seed fails (git's `index.lock` held, a full disk) | the accept stands: the fold removes the marker rather than leave one naming a tree the index does not hold, and the next scan reseeds |
 | `index.lock` held by another process | scan runs unrefreshed |
