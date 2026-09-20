@@ -5210,8 +5210,8 @@ fn tui_tour_quit_writes_marker() {
 /// wrap" is answered by whether the end of that line is on the screen at all — the same
 /// thing a reader is asking. The undo half is not a detail: `alt-z` is delivered by a
 /// terminal as `Esc z`, and a loop that took the two bytes apart would accept the `z` as
-/// an undo of whatever the cursor is on. The status line is the witness, because `z` here
-/// would have to say it had nothing to undo.
+/// an undo of whatever was accepted last. The scene accepts a hunk first, so the ledger's
+/// undo depth is the witness: one before the bytes, one after.
 #[test]
 fn pty_wrap_toggles_and_alt_z_is_not_an_undo() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -5245,16 +5245,38 @@ fn pty_wrap_toggles_and_alt_z_is_not_an_undo() {
     pty.wait_for(Duration::from_secs(5), |s| s.contents().contains(tail))
         .unwrap_or_else(|e| panic!("`c` wraps again: {e}\n{}", pty.screen_text()));
 
+    // Something for an undo to take (code verification F8: on an empty stack "the depth
+    // did not change" holds whether or not the `z` was read as an undo). Hunk 1 is
+    // accepted; the long line is in the hunk after it and stays on the screen.
+    pty.send(b"p").expect("p");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        let (_, cols) = s.size();
+        s.rows(0, cols)
+            .find(|r| r.contains("@@ -"))
+            .is_some_and(|r| header_text(&r).starts_with("@@ -1,"))
+    })
+    .unwrap_or_else(|e| panic!("`p` is back on hunk 1: {e}\n{}", pty.screen_text()));
+    pty.send(b"a").expect("a");
+    pty.wait_for(OVERLOADED, |s| {
+        s.contents().contains("accepted src/parse.rs") && s.contents().contains(tail)
+    })
+    .unwrap_or_else(|e| panic!("hunk 1 accepted: {e}\n{}", pty.screen_text()));
+    assert_eq!(undo_depth(&fx, "alpha"), 1, "one accept to undo");
+
     // `Esc z` in one write is `alt-z`.
     pty.send(b"\x1bz").expect("alt-z");
     pty.wait_for(Duration::from_secs(5), |s| !s.contents().contains(tail))
         .unwrap_or_else(|e| panic!("`alt-z` clips: {e}\n{}", pty.screen_text()));
     let text = pty.screen_text();
     assert!(
-        !text.contains("nothing to undo"),
+        !text.contains("undid accept") && !text.contains("nothing to undo"),
         "the `z` was never read as an undo:\n{text}"
     );
-    assert_eq!(undo_depth(&fx, "alpha"), 0, "and the ledger is untouched");
+    assert_eq!(
+        undo_depth(&fx, "alpha"),
+        1,
+        "and the accept is still there to undo"
+    );
 
     let since = pty.raw().len();
     pty.send(b"q").expect("q");
