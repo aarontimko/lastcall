@@ -16,7 +16,7 @@ expression: frame
 "││ a              accept the hunk under the cursor     e              expand a collapsed file    │ │"
 "││ A              accept the whole file or repo        f              full paths                 │ │"
 "││ Ctrl-A         accept everything listed             o              show org/repo              │ │"
-"││ u              restore the hunk                     c / Alt-z      wrap long lines            │ │"
+"││ u              restore the hunk                     c / Opt-z (Ω) / Alt-z wrap long lines     │ │"
 "││ U              restore the whole file               s              snooze this repo           │ │"
 "││ z              undo the last accept                 S              show / hide snoozed repos  │ │"
 "││ Home           first entry / top of diff            ?              this help                  │ │"
