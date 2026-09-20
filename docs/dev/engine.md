@@ -186,7 +186,7 @@ either per-process or deliberately shared:
 | file | per process or shared | why |
 |---|---|---|
 | `index.<pid>.tmp` | per process | two concurrent scans would `read-tree` into the same file; a fold owns it for the fold's length |
-| `index`, `index.tree` | shared | a cache of the seen tree, and git itself serialises writes to it through `index.lock` |
+| `index`, `index.tree` | shared | a cache of the seen tree, and git itself serialises writes to it through `index.lock`; **seeded** only under the ledger lock, and only from the tree the ledger on disk names (Phase 13, below) |
 | `ledger.json` | shared | `lock` serialises writes, and every write reloads the on-disk ledger under it and replays the in-memory change |
 
 The temp index is `paths::temp_index_name(pid)` = `index.<pid>.tmp`, a sibling of `store/` in
@@ -207,6 +207,65 @@ without refresh` (over-report at worst, which is the fail-open direction).
 `engine_two_engines_scan_one_root_concurrently_and_agree` interleaves eight scans across two
 engines over one root: all twelve rows identical, and the 3 × 50 ms budget absorbed it with no
 exhaustion, so it was left alone.
+
+**Seeded only under the ledger lock (Phase 13).** Sharing the index was safe for the refresh
+and not for the seed. A seed is three steps, `remove index.tree`, `read-tree`, `write
+index.tree`, and nothing used to be held across them, so two processes could interleave and
+leave the index holding one tree under a marker naming another. Every later `ensure` then
+called that index fresh, and a file accepted into the newer tree and put back to its older
+content was not listed: a hide, lasting until something else reseeded. Six rules replace it.
+
+- **Two doors, and the raw `seed` is private.** `seed_committed(&LedgerLock, tree)` is the
+  fold's: it takes the guard by reference, so "the caller wrote this tree under this lock"
+  is a fact the compiler checks rather than a comment. `ensure` and `reseed` are the scan's
+  two sites: they acquire the ledger lock themselves, seed, and release it before they
+  return, so `scan.rs` never holds a guard and none can outlive the call into a retry.
+  `PrivateIndex` keeps a `RepoPaths` and a `lock_budget` (the shipping `40 × 50 ms`, with an
+  in-crate setter so a test can reach the busy path without waiting two seconds).
+- **Only the tree the ledger on disk names.** Under the lock the marker is read once more,
+  because another pane's fold may have seeded it while this call waited and a redundant
+  `read-tree` zeroes git's stat data and costs a whole-tree content refresh. Then
+  `ledger.json` is read with `std::fs::read` plus `ledger::parse`, never `ledger::load`,
+  which moves an unparsable file aside. A disagreement, a read failure or a parse failure is
+  `IndexError::LedgerMoved` with nothing touched. The comparison is the **tree** and never
+  the stamp: a flag, a snooze and a plain accept all move the stamp without moving the tree,
+  and `reload_ledger_if_changed` now stores the stamp only after a successful read and parse
+  for the same reason. An empty index (`None`) is always allowed, because it over-shows.
+- **An unremovable marker aborts the seed** before `read-tree`, so "removal failed,
+  `read-tree` succeeded, marker write failed" can never leave the new index under the old
+  marker, which is the defect's own end state.
+- **A fresh scan takes no lock, and validates what it read.** `ensure` returns the marker
+  file's identity as it read it (mtime, length and inode; every seed replaces the file by
+  `rename`), and the scan stats it again after `others`. A different or missing identity
+  means the index was reseeded while this scan read it, and the scan returns
+  `ScanError::IndexMoved`. Identity and not content, because a later fold can return to an
+  earlier tree. Without it, a reseed between `diff_files` and `others` can omit a path that
+  is pending under both trees, and a one-shot `lastcall status` has no next scan to correct
+  it.
+- **Both loop `scan_root`, bound 2** (reload, `sync_branch`, `trim`, scan). On exhaustion
+  `LedgerMoved` is returned as the error; `IndexMoved` is not an error at all, it returns
+  the last pile with a notice, so nothing new reaches an accept or `lastcall status`.
+- **The fold seeds before it drops the lock, best effort.** The accept is committed by then,
+  so a seed that fails removes the marker instead and `Ops::fold` still returns `Ok`: an
+  index with no marker is reseeded by the next scan, while an index under a marker naming a
+  tree it does not hold is the defect.
+
+`refresh` still rewrites `index` from every scan with no ledger lock, so the rule is "seeded
+only under the lock" and not "written only under the lock"; that writer was already safe,
+because git takes `index.lock` before it reads the index. The new nesting is ledger lock and
+then git's `index.lock`, and no holder of `index.lock` ever asks for the ledger lock, so
+there is no lock order to police. A scan whose `trim` folds does not block on itself either:
+the fold releases the lock before `scan::scan` runs, and leaves the marker fresh, so the
+`ensure` that follows takes no lock.
+
+`engine_fold_seeds_the_index_before_it_drops_the_ledger_lock`,
+`engine_a_stale_scan_seeds_under_the_ledger_lock`,
+`engine_a_stale_scan_reloads_instead_of_seeding_its_own_tree`,
+`engine_a_reseed_between_diff_files_and_others_is_retried` and
+`index_seeds_only_the_tree_the_ledger_on_disk_names` are those claims under test.
+
+The fix holds between processes that all run it. An older lastcall on the same repository
+still seeds unlocked, so open panes are restarted after an upgrade.
 
 **The ledger lock budget doubled** in Phase 5: 20 × 50 ms → **40 × 50 ms = 2 s**
 (`ledger::LOCK_RETRIES`, `ledger::LOCK_BACKOFF`). With one lastcall per pane, finding another
@@ -542,7 +601,10 @@ Every rung shows *more* than the truth, never less, and says why in a notice:
 | seen tree not resolvable in the store (user ran `git gc`) | treated as `null`, notice; the next accept persists `null` and accept-all seeds from the empty tree |
 | HEAD cannot be inspected (corrupt `.git/HEAD`, git-dir unreadable) | rows unchanged, no annotation, notice `head inspection skipped` |
 | override blob missing (E3) or override unparsable (E2) | that path resolves to the seen-tree entry |
-| `index` / `index.tree` missing, mismatched, or unreadable (empty, garbage, truncated) | reseeded from the seen tree; the pile is identical |
+| `index` / `index.tree` missing, mismatched, or unreadable (empty, garbage, truncated) | reseeded from the seen tree, under the ledger lock; the pile is identical |
+| the ledger on disk names a seen tree other than the one a scan is about to seed (another process folded first) | nothing is touched; the whole scan runs again against the ledger the disk has, and only a second disagreement reaches the caller, as `LedgerMoved` |
+| the private index reseeded by another process between a scan's two reads of it | the whole scan runs again; a second reseed is not an error, the pile comes back with the notice `the private index was reseeded while this root was scanned; the list is refreshed by the next scan` |
+| the fold's seed fails (git's `index.lock` held, a full disk) | the accept stands: the fold removes the marker rather than leave one naming a tree the index does not hold, and the next scan reseeds |
 | `index.lock` held by another process | scan runs unrefreshed |
 | a path that cannot be hashed (unreadable, a socket, `git-lfs` missing) | an `Unhashable` row |
 | accept whose rendered oid/mode/baseline (oid **and** mode for hunks, so a stale mode hunk cannot apply twice) no longer matches the live file | refused, nothing written; the next scan shows the new state (A5/A6) |

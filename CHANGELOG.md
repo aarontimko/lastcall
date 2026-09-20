@@ -5,6 +5,20 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html). A version's s
 exactly what its GitHub release notes carry, so it is written for the people installing the
 binary rather than for the commit log.
 
+## Unreleased
+
+### Fixed
+
+- **Two lastcall processes on one repository could leave a change unlisted.** When one pane
+  accepted a file at the same moment another pane refreshed its picture of the repository,
+  the shared cache of what you have already seen could end up holding one snapshot under a
+  label naming a different one. A file accepted in the first pane and then put back to its
+  earlier content was then missing from the list, in both panes, until something else
+  refreshed the cache. The cache is now rebuilt only while the same lock every write takes
+  is held, and only from the snapshot the record on disk names. The fix holds once every
+  lastcall process on that repository runs the new version, so restart open panes after
+  upgrading.
+
 ## 0.4.0 - 2026-09-18
 
 ### Changed
