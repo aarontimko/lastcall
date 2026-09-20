@@ -158,9 +158,12 @@ expression: style
 44 0..1 Cyan Reset -
 44 16..17 Cyan Reset -
 44 83..84 Cyan Reset -
-45 0..17 Cyan Reset -
-45 18..32 Reset Reset DIM
+45 0..1 Cyan Reset -
+45 16..17 Cyan Reset -
 45 83..84 Cyan Reset -
-46 0..16 Reset Reset DIM
-46 16..84 Cyan Reset -
-46 84..87 Reset Reset DIM
+46 0..17 Cyan Reset -
+46 18..32 Reset Reset DIM
+46 83..84 Cyan Reset -
+47 0..16 Reset Reset DIM
+47 16..84 Cyan Reset -
+47 84..87 Reset Reset DIM
