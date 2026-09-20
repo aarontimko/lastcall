@@ -29,7 +29,7 @@ A fresh directory under the system temp directory, `lastcall-tryout-<scenario>-<
 | Path | What it is |
 |---|---|
 | `parent/` | the repositories (and watched folders) the scenario built; the only entry in `parent_dirs` |
-| `state/` | the state directory for this run: ledgers, stores, the tour marker |
+| `state/` | the state directory for this run: ledgers, stores, and a seeded `first-launch.json` so the welcome overlay does not open over step 1 |
 | `state/config.toml` | `parent_dirs`, whatever the scenario added, and `[update] check = false` |
 | `STEPS.md` | the numbered steps, as printed |
 | `run.py` | reopens the same sandbox: `python3 <sandbox>/run.py` |
@@ -43,8 +43,10 @@ it is also the evidence if a step failed: the state directory can be read with t
 - `~/.local/state/lastcall` and `~/.config/lastcall`. The run is pointed at the sandbox
   with `LASTCALL_STATE_DIR` and `LASTCALL_CONFIG`, the same two variables the probes use.
 - The network. The scenario's config turns the daily update check off.
-- Your git identity or config. Commits in the sandbox carry their own throwaway identity on
-  the command line, signing off and hooks disabled for those commands only.
+- Your git identity or config. The script's own git commands carry a throwaway identity
+  on the command line, with signing and hooks off, and they do not read the global or
+  system git config at all, so an excludes file or a line-ending setting of yours cannot
+  change what a scenario builds. (lastcall itself, once open, runs git as it always does.)
 
 `HOME` is deliberately **not** redirected, unlike `just probe-tui`. A hands-on run is often
 about herdr: inside a pane lastcall is handed the session's socket, but from any other
@@ -81,15 +83,23 @@ The pieces:
   a conflict), with the throwaway identity applied.
 - `sandbox.config_extra(keys=..., tables=...)` adds top-level keys (`draft_dirs = [...]`)
   or whole tables (`[keys]`, `[ui]`) to the config. A watched scratch folder is a
-  `draft_dirs` entry plus files written under it with `repo.write`.
+  `draft_dirs` entry plus files written under it with `repo.write`. `parent_dirs` and
+  `[update]` are the sandbox's own, and a table can be given once (TOML's rule): the call
+  raises on either, so the mistake shows when the scenario is built and not at launch.
+- `sandbox.welcome = True` leaves the first-launch welcome in place, for a scenario that is
+  about the welcome.
 - The function's docstring's first line is what `just tryout list` prints.
 
 Rules a scenario follows:
 
-1. **Deterministic and offline.** No clock, no random content, no network, nothing read
-   from outside the sandbox. Two runs of one scenario build the same repositories.
+1. **Deterministic and offline.** No random content, no network, nothing read from outside
+   the sandbox, and nothing that depends on the date. Two runs of one scenario build the
+   same files and the same history (commit times aside).
 2. **Every step says what to do and what to see.** "Open `min.js`: the line ends in a dim
-   ` … +N`" can pass or fail. "Check that wrapping works" cannot.
+   ` … +N`" can pass or fail. "Check that wrapping works" cannot. What is seen must be
+   there at any terminal size: the hint line drops entries in a narrow terminal (`wrap` is
+   the first to go, under 150 columns with the diff focused), so a step never rests on a
+   hint alone.
 3. **Put a landmark at the far end of anything long.** The wrap scenario ends its long
    lines in `THE-END-OF-THE-PROSE-LINE` and `END-OF-MINIFIED`, so "is the end visible" is
    a word to look for, not a judgement.

@@ -29,6 +29,7 @@ steps; register it in SCENARIOS. docs/dev/tryout.md has the rules a scenario fol
 Standard library only, and nothing newer than Python 3.9 (what macOS ships).
 """
 
+import json
 import os
 import subprocess
 import sys
@@ -47,8 +48,10 @@ class Repo:
         self.git("init", "-q", "-b", "main", ".")
 
     def git(self, *args):
-        # The identity is the commit's own, so the person's git config is neither needed
-        # nor changed; the hooks path is emptied so a global hook cannot run here.
+        # The identity is the commit's own and the person's git config is not read at all
+        # (a global excludes file or `core.autocrlf` would change what a scenario builds);
+        # the hooks path is emptied so no hook runs here.
+        env = dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null")
         subprocess.run(
             [
                 "git",
@@ -59,6 +62,7 @@ class Repo:
                 *args,
             ],
             cwd=self.path,
+            env=env,
             check=True,
             stdout=subprocess.DEVNULL,
         )
@@ -90,12 +94,27 @@ class Sandbox:
         # Extra TOML for the scenario: top-level keys first, then tables.
         self.config_keys = []
         self.config_tables = []
+        # A fresh state directory opens on the first-launch welcome, which would sit over
+        # step 1 and whose choices write to the config. A scenario about the welcome itself
+        # sets this to True.
+        self.welcome = False
 
     def repo(self, name):
         return Repo(os.path.join(self.parent, name))
 
     def config_extra(self, keys="", tables=""):
-        """Top-level `key = value` lines and whole `[table]` blocks for config.toml."""
+        """Top-level `key = value` lines and whole `[table]` blocks for config.toml.
+
+        `parent_dirs` and the `[update]` table are the sandbox's own; TOML allows a key or
+        a table once, so a scenario that names either is refused here, not at launch.
+        """
+        named = [line.strip() for line in (keys + "\n" + tables).splitlines()]
+        if any(n.startswith("parent_dirs") or n.startswith("[update]") for n in named):
+            raise ValueError("parent_dirs and [update] belong to the sandbox")
+        heads = [n for n in named if n.startswith("[")]
+        taken = [n for t in self.config_tables for n in t.splitlines() if n.startswith("[")]
+        if any(h in taken for h in heads) or len(set(heads)) != len(heads):
+            raise ValueError("a table can be given once: put all of it in one call")
         if keys:
             self.config_keys.append(keys.strip("\n"))
         if tables:
@@ -103,13 +122,18 @@ class Sandbox:
 
     def write_config(self):
         # The daily update check is off: a hands-on run makes no network request.
-        lines = ['parent_dirs = ["%s"]' % self.parent]
+        # json.dumps writes a basic string TOML reads the same way (quotes, backslashes).
+        lines = ["parent_dirs = [%s]" % json.dumps(self.parent)]
         lines += self.config_keys
         lines += ["", "[update]", "check = false"]
         for table in self.config_tables:
             lines += ["", table]
         with open(self.config, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
+        if not self.welcome:
+            # What lastcall writes when the welcome is dismissed (`tui/tour.rs`).
+            with open(os.path.join(self.state, "first-launch.json"), "w", encoding="utf-8") as f:
+                json.dump({"shown_at": 0, "version": "tryout"}, f)
 
 
 # ---- scenarios -------------------------------------------------------------------------
@@ -164,9 +188,10 @@ def scenario_wrap(sandbox):
         "rows and THE-END-OF-THE-PROSE-LINE is readable; continuation rows carry a dim `+`. "
         "The Chinese and Arabic line ends in END-OF-SCRIPTS with nothing cut at the edge.",
         "Code wraps. Open `code.rs`: `// END-OF-CODE-LINE` is readable.",
-        "The toggle. Press `c`: lines clip at the edge and the hint at the bottom changes "
-        "between `c clip` and `c wrap`. Press `c` again. Then Option-z on a Mac (Alt-z "
-        "elsewhere): it does the same.",
+        "The toggle. Press `c`: lines clip at the edge and the ends are gone. Press `c` "
+        "again: they are back. Then Option-z on a Mac (Alt-z elsewhere): it does the same. "
+        "In a terminal 150 columns wide or more the hint line also names the key, `c clip` "
+        "while wrapping and `c wrap` while clipped; `?` lists it at any width.",
         "The cap. Open `min.js`: the long line stops a few rows short of the pane's bottom "
         "and ends in a dim ` … +N`. Press `v` then `y` and paste somewhere: the whole "
         "line arrives, END-OF-MINIFIED included.",
@@ -189,6 +214,11 @@ SCENARIOS = {
 
 
 # ---- the runner ------------------------------------------------------------------------
+
+
+# `--check` answers "is this a scenario" and builds nothing: the just recipe asks before it
+# pays for a release build.
+ALLOWED_FLAGS = ("--no-launch", "--check")
 
 
 def first_line(doc):
@@ -226,10 +256,12 @@ def main(argv):
             print("%-12s %s" % (name, first_line(SCENARIOS[name].__doc__)))
         return 0 if args else 2
     name = args[0]
-    if len(args) != 1 or name not in SCENARIOS or any(f != "--no-launch" for f in flags):
+    if len(args) != 1 or name not in SCENARIOS or any(f not in ALLOWED_FLAGS for f in flags):
         print("usage: tryout.py list | <scenario> [--no-launch]", file=sys.stderr)
         print("scenarios: " + ", ".join(sorted(SCENARIOS)), file=sys.stderr)
         return 2
+    if "--check" in flags:
+        return 0
     if not os.path.exists(BINARY):
         print("no %s: run `just tryout %s`, which builds it" % (BINARY, name), file=sys.stderr)
         return 2
@@ -239,7 +271,7 @@ def main(argv):
     print(steps)
     print("sandbox: %s" % sandbox.base)
     print("steps:   %s" % os.path.join(sandbox.base, "STEPS.md"))
-    print("reopen:  python3 %s" % run)
+    print("reopen:  python3 '%s'" % run)
     if "--no-launch" in flags:
         return 0
     try:
