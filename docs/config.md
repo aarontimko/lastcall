@@ -151,8 +151,8 @@ bound to Option and an arrow: iTerm2 and herdr panes send that as
 escape prefix can deliver Option-Up as three separate keys, and the third of them is `A`.
 Use `{` and `}` there; they are bound to the same two actions and work everywhere.
 
-`wrap` has the same shape for the same reason: `alt-z` is the wrap key in most editors, and
-`c` is its plain twin. A terminal that does not send Option as Meta sends a plain letter
+`wrap` has the same shape for the same reason: `alt-z` is the wrap key in VS Code and the
+editors built on it, and `c` is its plain twin. A terminal that does not send Option as Meta sends a plain letter
 for Option-z, and nothing happens. A terminal that splits the escape delivers `Esc` then
 `z`, and `z` is undo, so use `c` there, or put `wrap = ["c"]` in `[keys]` and leave
 Option out of it.

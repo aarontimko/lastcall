@@ -963,13 +963,27 @@ reducer guesses at is the bug this module exists to make impossible.
 downstream had to learn a second coordinate system, and a reader who was on line 40 is on
 line 40 after a resize or a toggle.
 
-- `wrap_words(text, width) -> Vec<(usize, usize)>` breaks after the last whitespace that
-  fits and hard-breaks a word that never will. It measures each candidate row with
-  `UnicodeWidthStr::width` **on the row as a whole**, which is how ratatui measures what it
-  draws, rather than summing per-character widths; and it never breaks before a zero-width
-  character, so a combining mark is not orphaned onto the next row. The ranges are
-  character indices into the line, contiguous and covering it, which is the module's
-  property test (`proptests::wrap_words_keeps_every_character_and_fits_every_row`).
+- `wrap_rows(text, width, max_rows) -> (Vec<(usize, usize)>, bool)` breaks after the last
+  whitespace that fits and hard-breaks a word that never will. It stops after `max_rows`
+  (the pane passes the cap) and the flag says whether text was left over, so a megabyte
+  line costs a few rows of work per frame and not a megabyte of it. `wrap_words` is the
+  unbounded form the tests use.
+  **A row is measured the way ratatui draws it, not the way a string measures.** ratatui
+  draws grapheme by grapheme and gives each one its own `CellWidth`; the width of the row
+  as one string is a different number for some scripts (an Arabic lam and alef measure one
+  cell and draw two, a halfwidth dakuten measures none and draws one), and a row measured
+  narrower than it draws loses its tail to the clip, which is the one thing this pane may
+  never do. So `clusters` walks the text with ratatui's own segmentation
+  (`Span::styled_graphemes`, which is also what drops control characters), sums
+  `CellWidth`, and a break falls only between clusters: a combining mark, a variation
+  selector or a joiner never lands on the next row away from what it modifies. No second
+  segmentation crate is involved, so there is no second opinion to drift from. A cluster
+  wider than the whole row is parted by characters, because ratatui draws nothing of a
+  symbol that does not fit. `render_wrap_every_character_is_on_some_row_in_every_script`
+  holds all of this at the level of the drawn buffer.
+  The ranges are character indices into the line, contiguous and covering it, which is
+  the module's property test
+  (`proptests::wrap_words_keeps_every_character_and_fits_every_row`).
   Not to be confused with `textbuf::wrap_ranges` (the inline editor's own line index) or
   `tour::wrap` (a paragraph filler for the welcome cards); neither is reusable here.
 - `parts_of(hunk, within, cols, rows, wrap)` is the per-line answer: `Part::Whole` for a
@@ -983,22 +997,34 @@ line 40 after a resize or a toggle.
   last row ends in a dim ` … +N` marker counting the characters not drawn, so whatever
   follows a very long line is always at least partly on screen. The count is part of the
   marker whose width decides where to cut, so `cut_for_marker` solves the two together,
-  shrinking a whole character at a time (a wide character is never halved) and falling
-  back to a bare `…` in a pane too narrow for the count.
+  shrinking a whole cluster at a time (a wide character is never halved, a mark never
+  parted from its base) and falling back to a bare `…` in a pane too narrow for the count.
 - `last_full_line`, `page_up_top` and `keep_visible` are the reducer's three questions.
   A forward move (`scroll_forward`: a page down, a wheel step) lands at most **one line
   past the last line that was fully visible**, so nothing scrolls past unread, and always
-  at least one line so a tall line still makes progress. `scroll_page_up` is a backward
+  at least one line so a tall line still makes progress. The wheel up (`scroll_back`) is
+  clamped to the page-up fill for the same reason, and `move_sel_cursor` applies both
+  clamps while a selection is live, where a page is counted in lines and a page of wrapped
+  lines is more rows than the body has. `scroll_page_up` is a backward
   fill and **not** page down's inverse: with rows of different heights the two cannot be,
   and what it promises is that the line the reader was on is still whole on the screen
   they land on. `keep_visible` is what `move_sel_cursor` uses in place of a `page_rows`
   line count, so a `v` selection over a five-row line scrolls as little as it can.
 
 **Geometry.** `Ui::rendered` writes the measured diff body back to `App.diff_size` beside
-the nav offset, and `Action::Resize` clears it; `App::diff_body_size` falls back to
-`diff_cols()` (the same inner arithmetic `editor_cols()` uses, factored into
-`main_inner_cols` so the two cannot drift) and `page_rows()`. So the reducer asks the
-layout about the pane the reader is actually looking at, and never about a pane of zero.
+the nav offset, and `Action::Resize` and a nav-width change clear it; `App::diff_body_size`
+falls back to `diff_cols()` (the same inner arithmetic `editor_cols()` uses, factored into
+`main_inner_cols` so the two cannot drift) and `page_rows() - 1` (the pane's first row is
+the file's header, not the body; `render_diff_body_fallback_is_what_the_renderer_draws`
+holds the fallback equal to the drawn body at every size). So the reducer asks the layout
+about the pane the reader is actually looking at, and never about a pane of zero. A banner
+appearing or the expansion replacing the main body inside one event batch can still leave
+the last frame's size for the keys in that batch; the next frame corrects it, and the
+layout is recomputed from the scroll on every draw, so nothing is stored wrong.
+
+**A continuation row** repeats the line's gutter mark in the line's colour, **dim**, so a
+wrapped `+` line does not read as several added lines; the text keeps its full colour, and
+the first row is built exactly as an unwrapped line is.
 
 **The toggle** is `Action::ToggleWrap`, action name `wrap`, keys `c` and `alt-z`, opening
 value `[ui] wrap` through `Launch`. It flips `App.wrap`, keeps `diff.scroll`, and writes
