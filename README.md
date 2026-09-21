@@ -97,7 +97,7 @@ lastcall update            # download it, verify its checksum, replace this bina
 **Or build it with cargo**, from the tagged source, if you would rather compile it yourself:
 
 ```sh
-cargo install --git https://github.com/aarontimko/lastcall --tag v0.4.0 lastcall
+cargo install --git https://github.com/aarontimko/lastcall --tag v0.5.0 lastcall
 ```
 
 That puts `lastcall` in `~/.cargo/bin`. This route upgrades by hand: the same line with the
@@ -141,7 +141,7 @@ just cargo build --release -p lastcall && ./target/release/lastcall --version
 
 ## Status
 
-v0.4.0 is the current release: four binaries built and attested by GitHub Actions from the
+v0.5.0 is the current release: four binaries built and attested by GitHub Actions from the
 tagged commit, on the [Releases](https://github.com/aarontimko/lastcall/releases) page.
 Expect keys, configuration keys and on-disk state to move between minor versions until 1.0,
 with everything that moves written down in [`CHANGELOG.md`](CHANGELOG.md), and
