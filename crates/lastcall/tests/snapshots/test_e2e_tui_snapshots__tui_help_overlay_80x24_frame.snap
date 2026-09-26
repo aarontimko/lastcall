@@ -22,7 +22,7 @@ expression: frame
 "│     │ … 24 more keys (97 columns shows all)                            │     │"
 "│     │ q / Ctrl-C     quit                                              │     │"
 "│     │ ^J is a newline in the note (⇧⏎ needs a kitty-protocol terminal) │     │"
-"│     │ shift+drag selects text (mouse capture is on) · v/y copies       │     │"
+"│     │ drag selects text · v/y copies                                   │     │"
 "│     │ lastcall tui --tour shows the welcome again                      │     │"
 "└─────│ any key closes                                                   │─────┘"
 "↑↓ sel└──────────────────────────────────────────────────────────────────┘      "

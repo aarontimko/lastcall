@@ -633,6 +633,25 @@ fn tui_group_view() {
     snapshot("tui_group_view", &app, W, H);
 }
 
+/// A repository's pane with its first two lines selected (the name line and the path):
+/// the band spans the pane's width (the styles file). At this width the hint line is full,
+/// so `v select  y copy` has dropped, as it does beside a file's diff.
+#[test]
+fn tui_root_pane_selection() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    let alpha = root_named(&engine, "alpha");
+    app.select(Some(Selection::Root(alpha)));
+    app.handle(Action::FocusToggle);
+    assert_eq!(app.handle(Action::Select).0, Changed::Yes);
+    app.handle(Action::NavDown);
+    assert_eq!(app.sel.map(|s| s.range()), Some((0, 1)));
+    let (frame, _) = draw(&app, W, H);
+    assert!(frame.contains("~/W/alpha"), "{frame}");
+    snapshot("tui_root_pane_selection", &app, W, H);
+}
+
 #[test]
 fn tui_help_overlay() {
     let scene = Scene::build();
