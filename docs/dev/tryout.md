@@ -46,6 +46,14 @@ Nothing is deleted afterwards. The path is printed; the directory is yours to re
 it is also the evidence if a step failed: the state directory can be read with the `jq` and
 `git` recipes in [`engine.md`](engine.md).
 
+A second run of the same scenario builds a second sandbox, and the printout says so under
+the paths (`note: 1 earlier cherry-pick sandbox here, newest built 11:40: …`). The git
+commands in the steps name the sandbox of the run that printed them, and a lastcall opened
+by an earlier run is still watching that earlier sandbox; a commit made in the wrong one
+is the classic way to see nothing change. The note exists because the Phase 14 hands-on
+walk was run twice, four minutes apart, and the accept landed in one sandbox while the
+git steps ran in the other.
+
 ## What it never touches
 
 - `~/.local/state/lastcall` and `~/.config/lastcall`. The run is pointed at the sandbox

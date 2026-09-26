@@ -37,6 +37,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BINARY = os.path.join(ROOT, "target", "release", "lastcall")
@@ -442,6 +443,28 @@ def build(name, launch_in=None):
     return sandbox, "\n".join(text)
 
 
+def earlier_sandboxes(name, base):
+    """The other `lastcall-tryout-<name>-*` directories beside `base`, newest first.
+
+    A person who runs a scenario twice has two sandboxes whose paths differ by a suffix,
+    and a lastcall opened by the first run keeps watching the first one; the git commands
+    in the second run's steps then land where nothing is looking. The note that lists
+    them is the difference between a puzzling "nothing changes" and a `cd` into the right
+    directory.
+    """
+    prefix = "lastcall-tryout-%s-" % name
+    tmp = os.path.dirname(base)
+    found = []
+    for entry in os.listdir(tmp):
+        path = os.path.join(tmp, entry)
+        if entry.startswith(prefix) and path != base and os.path.isdir(path):
+            steps = os.path.join(path, "STEPS.md")
+            built = os.path.getmtime(steps if os.path.exists(steps) else path)
+            found.append((built, path))
+    found.sort(reverse=True)
+    return found
+
+
 def main(argv):
     args = [a for a in argv if not a.startswith("--")]
     flags = [a for a in argv if a.startswith("--")]
@@ -475,6 +498,21 @@ def main(argv):
     print("opens in: %s" % os.path.join(sandbox.parent, sandbox.launch_in).rstrip(os.sep))
     print("steps:   %s" % os.path.join(sandbox.base, "STEPS.md"))
     print("reopen:  python3 '%s'" % run)
+    others = earlier_sandboxes(name, sandbox.base)
+    if others:
+        built, newest = others[0]
+        print(
+            "note:    %d earlier %s sandbox%s here, newest built %s: %s. The steps and "
+            "the git commands above name this run's sandbox; a lastcall opened by an "
+            "earlier run is still watching that run's."
+            % (
+                len(others),
+                name,
+                "" if len(others) == 1 else "es",
+                time.strftime("%H:%M", time.localtime(built)),
+                newest,
+            )
+        )
     if "--no-launch" in flags:
         return 0
     try:
