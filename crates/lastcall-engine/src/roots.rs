@@ -139,6 +139,10 @@ impl Discovery {
 pub struct RootsChanged {
     pub added: Vec<PathBuf>,
     pub removed: Vec<PathBuf>,
+    /// Set on the one `RootsChanged` the watcher emits for a config reload (Phase 14 D),
+    /// which it emits even when both lists are empty: the TUI posts the reload's notice when
+    /// this lands, with the counts it carries. `false` from [`diff`] and every other pass.
+    pub reload: bool,
 }
 
 impl RootsChanged {
@@ -710,7 +714,11 @@ pub fn diff(prev: &Discovery, next: &Discovery) -> RootsChanged {
         .filter(|r| next.get(&r.path).is_none())
         .map(|r| r.path.clone())
         .collect();
-    RootsChanged { added, removed }
+    RootsChanged {
+        added,
+        removed,
+        reload: false,
+    }
 }
 
 #[cfg(test)]

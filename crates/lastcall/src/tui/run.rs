@@ -136,6 +136,9 @@ pub enum Local {
     Roots(Vec<RootMeta>),
     /// The `Refresh` finished (all its piles were sent first).
     RefreshDone,
+    /// An `Effect::Reload` finished (Phase 14 D): the config applied, or the error that
+    /// kept it from applying (the `ConfigError` or `KeymapError` text launch would print).
+    Reloaded(Result<Box<Reload>, String>),
     /// A root's scan failed during a `Refresh`; its previous pile stays.
     Notice(Option<PathBuf>, String),
     /// An engine task died (panicked): the panic hook has already restored the terminal,
@@ -174,6 +177,15 @@ pub enum Local {
     /// The row `hunks_of` was given travels back with the answer, so the app can tell an
     /// answer for the oids on screen from one for oids a pile has since replaced.
     Expanded(PathBuf, Box<Row>, Expanded),
+}
+
+/// A config file read again and applied to the engine (Phase 14 D): the new keymap for
+/// [`Ui`], and the running config beside the file's new one for the notice and `[ui]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Reload {
+    pub keymap: Keymap,
+    pub old: lastcall_engine::config::Config,
+    pub new: lastcall_engine::config::Config,
 }
 
 /// The terminal-free core of the loop: the app, the keymap, and the hit map of the last
@@ -435,6 +447,15 @@ impl Ui {
             Local::Exported { label, result } => (self.app.exported(label, result), None),
             Local::Roots(metas) => (self.app.sync_roots(metas), None),
             Local::RefreshDone => (self.app.refresh_done(), None),
+            // Phase 14 D: the keymap is the loop's (`Ui`) and the table the app's; both are
+            // swapped here, together, so a key and the hint that names it never disagree.
+            Local::Reloaded(Ok(reload)) => {
+                let Reload { keymap, old, new } = *reload;
+                self.app.keymap = keymap.table();
+                self.keymap = keymap;
+                (self.app.reloaded(&old, &new), None)
+            }
+            Local::Reloaded(Err(error)) => (self.app.reload_failed(&error), None),
             Local::Notice(root, text) => self.app.apply(EngineEvent::Notice { root, text }),
             Local::Fatal(text) => {
                 self.app.set_status(text);
@@ -875,6 +896,52 @@ fn spawn_snooze(
         };
         if let Some(result) = joined(snooze, &tx, "snooze").await {
             let _ = tx.send(Local::Snoozed(root, result));
+        }
+    });
+}
+
+/// Read the config file again and apply it to the engine (Phase 14 D). The same
+/// resolution as launch (`config::load` over the launch `Env`, so `LASTCALL_CONFIG` and then
+/// XDG), then the `[keys]` table, then `resolve` against the launch directory. Either
+/// failure returns its text and touches nothing; only a file that loads and whose keys
+/// parse reaches [`Engine::reload`]. Runs under the engine lock, on a blocking thread.
+pub fn reload_config(engine: &mut Engine) -> Result<Reload, String> {
+    let env = engine.env().clone();
+    let loaded = lastcall_engine::config::load(&env).map_err(|e| e.to_string())?;
+    let keymap = Keymap::from_config(&loaded.config.keys).map_err(|e| e.to_string())?;
+    let resolved = loaded.resolve(env.cwd());
+    let old = engine.config().clone();
+    engine.reload(&loaded, &resolved);
+    Ok(Reload {
+        keymap,
+        old,
+        new: loaded.config,
+    })
+}
+
+/// `Effect::Reload`: [`reload_config`] off the UI task, then the watcher's reload pass.
+///
+/// The order is `spawn_set_search_depth`'s: the settings land under the lock first, and
+/// only then is the loop asked for the pass that reads them, so no discovery can run on
+/// the old config after the answer says the new one applied. A refused file asks for
+/// nothing.
+fn spawn_reload(
+    engine: &Arc<Mutex<Engine>>,
+    tx: mpsc::UnboundedSender<Local>,
+    rescan: RescanTrigger,
+) {
+    let engine = engine.clone();
+    tokio::spawn(async move {
+        let work = tokio::spawn(async move { blocking(&engine, reload_config).await });
+        let Some(result) = joined(work, &tx, "reload").await else {
+            return;
+        };
+        let applied = result.is_ok();
+        if tx.send(Local::Reloaded(result.map(Box::new))).is_err() {
+            return;
+        }
+        if applied {
+            rescan.request_reload();
         }
     });
 }
@@ -1864,6 +1931,11 @@ pub fn run(
                             watcher.rescan_trigger(),
                         ),
                         Effect::SyncRoots => spawn_sync_roots(&watcher.engine, local_tx.clone()),
+                        Effect::Reload => spawn_reload(
+                            &watcher.engine,
+                            local_tx.clone(),
+                            watcher.rescan_trigger(),
+                        ),
                         Effect::Accept(reqs) => {
                             spawn_accept(
                                 &watcher.engine,
@@ -2222,6 +2294,132 @@ mod tests {
         assert!(found, "the watcher ended before the rescan landed");
         assert_eq!(lock(&watcher.engine).search_depth(), 2);
         watcher.join().await;
+    }
+
+    /// Phase 14 D: the reload's settings land under the engine lock before the discovery
+    /// pass it asks for, exactly as the depth card's do. The file raises `search_depth` and
+    /// adds an `ignore_globs` entry; the watcher's reload `RootsChanged` must already list the
+    /// root only the new depth reaches, and the engine must hold the new ignore set.
+    #[tokio::test]
+    async fn run_reload_lands_before_the_discovery_it_asks_for() {
+        use lastcall_engine::config::Config;
+        use lastcall_engine::watcher::{EngineTimings, lock};
+        use lastcall_testkit::engine::open_engine;
+        use lastcall_testkit::fixture_repo::FixtureRepo;
+        use lastcall_testkit::tmp::TempDir;
+
+        let repo = FixtureRepo::new("run-reload").unwrap();
+        let state = TempDir::new("lc-run-reload-state");
+        let conf = TempDir::new("lc-run-reload-conf");
+        let deep = repo.parent_dir().join("worktrees").join("b");
+        std::fs::create_dir_all(&deep).unwrap();
+        repo.git_at(&deep, &["init", "-q", "-b", "main"]).unwrap();
+        let deep = std::fs::canonicalize(&deep).unwrap();
+        let parent = std::fs::canonicalize(repo.parent_dir()).unwrap();
+        let file = conf.path().join("config.toml");
+        std::fs::write(
+            &file,
+            format!(
+                "parent_dirs = [{:?}]\nsearch_depth = 2\nignore_globs = [\"scratch/**\"]\n\n[keys]\nreload = \"ctrl-r\"\n",
+                parent.display().to_string()
+            ),
+        )
+        .unwrap();
+        let env = repo
+            .engine_env(state.path())
+            .with_var("LASTCALL_CONFIG", file.to_string_lossy());
+        let engine = open_engine(repo.parent_dir(), &env, state.path(), Config::default());
+        let mut watcher = engine.run(EngineTimings::default());
+        assert!(lock(&watcher.engine).root(&deep).is_none());
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        spawn_reload(&watcher.engine, tx, watcher.rescan_trigger());
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(20), rx.recv())
+            .await
+            .expect("the loop's answer arrives")
+            .expect("the channel is open");
+        let Local::Reloaded(Ok(reload)) = answer else {
+            panic!("{answer:?}")
+        };
+        assert_eq!(reload.new.search_depth, 2);
+        assert_eq!(reload.old.search_depth, 1);
+        assert_ne!(
+            reload.keymap,
+            Keymap::defaults(),
+            "the file's [keys] came back"
+        );
+        let changed = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while let Some(event) = watcher.events.recv().await {
+                if let EngineEvent::RootsChanged(changed) = event
+                    && changed.reload
+                {
+                    return Some(changed);
+                }
+            }
+            None
+        })
+        .await
+        .expect("the reload pass arrives")
+        .expect("the watcher ended before the reload pass landed");
+        assert_eq!(
+            changed.added,
+            vec![deep.clone()],
+            "discovered at the new depth"
+        );
+        assert!(changed.removed.is_empty());
+        {
+            let g = lock(&watcher.engine);
+            assert!(g.root(&deep).is_some());
+            assert!(g.ignore_globs().is_match("scratch/a.txt"));
+        }
+        watcher.join().await;
+    }
+
+    /// Phase 14 D: a file that does not load, or whose `[keys]` do not parse, changes
+    /// nothing: the engine keeps its config and sets, and `Ui` keeps its keymap and table,
+    /// and the status line carries the text launch would have printed.
+    #[test]
+    fn run_an_invalid_config_file_changes_nothing() {
+        use lastcall_engine::config::Config;
+        use lastcall_testkit::engine::open_engine;
+        use lastcall_testkit::fixture_repo::FixtureRepo;
+        use lastcall_testkit::tmp::TempDir;
+
+        let repo = FixtureRepo::new("run-reload-bad").unwrap();
+        let state = TempDir::new("lc-run-reload-bad-state");
+        let conf = TempDir::new("lc-run-reload-bad-conf");
+        let file = conf.path().join("config.toml");
+        let env = repo
+            .engine_env(state.path())
+            .with_var("LASTCALL_CONFIG", file.to_string_lossy());
+        let mut engine = open_engine(repo.parent_dir(), &env, state.path(), Config::default());
+        let before = engine.config().clone();
+        for (text, says) in [
+            ("search_depth = \n", "line 1"),
+            ("no_such_key = 1\n", "no_such_key"),
+            ("[keys]\nrefresh = \"shift-r\"\n", "reload"),
+        ] {
+            std::fs::write(&file, text).unwrap();
+            let err = reload_config(&mut engine).expect_err(text);
+            assert!(err.contains(says), "{text:?}: {err}");
+            assert_eq!(engine.config(), &before, "{text:?} touched the engine");
+            let mut ui = Ui::new(App::new(), Keymap::defaults());
+            let table = ui.app.keymap.clone();
+            ui.local(Local::Reloaded(Err(err.clone())));
+            assert_eq!(ui.keymap, Keymap::defaults());
+            assert_eq!(ui.app.keymap, table);
+            assert_eq!(
+                ui.app.status.as_ref().map(|s| s.text.clone()),
+                Some(format!("config not reloaded: {err}"))
+            );
+        }
+        // And a good file swaps both halves together.
+        std::fs::write(&file, "[keys]\nreload = \"ctrl-r\"\n").unwrap();
+        let reload = reload_config(&mut engine).unwrap();
+        let mut ui = Ui::new(App::new(), Keymap::defaults());
+        ui.local(Local::Reloaded(Ok(Box::new(reload))));
+        assert_eq!(ui.app.keymap, ui.keymap.table());
+        assert_eq!(ui.app.keys_for("reload"), ["ctrl-r".to_owned()]);
     }
 
     fn mouse(kind: MouseEventKind, column: u16, row: u16) -> Event {

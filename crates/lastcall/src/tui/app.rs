@@ -339,6 +339,9 @@ impl Changed {
 pub enum Effect {
     /// Rescan every root (`Engine::scan_all` under the lock); `refresh_done` clears the flag.
     Refresh,
+    /// Read the config file again and apply it (Phase 14 D): the answer is
+    /// `Local::Reloaded`, and the watcher's reload `RootsChanged` completes the notice.
+    Reload,
     /// Re-read `RootMeta::of` for every root and feed it to `sync_roots`.
     SyncRoots,
     Quit,
@@ -646,6 +649,105 @@ pub enum AcceptAnswer {
 pub struct Accepting {
     pub scope: AcceptScope,
     pub files: Vec<(PathBuf, usize)>,
+}
+
+/// A config reload between `R` and its notice (Phase 14 D). The two halves arrive on
+/// different channels: the loop's own answer (`Local::Reloaded`, what the file changed) and
+/// the watcher's `RootsChanged` with `reload` set (the roots its discovery pass added and
+/// removed). The notice waits for both, so it can say both.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Reloading {
+    pub changes: Option<ReloadChanges>,
+    /// `(added, removed)`; a root reopened under another parent dir counts as added only.
+    pub roots: Option<(usize, usize)>,
+}
+
+/// What a reloaded config changed that the notice names, from the running config and the
+/// file's new one ([`reload_changes`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReloadChanges {
+    /// In notice order: `keys`, `ui`, `watcher`, `collapse`, `review_ignored`,
+    /// `skip_globs`, `discovery`.
+    pub parts: Vec<&'static str>,
+    /// `[herdr]` or `[update]` differs: those apply at the next launch.
+    pub next_launch: bool,
+}
+
+/// The notice fragments for a reload from `old` to `new` (Phase 14 D). `discovery` covers
+/// the keys whose effect is the root set (`parent_dirs`, `draft_dirs`, `search_depth`,
+/// `draft_dir_parents`, `draft_initial`); the notice drops it when the root counts already
+/// say what happened.
+pub fn reload_changes(
+    old: &lastcall_engine::config::Config,
+    new: &lastcall_engine::config::Config,
+) -> ReloadChanges {
+    let mut parts = Vec::new();
+    if old.keys != new.keys {
+        parts.push("keys");
+    }
+    if old.ui != new.ui || old.hide_empty_repos != new.hide_empty_repos {
+        parts.push("ui");
+    }
+    if old.ignore_globs != new.ignore_globs {
+        parts.push("watcher");
+    }
+    if old.collapsed_globs != new.collapsed_globs
+        || old.collapse_size_bytes != new.collapse_size_bytes
+    {
+        parts.push("collapse");
+    }
+    if old.review_ignored != new.review_ignored {
+        parts.push("review_ignored");
+    }
+    if old.skip_globs != new.skip_globs {
+        parts.push("skip_globs");
+    }
+    if old.parent_dirs != new.parent_dirs
+        || old.draft_dirs != new.draft_dirs
+        || old.search_depth != new.search_depth
+        || old.draft_dir_parents != new.draft_dir_parents
+        || old.draft_initial != new.draft_initial
+    {
+        parts.push("discovery");
+    }
+    ReloadChanges {
+        parts,
+        next_launch: old.herdr != new.herdr || old.update != new.update,
+    }
+}
+
+/// The sentence a reload that changed `[herdr]` or `[update]` adds to its notice.
+pub const NEXT_LAUNCH: &str = "herdr and update settings apply at the next launch";
+
+/// The reload's status line: `config reloaded: 1 root added, keys`, or `config reloaded,
+/// nothing changed`, with [`NEXT_LAUNCH`] after a semicolon when it applies.
+pub fn reload_notice(changes: &ReloadChanges, (added, removed): (usize, usize)) -> String {
+    let plural = |n: usize| if n == 1 { "root" } else { "roots" };
+    let mut parts: Vec<String> = Vec::new();
+    if added > 0 {
+        parts.push(format!("{added} {} added", plural(added)));
+    }
+    if removed > 0 {
+        parts.push(format!("{removed} {} removed", plural(removed)));
+    }
+    for part in &changes.parts {
+        if *part == "discovery" && (added > 0 || removed > 0) {
+            continue;
+        }
+        parts.push((*part).to_owned());
+    }
+    let head = if parts.is_empty() && !changes.next_launch {
+        "config reloaded, nothing changed".to_owned()
+    } else if parts.is_empty() {
+        "config reloaded".to_owned()
+    } else {
+        format!("config reloaded: {}", parts.join(", "))
+    };
+    if changes.next_launch {
+        format!("{head}; {NEXT_LAUNCH}")
+    } else {
+        head
+    }
 }
 
 /// What one restore covers (§6.3). Deliberately fewer variants than [`AcceptScope`]: there
@@ -1188,6 +1290,9 @@ pub struct App {
     /// in `handle` (render uses the frame's own area).
     pub size: (u16, u16),
     pub refreshing: bool,
+    /// A config reload in flight (`R`, Phase 14 D): its notice is posted once both halves
+    /// are in, whichever lands first. `None` when no reload is running.
+    pub reload: Option<Reloading>,
     /// Piles that arrived before `sync_roots` delivered their root's meta; adopted then.
     pub orphan_piles: BTreeMap<PathBuf, Pile>,
     /// The scan seq of the last pile applied per root: an older pile is dropped untouched
@@ -1306,6 +1411,7 @@ impl App {
             wall: None,
             size: (80, 24),
             refreshing: false,
+            reload: None,
             orphan_piles: BTreeMap::new(),
             seq: BTreeMap::new(),
             unscannable: std::collections::BTreeSet::new(),
@@ -1827,6 +1933,30 @@ impl App {
             }
             EngineEvent::RootsChanged(changed) => {
                 let mut result = Changed::No;
+                // Design review F19: a confirm modal whose root just left would confirm an
+                // op on a root the engine no longer has. It closes and says why.
+                if let Some(root) = self.confirm_root()
+                    && changed.removed.contains(&root)
+                    && !changed.added.contains(&root)
+                {
+                    let name = self.root_name(&root);
+                    self.confirm = None;
+                    self.set_status(format!("{name}: no longer listed"));
+                    result = Changed::Yes;
+                }
+                if changed.reload
+                    && let Some(reload) = self.reload.as_mut()
+                {
+                    let added = changed.added.len();
+                    let removed = changed
+                        .removed
+                        .iter()
+                        .filter(|r| !changed.added.contains(r))
+                        .count();
+                    reload.roots = Some((added, removed));
+                    self.finish_reload();
+                    result = Changed::Yes;
+                }
                 for root in &changed.removed {
                     if self.roots.remove(root).is_some() {
                         result = Changed::Yes;
@@ -3708,6 +3838,74 @@ impl App {
     }
 
     /// The loop calls this when an `Effect::Refresh` finished (its piles arrive as events).
+    /// The root a single-root confirm modal would act on (an accept or a restore of one
+    /// root); `None` for accept-all, the editor's discard, and no modal.
+    fn confirm_root(&self) -> Option<PathBuf> {
+        match &self.confirm.as_ref()?.scope {
+            ConfirmScope::Accept(scope) => match scope {
+                AcceptScope::Hunk { root, .. }
+                | AcceptScope::File { root, .. }
+                | AcceptScope::Group { root, .. }
+                | AcceptScope::Root(root)
+                | AcceptScope::Bless { root, .. } => Some(root.clone()),
+                AcceptScope::All => None,
+            },
+            ConfirmScope::Restore(scope) => Some(scope.root().to_path_buf()),
+            ConfirmScope::Discard { .. } => None,
+        }
+    }
+
+    /// The loop applied a reloaded config (Phase 14 D): the keymap is already swapped by
+    /// [`super::run::Ui::local`]; this applies `[ui]` and records what changed for the
+    /// notice. A `[ui]` value reaches the session toggle only when the **file** changed it
+    /// (design review F14): a toggle the reader flipped is theirs until they edit the line.
+    pub fn reloaded(
+        &mut self,
+        old: &lastcall_engine::config::Config,
+        new: &lastcall_engine::config::Config,
+    ) -> Changed {
+        if old.ui.wrap != new.ui.wrap {
+            self.wrap = new.ui.wrap;
+        }
+        if old.hide_empty_repos != new.hide_empty_repos {
+            self.hide_empty = new.hide_empty_repos;
+            self.reconcile_selection();
+        }
+        let changes = reload_changes(old, new);
+        match self.reload.as_mut() {
+            Some(reload) => reload.changes = Some(changes),
+            None => {
+                self.reload = Some(Reloading {
+                    changes: Some(changes),
+                    roots: None,
+                })
+            }
+        }
+        self.finish_reload();
+        Changed::Yes
+    }
+
+    /// The reload did not apply: the file did not load or its `[keys]` did not parse.
+    /// Nothing else changed.
+    pub fn reload_failed(&mut self, error: &str) -> Changed {
+        self.reload = None;
+        self.set_status(format!("config not reloaded: {error}"));
+        Changed::Yes
+    }
+
+    /// Post the reload's notice once both halves are in.
+    fn finish_reload(&mut self) {
+        let Some(Reloading {
+            changes: Some(changes),
+            roots: Some(roots),
+        }) = self.reload.clone()
+        else {
+            return;
+        };
+        self.reload = None;
+        self.set_status(reload_notice(&changes, roots));
+    }
+
     pub fn refresh_done(&mut self) -> Changed {
         if !self.refreshing {
             return Changed::No;
@@ -4314,6 +4512,15 @@ impl App {
                 self.refreshing = true;
                 self.set_status("refreshing…");
                 return (Changed::Yes, Some(Effect::Refresh));
+            }
+            // Phase 14 D: the same shape as `Refresh`, one at a time.
+            Reload => {
+                if self.reload.is_some() {
+                    return (Changed::No, None);
+                }
+                self.reload = Some(Reloading::default());
+                self.set_status("reloading…");
+                return (Changed::Yes, Some(Effect::Reload));
             }
             Help => {
                 self.help = true;
@@ -6086,6 +6293,7 @@ mod tests {
         app.apply(EngineEvent::RootsChanged(RootsChanged {
             added: vec![],
             removed: vec![root("alpha")],
+            reload: false,
         }));
         assert!(
             !app.seq.contains_key(&root("alpha")),
@@ -7161,6 +7369,224 @@ mod tests {
         );
     }
 
+    /// Phase 14 D: the notice fragments come from the running config and the file's new
+    /// one, key group by key group, and the notice says the root counts first.
+    #[test]
+    fn app_reload_changes_name_what_the_file_changed() {
+        use lastcall_engine::config::{Config, KeySpecs};
+        let old = Config::default();
+        let same = reload_changes(&old, &old.clone());
+        assert_eq!(same, ReloadChanges::default());
+        assert_eq!(
+            reload_notice(&same, (0, 0)),
+            "config reloaded, nothing changed"
+        );
+        let mut new = old.clone();
+        new.keys
+            .insert("reload".into(), KeySpecs::One("ctrl-r".into()));
+        new.ui.wrap = false;
+        new.ignore_globs.push("scratch/**".into());
+        new.collapse_size_bytes += 1;
+        new.review_ignored.push("z_ignore_*".into());
+        new.skip_globs.push("*/evals/**".into());
+        new.draft_dirs.push("notes".into());
+        let all = reload_changes(&old, &new);
+        assert_eq!(
+            all.parts,
+            vec![
+                "keys",
+                "ui",
+                "watcher",
+                "collapse",
+                "review_ignored",
+                "skip_globs",
+                "discovery"
+            ]
+        );
+        assert!(!all.next_launch);
+        assert_eq!(
+            reload_notice(&all, (1, 0)),
+            "config reloaded: 1 root added, keys, ui, watcher, collapse, review_ignored, skip_globs",
+            "the counts say what discovery did"
+        );
+        assert_eq!(
+            reload_notice(&all, (0, 0)),
+            "config reloaded: keys, ui, watcher, collapse, review_ignored, skip_globs, discovery"
+        );
+        // `hide_empty_repos` is a `[ui]`-kind setting though it sits at the top level.
+        let mut hide = old.clone();
+        hide.hide_empty_repos = true;
+        assert_eq!(reload_changes(&old, &hide).parts, vec!["ui"]);
+        // `[herdr]` and `[update]` apply at the next launch, and the notice says so.
+        let mut later = old.clone();
+        later.update.check = !later.update.check;
+        let changes = reload_changes(&old, &later);
+        assert_eq!(changes.parts, Vec::<&str>::new());
+        assert!(changes.next_launch);
+        assert_eq!(
+            reload_notice(&changes, (0, 0)),
+            format!("config reloaded; {NEXT_LAUNCH}")
+        );
+        let mut herdr = old.clone();
+        herdr.herdr.toast = !herdr.herdr.toast;
+        assert!(reload_changes(&old, &herdr).next_launch);
+        assert_eq!(
+            reload_notice(&reload_changes(&old, &herdr), (2, 1)),
+            format!("config reloaded: 2 roots added, 1 root removed; {NEXT_LAUNCH}")
+        );
+    }
+
+    /// Phase 14 D (design review F14): a `[ui]` value reaches the session toggle only when
+    /// the file changed it; a toggle the reader flipped is kept through a reload that did
+    /// not touch the line.
+    #[test]
+    fn app_reload_applies_a_ui_value_only_when_the_file_changed_it() {
+        use lastcall_engine::config::Config;
+        let mut app = three_roots();
+        let old = Config::default();
+        app.handle(Action::ToggleWrap);
+        app.handle(Action::HideEmpty);
+        let (wrap, hide) = (app.wrap, app.hide_empty);
+        assert_eq!((wrap, hide), (!old.ui.wrap, !old.hide_empty_repos));
+        let mut keys_only = old.clone();
+        keys_only.keys.insert(
+            "reload".into(),
+            lastcall_engine::config::KeySpecs::One("ctrl-r".into()),
+        );
+        app.reloaded(&old, &keys_only);
+        assert_eq!(
+            (app.wrap, app.hide_empty),
+            (wrap, hide),
+            "the file left both lines alone, so the session keeps its own"
+        );
+        let mut edited = old.clone();
+        edited.ui.wrap = !old.ui.wrap;
+        app.handle(Action::ToggleWrap); // the session is back to the old file value
+        app.reloaded(&old, &edited);
+        assert_eq!(
+            app.wrap, edited.ui.wrap,
+            "the file changed it: the file wins"
+        );
+        assert_eq!(app.hide_empty, hide, "untouched line, session value kept");
+        let mut shown = old.clone();
+        shown.hide_empty_repos = !old.hide_empty_repos;
+        app.reloaded(&old, &shown);
+        assert_eq!(app.hide_empty, shown.hide_empty_repos);
+    }
+
+    /// Phase 14 D: `R` says `reloading…` and asks for `Effect::Reload`, once; the notice
+    /// lands when both the loop's answer and the watcher's reload `RootsChanged` are in,
+    /// whichever comes first; a plain `RootsChanged` does not finish it; a refused file
+    /// ends it with the error.
+    #[test]
+    fn app_reload_notice_waits_for_both_halves_in_either_order() {
+        use lastcall_engine::config::Config;
+        let old = Config::default();
+        let mut new = old.clone();
+        new.ignore_globs.push("scratch/**".into());
+        let reload_event = |added: Vec<PathBuf>, removed: Vec<PathBuf>| {
+            EngineEvent::RootsChanged(RootsChanged {
+                added,
+                removed,
+                reload: true,
+            })
+        };
+        // The loop's answer first.
+        let mut app = three_roots();
+        assert_eq!(
+            app.handle(Action::Reload),
+            (Changed::Yes, Some(Effect::Reload))
+        );
+        assert_eq!(status(&app), "reloading…");
+        assert_eq!(
+            app.handle(Action::Reload),
+            (Changed::No, None),
+            "one at a time"
+        );
+        app.reloaded(&old, &new);
+        assert_eq!(status(&app), "reloading…", "the root counts are not in yet");
+        app.apply(EngineEvent::RootsChanged(RootsChanged {
+            added: vec![root("delta")],
+            removed: vec![],
+            reload: false,
+        }));
+        assert_eq!(
+            status(&app),
+            "reloading…",
+            "an ordinary rescan is not the reload's"
+        );
+        let (_, effect) = app.apply(reload_event(vec![root("gamma2")], vec![root("beta")]));
+        assert_eq!(effect, Some(Effect::SyncRoots));
+        assert_eq!(
+            status(&app),
+            "config reloaded: 1 root added, 1 root removed, watcher"
+        );
+        assert!(app.reload.is_none());
+        // The watcher's event first; an empty one still finishes the reload.
+        let mut app = three_roots();
+        app.handle(Action::Reload);
+        let (_, effect) = app.apply(reload_event(vec![], vec![]));
+        assert_eq!(effect, None, "nothing to sync");
+        assert_eq!(status(&app), "reloading…");
+        app.reloaded(&old, &old);
+        assert_eq!(status(&app), "config reloaded, nothing changed");
+        // A root reopened under another parent dir is added, not also removed.
+        let mut app = three_roots();
+        app.handle(Action::Reload);
+        app.reloaded(&old, &old);
+        app.apply(reload_event(vec![root("alpha")], vec![root("alpha")]));
+        assert_eq!(status(&app), "config reloaded: 1 root added");
+        // A refused file.
+        let mut app = three_roots();
+        app.handle(Action::Reload);
+        assert_eq!(
+            app.reload_failed("config file /c.toml, line 3: expected `=`"),
+            Changed::Yes
+        );
+        assert_eq!(
+            status(&app),
+            "config not reloaded: config file /c.toml, line 3: expected `=`"
+        );
+        assert!(app.reload.is_none());
+        assert_eq!(
+            app.handle(Action::Reload).1,
+            Some(Effect::Reload),
+            "free again"
+        );
+    }
+
+    /// Design review F19: a confirm modal over a root that just left the list closes and
+    /// says so; one over a root that stays, or over every root, is left open.
+    #[test]
+    fn app_roots_changed_closes_a_confirm_whose_root_left() {
+        let removed = |r: &str| {
+            EngineEvent::RootsChanged(RootsChanged {
+                added: vec![],
+                removed: vec![root(r)],
+                reload: false,
+            })
+        };
+        let mut app = three_roots();
+        app.confirm = Some(Confirm {
+            scope: ConfirmScope::Accept(AcceptScope::Root(root("beta"))),
+        });
+        app.apply(removed("gamma"));
+        assert!(app.confirm.is_some(), "another root left");
+        let name = app.root_name(&root("beta"));
+        app.apply(removed("beta"));
+        assert!(app.confirm.is_none());
+        assert_eq!(status(&app), format!("{name}: no longer listed"));
+        let mut app = three_roots();
+        app.confirm = Some(Confirm {
+            scope: ConfirmScope::Accept(AcceptScope::All),
+        });
+        app.apply(removed("beta"));
+        assert!(
+            app.confirm.is_some(),
+            "accept-all recounts over what is left"
+        );
+    }
+
     #[test]
     fn app_roots_changed_drops_removed_and_adopts_orphan_piles_on_sync() {
         let mut app = three_roots();
@@ -7168,6 +7594,7 @@ mod tests {
         let (changed, effect) = app.apply(EngineEvent::RootsChanged(RootsChanged {
             added: vec![root("gamma")],
             removed: vec![root("beta")],
+            reload: false,
         }));
         assert_eq!((changed, effect), (Changed::Yes, Some(Effect::SyncRoots)));
         assert!(!app.roots.contains_key(&root("beta")));

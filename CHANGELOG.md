@@ -21,6 +21,12 @@ binary rather than for the commit log.
   launch, and a file or repository that matches inside a watched folder is not reviewed. It
   never reaches a listed repository's own files, and a parent directory or the directory
   you launched in is never skipped.
+- `R` reads the config file again and applies it without a restart: key bindings,
+  patterns, `[ui]` values you changed in the file, and the list of repositories and watched
+  folders. A file that does not load is refused with the reason on the status line and the
+  running settings kept; nothing you accepted is touched either way. `[herdr]` and
+  `[update]` still apply at the next launch, and the status line says so. Rebind it with
+  `reload` under `[keys]`.
 
 ### Fixed
 

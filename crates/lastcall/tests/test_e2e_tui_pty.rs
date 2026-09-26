@@ -3368,7 +3368,7 @@ fn help_box_of(s: &vt100::Screen) -> Option<(usize, usize)> {
 /// height that holds the whole box the box is `rows + 4` tall (`render::render_help`), and
 /// the exact fit is one row less — the height at which the body fills the box and the draw
 /// used to spend the footer's row on a key. Every resize waits on a marker only the **new**
-/// frame can satisfy: at the exact fit the box's top border is on row 0 (at 30 rows it is
+/// frame can satisfy: at the exact fit the box's top border is on row 0 (at 34 rows it is
 /// not), and one row below that the clip notice appears.
 #[test]
 fn pty_help_overlay_says_how_to_leave_and_any_key_closes() {
@@ -3384,8 +3384,15 @@ fn pty_help_overlay_says_how_to_leave_and_any_key_closes() {
         s.contents().contains("any key closes")
     })
     .unwrap_or_else(|e| panic!("the help overlay: {e}"));
+    // Phase 14 D's `reload` row made 30 rows the exact fit itself, so the scene measures
+    // the natural box in a taller frame, where it is centred and not flush.
+    pty.resize(100, 34).expect("resize");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        help_box_of(s).is_some_and(|(top, _)| top > 0)
+    })
+    .unwrap_or_else(|e| panic!("the box centred in 34 rows: {e}\n{}", pty.screen_text()));
 
-    // 100 columns is past the 97 two columns need and 30 rows hold them: every row of the
+    // 100 columns is past the 97 two columns need and 34 rows hold them: every row of the
     // keymap is on the frame, the modal keys included, and nothing is clipped.
     let text = pty.screen_text();
     for row in [
@@ -3399,6 +3406,7 @@ fn pty_help_overlay_says_how_to_leave_and_any_key_closes() {
         "clear the file's flags",
         "workspace scope on/off",
         "rescan now",
+        "reload the config file",
         "this help",
         "quit",
         "confirm",
@@ -3411,7 +3419,7 @@ fn pty_help_overlay_says_how_to_leave_and_any_key_closes() {
         .screen(help_box_of)
         .unwrap_or_else(|| panic!("the overlay's box:\n{text}"));
     let natural = (bottom - top + 1) as u16;
-    assert!(top > 0, "at 30 rows the box is centred, not flush:\n{text}");
+    assert!(top > 0, "at 34 rows the box is centred, not flush:\n{text}");
 
     // The exact fit: one row less than the box's natural height. The body fills the box and
     // the way out is still the last thing in it.
@@ -3487,11 +3495,11 @@ fn pty_help_overlay_says_how_to_leave_and_any_key_closes() {
     // A key that means something elsewhere closes the overlay and is **spent** on it: `j`
     // does not also move the selection (`app_help_opens_and_any_key_closes_it`). The next
     // `j` does, which is how the scene knows the loop kept the keys rather than the overlay.
-    pty.resize(100, 30).expect("resize");
+    pty.resize(100, 34).expect("resize");
     pty.wait_for(Duration::from_secs(5), |s| {
         help_box_of(s).is_some_and(|(top, _)| top > 0)
     })
-    .unwrap_or_else(|e| panic!("the overlay is centred again at 30 rows: {e}"));
+    .unwrap_or_else(|e| panic!("the overlay is centred again at 34 rows: {e}"));
     pty.send(b"j").expect("j closes the overlay");
     pty.wait_for(Duration::from_secs(5), |s| {
         !s.contents().contains("any key closes") && rows_listed(s)
@@ -5369,6 +5377,118 @@ fn pty_removed_worktree_leaves_without_the_backstop_and_the_gap_refuses() {
             && find(&raw[since..], b"head inspection failed").is_none(),
         "no failure notice on the way out"
     );
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}
+
+/// Phase 14 D through the binary: the config file edited mid-scene to add a watched folder
+/// and `R` pressed: the folder is a root on the nav, the accept made before the reload is
+/// still in its ledger, and the status line says what changed. Then an invalid file and
+/// `R` again: the refusal is on the status line and a key only the running file binds (`x`,
+/// a second `refresh` key) still works. `?` lists `R`.
+#[test]
+fn pty_reload_adds_a_root_keeps_an_accept_and_refuses_a_broken_file() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let base = fixture_parent::config_toml(&fx.parent);
+    let keys = "[keys]\nrefresh = [\"r\", \"x\"]\n";
+    std::fs::write(&fx.config, format!("{base}{keys}")).expect("config written");
+    let scratch = fx.parent.join("scratch");
+    std::fs::create_dir_all(&scratch).expect("scratch folder");
+    std::fs::write(scratch.join("s1.md"), "a draft the reload brings in\n").expect("s1.md");
+
+    let Some(mut pty) = fx.spawn_tui(&bin()) else {
+        return;
+    };
+    wait_first_piles(&mut pty);
+    wait_watching(&mut pty);
+    assert!(
+        !pty.screen_text().contains("scratch"),
+        "not a root before the reload"
+    );
+
+    // An accept before the reload.
+    select_until(&mut pty, "n2.md  M ");
+    pty.send(b"A").expect("A");
+    pty.wait_for(OVERLOADED, |s| status_is(s, "accepted n2.md"))
+        .unwrap_or_else(|e| panic!("the accept: {e}\n{}", pty.screen_text()));
+    let (notes_dir, _) = fx.ledger_in("notes");
+    let notes_ledger = std::fs::read(notes_dir.join("ledger.json")).expect("notes ledger");
+    assert_eq!(undo_depth(&fx, "notes"), 1);
+
+    // The second watched folder, and `R`.
+    let edited = base.replace(
+        "draft_dirs = [\"notes\"]",
+        "draft_dirs = [\"notes\", \"scratch\"]",
+    );
+    assert_ne!(edited, base, "the fixture's draft_dirs line");
+    std::fs::write(&fx.config, format!("{edited}{keys}")).expect("config edited");
+    let t = Instant::now();
+    pty.send(b"R").expect("R");
+    pty.wait_for(LONG, |s| {
+        let text = s.contents();
+        text.contains("config reloaded: 1 root added") && text.contains("W/scratch")
+    })
+    .unwrap_or_else(|e| panic!("the reload: {e}\n{}", pty.screen_text()));
+    let reloaded = t.elapsed();
+    let line = pty
+        .screen_text()
+        .lines()
+        .last()
+        .unwrap_or_default()
+        .trim_end()
+        .to_owned();
+    pty.wait_for(Duration::from_secs(5), |s| {
+        s.contents().contains("4 repos · ")
+    })
+    .unwrap_or_else(|e| panic!("four roots: {e}\n{}", pty.screen_text()));
+    assert_eq!(
+        std::fs::read(notes_dir.join("ledger.json")).expect("notes ledger"),
+        notes_ledger,
+        "the reload wrote no ledger"
+    );
+    assert!(
+        pty.screen_text().contains("nothing pending in W/notes"),
+        "the accept survives:\n{}",
+        pty.screen_text()
+    );
+
+    // A broken file: refused, and the running keymap still answers `x`.
+    std::fs::write(&fx.config, format!("{edited}{keys}this is not toml\n")).expect("broken");
+    pty.send(b"R").expect("R");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        s.contents().contains("config not reloaded: ")
+    })
+    .unwrap_or_else(|e| panic!("the refusal: {e}\n{}", pty.screen_text()));
+    let refusal = pty
+        .screen_text()
+        .lines()
+        .last()
+        .unwrap_or_default()
+        .trim_end()
+        .to_owned();
+    pty.send(b"x").expect("x");
+    pty.wait_for(OVERLOADED, |s| status_is(s, "refreshed"))
+        .unwrap_or_else(|e| panic!("`x` still refreshes: {e}\n{}", pty.screen_text()));
+    assert!(pty.screen_text().contains("W/scratch"), "the root stays");
+
+    // `?` lists `R`.
+    pty.send(b"?").expect("?");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        let (_, cols) = s.size();
+        s.rows(0, cols)
+            .any(|r| r.contains("reload the config file") && r.contains('R'))
+    })
+    .unwrap_or_else(|e| panic!("the help row: {e}\n{}", pty.screen_text()));
+    note(&format!(
+        "PTY D reload: {line:?} after {reloaded:.3?}; then {refusal:?}; `x` still refreshes"
+    ));
+    pty.send(b"\x1b").expect("esc");
+    std::thread::sleep(Duration::from_millis(50));
 
     let since = pty.raw().len();
     pty.send(b"q").expect("q");

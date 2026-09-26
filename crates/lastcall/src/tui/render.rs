@@ -560,6 +560,10 @@ const HINT_DROP_ORDER: &[&str] = &[
     // and the pane itself shows whether it is on, so a full line gives it up before it
     // gives up anything that was on the line before this phase. That is also what keeps
     // every existing 100-column frame unchanged (design review F25).
+    // Phase 14 D: `R reload` goes before anything else, so every frame that was full before
+    // it existed is exactly the frame it was; it is on the line only where there is room
+    // to spare, and the help overlay names it at every width.
+    "reload",
     "wrap",
     "copy",
     "select",
@@ -581,7 +585,14 @@ const HINT_DROP_ORDER: &[&str] = &[
 /// [`NAV_MIN_COLS`] whatever the width arithmetic says: below 70 columns the diff takes the
 /// whole body and holds focus, so `Tab focus` toggles nothing, and `v`/`y`/`w`/`r` belong to
 /// the same wide-frame set the tiers used to gate together.
-const HINT_NAV_ONLY: &[&str] = &["scope", "focus_toggle", "refresh", "select", "copy"];
+const HINT_NAV_ONLY: &[&str] = &[
+    "scope",
+    "focus_toggle",
+    "refresh",
+    "reload",
+    "select",
+    "copy",
+];
 
 /// The hint line from the app's own keymap: `↑↓ select  ⏎ open  n/p hunk  <accept>  ^A
 /// accept all  t hide empty  Tab focus  r refresh  ? help  q quit`, where `<accept>` follows
@@ -818,6 +829,7 @@ pub fn hints(app: &App, width: u16) -> String {
             first("focus_toggle").map(|k| format!("{k} focus")),
         ),
         ("refresh", first("refresh").map(|k| format!("{k} refresh"))),
+        ("reload", first("reload").map(|k| format!("{k} reload"))),
         // Phase 8 deliverable 9: the diff pane's own two keys. They are still the first two
         // off the line (`HINT_DROP_ORDER`), so no narrower frame loses a hint it used to
         // have — and the help overlay and its mouse note name them at every width.
@@ -3093,9 +3105,10 @@ mod tests {
         // Verifier (b) F4: an empty app has no hunk to walk to and nothing to accept, so
         // neither `n/p hunk` nor `^A accept all` is offered. `render_hints_follow_the_selection`
         // is where the full line is pinned.
+        // Phase 14 D: an empty app's line has the room, so `R reload` is on it.
         assert_eq!(
             hints(&app, 100),
-            "↑↓ select  ⏎ open  t hide empty  Tab focus  r refresh  ? help  q quit"
+            "↑↓ select  ⏎ open  t hide empty  Tab focus  r refresh  R reload  ? help  q quit"
         );
         assert_eq!(
             hints(&app, 60),
@@ -3431,10 +3444,17 @@ mod tests {
             hints(&app, 136),
             "↑↓ select  ⏎ open  n/p hunk  a accept hunk  A accept file  ^A accept all  t hide empty  Tab focus  r refresh  Alt-z clip  ? help  q quit"
         );
+        // Phase 14 D: `R reload` is first in `HINT_DROP_ORDER`, so it needs ten columns
+        // more than the whole Phase 13 line, and every width up to 136 reads as it did.
+        assert_eq!(
+            hints(&app, 146),
+            "↑↓ select  ⏎ open  n/p hunk  a accept hunk  A accept file  ^A accept all  t hide empty  Tab focus  r refresh  R reload  Alt-z clip  ? help  q quit"
+        );
+        assert_eq!(hints(&app, 145), hints(&app, 136));
         assert_eq!(
             hints(&app, 200),
-            hints(&app, 136),
-            "136 is the whole nav line"
+            hints(&app, 146),
+            "146 is the whole nav line"
         );
         assert_eq!(hints(&app, 135), nav_line, "the wrap hint goes first");
         app.handle(Action::ToggleWrap);
@@ -3484,9 +3504,16 @@ mod tests {
         );
         assert_eq!(
             hints(&app, 154),
-            hints(&app, 200),
-            "154 is the whole line once the wrap hint is on it"
+            "↑↓ scroll  ← back  n/p hunk  a accept hunk  A accept file  ^A accept all  t hide empty  Tab focus  r refresh  v select  y copy  Alt-z clip  ? help  q quit",
+            "154 is the whole Phase 13 line once the wrap hint is on it"
         );
+        // Phase 14 D: `R reload` needs ten more, and is the first off.
+        assert_eq!(
+            hints(&app, 164),
+            hints(&app, 200),
+            "164 is the whole line with `R reload` on it"
+        );
+        assert_eq!(hints(&app, 163), hints(&app, 154));
         assert_eq!(
             hints(&app, 142),
             hints(&app, 153),

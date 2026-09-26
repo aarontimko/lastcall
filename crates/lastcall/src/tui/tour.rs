@@ -352,6 +352,19 @@ pub fn failure_line(path: &str, reason: &str) -> String {
     }
 }
 
+/// The sentence under a failed write's line when a reload can apply it: the file's
+/// top-level keys are re-read by the `reload` key; `[herdr]` is read at launch only.
+fn reload_applies(app: &App, setting: Setting) -> Option<String> {
+    let key = primary(app, "reload");
+    match setting {
+        Setting::HerdrScopeAll => None,
+        Setting::HideEmptyRepos | Setting::SearchDepth2 if !key.is_empty() => {
+            Some(format!("Once it is in the file, {key} applies it."))
+        }
+        Setting::HideEmptyRepos | Setting::SearchDepth2 => None,
+    }
+}
+
 // ---- the card as text -----------------------------------------------------------------
 
 /// What a line of a card is, so the painter knows how to style it and what to make clickable.
@@ -594,6 +607,15 @@ impl Tour {
                 );
                 for toml in self.card().setting().map(Setting::lines).unwrap_or(&[]) {
                     out.push(line(format!("    {toml}"), Kind::Footer));
+                }
+                // A reload applies a top-level key once the line is in the file; `[herdr]`
+                // waits for the next launch, so its card does not promise it.
+                if let Some(applies) = self.card().setting().and_then(|s| reload_applies(app, s)) {
+                    out.extend(
+                        wrap(&applies, width)
+                            .into_iter()
+                            .map(|t| line(t, Kind::Footer)),
+                    );
                 }
             }
             None if self.card().is_choice() => out.push(line(CHOICE_FOOTER, Kind::Footer)),
@@ -1436,6 +1458,34 @@ mod tests {
         assert!(
             !text.iter().any(|l| l.contains("skip the rest")),
             "the reason replaces the keys, it does not crowd in beside them"
+        );
+    }
+
+    /// Phase 14 D (F29): a reload re-reads the file, so a failed write of a top-level key
+    /// says the reload key applies the line once it is added; `[herdr]` is read at launch
+    /// only, and its card (above) promises nothing.
+    #[test]
+    fn tour_failure_says_the_reload_key_applies_a_top_level_line() {
+        let app = app_at(100, 30);
+        let mut tour = Tour::new(vec![Card::Depth {
+            path: Some("/c/config.toml".to_owned()),
+        }]);
+        tour.failed = Some(failure_line("/c/config.toml", "read-only file system"));
+        let text: Vec<String> = tour
+            .lines(&app, 92, 40)
+            .iter()
+            .filter(|l| l.kind == Kind::Footer)
+            .map(|l| l.text.clone())
+            .collect();
+        assert_eq!(
+            text,
+            vec![
+                "    /c/config.toml".to_owned(),
+                "could not write /c/config.toml: read-only file system. Add this line yourself:"
+                    .to_owned(),
+                "    search_depth = 2".to_owned(),
+                "Once it is in the file, R applies it.".to_owned(),
+            ]
         );
     }
 

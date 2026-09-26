@@ -749,6 +749,39 @@ impl Engine {
         self.config.search_depth = depth.clamp(1, crate::config::MAX_SEARCH_DEPTH);
     }
 
+    /// Apply a config file read again while running (`R`, Phase 14 D, Amendment v1.15).
+    ///
+    /// Replaces the config and the resolved parent dirs, rebuilds the `collapsed_globs`,
+    /// `ignore_globs` and `skip_globs` sets and hands every open repository its new
+    /// `review_ignored` patterns. Every `RootState` and every ledger is kept: nothing here
+    /// opens, closes or scans a root. The roots a new `parent_dirs`, `draft_dirs`,
+    /// `search_depth` or `skip_globs` implies land on the next [`Engine::rescan`], which the
+    /// caller asks the watcher for (`RescanTrigger::request_reload`), so this setter lands
+    /// first, the way [`Engine::set_search_depth`] does. A scan already running holds its
+    /// own `ScanCtx` clone and finishes under the old sets; the next one uses these.
+    ///
+    /// The environment, the state directory and the layout are the launch's and are never
+    /// replaced: `loaded.state_dir` is ignored. A `draft_initial` change reaches roots opened
+    /// from now on; an open root is never first-sighted again.
+    pub fn reload(&mut self, loaded: &Loaded, resolved: &Resolved) {
+        self.config = loaded.config.clone();
+        self.resolved = resolved.clone();
+        self.collapsed = build_globs(&self.config.collapsed_globs);
+        self.ignore = build_globs(&self.config.ignore_globs);
+        self.skip = crate::config::skip_set(&self.config.skip_globs);
+        for n in &resolved.notices {
+            if !self.notices.contains(n) {
+                self.notices.push(n.clone());
+            }
+        }
+        for root in self.roots.values_mut() {
+            if root.kind == RootKind::Git {
+                root.index
+                    .set_review_ignored(self.config.review_ignored.clone());
+            }
+        }
+    }
+
     /// How many folders below each parent dir discovery currently reads.
     pub fn search_depth(&self) -> u8 {
         self.config.search_depth
@@ -792,7 +825,20 @@ impl Engine {
             draft_dir_parents: self.config.draft_dir_parents,
             skip_globs: &self.config.skip_globs,
         });
-        let changed = roots::diff(&self.discovery, &next);
+        let mut changed = roots::diff(&self.discovery, &next);
+        // Phase 14 D (design review F5): a root that discovery now files under another
+        // parent dir is a new root in the state layout (§6.1), so it is closed here and
+        // opened below under the new parent, first-sighted there, its old record left where
+        // it was. It is reported as removed and added, so every consumer drops the old view
+        // before it takes the new one; a reload and the next launch agree on it.
+        for d in &next.roots {
+            if let Some(prev) = self.discovery.get(&d.path)
+                && prev.parent != d.parent
+            {
+                changed.removed.push(d.path.clone());
+                changed.added.push(d.path.clone());
+            }
+        }
         for n in &next.notices {
             if !self.notices.contains(n) {
                 self.notices.push(n.clone());
@@ -5039,6 +5085,58 @@ pub(crate) mod tests {
         let acc = result.expect("a refusal, not an error");
         let refused: Vec<String> = acc.outcome.refused.iter().map(|r| r.to_string()).collect();
         assert_eq!(refused, vec!["folder removed".to_owned()]);
+    }
+
+    /// Phase 14 D: `Engine::reload` replaces the config and rebuilds the glob sets, keeps
+    /// every `RootState` (same ledger, same last pile, no discovery pass), and the next scan
+    /// uses the new sets: a path newly matching `collapsed_globs` is collapsed, and a
+    /// gitignored file newly matching `review_ignored` is a row.
+    #[test]
+    fn engine_reload_keeps_every_root_and_the_next_scan_uses_the_new_sets() {
+        let repo = FixtureRepo::new("reload").unwrap();
+        let state = TempDir::new("lc-reload-state");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let r = only_root(&engine);
+        repo.write(".gitignore", "z_ignore_*\n");
+        repo.write("out.gen", "generated\n");
+        repo.write("z_ignore_notes.md", "mine\n");
+        let before = engine.scan(&r).unwrap();
+        let row = |pile: &Pile, p: &str| pile.rows.iter().find(|x| x.path == p.as_bytes()).cloned();
+        assert_eq!(row(&before, "out.gen").unwrap().collapsed, None);
+        assert!(row(&before, "z_ignore_notes.md").is_none());
+        let ledger = ledger_bytes(&engine, &r);
+        let runs = engine.discovery_runs();
+
+        let (mut loaded, resolved) = loaded_for(&repo, &state, Config::default());
+        loaded.config.collapsed_globs.push("*.gen".into());
+        loaded.config.review_ignored.push("z_ignore_*".into());
+        loaded.config.ignore_globs.push("scratch/**".into());
+        engine.reload(&loaded, &resolved);
+        assert_eq!(
+            engine.discovery_runs(),
+            runs,
+            "a reload runs no discovery itself"
+        );
+        assert_eq!(engine.root_paths(), vec![r.clone()]);
+        assert_eq!(
+            engine.root(&r).unwrap().last_pile.as_ref(),
+            Some(&before),
+            "the same RootState"
+        );
+        assert_eq!(ledger_bytes(&engine, &r), ledger, "no ledger written");
+        assert_eq!(engine.config(), &loaded.config);
+        assert!(engine.ignore_globs().is_match("scratch/a"));
+
+        let after = engine.scan(&r).unwrap();
+        assert_eq!(
+            row(&after, "out.gen").unwrap().collapsed,
+            Some(crate::scan::Collapsed::Glob)
+        );
+        assert!(
+            row(&after, "z_ignore_notes.md").is_some(),
+            "{:?}",
+            after.rows
+        );
     }
 
     /// Phase 14 C: a scan and a head inspection of a root whose directory is gone spawn no

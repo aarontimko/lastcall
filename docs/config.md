@@ -21,6 +21,19 @@ The first of these that exists wins:
 Every key is optional. **An unknown key is an error**, on every command, naming the key and
 the line: a typo in a config file never silently does nothing.
 
+**Editing the file while the review screen is open.** Press `R` (the `reload` action) and
+the file is read again, from the same place as at launch. A file that does not load, or a
+`[keys]` table that does not parse, changes nothing: the status line says
+`config not reloaded:` and the reason, and the running settings stay. A file that loads is
+applied whole: the key bindings, `[ui]` values you changed in the file (a toggle you
+flipped with a key keeps its state unless the file's value changed), the patterns, and the
+list of repositories and watched folders, which is found again at once. Nothing you
+accepted is touched, and the status line says what changed, for example
+`config reloaded: 1 root added, keys`. A few settings are read once, at launch: `[herdr]`
+and `[update]` (the status line says so when you changed them), the state directory, and
+which file is the config file. `draft_initial` applies to watched folders listed after the
+reload; one already listed keeps what it has.
+
 ## The first launch
 
 The first time you open the review screen, a small card sits over the frame and names the
@@ -48,13 +61,14 @@ file lives", under a comment saying where the line came from. If there is no con
 yet, one is created holding just that comment and that setting. **Nothing else in the file is
 touched**: your comments, your key order and your formatting survive the edit. If the write
 fails, the card says so and prints the line to add by hand, and the change still holds for
-the session.
+the session. Once you have added a top-level line yourself, `R` applies it; a `[herdr]` line
+applies at the next launch.
 
 ## The keys
 
 | key | default | what it does |
 |---|---|---|
-| `parent_dirs` | `[]`, meaning the directory you launched in | absolute paths. Every git repository directly under each one is watched, and a repository sitting untracked inside one of those is listed too, with a badge. A repository one plain folder deeper (for example `worktrees/<name>`) is reached with `search_depth`, or with its own entry here when it lives somewhere else entirely. |
+| `parent_dirs` | `[]`, meaning the directory you launched in | absolute paths. Every git repository directly under each one is watched, and a repository sitting untracked inside one of those is listed too, with a badge. A repository one plain folder deeper (for example `worktrees/<name>`) is reached with `search_depth`, or with its own entry here when it lives somewhere else entirely. A repository's review state is kept per entry here: one that comes to be found under a different entry (say it was reached through its parent folder and is now an entry of its own) starts afresh, as on the day it was first listed, and its old state is left on disk where it was. `R` and a relaunch agree on this. |
 | `draft_dirs` | `[]` | folders that are **not** git repositories, each reviewed as a root of its own. Entries are absolute paths, or globs matched under every parent directory **and under every repository that was found**, so `"z_ignore"` names the `z_ignore` folder of each repository as well as one directly inside a parent directory, and `"*/scratch"` reaches one folder further down from each of those. A plain entry reviews **the files in that folder**, and nothing below it; add `/**` to review the folder and everything below it, minus any git repository inside it and anything an inner entry of its own already reviews. `*` matches within one folder name and never across a `/`; `**` as a whole component reaches up to four folders down, and an entry may name at most four folders. A file of `collapse_size_bytes` or more is never read in a watched folder, whatever the shape: it is counted in one notice instead. |
 | `review_ignored` | `[]` | gitignored files a repository's review includes after all. Each entry is a pattern as you would write it in `.gitignore`, matched from the repository's own folder: `"z_ignore_*"` lists every gitignored file of that name at any depth, `"/notes-*.md"` only the ones at the top, and `"**/*.scratch.md"` works as it does in a `.gitignore`. A matching file is an ordinary row under its repository, new files pending as any untracked file is, with no badge. Git never looks inside an ignored folder, so a file inside one stays unlisted whatever the pattern says: to review a whole ignored folder, name the folder with a trailing slash (`"z_ignore/"`); `"z_ignore/**"` cannot reach inside it. A pattern that matches an ignored repository inside yours lists it as a nested repository, which `skip_globs` can take out again. An entry may not be empty, may not begin with `!` (every entry already re-includes), and is one line; write a trailing space as `\ `, as in `.gitignore`. Removing an entry later never hides anything: a file you accepted while it was in force stops being listed, but a later change to it, or its deletion, is still a row until you accept that too. |
 | `draft_dir_parents` | `1` | how many folders above a watched folder its name shows, `0` to `4`. With `1`, a `z_ignore` folder inside a repository is listed as `repo/z_ignore`, which is what tells two folders of the same name apart. `0` is the matched folder's path relative to the directory it was found under, so an entry of `notes` shows `notes` and an entry of `*/notes` shows `a/notes`. |
@@ -150,6 +164,7 @@ the character the keyboard sends.
 | `jump` | `g` | jump to that agent in herdr |
 | `scope` | `w` | turn the workspace scope on or off |
 | `refresh` | `r` | rescan now |
+| `reload` | `shift-r` | read the config file again and apply it (see the top of this page) |
 | `help` | `?` | the help overlay, which lists all of this live |
 | `quit` | `q`, `ctrl-c` | quit |
 

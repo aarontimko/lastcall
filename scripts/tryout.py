@@ -258,8 +258,57 @@ def scenario_ignored(sandbox):
     ]
 
 
+def scenario_reload(sandbox):
+    """`R` reads the config file again: a new watched folder, a skipped clone, a refusal."""
+    demo = sandbox.repo("demo")
+    demo.commit("base", demo.write("app.py", "def main():\n    return 1\n"))
+    demo.write("app.py", "def main():\n    return 2\n")
+    clone = sandbox.repo("evals-clone")
+    clone.commit("base", clone.write("README.md", "a clone nobody reviews\n"))
+    clone.write("README.md", "a clone nobody reviews, changed\n")
+    notes = os.path.join(sandbox.parent, "notes")
+    scratch = os.path.join(sandbox.parent, "scratch")
+    for folder, name, text in (
+        (notes, "todo.md", "- ship it\n"),
+        (scratch, "idea.md", "an idea\n"),
+    ):
+        os.makedirs(folder)
+        with open(os.path.join(folder, name), "w", encoding="utf-8") as f:
+            f.write(text)
+    sandbox.config_extra(keys='draft_dirs = [\n  "notes",\n  # "scratch",\n]')
+    config = sandbox.config
+    return [
+        "Three roots. The list shows `demo` (one change, `app.py`), `evals-clone` (one "
+        "change) and `parent/notes` (nothing pending). `parent/scratch` is not listed: its "
+        "line in the "
+        "config is commented out.",
+        "Accept something. Select `app.py` under `demo` and press `A`: the row leaves and "
+        "`demo` has nothing pending.",
+        "Uncomment the second watched folder. In a second terminal open `%s` in an editor, "
+        "delete the `# ` in front of `\"scratch\",` and save. The screen does not change: "
+        "nothing reads the file until you ask." % config,
+        "Press `R`. The status line says `config reloaded: 1 root added` and `parent/scratch` is "
+        "listed, with nothing pending (`draft_initial` is `seen`). `demo` still has nothing "
+        "pending: the accept from step 2 is intact. Edit `%s/idea.md` in the second "
+        "terminal and it shows up as a change." % scratch,
+        "Skip a repository. Add the line `skip_globs = [\"evals-clone\"]` at the very top "
+        "of the config file (above `[update]`: a top-level key cannot follow a table), save, "
+        "press `R`. The status line says `config reloaded: 1 root removed, skip_globs` and "
+        "`evals-clone` leaves the list. Delete the line and press `R` again: it is back.",
+        "Break the file. Add a last line `this is not toml` and save, then press `R`. The "
+        "status line says `config not reloaded:` then the file, the line number and what is "
+        "wrong (a narrow terminal cuts the end; widen it to read all of it). Nothing on the "
+        "screen changed and every key still works: `r` rescans and says `refreshed`.",
+        "Mend it. Remove the bad line, press `R`: `config reloaded, nothing changed`.",
+        "The key. `?` lists `R  reload the config file` next to `r`. In a terminal wide "
+        "enough, the hint line at the bottom names `R reload` after `r refresh`; it is the "
+        "first hint to go when the line is short.",
+    ]
+
+
 SCENARIOS = {
     "ignored": scenario_ignored,
+    "reload": scenario_reload,
     "wrap": scenario_wrap,
 }
 

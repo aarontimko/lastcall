@@ -136,6 +136,7 @@ as `STEPS.md` in the sandbox. What each one is for:
 |---|---|
 | `wrap` | word wrap in the diff pane: prose, code, other scripts, the cap, paging, `alt-z` |
 | `ignored` | `review_ignored`: gitignored scratch files listed under their repository, never from inside an ignored folder |
+| `reload` | `R`: a watched folder uncommented and listed without a restart, an accept that survives it, `skip_globs` taking a repository out, a broken file refused |
 
 ### `ignored`
 
@@ -147,6 +148,19 @@ badge and the one inside `z_ignore/` is absent; accept the top file; append a li
 from a second terminal (the printed step names the sandbox path and the command) and see
 one hunk; accept; delete it and accept the deletion; the deep file accepts with `A` and
 comes back with `z`.
+
+### `reload`
+
+Two repositories, `demo` (one change to `app.py`) and `evals-clone` (one change), and two
+plain folders, `notes` and `scratch`; the config lists the watched folders one per line,
+with `# "scratch",` commented out. The steps: three roots; accept `app.py`; uncomment the
+line (nothing moves until asked); `R` lists `scratch` with the notice
+`config reloaded: 1 root added`, and `demo` still has nothing pending; a
+`skip_globs = ["evals-clone"]` line at the top and `R` takes the clone out
+(`1 root removed, skip_globs`) and deleting it brings it back; a last line that is not TOML
+and `R` is refused on the status line with the file and the line, every key still working;
+mended, `R` says `nothing changed`; `?` and the hint line name `R`. The config path is long
+in a sandbox, so the refusal's end needs a wide terminal; the step says so.
 
 ## Where it sits among the other tools
 

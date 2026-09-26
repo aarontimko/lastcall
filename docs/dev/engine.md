@@ -359,6 +359,25 @@ the value the next `rescan` uses; it discovers nothing by itself. The TUI pairs 
 matters because a notify is coalesced: one that arrives first would be answered by a rescan
 still running at the old depth, and the set would then wait for the backstop.
 
+**Reloading the whole config (Phase 14 D, Amendment v1.15).** `Engine::reload(&Loaded,
+&Resolved)` is the general form of that setter: it replaces `config` and `resolved`,
+rebuilds the `collapsed`, `ignore` and `skip` sets, hands each git root's `PrivateIndex` the
+new `review_ignored`, and adds the resolved notices; it keeps every `RootState` and every
+ledger and ignores `Loaded.state_dir` (the state directory is the launch environment's). A
+scan in flight holds its `ScanCtx` clone and finishes under the old sets. The TUI follows it
+with `RescanTrigger::request_reload`, which sets the loop's `reload` flag before the notify;
+the rescan block takes the flag, re-reads its `ignore` local from the engine (the watcher's
+routing uses it), reinstalls the watches only when roots moved (the watch set is a function
+of the roots), and emits `RootsChanged { reload: true, .. }` even when the diff is empty, so
+an edit to `ignore_globs` or `[keys]` alone still reaches the TUI. When the reinstall a
+reload started ends with the same watched set, its `watching …` notice is not repeated.
+`Engine::rescan` treats a surviving path whose discovered `parent` changed as removed and
+added in the same pass: the old `RootState` is closed and the root opened (and
+first-sighted) under the new parent id, its old record left on disk, which is what a relaunch
+would do. Tests: `engine_reload_keeps_every_root_and_the_next_scan_uses_the_new_sets`
+(unit) and `test_integration_reload.rs` (parents re-pointed and back, an
+`ignore_globs`-only reload with a real watch, a repository moved between parent entries).
+
 **`skip_globs`, decided before anything is read (Phase 14, Amendment v1.15).** `discover`
 builds one `Skip` per pass from `config::skip_set` (the `draft_dirs` grammar,
 `literal_separator(true)`) and asks it about every candidate directory **before** the `.git`

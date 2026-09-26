@@ -12,6 +12,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -166,6 +167,8 @@ pub struct Watcher {
     pub handle: JoinHandle<()>,
     stop: watch::Sender<bool>,
     rescan: Arc<Notify>,
+    /// Set by [`RescanTrigger::request_reload`]; the loop's next rescan takes it.
+    reload: Arc<AtomicBool>,
 }
 
 impl Watcher {
@@ -200,7 +203,10 @@ impl Watcher {
     /// after the guard is gone. Cloning it is free and the clones coalesce exactly as
     /// [`Watcher::request_rescan`] does.
     pub fn rescan_trigger(&self) -> RescanTrigger {
-        RescanTrigger(Arc::clone(&self.rescan))
+        RescanTrigger {
+            notify: Arc::clone(&self.rescan),
+            reload: Arc::clone(&self.reload),
+        }
     }
 
     pub async fn join(self) {
@@ -212,12 +218,27 @@ impl Watcher {
 /// A clonable handle on the watcher's rescan trigger. Holding one keeps nothing alive that
 /// matters: a notify with no loop listening is a no-op.
 #[derive(Debug, Clone)]
-pub struct RescanTrigger(Arc<Notify>);
+pub struct RescanTrigger {
+    notify: Arc<Notify>,
+    reload: Arc<AtomicBool>,
+}
 
 impl RescanTrigger {
     /// [`Watcher::request_rescan`], from wherever the handle got to.
     pub fn request_rescan(&self) {
-        self.0.notify_one();
+        self.notify.notify_one();
+    }
+
+    /// The rescan a config reload asks for (`R`, Phase 14 D), after [`Engine::reload`] has
+    /// landed under the lock. A plain rescan emits `RootsChanged` only when the root set
+    /// changed, so an edit to `ignore_globs`, `[keys]` or `collapsed_globs` alone would
+    /// never reach the loop (design review F4). This one makes the loop's next rescan re-read
+    /// its roots and its `ignore_globs` from the engine and emit a `RootsChanged` with
+    /// `reload` set, even when nothing was added or removed. The flag is set before the
+    /// notify, so the pass that takes it runs after the reload's setter.
+    pub fn request_reload(&self) {
+        self.reload.store(true, Ordering::SeqCst);
+        self.notify.notify_one();
     }
 }
 
@@ -234,12 +255,14 @@ impl Engine {
         let (tx, events) = mpsc::channel(256);
         let (stop, stop_rx) = watch::channel(false);
         let rescan = Arc::new(Notify::new());
+        let reload = Arc::new(AtomicBool::new(false));
         let handle = tokio::spawn(run_loop(
             engine.clone(),
             timings,
             tx,
             stop_rx,
             rescan.clone(),
+            reload.clone(),
         ));
         Watcher {
             events,
@@ -247,6 +270,7 @@ impl Engine {
             handle,
             stop,
             rescan,
+            reload,
         }
     }
 }
@@ -666,6 +690,8 @@ async fn run_loop(
     mut stop: watch::Receiver<bool>,
     // `Watcher::request_rescan`: the discovery rescan on demand, not only on the tick.
     requested_rescan: Arc<Notify>,
+    // `RescanTrigger::request_reload`: the next rescan is a config reload's (Phase 14 D).
+    reload: Arc<AtomicBool>,
 ) {
     let (fs_tx, mut fs_rx) = mpsc::unbounded_channel::<Result<notify::Event, notify::Error>>();
     let mut watcher = match notify::recommended_watcher(move |res| {
@@ -688,7 +714,7 @@ async fn run_loop(
         }
     };
     let mut watched: BTreeSet<PathBuf> = BTreeSet::new();
-    let (mut roots, ignore) = {
+    let (mut roots, mut ignore) = {
         let g = lock(&engine);
         (root_watches(&g), g.ignore_globs().clone())
     };
@@ -700,6 +726,10 @@ async fn run_loop(
         roots.clone(),
     ));
     let mut reinstall = false;
+    // Phase 14 D: the watched set before an install a reload started. When that install
+    // lands on the same set, the `watching …` notice is not repeated, so it does not
+    // replace the reload's own notice on the status line.
+    let mut watched_before: Option<BTreeSet<PathBuf>> = None;
     // Initial scans: every root through one `scan_all` on the engine's bounded pool (Phase
     // 5 deliverable 1b), each root reported as `Scanned` the moment it finishes, the piles
     // landing together in path order. The first root used to be scanned on its own so its
@@ -787,13 +817,14 @@ async fn run_loop(
                             }
                             rescan.reset();
                             tracing::debug!(roots = roots.len(), "watch installed");
+                            let quiet = watched_before.take().is_some_and(|b| b == watched);
                             let text = format!(
                                 "watching {} ({} root{})",
                                 watched.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", "),
                                 roots.len(),
                                 if roots.len() == 1 { "" } else { "s" }
                             );
-                            if !emit(&tx, EngineEvent::Notice { root: None, text }).await { return; }
+                            if !quiet && !emit(&tx, EngineEvent::Notice { root: None, text }).await { return; }
                         }
                     }
                     Err(e) => {
@@ -853,35 +884,12 @@ async fn run_loop(
             tracing::debug!("rescan backstop");
             // Whatever asked for it, this pass covers a removal burst's pending one.
             discover.clear();
+            // Taken before the rescan: `Engine::reload` landed before the flag was set, so
+            // this pass already sees the new config.
+            let reloading = reload.swap(false, Ordering::SeqCst);
             let changed = blocking(&engine, |e| e.rescan()).await;
-            match changed {
-                Ok(changed) => {
-                    if !changed.is_empty() {
-                        roots = {
-                            let g = lock(&engine);
-                            root_watches(&g)
-                        };
-                        // Phase 14 C: a root discovery dropped has nothing left to scan,
-                        // inspect or ask about.
-                        let listed = |p: &Path| roots.iter().any(|r| r.path == p);
-                        due.retain(|p, _| listed(p));
-                        first_seen.retain(|p, _| listed(p));
-                        head_due.retain(|p| listed(p));
-                        gone_asked.retain(|p| listed(p));
-                        if install.is_some() {
-                            reinstall = true;
-                        } else {
-                            install = Some(spawn_install(
-                                watcher.take(),
-                                std::mem::take(&mut watched),
-                                roots.clone(),
-                            ));
-                        }
-                        if !emit(&tx, EngineEvent::RootsChanged(changed)).await {
-                            return;
-                        }
-                    }
-                }
+            let changed = match changed {
+                Ok(changed) => Some(changed),
                 Err(e) => {
                     if !emit(
                         &tx,
@@ -892,6 +900,53 @@ async fn run_loop(
                     )
                     .await
                     {
+                        return;
+                    }
+                    // A reload still owes its notice; the root set is what it was.
+                    reloading.then(RootsChanged::default)
+                }
+            };
+            if let Some(mut changed) = changed {
+                if reloading {
+                    tracing::debug!(
+                        added = changed.added.len(),
+                        removed = changed.removed.len(),
+                        "config reload"
+                    );
+                    // `ignore_globs` is read here and nowhere else in the loop, so this is
+                    // what re-points the watcher at the reloaded file.
+                    ignore = lock(&engine).ignore_globs().clone();
+                }
+                if !changed.is_empty() {
+                    roots = {
+                        let g = lock(&engine);
+                        root_watches(&g)
+                    };
+                    // Phase 14 C: a root discovery dropped has nothing left to scan,
+                    // inspect or ask about.
+                    let listed = |p: &Path| roots.iter().any(|r| r.path == p);
+                    due.retain(|p, _| listed(p));
+                    first_seen.retain(|p, _| listed(p));
+                    head_due.retain(|p| listed(p));
+                    gone_asked.retain(|p| listed(p));
+                    if install.is_some() {
+                        reinstall = true;
+                    } else {
+                        if reloading {
+                            watched_before = Some(watched.clone());
+                        }
+                        install = Some(spawn_install(
+                            watcher.take(),
+                            std::mem::take(&mut watched),
+                            roots.clone(),
+                        ));
+                    }
+                }
+                // The watch set is a function of the root set alone (`wanted_watches`), so
+                // a reload that moved no root has nothing to reinstall; it still emits.
+                if !changed.is_empty() || reloading {
+                    changed.reload = reloading;
+                    if !emit(&tx, EngineEvent::RootsChanged(changed)).await {
                         return;
                     }
                 }
@@ -1399,7 +1454,10 @@ mod tests {
     #[tokio::test]
     async fn watcher_rescan_trigger_is_the_loops_own_and_keeps_a_request_made_early() {
         let rescan = Arc::new(Notify::new());
-        let trigger = RescanTrigger(Arc::clone(&rescan));
+        let trigger = RescanTrigger {
+            notify: Arc::clone(&rescan),
+            reload: Arc::default(),
+        };
         let far = trigger.clone();
         far.request_rescan();
         tokio::time::timeout(Duration::from_secs(5), rescan.notified())
