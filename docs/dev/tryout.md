@@ -128,18 +128,25 @@ Rules a scenario follows:
    there at any terminal size (the help overlay folds under 97 columns, too): the hint line drops entries in a narrow terminal (`wrap` is
    the first to go, under 154 columns with the diff focused), so a step never rests on a
    hint alone.
-3. **Put a landmark at the far end of anything long.** The wrap scenario ends its long
+3. **Spell it out.** A key is named with what it does and to what: "press `ctrl-a` (hold
+   Control, press `a`: accept all), which accepts both `d.rs` and `e.rs`", never "press
+   `ctrl-a`: empty". "Empty" says what is empty ("the `demo` list has no rows"), "no group"
+   says what is missing ("no `seen` row: on `run-2` this content has never been accepted"),
+   and a git command says what it does to the repository when the reason for the next
+   screen depends on it. The sponsor's Phase 14 walk stalled at step 10 on exactly those
+   two abbreviations.
+4. **Put a landmark at the far end of anything long.** The wrap scenario ends its long
    lines in `THE-END-OF-THE-PROSE-LINE` and `END-OF-MINIFIED`, so "is the end visible" is
    a word to look for, not a judgement.
-4. **Check the keys against `DEFAULT_KEYMAP`** in `crates/lastcall/src/tui/input.rs` before
+5. **Check the keys against `DEFAULT_KEYMAP`** in `crates/lastcall/src/tui/input.rs` before
    writing them into a step, and say the laptop spelling where there is one (`End` is
    fn-Right). A step naming a key that is not bound wastes the run.
-5. **Name the run that matters.** If the feature can differ inside a herdr pane, or on a
+6. **Name the run that matters.** If the feature can differ inside a herdr pane, or on a
    second terminal, say so in a step. The footer already asks for both a standalone run and
    one inside herdr.
-6. **Nothing personal and nothing real.** File names, content and repository names are
+7. **Nothing personal and nothing real.** File names, content and repository names are
    invented. A scenario never copies from a real repository.
-7. **One scenario per thing being judged.** A scenario that has grown past a dozen steps
+8. **One scenario per thing being judged.** A scenario that has grown past a dozen steps
    is two scenarios.
 
 ## The scenarios

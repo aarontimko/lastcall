@@ -389,15 +389,25 @@ def scenario_cherry_pick(sandbox):
         "· 1 grouped seen · 0 collapsed`: every pending file, folded or not. Press `y`: "
         "the list empties. Then commit so the next switch starts clean: "
         "`git add -A && git commit -qm \"feat-x work\"`.",
-        "The rebase variant. `git switch run-2`: two rows, `d.rs` and `e.rs`, no group. "
-        "Press `ctrl-a`: empty. `git switch feat-y`: empty. `git rebase run-2`: the "
-        "list shows `seen · 2 files`, and selecting it says `content accepted on run-2`.",
-        "The squash-merge variant. `git switch feat-z`: empty. `git merge --squash run-2`: "
-        "`seen · 2 files` again.",
-        "Nothing hidden. In the second terminal: `%s`. It lists `d.rs` and `e.rs` each "
-        "with `[seen]`, then the line `seen · 2 files`. Add `--json` to the same command: "
-        "each pending row carries a `seen_on` list holding `run-2` and `groups` holds one "
-        "`\"kind\": \"seen\"`." % status,
+        "The rebase variant. In the second terminal: `git switch run-2`. lastcall's branch "
+        "line says `run-2` and two plain rows appear under it, `d.rs` and `e.rs`, with no "
+        "`seen` row: on `run-2` this content has never been accepted. In lastcall press "
+        "`ctrl-a` (hold Control, press `a`: accept all), which accepts both `d.rs` and "
+        "`e.rs`; the `demo` list now has no rows. In the second terminal: `git switch "
+        "feat-y`. The branch line says `feat-y`; the `demo` list still has no rows, "
+        "because `feat-y` has no changes of its own. Then `git rebase run-2`, which brings "
+        "the `d.rs` and `e.rs` commit onto `feat-y`: within a second or two the `demo` list "
+        "shows one row, `seen · 2 files`, not two plain rows. Select it: the right pane "
+        "says `2 files, content accepted on run-2`.",
+        "The squash-merge variant. In the second terminal: `git switch feat-z`. The branch "
+        "line says `feat-z` and the `demo` list has no rows. Then `git merge --squash "
+        "run-2`, which copies the `d.rs` and `e.rs` changes into the working tree without "
+        "committing: the `demo` list shows `seen · 2 files` again, for the same reason.",
+        "Nothing hidden. In the second terminal run lastcall's status command against this "
+        "sandbox: `%s`. It prints `d.rs` and `e.rs`, each tagged `[seen]`, then the line "
+        "`seen · 2 files`. Run the same command with `--json` added at the end: in the "
+        "JSON, each of the two pending rows has a `seen_on` list containing `run-2`, and "
+        "`groups` has one entry whose `\"kind\"` is `\"seen\"`." % status,
     ]
 
 
