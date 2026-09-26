@@ -2,6 +2,8 @@
 
 **Rulings: FROZEN 2026-09-25, item 10 ruled 2026-09-26** (§10 2026-09-25, "the first weekend on `v0.5.0`", and §10 2026-09-26, ruling 10); every item carries its ruling inline. **Adversarial design review: FOLDED 2026-09-25** (fresh-context Fable, read-only; verdict *fixes required*, 0 BLOCKER, 11 MAJOR, 14 MINOR, 6 NIT, report `z_ignore/review-phase14/design-review.md`; every finding folded into this text or ruled in the §10 entry "Phase 14 design review folded"; F7 became item 10's refined Rec, ruled "10 rec" on 2026-09-26).
 
+**Code verification: FOLDED 2026-09-26** (two fresh-context Fable verifiers after the build, one read-only on the built binaries for A/E/C/D and one with cargo for B; 0 BLOCKER, 3 MAJOR, 5 MINOR, 7 NIT across both; every finding fixed, ruled or rejected in the §10 close-out entry "Phase 14 close-out"; the fold rule ruled flag-based there, and this text says so where it once said override).
+
 **The framing (sponsor, 2026-09-25):** the sponsor's first weekend of hands-on use of `v0.5.0` produced a list, and the list is the phase. Each item was ruled in the numbered Rec/Alt format and the rulings are quoted below. The sponsor said more items may come during the weekend: a new item enters as a new deliverable with its own ruling and its own section here, never as a silent widening of an existing one, and the phase closes when the sponsor says the list is done. Target `v0.6.0`.
 
 ---
@@ -178,13 +180,13 @@ Reference implementations to imitate: `upstream.rs::annotate` and `Pile::groups(
 
 ## Gate checklist (mirrors `00-spec.md` §8 "Phase 14")
 
-- [ ] A: `others_args` unchanged for an empty list (asserted against the literal); D27 green with restarts; the three config refusals; `just tryout ignored` runs.
-- [ ] B: the fold property as a proptest; D16 as amended plus the six integration variants; the expand exit's reducer tests; snapshots at two sizes, closed and open; the PTY scene; `status --json` additive fields with the golden regenerated in its own commit; `just tryout cherry-pick` runs with every step in `docs/dev/tryout.md`.
-- [ ] C: no git spawn against a missing directory (counted on the thread-local counter) and no ledger write in the gap for a pending deletion (red on the unfixed code first); D28 both forms; the PTY scene inside the backstop; the state kept and reused.
-- [ ] D: the keymap tests; settings land before the discovery; the integration re-point with ledgers kept and a removed parent unwatched; `ignore_globs` swapped live with no root change; the PTY scene for a valid and an invalid reload; `just tryout reload` runs; the §11 `draft_dirs`-at-next-start entry closed.
-- [ ] E: the discovery and scan tests; A9 with restart; the empty list leaves every existing discovery and scan test untouched; the boundary tested (a tracked edit inside a listed repository is a row whatever the key says).
-- [ ] Docs: every file above; the em-dash counts unchanged in `docs/dev/tui.md` (210) and `docs/dev/engine.md` (84), zero in the user docs; CHANGELOG `## Unreleased`; `just lint` green; no personal detail in the diff.
-- [ ] Standing: unit floor 852 grows (count and split in the report); integration, harness, prepush, PTY and snapshot counts stated; the real-herdr subset green in CI; `just audit` in CI only.
+- [x] A: `others_args` unchanged for an empty list (asserted against the literal); D27 green with restarts; the three config refusals; `just tryout ignored` runs.
+- [x] B: the fold property as a proptest; D16 as amended plus the six integration variants; the expand exit's reducer tests; snapshots at two sizes, closed and open; the PTY scene; `status --json` additive fields with the golden regenerated in its own commit; `just tryout cherry-pick` runs with every step in `docs/dev/tryout.md`.
+- [x] C: no git spawn against a missing directory (counted on the thread-local counter) and no ledger write in the gap for a pending deletion (red on the unfixed code first); D28 both forms; the PTY scene inside the backstop; the state kept and reused.
+- [x] D: the keymap tests; settings land before the discovery; the integration re-point with ledgers kept and a removed parent unwatched; `ignore_globs` swapped live with no root change; the PTY scene for a valid and an invalid reload; `just tryout reload` runs; the §11 `draft_dirs`-at-next-start entry closed.
+- [x] E: the discovery and scan tests; A9 with restart; the empty list leaves every existing discovery and scan test untouched; the boundary tested (a tracked edit inside a listed repository is a row whatever the key says).
+- [x] Docs: every file above; the em-dash counts unchanged in `docs/dev/tui.md` (210) and `docs/dev/engine.md` (84), zero in the user docs; CHANGELOG `## Unreleased`; `just lint` green; no personal detail in the diff.
+- [x] Standing: unit floor 852 grows (count and split in the report); integration, harness, prepush, PTY and snapshot counts stated; the real-herdr subset green in CI; `just audit` in CI only.
 - [ ] **[sponsor]** on the sponsor's own machine: `just tryout cherry-pick` walked step by step, all twelve steps (ruling 10: "make sure my sponsor really walks throught his in detail"), `just tryout ignored`, `just tryout reload`, and one agent worktree removed while listed in the sponsor's own repositories, with no error on the status line; the evals clones gone with one `skip_globs` line and one `R`; the sponsor's words in §10.
 - [ ] Amendment v1.15 ratified by the merge; the §10 close-out entry with the judgment-call list; `v0.6.0` released by the sponsor's tag.
 
