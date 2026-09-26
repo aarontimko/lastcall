@@ -33,6 +33,7 @@ expression: frame
 "│               │ g              jump to the agent in herdr                        │               │"
 "│               │ w              workspace scope on/off                            │               │"
 "│               │ r              rescan now                                        │               │"
+"│               │ R              reload the config file                            │               │"
 "│               │ e              expand a collapsed file                           │               │"
 "│               │ f              full paths                                        │               │"
 "│               │ o              show org/repo                                     │               │"
