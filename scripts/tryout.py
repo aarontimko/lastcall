@@ -119,6 +119,13 @@ class Sandbox:
         # False leaves `parent_dirs` out of the config, so lastcall watches whatever
         # directory it is opened from: the way it runs with no config at all.
         self.name_parent = True
+        # The first repository built, for the printed `shell:` line.
+        self.first_repo = None
+
+    def shell_dir(self):
+        """Where the person's second terminal stands: the first repository the scenario
+        built, else the parent directory."""
+        return self.first_repo or self.parent
 
     def launch_dir(self):
         """The directory lastcall opens from; refused if it is not under `parent/`."""
@@ -129,7 +136,10 @@ class Sandbox:
         return full
 
     def repo(self, name):
-        return Repo(os.path.join(self.parent, name))
+        path = os.path.join(self.parent, name)
+        if self.first_repo is None:
+            self.first_repo = path
+        return Repo(path)
 
     def config_extra(self, keys="", tables=""):
         """Top-level `key = value` lines and whole `[table]` blocks for config.toml.
@@ -543,6 +553,10 @@ def main(argv):
     print(steps)
     print("sandbox: %s" % sandbox.base)
     print("opens in: %s" % os.path.join(sandbox.parent, sandbox.launch_in).rstrip(os.sep))
+    # The second terminal's first command, spelled out: a `cd` built on `$TMPDIR` fails
+    # silently in a shell that does not carry the variable (a pane, a multiplexer), and the
+    # next command then runs wherever that shell was.
+    print("shell:    cd '%s'   (the second terminal, before step 1)" % sandbox.shell_dir())
     print("steps:   %s" % os.path.join(sandbox.base, "STEPS.md"))
     print("reopen:  python3 '%s'" % run)
     if sandbox.moved:

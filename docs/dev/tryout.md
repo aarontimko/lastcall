@@ -48,7 +48,9 @@ it is also the evidence if a step failed: the state directory can be read with t
 `git` recipes in [`engine.md`](engine.md).
 
 The path is the same on every run, so a second terminal can `cd` to it once and stay
-right across runs. A run moves the previous run's sandbox aside first, to
+right across runs. The printout's `shell:` line is that `cd`, spelled out in full: a `cd`
+built on `$TMPDIR` fails silently in a shell that does not carry the variable, and the
+next command then runs wherever that shell was. A run moves the previous run's sandbox aside first, to
 `lastcall-tryout-<scenario>.<built-at>/`, and says so under the paths (`note: the previous
 cherry-pick sandbox was moved to …`); the old run's state is kept as evidence. A run refuses
 to start while a lastcall opened by an earlier run is still open over the path (the pid in
