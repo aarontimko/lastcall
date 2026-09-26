@@ -55,7 +55,7 @@ the session.
 | key | default | what it does |
 |---|---|---|
 | `parent_dirs` | `[]`, meaning the directory you launched in | absolute paths. Every git repository directly under each one is watched, and a repository sitting untracked inside one of those is listed too, with a badge. A repository one plain folder deeper (for example `worktrees/<name>`) is reached with `search_depth`, or with its own entry here when it lives somewhere else entirely. |
-| `draft_dirs` | `[]` | folders that are **not** git repositories, each reviewed as a root of its own. Entries are relative to a parent directory (`"notes"`, `"*/scratch"`) or absolute paths. A plain entry reviews **the files in that folder**, and nothing below it; add `/**` to review the folder and everything below it, minus any git repository inside it and anything an inner entry of its own already reviews. `*` matches within one folder name and never across a `/`; `**` as a whole component reaches up to four folders down, and an entry may name at most four folders. A file of `collapse_size_bytes` or more is never read in a watched folder, whatever the shape: it is counted in one notice instead. |
+| `draft_dirs` | `[]` | folders that are **not** git repositories, each reviewed as a root of its own. Entries are absolute paths, or globs matched under every parent directory **and under every repository that was found**, so `"z_ignore"` names the `z_ignore` folder of each repository as well as one directly inside a parent directory, and `"*/scratch"` reaches one folder further down from each of those. A plain entry reviews **the files in that folder**, and nothing below it; add `/**` to review the folder and everything below it, minus any git repository inside it and anything an inner entry of its own already reviews. `*` matches within one folder name and never across a `/`; `**` as a whole component reaches up to four folders down, and an entry may name at most four folders. A file of `collapse_size_bytes` or more is never read in a watched folder, whatever the shape: it is counted in one notice instead. |
 | `draft_dir_parents` | `1` | how many folders above a watched folder its name shows, `0` to `4`. With `1`, a `z_ignore` folder inside a repository is listed as `repo/z_ignore`, which is what tells two folders of the same name apart. `0` is the matched folder's path relative to the directory it was found under, so an entry of `notes` shows `notes` and an entry of `*/notes` shows `a/notes`. |
 | `draft_initial` | `"seen"` | what the first sight of a watched folder means. `seen` starts from zero, so only changes made after that are pending. `pending` treats everything already there as pending. |
 | `collapsed_globs` | the nine common lockfiles | paths shown as one collapsed row instead of a wall of hunks. The default list is `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `Cargo.lock`, `poetry.lock`, `uv.lock`, `Gemfile.lock`, `go.sum`, `composer.lock`. Setting the key replaces the list. |
@@ -69,7 +69,7 @@ parent_dirs = ["/home/me/src"]
 draft_dirs = [
   "notes",            # the files in notes/, and nothing below it
   "_drafts/**",       # _drafts/ and everything below it
-  "*/z_ignore",       # the scratch folder of each repository, its own files only
+  "z_ignore",         # the scratch folder of each repository, its own files only
 ]
 draft_dir_parents = 1  # listed as `repo/z_ignore`, not `z_ignore`
 draft_initial = "seen"
