@@ -22,6 +22,12 @@ binary rather than for the commit log.
   never reaches a listed repository's own files, and a parent directory or the directory
   you launched in is never skipped.
 
+### Fixed
+
+- A removed worktree now leaves the list at once, whether it was removed with `git worktree
+  remove` or by deleting the folder, instead of showing an error for up to thirty seconds.
+  An accept aimed at it in that moment is refused with `folder removed` and changes nothing.
+
 ## 0.5.0 - 2026-09-20
 
 ### Added

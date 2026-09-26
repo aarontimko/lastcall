@@ -42,7 +42,9 @@ use std::time::Duration;
 use crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, Event, MouseButton, MouseEvent, MouseEventKind,
 };
-use lastcall_engine::engine::{AcceptRequest, Engine, RenderedHunk, RestoreRequest, SaveRequest};
+use lastcall_engine::engine::{
+    AcceptRequest, Engine, EngineError, RenderedHunk, RestoreRequest, SaveRequest,
+};
 use lastcall_engine::env::Env;
 use lastcall_engine::herdr::HerdrEvent;
 use lastcall_engine::herdr::client::{Cache, ClientHandle};
@@ -58,6 +60,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use tokio::sync::mpsc;
 
+use super::app::accept_found_root_gone;
 use super::app::{
     AcceptFailed, AcceptResult, App, Changed, EditOpen, Effect, FlagKind, FlagResult,
     RestoreResult, RootMeta, SaveResult, SnoozeResult, UndoResult,
@@ -737,22 +740,35 @@ fn root_metas(engine: &Engine) -> Vec<RootMeta> {
 }
 
 /// `Effect::Refresh`: scan every root off the UI task, one `Local::Pile` per root, then
-/// `Local::RefreshDone`.
-fn spawn_refresh(engine: &Arc<Mutex<Engine>>, tx: mpsc::UnboundedSender<Local>) {
+/// `Local::RefreshDone`. A root whose folder is gone (Phase 14 C) is no failed scan: it
+/// sends nothing and the watcher is asked for the discovery pass that drops it.
+fn spawn_refresh(
+    engine: &Arc<Mutex<Engine>>,
+    tx: mpsc::UnboundedSender<Local>,
+    rescan: RescanTrigger,
+) {
     let engine = engine.clone();
     tokio::spawn(async move {
         let scan = tokio::spawn(async move { blocking(&engine, |e| e.scan_all()).await });
         let Some(results) = joined(scan, &tx, "refresh").await else {
             return;
         };
+        let mut gone = false;
         for (root, seq, result) in results {
             let local = match result {
                 Ok(pile) => Local::Pile(root, seq, pile),
+                Err(EngineError::RootGone(_)) => {
+                    gone = true;
+                    continue;
+                }
                 Err(e) => Local::Notice(Some(root), format!("scan failed: {e}")),
             };
             if tx.send(local).is_err() {
                 return;
             }
+        }
+        if gone {
+            rescan.request_rescan();
         }
         let _ = tx.send(Local::RefreshDone);
     });
@@ -765,6 +781,7 @@ fn spawn_accept(
     engine: &Arc<Mutex<Engine>>,
     tx: mpsc::UnboundedSender<Local>,
     reqs: Vec<(PathBuf, AcceptRequest)>,
+    rescan: RescanTrigger,
 ) {
     let engine = engine.clone();
     tokio::spawn(async move {
@@ -780,6 +797,11 @@ fn spawn_accept(
             .await
         });
         if let Some(results) = joined(accept, &tx, "accept").await {
+            // Phase 14 C: an accept in a root whose folder is gone was refused before any
+            // write; the watcher's discovery pass is what takes the row away.
+            if results.iter().any(|(_, r)| accept_found_root_gone(r)) {
+                rescan.request_rescan();
+            }
             let _ = tx.send(Local::Accepted(results));
         }
     });
@@ -1836,10 +1858,19 @@ pub fn run(
                         // this arm is belt and braces — and never a `break`, which would only
                         // leave this `for` and drop the rest of the pass's effects.
                         Effect::Quit => stop = Some(Stop::Quit),
-                        Effect::Refresh => spawn_refresh(&watcher.engine, local_tx.clone()),
+                        Effect::Refresh => spawn_refresh(
+                            &watcher.engine,
+                            local_tx.clone(),
+                            watcher.rescan_trigger(),
+                        ),
                         Effect::SyncRoots => spawn_sync_roots(&watcher.engine, local_tx.clone()),
                         Effect::Accept(reqs) => {
-                            spawn_accept(&watcher.engine, local_tx.clone(), reqs)
+                            spawn_accept(
+                                &watcher.engine,
+                                local_tx.clone(),
+                                reqs,
+                                watcher.rescan_trigger(),
+                            )
                         }
                         Effect::Restore(reqs) => {
                             spawn_restore(&watcher.engine, local_tx.clone(), reqs)

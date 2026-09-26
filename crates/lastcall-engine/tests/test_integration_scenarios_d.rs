@@ -1080,6 +1080,143 @@ fn scenario_d13_worktree_kept_inside_its_repository() {
     );
 }
 
+// ---- D28: a root removed while listed (Phase 14 C, Amendment v1.15) ----
+
+/// How the worktree leaves: the agent's own cleanup, or a plain `rm -r` git is not told
+/// about (the admin dir `.git/worktrees/wt` survives it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Removal {
+    WorktreeRemoveForce,
+    RmR,
+}
+
+fn scenario_d28(form: Removal) {
+    let tag = format!("D28 {form:?}");
+    // Setup: D13's layout at search_depth = 2, `wt` listed with its badge.
+    let mut repo = FixtureRepo::new("R").unwrap();
+    repo.commit_files(&[(".gitignore", ".worktrees/\n")], "ignore worktrees")
+        .unwrap();
+    repo.git(&["worktree", "add", "-q", ".worktrees/wt", "-b", "feat-w"])
+        .unwrap();
+    let parent = std::fs::canonicalize(repo.parent_dir()).unwrap();
+    let r = std::fs::canonicalize(repo.path()).unwrap();
+    let wt = std::fs::canonicalize(repo.path().join(".worktrees/wt")).unwrap();
+    let state = TempDir::new("lc-d28-state");
+    let env = repo.engine_env(state.path());
+    let mut engine = at_depth(&parent, &env, state.path(), 2);
+    assert_eq!(
+        listed(&engine, &parent),
+        vec!["R", "R/.worktrees/wt"],
+        "{tag}"
+    );
+    assert_eq!(
+        engine.root(&wt).unwrap().badge,
+        Some(Badge::WorktreeOf(r.clone()))
+    );
+    assert_pile!(engine, wt, "", "D28 first sight");
+    // A pending deletion (the accept that wrote in the gap) and a pending file.
+    std::fs::remove_file(wt.join("f2")).unwrap();
+    std::fs::write(wt.join("pend"), "p\n").unwrap();
+    let pile = assert_pile!(engine, wt, "f2|pend", "D28 pending in wt");
+    let deletion = Rendered::of(pile.row(b"f2").unwrap());
+    let ledger = engine.root(&wt).unwrap().paths.ledger.clone();
+    let seen_tree = engine.root(&wt).unwrap().ledger.seen_tree.clone();
+    assert!(seen_tree.is_some(), "{tag}: a record to keep");
+
+    // Action: the removal.
+    match form {
+        Removal::WorktreeRemoveForce => {
+            let refused = repo.git(&["worktree", "remove", ".worktrees/wt"]);
+            assert!(refused.is_err(), "plain remove refuses pending files");
+            repo.git(&["worktree", "remove", "--force", ".worktrees/wt"])
+                .unwrap();
+            assert!(!repo.path().join(".git/worktrees/wt").exists(), "{tag}");
+        }
+        Removal::RmR => {
+            std::fs::remove_dir_all(&wt).unwrap();
+            assert!(repo.path().join(".git/worktrees/wt").is_dir(), "{tag}");
+        }
+    }
+    assert!(!wt.exists(), "{tag}");
+
+    // In the gap, before discovery: the accept of the pending deletion is refused as
+    // `folder removed`, writes nothing and spawns nothing; the scan is `RootGone`, not a
+    // failed scan, and spawns nothing either.
+    let bytes = std::fs::read(&ledger).unwrap();
+    let n = lastcall_engine::git::thread_spawn_count();
+    let acc = engine
+        .accept(&wt, lastcall_engine::engine::AcceptRequest::File(deletion))
+        .expect("a refusal, not an error");
+    let scan = engine.scan(&wt);
+    assert_eq!(
+        lastcall_engine::git::thread_spawn_count() - n,
+        0,
+        "{tag}: no git against the missing directory"
+    );
+    assert_eq!(acc.outcome.refused, vec![Refused::RootGone], "{tag}");
+    assert_eq!(acc.outcome.refused[0].to_string(), "folder removed");
+    assert_eq!(
+        std::fs::read(&ledger).unwrap(),
+        bytes,
+        "{tag}: nothing written"
+    );
+    assert!(
+        matches!(&scan, Err(lastcall_engine::engine::EngineError::RootGone(p)) if *p == wt),
+        "{tag}: {scan:?}"
+    );
+
+    // The discovery pass drops it; the state directory keeps its record.
+    let changed = engine.rescan().unwrap();
+    assert_eq!(changed.removed, vec![wt.clone()], "{tag}");
+    assert!(changed.added.is_empty(), "{tag}");
+    assert_eq!(listed(&engine, &parent), vec!["R"], "{tag}");
+    assert_eq!(
+        std::fs::read(&ledger).unwrap(),
+        bytes,
+        "{tag}: the record is kept"
+    );
+    drop(engine);
+
+    // Restart: nothing listed for it, and `status` does not name it.
+    let mut engine = at_depth(&parent, &env, state.path(), 2);
+    assert_eq!(listed(&engine, &parent), vec!["R"], "{tag} restart");
+    let report = lastcall_engine::status::StatusReport::build(&mut engine, None).unwrap();
+    let roots: Vec<&str> = report.roots.iter().map(|s| s.root.as_str()).collect();
+    assert_eq!(roots, vec![r.to_str().unwrap()], "{tag} status");
+
+    // Re-added at the same path (the `rm -r` form needs the prune first: git still has it
+    // registered and refuses the add), it is listed again with its old record.
+    if form == Removal::RmR {
+        let refused = repo.git(&["worktree", "add", "-q", ".worktrees/wt", "feat-w"]);
+        assert!(refused.is_err(), "add refuses a registered path");
+        repo.git(&["worktree", "prune"]).unwrap();
+    }
+    repo.git(&["worktree", "add", "-q", ".worktrees/wt", "feat-w"])
+        .unwrap();
+    let changed = engine.rescan().unwrap();
+    assert_eq!(changed.added, vec![wt.clone()], "{tag} re-added");
+    assert_eq!(
+        engine.root(&wt).unwrap().ledger.seen_tree,
+        seen_tree,
+        "{tag}: the old record"
+    );
+    assert_eq!(
+        engine.root(&wt).unwrap().badge,
+        Some(Badge::WorktreeOf(r.clone()))
+    );
+    assert_pile!(engine, wt, "", "D28 the checkout is the seen state again");
+}
+
+#[test]
+fn scenario_d28_a_worktree_removed_by_git_leaves_and_refuses_the_gap() {
+    scenario_d28(Removal::WorktreeRemoveForce);
+}
+
+#[test]
+fn scenario_d28_variant_a_worktree_removed_by_rm_r_leaves_and_refuses_the_gap() {
+    scenario_d28(Removal::RmR);
+}
+
 // ---------------------------------------------------------------------------------------
 // Per-branch seen records (D14 to D23, Amendment v1.12). One record per branch the repo has
 // been checked out on while lastcall watched; the record in force is the one the branch

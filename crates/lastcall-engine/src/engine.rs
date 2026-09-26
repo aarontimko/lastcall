@@ -76,6 +76,12 @@ pub enum EngineError {
     /// row); this is the engine-side guard behind that.
     #[error("{path} is binary; there is no text expansion")]
     BinaryRow { root: PathBuf, path: String },
+    /// The root's directory is no longer there (Phase 14 C): a linked worktree removed, a
+    /// folder moved away or put in the trash. Not a failed scan: nothing is spawned against
+    /// the missing path, the root is not marked unscannable, and the answer is a discovery
+    /// pass, which no longer finds it. Its state on disk is kept.
+    #[error("{}: folder removed", .0.display())]
+    RootGone(PathBuf),
 }
 
 fn io_err(path: &Path, source: std::io::Error) -> EngineError {
@@ -1188,8 +1194,20 @@ fn scan_root(state: &mut RootState, ctx: &ScanCtx) -> Result<Pile, EngineError> 
             Err(e) if !last && moved_under_this_scan(&e) => attempt += 1,
             // On exhaustion `LedgerMoved` is the answer; `IndexMoved` cannot reach here,
             // because the last attempt keeps its pile and reports a notice instead.
-            other => return other,
+            other => return other.map_err(|e| gone_or(&state.path, e)),
         }
+    }
+}
+
+/// Phase 14 C: an error from a scan or a head inspection, re-checked against the root's
+/// directory. A folder removed while git was running in it fails with git's own `fatal:`
+/// or a spawn error; that is the folder leaving, not a scan that failed, so it is reported
+/// as [`EngineError::RootGone`] and the caller asks for discovery.
+fn gone_or(root: &Path, e: EngineError) -> EngineError {
+    match e {
+        EngineError::RootGone(_) => e,
+        _ if !root.is_dir() => EngineError::RootGone(root.to_path_buf()),
+        _ => e,
     }
 }
 
@@ -1198,6 +1216,12 @@ fn scan_root_once(
     ctx: &ScanCtx,
     retry_on_reseed: bool,
 ) -> Result<Pile, EngineError> {
+    // Phase 14 C: one `metadata` call before anything else, so a root whose directory is
+    // gone spawns no git (every runner uses it as the cwd) and adopts no branch switch
+    // from a `HEAD` its admin dir still holds (`sync_branch` would write the ledger).
+    if !state.path.is_dir() {
+        return Err(EngineError::RootGone(state.path.clone()));
+    }
     state.reload_ledger_if_changed();
     // R1: which record is in force, before a single baseline is read. A scan that arrives
     // on file events alone, with no head inspection behind it, still sees the switch.
@@ -1490,6 +1514,16 @@ impl Engine {
 
     /// Re-inspect HEAD; when it moved (or an operation finished), scan and describe it.
     pub fn inspect_head(&mut self, root: &Path) -> Result<Option<HeadChange>, EngineError> {
+        // Phase 14 C: first, before `sync_branch` (which spawns git with the root as its
+        // cwd and writes the ledger on a switch) and before `headstate::inspect`.
+        if !root.is_dir() {
+            return Err(EngineError::RootGone(root.to_path_buf()));
+        }
+        self.inspect_head_present(root)
+            .map_err(|e| gone_or(root, e))
+    }
+
+    fn inspect_head_present(&mut self, root: &Path) -> Result<Option<HeadChange>, EngineError> {
         let clock = self.options.clock.clone();
         let state = self
             .roots
@@ -1601,6 +1635,25 @@ impl Engine {
                 return Err(EngineError::Ops(e));
             }
         };
+        // Phase 14 C: refused because the folder is gone, so nothing was written and a
+        // scan could only fail. The refusal is the answer the status line shows; the pile
+        // is the last one this root had, and discovery takes the row away.
+        if outcome
+            .refused
+            .iter()
+            .any(|r| matches!(r, Refused::RootGone))
+        {
+            let pile = self
+                .roots
+                .get(root)
+                .and_then(|s| s.last_pile.clone())
+                .unwrap_or_default();
+            return Ok(Accepted {
+                outcome,
+                seq: self.scan_seq,
+                pile,
+            });
+        }
         let pile = self.scan(root)?;
         Ok(Accepted {
             outcome,
@@ -4935,6 +4988,101 @@ pub(crate) mod tests {
         engine.set_search_depth(1);
         engine.rescan().unwrap();
         assert_eq!(engine.root_paths(), vec![root]);
+    }
+
+    /// Phase 14 C: a linked worktree beside the fixture repository, opened and seen once,
+    /// with `f2` deleted in it so a pending deletion is on its pile. Returns the worktree's
+    /// canonical path and that deletion's rendered row; the directory is still there.
+    fn removed_root_fixture(name: &str) -> (FixtureRepo, TempDir, Engine, PathBuf, Rendered) {
+        let repo = FixtureRepo::new(name).unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let wt = repo.parent_dir().join("wt");
+        repo.git(&["worktree", "add", "-q", "-b", "wt", wt.to_str().unwrap()])
+            .unwrap();
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let wt = std::fs::canonicalize(&wt).unwrap();
+        assert!(
+            engine.root_paths().contains(&wt),
+            "{:?}",
+            engine.root_paths()
+        );
+        assert!(engine.scan(&wt).unwrap().is_empty(), "first sight");
+        std::fs::remove_file(wt.join("f2")).unwrap();
+        let pile = engine.scan(&wt).unwrap();
+        let row = pile.row(b"f2").expect("the deletion is pending");
+        let rendered = Rendered::of(row);
+        assert!(rendered.oid.is_none(), "a deletion: {rendered:?}");
+        (repo, state, engine, wt, rendered)
+    }
+
+    /// Phase 14 C, the gap: the worktree's directory is gone but discovery has not run yet.
+    /// An accept of the pending **deletion** is the one that wrote the ledger before the
+    /// fix (the path is absent, which is what a deletion accept checks for), and the scan
+    /// after it then failed on the missing directory. Now it is refused as `folder
+    /// removed` before the write, no git runs, and there is no post-op scan.
+    #[test]
+    fn engine_accept_of_a_pending_deletion_in_a_removed_root_writes_nothing() {
+        let (_repo, _state, mut engine, wt, rendered) = removed_root_fixture("eng-gone-accept");
+        let ledger_path = engine.root(&wt).unwrap().paths.ledger.clone();
+        std::fs::remove_dir_all(&wt).unwrap();
+        let read = || std::fs::read(&ledger_path).map(|b| String::from_utf8_lossy(&b).into_owned());
+        let before = read().expect("the first sight wrote the ledger");
+        let spawns = crate::git::thread_spawn_count();
+        let result = engine.accept(&wt, AcceptRequest::File(rendered));
+        let spawned = crate::git::thread_spawn_count() - spawns;
+        assert_eq!(
+            read().unwrap(),
+            before,
+            "the ledger was written in the gap (accept returned {result:?})"
+        );
+        assert_eq!(spawned, 0, "no git against a missing directory");
+        let acc = result.expect("a refusal, not an error");
+        let refused: Vec<String> = acc.outcome.refused.iter().map(|r| r.to_string()).collect();
+        assert_eq!(refused, vec!["folder removed".to_owned()]);
+    }
+
+    /// Phase 14 C: a scan and a head inspection of a root whose directory is gone spawn no
+    /// git and write nothing. The `rm -r` form leaves `.git/worktrees/wt` behind, and a
+    /// branch switch is made pending in its `HEAD`, so the test proves the `is_dir` check
+    /// comes before `sync_branch` (which would adopt the switch and write the ledger).
+    /// Discovery then drops the root and its state stays on disk.
+    #[test]
+    fn engine_scan_and_inspect_head_of_a_removed_root_spawn_nothing() {
+        let (repo, _state, mut engine, wt, _) = removed_root_fixture("eng-gone-scan");
+        repo.git(&["branch", "other"]).unwrap();
+        let ledger_path = engine.root(&wt).unwrap().paths.ledger.clone();
+        std::fs::remove_dir_all(&wt).unwrap();
+        let admin = repo.path().join(".git").join("worktrees").join("wt");
+        assert!(admin.is_dir(), "the rm -r form keeps the admin dir");
+        std::fs::write(admin.join("HEAD"), "ref: refs/heads/other\n").unwrap();
+        let read = || std::fs::read(&ledger_path).map(|b| String::from_utf8_lossy(&b).into_owned());
+        let before = read().unwrap();
+
+        let n = crate::git::thread_spawn_count();
+        let scan = engine.scan(&wt);
+        let scan_spawns = crate::git::thread_spawn_count() - n;
+        let n = crate::git::thread_spawn_count();
+        let head = engine.inspect_head(&wt);
+        let head_spawns = crate::git::thread_spawn_count() - n;
+        assert_eq!(read().unwrap(), before, "the ledger was written");
+        assert_eq!(
+            (scan_spawns, head_spawns),
+            (0, 0),
+            "git spawned against a missing directory: scan {scan:?}, inspect_head {head:?}"
+        );
+        assert!(
+            matches!(&scan, Err(EngineError::RootGone(p)) if *p == wt),
+            "{scan:?}"
+        );
+        assert!(
+            matches!(&head, Err(EngineError::RootGone(p)) if *p == wt),
+            "{head:?}"
+        );
+
+        let changed = engine.rescan().unwrap();
+        assert_eq!(changed.removed, vec![wt.clone()]);
+        assert!(!engine.root_paths().contains(&wt));
+        assert_eq!(read().unwrap(), before, "the record is kept on disk");
     }
 
     /// Out-of-range depths clamp rather than panic: the binary's callers are keystrokes.

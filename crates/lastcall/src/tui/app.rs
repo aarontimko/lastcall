@@ -1009,6 +1009,10 @@ pub type SaveResult = Result<Saved, AcceptFailed>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AcceptFailed {
     LedgerBusy,
+    /// The root's folder went away between the op and the scan after it (Phase 14 C). The
+    /// usual gap answer is the `Refused::RootGone` refusal; this is the same news arriving
+    /// one step later, and it reads the same way.
+    RootGone,
     Other(String),
 }
 
@@ -1018,8 +1022,34 @@ impl AcceptFailed {
     pub fn of(e: &EngineError) -> Self {
         match e {
             EngineError::Ops(OpsError::Ledger(LedgerError::LockBusy { .. })) => Self::LedgerBusy,
+            EngineError::RootGone(_) => Self::RootGone,
             other => Self::Other(other.to_string()),
         }
+    }
+}
+
+/// What a failure reads as after `<root>: `. `LedgerBusy` has its own sentence at every
+/// call site and is written here only for completeness.
+impl std::fmt::Display for AcceptFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LedgerBusy => f.write_str("ledger busy"),
+            Self::RootGone => f.write_str("folder removed"),
+            Self::Other(e) => f.write_str(e),
+        }
+    }
+}
+
+/// Whether one root's accept result says its folder is gone, as a refusal or as the
+/// error of the scan after the op (Phase 14 C): the loop asks for discovery on it.
+pub fn accept_found_root_gone(result: &AcceptResult) -> bool {
+    match result {
+        Ok(acc) => acc
+            .outcome
+            .refused
+            .iter()
+            .any(|r| matches!(r, Refused::RootGone)),
+        Err(e) => *e == AcceptFailed::RootGone,
     }
 }
 
@@ -2771,7 +2801,7 @@ impl App {
                 "ledger busy in {} — try again",
                 self.root_name(&root)
             )),
-            Err(AcceptFailed::Other(e)) => {
+            Err(e @ (AcceptFailed::Other(_) | AcceptFailed::RootGone)) => {
                 self.set_status(format!("{}: {e}", self.root_name(&root)))
             }
         }
@@ -2921,7 +2951,7 @@ impl App {
                 ));
                 return (Changed::Yes, None);
             }
-            Err(AcceptFailed::Other(e)) => {
+            Err(e @ (AcceptFailed::Other(_) | AcceptFailed::RootGone)) => {
                 self.set_status(format!("{}: {e}", self.root_name(&root)));
                 return (Changed::Yes, None);
             }
@@ -3135,7 +3165,9 @@ impl App {
             Err(AcceptFailed::LedgerBusy) => {
                 parts.push(format!("ledger busy in {name} — try again"))
             }
-            Err(AcceptFailed::Other(e)) => parts.push(format!("{name}: {e}")),
+            Err(e @ (AcceptFailed::Other(_) | AcceptFailed::RootGone)) => {
+                parts.push(format!("{name}: {e}"))
+            }
         }
         if inflight.is_none() && parts.is_empty() {
             return changed;
@@ -3393,7 +3425,9 @@ impl App {
             Err(AcceptFailed::LedgerBusy) => {
                 parts.push(format!("ledger busy in {name} — try again"))
             }
-            Err(AcceptFailed::Other(e)) => parts.push(format!("{name}: {e}")),
+            Err(e @ (AcceptFailed::Other(_) | AcceptFailed::RootGone)) => {
+                parts.push(format!("{name}: {e}"))
+            }
         }
         if inflight.is_none() && parts.is_empty() {
             return changed;
@@ -3465,7 +3499,7 @@ impl App {
                     "ledger busy in {} — try again",
                     self.root_name(&root)
                 )),
-                Err(AcceptFailed::Other(e)) => {
+                Err(e @ (AcceptFailed::Other(_) | AcceptFailed::RootGone)) => {
                     errors.push(format!("{}: {e}", self.root_name(&root)))
                 }
             }
@@ -3538,7 +3572,14 @@ impl App {
         let mut errors: Vec<String> = Vec::new();
         let mut ok_roots: Vec<PathBuf> = Vec::new();
         for (root, result) in results {
+            let gone = accept_found_root_gone(&result);
             match result {
+                // Phase 14 C: the folder is gone, nothing was written, and discovery is
+                // about to drop the root; the pile that came back is its last one, so it
+                // is not applied. The refusal names the root, since it names no row.
+                Ok(_) | Err(AcceptFailed::RootGone) if gone => {
+                    refusals.push(format!("{}: folder removed", self.root_name(&root)));
+                }
                 Ok(acc) => {
                     refusals.extend(acc.outcome.refused.iter().map(|r| r.to_string()));
                     ok_roots.push(root.clone());
@@ -3551,7 +3592,7 @@ impl App {
                     "ledger busy in {} — try again",
                     self.root_name(&root)
                 )),
-                Err(AcceptFailed::Other(e)) => {
+                Err(e @ (AcceptFailed::Other(_) | AcceptFailed::RootGone)) => {
                     errors.push(format!("{}: {e}", self.root_name(&root)))
                 }
             }
@@ -6441,7 +6482,7 @@ mod tests {
 
     /// The classification is on the typed error, not on the message text.
     #[test]
-    fn app_accept_failed_classifies_lock_busy_and_nothing_else() {
+    fn app_accept_failed_classifies_lock_busy_root_gone_and_nothing_else() {
         use lastcall_engine::paths::RepoPaths;
         let busy = EngineError::Ops(OpsError::Ledger(LedgerError::LockBusy {
             path: RepoPaths::under("/state/repo".into()).lock,
@@ -6453,6 +6494,47 @@ mod tests {
             AcceptFailed::of(&other),
             AcceptFailed::Other("no such root: /gone".into())
         );
+        // Phase 14 C: the scan after an op found the folder gone.
+        let gone = EngineError::RootGone("/w/wt".into());
+        assert_eq!(AcceptFailed::of(&gone), AcceptFailed::RootGone);
+        assert_eq!(AcceptFailed::RootGone.to_string(), "folder removed");
+    }
+
+    /// Phase 14 C: an accept in a root whose folder is gone comes back refused as
+    /// `RootGone` with that root's last pile. The status line names the root (the refusal
+    /// names no row), the pile is not applied, the cursor stays, and the loop is told to
+    /// ask for discovery. The same words when the news is the error of the scan after it.
+    #[test]
+    fn app_accept_in_a_removed_root_says_folder_removed_and_applies_nothing() {
+        use lastcall_engine::ops::{Outcome, Refused};
+        let mut app = three_roots();
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Accept);
+        let before = app.roots[&root("alpha")].clone();
+        let result: AcceptResult = Ok(Accepted {
+            outcome: Outcome {
+                refused: vec![Refused::RootGone],
+                ..Outcome::default()
+            },
+            seq: 99,
+            pile: Pile::default(),
+        });
+        assert!(accept_found_root_gone(&result));
+        assert_eq!(app.accepted(vec![(root("alpha"), result)]), Changed::Yes);
+        assert_eq!(status(&app), "alpha: folder removed");
+        assert_eq!(app.roots[&root("alpha")], before, "no pile applied");
+        assert_eq!(app.selection, Some(row("alpha", "f1")));
+        assert_eq!(app.accepting, None);
+
+        app.handle(Action::Accept);
+        let result: AcceptResult = Err(AcceptFailed::RootGone);
+        assert!(accept_found_root_gone(&result));
+        app.accepted(vec![(root("alpha"), result)]);
+        assert_eq!(status(&app), "alpha: folder removed");
+        assert!(!accept_found_root_gone(&Err(AcceptFailed::LedgerBusy)));
+        assert!(!accept_found_root_gone(
+            &accepted_ok("alpha", 3, Pile::default()).1
+        ));
     }
 
     #[test]

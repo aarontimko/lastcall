@@ -281,3 +281,90 @@ async fn watcher_request_rescan_finds_a_new_root_without_waiting_for_the_backsto
     );
     w.join().await;
 }
+
+/// D28 through the loop (Phase 14 C): a listed worktree removed while the watch is live
+/// leaves on the removal's own events, well inside the backstop (a minute here), with no
+/// `scan failed` and no `head inspection failed` notice on the way. The head poll is short
+/// so the `rm -r` form, whose admin dir survives, is inspected several times in the window:
+/// each of those is a silent `RootGone`, not a notice.
+async fn d28_through_the_loop(rm_r: bool) {
+    let mut repo = FixtureRepo::new("R").unwrap();
+    if !fs_events_delivered(repo.path()) {
+        use std::io::Write as _;
+        let _ = std::io::stderr().write_all(
+            b"SKIP: no filesystem event within 2 s here (fseventsd?); D28 needs the watch\n",
+        );
+        return;
+    }
+    repo.commit_files(&[(".gitignore", ".worktrees/\n")], "ignore worktrees")
+        .unwrap();
+    repo.git(&["worktree", "add", "-q", ".worktrees/wt", "-b", "feat-w"])
+        .unwrap();
+    let wt = std::fs::canonicalize(repo.path().join(".worktrees/wt")).unwrap();
+    std::fs::write(wt.join("pend"), "p\n").unwrap();
+    let state = TempDir::new("lc-watch-state");
+    let env = repo.engine_env(state.path());
+    let engine = open_engine(
+        repo.parent_dir(),
+        &env,
+        state.path(),
+        Config {
+            search_depth: 2,
+            ..Config::default()
+        },
+    );
+    assert!(
+        engine.root_paths().contains(&wt),
+        "{:?}",
+        engine.root_paths()
+    );
+    let mut w = engine.run(EngineTimings {
+        head_poll: Duration::from_millis(250),
+        rescan: Duration::from_secs(60),
+        ..EngineTimings::default()
+    });
+    wait_live(&mut w).await;
+
+    let started = tokio::time::Instant::now();
+    if rm_r {
+        std::fs::remove_dir_all(&wt).unwrap();
+    } else {
+        repo.git(&["worktree", "remove", "--force", ".worktrees/wt"])
+            .unwrap();
+    }
+    let mut left = None;
+    let mut notices = Vec::new();
+    while started.elapsed() < Duration::from_secs(5) {
+        match next_event(&mut w, Duration::from_millis(250)).await {
+            Some(EngineEvent::RootsChanged(changed)) if changed.removed.contains(&wt) => {
+                left.get_or_insert(started.elapsed());
+            }
+            Some(EngineEvent::Notice { text, .. }) => notices.push(text),
+            _ => {}
+        }
+    }
+    let took = left.expect("the removed worktree left the list within 5 s");
+    assert!(took < Duration::from_secs(5), "{took:?}");
+    eprintln!("D28 (rm -r: {rm_r}): the row left after {took:?}");
+    assert!(
+        !lock(&w.engine).root_paths().contains(&wt),
+        "the engine no longer holds it"
+    );
+    assert!(
+        notices
+            .iter()
+            .all(|n| !n.starts_with("scan failed") && !n.starts_with("head inspection failed")),
+        "{notices:?}"
+    );
+    w.join().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watcher_d28_a_worktree_removed_by_git_leaves_on_its_own_events() {
+    d28_through_the_loop(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watcher_d28_a_worktree_removed_by_rm_r_leaves_on_its_own_events() {
+    d28_through_the_loop(true).await;
+}

@@ -5295,3 +5295,84 @@ fn pty_wrap_toggles_and_alt_z_is_not_an_undo() {
     assert_eq!(status.exit_code(), 0, "{status:?}");
     assert_clean_exit(&pty, since);
 }
+
+/// Phase 14 C, D28 through the binary: a listed linked worktree removed mid-scene leaves
+/// the nav on the removal's own events, launched **without** `--poll` so the only other
+/// way out is the thirty-second backstop; and `A` on its pending deletion sent at once,
+/// inside the debounce before the discovery pass, answers `alpha-wt: folder removed` and
+/// writes nothing. The `rm -r` form: it leaves no git-dir event behind to shorten the gap.
+#[test]
+fn pty_removed_worktree_leaves_without_the_backstop_and_the_gap_refuses() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let checkout = fx.parent.join("alpha-wt");
+    fx.repo("alpha")
+        .git(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "wt",
+            &checkout.to_string_lossy(),
+            "HEAD",
+        ])
+        .expect("git worktree add");
+
+    let Ok(mut pty) = fx.command(&bin()).args(["tui"]).spawn() else {
+        note("SKIP: this host cannot open a pty");
+        return;
+    };
+    // Four roots here, so not `wait_first_piles` (which pins the fixture's three).
+    pty.wait_for(LONG, rows_listed)
+        .unwrap_or_else(|e| panic!("first piles: {e}"));
+    wait_watching(&mut pty);
+    // The agent deletes a file in the worktree: a pending deletion, the accept that wrote
+    // the ledger in the gap before the fix.
+    std::fs::remove_file(checkout.join("f3")).expect("delete f3 in the worktree");
+    pty.wait_for(LONG, |s| {
+        let t = s.contents();
+        t.contains("alpha-wt") && t.contains("D f3")
+    })
+    .unwrap_or_else(|e| panic!("the deletion in alpha-wt: {e}\n{}", pty.screen_text()));
+    select_until(&mut pty, "f3  D");
+    let (state_dir, _) = fx.ledger_in("alpha-wt");
+    let ledger = state_dir.join("ledger.json");
+    let bytes = std::fs::read(&ledger).expect("the worktree's ledger");
+    let since = pty.raw().len();
+
+    let t = Instant::now();
+    std::fs::remove_dir_all(&checkout).expect("rm -r alpha-wt");
+    pty.send(b"A").expect("A");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        status_is(s, "alpha-wt: folder removed")
+    })
+    .unwrap_or_else(|e| panic!("the gap's refusal: {e}\n{}", pty.screen_text()));
+    let refused = t.elapsed();
+    pty.wait_for(Duration::from_secs(5), |s| {
+        !s.contents().contains("alpha-wt")
+    })
+    .unwrap_or_else(|e| panic!("the row never left: {e}\n{}", pty.screen_text()));
+    let gone = t.elapsed();
+    note(&format!(
+        "PTY D28: `alpha-wt: folder removed` after {refused:.3?}; the row gone after \
+         {gone:.3?} (no --poll; backstop 30 s)"
+    ));
+    assert!(gone < Duration::from_secs(5), "{gone:?}");
+    assert_eq!(
+        std::fs::read(&ledger).expect("the record is kept"),
+        bytes,
+        "nothing written in the gap"
+    );
+    let raw = pty.raw();
+    assert!(
+        find(&raw[since..], b"scan failed").is_none()
+            && find(&raw[since..], b"head inspection failed").is_none(),
+        "no failure notice on the way out"
+    );
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}

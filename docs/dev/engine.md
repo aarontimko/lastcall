@@ -1266,3 +1266,25 @@ or missing (the development machine's fseventsd delivered nothing during Phase 2
 `crates/lastcall-engine/tests/test_integration_watcher.rs` proves delivery where it works and
 skips with a reason where it does not). `just probe-watch` demonstrates the B1
 notice (`committed on main (1 commit)`) arriving while the pending row stays.
+
+**A removed root (Phase 14 C, D28).** `scan_root_once`, `inspect_head` and
+`Ops::accept_preflight` each begin with `root.is_dir()`, before any git call and before
+`reload_ledger_if_changed` or `sync_branch` (which, unguarded, rewrote `seen_branch` from a
+worktree's still-present admin dir). A missing root is `EngineError::RootGone(path)` from
+a scan or an inspection, and `Refused::RootGone` (`folder removed`) from an accept: the
+ledger is byte-identical and the spawn count is zero, and `accept_with` returns the last pile
+without the post-op scan. A git failure that lands after the check (the folder removed
+mid-scan) is mapped to `RootGone` by `gone_or` when the folder is gone by then. The loop never
+reports `RootGone` as a failure notice: it asks for discovery at once through the rescan
+trigger, once per root until that root scans again (`gone_asked`), and the rescan's
+`removed` takes the row out. Events are classified by `classify_path`, which returns
+`Scheduled::Discover` for a path at or above a listed root that is no longer a directory,
+decided by `!path.is_dir()` and never by the event kind (FSEvents reports an `rm -r` as a
+rename as often as a remove). Discover events share one trailing-edge deadline
+(`DiscoverDue`, the same 750 ms and 3 s cap as a root's scan), so a burst of removals costs one
+discovery pass, and any rescan clears it. The TUI does the same: `spawn_refresh` drops a
+`RootGone` silently and asks for the rescan, and an accept whose result is root-gone shows
+`<root>: folder removed` and applies nothing. Undo, flag, snooze and restore are not guarded:
+each needs a selected row, and the row is gone within one debounce window. The record stays
+in the state dir, so re-adding the worktree at the same path finds its `seen_tree`
+(`scenario_d28_*`).

@@ -20,7 +20,7 @@ use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::engine::{Engine, HeadChange};
+use crate::engine::{Engine, EngineError, HeadChange};
 use crate::git::Oid;
 use crate::roots::RootsChanged;
 use crate::scan::Pile;
@@ -80,6 +80,38 @@ fn schedule(
 /// scan. Miss one and the cap re-fires immediately on the next event of a long burst.
 fn scanned(first_seen: &mut BTreeMap<PathBuf, Instant>, root: &Path) {
     first_seen.remove(root);
+}
+
+/// The discovery pass a root directory's removal asks for (Phase 14 C), on the same
+/// trailing edge and cap as a root's scan: every [`Scheduled::Discover`] of a burst moves
+/// one deadline, so an agent removing several worktrees at once costs one pass, not one
+/// per worktree. When the deadline passes the loop runs the rescan block.
+#[derive(Debug, Default)]
+struct DiscoverDue {
+    due: Option<Instant>,
+    first: Option<Instant>,
+}
+
+impl DiscoverDue {
+    fn schedule(&mut self, now: Instant, timings: &EngineTimings) {
+        let first = *self.first.get_or_insert(now);
+        self.due = Some((now + timings.debounce).min(first + timings.debounce_max));
+    }
+
+    /// Whether the pass is due at `now`; a `true` ends the burst.
+    fn take_ready(&mut self, now: Instant) -> bool {
+        if self.due.is_some_and(|d| d <= now) {
+            *self = Self::default();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// A discovery pass ran for some other reason: this burst's pass is covered.
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
 }
 
 /// Deliverable 8's watcher probes. The loop's decisions are invisible from the outside —
@@ -259,9 +291,13 @@ pub fn actionable(kind: &notify::EventKind) -> bool {
     }
 }
 
+#[derive(Debug)]
 enum Scheduled {
     Scan(PathBuf),
     Head(PathBuf),
+    /// A root's directory, or a folder above one, is no longer there (Phase 14 C): run
+    /// discovery, which no longer finds it, rather than scan a missing directory.
+    Discover,
     Ignore,
 }
 
@@ -271,12 +307,37 @@ impl Scheduled {
         match self {
             Scheduled::Scan(_) => "scan",
             Scheduled::Head(_) => "head",
+            Scheduled::Discover => "discover",
             Scheduled::Ignore => "ignore",
         }
     }
 }
 
+/// What one filesystem event schedules, path by path; nothing for an event that is not
+/// [`actionable`].
+fn classify_event(
+    ev: &notify::Event,
+    roots: &[RootWatch],
+    ignore: &globset::GlobSet,
+) -> Vec<(PathBuf, Scheduled)> {
+    if !actionable(&ev.kind) {
+        return Vec::new();
+    }
+    ev.paths
+        .iter()
+        .map(|p| (p.clone(), classify_path(p, roots, ignore)))
+        .collect()
+}
+
 fn classify_path(path: &Path, roots: &[RootWatch], ignore: &globset::GlobSet) -> Scheduled {
+    // Phase 14 C: an event at a root's own directory or above one is decided by whether
+    // the directory is still there, never by the event's kind. A removal arrives as
+    // `Remove` on one platform and as a rename (`Modify(Name(Any))`, no side given) on
+    // macOS, which is also what a move to the trash is. One `metadata` call, made only for
+    // these paths; one that still exists falls through to the rules below as before.
+    if roots.iter().any(|r| r.path.starts_with(path)) && !path.is_dir() {
+        return Scheduled::Discover;
+    }
     // Git-dir hits first: a linked worktree's git dir lives outside its root, *inside* the
     // main worktree's (`<main>/.git/worktrees/<name>`), so the longest matching dir wins
     // and, at equal length, a root's own `git_dir` beats another's shared `common_dir`.
@@ -437,31 +498,49 @@ async fn emit(tx: &mpsc::Sender<EngineEvent>, event: EngineEvent) -> bool {
     tx.send(event).await.is_ok()
 }
 
+/// What one scan or head inspection left the loop to do besides publish.
+#[derive(Debug, Default)]
+struct Outcome {
+    /// `false` when the consumer is gone and the loop should end.
+    alive: bool,
+    /// Roots whose directory is gone ([`EngineError::RootGone`]): not a failed scan and
+    /// not a notice, but a discovery pass to ask for.
+    gone: Vec<PathBuf>,
+}
+
 async fn scan_root(
     engine: &Arc<Mutex<Engine>>,
     tx: &mpsc::Sender<EngineEvent>,
     root: PathBuf,
-) -> bool {
+) -> Outcome {
     let r = root.clone();
     // The seq is read under the same lock as the scan it numbers.
     match blocking(engine, move |e| e.scan(&r).map(|pile| (e.scan_seq(), pile))).await {
-        Ok((seq, pile)) => emit(tx, EngineEvent::Pile { root, seq, pile }).await,
-        Err(e) => {
-            emit(
+        Ok((seq, pile)) => Outcome {
+            alive: emit(tx, EngineEvent::Pile { root, seq, pile }).await,
+            gone: Vec::new(),
+        },
+        Err(EngineError::RootGone(_)) => Outcome {
+            alive: true,
+            gone: vec![root],
+        },
+        Err(e) => Outcome {
+            alive: emit(
                 tx,
                 EngineEvent::Notice {
                     root: Some(root),
                     text: format!("scan failed: {e}"),
                 },
             )
-            .await
-        }
+            .await,
+            gone: Vec::new(),
+        },
     }
 }
 
 /// Scan every root in one engine call — the bounded pool — and emit the piles in path
 /// order. One lock for the whole set instead of one per root.
-async fn scan_all_roots(engine: &Arc<Mutex<Engine>>, tx: &mpsc::Sender<EngineEvent>) -> bool {
+async fn scan_all_roots(engine: &Arc<Mutex<Engine>>, tx: &mpsc::Sender<EngineEvent>) -> Outcome {
     let progress = tx.clone();
     let results = blocking(engine, move |e| {
         e.scan_all_with(&|root, rows| {
@@ -475,9 +554,14 @@ async fn scan_all_roots(engine: &Arc<Mutex<Engine>>, tx: &mpsc::Sender<EngineEve
         })
     })
     .await;
+    let mut gone = Vec::new();
     for (root, seq, result) in results {
         let ok = match result {
             Ok(pile) => emit(tx, EngineEvent::Pile { root, seq, pile }).await,
+            Err(EngineError::RootGone(_)) => {
+                gone.push(root);
+                true
+            }
             Err(e) => {
                 emit(
                     tx,
@@ -490,10 +574,10 @@ async fn scan_all_roots(engine: &Arc<Mutex<Engine>>, tx: &mpsc::Sender<EngineEve
             }
         };
         if !ok {
-            return false;
+            return Outcome { alive: false, gone };
         }
     }
-    true
+    Outcome { alive: true, gone }
 }
 
 /// The outcome of one head inspection: whether the consumer is still listening, and
@@ -502,6 +586,8 @@ async fn scan_all_roots(engine: &Arc<Mutex<Engine>>, tx: &mpsc::Sender<EngineEve
 struct Inspected {
     alive: bool,
     scanned: bool,
+    /// The root's directory is gone (Phase 14 C): ask for discovery, say nothing.
+    gone: bool,
 }
 
 async fn inspect_root(
@@ -542,11 +628,18 @@ async fn inspect_root(
             Inspected {
                 alive,
                 scanned: true,
+                gone: false,
             }
         }
         Ok(None) => Inspected {
             alive: true,
             scanned: false,
+            gone: false,
+        },
+        Err(EngineError::RootGone(_)) => Inspected {
+            alive: true,
+            scanned: false,
+            gone: true,
         },
         Err(e) => {
             let alive = emit(
@@ -560,6 +653,7 @@ async fn inspect_root(
             Inspected {
                 alive,
                 scanned: false,
+                gone: false,
             }
         }
     }
@@ -613,9 +707,16 @@ async fn run_loop(
     // (one repo listed as if it were the only one with changes while the rest were still
     // being scanned), so the TUI lists nothing until every root has reported and the head
     // start bought nothing — `first_pile_ms` on the bench is now the batch's arrival.
-    if !scan_all_roots(&engine, &tx).await {
+    // Phase 14 C: roots whose directory was found gone and for which a discovery pass has
+    // been asked. A root stays here until a scan of it succeeds or discovery drops it, so
+    // one that discovery keeps listing (nothing on disk says it should) is asked for once,
+    // not on every scan after every pass.
+    let mut gone_asked: BTreeSet<PathBuf> = BTreeSet::new();
+    let initial = scan_all_roots(&engine, &tx).await;
+    if !initial.alive {
         return;
     }
+    ask_discovery(&mut gone_asked, initial.gone, &requested_rescan);
 
     let mut due: BTreeMap<PathBuf, Instant> = BTreeMap::new();
     // When each root's current burst of worktree events began; the starvation cap's input.
@@ -639,8 +740,15 @@ async fn run_loop(
     rescan.tick().await;
 
     let mut rescan_now = false;
+    let mut discover = DiscoverDue::default();
     loop {
-        let next_due = due.values().min().copied();
+        let next_due = due
+            .values()
+            .min()
+            .copied()
+            .into_iter()
+            .chain(discover.due)
+            .min();
         let sleep = tokio::time::sleep_until(
             next_due.unwrap_or_else(|| Instant::now() + Duration::from_secs(3600)),
         );
@@ -666,11 +774,14 @@ async fn run_loop(
                                 let ok = if r.git_dir.is_some() {
                                     let done = inspect_root(&engine, &tx, r.path.clone()).await;
                                     if done.scanned { scanned(&mut first_seen, &r.path); }
+                                    if done.gone { ask_discovery(&mut gone_asked, vec![r.path.clone()], &requested_rescan); }
                                     done.alive
                                 } else {
                                     scanned(&mut first_seen, &r.path);
                                     trace_scan_due(&r.path, "refresh");
-                                    scan_root(&engine, &tx, r.path).await
+                                    let out = scan_root(&engine, &tx, r.path.clone()).await;
+                                    settle(&mut gone_asked, &r.path, out.gone, &requested_rescan);
+                                    out.alive
                                 };
                                 if !ok { return; }
                             }
@@ -703,23 +814,21 @@ async fn run_loop(
                             let now = Instant::now();
                             for r in &roots { trace_scan_due(&r.path, "rescan"); due.insert(r.path.clone(), now); }
                         }
-                        if actionable(&ev.kind) {
-                            for p in &ev.paths {
-                                let scheduled = classify_path(p, &roots, &ignore);
-                                tracing::debug!(
-                                    path = %p.display(),
-                                    kind = ?ev.kind,
-                                    scheduled = scheduled.label(),
-                                    "watch event"
-                                );
-                                match scheduled {
-                                    Scheduled::Scan(root) => {
-                                        trace_scan_due(&root, "event");
-                                        schedule(&mut due, &mut first_seen, root, Instant::now(), &timings);
-                                    }
-                                    Scheduled::Head(root) => { head_due.insert(root); }
-                                    Scheduled::Ignore => {}
+                        for (p, scheduled) in classify_event(&ev, &roots, &ignore) {
+                            tracing::debug!(
+                                path = %p.display(),
+                                kind = ?ev.kind,
+                                scheduled = scheduled.label(),
+                                "watch event"
+                            );
+                            match scheduled {
+                                Scheduled::Scan(root) => {
+                                    trace_scan_due(&root, "event");
+                                    schedule(&mut due, &mut first_seen, root, Instant::now(), &timings);
                                 }
+                                Scheduled::Head(root) => { head_due.insert(root); }
+                                Scheduled::Discover => discover.schedule(Instant::now(), &timings),
+                                Scheduled::Ignore => {}
                             }
                         }
                     }
@@ -736,8 +845,14 @@ async fn run_loop(
             _ = sleep, if next_due.is_some() => {}
         }
 
+        if discover.take_ready(Instant::now()) {
+            tracing::debug!("discover due");
+            rescan_now = true;
+        }
         if std::mem::take(&mut rescan_now) {
             tracing::debug!("rescan backstop");
+            // Whatever asked for it, this pass covers a removal burst's pending one.
+            discover.clear();
             let changed = blocking(&engine, |e| e.rescan()).await;
             match changed {
                 Ok(changed) => {
@@ -746,6 +861,13 @@ async fn run_loop(
                             let g = lock(&engine);
                             root_watches(&g)
                         };
+                        // Phase 14 C: a root discovery dropped has nothing left to scan,
+                        // inspect or ask about.
+                        let listed = |p: &Path| roots.iter().any(|r| r.path == p);
+                        due.retain(|p, _| listed(p));
+                        first_seen.retain(|p, _| listed(p));
+                        head_due.retain(|p| listed(p));
+                        gone_asked.retain(|p| listed(p));
                         if install.is_some() {
                             reinstall = true;
                         } else {
@@ -789,6 +911,9 @@ async fn run_loop(
             if done.scanned {
                 scanned(&mut first_seen, &root);
             }
+            if done.gone {
+                ask_discovery(&mut gone_asked, vec![root], &requested_rescan);
+            }
             if !done.alive {
                 return;
             }
@@ -802,10 +927,36 @@ async fn run_loop(
         for root in ready {
             due.remove(&root);
             scanned(&mut first_seen, &root);
-            if !scan_root(&engine, &tx, root).await {
+            let out = scan_root(&engine, &tx, root.clone()).await;
+            settle(&mut gone_asked, &root, out.gone, &requested_rescan);
+            if !out.alive {
                 return;
             }
         }
+    }
+}
+
+/// Phase 14 C: ask for one discovery pass for roots found gone, through the loop's own
+/// rescan trigger (a permit left for the next `select!`, so every ask in one pass of the
+/// loop is one rescan). A root already asked about is not asked about again.
+fn ask_discovery(gone_asked: &mut BTreeSet<PathBuf>, gone: Vec<PathBuf>, trigger: &Notify) {
+    let mut ask = false;
+    for root in gone {
+        ask |= gone_asked.insert(root);
+    }
+    if ask {
+        tracing::debug!("root gone, discovery asked");
+        trigger.notify_one();
+    }
+}
+
+/// [`ask_discovery`] after one root's scan: a scan that found the directory again ends
+/// that root's ask.
+fn settle(gone_asked: &mut BTreeSet<PathBuf>, root: &Path, gone: Vec<PathBuf>, trigger: &Notify) {
+    if gone.is_empty() {
+        gone_asked.remove(root);
+    } else {
+        ask_discovery(gone_asked, gone, trigger);
     }
 }
 
@@ -1112,6 +1263,133 @@ mod tests {
             Scheduled::Ignore
         ));
         assert!(matches!(is("/w/wt/src/a.rs"), Scheduled::Scan(r) if r == Path::new("/w/wt")));
+    }
+
+    /// Phase 14 C: an event at a root's own directory, or at a folder above one, is decided
+    /// by whether the directory is still there and never by the event's kind. `Remove` and
+    /// macOS's rename-away (`Modify(Name(Any))`, also a move to the trash) both give
+    /// `Discover` when it is gone; a `Modify` at a root that still exists is a scan as
+    /// before; an event below a root is a scan as before, the ignore globs included.
+    #[test]
+    fn watcher_classify_a_removed_root_is_discover_whatever_the_event_kind() {
+        use notify::event::{AccessKind, EventKind, ModifyKind, RemoveKind, RenameMode};
+        let tmp = lastcall_testkit::tmp::TempDir::new("lc-watch-gone");
+        let w = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(w.join("a")).unwrap();
+        let watch = |path: PathBuf| RootWatch {
+            parent: w.clone(),
+            git_dir: None,
+            common_dir: None,
+            path,
+        };
+        // `gone` and `sub/r` were never created: both are removed roots.
+        let roots = vec![
+            watch(w.join("a")),
+            watch(w.join("gone")),
+            watch(w.join("sub").join("r")),
+        ];
+        let ignore = crate::engine::build_globs(&["vendor/**".to_owned()]);
+        let event = |kind: EventKind, path: PathBuf| notify::Event::new(kind).add_path(path);
+        let one = |ev: notify::Event| -> Vec<&'static str> {
+            classify_event(&ev, &roots, &ignore)
+                .iter()
+                .map(|(_, s)| s.label())
+                .collect()
+        };
+        let removed = EventKind::Remove(RemoveKind::Folder);
+        let renamed = EventKind::Modify(ModifyKind::Name(RenameMode::Any));
+        assert_eq!(one(event(removed, w.join("gone"))), vec!["discover"]);
+        assert_eq!(one(event(renamed, w.join("gone"))), vec!["discover"]);
+        assert_eq!(
+            one(event(removed, w.join("sub"))),
+            vec!["discover"],
+            "a folder above a root"
+        );
+        assert!(matches!(
+            classify_path(&w.join("a"), &roots, &ignore),
+            Scheduled::Scan(r) if r == w.join("a")
+        ));
+        assert_eq!(
+            one(event(renamed, w.join("a"))),
+            vec!["scan"],
+            "the root is still there"
+        );
+        assert_eq!(one(event(removed, w.join("a").join("x.rs"))), vec!["scan"]);
+        assert_eq!(
+            one(event(removed, w.join("gone").join("x.rs"))),
+            vec!["scan"],
+            "below a root is a scan as before, gone or not"
+        );
+        assert_eq!(
+            one(event(removed, w.join("a").join("vendor").join("x"))),
+            vec!["ignore"]
+        );
+        assert!(
+            one(event(EventKind::Access(AccessKind::Any), w.join("gone"))).is_empty(),
+            "an access event still schedules nothing"
+        );
+        assert_eq!(
+            one(event(removed, w.join("elsewhere"))),
+            vec!["ignore"],
+            "a missing path that is no root and above none"
+        );
+    }
+
+    /// Phase 14 C: N removals inside one debounce window are one discovery pass, due on
+    /// the trailing edge of the last one; a writer that never pauses still gets its pass
+    /// at the cap; and a pass that ran for another reason covers the burst.
+    #[test]
+    fn watcher_removals_in_one_debounce_window_schedule_one_discovery_pass() {
+        let timings = EngineTimings::default();
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut d = DiscoverDue::default();
+        for ms in [0, 100, 200, 300, 400] {
+            d.schedule(at(ms), &timings);
+        }
+        let passes: Vec<u64> = (0..=3000)
+            .step_by(50)
+            .filter(|ms| d.take_ready(at(*ms)))
+            .collect();
+        assert_eq!(
+            passes,
+            vec![1150],
+            "one pass, 750 ms after the last removal"
+        );
+
+        let mut d = DiscoverDue::default();
+        let mut passes = Vec::new();
+        for ms in (0..=4000).step_by(500) {
+            if d.take_ready(at(ms)) {
+                passes.push(ms);
+            }
+            d.schedule(at(ms), &timings);
+        }
+        assert_eq!(passes, vec![3000], "the cap, as for a root's scan");
+
+        let mut d = DiscoverDue::default();
+        d.schedule(at(0), &timings);
+        d.clear();
+        assert!(!d.take_ready(at(5000)));
+    }
+
+    /// Phase 14 C: a root found gone asks for discovery once. A second `RootGone` for the
+    /// same root (discovery kept it, or another scan came first) asks nothing more until a
+    /// scan of it succeeds again, so a gone root that stays listed is no hot loop.
+    #[tokio::test]
+    async fn watcher_a_gone_root_asks_for_discovery_once_until_it_scans_again() {
+        let trigger = Notify::new();
+        let wait = || tokio::time::timeout(Duration::from_millis(50), trigger.notified());
+        let mut asked = BTreeSet::new();
+        let r = PathBuf::from("/w/wt");
+        ask_discovery(&mut asked, vec![r.clone()], &trigger);
+        assert!(wait().await.is_ok(), "asked");
+        settle(&mut asked, &r, vec![r.clone()], &trigger);
+        assert!(wait().await.is_err(), "not asked twice");
+        settle(&mut asked, &r, vec![], &trigger);
+        assert!(asked.is_empty(), "a scan that succeeded ends the ask");
+        settle(&mut asked, &r, vec![r.clone()], &trigger);
+        assert!(wait().await.is_ok(), "gone again, asked again");
     }
 
     /// The handle a caller carries off the watcher fires the watcher's own trigger, and a
