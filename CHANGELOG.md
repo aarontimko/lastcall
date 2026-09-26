@@ -48,6 +48,10 @@ binary rather than for the commit log.
 - A removed worktree now leaves the list at once, whether it was removed with `git worktree
   remove` or by deleting the folder, instead of showing an error for up to thirty seconds.
   An accept aimed at it in that moment is refused with `folder removed` and changes nothing.
+- A repository sitting inside a listed one when lastcall starts (a clone in an untracked
+  folder, say) is now on the screen from the start, badged, watched and kept up to date,
+  not only when it appears while the screen is open. Pressing `r` no longer hides one it
+  finds either.
 
 ## 0.5.0 - 2026-09-20
 

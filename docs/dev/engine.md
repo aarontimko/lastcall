@@ -1292,7 +1292,11 @@ and the next event opens a fresh one; a scan the loop did **not** initiate (the 
 `Effect::Refresh`, or the rescan an accept leaves behind) does not, which costs at most one
 redundant scan per window.
 `scan_all` re-runs discovery only when a scan saw a root's set of nested repositories change,
-not on every tick while one exists. Events only *schedule* work: every scan, head inspection and rescan runs on
+not on every tick while one exists; what those passes add or remove is kept on the engine
+until `Engine::take_roots_changed` drains it, which the loop does under the launch scan's own
+lock (and the backstop on every pass, for a TUI refresh's `scan_all`), so a repository
+promoted there (a clone untracked inside a listed repository at launch) is re-watched and
+announced as a `RootsChanged` like any backstop change (Phase 14 H). Events only *schedule* work: every scan, head inspection and rescan runs on
 `spawn_blocking` under the engine's mutex, and the result is published as an `EngineEvent`
 (`Pile { root, seq, pile }`, `Head` with its transition notice and the seq of the scan it
 ran, `RootsChanged`, `Notice`). `ignore_globs` scope
