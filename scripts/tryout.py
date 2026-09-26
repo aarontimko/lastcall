@@ -17,13 +17,17 @@ setup as code, plus the numbered steps to follow and what each should show.
 
 `just tryout <scenario>` builds the release binary first and then runs this.
 
-The sandbox is a fresh directory under the system temp directory holding the repositories
-(`parent/`), a state directory (`state/`), a `config.toml` naming only `parent/`, the steps
-(`STEPS.md`) and a `run.py` that reopens the same sandbox. lastcall is pointed at it with
+The sandbox is one directory per scenario under the system temp directory,
+`lastcall-tryout-<scenario>/`, holding the repositories (`parent/`), a state directory
+(`state/`), a `config.toml` naming only `parent/`, the steps (`STEPS.md`) and a `run.py`
+that reopens the same sandbox. The path is the same on every run, so a second terminal can
+`cd` to it once: a run moves the previous run's sandbox aside first (to
+`lastcall-tryout-<scenario>.<built-at>`) and refuses to start while a lastcall opened by an
+earlier run is still open over the path. lastcall is pointed at the sandbox with
 LASTCALL_STATE_DIR and LASTCALL_CONFIG, so the real `~/.local/state/lastcall` and
 `~/.config/lastcall` are never read or written. HOME is left alone on purpose: outside a
 herdr pane lastcall looks for the herdr session under the real home directory. Nothing is
-deleted afterwards; the path is printed, and the directory is the person's to remove.
+deleted afterwards; the path is printed, and the directories are the person's to remove.
 
 Adding a scenario: write a function that takes a `Sandbox`, builds what it needs with
 `sandbox.repo(...)`, `Repo.write`, `Repo.commit` and `sandbox.config_extra`, and returns the
@@ -89,10 +93,16 @@ class Sandbox:
     """The directory a scenario builds into, and the config it opens with."""
 
     def __init__(self, scenario):
-        self.base = tempfile.mkdtemp(prefix="lastcall-tryout-%s-" % scenario)
+        self.base = os.path.join(tempfile.gettempdir(), "lastcall-tryout-%s" % scenario)
+        # The previous run's sandbox, moved aside so this run's steps and git commands
+        # always name the same path; None on a first run.
+        self.moved = move_aside(self.base)
+        os.makedirs(self.base)
         self.parent = os.path.join(self.base, "parent")
         self.state = os.path.join(self.base, "state")
         self.config = os.path.join(self.state, "config.toml")
+        # `run.py` writes the pid of the lastcall it opens here; the next run reads it.
+        self.pidfile = os.path.join(self.base, "tui.pid")
         os.makedirs(self.parent)
         os.makedirs(self.state)
         # Extra TOML for the scenario: top-level keys first, then tables.
@@ -437,32 +447,59 @@ def build(name, launch_in=None):
             "os.environ['LASTCALL_STATE_DIR'] = %r\n"
             "os.environ['LASTCALL_CONFIG'] = %r\n"
             "os.chdir(%r)\n"
+            "with open(%r, 'w') as f:\n"
+            "    f.write(str(os.getpid()))\n"
             "os.execv(%r, ['lastcall', 'tui'])\n"
-            % (sandbox.state, sandbox.config, launch_dir, BINARY)
+            % (sandbox.state, sandbox.config, launch_dir, sandbox.pidfile, BINARY)
         )
     return sandbox, "\n".join(text)
 
 
-def earlier_sandboxes(name, base):
-    """The other `lastcall-tryout-<name>-*` directories beside `base`, newest first.
+def running_tui(base):
+    """The pid of a lastcall that an earlier run's `run.py` opened over `base` and that is
+    still running, or None. The pid file is written by `run.py` just before it execs the
+    binary, so the pid is the TUI's own."""
+    try:
+        with open(os.path.join(base, "tui.pid"), encoding="utf-8") as f:
+            pid = int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True
+        ).stdout
+    except OSError:
+        return None
+    return pid if "lastcall" in out else None
 
-    A person who runs a scenario twice has two sandboxes whose paths differ by a suffix,
-    and a lastcall opened by the first run keeps watching the first one; the git commands
-    in the second run's steps then land where nothing is looking. The note that lists
-    them is the difference between a puzzling "nothing changes" and a `cd` into the right
-    directory.
+
+def move_aside(base):
+    """Move the previous run's sandbox at `base` to `<base>.<built-at>` and return the new
+    path, or None when there was none.
+
+    One path per scenario is what lets a second terminal `cd` to the sandbox once and
+    stay right across runs. The move keeps the previous run's evidence, and a lastcall
+    still open over `base` would otherwise carry on writing the old run's state into the
+    new run's directory, so that is refused: quit it and run again.
     """
-    prefix = "lastcall-tryout-%s-" % name
-    tmp = os.path.dirname(base)
-    found = []
-    for entry in os.listdir(tmp):
-        path = os.path.join(tmp, entry)
-        if entry.startswith(prefix) and path != base and os.path.isdir(path):
-            steps = os.path.join(path, "STEPS.md")
-            built = os.path.getmtime(steps if os.path.exists(steps) else path)
-            found.append((built, path))
-    found.sort(reverse=True)
-    return found
+    if not os.path.lexists(base):
+        return None
+    pid = running_tui(base)
+    if pid is not None:
+        raise ValueError(
+            "a lastcall opened by an earlier run (pid %d) is still open over %s: "
+            "quit it with `q`, then run this again" % (pid, base)
+        )
+    steps = os.path.join(base, "STEPS.md")
+    built = os.path.getmtime(steps if os.path.exists(steps) else base)
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(built))
+    target = "%s.%s" % (base, stamp)
+    n = 1
+    while os.path.lexists(target):
+        n += 1
+        target = "%s.%s-%d" % (base, stamp, n)
+    os.rename(base, target)
+    return target
 
 
 def main(argv):
@@ -498,21 +535,8 @@ def main(argv):
     print("opens in: %s" % os.path.join(sandbox.parent, sandbox.launch_in).rstrip(os.sep))
     print("steps:   %s" % os.path.join(sandbox.base, "STEPS.md"))
     print("reopen:  python3 '%s'" % run)
-    others = earlier_sandboxes(name, sandbox.base)
-    if others:
-        built, newest = others[0]
-        print(
-            "note:    %d earlier %s sandbox%s here, newest built %s: %s. The steps and "
-            "the git commands above name this run's sandbox; a lastcall opened by an "
-            "earlier run is still watching that run's."
-            % (
-                len(others),
-                name,
-                "" if len(others) == 1 else "es",
-                time.strftime("%H:%M", time.localtime(built)),
-                newest,
-            )
-        )
+    if sandbox.moved:
+        print("note:    the previous %s sandbox was moved to %s" % (name, sandbox.moved))
     if "--no-launch" in flags:
         return 0
     try:

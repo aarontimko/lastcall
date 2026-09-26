@@ -32,7 +32,7 @@ a packaged run exists to surface.
 
 ## What a run leaves on disk
 
-A fresh directory under the system temp directory, `lastcall-tryout-<scenario>-<random>/`:
+One directory per scenario under the system temp directory, `lastcall-tryout-<scenario>/`:
 
 | Path | What it is |
 |---|---|
@@ -41,18 +41,25 @@ A fresh directory under the system temp directory, `lastcall-tryout-<scenario>-<
 | `state/config.toml` | `parent_dirs`, whatever the scenario added, and `[update] check = false` |
 | `STEPS.md` | the numbered steps, as printed |
 | `run.py` | reopens the same sandbox: `python3 <sandbox>/run.py` |
+| `tui.pid` | written by `run.py`: the pid of the lastcall it opened, read by the next run |
 
 Nothing is deleted afterwards. The path is printed; the directory is yours to remove, and
 it is also the evidence if a step failed: the state directory can be read with the `jq` and
 `git` recipes in [`engine.md`](engine.md).
 
-A second run of the same scenario builds a second sandbox, and the printout says so under
-the paths (`note: 1 earlier cherry-pick sandbox here, newest built 11:40: …`). The git
-commands in the steps name the sandbox of the run that printed them, and a lastcall opened
-by an earlier run is still watching that earlier sandbox; a commit made in the wrong one
-is the classic way to see nothing change. The note exists because the Phase 14 hands-on
-walk was run twice, four minutes apart, and the accept landed in one sandbox while the
-git steps ran in the other.
+The path is the same on every run, so a second terminal can `cd` to it once and stay
+right across runs. A run moves the previous run's sandbox aside first, to
+`lastcall-tryout-<scenario>.<built-at>/`, and says so under the paths (`note: the previous
+cherry-pick sandbox was moved to …`); the old run's state is kept as evidence. A run refuses
+to start while a lastcall opened by an earlier run is still open over the path (the pid in
+`tui.pid` is alive and is a lastcall): that lastcall would otherwise carry on writing the
+old run's state into the new run's directory. Quit it with `q` and run again.
+
+The stable path replaced a random suffix. The Phase 14 hands-on walk was run three times
+with a suffix per run, and each time the shell's git commands landed in an earlier run's
+sandbox while the open lastcall watched the new one, so nothing changed on screen. A walk
+that goes wrong is restarted from `just tryout <scenario>`, never patched midway: one
+command, one directory, the steps from the top.
 
 ## What it never touches
 
