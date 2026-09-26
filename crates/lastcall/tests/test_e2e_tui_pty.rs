@@ -3073,6 +3073,73 @@ fn pty_copy_writes_osc52_with_the_selected_lines() {
     assert_clean_exit(&pty, since);
 }
 
+/// Phase 14 G: the mouse copies a repository's pane, not only a diff. A click on beta's
+/// repository row, a drag over the pane's first two lines (the name line and the path),
+/// and the release writes exactly one OSC 52 whose payload is those two lines as drawn.
+#[test]
+fn pty_drag_on_a_repository_pane_copies_its_name_and_path() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let Some(mut pty) = fx.spawn_tui(&bin()) else {
+        return;
+    };
+    wait_first_piles(&mut pty);
+    wait_watching(&mut pty);
+
+    let beta_row = pty
+        .find_row(|r| r.starts_with("│beta"))
+        .expect("beta's repo row is on screen");
+    pty.click(3, beta_row).expect("click");
+    pty.wait_for_text("beta  main · 2 files", Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("clicking beta shows its pane: {e}"));
+
+    // The two lines, read before the drag: the cue covers the pane's centre after it.
+    let rows = pty.rows();
+    let top = pty
+        .find_row(|r| r.contains("beta  main · 2 files"))
+        .expect("the pane's name line");
+    let pane = col_of(&rows[top as usize], "beta  main").expect("the pane's left edge");
+    let on_screen: Vec<String> = (top..top + 2)
+        .map(|r| {
+            let text: String = rows[r as usize].chars().skip(pane as usize).collect();
+            text.trim_end().trim_end_matches('│').trim_end().to_owned()
+        })
+        .collect();
+    assert!(
+        !on_screen[1].is_empty(),
+        "the path line is drawn: {on_screen:?}"
+    );
+
+    let before = pty.raw().len();
+    pty.press(pane + 2, top).expect("press on the name line");
+    pty.drag_to(pane + 2, top + 1)
+        .expect("drag onto the path line");
+    pty.release(pane + 2, top + 1).expect("release");
+    pty.wait_for_text("copied to clipboard", Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("the cue says the copy happened: {e}"));
+
+    let raw = pty.raw();
+    let osc: Vec<usize> = (0..raw.len())
+        .filter(|i| raw[*i..].starts_with(b"\x1b]52;c;"))
+        .collect();
+    assert_eq!(osc.len(), 1, "one OSC 52 write, at {osc:?}");
+    assert!(osc[0] >= before, "and it is the one the release asked for");
+    let payload = &raw[osc[0] + b"\x1b]52;c;".len()..];
+    let end = payload.iter().position(|b| *b == 0x07).expect("the BEL");
+    let encoded = String::from_utf8(payload[..end].to_vec()).expect("base64 is ascii");
+    assert_eq!(
+        String::from_utf8(base64_decode(&encoded)).expect("the payload is the pane's text"),
+        format!("{}\n{}\n", on_screen[0], on_screen[1]),
+        "the payload decodes to the two lines that were on screen (encoded: {encoded})"
+    );
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}
+
 // ---- Phase 9b deliverable 2.6: the once-a-day update check --------------------------------
 
 /// A served release directory holding just the release answer (the notice needs nothing
@@ -3482,7 +3549,7 @@ fn pty_help_overlay_says_how_to_leave_and_any_key_closes() {
     );
     for footer in [
         "^J is a newline in the note",
-        "shift+drag selects text",
+        "drag selects text · v/y copies",
         "any key closes",
     ] {
         assert!(

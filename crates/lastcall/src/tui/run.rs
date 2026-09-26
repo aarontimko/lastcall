@@ -2263,6 +2263,7 @@ mod tests {
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
+    use lastcall_engine::scan::GroupKind;
     use ratatui::backend::TestBackend;
 
     fn key(code: KeyCode) -> Event {
@@ -3028,6 +3029,126 @@ mod tests {
         assert!(ui.app.sel.is_none(), "and it selects nothing");
         ui.event(&mouse(MouseEventKind::Up(MouseButton::Left), dx + 4, dy));
         assert!(!ui.app.dragging);
+    }
+
+    /// Deliverable G: a repository's pane is text the mouse can copy. The click on the
+    /// nav row draws the pane, the next frame's hit map carries its rectangle, and a drag
+    /// over its first two lines copies exactly those two lines on the release.
+    #[test]
+    fn run_mouse_drag_on_a_repository_pane_copies_its_lines() {
+        let mut ui = ui();
+        render_into(&mut ui);
+        let (x, y) = target_center(&ui, &Target::NavRoot(root("alpha")));
+        ui.event(&mouse(MouseEventKind::Down(MouseButton::Left), x, y));
+        ui.event(&mouse(MouseEventKind::Up(MouseButton::Left), x, y));
+        assert_eq!(ui.app.selection, Some(Selection::Root(root("alpha"))));
+        render_into(&mut ui);
+        let body = ui
+            .hits
+            .as_ref()
+            .unwrap()
+            .diff_body
+            .expect("the pane's rectangle");
+        let lines = ui.app.pane_lines();
+        assert!(lines.len() >= 2);
+
+        ui.event(&mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            body.x + 2,
+            body.y,
+        ));
+        assert_eq!(ui.app.press_line, Some(0));
+        ui.event(&mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            body.x + 2,
+            body.y + 1,
+        ));
+        assert_eq!(ui.app.sel.map(|s| s.range()), Some((0, 1)));
+        let (changed, effect) = ui.event(&mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            body.x + 2,
+            body.y + 1,
+        ));
+        assert_eq!(changed, Changed::Yes);
+        let Some(Effect::Copy(bytes)) = effect else {
+            panic!("expected a copy, got {effect:?}");
+        };
+        let text = String::from_utf8(bytes).unwrap();
+        assert_eq!(text, format!("{}\n{}\n", lines[0], lines[1]));
+        assert!(text.contains("~/W/alpha"), "the path line: {text:?}");
+        assert!(ui.app.sel.is_none());
+    }
+
+    /// Deliverable G: the blank under a short pane answers its last line, as the blank
+    /// under a short diff always has, so a press there and a drag up covers the pane.
+    #[test]
+    fn run_a_press_under_a_short_pane_selects_to_its_last_line() {
+        let mut ui = ui();
+        ui.app
+            .select(Some(Selection::Group(root("beta"), GroupKind::Upstream)));
+        render_into(&mut ui);
+        let body = ui
+            .hits
+            .as_ref()
+            .unwrap()
+            .diff_body
+            .expect("the pane's rectangle");
+        assert_eq!(ui.app.pane_lines(), ["[upstream] 1 file", "  u1"]);
+        assert_eq!(ui.hits.as_ref().unwrap().diff_rows, [0, 1]);
+
+        ui.event(&mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            body.x + 2,
+            body.y + 8,
+        ));
+        assert_eq!(
+            ui.app.press_line,
+            Some(1),
+            "the blank answers the last line"
+        );
+        ui.event(&mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            body.x + 2,
+            body.y,
+        ));
+        assert_eq!(ui.app.sel.map(|s| s.range()), Some((0, 1)));
+        let (_, effect) = ui.event(&mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            body.x + 2,
+            body.y,
+        ));
+        assert_eq!(
+            effect,
+            Some(Effect::Copy(b"[upstream] 1 file\n  u1\n".to_vec()))
+        );
+    }
+
+    /// Deliverable G: a repository frame reports the whole pane as its body, and the
+    /// measure it takes never touches `diff_short`, which only a file's own frame may set;
+    /// the next file frame measures its body afresh.
+    #[test]
+    fn run_a_repository_frame_measures_the_whole_pane_and_leaves_the_diff_short_alone() {
+        let mut ui = ui();
+        ui.app.select(Some(Selection::Root(root("alpha"))));
+        let short = ui.app.diff_short;
+        render_into(&mut ui);
+        let hits = ui.hits.clone().unwrap();
+        let body = hits.diff_body.expect("the pane's rectangle");
+        assert_eq!(
+            body,
+            hits.main.unwrap().intersection(body),
+            "inside the main pane"
+        );
+        assert_eq!(ui.app.diff_size, Some((body.width, body.height)));
+        assert_eq!(
+            ui.app.diff_short, short,
+            "a short pane is not a short file body"
+        );
+
+        // Moving to a file forgets the whole-pane measure, so the reducer's arithmetic
+        // before the next frame uses the fallback rather than a too-tall body.
+        ui.app.select(Some(row("alpha", "f1")));
+        assert_eq!(ui.app.diff_size, None);
     }
 
     #[test]
