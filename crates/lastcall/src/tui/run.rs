@@ -3267,6 +3267,56 @@ mod tests {
         assert_eq!((changed, effect), (Changed::Yes, Some(Effect::SyncRoots)));
     }
 
+    /// Phase 14 H, end to end once: the launch scan's pile for a repository it found on
+    /// the way (`beta`, nested in a listed one) lands before the watcher announces the
+    /// root. The pile is held; the `RootsChanged` asks for the root metadata and nothing
+    /// else; the metadata lists `beta` with the pile it already has, and no scan is asked
+    /// for on the way.
+    #[test]
+    fn run_a_pile_before_the_roots_changed_that_adds_its_root_is_listed_without_a_rescan() {
+        use lastcall_engine::roots::RootsChanged;
+        let mut ui = Ui::new(App::new(), Keymap::defaults());
+        ui.local(Local::Roots(vec![meta("alpha"), meta("notes")]));
+        for name in ["alpha", "notes"] {
+            assert_eq!(ui.engine(pile_event(name, pile(name))).1, None);
+        }
+        assert!(!ui.app.roots.contains_key(&root("beta")));
+
+        let (_, effect) = ui.engine(pile_event_seq("beta", 3, pile("beta")));
+        assert_eq!(effect, None, "a pile for an unknown root asks for nothing");
+        assert!(
+            !ui.app.roots.contains_key(&root("beta")),
+            "held, not listed"
+        );
+        assert!(ui.app.orphan_piles.contains_key(&root("beta")));
+
+        let (_, effect) = ui.engine(EngineEvent::RootsChanged(RootsChanged {
+            added: vec![root("beta")],
+            removed: vec![],
+            reload: false,
+        }));
+        assert_eq!(
+            effect,
+            Some(Effect::SyncRoots),
+            "the root metadata, not a scan"
+        );
+
+        assert_eq!(
+            ui.local(Local::Roots(vec![
+                meta("alpha"),
+                meta("beta"),
+                meta("notes")
+            ])),
+            (Changed::Yes, None),
+            "listed from the held pile; no further effect"
+        );
+        let beta = &ui.app.roots[&root("beta")];
+        assert!(beta.listed());
+        assert_eq!(beta.pile, pile("beta"));
+        assert!(ui.app.orphan_piles.is_empty());
+        assert!(!ui.app.refreshing, "no refresh was started");
+    }
+
     /// Verifier (b) F4: `$EDITOR` is often an absolute path, `render_status` ellipsizes from
     /// the tail, and the old `<program>: not found` therefore drew a status row of pure path
     /// with the answer cut off. The verb leads now, so a 120-character program name loses
