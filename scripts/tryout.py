@@ -296,9 +296,9 @@ def scenario_reload(sandbox):
         "press `R`. The status line says `config reloaded: 1 root removed, skip_globs` and "
         "`evals-clone` leaves the list. Delete the line and press `R` again: it is back.",
         "Break the file. Add a last line `this is not toml` and save, then press `R`. The "
-        "status line says `config not reloaded:` then the file, the line number and what is "
-        "wrong (a narrow terminal cuts the end; widen it to read all of it). Nothing on the "
-        "screen changed and every key still works: `r` rescans and says `refreshed`.",
+        "status line says `config not reloaded:` then the line number and what is wrong. "
+        "Nothing on the screen changed and every key still works: `r` rescans and says "
+        "`refreshed`.",
         "Mend it. Remove the bad line, press `R`: `config reloaded, nothing changed`.",
         "The key. `?` lists `R  reload the config file` next to `r`. In a terminal wide "
         "enough, the hint line at the bottom names `R reload` after `r refresh`; it is the "
@@ -353,15 +353,17 @@ def scenario_cherry_pick(sandbox):
         "each edited. Read them, then press `ctrl-a`: the list empties. In the second "
         "terminal: `git commit -qam \"run-1 work\"`. The list stays empty." % demo,
         "The switch. `git switch feat-x`: the branch line says `feat-x` and the list stays "
-        "empty (feat-x is main's copy).",
+        "empty (the status line says it is your first time on feat-x, carried over from "
+        "run-1).",
         "The cherry-pick. `git cherry-pick run-1`: within a second or two the list shows "
         "one row, `seen · 3 files`, not three rows.",
         "Read it. Select `seen · 3 files`: the right pane says `3 files, content accepted "
         "on run-1` and lists the three paths, each with `run-1` beside it.",
         "Open it. Press `e`: `a.rs`, `b.rs` and `c.rs` appear indented under the group "
-        "row, each badged `[seen]`, and the hint line says `e collapse`. Select `b.rs`: "
-        "its diff shows like any row's, `[seen]` on its header. Press `e` again: they fold "
-        "back and the group row is selected.",
+        "row, each badged `[seen]`; once the `HEAD moved` status line has cleared (it stays "
+        "for half a minute) the hint line says `e collapse`. Select `b.rs`: its diff shows "
+        "like any row's, `[seen]` on its header. Press `e` again: they fold back and the "
+        "group row is selected.",
         "One file changes. `printf 'extra\\n' >> b.rs`: `b.rs` becomes its own row above "
         "`seen · 2 files`, with no badge (its content is new).",
         "Flag a member. Press `e` on the group, select `c.rs`, press `m`, type a note, "
@@ -383,7 +385,7 @@ def scenario_cherry_pick(sandbox):
         "`seen · 2 files` again.",
         "Nothing hidden. In the second terminal: `%s`. It lists `d.rs` and `e.rs` each "
         "with `[seen]`, then the line `seen · 2 files`. Add `--json` to the same command: "
-        "each pending row carries `\"seen_on\": [\"run-2\"]` and `groups` holds one "
+        "each pending row carries a `seen_on` list holding `run-2` and `groups` holds one "
         "`\"kind\": \"seen\"`." % status,
     ]
 

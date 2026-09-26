@@ -159,9 +159,9 @@ line (nothing moves until asked); `R` lists `scratch` with the notice
 `config reloaded: 1 root added`, and `demo` still has nothing pending; a
 `skip_globs = ["evals-clone"]` line at the top and `R` takes the clone out
 (`1 root removed, skip_globs`) and deleting it brings it back; a last line that is not TOML
-and `R` is refused on the status line with the file and the line, every key still working;
-mended, `R` says `nothing changed`; `?` and the hint line name `R`. The config path is long
-in a sandbox, so the refusal's end needs a wide terminal; the step says so.
+and `R` is refused on the status line with the line number and the reason (the file's
+path is left off, since it would push the reason past an 80-column screen), every key
+still working; mended, `R` says `nothing changed`; `?` and the hint line name `R`.
 
 ### `cherry-pick`
 
@@ -182,7 +182,8 @@ the scenario prints them (the engine half of each is pinned by
    `seen · 3 files`, not three.
 4. Read it: select it, the right pane says `3 files, content accepted on run-1` and lists
    the three paths with `run-1` beside each.
-5. Open it: `e`, the three files indented under the group row, badged `[seen]`; select
+5. Open it: `e`, the three files indented under the group row, badged `[seen]` (the hint
+   line reads `e collapse` once the `HEAD moved` status line has cleared); select
    `b.rs`, its diff like any row's with `[seen]` on the header; `e` again folds them back
    and selects the group row.
 6. One file changes: `printf 'extra\n' >> b.rs`, `b.rs` becomes its own row (no badge)
@@ -202,8 +203,8 @@ the scenario prints them (the engine half of each is pinned by
     `seen · 2 files`.
 12. Nothing hidden: `lastcall status` (the printed line carries the sandbox's
     `LASTCALL_STATE_DIR` and `LASTCALL_CONFIG`) lists `d.rs` and `e.rs` with `[seen]` and
-    the line `seen · 2 files`; `--json` shows `"seen_on": ["run-2"]` on each row and a
-    group of kind `seen`.
+    the line `seen · 2 files`; `--json` shows a `seen_on` list holding `run-2` on each row
+    and a group of kind `seen`.
 
 The scratch files in step 9 are there because the accept-all modal only asks above ten
 files; without them `ctrl-a` accepts at once and there is no count to read.
