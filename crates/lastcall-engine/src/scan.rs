@@ -131,18 +131,59 @@ pub struct Row {
     #[serde(default)]
     pub flags: Vec<Flag>,
     pub rename: Option<Rename>,
+    /// The branches whose parked record already accepted exactly this content (Phase 14
+    /// B, Amendment v1.15), sorted; empty when none. Set by `seen.rs` after the scan,
+    /// never by it. `#[serde(default)]` so recorded-pile fixtures written before it load.
+    #[serde(default)]
+    pub seen_on: Vec<String>,
 }
 
 impl Row {
     pub fn path_lossy(&self) -> String {
         String::from_utf8_lossy(&self.path).into_owned()
     }
+
+    /// Whether this row folds into the `seen · N files` group (Phase 14 B): its content
+    /// was accepted on another branch, it is not an upstream or mixed row, and it carries
+    /// nothing of the user's own: no flag, so no note. A pending deletion is always a row.
+    /// A flagged row stays a row (with a `[seen]` badge). An accept-only override is
+    /// **not** a reason to stay: compaction
+    /// folds those into the seen tree, and whether a row folds must not change when the
+    /// record is compacted (the pile is identical across a compaction).
+    pub fn folds_seen(&self) -> bool {
+        !self.seen_on.is_empty()
+            && self.current.is_some()
+            && self.annotation.is_none()
+            && self.flags.is_empty()
+    }
 }
 
-/// A derived group row (§6.7 "upstream · N files").
+/// What a derived group row gathers. `Annotation` stays the row's own label, so a row is
+/// never annotated `Seen`; the seen group is built from [`Row::seen_on`] instead.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum GroupKind {
+    Upstream,
+    Mixed,
+    Seen,
+}
+
+impl GroupKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            GroupKind::Upstream => "upstream",
+            GroupKind::Mixed => "mixed",
+            GroupKind::Seen => "seen",
+        }
+    }
+}
+
+/// A derived group row (§6.7 "upstream · N files", Phase 14 B "seen · N files").
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Group {
-    pub kind: Annotation,
+    pub kind: GroupKind,
     pub paths: Vec<Vec<u8>>,
 }
 
@@ -191,22 +232,34 @@ impl Pile {
         self.rows.iter().find(|r| r.path == path)
     }
 
-    /// The rows tagged `upstream`, as one group (empty when none).
+    /// The derived groups, in nav order: the rows tagged `upstream`, then the rows that
+    /// fold into `seen` ([`Row::folds_seen`]). A group with no rows is not listed.
     pub fn groups(&self) -> Vec<Group> {
-        let paths: Vec<Vec<u8>> = self
-            .rows
-            .iter()
-            .filter(|r| r.annotation == Some(Annotation::Upstream))
-            .map(|r| r.path.clone())
-            .collect();
-        if paths.is_empty() {
-            Vec::new()
-        } else {
-            vec![Group {
-                kind: Annotation::Upstream,
-                paths,
-            }]
-        }
+        let of = |kind: GroupKind, keep: &dyn Fn(&Row) -> bool| {
+            let paths: Vec<Vec<u8>> = self
+                .rows
+                .iter()
+                .filter(|r| keep(r))
+                .map(|r| r.path.clone())
+                .collect();
+            (!paths.is_empty()).then_some(Group { kind, paths })
+        };
+        [
+            of(GroupKind::Upstream, &|r: &Row| {
+                r.annotation == Some(Annotation::Upstream)
+            }),
+            of(GroupKind::Seen, &Row::folds_seen),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    /// The paths folded into the seen group, if any.
+    pub fn seen_group(&self) -> Option<Group> {
+        self.groups()
+            .into_iter()
+            .find(|g| g.kind == GroupKind::Seen)
     }
 }
 
@@ -686,6 +739,7 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
                     collapsed: Some(Collapsed::Unread { over_bytes }),
                     flags,
                     rename: None,
+                    seen_on: Vec::new(),
                 });
                 continue;
             }
@@ -728,6 +782,7 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
                 collapsed: None,
                 flags,
                 rename: None,
+                seen_on: Vec::new(),
             };
             rows.push(row);
         }

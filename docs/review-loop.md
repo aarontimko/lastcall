@@ -86,6 +86,73 @@ arrived from a fetch, so it is somebody else's work and not the agent's. **`[mix
 means some of it did and some of it did not. They are a hint about who to ask, not a
 restriction: the keys all work the same.
 
+A third group appears when an agent brings over work you have already reviewed on another
+branch of the same repository: a cherry-pick, a rebase onto a branch you reviewed, or a
+squash-merge of one. Every file whose content matches exactly what you accepted on another
+branch folds into one row, `seen · N files`, instead of being listed again. Selecting it
+says which branches accepted that content and lists the files:
+
+```text
+lastcall  3 repos · 11 files · 13 hunks  standalone  [Accept All]                         watching W
+┌──────────────────────────┬───────────────────────────────────────────────────────────────────────┐
+│alpha                     │5 files, content accepted on run-1                                     │
+│  feat-x · 8 files        │  s/a.rs  run-1                                                        │
+│  M f1  +1 −1             │  s/b.rs  run-1                                                        │
+│  M f2  +1 −0             │  s/c.rs  run-1                                                        │
+│  M parse.rs  +10 −2      │  s/d.rs  run-1                                                        │
+│  seen · 5 files          │  s/e.rs  run-1                                                        │
+│──────────────────────────│                                                                       │
+│beta                      │                                                                       │
+│  main · 2 files          │                                                                       │
+│  A u1  +1 −0  [upstream] │                                                                       │
+│  A u2  +2 −0  [mixed]    │                                                                       │
+│  upstream · 1 file       │                                                                       │
+│──────────────────────────│                                                                       │
+│W/notes                   │                                                                       │
+│  draft · 1 file          │                                                                       │
+│  M n2.md  +2 −0          │                                                                       │
+└──────────────────────────┴───────────────────────────────────────────────────────────────────────┘
+↑↓ select  ⏎ open  A accept group  e expand  ^A accept all  t hide empty  Tab focus  ? help  q quit
+```
+
+Nothing is hidden by the fold. `e` on the group row opens it, and its files appear indented
+under it with a `[seen]` badge; each one is an ordinary row you can open, flag or restore.
+`e` on the group or on any of its files closes it again:
+
+```text
+lastcall  3 repos · 11 files · 13 hunks  standalone  [Accept All]                         watching W
+┌──────────────────────────┬───────────────────────────────────────────────────────────────────────┐
+│alpha                     │5 files, content accepted on run-1                                     │
+│  feat-x · 8 files        │  s/a.rs  run-1                                                        │
+│  M f1  +1 −1             │  s/b.rs  run-1                                                        │
+│  M f2  +1 −0             │  s/c.rs  run-1                                                        │
+│  M parse.rs  +10 −2      │  s/d.rs  run-1                                                        │
+│  seen · 5 files          │  s/e.rs  run-1                                                        │
+│    A a.rs  +1 −0  [seen] │                                                                       │
+│    A b.rs  +1 −0  [seen] │                                                                       │
+│    A c.rs  +1 −0  [seen] │                                                                       │
+│    A d.rs  +1 −0  [seen] │                                                                       │
+│    A e.rs  +1 −0  [seen] │                                                                       │
+│──────────────────────────│                                                                       │
+│beta                      │                                                                       │
+│  main · 2 files          │                                                                       │
+│  A u1  +1 −0  [upstream] │                                                                       │
+│  A u2  +2 −0  [mixed]    │                                                                       │
+│  upstream · 1 file       │                                                                       │
+│──────────────────────────│                                                                       │
+│W/notes                   │                                                                       │
+│  draft · 1 file          │                                                                       │
+│  M n2.md  +2 −0          │                                                                       │
+└──────────────────────────┴───────────────────────────────────────────────────────────────────────┘
+↑↓ select  ⏎ open  A accept group  e collapse  ^A accept all  t hide empty  ? help  q quit
+```
+
+A file leaves the group as soon as it stops matching (it was edited after it arrived) or
+as soon as you flag it; it then has its own row, still badged `[seen]` while its content
+matches. `A` on the group accepts every file in it, `a` there is refused, and `z` puts them
+back. `ctrl-a` counts the folded files with the rest, and `lastcall status` lists every one
+of them with `[seen]` and the group's line.
+
 A watched folder that is not a repository carries the folder above it in its name, so the
 `W/notes` row says which `notes` it is when more than one is being watched. Selecting that
 row puts the folder's own location on a dim second line under the name, with your home

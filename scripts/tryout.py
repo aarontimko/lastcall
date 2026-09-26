@@ -306,7 +306,90 @@ def scenario_reload(sandbox):
     ]
 
 
+def scenario_cherry_pick(sandbox):
+    """Content already accepted on another branch folds into one `seen` row, and opens."""
+    repo = sandbox.repo("demo")
+    # The person runs git by hand in this repository, so its own config carries what their
+    # global config might not have (an identity) or might add (signing, hooks).
+    for key, value in (
+        ("user.name", "tryout"),
+        ("user.email", "tryout@example.invalid"),
+        ("commit.gpgsign", "false"),
+        ("core.hooksPath", "/dev/null"),
+    ):
+        repo.git("config", key, value)
+    repo.commit(
+        "base",
+        repo.write("a.rs", "pub fn a() -> u32 {\n    1\n}\n"),
+        repo.write("b.rs", "pub fn b() -> u32 {\n    2\n}\n"),
+        repo.write("c.rs", "pub fn c() -> u32 {\n    3\n}\n"),
+    )
+    for branch in ("feat-x", "feat-y", "feat-z"):
+        repo.git("branch", branch)
+    repo.git("switch", "-q", "-c", "run-2")
+    repo.commit(
+        "run-2 work",
+        repo.write("d.rs", "pub fn d() -> u32 {\n    4\n}\n"),
+        repo.write("e.rs", "pub fn e() -> u32 {\n    5\n}\n"),
+    )
+    repo.git("switch", "-q", "main")
+    repo.git("switch", "-q", "-c", "run-1")
+    for name, n in (("a.rs", 10), ("b.rs", 20), ("c.rs", 30)):
+        stem = name[0]
+        repo.write(
+            name,
+            "pub fn %s() -> u32 {\n    %d\n}\n\npub fn %s_twice() -> u32 {\n    %s() * 2\n}\n"
+            % (stem, n, stem, stem),
+        )
+    demo = os.path.join(sandbox.parent, "demo")
+    status = "LASTCALL_STATE_DIR='%s' LASTCALL_CONFIG='%s' '%s' status" % (
+        sandbox.state,
+        sandbox.config,
+        BINARY,
+    )
+    return [
+        "The reviewed work. Keep lastcall open and use a second terminal for git: "
+        "`cd '%s'`. The list shows `demo` on `run-1 · 3 files`: `a.rs`, `b.rs`, `c.rs`, "
+        "each edited. Read them, then press `ctrl-a`: the list empties. In the second "
+        "terminal: `git commit -qam \"run-1 work\"`. The list stays empty." % demo,
+        "The switch. `git switch feat-x`: the branch line says `feat-x` and the list stays "
+        "empty (feat-x is main's copy).",
+        "The cherry-pick. `git cherry-pick run-1`: within a second or two the list shows "
+        "one row, `seen · 3 files`, not three rows.",
+        "Read it. Select `seen · 3 files`: the right pane says `3 files, content accepted "
+        "on run-1` and lists the three paths, each with `run-1` beside it.",
+        "Open it. Press `e`: `a.rs`, `b.rs` and `c.rs` appear indented under the group "
+        "row, each badged `[seen]`, and the hint line says `e collapse`. Select `b.rs`: "
+        "its diff shows like any row's, `[seen]` on its header. Press `e` again: they fold "
+        "back and the group row is selected.",
+        "One file changes. `printf 'extra\\n' >> b.rs`: `b.rs` becomes its own row above "
+        "`seen · 2 files`, with no badge (its content is new).",
+        "Flag a member. Press `e` on the group, select `c.rs`, press `m`, type a note, "
+        "press Enter: `c.rs` leaves the group as its own row with the flag mark and "
+        "`[seen]`, and `seen · 1 file` remains, still open with `a.rs` under it.",
+        "Accept the group. Select `seen · 1 file`, press `a`: refused, the status line "
+        "says `A accepts the group`. Press `A`: `accepted seen · 1 file` and the group "
+        "row is gone. Press `z`: `undid accept of a.rs` and `seen · 1 file` is back.",
+        "Accept all. In the second terminal make ten scratch files so `ctrl-a` asks first: "
+        "`for i in 1 2 3 4 5 6 7 8 9 10; do echo \"note $i\" > note-$i.txt; done`. Press "
+        "`ctrl-a`: the modal says `Accept all 13 files in demo?` and `0 grouped upstream "
+        "· 1 grouped seen · 0 collapsed`: every pending file, folded or not. Press `y`: "
+        "the list empties. Then commit so the next switch starts clean: "
+        "`git add -A && git commit -qm \"feat-x work\"`.",
+        "The rebase variant. `git switch run-2`: two rows, `d.rs` and `e.rs`, no group. "
+        "Press `ctrl-a`: empty. `git switch feat-y`: empty. `git rebase run-2`: the "
+        "list shows `seen · 2 files`, and selecting it says `content accepted on run-2`.",
+        "The squash-merge variant. `git switch feat-z`: empty. `git merge --squash run-2`: "
+        "`seen · 2 files` again.",
+        "Nothing hidden. In the second terminal: `%s`. It lists `d.rs` and `e.rs` each "
+        "with `[seen]`, then the line `seen · 2 files`. Add `--json` to the same command: "
+        "each pending row carries `\"seen_on\": [\"run-2\"]` and `groups` holds one "
+        "`\"kind\": \"seen\"`." % status,
+    ]
+
+
 SCENARIOS = {
+    "cherry-pick": scenario_cherry_pick,
     "ignored": scenario_ignored,
     "reload": scenario_reload,
     "wrap": scenario_wrap,

@@ -10,7 +10,7 @@ use crate::engine::{Engine, RootState};
 use crate::git::Oid;
 use crate::headstate::InProgress;
 use crate::roots::Badge;
-use crate::scan::{Annotation, Change, Collapsed, Entry, Pile, Rename, Row};
+use crate::scan::{Annotation, Change, Collapsed, Entry, GroupKind, Pile, Rename, Row};
 use crate::store::RootKind;
 
 pub const STATUS_VERSION: u32 = 1;
@@ -125,11 +125,15 @@ pub struct RowStatus {
     /// Every flag on the row, oldest first. Additive in v1.7 (`status_version` stays 1).
     pub flags: Vec<FlagEntryStatus>,
     pub rename: Option<RenameStatus>,
+    /// The branches whose parked record already accepted this content, sorted; empty
+    /// when none (Phase 14 B). Additive in v1.15 (`status_version` stays 1).
+    pub seen_on: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct GroupStatus {
-    pub kind: Annotation,
+    /// `upstream` or `seen` (v1.15 adds `seen`; additive).
+    pub kind: GroupKind,
     pub paths: Vec<String>,
 }
 
@@ -186,6 +190,7 @@ impl RowStatus {
                     similarity: *similarity,
                 },
             }),
+            seen_on: row.seen_on.clone(),
         }
     }
 }
@@ -375,11 +380,7 @@ impl StatusReport {
                 out.push_str(&format!("  {}\n", row_line(row)));
             }
             for g in &root.groups {
-                let kind = match g.kind {
-                    Annotation::Upstream => "upstream",
-                    Annotation::Mixed => "mixed",
-                };
-                out.push_str(&format!("  {kind} · {} files\n", g.paths.len()));
+                out.push_str(&format!("  {} · {} files\n", g.kind.name(), g.paths.len()));
             }
         }
         out
@@ -422,6 +423,11 @@ pub fn row_line(row: &RowStatus) -> String {
         Some(Annotation::Upstream) => s.push_str("  [upstream]"),
         Some(Annotation::Mixed) => s.push_str("  [mixed]"),
         None => {}
+    }
+    // Phase 14 B: every row is listed here, folded or not; the mark says which ones the
+    // `seen` line counts or would, had they no override.
+    if !row.seen_on.is_empty() {
+        s.push_str("  [seen]");
     }
     match &row.rename {
         Some(RenameStatus::From { from, similarity }) => {

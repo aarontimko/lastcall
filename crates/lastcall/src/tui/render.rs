@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 use lastcall_engine::count::with_thousands;
 use lastcall_engine::hunks::{EXPAND_LINE_CAP, Hunk, Tag};
 use lastcall_engine::ledger::{Flag, iso8601_date};
-use lastcall_engine::scan::{Change, Collapsed, Rename, Row};
+use lastcall_engine::scan::{Change, Collapsed, Group, GroupKind, Rename, Row};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
@@ -576,6 +576,8 @@ const HINT_DROP_ORDER: &[&str] = &[
     "undo",
     "jump",
     "ack",
+    // Phase 14 B: on the seen group only, so no earlier frame carries it.
+    "expand",
     "accept_file",
     "hunk_next",
     "accept",
@@ -805,6 +807,14 @@ pub fn hints(app: &App, width: u16) -> String {
                 .map(|k| format!("{k} hunk")),
         ),
         ("accept", context),
+        // Phase 14 B (ruling 10): the seen group's one exit, named with the verb `e`
+        // will perform: open on the closed group, close on the open one or a member.
+        (
+            "expand",
+            app.seen_toggle().and_then(|open| {
+                first("expand").map(|k| format!("{k} {}", if open { "collapse" } else { "expand" }))
+            }),
+        ),
         ("accept_file", file),
         (
             // Verifier (b) F4: with nothing pending anywhere `^A` lands on `nothing to
@@ -1032,17 +1042,22 @@ fn render_nav(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
                 selected: false,
             });
         }
-        for row in view.rows() {
+        // Phase 14 B: the nav's own rows (the seen group's members are folded out), then
+        // the groups; an open seen group lists its members under it, indented.
+        let row_line = |row: &Row, member: bool| {
             let sel = Selection::Row(path.clone(), row.path.clone());
-            let is_sel = app.selection.as_ref() == Some(&sel);
-            if is_sel {
+            NavLine {
+                line: nav_row_line(row, app.full_paths, width, member),
+                target: Some(Target::NavRow(path.clone(), row.path.clone())),
+                selected: app.selection.as_ref() == Some(&sel),
+            }
+        };
+        for row in view.nav_rows() {
+            let line = row_line(row, false);
+            if line.selected {
                 selected_at = Some(lines.len());
             }
-            lines.push(NavLine {
-                line: nav_row_line(row, app.full_paths, width),
-                target: Some(Target::NavRow(path.clone(), row.path.clone())),
-                selected: is_sel,
-            });
+            lines.push(line);
         }
         for group in &view.groups {
             let sel = Selection::Group(path.clone(), group.kind);
@@ -1053,12 +1068,21 @@ fn render_nav(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
             lines.push(NavLine {
                 line: Line::from(format!(
                     "  {} · {}",
-                    annotation_name(group.kind),
+                    group.kind.name(),
                     plural(group.paths.len(), "file")
                 )),
                 target: Some(Target::NavGroup(path.clone(), group.kind)),
                 selected: is_sel,
             });
+            if group.kind == GroupKind::Seen && app.seen_open.contains(path) {
+                for member in group.paths.iter().filter_map(|p| view.row(p)) {
+                    let line = row_line(member, true);
+                    if line.selected {
+                        selected_at = Some(lines.len());
+                    }
+                    lines.push(line);
+                }
+            }
         }
     }
 
@@ -1130,8 +1154,10 @@ fn letter(change: Change) -> char {
     }
 }
 
-/// `  M name ⊟ ⚑  [conflict]  +3 −1  [upstream]`, the name ellipsized so the rest fits.
-fn nav_row_line(row: &Row, full_paths: bool, width: usize) -> Line<'static> {
+/// `  M name ⊟ ⚑  [conflict]  +3 −1  [upstream]`, the name ellipsized so the rest fits. A
+/// member of an open seen group is indented two more columns (Phase 14 B); a row whose
+/// content another branch accepted carries `[seen]` where an upstream row carries its label.
+fn nav_row_line(row: &Row, full_paths: bool, width: usize, member: bool) -> Line<'static> {
     let path = row.path_lossy();
     let name = if full_paths {
         path.clone()
@@ -1155,8 +1181,10 @@ fn nav_row_line(row: &Row, full_paths: bool, width: usize) -> Line<'static> {
     let annotation = row
         .annotation
         .map(|a| format!("  [{}]", annotation_name(a)))
+        .or_else(|| (!row.seen_on.is_empty()).then(|| "  [seen]".to_owned()))
         .unwrap_or_default();
-    let fixed = 4 // "  M "
+    let indent = if member { "    " } else { "  " };
+    let fixed = indent.width() + 2 // "  M "
         + markers.width()
         + conflict.width()
         + 2
@@ -1166,7 +1194,7 @@ fn nav_row_line(row: &Row, full_paths: bool, width: usize) -> Line<'static> {
         + annotation.width();
     let name = ellipsize(&name, width.saturating_sub(fixed).max(1));
     let mut spans = vec![Span::raw(format!(
-        "  {} {name}{markers}{conflict}  ",
+        "{indent}{} {name}{markers}{conflict}  ",
         letter(row.change)
     ))];
     spans.push(Span::styled(counts_added, green()));
@@ -1344,14 +1372,23 @@ fn render_main(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
                 )));
                 push_notices(&mut lines, view.notices());
                 for row in view.rows() {
-                    lines.push(nav_row_line(row, true, usize::MAX));
+                    lines.push(nav_row_line(row, true, usize::MAX, false));
                 }
+            }
+        }
+        Some(Selection::Group(root, GroupKind::Seen)) => {
+            if let Some((view, group)) = app
+                .roots
+                .get(root)
+                .and_then(|v| v.group(GroupKind::Seen).map(|g| (v, g)))
+            {
+                seen_group_pane(view, group, area.width as usize, &mut lines);
             }
         }
         Some(Selection::Group(root, kind)) => {
             if let Some(group) = app.roots.get(root).and_then(|v| v.group(*kind)) {
                 lines.push(Line::from(vec![
-                    Span::styled(annotation_name(*kind).to_owned(), bold()),
+                    Span::styled(kind.name().to_owned(), bold()),
                     Span::raw(format!(" · {}", plural(group.paths.len(), "file"))),
                 ]));
                 for p in &group.paths {
@@ -1526,6 +1563,52 @@ fn render_editor(ed: &Editor, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
     }
 }
 
+/// The seen group's pane (Phase 14 B): `N files, content accepted on <branch>` (two or
+/// three branches listed, more as `on N branches`), then one path per line, each followed
+/// by the branches that accepted it when every such line fits the pane; when one does not,
+/// the header alone names the branches.
+fn seen_group_pane(view: &RootView, group: &Group, width: usize, lines: &mut Vec<Line<'static>>) {
+    let rows: Vec<&Row> = group.paths.iter().filter_map(|p| view.row(p)).collect();
+    let mut branches: Vec<&str> = rows
+        .iter()
+        .flat_map(|r| r.seen_on.iter().map(String::as_str))
+        .collect();
+    branches.sort_unstable();
+    branches.dedup();
+    let on = match branches.as_slice() {
+        [] => String::new(),
+        few @ ([_] | [_, _] | [_, _, _]) => format!(" on {}", few.join(", ")),
+        many => format!(" on {} branches", many.len()),
+    };
+    lines.push(Line::from(vec![
+        Span::styled(plural(rows.len(), "file"), bold()),
+        Span::raw(format!(", content accepted{on}")),
+    ]));
+    let with_branch: Vec<(String, String)> = rows
+        .iter()
+        .map(|r| (format!("  {}", r.path_lossy()), r.seen_on.join(", ")))
+        .collect();
+    let pad = with_branch
+        .iter()
+        .map(|(p, _)| p.width())
+        .max()
+        .unwrap_or(0);
+    let fits = with_branch
+        .iter()
+        .all(|(_, b)| pad + 2 + b.width() <= width);
+    for (path, branch) in with_branch {
+        if fits {
+            let gap = " ".repeat(pad - path.width() + 2);
+            lines.push(Line::from(vec![
+                Span::raw(format!("{path}{gap}")),
+                Span::styled(branch, dim()),
+            ]));
+        } else {
+            lines.push(Line::from(path));
+        }
+    }
+}
+
 fn push_notices(lines: &mut Vec<Line<'static>>, notices: &[String]) {
     for n in notices {
         lines.push(Line::from(Span::styled(n.clone(), dim())));
@@ -1546,6 +1629,8 @@ fn row_header(row: &Row, budget: usize) -> Line<'static> {
     }
     if let Some(a) = row.annotation {
         spans.push(Span::styled(format!("  [{}]", annotation_name(a)), dim()));
+    } else if !row.seen_on.is_empty() {
+        spans.push(Span::styled("  [seen]", dim()));
     }
     match &row.rename {
         Some(Rename::From { from, similarity }) => spans.push(Span::raw(format!(
@@ -2237,7 +2322,8 @@ fn render_help(app: &App, buf: &mut Buffer, area: Rect) {
 ///
 /// An accept's numbers come from `App::confirm_counts`, i.e. the held piles as they are at
 /// this frame: `Accept all <N> files in <root>?` (one root) or `across <R> repos?`, then
-/// `<g> grouped upstream · <c> collapsed` only when either is non-zero. A restore covers one
+/// `<g> grouped upstream · <c> collapsed` only when either is non-zero (with `<s> grouped
+/// seen` between them when the scope folds any seen rows, Phase 14 B). A restore covers one
 /// row, so it has one question row and nothing to tally (F11). So does the post-`$EDITOR`
 /// blessing (Phase 8 deliverable 3), whose question names the path and nothing else. It is
 /// framed as *intent* ("edited — mark every hunk reviewed?"), never as detection: lastcall
@@ -2270,7 +2356,14 @@ fn render_confirm(app: &App, buf: &mut Buffer, area: Rect) {
                 "Accept all {} {target}?",
                 plural(counts.files, "file")
             )];
-            if counts.grouped > 0 || counts.collapsed > 0 {
+            // Phase 14 B: folded rows are counted in `files` like every row, and named
+            // here when there are any, so the modal says what the nav folded away.
+            if counts.grouped_seen > 0 {
+                rows.push(format!(
+                    "{} grouped upstream · {} grouped seen · {} collapsed",
+                    counts.grouped, counts.grouped_seen, counts.collapsed
+                ));
+            } else if counts.grouped > 0 || counts.collapsed > 0 {
                 rows.push(format!(
                     "{} grouped upstream · {} collapsed",
                     counts.grouped, counts.collapsed
@@ -3582,7 +3675,7 @@ mod tests {
         );
         app.select(Some(Selection::Group(
             root("beta"),
-            lastcall_engine::scan::Annotation::Upstream,
+            lastcall_engine::scan::GroupKind::Upstream,
         )));
         assert!(
             hints(&app, 100).contains("A accept group  ^A accept all"),
@@ -5329,5 +5422,283 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "hidden text:\n{}", failures.join("\n"));
+    }
+
+    // --- the seen fold (Phase 14 B) --------------------------------------------------------
+
+    /// three_roots with alpha's pile carrying three folded rows s1..s3 (seen on run-1).
+    fn seen_app() -> App {
+        let mut app = three_roots();
+        app.apply(pile_event("alpha", alpha_seen()));
+        app.handle(Action::Resize(100, 30));
+        app
+    }
+
+    /// Every screen cell whose hit-map target is `target`.
+    fn cells_of(hits: &HitMap, w: u16, h: u16, target: &Target) -> Vec<(u16, u16)> {
+        let mut out = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                if hits.at(x, y) == Some(target) {
+                    out.push((x, y));
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn render_seen_group_closed_is_one_line_and_open_lists_every_member_clickable() {
+        let mut app = seen_app();
+        let (frame, _) = frame_of(&app, 100, 30);
+        assert!(frame.contains("  seen · 3 files"), "{frame}");
+        assert!(
+            !frame.contains("s1"),
+            "a closed group hides its members: {frame}"
+        );
+
+        app.select(Some(Selection::Group(root("alpha"), GroupKind::Seen)));
+        app.handle(Action::Expand);
+        let (buf, hits) = drawn(&app, 100, 30);
+        let group_y = (0..30)
+            .find(|&y| drawn_row(&buf, 100, y).contains("seen · 3 files"))
+            .expect("the group line");
+        for (i, name) in ["s1", "s2", "s3"].iter().enumerate() {
+            let y = group_y + 1 + i as u16;
+            let text = drawn_row(&buf, 100, y);
+            assert!(
+                text.contains(&format!("│    M {name}")),
+                "indented four under the group: {text:?}"
+            );
+            assert!(text.contains("[seen]"), "the badge: {text:?}");
+            let target = Target::NavRow(root("alpha"), name.as_bytes().to_vec());
+            let cells = cells_of(&hits, 100, 30, &target);
+            assert!(!cells.is_empty(), "{name} has a hit-map entry");
+            assert!(cells.iter().all(|&(_, cy)| cy == y));
+            app.hit(target);
+            assert_eq!(app.selection, Some(row("alpha", name)));
+        }
+    }
+
+    #[test]
+    fn render_seen_group_selected_shows_the_header_and_each_path_with_its_branch() {
+        let mut app = seen_app();
+        app.select(Some(Selection::Group(root("alpha"), GroupKind::Seen)));
+        let (frame, _) = frame_of(&app, 100, 30);
+        assert!(
+            frame.contains("3 files, content accepted on run-1"),
+            "{frame}"
+        );
+        for name in ["s1", "s2", "s3"] {
+            assert!(frame.contains(&format!("  {name}  run-1")), "{frame}");
+        }
+        // Three branches are named; a fourth makes it a count.
+        let mut pile = alpha_seen();
+        let names = ["run-1", "run-2", "run-3", "run-4"];
+        for (r, b) in pile
+            .rows
+            .iter_mut()
+            .filter(|r| !r.seen_on.is_empty())
+            .zip(names)
+        {
+            r.seen_on = vec![b.to_owned()];
+        }
+        app.apply(pile_event_seq("alpha", 1, pile.clone()));
+        let (frame, _) = frame_of(&app, 100, 30);
+        assert!(
+            frame.contains("3 files, content accepted on run-1, run-2, run-3"),
+            "{frame}"
+        );
+        pile.rows[3].seen_on = vec!["run-1".to_owned(), "run-4".to_owned()];
+        app.apply(pile_event_seq("alpha", 2, pile));
+        let (frame, _) = frame_of(&app, 100, 30);
+        assert!(frame.contains("content accepted on 4 branches"), "{frame}");
+    }
+
+    #[test]
+    fn render_seen_hint_says_expand_on_the_closed_group_and_collapse_when_open() {
+        let mut app = seen_app();
+        app.select(Some(Selection::Group(root("alpha"), GroupKind::Seen)));
+        assert!(
+            hints(&app, 200).contains("e expand"),
+            "{}",
+            hints(&app, 200)
+        );
+        app.handle(Action::Expand);
+        assert!(
+            hints(&app, 200).contains("e collapse"),
+            "{}",
+            hints(&app, 200)
+        );
+        app.handle(Action::NavDown);
+        assert!(
+            hints(&app, 200).contains("e collapse"),
+            "a member closes it too"
+        );
+        app.select(Some(row("alpha", "f1")));
+        assert!(!hints(&app, 200).contains("e expand"));
+        assert!(!hints(&app, 200).contains("e collapse"));
+    }
+
+    #[test]
+    fn render_seen_accept_all_modal_names_the_grouped_seen_rows() {
+        // Over `CONFIRM_ABOVE` files, so `^A` asks first: alpha gets five more seen rows.
+        let mut app = seen_app();
+        let mut pile = alpha_seen();
+        let template = pile.rows[3].clone();
+        for name in ["s4", "s5", "s6", "s7", "s8"] {
+            let mut r = template.clone();
+            r.path = name.as_bytes().to_vec();
+            pile.rows.push(r);
+        }
+        app.apply(pile_event_seq("alpha", 1, pile));
+        assert_eq!(app.handle(Action::AcceptAll), (Changed::Yes, None));
+        let (frame, _) = frame_of(&app, 100, 30);
+        assert!(
+            frame.contains("Accept all 14 files across 3 repos?"),
+            "{frame}"
+        );
+        assert!(
+            frame.contains("1 grouped upstream · 8 grouped seen · 0 collapsed"),
+            "{frame}"
+        );
+    }
+
+    mod proptests {
+        use proptest::prelude::*;
+
+        use super::*;
+        use lastcall_engine::scan::{Annotation, Change, Pile};
+
+        /// 8 cases in the unit tier, `PROPTEST_CASES` (64 from the pre-push hook) when set
+        /// — the house split.
+        fn config() -> ProptestConfig {
+            ProptestConfig {
+                cases: std::env::var("PROPTEST_CASES")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(8),
+                failure_persistence: None,
+                ..ProptestConfig::default()
+            }
+        }
+
+        /// One row's shape: seen somewhere, its annotation (none / upstream / mixed),
+        /// flagged, a pending deletion.
+        type Shape = (bool, u8, bool, bool);
+
+        fn shaped(path: &str, (seen, annotation, flagged, deleted): Shape) -> Row {
+            let mut r = pile("alpha").rows[0].clone();
+            r.path = path.as_bytes().to_vec();
+            if seen {
+                r.seen_on = vec!["run-1".to_owned()];
+            }
+            r.annotation = match annotation {
+                1 => Some(Annotation::Upstream),
+                2 => Some(Annotation::Mixed),
+                _ => None,
+            };
+            if flagged {
+                r.flags.push(lastcall_engine::ledger::Flag::file(
+                    "look",
+                    "2026-09-26T00:00:00Z",
+                ));
+            }
+            if deleted {
+                r.change = Change::Deleted;
+                r.current = None;
+            }
+            r
+        }
+
+        /// F20's shape: every pile holds a seen-and-flagged path, a seen-and-upstream
+        /// path, a seen-plain path and a pending deletion (seen too), then random rows.
+        fn any_pile() -> impl Strategy<Value = Pile> {
+            let shape = (any::<bool>(), 0u8..3, any::<bool>(), any::<bool>());
+            prop::collection::vec(shape, 0..10).prop_map(|shapes| {
+                let mut p = pile("alpha");
+                p.rows = vec![
+                    shaped("fixed/del", (true, 0, false, true)),
+                    shaped("fixed/flagged", (true, 0, true, false)),
+                    shaped("fixed/plain", (true, 0, false, false)),
+                    shaped("fixed/up", (true, 1, false, false)),
+                ];
+                for (i, s) in shapes.into_iter().enumerate() {
+                    p.rows.push(shaped(&format!("r{i:02}"), s));
+                }
+                p
+            })
+        }
+
+        fn paths<'a>(it: impl Iterator<Item = &'a Vec<u8>>) -> BTreeSet<Vec<u8>> {
+            it.cloned().collect()
+        }
+
+        /// **Nothing is hidden, ever.** For any pile, open or closed: the nav's own rows,
+        /// the seen group and the upstream group sort every pile row exactly once (upstream
+        /// rows are listed on the nav as well as in their group, as since Phase 5, so the
+        /// upstream group is a subset of the nav rows and disjoint from the seen group);
+        /// the group's header, the accept-all modal and `status` count what it lists.
+        #[test]
+        fn render_seen_fold_hides_nothing_and_every_count_agrees() {
+            proptest!(config(), |(p in any_pile(), open in any::<bool>())| {
+                let mut app = App::new();
+                app.sync_roots(vec![meta("alpha")]);
+                app.apply(pile_event("alpha", p.clone()));
+                app.handle(Action::Resize(100, 60));
+                let group = Selection::Group(root("alpha"), GroupKind::Seen);
+                app.select(Some(group.clone()));
+                if open {
+                    app.handle(Action::Expand);
+                }
+                let view = &app.roots[&root("alpha")];
+                let all = paths(p.rows.iter().map(|r| &r.path));
+                let nav = paths(view.nav_rows().map(|r| &r.path));
+                let seen = view.group(GroupKind::Seen).map(|g| g.paths.clone()).unwrap_or_default();
+                let upstream = view
+                    .group(GroupKind::Upstream)
+                    .map(|g| g.paths.clone())
+                    .unwrap_or_default();
+                let seen_set = paths(seen.iter());
+                let up_set = paths(upstream.iter());
+                prop_assert_eq!(seen_set.len(), seen.len(), "no path twice in the group");
+                prop_assert!(nav.is_disjoint(&seen_set));
+                prop_assert!(up_set.is_disjoint(&seen_set));
+                prop_assert!(up_set.is_subset(&nav));
+                prop_assert_eq!(nav.len() + seen.len(), p.rows.len());
+                let union: BTreeSet<Vec<u8>> = nav.union(&seen_set).cloned().collect();
+                prop_assert_eq!(&union, &all);
+                // F20's four fixed paths land where the rule says.
+                prop_assert!(nav.contains(b"fixed/del".as_slice()));
+                prop_assert!(nav.contains(b"fixed/flagged".as_slice()));
+                prop_assert!(seen_set.contains(b"fixed/plain".as_slice()));
+                prop_assert!(up_set.contains(b"fixed/up".as_slice()));
+                prop_assert!(!seen_set.contains(b"fixed/up".as_slice()));
+
+                // The nav lists each own row once, and the members only when open.
+                let listed: Vec<Selection> = app
+                    .nav_entries()
+                    .into_iter()
+                    .filter(|e| matches!(e, Selection::Row(..)))
+                    .collect();
+                prop_assert_eq!(listed.len(), nav.len() + if open { seen.len() } else { 0 });
+
+                // The counts: the nav's group line, the header, the modal, `status`.
+                let (frame, _) = frame_of(&app, 100, 60);
+                let n = plural(seen.len(), "file");
+                prop_assert!(frame.contains(&format!("seen · {n}")), "{}", frame);
+                prop_assert!(frame.contains(&format!("{n}, content accepted on run-1")), "{}", frame);
+                let counts = app.counts_of(&AcceptScope::All);
+                prop_assert_eq!(counts.files, p.rows.len());
+                prop_assert_eq!(counts.grouped_seen, seen.len());
+                let status_seen = p
+                    .groups()
+                    .into_iter()
+                    .find(|g| g.kind == GroupKind::Seen)
+                    .map(|g| g.paths)
+                    .unwrap_or_default();
+                prop_assert_eq!(&status_seen, &seen);
+            });
+        }
     }
 }

@@ -145,7 +145,7 @@ Refused by construction: `status`, `diff`, `add`, `update-index`, `checkout`, `s
 6. Row iff baseline ≠ current by oid or mode (D1); on `core.filemode=false` roots the executable bit is normalized away on both sides, so a mode-only row cannot appear there.
 7. Every baseline and current blob of every row fetched in **one** `cat-file --batch` (2,000 unseen files cost 16 git processes per scan, not 2,000); hunks from a byte diff of the two blobs (`hunks.rs`); binary (NUL in the first 8000 bytes) or ≥ `collapse_size_bytes` or matching `collapsed_globs` → collapsed (D7/D8). A blob the batch cannot produce renders that row without content and a notice.
 8. Conflict state from the user's `ls-files -u` (C4); the override's flag; rename pairing (D5) — presentation only, the ledger stores delete + add. The pairing reads the **pile's rows**: a temp index (`index.<pid>.tmp`, this process's own) holds exactly the `deleted` rows at their baselines (`read-tree --empty` + `update-index --index-info`), the `added` rows are `add -N`ed, then `diff -M -z --name-status`. It is not a copy of the private index — that is the seen tree, and a path the user accepted as deleted (override `null`, no row) or a deleted row whose baseline is an override blob would otherwise pair or score differently before and after a compaction that changes no baseline.
-9. Annotation (`upstream.rs`): heads = HEAD (+ `MERGE_HEAD`); range `seen_head..head` or from the merge-base; commits reachable from a remote ref by someone else are upstream; a pending path whose content equals a head's blob is `upstream`, touched upstream but different is `mixed`, otherwise plain. No merge-base, detached with no upstream, shallow, or no remotes → nothing annotated (C7).
+9. Annotation (`upstream.rs`): heads = HEAD (+ `MERGE_HEAD`); range `seen_head..head` or from the merge-base; commits reachable from a remote ref by someone else are upstream; a pending path whose content equals a head's blob is `upstream`, touched upstream but different is `mixed`, otherwise plain. No merge-base, detached with no upstream, shallow, or no remotes → nothing annotated (C7). Then the seen marks (`seen.rs`, Phase 14 B, Amendment v1.15): every row with a present current side and no annotation is compared with each **parked** record's composed baseline (an override blob with its mode, else that record's `seen_tree` entry; an absent or flag-only override never matches; the record in force is never compared), and an exact oid and mode match (filemode-normalized as in step 6) pushes that branch onto `row.seen_on`, sorted. `RootState.seen_cache` holds one `ls-tree -r` per (branch, parked tree oid) and is pruned to the records still parked at that tree before each call; with no candidate row nothing is listed. A parked tree the store no longer has lists as empty; a listing error takes back every mark and adds the notice `seen annotation skipped: …`. A branch deleted after its record was parked still matches until the next switch prunes the record (`prune_parked`). The marks never add or remove a row: `Row::folds_seen` (marked, current present, no annotation, no flag) is what the TUI folds and `Pile::groups()` reports as the `seen` group, after the `upstream` one.
 10. Notices from every step ride along in `pile.notices`; nothing after step 6 removes a row.
 
 ## Many roots at once, many lastcalls at once (Phase 5)
@@ -540,6 +540,9 @@ A git root keeps one seen record per branch. One of them is **in force** and liv
 level of `ledger.json` exactly where the only record used to live; the rest are **parked** in
 `branches`, keyed by branch name. Nothing here changes what a pile is: it is still
 `diff(baseline, worktree)` against the record in force.
+Parked records are read for one thing besides the switch: the seen marks after step 9 of
+the pipeline (Phase 14 B), which label a row with the parked branches that already accepted
+its exact content and never add or remove one.
 
 **Which record.** The branch is the name in `<git_dir>/HEAD` when that file reads
 `ref: refs/heads/<name>`, one file read and no git process (`headstate::head_branch`; a linked
@@ -663,6 +666,7 @@ jq -r '.branches // {} | keys[]' ledger.json                  # the parked branc
 jq -r '.branches["feat-x"].seen_tree' ledger.json             # one parked record's tree
 GIT_DIR=store git ls-tree -r "$(jq -r '.branches["feat-x"].seen_tree' ledger.json)"
 lastcall status --json | jq -r '.roots[] | "\(.root) \(.seen_branch) \(.parked_branches)"'
+lastcall status --json | jq -r '.roots[].pending[] | select(.seen_on != []) | "\(.path) \(.seen_on)"'
 ```
 
 ## The fail-open ladder
@@ -1171,11 +1175,12 @@ $EDITOR admits of.
           "conflicted": false,
           "collapsed": null | "glob" | "binary" | "size",
           "flag": null | {"note": "…"},
-          "rename": null | {"from": "old", "similarity": 90} | {"to": "new", "similarity": 90}
+          "rename": null | {"from": "old", "similarity": 90} | {"to": "new", "similarity": 90},
+          "seen_on": ["run-1"]
         }
       ],
       "omitted": 0,
-      "groups": [{"kind": "upstream", "paths": ["u1"]}],
+      "groups": [{"kind": "upstream", "paths": ["u1"]}, {"kind": "seen", "paths": ["a.rs"]}],
       "undo": 0,
       "snoozed_until": "2026-09-20T09:00:00Z | null",
       "notices": ["root-level and scan notices"]
@@ -1194,6 +1199,14 @@ no remote, a local-path or `file://` origin (the fixtures' origins), and anythin
 give `null`. The committed example is
 `crates/lastcall/tests/golden/status_multi_repo.json` (two repos and a draft dir, produced by
 `lastcall_testkit::fixture_parent`; `just golden-update` rewrites it).
+
+`seen_on` and the `seen` group kind (additive, Phase 14 B, Amendment v1.15;
+`status_version` stays 1): `seen_on` is the sorted list of parked branches whose record
+already accepted exactly this row's content (empty for most rows; see the seen marks after
+step 9 of the pipeline), and the `seen` group lists the rows that fold (`Row::folds_seen`),
+so a row can carry `seen_on` without being in the group (flagged, annotated, or a
+deletion). The human form appends `  [seen]` to a marked row's line and prints the group as
+`seen · N files` after `upstream · N files`.
 
 `omitted` (additive, Phase 4; `status_version` stays 1 — an Amendment v1.4 candidate) is
 the number of changed paths beyond the row cap that this scan did not hash (see step 4 of

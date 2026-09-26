@@ -6,7 +6,7 @@ mod common;
 use common::Fresh;
 use lastcall_engine::headstate::{self, InProgress};
 use lastcall_engine::ops::{NoFault, Rendered};
-use lastcall_engine::scan::Annotation;
+use lastcall_engine::scan::{Annotation, GroupKind};
 use lastcall_testkit::assert_pile;
 
 /// Accept every upstream group the way the UI's "accept group" does.
@@ -44,7 +44,7 @@ fn scenario_c1_c2_fetch_then_ff_pull() {
     );
     let groups = pile.groups();
     assert_eq!(groups.len(), 1);
-    assert_eq!(groups[0].kind, Annotation::Upstream);
+    assert_eq!(groups[0].kind, GroupKind::Upstream);
     assert_eq!(
         groups[0].paths,
         vec![b"u1".to_vec(), b"u2".to_vec(), b"u3".to_vec()]

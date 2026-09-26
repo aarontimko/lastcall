@@ -9,7 +9,7 @@
 //! Selection is by path bytes, never by index: a rescan that reorders or removes rows can
 //! only move the selection through [`App::reconcile_selection`]'s documented fallback.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -25,7 +25,7 @@ use lastcall_engine::hunks::{Expanded, Hunk, Tag};
 use lastcall_engine::ledger::{FlagHunk, FlagSummary, LedgerError, iso8601_date, parse_iso8601};
 use lastcall_engine::ops::{OpsError, Refused, Rendered};
 use lastcall_engine::roots::Badge;
-use lastcall_engine::scan::{Annotation, Change, Collapsed, Entry, Group, Pile, Row};
+use lastcall_engine::scan::{Annotation, Change, Collapsed, Entry, Group, GroupKind, Pile, Row};
 use lastcall_engine::store::{Current, RootKind};
 use lastcall_engine::watcher::EngineEvent;
 
@@ -189,8 +189,21 @@ impl RootView {
         self.pile = pile;
     }
 
+    /// Every row of the pile. The header, the accept paths, the confirm modal and the
+    /// repository pane go by this; only the nav goes by [`RootView::nav_rows`].
     pub fn rows(&self) -> &[Row] {
         &self.pile.rows
+    }
+
+    /// The rows the nav lists on their own (Phase 14 B): every row minus the ones folded
+    /// into the `seen · N files` group ([`Row::folds_seen`]).
+    pub fn nav_rows(&self) -> impl Iterator<Item = &Row> {
+        self.pile.rows.iter().filter(|r| !r.folds_seen())
+    }
+
+    /// Whether `path` is a row folded into this root's seen group.
+    pub fn folded(&self, path: &[u8]) -> bool {
+        self.row(path).is_some_and(Row::folds_seen)
     }
 
     pub fn notices(&self) -> &[String] {
@@ -209,7 +222,7 @@ impl RootView {
         self.pile.rows.iter().find(|r| r.path == path)
     }
 
-    pub fn group(&self, kind: Annotation) -> Option<&Group> {
+    pub fn group(&self, kind: GroupKind) -> Option<&Group> {
         self.groups.iter().find(|g| g.kind == kind)
     }
 }
@@ -219,7 +232,7 @@ impl RootView {
 pub enum Selection {
     Root(PathBuf),
     Row(PathBuf, Vec<u8>),
-    Group(PathBuf, Annotation),
+    Group(PathBuf, GroupKind),
 }
 
 impl Selection {
@@ -243,8 +256,9 @@ fn nav_key(sel: &Selection) -> (u8, &[u8], u8) {
             2,
             b"",
             match kind {
-                Annotation::Upstream => 0,
-                Annotation::Mixed => 1,
+                GroupKind::Upstream => 0,
+                GroupKind::Mixed => 1,
+                GroupKind::Seen => 2,
             },
         ),
     }
@@ -255,7 +269,7 @@ fn nav_key(sel: &Selection) -> (u8, &[u8], u8) {
 pub enum Target {
     NavRoot(PathBuf),
     NavRow(PathBuf, Vec<u8>),
-    NavGroup(PathBuf, Annotation),
+    NavGroup(PathBuf, GroupKind),
     /// The header line of hunk `i` in the diff.
     DiffHunk(usize),
     DiffBody,
@@ -604,7 +618,7 @@ pub enum AcceptScope {
     },
     Group {
         root: PathBuf,
-        kind: Annotation,
+        kind: GroupKind,
     },
     /// Every row of one root.
     Root(PathBuf),
@@ -1036,6 +1050,8 @@ pub struct ConfirmCounts {
     pub files: usize,
     /// Rows inside an upstream group.
     pub grouped: usize,
+    /// Rows folded into a seen group (Phase 14 B); counted in `files` like every row.
+    pub grouped_seen: usize,
     /// Collapsed rows.
     pub collapsed: usize,
     /// Names of the listed roots covered.
@@ -1358,6 +1374,10 @@ pub struct App {
     /// The one collapsed row whose hunks `e` fetched, if any. A view, never a baseline;
     /// see [`Expansion`].
     pub expanded: Option<Expansion>,
+    /// The roots whose `seen · N files` group is open (Phase 14 B, ruling 10): `e` on the
+    /// group lists its members under it as indented rows. Session state, never persisted;
+    /// kept across scans and cleared when the group disappears.
+    pub seen_open: BTreeSet<PathBuf>,
     /// The effective key bindings, `(action name, key specs)` in `DEFAULT_KEYMAP` order.
     /// Seeded from the defaults; worker 3b replaces it after `Keymap::from_config` so the
     /// hint line and the help overlay show the user's own bindings.
@@ -1431,6 +1451,7 @@ impl App {
             tour: None,
             loading: None,
             expanded: None,
+            seen_open: BTreeSet::new(),
             // The canonical spellings (`shift-a` shows as `A`), as `Keymap::table` gives.
             keymap: Keymap::defaults().table(),
             enhanced: false,
@@ -1727,7 +1748,9 @@ impl App {
         ))
     }
 
-    /// Nav order: for each listed root by path, `[Root, rows…, groups…]`.
+    /// Nav order: for each listed root by path, `[Root, rows…, groups…]`. The rows are
+    /// [`RootView::nav_rows`] (the seen group's members are folded out), and an open seen
+    /// group is followed by its members, in path order, as ordinary row entries.
     pub fn nav_entries(&self) -> Vec<Selection> {
         let mut out = Vec::new();
         for (path, view) in &self.roots {
@@ -1735,14 +1758,45 @@ impl App {
                 continue;
             }
             out.push(Selection::Root(path.clone()));
-            for r in view.rows() {
+            for r in view.nav_rows() {
                 out.push(Selection::Row(path.clone(), r.path.clone()));
             }
             for g in &view.groups {
                 out.push(Selection::Group(path.clone(), g.kind));
+                if g.kind == GroupKind::Seen && self.seen_open.contains(path) {
+                    for p in &g.paths {
+                        out.push(Selection::Row(path.clone(), p.clone()));
+                    }
+                }
             }
         }
         out
+    }
+
+    /// What `e` does to the seen group from the current selection, for the hint line:
+    /// `Some(false)` opens it (the closed group is selected), `Some(true)` closes it (the
+    /// open group or one of its members is selected), `None` when `e` is not about it,
+    /// which includes a collapsed member not yet expanded (`e` expands that file first).
+    pub fn seen_toggle(&self) -> Option<bool> {
+        match self.selection.as_ref()? {
+            Selection::Group(root, GroupKind::Seen) => Some(self.seen_open.contains(root)),
+            Selection::Row(root, path)
+                if self.seen_open.contains(root)
+                    && self.roots.get(root).is_some_and(|v| v.folded(path)) =>
+            {
+                // A collapsed member not expanded yet: `e` is its own `[e expand]` first,
+                // or a folded lockfile would have no way to show its content at all.
+                let expands = self.selected_row().is_some_and(|r| {
+                    Self::expandable(r)
+                        && !self
+                            .expanded
+                            .as_ref()
+                            .is_some_and(|e| e.root == *root && e.path == *path)
+                });
+                (!expands).then_some(true)
+            }
+            _ => None,
+        }
     }
 
     pub fn listed_roots(&self) -> impl Iterator<Item = &RootView> {
@@ -1791,6 +1845,21 @@ impl App {
     /// draw — on a binary row, on a row that is not collapsed, and on a row already
     /// expanded, so the key is silent exactly where it has nothing to do.
     fn request_expand(&mut self) -> (Changed, Option<Effect>) {
+        // Phase 14 B (ruling 10): on the seen group, or on one of its open members, `e`
+        // opens or closes the group. Pure state: no engine call, no `Effect::Expand`.
+        match (self.seen_toggle(), self.selection.clone()) {
+            (Some(false), Some(Selection::Group(root, _))) => {
+                self.seen_open.insert(root);
+                return (Changed::Yes, None);
+            }
+            (Some(true), Some(sel)) => {
+                let root = sel.root().to_path_buf();
+                self.seen_open.remove(&root);
+                self.select(Some(Selection::Group(root, GroupKind::Seen)));
+                return (Changed::Yes, None);
+            }
+            _ => {}
+        }
         let Some(Selection::Row(root, path)) = self.selection.clone() else {
             return (Changed::No, None);
         };
@@ -2312,6 +2381,7 @@ impl App {
                 .iter()
                 .filter(|r| r.annotation == Some(Annotation::Upstream))
                 .count();
+            counts.grouped_seen += rows.iter().filter(|r| r.folds_seen()).count();
             counts.collapsed += rows.iter().filter(|r| r.collapsed.is_some()).count();
             counts.roots.push(self.root_name(root));
         };
@@ -2456,7 +2526,7 @@ impl App {
         (Changed::Yes, None)
     }
 
-    fn group_rows(&self, root: &Path, kind: Annotation) -> Vec<&Row> {
+    fn group_rows(&self, root: &Path, kind: GroupKind) -> Vec<&Row> {
         let Some(view) = self.roots.get(root) else {
             return Vec::new();
         };
@@ -3776,11 +3846,9 @@ impl App {
             // content the user's own editor session left, which is the whole point of the
             // confirm they just answered (ruling P1).
             AcceptScope::Bless { path, .. } => format!("reviewed {}", lossy(path)),
-            AcceptScope::Group { kind, .. } => format!(
-                "accepted {} · {}",
-                annotation_name(*kind),
-                plural(files, "file")
-            ),
+            AcceptScope::Group { kind, .. } => {
+                format!("accepted {} · {}", kind.name(), plural(files, "file"))
+            }
             AcceptScope::Root(_) | AcceptScope::All => match ok_roots {
                 [one] => format!(
                     "accepted {} in {}",
@@ -3951,6 +4019,13 @@ impl App {
     /// accept, a restore, `t`, `w`, a herdr scope or roots update, the end of the launch
     /// hold — comes through here, so the rule is stated once.
     pub fn reconcile_selection(&mut self) {
+        // Phase 14 B: an open seen group stays open across scans until it disappears.
+        let roots = &self.roots;
+        self.seen_open.retain(|r| {
+            roots
+                .get(r)
+                .is_some_and(|v| v.group(GroupKind::Seen).is_some())
+        });
         let Some(sel) = self.selection.clone() else {
             return;
         };
@@ -3958,6 +4033,14 @@ impl App {
         if let Some(at) = entries.iter().position(|e| *e == sel) {
             self.nav_anchor = Some(at);
             self.clamp_cursor();
+            return;
+        }
+        // A selected row that folded into the (closed) seen group is still pending: the
+        // selection follows it to the group row rather than to a neighbour.
+        if let Selection::Row(root, path) = &sel
+            && self.roots.get(root).is_some_and(|v| v.folded(path))
+        {
+            self.select(Some(Selection::Group(root.clone(), GroupKind::Seen)));
             return;
         }
         let next = self.neighbour_after(&sel, &entries);
@@ -5424,6 +5507,34 @@ pub(crate) mod testfix {
         p
     }
 
+    /// alpha's pile (`f1`, `f2`) plus `s1`, `s2`, `s3` cloned from `f1` and marked seen on
+    /// `run-1`, so they fold into alpha's `seen · 3 files` group (Phase 14 B).
+    pub fn alpha_seen() -> Pile {
+        let mut p = pile("alpha");
+        let template = p.rows[0].clone();
+        for name in ["s1", "s2", "s3"] {
+            let mut r = template.clone();
+            r.path = name.as_bytes().to_vec();
+            r.seen_on = vec!["run-1".to_owned()];
+            p.rows.push(r);
+        }
+        p
+    }
+
+    /// [`alpha_seen`] with a flag on `path`, as the engine's rescan after `m` returns it.
+    pub fn alpha_seen_flagged(path: &str) -> Pile {
+        let mut p = alpha_seen();
+        for r in &mut p.rows {
+            if r.path == path.as_bytes() {
+                r.flags.push(lastcall_engine::ledger::Flag::file(
+                    "look",
+                    "2026-09-26T00:00:00Z",
+                ));
+            }
+        }
+        p
+    }
+
     pub fn row(root: &str, path: &str) -> Selection {
         Selection::Row(self::root(root), path.as_bytes().to_vec())
     }
@@ -5513,7 +5624,7 @@ mod tests {
         assert_eq!(app.handle(Action::Expand), (Changed::No, None));
         assert!(app.expanded.is_none());
         // A group entry.
-        app.select(Some(Selection::Group(root("beta"), Annotation::Upstream)));
+        app.select(Some(Selection::Group(root("beta"), GroupKind::Upstream)));
         assert_eq!(app.handle(Action::Expand), (Changed::No, None));
     }
 
@@ -5903,7 +6014,7 @@ mod tests {
         assert!(!app.roots[&root("alpha")].listed(), "no rows left");
         assert!(app.nav_entries().contains(&Selection::Root(root("alpha"))));
 
-        app.select(Some(Selection::Group(root("beta"), Annotation::Upstream)));
+        app.select(Some(Selection::Group(root("beta"), GroupKind::Upstream)));
         let beta = pile("beta");
         let group = beta.groups().into_iter().next().unwrap();
         let rendered: Vec<Rendered> = group
@@ -5975,12 +6086,265 @@ mod tests {
         );
     }
 
+    // --- Phase 14 B: the seen fold and its expand exit ----------------------------------
+
+    /// three_roots with alpha's pile replaced by [`alpha_seen`].
+    fn seen_app() -> App {
+        let mut app = three_roots();
+        app.apply(pile_event("alpha", alpha_seen()));
+        app
+    }
+
+    fn seen_group() -> Selection {
+        Selection::Group(root("alpha"), GroupKind::Seen)
+    }
+
+    /// alpha's nav block, in order.
+    fn alpha_nav(app: &App) -> Vec<Selection> {
+        app.nav_entries()
+            .into_iter()
+            .filter(|e| e.root() == root("alpha"))
+            .collect()
+    }
+
+    #[test]
+    fn app_seen_rows_fold_out_of_the_nav_into_one_group_entry() {
+        let app = seen_app();
+        assert_eq!(
+            alpha_nav(&app),
+            vec![
+                Selection::Root(root("alpha")),
+                row("alpha", "f1"),
+                row("alpha", "f2"),
+                row("alpha", "src/parse.rs"),
+                seen_group(),
+            ]
+        );
+        // `rows()` is still the whole pile: the header and the accept paths go by it.
+        assert_eq!(app.roots[&root("alpha")].rows().len(), 6);
+        assert_eq!(app.roots[&root("alpha")].nav_rows().count(), 3);
+    }
+
+    #[test]
+    fn app_seen_e_opens_the_group_members_follow_it_and_e_again_closes() {
+        let mut app = seen_app();
+        app.select(Some(seen_group()));
+        assert_eq!(app.seen_toggle(), Some(false));
+        assert_eq!(app.handle(Action::Expand), (Changed::Yes, None));
+        assert!(app.seen_open.contains(&root("alpha")));
+        assert_eq!(
+            alpha_nav(&app),
+            vec![
+                Selection::Root(root("alpha")),
+                row("alpha", "f1"),
+                row("alpha", "f2"),
+                row("alpha", "src/parse.rs"),
+                seen_group(),
+                row("alpha", "s1"),
+                row("alpha", "s2"),
+                row("alpha", "s3"),
+            ],
+            "members in path order right after the group row"
+        );
+        assert_eq!(
+            app.selection,
+            Some(seen_group()),
+            "opening keeps the selection"
+        );
+        assert_eq!(app.seen_toggle(), Some(true));
+        assert_eq!(app.handle(Action::Expand), (Changed::Yes, None));
+        assert!(app.seen_open.is_empty());
+        assert_eq!(alpha_nav(&app).len(), 5);
+    }
+
+    #[test]
+    fn app_seen_e_on_a_member_closes_the_group_and_selects_it() {
+        let mut app = seen_app();
+        app.select(Some(seen_group()));
+        app.handle(Action::Expand);
+        app.handle(Action::NavDown);
+        app.handle(Action::NavDown);
+        assert_eq!(app.selection, Some(row("alpha", "s2")));
+        // A member is an ordinary row: its diff is the row's.
+        assert_eq!(
+            app.selected_row().map(|r| r.path.clone()),
+            Some(b"s2".to_vec())
+        );
+        assert!(!app.view_hunks().is_empty());
+        assert_eq!(app.seen_toggle(), Some(true));
+        assert_eq!(app.handle(Action::Expand), (Changed::Yes, None));
+        assert!(app.seen_open.is_empty());
+        assert_eq!(app.selection, Some(seen_group()));
+    }
+
+    /// A collapsed member (a lockfile, a large file) would have no way to show its content
+    /// if `e` always closed the group, so on one not yet expanded `e` expands it first;
+    /// once it is expanded, `e` closes the group as on any other member.
+    #[test]
+    fn app_seen_e_on_a_collapsed_member_expands_it_first_then_closes_the_group() {
+        let mut app = three_roots();
+        let mut p = alpha_seen();
+        for r in &mut p.rows {
+            if r.path == b"s2" {
+                r.collapsed = Some(Collapsed::Size);
+                r.hunks.clear();
+            }
+        }
+        app.apply(pile_event("alpha", p));
+        app.select(Some(seen_group()));
+        app.handle(Action::Expand);
+        app.select(Some(row("alpha", "s2")));
+        assert_eq!(
+            app.seen_toggle(),
+            None,
+            "the hint says expand, not collapse"
+        );
+        let (changed, effect) = app.handle(Action::Expand);
+        assert_eq!(changed, Changed::No);
+        let Some(Effect::Expand(asked_root, asked_row)) = effect else {
+            panic!("an expand effect: {effect:?}");
+        };
+        assert_eq!(asked_root, root("alpha"));
+        assert!(
+            app.seen_open.contains(&root("alpha")),
+            "the group stays open"
+        );
+        assert_eq!(
+            app.set_expanded(root("alpha"), &asked_row, expansion_of(2, 0)),
+            Changed::Yes
+        );
+        assert_eq!(app.view_hunks().len(), 2);
+        assert_eq!(app.seen_toggle(), Some(true));
+        assert_eq!(app.handle(Action::Expand), (Changed::Yes, None));
+        assert!(app.seen_open.is_empty());
+        assert_eq!(app.selection, Some(seen_group()));
+    }
+
+    #[test]
+    fn app_seen_a_flagged_member_leaves_the_group_and_the_group_stays_open() {
+        let mut app = seen_app();
+        app.select(Some(seen_group()));
+        app.handle(Action::Expand);
+        app.select(Some(row("alpha", "s3")));
+        // `m` wrote a flag; the rescan brings the row back flagged.
+        app.apply(pile_event("alpha", alpha_seen_flagged("s3")));
+        assert!(app.seen_open.contains(&root("alpha")), "still open");
+        assert_eq!(
+            alpha_nav(&app),
+            vec![
+                Selection::Root(root("alpha")),
+                row("alpha", "f1"),
+                row("alpha", "f2"),
+                row("alpha", "src/parse.rs"),
+                row("alpha", "s3"),
+                seen_group(),
+                row("alpha", "s1"),
+                row("alpha", "s2"),
+            ],
+            "its own row above the group, the group one shorter"
+        );
+        assert_eq!(
+            app.selection,
+            Some(row("alpha", "s3")),
+            "the selection follows it"
+        );
+        assert_eq!(
+            app.roots[&root("alpha")]
+                .group(GroupKind::Seen)
+                .map(|g| g.paths.len()),
+            Some(2)
+        );
+        assert_eq!(app.seen_toggle(), None, "`e` on it is not about the group");
+    }
+
+    #[test]
+    fn app_seen_open_survives_a_scan_and_clears_when_the_group_goes() {
+        let mut app = seen_app();
+        app.select(Some(seen_group()));
+        app.handle(Action::Expand);
+        app.apply(pile_event_seq("alpha", 1, alpha_seen()));
+        assert!(
+            app.seen_open.contains(&root("alpha")),
+            "same pile, still open"
+        );
+        app.apply(pile_event_seq("alpha", 2, pile("alpha")));
+        assert!(app.seen_open.is_empty(), "the group vanished");
+        assert_ne!(app.selection, Some(seen_group()));
+        // It comes back closed.
+        app.apply(pile_event_seq("alpha", 3, alpha_seen()));
+        assert!(app.seen_open.is_empty());
+        assert_eq!(alpha_nav(&app).len(), 5);
+    }
+
+    #[test]
+    fn app_seen_e_elsewhere_does_nothing_to_the_group() {
+        let mut app = seen_app();
+        app.select(Some(row("alpha", "f1")));
+        assert_eq!(app.seen_toggle(), None);
+        assert_eq!(app.handle(Action::Expand), (Changed::No, None));
+        assert!(app.seen_open.is_empty());
+        app.select(Some(Selection::Root(root("alpha"))));
+        assert_eq!(app.handle(Action::Expand), (Changed::No, None));
+        assert!(app.seen_open.is_empty());
+    }
+
+    #[test]
+    fn app_seen_a_selected_row_that_folds_moves_the_selection_to_the_group() {
+        let mut app = three_roots();
+        let mut plain = alpha_seen();
+        for r in &mut plain.rows {
+            r.seen_on.clear();
+        }
+        app.apply(pile_event("alpha", plain));
+        app.select(Some(row("alpha", "s2")));
+        app.apply(pile_event_seq("alpha", 1, alpha_seen()));
+        assert_eq!(app.selection, Some(seen_group()), "not the neighbour");
+    }
+
+    #[test]
+    fn app_seen_group_accepts_with_the_file_key_and_counts_in_accept_all() {
+        let mut app = seen_app();
+        app.select(Some(seen_group()));
+        assert_eq!(
+            app.accept_scope(),
+            Some(AcceptAnswer::Refuse("A accepts the group".to_owned()))
+        );
+        let alpha = alpha_seen();
+        let rendered: Vec<Rendered> = ["s1", "s2", "s3"]
+            .iter()
+            .map(|p| Rendered::of(alpha.row(p.as_bytes()).unwrap()))
+            .collect();
+        assert_eq!(
+            requests(app.handle(Action::AcceptFile).1),
+            vec![(
+                root("alpha"),
+                AcceptRequest::Group {
+                    rows: rendered,
+                    rendered_on: alpha.seen_branch.clone(),
+                }
+            )]
+        );
+        app.accepted(vec![accepted_ok(
+            "alpha",
+            3,
+            without(alpha.clone(), &["s1", "s2", "s3"]),
+        )]);
+        assert_eq!(status(&app), "accepted seen · 3 files");
+
+        // Accept-all counts every row, folded or not, and names the folded ones.
+        let app = seen_app();
+        let counts = app.counts_of(&AcceptScope::All);
+        let every: usize = app.roots.values().map(|v| v.rows().len()).sum();
+        assert_eq!(counts.files, every);
+        assert_eq!(counts.grouped_seen, 3);
+    }
+
     /// A group is several files too, so `a` refuses there on the same terms and `A` folds
     /// it. The refusal names the group rather than a repository.
     #[test]
     fn app_accept_on_a_group_refuses_and_accept_file_folds_it() {
         let mut app = three_roots();
-        app.select(Some(Selection::Group(root("beta"), Annotation::Upstream)));
+        app.select(Some(Selection::Group(root("beta"), GroupKind::Upstream)));
         let before = app.roots[&root("beta")].clone();
 
         assert_eq!(
@@ -5996,7 +6360,7 @@ mod tests {
             app.accept_file_scope(),
             Some(AcceptScope::Group {
                 root: root("beta"),
-                kind: Annotation::Upstream,
+                kind: GroupKind::Upstream,
             })
         );
     }
@@ -6039,7 +6403,7 @@ mod tests {
                 "Ctrl-W accepts all in alpha".to_owned()
             ))
         );
-        app.select(Some(Selection::Group(root("beta"), Annotation::Upstream)));
+        app.select(Some(Selection::Group(root("beta"), GroupKind::Upstream)));
         assert_eq!(
             app.accept_scope(),
             Some(AcceptAnswer::Refuse("Ctrl-W accepts the group".to_owned()))
@@ -6385,6 +6749,7 @@ mod tests {
             Some(ConfirmCounts {
                 files: 11,
                 grouped: 1,
+                grouped_seen: 0,
                 collapsed: 2,
                 roots: vec!["alpha".into()],
             })
@@ -6865,7 +7230,7 @@ mod tests {
                 Selection::Root(root("beta")),
                 row("beta", "u1"),
                 row("beta", "u2"),
-                Selection::Group(root("beta"), Annotation::Upstream),
+                Selection::Group(root("beta"), GroupKind::Upstream),
                 Selection::Root(root("notes")),
                 row("notes", "n2.md"),
             ]
@@ -6899,7 +7264,7 @@ mod tests {
             "the repo is still listed, so the cursor stays in it — its name row"
         );
 
-        app.select(Some(Selection::Group(root("beta"), Annotation::Upstream)));
+        app.select(Some(Selection::Group(root("beta"), GroupKind::Upstream)));
         let mut p = pile("beta");
         for r in &mut p.rows {
             r.annotation = Some(Annotation::Mixed);

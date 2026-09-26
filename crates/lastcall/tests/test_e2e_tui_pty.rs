@@ -5496,3 +5496,162 @@ fn pty_reload_adds_a_root_keeps_an_accept_and_refuses_a_broken_file() {
     assert_eq!(status.exit_code(), 0, "{status:?}");
     assert_clean_exit(&pty, since);
 }
+
+/// Phase 14 B through the real binary: content already accepted on another branch folds
+/// into `seen · N files`, and the fold opens, splits, closes, accepts and undoes. The
+/// "agent" works mid-run: `run-1` commits three files, the person accepts them one by one,
+/// then `main` → a fresh `feat-x` cherry-picks the run. The walk: `e` opens the group, a
+/// member's diff is an ordinary row's, `m` on it splits it out (its own row, the group one
+/// shorter), `e` on another member closes the group and selects it, `A` accepts the rest,
+/// `z` puts them back.
+#[test]
+fn pty_seen_group_cherry_pick_expand_flag_accept_undo() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let Some(mut pty) = fx.spawn_tui(&bin()) else {
+        return;
+    };
+    wait_first_piles(&mut pty);
+    let repo = fx.repo("alpha");
+    let names = ["s/a.rs", "s/b.rs", "s/c.rs"];
+
+    // The run: three committed files on `run-1`, accepted there one at a time.
+    repo.checkout_b("run-1").unwrap();
+    for (i, name) in names.iter().enumerate() {
+        repo.write(name, format!("fn run_{i}() {{}}\n"));
+    }
+    let mut add = vec!["add", "--"];
+    add.extend(names);
+    repo.git(&add).unwrap();
+    repo.git(&["commit", "-q", "-m", "run-1 work"]).unwrap();
+    pty.wait_for(OVERLOADED, |s| {
+        let t = s.contents();
+        t.contains("run-1 · 6 files") && t.contains("A c.rs")
+    })
+    .unwrap_or_else(|e| panic!("the run's rows: {e}\n{}", pty.screen_text()));
+    for name in names {
+        select_until(&mut pty, &format!("{name}  A "));
+        pty.send(b"A").expect("A");
+        let want = format!("accepted {name}");
+        pty.wait_for(OVERLOADED, move |s| status_is(s, &want))
+            .unwrap_or_else(|e| panic!("accept {name}: {e}\n{}", pty.screen_text()));
+    }
+    pty.wait_for(OVERLOADED, |s| s.contents().contains("run-1 · 3 files"))
+        .unwrap_or_else(|e| panic!("run-1 reviewed: {e}\n{}", pty.screen_text()));
+
+    // Back on `main`, then a fresh `feat-x` cherry-picks the run.
+    repo.checkout("main").unwrap();
+    pty.wait_for(OVERLOADED, |s| s.contents().contains("main · 3 files"))
+        .unwrap_or_else(|e| panic!("back on main: {e}\n{}", pty.screen_text()));
+    repo.checkout_b("feat-x").unwrap();
+    pty.wait_for(OVERLOADED, |s| s.contents().contains("feat-x · 3 files"))
+        .unwrap_or_else(|e| panic!("feat-x: {e}\n{}", pty.screen_text()));
+    let t = Instant::now();
+    repo.git(&["cherry-pick", "main..run-1"]).unwrap();
+    pty.wait_for(OVERLOADED, |s| {
+        let t = s.contents();
+        t.contains("feat-x · 6 files") && t.contains("seen · 3 files") && !t.contains("A a.rs")
+    })
+    .unwrap_or_else(|e| panic!("the fold: {e}\n{}", pty.screen_text()));
+    note(&format!(
+        "PTY seen: `seen · 3 files` on the nav {:.3?} after the cherry-pick",
+        t.elapsed()
+    ));
+
+    // `e` on the group opens it: the members, indented, badged.
+    select_until(&mut pty, "3 files, content accepted on run-1");
+    pty.send(b"e").expect("e");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        let t = s.contents();
+        ["a.rs", "b.rs", "c.rs"]
+            .iter()
+            .all(|n| t.contains(&format!("    A {n}  +1 −0  [seen]")))
+    })
+    .unwrap_or_else(|e| panic!("the open group: {e}\n{}", pty.screen_text()));
+    note(&format!(
+        "PTY seen open: {:?}",
+        pty.find_row(|r| r.contains("    A a.rs")).map(|r| {
+            pty.screen_text()
+                .lines()
+                .nth(r as usize)
+                .unwrap_or("")
+                .to_owned()
+        })
+    ));
+
+    // A member's diff is an ordinary row's, with the badge on its header.
+    pty.send(b"jj").expect("to b.rs");
+    nav_cursor_reaches(&mut pty, "A b.rs  +1 −0  [seen]", "jj");
+    pty.send(b"\r").expect("open");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        let t = s.contents();
+        t.contains("s/b.rs  A  +1 −0  [seen]") && t.contains("+fn run_1() {}")
+    })
+    .unwrap_or_else(|e| panic!("the member's diff: {e}\n{}", pty.screen_text()));
+
+    // `m` flags it: the rescan brings it back flagged, its own row, the group one shorter
+    // and still open.
+    pty.send(b"m").expect("m");
+    pty.wait_for(Duration::from_secs(5), |s| s.contents().contains("⏎ send"))
+        .unwrap_or_else(|e| panic!("the note modal: {e}\n{}", pty.screen_text()));
+    pty.send(b"look at this one").expect("the note");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        s.contents().contains("look at this one")
+    })
+    .unwrap_or_else(|e| panic!("the note is echoed: {e}"));
+    pty.send(b"\r").expect("enter");
+    pty.wait_for(OVERLOADED, |s| {
+        let t = s.contents();
+        t.contains("seen · 2 files")
+            && t.contains("    A a.rs  +1 −0  [seen]")
+            && t.contains("    A c.rs  +1 −0  [seen]")
+            && !t.contains("    A b.rs")
+    })
+    .unwrap_or_else(|e| panic!("the split: {e}\n{}", pty.screen_text()));
+    note(&format!(
+        "PTY seen split: {:?}",
+        pty.find_row(|r| r.contains("seen · 2 files")).map(|r| {
+            pty.screen_text()
+                .lines()
+                .nth(r as usize)
+                .unwrap_or("")
+                .to_owned()
+        })
+    ));
+
+    // `e` on a member closes the group and selects it.
+    select_until(&mut pty, "s/a.rs  A ");
+    pty.send(b"e").expect("e on a member");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        let t = s.contents();
+        t.contains("2 files, content accepted on run-1") && !t.contains("    A a.rs")
+    })
+    .unwrap_or_else(|e| panic!("the close: {e}\n{}", pty.screen_text()));
+    nav_cursor_reaches(&mut pty, "seen · 2 files", "e on a member");
+
+    // `A` accepts the group; `z` puts it back.
+    pty.send(b"A").expect("A");
+    pty.wait_for(OVERLOADED, |s| {
+        // The nav's group line, not the status (which says `seen · 2 files` too).
+        status_is(s, "accepted seen · 2 files") && !s.contents().contains("│  seen · 2 files")
+    })
+    .unwrap_or_else(|e| panic!("the group accept: {e}\n{}", pty.screen_text()));
+    assert!(
+        pty.screen_text().contains("feat-x · 4 files"),
+        "the flagged file stays:\n{}",
+        pty.screen_text()
+    );
+    pty.send(b"z").expect("z");
+    pty.wait_for(OVERLOADED, |s| {
+        status_is(s, "undid accept of 2 files in alpha")
+            && s.contents().contains("│  seen · 2 files")
+    })
+    .unwrap_or_else(|e| panic!("the undo: {e}\n{}", pty.screen_text()));
+    note("PTY seen: A accepted seen · 2 files; z undid accept of 2 files in alpha");
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}

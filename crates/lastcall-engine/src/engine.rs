@@ -31,6 +31,7 @@ use crate::ops::{self, FaultInjector, NoFault, Ops, OpsError, Outcome, Refused, 
 use crate::paths::{Layout, ParentId, ParentMeta, RepoPaths, RootId};
 use crate::roots::{self, Badge, DiscoverInputs, Discovery, RootsChanged};
 use crate::scan::{self, Entry, Pile, Row, ScanError, ScanInputs};
+use crate::seen::{self, SeenCache};
 use crate::store::{Current, DraftScope, ExcludedDir, RepoFacts, RootKind, Store, StoreError};
 use crate::upstream::{self, Classifier};
 
@@ -222,6 +223,8 @@ pub struct RootState {
     pub tree: TreeEntries,
     pub head: HeadState,
     pub classifier: Classifier,
+    /// Parked trees listed for the seen-on-another-branch marks (Phase 14 B, `seen.rs`).
+    pub seen_cache: SeenCache,
     pub case_insensitive: bool,
     /// Root-relative folders inside this root that another root looks after (their files
     /// are theirs), with whether the whole tree below each belongs there.
@@ -1148,6 +1151,7 @@ fn open_root_with(ctx: &OpenCtx<'_>, d: &roots::DiscoveredRoot) -> Result<RootSt
         tree,
         head,
         classifier: Classifier::default(),
+        seen_cache: SeenCache::default(),
         excluded_dirs: d.excluded_dirs.clone(),
         notices,
         last_pile: None,
@@ -1368,6 +1372,25 @@ fn scan_root_once(
         };
         if let Some(n) = skipped {
             pile.notices.push(n);
+        }
+        // Phase 14 B: after upstream, so an upstream or mixed row is never marked seen. A
+        // parked tree the store no longer holds lists as empty (nothing matches, nothing
+        // is hidden); any other failure is a notice and a pile with no seen marks.
+        let store = &state.store;
+        if let Err(e) = seen::mark(
+            &mut pile,
+            &state.ledger,
+            store.filemode(),
+            &mut state.seen_cache,
+            |t| {
+                if store.exists(t) {
+                    store.ls_tree(t)
+                } else {
+                    Ok(TreeEntries::new())
+                }
+            },
+        ) {
+            pile.notices.push(format!("seen annotation skipped: {e}"));
         }
     }
     state.last_pile = Some(pile.clone());
@@ -4686,6 +4709,7 @@ pub(crate) mod tests {
             collapsed: Some(crate::scan::Collapsed::Glob),
             flags: Vec::new(),
             rename: None,
+            seen_on: Vec::new(),
         };
         let err = engine
             .hunks_of(Path::new("/nope/not/a/root"), &row)

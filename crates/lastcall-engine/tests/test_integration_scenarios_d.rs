@@ -1514,12 +1514,32 @@ fn scenario_d16_cherry_picks_show_once_more_by_design() {
     );
     s.repo.git(&["cherry-pick", "main..run-1"]).unwrap();
     s.repo.git(&["cherry-pick", "main..run-2"]).unwrap();
-    assert_pile!(
+    let pile = assert_pile!(
         s.engine,
         s.root,
         "a.rs|b.rs|c.rs",
         "D16 the cherry-picked content shows again"
     );
+    // Amendment v1.15: the rows are still pending, and each says which parked record
+    // already accepted exactly this content; the three fold into one `seen` group.
+    let seen_on: Vec<(String, Vec<String>)> = pile
+        .rows
+        .iter()
+        .map(|r| (r.path_lossy(), r.seen_on.clone()))
+        .collect();
+    assert_eq!(
+        seen_on,
+        vec![
+            ("a.rs".to_owned(), vec!["run-1".to_owned()]),
+            ("b.rs".to_owned(), vec!["run-1".to_owned()]),
+            ("c.rs".to_owned(), vec!["run-2".to_owned()]),
+        ],
+        "D16 seen_on per row"
+    );
+    let groups = pile.groups();
+    assert_eq!(groups.len(), 1, "D16 one group: {groups:?}");
+    assert_eq!(groups[0].kind, lastcall_engine::scan::GroupKind::Seen);
+    assert_eq!(groups[0].paths.len(), 3, "D16 seen · 3 files");
     let before = s.ledger().seen_tree.clone();
     assert!(s.accept_all().ok());
     assert_pile!(s.engine, s.root, "", "D16 accept-all on feat/x");
