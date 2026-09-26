@@ -1390,9 +1390,10 @@ fn render_main(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
         }
         Some(Selection::Group(root, kind)) => {
             if let Some(group) = app.roots.get(root).and_then(|v| v.group(*kind)) {
+                // The same bracketed label as the nav row it was selected from.
                 lines.push(Line::from(vec![
-                    Span::styled(kind.name().to_owned(), bold()),
-                    Span::raw(format!(" · {}", plural(group.paths.len(), "file"))),
+                    Span::styled(format!("[{}]", kind.name()), bold()),
+                    Span::raw(format!(" {}", plural(group.paths.len(), "file"))),
                 ]));
                 for p in &group.paths {
                     lines.push(Line::from(format!("  {}", String::from_utf8_lossy(p))));

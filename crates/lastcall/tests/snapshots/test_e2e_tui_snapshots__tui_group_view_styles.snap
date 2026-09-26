@@ -7,7 +7,7 @@ expression: style
 1 27..100 Cyan Reset -
 2 1..6 Reset Reset BOLD
 2 27..28 Cyan Reset -
-2 28..36 Reset Reset BOLD
+2 28..38 Reset Reset BOLD
 2 99..100 Cyan Reset -
 3 27..28 Cyan Reset -
 3 99..100 Cyan Reset -
