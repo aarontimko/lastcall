@@ -46,6 +46,10 @@ you are sitting in front of: a second one over the same session tracks its own.
 
 Clicking the dot selects that repository and acknowledges it in one gesture.
 
+Copying inside a herdr pane is by drag, since the terminal's own selection does not reach
+it there: drag across any text in the right pane, a diff, a repository's path or a group's
+file list, and the release copies it.
+
 **A badge in the header** saying what the link is doing: `herdr <version>` when connected,
 `herdr ⟳` while reconnecting, `standalone` when there is no link, and, under `mode = "on"`,
 `standalone: <reason>` when one was asked for and did not happen. Click the badge to put the

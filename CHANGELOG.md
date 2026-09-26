@@ -35,6 +35,12 @@ binary rather than for the commit log.
   edit or flag afterwards leaves the group for its own row. `A` accepts the group, `z` puts
   it back, and `lastcall status` still lists every file (`status --json` adds `seen_on` to
   each row and a `seen` group).
+- The mouse copies any text in the right pane, not only diff lines: drag across a
+  repository's path, its file list or a group's files, and the release puts those lines on
+  the clipboard. Inside a herdr pane, where the terminal's own selection does not reach,
+  that is how you copy. `v` and `y` work there too, and `y` on a repository or group row
+  copies its whole pane. Outside herdr, `shift` and drag is still your terminal's own
+  selection.
 
 ### Changed
 

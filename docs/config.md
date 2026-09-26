@@ -156,8 +156,8 @@ the character the keyboard sends.
 | `undo` | `z` | undo the last accept in the selected repository; the last 20 are kept |
 | `flag` | `m` | flag it with a note |
 | `unflag` | `shift-m` | clear that file's flags |
-| `select` | `v` | start a line selection in the diff |
-| `copy` | `y` | copy the selection, or the hunk under the cursor |
+| `select` | `v` | start a line selection in the right pane |
+| `copy` | `y` | copy the selection, or the hunk under the cursor; on a repository or group row, that whole pane |
 | `edit` | `i` | edit the file in place |
 | `edit_external` | `shift-i` | open the file in your own editor at the hunk |
 | `ack` | `d` | acknowledge an agent's attention flag |

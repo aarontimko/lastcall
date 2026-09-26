@@ -76,8 +76,9 @@ opinion about your branches.
   accept instead of a wall of hunks, and `e` expands one when you do want to read it.
 - **Editing in place, or in your own editor.** `i` for lastcall's, `shift-i` for
   `$VISUAL`. A save writes the file and advances the baseline in one step.
-- **Copy that works over ssh.** `v` and `y` put diff lines on the clipboard of the terminal
-  you are actually sitting at.
+- **Copy that works over ssh.** Drag across any text in the right pane, or use `v` and
+  `y`, and diff lines, a repository's path or a group's file list land on the clipboard of
+  the terminal you are actually sitting at.
 - **Headless too.** `lastcall status`, `lastcall status --json` and `lastcall watch` read
   and report the same ledger with no screen involved.
 - **Everything rebindable**, and an unknown config key is an error rather than a shrug.

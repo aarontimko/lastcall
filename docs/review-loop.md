@@ -385,9 +385,11 @@ or over the collapse size.
 
 ## 7. Copy
 
-`v` starts a line selection in the diff, `↑` and `↓` extend it, and `y` copies. With no
-selection, `y` copies the hunk under the cursor. `esc` drops the selection without leaving
-the file.
+Drag across any text in the right pane, a diff, a repository's path, a group's file list,
+and the release copies it. From the keyboard, `v` starts a line selection in the right
+pane, `↑` and `↓` extend it, and `y` copies. With no selection, `y` copies the hunk under
+the cursor, or on a repository or a group the whole pane. `esc` drops the selection without
+leaving the file.
 
 ```text
 │──────────────────────────│@@ -51,4 +53,10 @@                      [a accept] [u restore] [m flag]│
@@ -401,8 +403,8 @@ larger than about 32 KiB is refused rather than truncated, with a line saying so
 half-pasted patch is worse than none.
 
 Some terminals have this switched off by default, in which case nothing lands and the
-terminal, not lastcall, is the place to look. `shift` and drag still selects text the
-ordinary way, since the mouse is otherwise being used for clicks.
+terminal, not lastcall, is the place to look. Outside a herdr pane, `shift` and drag still
+uses the terminal's own selection, which works where OSC 52 is switched off.
 
 ## What it remembers
 
