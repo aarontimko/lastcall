@@ -588,6 +588,9 @@ pub struct Engine {
     discovery: Discovery,
     collapsed: GlobSet,
     ignore: GlobSet,
+    /// `skip_globs` (Amendment v1.15), for a watched folder's scan; discovery reads the
+    /// config's list itself.
+    skip: GlobSet,
     /// Engine-level notices (config resolution, discovery).
     notices: Vec<String>,
     pending_nested: Vec<(PathBuf, PathBuf)>,
@@ -633,6 +636,7 @@ impl Engine {
         std::fs::create_dir_all(layout.roots_dir()).map_err(|e| io_err(&layout.roots_dir(), e))?;
         let collapsed = build_globs(&loaded.config.collapsed_globs);
         let ignore = build_globs(&loaded.config.ignore_globs);
+        let skip = crate::config::skip_set(&loaded.config.skip_globs);
         let mut engine = Engine {
             env: env.clone(),
             config: loaded.config.clone(),
@@ -643,6 +647,7 @@ impl Engine {
             discovery: Discovery::default(),
             collapsed,
             ignore,
+            skip,
             notices: resolved.notices.clone(),
             pending_nested: Vec::new(),
             discovery_runs: 0,
@@ -779,6 +784,7 @@ impl Engine {
             search_depth: self.config.search_depth,
             collapse_size_bytes: self.config.collapse_size_bytes,
             draft_dir_parents: self.config.draft_dir_parents,
+            skip_globs: &self.config.skip_globs,
         });
         let changed = roots::diff(&self.discovery, &next);
         for n in &next.notices {
@@ -1116,6 +1122,8 @@ fn open_root_with(ctx: &OpenCtx<'_>, d: &roots::DiscoveredRoot) -> Result<RootSt
 /// by reference across the scan pool; nothing in it is mutated there.
 struct ScanCtx {
     collapsed: GlobSet,
+    /// `skip_globs`, for a watched folder's candidates (empty: nothing is skipped).
+    skip: GlobSet,
     collapse_size_bytes: u64,
     row_cap: usize,
     /// The engine's injected wall clock, read once per `scan_all` so every root in one
@@ -1221,6 +1229,17 @@ fn scan_root_once(
     }
     #[cfg(test)]
     SCAN_ROOT_HOOK.with(|h| h.fire(()));
+    // A watched folder's `skip_globs` test is anchored at the parent dir it is filed
+    // under, the same path discovery matched; a repository's own files are never skipped.
+    let skip_prefix: Vec<u8> = state
+        .path
+        .strip_prefix(&state.parent)
+        .map(|rel| rel.as_os_str().as_bytes().to_vec())
+        .unwrap_or_default();
+    let skip = (state.kind == RootKind::Draft && !ctx.skip.is_empty()).then(|| scan::DraftSkip {
+        globs: &ctx.skip,
+        prefix: &skip_prefix,
+    });
     let out = scan::scan(&ScanInputs {
         store: &state.store,
         index: &state.index,
@@ -1236,6 +1255,7 @@ fn scan_root_once(
         index_tmp: &state.paths.index_tmp,
         row_cap: ctx.row_cap,
         retry_on_reseed,
+        skip,
     })?;
     let mut pile = out.pile;
     // The two per-root ledger facts the reducer may never read for itself (design review
@@ -1288,6 +1308,7 @@ impl Engine {
     fn scan_ctx(&self) -> ScanCtx {
         ScanCtx {
             collapsed: self.collapsed.clone(),
+            skip: self.skip.clone(),
             collapse_size_bytes: self.config.collapse_size_bytes,
             row_cap: self.options.row_cap,
             now: self.options.clock.now(),

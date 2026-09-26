@@ -5664,6 +5664,7 @@ mod tests {
                     index_tmp: &self.paths.index_tmp,
                     row_cap: DEFAULT_ROW_CAP,
                     retry_on_reseed: false,
+                    skip: None,
                 })
                 .unwrap()
                 .pile

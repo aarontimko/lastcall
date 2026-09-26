@@ -166,6 +166,75 @@ pub struct DiscoverInputs<'a> {
     /// `Config::draft_dir_parents`: how many folders above a watched folder its name
     /// carries (Amendment v1.13).
     pub draft_dir_parents: u8,
+    /// `Config::skip_globs` (Amendment v1.15): a repository or a watched folder whose path
+    /// relative to the parent dir it is filed under matches one is never a root, and the
+    /// walk never enters a plain folder that matches.
+    pub skip_globs: &'a [String],
+}
+
+/// The `skip_globs` test discovery runs on every candidate directory, **before** anything
+/// about it is read: no `.git` probe, no `rev-parse`, so a skipped repository costs no
+/// spawn and a skipped tree of clones is never walked (Amendment v1.15).
+struct Skip<'a> {
+    set: globset::GlobSet,
+    parents: &'a [PathBuf],
+    /// Never skipped whatever matches: the parent dirs themselves and the launch
+    /// directory. A root that **is** or **contains** one of these stays.
+    protected: Vec<PathBuf>,
+}
+
+impl<'a> Skip<'a> {
+    fn new(entries: &[String], parents: &'a [PathBuf], launch: &Path) -> Self {
+        let mut protected = parents.to_vec();
+        protected.push(std::fs::canonicalize(launch).unwrap_or_else(|_| launch.to_path_buf()));
+        Skip {
+            set: crate::config::skip_set(entries),
+            parents,
+            protected,
+        }
+    }
+
+    /// Whether `rel` (a folder's relative path) matches, as `rel` and as `rel/`: the
+    /// second form is what lets `evals/**` prune the folder `evals` itself.
+    fn matches_dir(&self, rel: &Path) -> bool {
+        if rel.as_os_str().is_empty() {
+            return false;
+        }
+        if self.set.is_match(rel) {
+            return true;
+        }
+        let mut with_slash = rel.as_os_str().to_os_string();
+        with_slash.push("/");
+        self.set.is_match(Path::new(&with_slash))
+    }
+
+    /// Whether discovery leaves `dir` out. A protected directory never is; when a pattern
+    /// would have matched it (against its own parent directory, since relative to the
+    /// parent dir it *is* the base), `notices` says the pattern was ignored for it.
+    fn skips(&self, dir: &Path, notices: &mut Vec<String>) -> bool {
+        if self.set.is_empty() {
+            return false;
+        }
+        if self.protected.iter().any(|p| p.starts_with(dir)) {
+            let own = dir.file_name().map(Path::new).unwrap_or(Path::new(""));
+            let filed = file_under(self.parents, dir);
+            let rel = dir.strip_prefix(&filed).unwrap_or(Path::new(""));
+            if self.matches_dir(own) || self.matches_dir(rel) {
+                let notice = format!(
+                    "skip_globs: {} is a parent dir or the launch directory, so the \
+                     pattern is ignored for it",
+                    dir.display()
+                );
+                if !notices.contains(&notice) {
+                    notices.push(notice);
+                }
+            }
+            return false;
+        }
+        let filed = file_under(self.parents, dir);
+        dir.strip_prefix(&filed)
+            .is_ok_and(|rel| self.matches_dir(rel))
+    }
 }
 
 const WALK_DEPTH: usize = crate::config::MAX_SEARCH_DEPTH as usize;
@@ -188,6 +257,7 @@ pub fn discover(inputs: &DiscoverInputs<'_>) -> Discovery {
         .collect();
     let parent_of = |path: &Path| -> PathBuf { file_under(&parents, path) };
     let depth = inputs.search_depth.clamp(1, WALK_DEPTH as u8);
+    let skip = Skip::new(inputs.skip_globs, &parents, inputs.env.cwd());
 
     // Git roots under each parent.
     for p in &parents {
@@ -196,6 +266,8 @@ pub fn discover(inputs: &DiscoverInputs<'_>) -> Discovery {
             continue;
         }
         if let Some(top) = toplevel(inputs.env, p) {
+            // A parent inside a repository is that repository: protected, never skipped.
+            skip.skips(&top, &mut notices);
             roots
                 .entry(top.clone())
                 .or_insert_with(|| git_root(top.clone(), parent_of(&top), None));
@@ -223,6 +295,8 @@ pub fn discover(inputs: &DiscoverInputs<'_>) -> Discovery {
             })
             .collect();
         children.sort();
+        // The skip decides first: a matching child is neither probed nor walked.
+        children.retain(|(child, _)| !skip.skips(child, &mut notices));
         for (child, _) in &children {
             if has_git_entry(child) {
                 record_git_root(inputs.env, &parents, &mut roots, &mut notices, child);
@@ -253,6 +327,9 @@ pub fn discover(inputs: &DiscoverInputs<'_>) -> Discovery {
                 .collect();
             entries.sort();
             for entry in entries {
+                if skip.skips(&entry, &mut notices) {
+                    continue;
+                }
                 if has_git_entry(&entry) {
                     record_git_root(inputs.env, &parents, &mut roots, &mut notices, &entry);
                 } else if !is_skipped(&entry) && level + 1 < depth {
@@ -267,7 +344,7 @@ pub fn discover(inputs: &DiscoverInputs<'_>) -> Discovery {
         let Ok(canon) = std::fs::canonicalize(dir) else {
             continue;
         };
-        if roots.contains_key(&canon) {
+        if roots.contains_key(&canon) || skip.skips(&canon, &mut notices) {
             continue;
         }
         if toplevel(inputs.env, &canon).as_deref() != Some(canon.as_path()) {
@@ -296,12 +373,19 @@ pub fn discover(inputs: &DiscoverInputs<'_>) -> Discovery {
             // repository falls back to its own parent, and the worktree follows it).
             let parent = roots[&main].parent.clone();
             for path in worktrees_inside(inputs.env, &main) {
+                if skip.skips(&path, &mut notices) {
+                    continue;
+                }
                 roots.entry(path.clone()).or_insert_with(|| {
                     git_root(path, parent.clone(), Some(Badge::WorktreeOf(main.clone())))
                 });
             }
         }
     }
+
+    // Whatever found a root, a matching one is not listed: the checks above keep the walk
+    // and the promotion from spawning for one, and this pass is the backstop for the rest.
+    roots.retain(|path, _| !skip.skips(path, &mut notices));
 
     // Linked-worktree badges.
     for root in roots.values_mut() {
@@ -345,13 +429,17 @@ pub fn discover(inputs: &DiscoverInputs<'_>) -> Discovery {
         // level below each base, and only a `**` component reads to the ceiling.
         let walk = crate::config::draft_entry_walk_depth(entry);
         for base in &bases {
-            for dir in matching_dirs(base, &matcher, walk) {
+            for dir in matching_dirs(base, &matcher, walk, &|d| skip.skips(d, &mut Vec::new())) {
                 let wider = watched.entry(dir).or_insert(false);
                 *wider |= recursive;
             }
         }
     }
     for (dir, recursive) in watched {
+        if skip.skips(&dir, &mut notices) {
+            // A watched folder whose own path matches is not a root.
+            continue;
+        }
         if roots.contains_key(&dir) {
             // A repository is already looking after it; its own rules win.
             continue;
@@ -563,7 +651,12 @@ fn draft_matcher(pattern: &str) -> Result<GlobMatcher, globset::Error> {
 ///
 /// `depth` is the entry's own reach (one level per component, the ceiling for a `**`
 /// component), so naming a folder costs a `read_dir` of each base and nothing more.
-fn matching_dirs(base: &Path, glob: &GlobMatcher, depth: usize) -> Vec<PathBuf> {
+fn matching_dirs(
+    base: &Path,
+    glob: &GlobMatcher,
+    depth: usize,
+    skipped: &dyn Fn(&Path) -> bool,
+) -> Vec<PathBuf> {
     let depth = depth.clamp(1, WALK_DEPTH);
     let mut out = Vec::new();
     let mut stack: Vec<(PathBuf, usize)> = vec![(base.to_path_buf(), 0)];
@@ -581,6 +674,10 @@ fn matching_dirs(base: &Path, glob: &GlobMatcher, depth: usize) -> Vec<PathBuf> 
             }
             let name = entry.file_name();
             if WALK_SKIP.iter().any(|s| name == *s) {
+                continue;
+            }
+            // A folder `skip_globs` names is neither a watched folder nor walked through.
+            if skipped(&path) {
                 continue;
             }
             if let Ok(rel) = path.strip_prefix(base)
@@ -699,6 +796,7 @@ mod tests {
             search_depth: 1,
             collapse_size_bytes: TEST_MAX,
             draft_dir_parents: 1,
+            skip_globs: &[],
         });
         assert_eq!(d.notices, Vec::<String>::new());
         assert_eq!(
@@ -795,6 +893,7 @@ mod tests {
                 search_depth: depth,
                 collapse_size_bytes: TEST_MAX,
                 draft_dir_parents: 1,
+                skip_globs: &[],
             })
         };
 
@@ -885,6 +984,7 @@ mod tests {
                 search_depth: depth,
                 collapse_size_bytes: TEST_MAX,
                 draft_dir_parents: 1,
+                skip_globs: &[],
             })
         };
 
@@ -951,6 +1051,7 @@ mod tests {
             search_depth: 1,
             collapse_size_bytes: TEST_MAX,
             draft_dir_parents: 1,
+            skip_globs: &[],
         });
         let repo_c = std::fs::canonicalize(&repo).unwrap();
         let notes_c = std::fs::canonicalize(&elsewhere).unwrap();
@@ -976,6 +1077,7 @@ mod tests {
             search_depth: 1,
             collapse_size_bytes: TEST_MAX,
             draft_dir_parents: 1,
+            skip_globs: &[],
         });
         assert!(missing.roots.is_empty());
         assert_eq!(missing.notices.len(), 1);
@@ -1018,6 +1120,7 @@ mod tests {
                 search_depth: 1,
                 collapse_size_bytes: TEST_MAX,
                 draft_dir_parents: parents,
+                skip_globs: &[],
             })
         }
 
@@ -1208,5 +1311,228 @@ mod tests {
                 (b"z_ignore/research".to_vec(), false),
             ]
         );
+    }
+
+    /// A discovery pass with `skip_globs`, everything else at its plainest.
+    fn discover_skipping(
+        env: &Env,
+        parents: &[PathBuf],
+        draft_dirs: &[String],
+        nested: &[(PathBuf, PathBuf)],
+        depth: u8,
+        skip: &[&str],
+    ) -> Discovery {
+        let skip: Vec<String> = skip.iter().map(|s| (*s).to_owned()).collect();
+        discover(&DiscoverInputs {
+            env,
+            parent_dirs: parents,
+            draft_dirs,
+            nested,
+            search_depth: depth,
+            collapse_size_bytes: TEST_MAX,
+            draft_dir_parents: 1,
+            skip_globs: &skip,
+        })
+    }
+
+    /// The git processes this thread spawns while `f` runs.
+    fn spawns<T>(f: impl FnOnce() -> T) -> (T, u64) {
+        let before = crate::git::thread_spawn_count();
+        let out = f();
+        (out, crate::git::thread_spawn_count() - before)
+    }
+
+    /// Amendment v1.15 (scenario A9): a repository `skip_globs` names is never listed, and
+    /// the match runs before the `.git` probe and `rev-parse`, so it costs no spawn: the
+    /// pass spends exactly what the same tree without the skipped repositories costs.
+    #[test]
+    fn roots_skip_globs_leave_a_matching_repository_unopened() {
+        let dir = TempDir::new("lc-roots-skip");
+        let env = test_env(&dir);
+        let full = dir.mkdir("P");
+        init_repo(&env, &full.join("keep"));
+        init_repo(&env, &full.join("c1"));
+        init_repo(&env, &full.join("evals/c2"));
+        init_repo(&env, &full.join("evals/deeper/c3"));
+        // The twin: the same tree without the three repositories the skip names.
+        let twin = dir.mkdir("Q");
+        init_repo(&env, &twin.join("keep"));
+        dir.mkdir("Q/evals/deeper");
+        let canon = |p: &Path| std::fs::canonicalize(p).unwrap();
+        let p = std::slice::from_ref(&full);
+        let q = std::slice::from_ref(&twin);
+
+        let (plain, plain_cost) = spawns(|| discover_skipping(&env, p, &[], &[], 3, &[]));
+        assert_eq!(plain.roots.len(), 4, "{:?}", plain.paths());
+
+        let (base, base_cost) = spawns(|| discover_skipping(&env, q, &[], &[], 3, &[]));
+        assert_eq!(base.paths(), vec![canon(&twin.join("keep"))]);
+
+        // A level-1 repository and a depth-2 one, each by its own pattern.
+        let (d, cost) =
+            spawns(|| discover_skipping(&env, p, &[], &[], 3, &["c1", "evals/*", "evals/*/c3"]));
+        assert_eq!(d.paths(), vec![canon(&full.join("keep"))]);
+        assert!(d.notices.is_empty(), "{:?}", d.notices);
+        assert_eq!(cost, base_cost, "a skipped repository costs no spawn");
+        assert!(plain_cost > cost, "{plain_cost} vs {cost}");
+
+        // A folder matching `evals/**` is not entered: `evals` itself matches as `evals/`,
+        // so nothing below it is probed, however deep.
+        let (d, cost) = spawns(|| discover_skipping(&env, p, &[], &[], 3, &["c1", "evals/**"]));
+        assert_eq!(d.paths(), vec![canon(&full.join("keep"))]);
+        assert_eq!(cost, base_cost);
+        let skip = Skip::new(&["evals/**".to_owned()], &[], dir.path());
+        assert!(skip.matches_dir(Path::new("evals")), "`rel/` is tried too");
+        assert!(skip.matches_dir(Path::new("evals/c2")));
+        assert!(!skip.matches_dir(Path::new("other")));
+
+        // An empty list changes nothing.
+        assert_eq!(discover_skipping(&env, p, &[], &[], 3, &[]), plain);
+    }
+
+    /// A scan's nested report that matches is never promoted, and never `rev-parse`d.
+    #[test]
+    fn roots_skip_globs_drop_a_nested_report_before_it_is_opened() {
+        let dir = TempDir::new("lc-roots-skip-nested");
+        let env = test_env(&dir);
+        let parent = dir.mkdir("P");
+        let proj = parent.join("proj");
+        init_repo(&env, &proj);
+        init_repo(&env, &proj.join("z_ignore/evals/c1"));
+        let canon = |p: &Path| std::fs::canonicalize(p).unwrap();
+        let ps = std::slice::from_ref(&parent);
+        let nested = vec![(canon(&proj), proj.join("z_ignore/evals/c1"))];
+
+        let promoted = discover_skipping(&env, ps, &[], &nested, 1, &[]);
+        assert_eq!(
+            promoted.paths(),
+            vec![canon(&proj), canon(&proj.join("z_ignore/evals/c1"))]
+        );
+        let (_, base_cost) =
+            spawns(|| discover_skipping(&env, ps, &[], &[], 1, &["*/z_ignore/**"]));
+        let (d, cost) = spawns(|| discover_skipping(&env, ps, &[], &nested, 1, &["*/z_ignore/**"]));
+        assert_eq!(d.paths(), vec![canon(&proj)]);
+        assert_eq!(
+            cost, base_cost,
+            "the nested promotion's `toplevel` never ran"
+        );
+        // The sponsor's own line.
+        let d = discover_skipping(&env, ps, &[], &nested, 1, &["*/z_ignore/**/evals/**"]);
+        assert_eq!(d.paths(), vec![canon(&proj)]);
+    }
+
+    /// F9: a parent dir entry and the launch directory are never skipped, and a notice says
+    /// the pattern was ignored for them. The same pattern under a parent above `r` skips it.
+    #[test]
+    fn roots_skip_globs_never_skip_a_parent_dir_or_the_launch_directory() {
+        let dir = TempDir::new("lc-roots-skip-parent");
+        let env = test_env(&dir);
+        let w = dir.mkdir("W");
+        let r = w.join("r");
+        init_repo(&env, &r);
+        std::fs::create_dir_all(r.join("src")).unwrap();
+        let canon = |p: &Path| std::fs::canonicalize(p).unwrap();
+        let says_ignored = |d: &Discovery| {
+            d.notices
+                .iter()
+                .any(|n| n.contains("skip_globs") && n.contains("ignored"))
+        };
+
+        let under_w = discover_skipping(&env, std::slice::from_ref(&w), &[], &[], 1, &["r"]);
+        assert!(under_w.roots.is_empty(), "{:?}", under_w.paths());
+        assert!(!says_ignored(&under_w), "{:?}", under_w.notices);
+
+        // `parent_dirs = [W/r]`: the entry itself.
+        let entry = discover_skipping(&env, std::slice::from_ref(&r), &[], &[], 1, &["r"]);
+        assert_eq!(entry.paths(), vec![canon(&r)]);
+        assert!(says_ignored(&entry), "{:?}", entry.notices);
+
+        // A parent inside `r` is `r`.
+        let inside = discover_skipping(&env, &[r.join("src")], &[], &[], 1, &["r"]);
+        assert_eq!(inside.paths(), vec![canon(&r)]);
+        assert!(says_ignored(&inside), "{:?}", inside.notices);
+
+        // Launched inside `r` with `parent_dirs = [W]`.
+        let launched = env.clone().with_cwd(r.join("src"));
+        let d = discover_skipping(&launched, std::slice::from_ref(&w), &[], &[], 1, &["r"]);
+        assert_eq!(d.paths(), vec![canon(&r)]);
+        assert!(says_ignored(&d), "{:?}", d.notices);
+    }
+
+    /// A watched folder whose own path matches is not a root; one beside it is.
+    #[test]
+    fn roots_skip_globs_drop_a_matching_watched_folder() {
+        let dir = TempDir::new("lc-roots-skip-draft");
+        let env = test_env(&dir);
+        let parent = dir.mkdir("P");
+        dir.mkdir("P/a_notes");
+        dir.mkdir("P/b_notes");
+        let proj = parent.join("proj");
+        init_repo(&env, &proj);
+        dir.mkdir("P/proj/z_ignore");
+        let canon = |p: &Path| std::fs::canonicalize(p).unwrap();
+        let ps = std::slice::from_ref(&parent);
+        let drafts = vec!["*_notes".to_owned(), "z_ignore/**".to_owned()];
+
+        let all = discover_skipping(&env, ps, &drafts, &[], 1, &[]);
+        assert_eq!(
+            all.paths(),
+            vec![
+                canon(&parent.join("a_notes")),
+                canon(&parent.join("b_notes")),
+                canon(&proj),
+                canon(&proj.join("z_ignore")),
+            ]
+        );
+        let d = discover_skipping(&env, ps, &drafts, &[], 1, &["b_notes", "proj/z_ignore"]);
+        assert_eq!(
+            d.paths(),
+            vec![canon(&parent.join("a_notes")), canon(&proj)]
+        );
+        assert!(
+            d.get(&canon(&proj)).unwrap().excluded_dirs.is_empty(),
+            "a skipped watched folder hands nothing over"
+        );
+    }
+
+    /// A linked worktree is skipped only when it matches on its own: skipping its main
+    /// leaves it listed, and skipping it leaves the main listed.
+    #[test]
+    fn roots_skip_globs_take_a_linked_worktree_on_its_own_path() {
+        let dir = TempDir::new("lc-roots-skip-wt");
+        let env = test_env(&dir);
+        let parent = dir.mkdir("P");
+        let m = parent.join("m");
+        init_repo(&env, &m);
+        std::fs::write(m.join(".gitignore"), ".worktrees/\n").unwrap();
+        git(&env, &m, &["add", ".gitignore"]);
+        git(&env, &m, &["commit", "-qm", "ignore"]);
+        git(
+            &env,
+            &m,
+            &["worktree", "add", "-q", "../m-wt", "-b", "feat-w"],
+        );
+        git(
+            &env,
+            &m,
+            &["worktree", "add", "-q", ".worktrees/in", "-b", "feat-i"],
+        );
+        let canon = |p: &Path| std::fs::canonicalize(p).unwrap();
+        let ps = std::slice::from_ref(&parent);
+
+        let d = discover_skipping(&env, ps, &[], &[], 1, &["m"]);
+        assert_eq!(d.paths(), vec![canon(&parent.join("m-wt"))]);
+        assert_eq!(
+            d.roots[0].badge,
+            Some(Badge::WorktreeOf(canon(&m))),
+            "still badged by its main"
+        );
+        let d = discover_skipping(&env, ps, &[], &[], 1, &["m-wt"]);
+        assert_eq!(d.paths(), vec![canon(&m)]);
+        // Mechanism 2: the one kept inside `m`.
+        let d = discover_skipping(&env, ps, &[], &[], 2, &[]);
+        assert!(d.paths().contains(&canon(&m.join(".worktrees/in"))));
+        let d = discover_skipping(&env, ps, &[], &[], 2, &["m/.worktrees/*"]);
+        assert_eq!(d.paths(), vec![canon(&m), canon(&parent.join("m-wt"))]);
     }
 }

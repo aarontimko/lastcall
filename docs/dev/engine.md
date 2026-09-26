@@ -359,6 +359,37 @@ the value the next `rescan` uses; it discovers nothing by itself. The TUI pairs 
 matters because a notify is coalesced: one that arrives first would be answered by a rescan
 still running at the old depth, and the set would then wait for the backstop.
 
+**`skip_globs`, decided before anything is read (Phase 14, Amendment v1.15).** `discover`
+builds one `Skip` per pass from `config::skip_set` (the `draft_dirs` grammar,
+`literal_separator(true)`) and asks it about every candidate directory **before** the `.git`
+probe: a level-1 child is dropped from `children` before `has_git_entry`/`record_git_root`,
+a level-2..N entry before the same pair (so a matching plain folder is never pushed on the
+walk stack), a scan's nested report before the promotion's `toplevel`, a `worktrees_inside`
+entry before it is inserted, and a watched folder before it is recorded; `matching_dirs`
+takes the same test as a predicate and neither returns nor enters a matching folder. A
+`retain` over the map before the badge pass is the backstop for whatever found a root. The
+path matched is the directory relative to `file_under(parents, dir)` (what
+`DiscoveredRoot.parent` will be), tried as `rel` and as `rel/`, which is what lets
+`evals/**` prune the folder `evals` itself. A directory that is or contains a parent entry or
+the canonical launch directory (`env.cwd()`) is protected: never skipped, and when a pattern
+would have matched it (its own name, or its path below the parent it is filed under) one
+deduplicated notice says the pattern was ignored for it. The spawn budget is the test:
+`roots_skip_globs_leave_a_matching_repository_unopened` asserts a tree with three skipped
+repositories costs exactly the `git::thread_spawn_count()` of the same tree without them.
+Inside a watched folder the scan gets a `DraftSkip { globs, prefix }` from `scan_root_once`
+(draft roots only, and only when the list is non-empty), where `prefix` is the folder's own
+path below `RootState.parent`; each candidate is matched as `prefix/rel`, and each of its
+folders inside the root as `dir` and `dir/`, at the two places `excluded_dirs` are dropped
+(the `others` filter and the scope filter), and a matching `NestedRepo` is dropped from
+`nested_repos` so it is never reported for promotion. Joining the prefix rather than
+stripping it from the patterns is deliberate: a pattern that starts with a glob
+(`*/z_ignore/**/evals/**`) cannot be stripped textually, and the join makes the scan match
+exactly the path discovery matched. The discover-side filter is what removes a clone reported
+before the key was added (`RootState.nested_repos` persists); the scan-side one only stops
+new reports. A repository's own files are never matched: `DraftSkip` is `None` for a git
+root. A file already in a watched folder's record that becomes skipped is not trimmed from
+the record (no ledger write); it is only never a candidate again.
+
 ## Draft roots and collapsed classes (Phase 6)
 
 **A draft root is a directory, not a repo.** `draft_dirs` (globs relative to a parent dir,

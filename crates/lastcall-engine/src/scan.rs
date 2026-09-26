@@ -240,6 +240,50 @@ pub struct ScanInputs<'a> {
     /// it on every attempt but the last; on the last one the scan keeps the pile it built
     /// and says so in a notice, which is what every scan did before Phase 13.
     pub retry_on_reseed: bool,
+    /// `skip_globs` for a watched folder (Amendment v1.15): a candidate or a nested
+    /// repository whose parent-relative path matches is dropped where `excluded_dirs` are.
+    /// `None` for a repository, whose own files no key may hide, and when the list is empty.
+    pub skip: Option<DraftSkip<'a>>,
+}
+
+/// A watched folder's `skip_globs` test. The patterns are relative to the parent dir the
+/// folder is filed under and the scan's paths to the folder itself, so each path is
+/// matched with the folder's own parent-relative `prefix` in front of it (design review
+/// F13): exactly the path discovery matches, so the two never disagree about a pattern
+/// that starts with a glob (`*/z_ignore/**/evals/**`).
+#[derive(Debug, Clone, Copy)]
+pub struct DraftSkip<'a> {
+    pub globs: &'a GlobSet,
+    /// The folder's path below its parent dir, `/`-separated; empty when it is the parent
+    /// dir itself.
+    pub prefix: &'a [u8],
+}
+
+impl DraftSkip<'_> {
+    /// Whether the root-relative `rel` is left out: it matches, or a folder above it inside
+    /// the root matches (as `dir` or `dir/`), the way discovery never walks into one.
+    pub fn skips(&self, rel: &[u8]) -> bool {
+        let rel = rel.strip_suffix(b"/").unwrap_or(rel);
+        let mut full = Vec::with_capacity(self.prefix.len() + 1 + rel.len() + 1);
+        if !self.prefix.is_empty() {
+            full.extend_from_slice(self.prefix);
+            full.push(b'/');
+        }
+        let start = full.len();
+        full.extend_from_slice(rel);
+        let is_match = |b: &[u8]| self.globs.is_match(Path::new(OsStr::from_bytes(b)));
+        if is_match(&full) {
+            return true;
+        }
+        for i in start..full.len() {
+            if full[i] == b'/' && (is_match(&full[..i]) || is_match(&full[..=i])) {
+                return true;
+            }
+        }
+        let mut dir = full;
+        dir.push(b'/');
+        is_match(&dir)
+    }
 }
 
 /// What a scan produced besides the pile.
@@ -408,6 +452,8 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
             Other::NestedRepo(d) => Some(d.clone()),
             Other::File(_) => None,
         })
+        // A nested repository `skip_globs` names is not reported for promotion.
+        .filter(|d| !inputs.skip.is_some_and(|s| s.skips(d)))
         .collect();
     nested_repos.sort();
 
@@ -472,6 +518,7 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
         if let Other::File(p) = o
             && !under_any(p, &nested_repos)
             && !under_excluded(p, inputs.excluded_dirs)
+            && !inputs.skip.is_some_and(|s| s.skips(p))
         {
             candidates.insert(p.clone());
         }
@@ -517,7 +564,10 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
         Some(scope) => {
             let mut kept: Vec<Vec<u8>> = Vec::with_capacity(candidates.len());
             for p in candidates {
-                if !scope.admits_shape(&p) || under_excluded(&p, inputs.excluded_dirs) {
+                if !scope.admits_shape(&p)
+                    || under_excluded(&p, inputs.excluded_dirs)
+                    || inputs.skip.is_some_and(|s| s.skips(&p))
+                {
                     continue;
                 }
                 let meta = store.lstat(&p);
@@ -1093,6 +1143,10 @@ mod tests {
         }
 
         fn scan(&self, scope: &DraftScope) -> ScanOutput {
+            self.scan_skipping(scope, None)
+        }
+
+        fn scan_skipping(&self, scope: &DraftScope, skip: Option<DraftSkip<'_>>) -> ScanOutput {
             super::scan(&ScanInputs {
                 store: &self.store,
                 index: &self.index,
@@ -1108,9 +1162,102 @@ mod tests {
                 index_tmp: &self.paths.index_tmp,
                 row_cap: crate::engine::DEFAULT_ROW_CAP,
                 retry_on_reseed: false,
+                skip,
             })
             .unwrap()
         }
+    }
+
+    /// Amendment v1.15 (scenario A9): inside a watched folder, a file or a nested
+    /// repository whose parent-relative path matches `skip_globs` is neither a candidate
+    /// nor reported for promotion; the folder's other files are untouched.
+    #[test]
+    fn scan_watched_folder_drops_what_skip_globs_name() {
+        let max = 1 << 20;
+        let w = Watched::new(max);
+        w.write("notes.md", 4);
+        w.write("evals/run.log", 4);
+        w.write("evals/sub/x.md", 4);
+        let env = crate::env::Env::empty(w.dir.path())
+            .with_home(w.dir.path().join("home"))
+            .with_var("GIT_CONFIG_GLOBAL", "/dev/null")
+            .with_var("GIT_CONFIG_SYSTEM", "/dev/null")
+            .with_var("GIT_CONFIG_NOSYSTEM", "1");
+        for clone in ["evals/c1", "other/c2"] {
+            assert!(
+                crate::git::base_command(&env, &w.root)
+                    .args(["init", "-q", clone])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            w.write(&format!("{clone}/x"), 2);
+        }
+        let tree = DraftScope::tree(max);
+        let globs = crate::config::skip_set(&["*/z_ignore/**/evals/**".to_owned()]);
+        // The folder is `proj/z_ignore` below its parent dir.
+        let skip = DraftSkip {
+            globs: &globs,
+            prefix: b"proj/z_ignore",
+        };
+
+        let all = w.scan(&tree);
+        assert_eq!(
+            row_paths(&all),
+            vec!["evals/run.log", "evals/sub/x.md", "notes.md"]
+        );
+        assert_eq!(
+            all.nested_repos,
+            vec![b"evals/c1".to_vec(), b"other/c2".to_vec()]
+        );
+
+        let out = w.scan_skipping(&tree, Some(skip));
+        assert_eq!(row_paths(&out), vec!["notes.md"]);
+        assert_eq!(out.nested_repos, vec![b"other/c2".to_vec()]);
+
+        // A pattern that names the folder `evals` alone prunes everything below it too.
+        let globs = crate::config::skip_set(&["proj/z_ignore/evals".to_owned()]);
+        let out = w.scan_skipping(
+            &tree,
+            Some(DraftSkip {
+                globs: &globs,
+                prefix: b"proj/z_ignore",
+            }),
+        );
+        assert_eq!(row_paths(&out), vec!["notes.md"]);
+        assert_eq!(out.nested_repos, vec![b"other/c2".to_vec()]);
+
+        // A folder watched on its own: unaffected unless its own files match.
+        let plain = DraftScope::plain(max);
+        let globs = crate::config::skip_set(&["*/z_ignore/evals/**".to_owned()]);
+        let out = w.scan_skipping(
+            &plain,
+            Some(DraftSkip {
+                globs: &globs,
+                prefix: b"proj/z_ignore",
+            }),
+        );
+        assert_eq!(row_paths(&out), vec!["notes.md"]);
+        assert_eq!(row_paths(&w.scan(&plain)), vec!["notes.md"]);
+        let globs = crate::config::skip_set(&["*/z_ignore/notes.md".to_owned()]);
+        let out = w.scan_skipping(
+            &plain,
+            Some(DraftSkip {
+                globs: &globs,
+                prefix: b"proj/z_ignore",
+            }),
+        );
+        assert!(row_paths(&out).is_empty(), "{:?}", row_paths(&out));
+
+        // The folder filed as the parent dir itself: no prefix.
+        let globs = crate::config::skip_set(&["evals/**".to_owned()]);
+        let bare = DraftSkip {
+            globs: &globs,
+            prefix: b"",
+        };
+        assert!(bare.skips(b"evals/run.log"));
+        assert!(bare.skips(b"evals/c1/"));
+        assert!(!bare.skips(b"notes.md"));
     }
 
     fn row_paths(out: &ScanOutput) -> Vec<String> {
@@ -1482,6 +1629,7 @@ pub(crate) mod fixture_tests {
                 index_tmp: &self.paths.index_tmp,
                 row_cap: crate::engine::DEFAULT_ROW_CAP,
                 retry_on_reseed: false,
+                skip: None,
             };
             super::scan(&inputs).unwrap()
         }

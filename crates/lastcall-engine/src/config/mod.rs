@@ -86,6 +86,15 @@ pub struct Config {
     pub collapse_size_bytes: u64,
     /// Watch-set noise filters; scope the watcher only, never pending computation (§6.5).
     pub ignore_globs: Vec<String>,
+    /// What discovery and a watched folder's review leave out (Amendment v1.15, §6.1):
+    /// globs in the `draft_dirs` grammar (`literal_separator`, so a `*` stays inside one
+    /// folder name), matched against a path relative to the parent directory a root is filed
+    /// under. A repository whose path matches is never listed (never opened, no git spawned
+    /// for it) and the folder walk never enters a matching folder; a watched folder's file
+    /// or nested repository that matches is not a candidate. Never a repository's own files:
+    /// no key hides a real change. A parent directory itself and the launch directory are
+    /// never skipped.
+    pub skip_globs: Vec<String>,
     /// The TUI's opening answer to `t` (Amendment v1.9, §6.1): `false` — the default the
     /// sponsor ruled — lists **every** repo under the parent dirs, the ones with nothing
     /// pending included; `true` starts with those hidden. Engine-side only as a value the
@@ -133,6 +142,7 @@ impl Default for Config {
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect(),
+            skip_globs: Vec::new(),
             hide_empty_repos: false,
             search_depth: DEFAULT_SEARCH_DEPTH,
             draft_dir_parents: DEFAULT_DRAFT_DIR_PARENTS,
@@ -505,6 +515,22 @@ impl Config {
                 )));
             }
         }
+        for entry in &self.skip_globs {
+            if entry.is_empty()
+                || Path::new(entry).is_absolute()
+                || !is_absolute_or_relative_glob(entry)
+            {
+                return Err(invalid(format!(
+                    "skip_globs entry {entry:?} must be a relative glob (non-empty, not \
+                     absolute, no `..` components, no `~`), matched below a parent dir"
+                )));
+            }
+            if let Err(e) = skip_matcher(entry) {
+                return Err(invalid(format!(
+                    "skip_globs entry {entry:?} is not a valid glob: {e}"
+                )));
+            }
+        }
         if let Some(session) = &self.herdr.session
             && (session.trim().is_empty() || session.contains('/'))
         {
@@ -541,6 +567,28 @@ pub fn draft_entry_walk_depth(entry: &str) -> usize {
         .split('/')
         .count()
         .clamp(1, MAX_SEARCH_DEPTH as usize)
+}
+
+/// The matcher for one `skip_globs` entry: the `draft_dirs` grammar, where a `*` stays
+/// inside one folder name and only a `**` component crosses folders.
+pub fn skip_matcher(entry: &str) -> Result<globset::Glob, globset::Error> {
+    globset::GlobBuilder::new(entry)
+        .literal_separator(true)
+        .build()
+}
+
+/// The `skip_globs` entries as one set. An entry that does not compile is left out
+/// (`validate` refuses one, so only a hand-built `Config` can carry it).
+pub fn skip_set(entries: &[String]) -> globset::GlobSet {
+    let mut builder = globset::GlobSetBuilder::new();
+    for entry in entries {
+        if let Ok(glob) = skip_matcher(entry) {
+            builder.add(glob);
+        }
+    }
+    builder
+        .build()
+        .unwrap_or_else(|_| globset::GlobSet::empty())
 }
 
 /// A `draft_dirs` entry is either absolute or a relative glob: non-empty, not `~`-prefixed,
@@ -1348,6 +1396,60 @@ nav_down = ["down", "j", "ctrl-n"]
         assert_eq!(c.review_ignored, vec!["z_ignore_*"]);
         let text = toml::to_string_pretty(&c).unwrap();
         assert!(text.contains("review_ignored = [\"z_ignore_*\"]"), "{text}");
+        assert_eq!(toml::from_str::<Config>(&text).unwrap(), c);
+    }
+
+    /// Amendment v1.15 (Phase 14 E): `skip_globs` is the `draft_dirs` grammar, relative
+    /// only, absent means empty, and it survives a round trip.
+    #[test]
+    fn config_skip_globs_defaults_empty_validates_and_round_trips() {
+        assert!(Config::default().skip_globs.is_empty());
+        let absent: Config = toml::from_str("parent_dirs = []\n").unwrap();
+        assert_eq!(absent.skip_globs, Vec::<String>::new());
+
+        let path = Path::new("/x/config.toml");
+        for (bad, says) in [
+            ("", "must be a relative glob"),
+            ("/abs/evals", "must be a relative glob"),
+            ("~/evals", "must be a relative glob"),
+            ("a/../b", "must be a relative glob"),
+            ("..", "must be a relative glob"),
+            ("evals/[", "is not a valid glob"),
+        ] {
+            let c = Config {
+                skip_globs: vec!["ok/**".to_string(), bad.to_string()],
+                ..Config::default()
+            };
+            let err = c.validate(path).unwrap_err();
+            assert!(matches!(err, ConfigError::Invalid { .. }), "{bad:?}: {err}");
+            let text = err.to_string();
+            assert!(text.contains("skip_globs"), "{bad:?}: {text}");
+            assert!(text.contains(says), "{bad:?}: {text}");
+        }
+        for good in ["*/z_ignore/**/evals/**", "c1", "evals/*", "**/fixtures"] {
+            let c = Config {
+                skip_globs: vec![good.to_string()],
+                ..Config::default()
+            };
+            c.validate(path).unwrap_or_else(|e| panic!("{good:?}: {e}"));
+        }
+        // The grammar: a `*` stays inside one folder name.
+        let set = skip_set(&["evals/*".to_string()]);
+        assert!(set.is_match("evals/c1"));
+        assert!(!set.is_match("evals/c1/deeper"));
+
+        let dir = TempDir::new("lc-config");
+        let (env, _) = env_with_config(&dir, "skip_globs = [\"/abs\"]\n");
+        let err = load(&env).unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid { .. }), "{err}");
+        let (env, _) = env_with_config(&dir, "skip_globs = [\"*/z_ignore/**/evals/**\"]\n");
+        let c = load(&env).unwrap().config;
+        assert_eq!(c.skip_globs, vec!["*/z_ignore/**/evals/**"]);
+        let text = toml::to_string_pretty(&c).unwrap();
+        assert!(
+            text.contains("skip_globs = [\"*/z_ignore/**/evals/**\"]"),
+            "{text}"
+        );
         assert_eq!(toml::from_str::<Config>(&text).unwrap(), c);
     }
 

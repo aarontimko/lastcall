@@ -15,6 +15,12 @@ binary rather than for the commit log.
   ignored folder stays unlisted, because git never looks there (name the folder itself,
   `"z_ignore/"`, to review what is in it). Removing an entry later hides nothing: a file
   you accepted under it still shows a later change or its deletion until you accept that.
+- `skip_globs` in `config.toml`: paths the list leaves out, as globs relative to the
+  parent directory (`skip_globs = ["*/z_ignore/**/evals/**"]`). A repository that matches is
+  never listed and never opened, so a folder full of cloned repositories costs nothing at
+  launch, and a file or repository that matches inside a watched folder is not reviewed. It
+  never reaches a listed repository's own files, and a parent directory or the directory
+  you launched in is never skipped.
 
 ## 0.5.0 - 2026-09-20
 

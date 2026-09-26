@@ -62,6 +62,7 @@ the session.
 | `collapsed_globs` | the nine common lockfiles | paths shown as one collapsed row instead of a wall of hunks. The default list is `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `Cargo.lock`, `poetry.lock`, `uv.lock`, `Gemfile.lock`, `go.sum`, `composer.lock`. Setting the key replaces the list. |
 | `collapse_size_bytes` | `524288` (512 KiB) | files at or above this size collapse too. Must be greater than zero. A file with a NUL byte in its first 8,000 is binary and collapses whatever this says. This is also the size at which a file in a watched folder stops being read at all, so raising it to see larger diffs in your repositories also makes watched folders read larger files, and their records grow with them. |
 | `ignore_globs` | `.git/**`, `node_modules/**`, `target/**`, `vendor/**`, `.venv/**` | these scope the filesystem watcher only. An ignored path never wakes a scan, but the next scan still reports a tracked edit under it, so this is a noise filter and not a way to hide changes. |
+| `skip_globs` | `[]` | what the list leaves out. Each entry is a glob in the `draft_dirs` grammar, matched against a path relative to the parent directory a root is filed under: `"*/z_ignore/**/evals/**"` takes out every clone kept below a repository's `z_ignore/.../evals/` folder. It has two effects. A repository whose path matches is never listed, whichever way it was found (a folder level, a repository inside a watched folder, a worktree); it is never opened, so a folder full of clones costs nothing at launch, and the search never goes into a plain folder that matches. And inside a watched folder, a file or a repository whose path matches is not reviewed. It never reaches a listed repository's own files: a tracked or untracked file inside a repository you see is reported whatever the key says, because no key hides a real change. A parent directory itself and the directory you launched in are never skipped; a notice says the pattern was ignored for it. A skipped repository keeps whatever state lastcall already had for it, and comes back if you remove the entry. An entry is relative, may not be empty, and may not contain `..` or start with `~`. |
 | `hide_empty_repos` | `false` | what the `t` toggle starts as. `false` lists every repository under a parent directory, whether it has anything pending or not. `true` opens with the empty ones hidden, except one carrying an agent flag. `t` flips it for the session, and the headless commands are unaffected. The welcome on your first launch offers to write `true` here for you. |
 | `search_depth` | `1` | how many folders below each parent directory are read for a repository. `1` is the repositories directly inside it, `2` also reads one plain folder further, such as `worktrees/<name>`, and lists a worktree kept inside a listed repository (one git call per listed repository, each rescan), up to `4`. The walk never enters a repository or a dependency folder such as `node_modules`, `target`, `.venv` or `vendor`, and it runs again every thirty seconds, so `3` and `4` want a narrow parent directory rather than a home directory. The welcome on your first launch offers to write `2` here for you. The key is new in this release: a 0.1.0 binary refuses a config file that has it, so delete the line before going back to that version. |
 
@@ -82,6 +83,13 @@ search_depth = 1
 
 If you have a config file and launch somewhere outside `parent_dirs`, that directory is
 watched for the session anyway and a notice says so.
+
+**Four keys take patterns, and each reads them its own way.** `review_ignored` is
+`.gitignore` grammar, matched from the repository's own folder. `draft_dirs` and
+`skip_globs` are globs where `*` stays inside one folder name and `**` crosses folders,
+matched from the parent directory a root is filed under (a parent directory, or the folder
+above a repository found anywhere else). `ignore_globs` and `collapsed_globs` are globs
+matched from the root itself, where a bare name such as `Cargo.lock` matches at any depth.
 
 ## `[keys]`
 
