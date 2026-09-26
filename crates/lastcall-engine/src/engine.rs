@@ -603,6 +603,9 @@ pub struct Engine {
     /// Engine-level notices (config resolution, discovery).
     notices: Vec<String>,
     pending_nested: Vec<(PathBuf, PathBuf)>,
+    /// What the discovery passes inside [`Engine::scan_all_with`] changed, merged, until
+    /// [`Engine::take_roots_changed`] drains it.
+    pending_roots_changed: RootsChanged,
     /// How many times discovery re-ran after open (a budget probe for tests).
     discovery_runs: u64,
     git_version: String,
@@ -659,6 +662,7 @@ impl Engine {
             skip,
             notices: resolved.notices.clone(),
             pending_nested: Vec::new(),
+            pending_roots_changed: RootsChanged::default(),
             discovery_runs: 0,
             git_version,
             home_shown: env
@@ -737,6 +741,17 @@ impl Engine {
     /// Discovery re-runs since open (`rescan`, including those `scan_all` triggers).
     pub fn discovery_runs(&self) -> u64 {
         self.discovery_runs
+    }
+
+    /// Drain the roots the discovery passes inside [`Engine::scan_all_with`] added or
+    /// removed since the last call.
+    ///
+    /// Those passes open and scan what they find, so [`Engine::rescan`] diffs against a
+    /// discovery that already has it: without this, a repository promoted during the
+    /// launch scan would reach no consumer (Phase 14 H). The watcher drains it under the
+    /// same lock as the `scan_all` that filled it; `reload` is always `false`.
+    pub fn take_roots_changed(&mut self) -> RootsChanged {
+        std::mem::take(&mut self.pending_roots_changed)
     }
 
     /// Change how many folders below each parent dir the next discovery pass reads
@@ -1497,8 +1512,14 @@ impl Engine {
                 break;
             }
             match self.rescan() {
-                Ok(changed) if !changed.added.is_empty() => continue,
-                _ => break,
+                Ok(changed) => {
+                    let added = !changed.added.is_empty();
+                    self.pending_roots_changed.merge(changed);
+                    if !added {
+                        break;
+                    }
+                }
+                Err(_) => break,
             }
         }
         let mut v: Vec<(PathBuf, u64, Result<Pile, EngineError>)> = results
@@ -5005,6 +5026,71 @@ pub(crate) mod tests {
             runs1,
             "no rediscovery while the nested set is unchanged"
         );
+    }
+
+    /// Phase 14 H: a repository held untracked inside a listed one at launch (`r/evals/c1`)
+    /// is promoted by the discovery pass inside `scan_all`, and that pass's `RootsChanged`
+    /// is kept for [`Engine::take_roots_changed`] instead of being dropped, so the watcher
+    /// can announce it. Drained once; a `skip_globs` entry that covers the clone means it
+    /// is never promoted and so never announced.
+    #[test]
+    fn engine_scan_all_keeps_what_its_discovery_added_for_take_roots_changed() {
+        let clone_under = |repo: &FixtureRepo| {
+            let clone = repo.path().join("evals").join("c1");
+            std::fs::create_dir_all(&clone).unwrap();
+            repo.git_at(&clone, &["init", "-q", "-b", "main"]).unwrap();
+            std::fs::write(clone.join("x"), "x\n").unwrap();
+            repo.git_at(&clone, &["add", "x"]).unwrap();
+            repo.git_at(&clone, &["commit", "-qm", "x"]).unwrap();
+            std::fs::canonicalize(&clone).unwrap()
+        };
+
+        let repo = FixtureRepo::new("r").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let clone = clone_under(&repo);
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let r = only_root(&engine);
+        assert_eq!(engine.take_roots_changed(), RootsChanged::default());
+        let results = engine.scan_all();
+        assert!(
+            results
+                .iter()
+                .any(|(p, _, pile)| *p == clone && pile.is_ok()),
+            "the clone was promoted and scanned: {results:?}"
+        );
+        assert_eq!(engine.root_paths(), vec![r.clone(), clone.clone()]);
+        let changed = engine.take_roots_changed();
+        assert_eq!(changed.added, vec![clone.clone()], "{changed:?}");
+        assert!(changed.removed.is_empty(), "{changed:?}");
+        assert!(!changed.reload);
+        assert_eq!(
+            engine.take_roots_changed(),
+            RootsChanged::default(),
+            "drained by the first take"
+        );
+        engine.scan_all();
+        assert_eq!(
+            engine.take_roots_changed(),
+            RootsChanged::default(),
+            "a second scan_all finds nothing new"
+        );
+
+        // `skip_globs` composes: a skipped clone is never promoted, so never announced.
+        let repo = FixtureRepo::new("r").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        clone_under(&repo);
+        let mut engine = open_engine(
+            &repo,
+            &state,
+            Config {
+                skip_globs: vec!["r/evals/**".to_owned()],
+                ..Config::default()
+            },
+        );
+        let r = only_root(&engine);
+        engine.scan_all();
+        assert_eq!(engine.root_paths(), vec![r]);
+        assert_eq!(engine.take_roots_changed(), RootsChanged::default());
     }
 
     /// Deliverable 8: the depth the tour's card applies is a session setting the next

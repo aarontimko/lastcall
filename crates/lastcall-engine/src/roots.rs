@@ -149,6 +149,21 @@ impl RootsChanged {
     pub fn is_empty(&self) -> bool {
         self.added.is_empty() && self.removed.is_empty()
     }
+
+    /// Fold a later pass's change into this one: both lists appended without repeats, in
+    /// the order the passes found them. `reload` is left as it was.
+    pub fn merge(&mut self, later: RootsChanged) {
+        for p in later.added {
+            if !self.added.contains(&p) {
+                self.added.push(p);
+            }
+        }
+        for p in later.removed {
+            if !self.removed.contains(&p) {
+                self.removed.push(p);
+            }
+        }
+    }
 }
 
 /// Inputs to a discovery pass.

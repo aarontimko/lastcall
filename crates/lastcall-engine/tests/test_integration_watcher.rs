@@ -368,3 +368,128 @@ async fn watcher_d28_a_worktree_removed_by_git_leaves_on_its_own_events() {
 async fn watcher_d28_a_worktree_removed_by_rm_r_leaves_on_its_own_events() {
     d28_through_the_loop(true).await;
 }
+
+/// Phase 14 H: a repository sitting untracked inside a listed one at launch
+/// (`r/evals/c1`) is promoted by the discovery pass inside the launch scan. The loop
+/// announces it with a `RootsChanged` well before the backstop (a minute here), its pile
+/// arrives, and it is watched: an edit inside it wakes a scan of the clone itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watcher_announces_a_repository_the_launch_scan_found_and_watches_it() {
+    let repo = FixtureRepo::new("r").unwrap();
+    let clone = repo.path().join("evals").join("c1");
+    std::fs::create_dir_all(&clone).unwrap();
+    repo.git_at(&clone, &["init", "-q", "-b", "main"]).unwrap();
+    std::fs::write(clone.join("x"), "x\n").unwrap();
+    repo.git_at(&clone, &["add", "x"]).unwrap();
+    repo.git_at(&clone, &["commit", "-qm", "x"]).unwrap();
+    let clone = std::fs::canonicalize(&clone).unwrap();
+    let state = TempDir::new("lc-watch-state");
+    let env = repo.engine_env(state.path());
+    let engine = open_engine(repo.parent_dir(), &env, state.path(), Config::default());
+    assert!(
+        !engine.root_paths().contains(&clone),
+        "open lists the repository alone: {:?}",
+        engine.root_paths()
+    );
+    let mut w = engine.run(EngineTimings {
+        debounce: Duration::from_millis(100),
+        head_poll: Duration::from_secs(60),
+        rescan: Duration::from_secs(60),
+        ..EngineTimings::default()
+    });
+
+    let started = tokio::time::Instant::now();
+    let (mut announced, mut piled) = (false, false);
+    while !(announced && piled) {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "within 10 s (the backstop is a minute): RootsChanged adding the clone {announced}, \
+             its pile {piled}"
+        );
+        match next_event(&mut w, Duration::from_secs(1)).await {
+            Some(EngineEvent::RootsChanged(changed)) => {
+                assert_eq!(changed.added, vec![clone.clone()], "{changed:?}");
+                assert!(changed.removed.is_empty(), "{changed:?}");
+                assert!(!changed.reload, "{changed:?}");
+                announced = true;
+            }
+            Some(EngineEvent::Pile { root, .. }) if root == clone => piled = true,
+            _ => {}
+        }
+    }
+    assert!(lock(&w.engine).root_paths().contains(&clone));
+
+    if !fs_events_delivered(repo.path()) {
+        use std::io::Write as _;
+        let _ = std::io::stderr().write_all(
+            b"SKIP (second half): no filesystem event within 2 s here (fseventsd?); the clone's watch needs one\n",
+        );
+        w.join().await;
+        return;
+    }
+    wait_live(&mut w).await;
+    let edited = tokio::time::Instant::now();
+    std::fs::write(clone.join("x"), "edited under watch\n").unwrap();
+    let mut shown = false;
+    while edited.elapsed() < Duration::from_secs(5) {
+        if let Some(EngineEvent::Pile { root, pile, .. }) =
+            next_event(&mut w, Duration::from_millis(500)).await
+            && root == clone
+            && pile.row(b"x").is_some()
+        {
+            shown = true;
+            break;
+        }
+    }
+    assert!(
+        shown,
+        "the edit inside the clone woke a scan of the clone within 5 s"
+    );
+    w.join().await;
+}
+
+/// Phase 14 H, the other `scan_all`: the TUI's refresh runs `Engine::scan_all` outside the
+/// loop, and a clone its discovery pass promotes is no news to any later `rescan`. The
+/// backstop folds `take_roots_changed` into its own pass, so the next one announces it.
+/// Every timer is a minute here: only the asked-for pass can carry it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watcher_backstop_announces_a_repository_an_outside_scan_all_found() {
+    let repo = FixtureRepo::new("r").unwrap();
+    let state = TempDir::new("lc-watch-state");
+    let env = repo.engine_env(state.path());
+    let engine = open_engine(repo.parent_dir(), &env, state.path(), Config::default());
+    let minute = Duration::from_secs(60);
+    let mut w = engine.run(EngineTimings {
+        debounce: minute,
+        debounce_max: minute,
+        head_poll: minute,
+        rescan: minute,
+    });
+    wait_live(&mut w).await;
+
+    let clone = repo.path().join("evals").join("c1");
+    std::fs::create_dir_all(&clone).unwrap();
+    repo.git_at(&clone, &["init", "-q", "-b", "main"]).unwrap();
+    let clone = std::fs::canonicalize(&clone).unwrap();
+    let results = lock(&w.engine).scan_all();
+    assert!(
+        results.iter().any(|(p, _, _)| *p == clone),
+        "the refresh promoted the clone: {results:?}"
+    );
+    w.request_rescan();
+
+    let started = tokio::time::Instant::now();
+    loop {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "no RootsChanged naming the clone within 10 s"
+        );
+        if let Some(EngineEvent::RootsChanged(changed)) =
+            next_event(&mut w, Duration::from_secs(1)).await
+        {
+            assert_eq!(changed.added, vec![clone.clone()], "{changed:?}");
+            break;
+        }
+    }
+    w.join().await;
+}

@@ -530,6 +530,10 @@ struct Outcome {
     /// Roots whose directory is gone ([`EngineError::RootGone`]): not a failed scan and
     /// not a notice, but a discovery pass to ask for.
     gone: Vec<PathBuf>,
+    /// The roots the discovery passes inside a `scan_all` added or removed
+    /// ([`Engine::take_roots_changed`], taken under the scan's own lock); empty for a
+    /// one-root scan. Phase 14 H: the loop adopts and announces it like a backstop change.
+    changed: RootsChanged,
 }
 
 async fn scan_root(
@@ -543,10 +547,12 @@ async fn scan_root(
         Ok((seq, pile)) => Outcome {
             alive: emit(tx, EngineEvent::Pile { root, seq, pile }).await,
             gone: Vec::new(),
+            changed: RootsChanged::default(),
         },
         Err(EngineError::RootGone(_)) => Outcome {
             alive: true,
             gone: vec![root],
+            changed: RootsChanged::default(),
         },
         Err(e) => Outcome {
             alive: emit(
@@ -558,16 +564,19 @@ async fn scan_root(
             )
             .await,
             gone: Vec::new(),
+            changed: RootsChanged::default(),
         },
     }
 }
 
 /// Scan every root in one engine call — the bounded pool — and emit the piles in path
-/// order. One lock for the whole set instead of one per root.
+/// order. One lock for the whole set instead of one per root; the roots that call's own
+/// discovery passes found are taken under the same lock and handed back in
+/// [`Outcome::changed`] for the loop to announce.
 async fn scan_all_roots(engine: &Arc<Mutex<Engine>>, tx: &mpsc::Sender<EngineEvent>) -> Outcome {
     let progress = tx.clone();
-    let results = blocking(engine, move |e| {
-        e.scan_all_with(&|root, rows| {
+    let (results, changed) = blocking(engine, move |e| {
+        let results = e.scan_all_with(&|root, rows| {
             // From the pool thread, under the engine lock: never block here — the consumer
             // may be the one waiting for the lock. A dropped tick costs one ✓ until the
             // pile lands.
@@ -575,7 +584,8 @@ async fn scan_all_roots(engine: &Arc<Mutex<Engine>>, tx: &mpsc::Sender<EngineEve
                 root: root.to_path_buf(),
                 rows,
             });
-        })
+        });
+        (results, e.take_roots_changed())
     })
     .await;
     let mut gone = Vec::new();
@@ -598,10 +608,18 @@ async fn scan_all_roots(engine: &Arc<Mutex<Engine>>, tx: &mpsc::Sender<EngineEve
             }
         };
         if !ok {
-            return Outcome { alive: false, gone };
+            return Outcome {
+                alive: false,
+                gone,
+                changed,
+            };
         }
     }
-    Outcome { alive: true, gone }
+    Outcome {
+        alive: true,
+        gone,
+        changed,
+    }
 }
 
 /// The outcome of one head inspection: whether the consumer is still listening, and
@@ -762,6 +780,29 @@ async fn run_loop(
     // that has already happened.
     let mut first_seen: BTreeMap<PathBuf, Instant> = BTreeMap::new();
     let mut head_due: BTreeSet<PathBuf> = BTreeSet::new();
+    // Phase 14 H: a repository the launch scan's own discovery promoted (a clone sitting
+    // untracked inside a listed repository) was opened and scanned in there, so no later
+    // `rescan` reports it. It is adopted and announced here, exactly as a backstop change
+    // is; the install already in flight is redone over the new set.
+    if !initial.changed.is_empty() {
+        adopt_roots(
+            &engine,
+            RootSet {
+                roots: &mut roots,
+                due: &mut due,
+                first_seen: &mut first_seen,
+                head_due: &mut head_due,
+                gone_asked: &mut gone_asked,
+                install: &mut install,
+                reinstall: &mut reinstall,
+                watcher: &mut watcher,
+                watched: &mut watched,
+            },
+        );
+        if !emit(&tx, EngineEvent::RootsChanged(initial.changed)).await {
+            return;
+        }
+    }
     let mut head_poll = tokio::time::interval(timings.head_poll);
     head_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     head_poll.tick().await; // the immediate first tick
@@ -887,7 +928,16 @@ async fn run_loop(
             // Taken before the rescan: `Engine::reload` landed before the flag was set, so
             // this pass already sees the new config.
             let reloading = reload.swap(false, Ordering::SeqCst);
-            let changed = blocking(&engine, |e| e.rescan()).await;
+            // Whatever a `scan_all` outside this loop (the TUI's refresh) promoted on its
+            // own discovery pass is folded in, so it is announced here and not lost.
+            let changed = blocking(&engine, |e| {
+                e.rescan().map(|later| {
+                    let mut changed = e.take_roots_changed();
+                    changed.merge(later);
+                    changed
+                })
+            })
+            .await;
             let changed = match changed {
                 Ok(changed) => Some(changed),
                 Err(e) => {
@@ -918,29 +968,25 @@ async fn run_loop(
                     ignore = lock(&engine).ignore_globs().clone();
                 }
                 if !changed.is_empty() {
-                    roots = {
-                        let g = lock(&engine);
-                        root_watches(&g)
-                    };
-                    // Phase 14 C: a root discovery dropped has nothing left to scan,
-                    // inspect or ask about.
-                    let listed = |p: &Path| roots.iter().any(|r| r.path == p);
-                    due.retain(|p, _| listed(p));
-                    first_seen.retain(|p, _| listed(p));
-                    head_due.retain(|p| listed(p));
-                    gone_asked.retain(|p| listed(p));
-                    if install.is_some() {
-                        reinstall = true;
-                    } else {
-                        if reloading {
-                            watched_before = Some(watched.clone());
-                        }
-                        install = Some(spawn_install(
-                            watcher.take(),
-                            std::mem::take(&mut watched),
-                            roots.clone(),
-                        ));
+                    // Phase 14 D: the install this change is about to start is a reload's
+                    // when no other is in flight (`adopt_roots` starts one exactly then).
+                    if reloading && install.is_none() {
+                        watched_before = Some(watched.clone());
                     }
+                    adopt_roots(
+                        &engine,
+                        RootSet {
+                            roots: &mut roots,
+                            due: &mut due,
+                            first_seen: &mut first_seen,
+                            head_due: &mut head_due,
+                            gone_asked: &mut gone_asked,
+                            install: &mut install,
+                            reinstall: &mut reinstall,
+                            watcher: &mut watcher,
+                            watched: &mut watched,
+                        },
+                    );
                 }
                 // The watch set is a function of the root set alone (`wanted_watches`), so
                 // a reload that moved no root has nothing to reinstall; it still emits.
@@ -988,6 +1034,46 @@ async fn run_loop(
                 return;
             }
         }
+    }
+}
+
+/// The loop's state a change in the root set touches, borrowed for [`adopt_roots`].
+struct RootSet<'a> {
+    roots: &'a mut Vec<RootWatch>,
+    due: &'a mut BTreeMap<PathBuf, Instant>,
+    first_seen: &'a mut BTreeMap<PathBuf, Instant>,
+    head_due: &'a mut BTreeSet<PathBuf>,
+    gone_asked: &'a mut BTreeSet<PathBuf>,
+    install: &'a mut Option<JoinHandle<Installed>>,
+    reinstall: &'a mut bool,
+    watcher: &'a mut Option<notify::RecommendedWatcher>,
+    watched: &'a mut BTreeSet<PathBuf>,
+}
+
+/// Take the engine's root set after a non-empty `RootsChanged`, whichever pass found it
+/// (the backstop's discovery, or the launch scan's own, Phase 14 H): re-read the root
+/// list, forget what was due for a root that left, and redo the watch install over the
+/// new set (after the one in flight, if any). The caller emits the `RootsChanged`.
+fn adopt_roots(engine: &Arc<Mutex<Engine>>, set: RootSet<'_>) {
+    *set.roots = {
+        let g = lock(engine);
+        root_watches(&g)
+    };
+    // Phase 14 C: a root discovery dropped has nothing left to scan, inspect or ask about.
+    let roots = &*set.roots;
+    let listed = |p: &Path| roots.iter().any(|r| r.path == p);
+    set.due.retain(|p, _| listed(p));
+    set.first_seen.retain(|p, _| listed(p));
+    set.head_due.retain(|p| listed(p));
+    set.gone_asked.retain(|p| listed(p));
+    if set.install.is_some() {
+        *set.reinstall = true;
+    } else {
+        *set.install = Some(spawn_install(
+            set.watcher.take(),
+            std::mem::take(set.watched),
+            roots.clone(),
+        ));
     }
 }
 
