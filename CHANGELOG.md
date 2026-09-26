@@ -5,6 +5,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html). A version's s
 exactly what its GitHub release notes carry, so it is written for the people installing the
 binary rather than for the commit log.
 
+## Unreleased
+
+### Added
+
+- `review_ignored` in `config.toml`: gitignored files you want reviewed after all, as
+  patterns in `.gitignore` grammar (`review_ignored = ["z_ignore_*"]`). A matching file is
+  an ordinary row under its repository, at any depth, with no badge; a file inside an
+  ignored folder stays unlisted, because git never looks there (name the folder itself,
+  `"z_ignore/"`, to review what is in it). Removing an entry later hides nothing: a file
+  you accepted under it still shows a later change or its deletion until you accept that.
+
 ## 0.5.0 - 2026-09-20
 
 ### Added

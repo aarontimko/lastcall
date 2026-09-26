@@ -5523,7 +5523,13 @@ mod tests {
                 let (store, notices) =
                     Store::open(&env, &root, RootKind::Draft, &paths, None).unwrap();
                 assert!(notices.is_empty(), "{notices:?}");
-                let index = PrivateIndex::new(store.git().clone(), &paths, RootKind::Draft, None);
+                let index = PrivateIndex::new(
+                    store.git().clone(),
+                    &paths,
+                    RootKind::Draft,
+                    None,
+                    Vec::new(),
+                );
                 let ledger = Ledger::new(&root, RootKind::Draft, None, Self::seen_at());
                 Self {
                     _dir: dir,

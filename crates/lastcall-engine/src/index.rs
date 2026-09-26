@@ -111,6 +111,10 @@ pub struct PrivateIndex {
     kind: RootKind,
     /// The user's `info/exclude` (common dir), passed as `--exclude-from` for git roots.
     exclude_from: Option<PathBuf>,
+    /// `review_ignored` (Amendment v1.15): one `--exclude=!<pattern>` each, git roots
+    /// only, in config order. Empty leaves the `others` argv byte-identical to what it was
+    /// before the key existed.
+    review_ignored: Vec<String>,
     /// How long a seed waits for the ledger lock. The shipping value is
     /// [`DEFAULT_LEDGER_LOCK`]; a test that wants the busy path shortens it rather than
     /// sleeping for two seconds.
@@ -123,14 +127,22 @@ impl PrivateIndex {
         paths: &RepoPaths,
         kind: RootKind,
         exclude_from: Option<PathBuf>,
+        review_ignored: Vec<String>,
     ) -> Self {
         Self {
             git,
             paths: paths.clone(),
             kind,
             exclude_from,
+            review_ignored,
             lock_budget: DEFAULT_LEDGER_LOCK,
         }
+    }
+
+    /// Replace the `review_ignored` patterns (a config reload, Amendment v1.15). The next
+    /// `others` listing uses them; nothing is re-read or re-seeded.
+    pub fn set_review_ignored(&mut self, review_ignored: Vec<String>) {
+        self.review_ignored = review_ignored;
     }
 
     #[cfg(test)]
@@ -389,7 +401,8 @@ impl PrivateIndex {
     }
 
     /// `ls-files -c core.ignorecase=false --others -z` with the user's excludes for git
-    /// roots (`--exclude-standard` + `--exclude-from=<user info/exclude>`), none for drafts.
+    /// roots (`--exclude-standard` + `--exclude-from=<user info/exclude>`, then one
+    /// `--exclude=!<pattern>` per `review_ignored` entry), none for drafts.
     pub fn others(&self, scope: Option<&DraftScope>) -> Result<Vec<Other>, IndexError> {
         let args = self.others_args(scope);
         let out = self.git.run(&args)?;
@@ -425,6 +438,14 @@ impl PrivateIndex {
                 && f.is_file()
             {
                 args.push(format!("--exclude-from={}", f.display()));
+            }
+            // `review_ignored` (Amendment v1.15): a command-line pattern sits above every
+            // ignore file, so a negation here lists a gitignored file as an ordinary
+            // untracked one. Git never descends into an ignored folder, so a file inside
+            // one stays unlisted whatever the pattern says; that is git's rule, stated in
+            // the docs rather than worked around.
+            for pattern in &self.review_ignored {
+                args.push(format!("--exclude=!{pattern}"));
             }
         }
         // A folder watched on its own: `--directory` makes git answer with the folder
@@ -502,7 +523,13 @@ mod tests {
         let (store, _) =
             Store::open(&env, repo.path(), RootKind::Git, &paths, Some(&facts)).unwrap();
         let exclude = rg.git_path("info/exclude").unwrap();
-        let index = PrivateIndex::new(store.git().clone(), &paths, RootKind::Git, Some(exclude));
+        let index = PrivateIndex::new(
+            store.git().clone(),
+            &paths,
+            RootKind::Git,
+            Some(exclude),
+            Vec::new(),
+        );
         let tree = Oid::parse(repo.git(&["rev-parse", "HEAD^{tree}"]).unwrap().trim()).unwrap();
         (store, index, tree)
     }
@@ -678,7 +705,8 @@ mod tests {
         let state = TempDir::new("lc-index-interleave-fixed");
         let (store, index_b, tree_x) = setup(&repo, &state);
         let paths = RepoPaths::under(state.join("repo"));
-        let mut index_a = PrivateIndex::new(store.git().clone(), &paths, RootKind::Git, None);
+        let mut index_a =
+            PrivateIndex::new(store.git().clone(), &paths, RootKind::Git, None, Vec::new());
         index_a.set_lock_budget((0, Duration::ZERO));
         let original = std::fs::read(repo.path().join("f1")).unwrap();
         repo.write("f1", "put back later\nsecond line\n");
@@ -819,6 +847,106 @@ mod tests {
         );
     }
 
+    /// Amendment v1.15 (scenario D27): with `review_ignored` empty the `others` argv is
+    /// byte-identical to the one every release before it ran, asserted against the literal
+    /// vector; two entries append two `--exclude=!…` in config order after
+    /// `--exclude-from`; a draft scope appends none whatever the list holds.
+    #[test]
+    fn index_others_args_carry_review_ignored_after_the_existing_arguments() {
+        let repo = FixtureRepo::new("idx-review-ignored").unwrap();
+        let state = TempDir::new("lc-index-review-ignored");
+        let (store, index, _tree) = setup(&repo, &state);
+        // git answers `rev-parse --git-path` with the canonical path, which is what
+        // `setup` handed the index.
+        let exclude = std::fs::canonicalize(repo.path().join(".git/info/exclude")).unwrap();
+        assert!(exclude.is_file(), "git init writes info/exclude");
+        let exclude_from = format!("--exclude-from={}", exclude.display());
+        let today: Vec<String> = vec![
+            "-c".to_string(),
+            "core.ignorecase=false".to_string(),
+            "ls-files".to_string(),
+            "--others".to_string(),
+            "-z".to_string(),
+            "--exclude-standard".to_string(),
+            exclude_from.clone(),
+        ];
+        assert_eq!(
+            index.others_args(None),
+            today,
+            "an empty list changes nothing"
+        );
+
+        let paths = RepoPaths::under(state.join("repo"));
+        let mut two = PrivateIndex::new(
+            store.git().clone(),
+            &paths,
+            RootKind::Git,
+            Some(exclude.clone()),
+            vec!["z_ignore_*".to_string(), "*.scratch".to_string()],
+        );
+        let mut expected = today.clone();
+        expected.push("--exclude=!z_ignore_*".to_string());
+        expected.push("--exclude=!*.scratch".to_string());
+        assert_eq!(
+            two.others_args(None),
+            expected,
+            "in order, after --exclude-from"
+        );
+        two.set_review_ignored(Vec::new());
+        assert_eq!(
+            two.others_args(None),
+            today,
+            "a reload back to empty is today's argv"
+        );
+
+        let draft = PrivateIndex::new(
+            store.git().clone(),
+            &paths,
+            RootKind::Draft,
+            None,
+            vec!["z_ignore_*".to_string()],
+        );
+        let tree = DraftScope::tree(1 << 20);
+        for args in [draft.others_args(Some(&tree)), draft.others_args(None)] {
+            assert!(
+                !args.iter().any(|a| a.starts_with("--exclude")),
+                "a watched folder never applied ignore files, so it re-includes nothing: {args:?}"
+            );
+        }
+    }
+
+    /// Amendment v1.15: the negation lists a gitignored file at any depth as an ordinary
+    /// untracked one, and nothing inside an ignored folder (git's rule).
+    #[test]
+    fn index_others_lists_review_ignored_files_but_never_inside_an_ignored_folder() {
+        let repo = FixtureRepo::new("idx-review-ignored-list").unwrap();
+        let state = TempDir::new("lc-index-review-ignored-list");
+        let (store, index, tree) = setup(&repo, &state);
+        index.reseed(Some(&tree)).unwrap();
+        repo.write(".git/info/exclude", "z_ignore_*\nz_ignore/\n");
+        repo.write("z_ignore_top.md", "t\n");
+        repo.write("a/b/c/z_ignore_deep.md", "d\n");
+        repo.write("z_ignore/inside.md", "i\n");
+        index.refresh();
+        assert!(index.others(None).unwrap().is_empty(), "all three ignored");
+        let paths = RepoPaths::under(state.join("repo"));
+        let exclude = repo.path().join(".git/info/exclude");
+        let reviewing = PrivateIndex::new(
+            store.git().clone(),
+            &paths,
+            RootKind::Git,
+            Some(exclude),
+            vec!["z_ignore_*".to_string()],
+        );
+        assert_eq!(
+            reviewing.others(None).unwrap(),
+            vec![
+                Other::File(b"a/b/c/z_ignore_deep.md".to_vec()),
+                Other::File(b"z_ignore_top.md".to_vec()),
+            ]
+        );
+    }
+
     /// Amendment v1.13 R1, R2 and design review F6: a folder watched on its own is listed
     /// with `--directory`, so git names the folders it finds instead of opening them, and
     /// never with `--no-empty-directory`, which is the flag that would make it look inside.
@@ -846,7 +974,13 @@ mod tests {
         dir.write("notes/nested/x", "x\n");
         let paths = RepoPaths::under(state.join("repo"));
         let (store, _) = Store::open(&env, &root, RootKind::Draft, &paths, None).unwrap();
-        let index = PrivateIndex::new(store.git().clone(), &paths, RootKind::Draft, None);
+        let index = PrivateIndex::new(
+            store.git().clone(),
+            &paths,
+            RootKind::Draft,
+            None,
+            Vec::new(),
+        );
         index.ensure(None).unwrap();
         index.refresh();
 

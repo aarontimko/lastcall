@@ -127,6 +127,27 @@ Rules a scenario follows:
 7. **One scenario per thing being judged.** A scenario that has grown past a dozen steps
    is two scenarios.
 
+## The scenarios
+
+`just tryout list` is the authority; the steps are printed by the scenario itself and saved
+as `STEPS.md` in the sandbox. What each one is for:
+
+| Scenario | What it lets a person judge |
+|---|---|
+| `wrap` | word wrap in the diff pane: prose, code, other scripts, the cap, paging, `alt-z` |
+| `ignored` | `review_ignored`: gitignored scratch files listed under their repository, never from inside an ignored folder |
+
+### `ignored`
+
+One repository, `demo`, whose committed `.gitignore` ignores `z_ignore_*` and `z_ignore/`,
+with `z_ignore_plan.md` at the top, `src/deep/er/z_ignore_notes.md` three folders down and
+`z_ignore/inside.md` inside the ignored folder; the config says
+`review_ignored = ["z_ignore_*"]`. The steps: the two matching files are rows with no
+badge and the one inside `z_ignore/` is absent; accept the top file; append a line to it
+from a second terminal (the printed step names the sandbox path and the command) and see
+one hunk; accept; delete it and accept the deletion; the deep file accepts with `A` and
+comes back with `z`.
+
 ## Where it sits among the other tools
 
 | Tool | Who runs it | What it answers |

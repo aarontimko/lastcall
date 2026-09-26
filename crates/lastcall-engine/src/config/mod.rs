@@ -71,6 +71,13 @@ pub struct Config {
     /// suffix it reads that one folder. The pattern that picks the folder is the entry
     /// without the suffix, so `notes/**` and `notes` match the same folders.
     pub draft_dirs: Vec<String>,
+    /// Gitignored files a repository's review includes after all (Amendment v1.15, §6.1):
+    /// each entry is one pattern in gitignore grammar, matched against the repository root
+    /// the way a `.gitignore` line is. A gitignored file matching one is listed as an
+    /// ordinary untracked candidate, at any depth, but never from inside an ignored folder
+    /// (git does not descend into one, so nothing there can be re-included). Git roots
+    /// only: a watched folder never applied the user's ignore files in the first place.
+    pub review_ignored: Vec<String>,
     /// What a draft root's first sight means (§6.2).
     pub draft_initial: DraftInitial,
     /// Generated files rendered as a single accept row.
@@ -115,6 +122,7 @@ impl Default for Config {
         Self {
             parent_dirs: Vec::new(),
             draft_dirs: Vec::new(),
+            review_ignored: Vec::new(),
             draft_initial: DraftInitial::Seen,
             collapsed_globs: DEFAULT_COLLAPSED_GLOBS
                 .iter()
@@ -474,6 +482,26 @@ impl Config {
                 return Err(invalid(format!(
                     "draft_dirs entry {entry:?} looks more than {MAX_SEARCH_DEPTH} folders below \
                      a parent dir, which is as deep as the search goes"
+                )));
+            }
+        }
+        for entry in &self.review_ignored {
+            if entry.trim().is_empty() {
+                return Err(invalid(format!(
+                    "review_ignored entry {entry:?} is empty: write a pattern as you would \
+                     in .gitignore (`z_ignore_*`, `**/*.scratch.md`)"
+                )));
+            }
+            if entry.starts_with('!') {
+                return Err(invalid(format!(
+                    "review_ignored entry {entry:?} must not begin with `!`: every entry is \
+                     already a re-include, so write the pattern without it"
+                )));
+            }
+            if entry.contains('\n') || entry.contains('\0') {
+                return Err(invalid(format!(
+                    "review_ignored entry {entry:?} must be one pattern on one line \
+                     (no newline or NUL)"
                 )));
             }
         }
@@ -1258,6 +1286,69 @@ nav_down = ["down", "j", "ctrl-n"]
         let (env, _) = env_with_config(&dir, "[ui]\nwrapp = true\n");
         let err = load(&env).unwrap_err();
         assert!(err.to_string().contains("unknown field"), "{err}");
+    }
+
+    /// Amendment v1.15 (§6.1, scenario D27): `review_ignored` is a list of gitignore
+    /// patterns, empty by default. An empty or whitespace entry, one that begins with `!`
+    /// (the negation is the engine's to add) and one spanning lines are load errors naming
+    /// the key; a wrong type is the usual parse error; a leading `/` anchors and is fine.
+    #[test]
+    fn config_review_ignored_defaults_empty_validates_and_round_trips() {
+        assert!(Config::default().review_ignored.is_empty());
+        let absent: Config = toml::from_str("parent_dirs = []\n").unwrap();
+        assert_eq!(absent.review_ignored, Vec::<String>::new());
+
+        let path = Path::new("/x/config.toml");
+        for (bad, says) in [
+            ("", "is empty"),
+            ("   ", "is empty"),
+            ("!z_ignore_*", "must not begin with `!`"),
+            ("a\nb", "one pattern on one line"),
+            ("a\0b", "one pattern on one line"),
+        ] {
+            let c = Config {
+                review_ignored: vec!["ok_*".to_string(), bad.to_string()],
+                ..Config::default()
+            };
+            let err = c.validate(path).unwrap_err();
+            assert!(matches!(err, ConfigError::Invalid { .. }), "{bad:?}: {err}");
+            let text = err.to_string();
+            assert!(text.contains("review_ignored"), "{bad:?}: {text}");
+            assert!(text.contains(says), "{bad:?}: {text}");
+            assert!(text.starts_with("config file /x/config.toml: "), "{text}");
+        }
+        for good in [
+            "z_ignore_*",
+            "**/*.scratch.md",
+            "/notes-*.md",
+            "z_ignore/",
+            "a\\ ",
+        ] {
+            let c = Config {
+                review_ignored: vec![good.to_string()],
+                ..Config::default()
+            };
+            c.validate(path).unwrap_or_else(|e| panic!("{good:?}: {e}"));
+        }
+
+        let dir = TempDir::new("lc-config");
+        let (env, _) = env_with_config(&dir, "review_ignored = \"z_ignore_*\"\n");
+        let err = load(&env).unwrap_err();
+        assert!(matches!(err, ConfigError::Parse { .. }), "{err}");
+        assert!(
+            err.to_string().contains("review_ignored") || err.to_string().contains("sequence"),
+            "{err}"
+        );
+        let (env, _) = env_with_config(&dir, "review_ignored = [\"!x\"]\n");
+        let err = load(&env).unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid { .. }), "{err}");
+
+        let (env, _) = env_with_config(&dir, "review_ignored = [\"z_ignore_*\"]\n");
+        let c = load(&env).unwrap().config;
+        assert_eq!(c.review_ignored, vec!["z_ignore_*"]);
+        let text = toml::to_string_pretty(&c).unwrap();
+        assert!(text.contains("review_ignored = [\"z_ignore_*\"]"), "{text}");
+        assert_eq!(toml::from_str::<Config>(&text).unwrap(), c);
     }
 
     #[test]

@@ -870,6 +870,7 @@ impl Engine {
             layout: &self.layout,
             clock: self.options.clock.as_ref(),
             draft_initial: self.config.draft_initial,
+            review_ignored: &self.config.review_ignored,
         }
     }
 
@@ -889,6 +890,8 @@ struct OpenCtx<'a> {
     layout: &'a Layout,
     clock: &'a (dyn Clock + Send + Sync),
     draft_initial: DraftInitial,
+    /// `review_ignored` (Amendment v1.15), handed to a git root's private index.
+    review_ignored: &'a [String],
 }
 
 fn open_root_with(ctx: &OpenCtx<'_>, d: &roots::DiscoveredRoot) -> Result<RootState, EngineError> {
@@ -925,7 +928,20 @@ fn open_root_with(ctx: &OpenCtx<'_>, d: &roots::DiscoveredRoot) -> Result<RootSt
     let (store, store_notices) = Store::open(ctx.env, &d.path, d.kind, &paths, facts.as_ref())?;
     notices.extend(store_notices);
     let exclude_from = git_paths.get(2).cloned();
-    let index = PrivateIndex::new(store.git().clone(), &paths, d.kind, exclude_from);
+    // `review_ignored` reaches git roots only: a watched folder's listing never applied
+    // the user's ignore files, so there is nothing there to re-include.
+    let review_ignored = if d.kind == RootKind::Git {
+        ctx.review_ignored.to_vec()
+    } else {
+        Vec::new()
+    };
+    let index = PrivateIndex::new(
+        store.git().clone(),
+        &paths,
+        d.kind,
+        exclude_from,
+        review_ignored,
+    );
     let user_email = repo_config
         .get("user.email")
         .filter(|e| !e.is_empty())

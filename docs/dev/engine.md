@@ -438,6 +438,22 @@ exactly as it names another repository, so `others` asks each reported folder fo
 entry of either shape before calling it a nested repo; an `lstat` that fails for any reason
 other than "not there" answers yes, which leaves the folder alone.
 
+**`review_ignored` is one argument per entry (Phase 14, Amendment v1.15).** For a git root,
+`Index::others_args` appends `--exclude=!<pattern>` per `review_ignored` entry, in config
+order, after `--exclude-standard` and `--exclude-from=<info/exclude>`. A command-line
+pattern sits above every ignore file (`.gitignore`, `info/exclude`, `core.excludesFile`),
+so a matching gitignored file is listed as an ordinary untracked candidate and everything
+downstream (pending on first sight, hashing, hunks, accept, deletion) is the untracked
+path's. Git never descends into an ignored folder, so a file inside one stays unlisted;
+nothing may be built on `check-ignore`, which still calls a re-included file ignored. A
+watched folder's listing never used `--exclude-standard` and gets no `--exclude` at all.
+With the list empty the argv is byte-identical to the pre-phase one
+(`index_others_args_carry_review_ignored_after_the_existing_arguments` asserts the literal
+vector). The patterns reach the index through `OpenCtx` at open and
+`PrivateIndex::set_review_ignored` at a config reload. An entry removed later over-shows by
+design: an accepted file keeps its seen-tree entry, so `diff-files` still reports its later
+change or deletion until accepted (D27; §11).
+
 **A collapsed row is one accept, not a diff.** `render_content` (step 7) runs a ladder and
 returns *before* hunks are computed: `collapsed_globs` (the nine common lockfiles by
 default) → binary (a NUL byte in the first 8,000 of either side) → size (either side

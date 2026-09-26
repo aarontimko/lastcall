@@ -1030,7 +1030,13 @@ mod tests {
                 .with_var("GIT_CONFIG_NOSYSTEM", "1");
             let paths = RepoPaths::under(state.join("repo"));
             let (store, _) = Store::open(&env, &root, RootKind::Draft, &paths, None).unwrap();
-            let index = PrivateIndex::new(store.git().clone(), &paths, RootKind::Draft, None);
+            let index = PrivateIndex::new(
+                store.git().clone(),
+                &paths,
+                RootKind::Draft,
+                None,
+                Vec::new(),
+            );
             let ledger = Ledger::new(
                 &root,
                 RootKind::Draft,
@@ -1407,8 +1413,13 @@ pub(crate) mod fixture_tests {
                 .parent()
                 .expect("a git dir above HEAD")
                 .to_path_buf();
-            let index =
-                PrivateIndex::new(store.git().clone(), &paths, RootKind::Git, Some(exclude));
+            let index = PrivateIndex::new(
+                store.git().clone(),
+                &paths,
+                RootKind::Git,
+                Some(exclude),
+                Vec::new(),
+            );
             let tree = Oid::parse(repo.git(&["rev-parse", "HEAD^{tree}"]).unwrap().trim()).unwrap();
             let tree_entries = store.ls_tree(&tree).unwrap();
             let head_commit = Oid::parse(repo.git(&["rev-parse", "HEAD"]).unwrap().trim()).unwrap();
