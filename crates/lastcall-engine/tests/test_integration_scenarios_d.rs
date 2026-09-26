@@ -1539,7 +1539,7 @@ fn scenario_d16_cherry_picks_show_once_more_by_design() {
     let groups = pile.groups();
     assert_eq!(groups.len(), 1, "D16 one group: {groups:?}");
     assert_eq!(groups[0].kind, lastcall_engine::scan::GroupKind::Seen);
-    assert_eq!(groups[0].paths.len(), 3, "D16 seen · 3 files");
+    assert_eq!(groups[0].paths.len(), 3, "D16 [seen] 3 files");
     let before = s.ledger().seen_tree.clone();
     assert!(s.accept_all().ok());
     assert_pile!(s.engine, s.root, "", "D16 accept-all on feat/x");

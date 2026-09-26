@@ -16,8 +16,30 @@ pub fn with_thousands(n: usize) -> String {
     out
 }
 
+/// `1 file`, `2 files`, `10,000 files`: a count and its noun, the noun plural unless the
+/// count is one. The `status` text report's group lines use it; the TUI keeps its own.
+pub fn plural(n: usize, noun: &str) -> String {
+    if n == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{} {noun}s", with_thousands(n))
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn count_plural_is_singular_only_for_one() {
+        for (n, want) in [
+            (0, "0 files"),
+            (1, "1 file"),
+            (2, "2 files"),
+            (10_000, "10,000 files"),
+        ] {
+            assert_eq!(super::plural(n, "file"), want);
+        }
+    }
+
     #[test]
     fn count_with_thousands_groups_digits_like_the_ruling() {
         for (n, want) in [

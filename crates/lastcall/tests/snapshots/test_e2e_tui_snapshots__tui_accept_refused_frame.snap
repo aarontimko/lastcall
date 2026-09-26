@@ -14,7 +14,7 @@ expression: frame
 "│  main · 2 files          │                                                                       │"
 "│  A u1  +1 −0  [upstream] │@@ -8,3 +8,4 @@                         [a accept] [u restore] [m flag]│"
 "│  A u2  +2 −0  [mixed]    │ a8                                                                    │"
-"│  upstream · 1 file       │ a9                                                                    │"
+"│  [upstream] 1 file       │ a9                                                                    │"
 "│──────────────────────────│ a10                                                                   │"
 "│W/notes                   │+another edit, after the frame                                         │"
 "│  draft · 1 file          │                                                                       │"

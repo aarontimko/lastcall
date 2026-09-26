@@ -12,7 +12,7 @@ expression: frame
 "│  main · 2 files          │+the reviewer gets to read this line all the way to│"
 "│  A u1  +1 −0  [upstream] │ line 4                                            │"
 "│  A u2  +2 −0  [mixed]    │ line 5                                            │"
-"│  upstream · 1 file       │-line 6                                            │"
+"│  [upstream] 1 file       │-line 6                                            │"
 "│──────────────────────────│+crates/lastcall/src/tui/wrap.rs::layout::a_single_│"
 "│W/notes                   │ line 7                                            │"
 "│  draft · 1 file          │ line 8                                            │"

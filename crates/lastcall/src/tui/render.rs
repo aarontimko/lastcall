@@ -1066,8 +1066,11 @@ fn render_nav(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
                 selected_at = Some(lines.len());
             }
             lines.push(NavLine {
+                // The sponsor's 2026-09-26 ruling: `[seen] 2 files`, bracketed like the badge
+                // its files wear and with no ` · `, so a group row never has the branch
+                // line's `name · count` shape just above it.
                 line: Line::from(format!(
-                    "  {} · {}",
+                    "  [{}] {}",
                     group.kind.name(),
                     plural(group.paths.len(), "file")
                 )),
@@ -5447,11 +5450,67 @@ mod tests {
         out
     }
 
+    /// The sponsor's 2026-09-26 ruling: a group row wears its files' badge in brackets
+    /// (`[upstream] 1 file`, `[seen] 3 files`), and the branch line is the only nav line
+    /// with the `name · N files` shape, so a group can never be read as a branch. Held
+    /// with the seen group closed and open, over every listed root.
+    #[test]
+    fn render_group_rows_are_bracketed_and_only_the_branch_line_reads_name_dot_count() {
+        let mut p = alpha_seen();
+        let mut up = p.rows[0].clone();
+        up.path = b"u1".to_vec();
+        up.annotation = Some(lastcall_engine::scan::Annotation::Upstream);
+        p.rows.push(up);
+        let mut app = three_roots();
+        app.apply(pile_event("alpha", p));
+        app.handle(Action::Resize(100, 30));
+        // ` · ` followed by a count and `file`: the branch line's shape.
+        let name_dot_count = |l: &str| {
+            l.match_indices(" · ").any(|(i, sep)| {
+                let rest = &l[i + sep.len()..];
+                let digits = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit() || *c == ',')
+                    .count();
+                digits > 0 && rest[digits..].starts_with(" file")
+            })
+        };
+        for open in [false, true] {
+            if open {
+                app.select(Some(Selection::Group(root("alpha"), GroupKind::Seen)));
+                app.handle(Action::Expand);
+                assert!(app.seen_open.contains(&root("alpha")));
+            }
+            let area = Rect::new(0, 0, 40, 40);
+            let mut buf = Buffer::empty(area);
+            render_nav(&app, &mut buf, area, &mut HitMap::default());
+            let lines: Vec<String> = (0..area.height)
+                .map(|y| row_text(&buf, area, y).trim_end().to_owned())
+                .collect();
+            let all = lines.join("\n");
+            assert!(lines.iter().any(|l| l == "  [upstream] 1 file"), "{all}");
+            assert!(lines.iter().any(|l| l == "  [seen] 3 files"), "{all}");
+            let shaped: Vec<usize> = (0..lines.len())
+                .filter(|&i| name_dot_count(&lines[i]))
+                .collect();
+            assert_eq!(shaped.len(), 3, "one branch line per listed root: {all}");
+            for i in shaped {
+                let above = &lines[i - 1];
+                assert!(
+                    ["alpha", "beta", "notes"]
+                        .iter()
+                        .any(|n| above.starts_with(n)),
+                    "line {i} has the branch line's shape but is not a branch line: {all}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn render_seen_group_closed_is_one_line_and_open_lists_every_member_clickable() {
         let mut app = seen_app();
         let (frame, _) = frame_of(&app, 100, 30);
-        assert!(frame.contains("  seen · 3 files"), "{frame}");
+        assert!(frame.contains("  [seen] 3 files"), "{frame}");
         assert!(
             !frame.contains("s1"),
             "a closed group hides its members: {frame}"
@@ -5461,7 +5520,7 @@ mod tests {
         app.handle(Action::Expand);
         let (buf, hits) = drawn(&app, 100, 30);
         let group_y = (0..30)
-            .find(|&y| drawn_row(&buf, 100, y).contains("seen · 3 files"))
+            .find(|&y| drawn_row(&buf, 100, y).contains("[seen] 3 files"))
             .expect("the group line");
         for (i, name) in ["s1", "s2", "s3"].iter().enumerate() {
             let y = group_y + 1 + i as u16;
@@ -5711,7 +5770,7 @@ mod tests {
                 // The counts: the nav's group line, the header, the modal, `status`.
                 let (frame, _) = frame_of(&app, 100, 60);
                 let n = plural(seen.len(), "file");
-                prop_assert!(frame.contains(&format!("seen · {n}")), "{}", frame);
+                prop_assert!(frame.contains(&format!("[seen] {n}")), "{}", frame);
                 prop_assert!(frame.contains(&format!("{n}, content accepted on run-1")), "{}", frame);
                 let counts = app.counts_of(&AcceptScope::All);
                 prop_assert_eq!(counts.files, p.rows.len());

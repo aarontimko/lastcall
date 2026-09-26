@@ -14,7 +14,7 @@ expression: frame
 "│  main · 2 files          │+line.starts_with("//") {                                              │"
 "│  A u1  +1 −0  [upstream] │             continue;                                                 │"
 "│  A u2  +2 −0  [mixed]    │         }                                                             │"
-"│  upstream · 1 file       │         let Some((key, value)) = line.split_once('=') else {          │"
+"│  [upstream] 1 file       │         let Some((key, value)) = line.split_once('=') else {          │"
 "│──────────────────────────│                                                                       │"
 "│W/notes                   │@@ -51,4 +53,10 @@                      [a accept] [u restore] [m flag]│"
 "│  draft · 1 file          │         assert_eq!(records[0].key, "name");                           │"

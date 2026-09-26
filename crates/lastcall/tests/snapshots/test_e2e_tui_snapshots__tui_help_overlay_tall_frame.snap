@@ -14,7 +14,7 @@ expression: frame
 "│  main · 2 file│ p / [          previous hunk                                     │               │"
 "│  A u1  +1 −0  │ t              hide / show empty repos                           │               │"
 "│  A u2  +2 −0  │ a              accept the hunk under the cursor                  │               │"
-"│  upstream · 1 │ A              accept the whole file or repo                     │               │"
+"│  [upstream] 1 │ A              accept the whole file or repo                     │               │"
 "│───────────────│ Ctrl-A         accept everything listed                          │               │"
 "│W/notes        │ u              restore the hunk                                  │               │"
 "│  draft · 1 fil│ U              restore the whole file                            │               │"

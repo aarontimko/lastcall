@@ -143,7 +143,7 @@ impl Row {
         String::from_utf8_lossy(&self.path).into_owned()
     }
 
-    /// Whether this row folds into the `seen · N files` group (Phase 14 B): its content
+    /// Whether this row folds into the `[seen] N files` group (Phase 14 B): its content
     /// was accepted on another branch, it is not an upstream or mixed row, and it carries
     /// nothing of the user's own: no flag, so no note. A pending deletion is always a row.
     /// A flagged row stays a row (with a `[seen]` badge), and so does either half of a
@@ -182,7 +182,7 @@ impl GroupKind {
     }
 }
 
-/// A derived group row (§6.7 "upstream · N files", Phase 14 B "seen · N files").
+/// A derived group row (§6.7 `[upstream] N files`, Phase 14 B `[seen] N files`).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Group {
     pub kind: GroupKind,

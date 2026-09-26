@@ -283,11 +283,11 @@ fn seen_group_the_tryout_walk_gives_what_each_step_promises() {
     let pile = assert_pile!(s.engine, s.root, "a.rs|b.rs|c.rs", "step 3");
     assert_eq!(seen_paths(&pile), vec!["a.rs", "b.rs", "c.rs"]);
     assert!(pile.rows.iter().all(|r| r.seen_on == ["run-1"]));
-    // (6) One file changes: its own row, `seen · 2 files`.
+    // (6) One file changes: its own row, `[seen] 2 files`.
     s.repo.write("b.rs", "b\nrun-1 edit\nextra\n");
     let pile = assert_pile!(s.engine, s.root, "a.rs|b.rs|c.rs", "step 6");
     assert_eq!(seen_paths(&pile), vec!["a.rs", "c.rs"]);
-    // (7) A flagged member leaves the group; `seen · 1 file`.
+    // (7) A flagged member leaves the group; `[seen] 1 file`.
     s.engine
         .flag(&s.root, b"c.rs", "look again", None, None)
         .unwrap();
@@ -304,7 +304,7 @@ fn seen_group_the_tryout_walk_gives_what_each_step_promises() {
         s.engine,
         s.root,
         "b.rs|c.rs",
-        "step 8: accepted seen · 1 file"
+        "step 8: accepted [seen] 1 file"
     );
     s.engine.undo(&s.root).unwrap();
     let pile = assert_pile!(s.engine, s.root, "a.rs|b.rs|c.rs", "step 8: z");

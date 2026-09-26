@@ -12,7 +12,7 @@ expression: frame
 "│  main · 2 files          │+the reviewer gets to read this line all the way to its end, because   │"
 "│  A u1  +1 −0  [upstream] │+the pane wrapped it instead of cutting it off wherever the window     │"
 "│  A u2  +2 −0  [mixed]    │+happened to stop                                                      │"
-"│  upstream · 1 file       │ line 4                                                                │"
+"│  [upstream] 1 file       │ line 4                                                                │"
 "│──────────────────────────│ line 5                                                                │"
 "│W/notes                   │-line 6                                                                │"
 "│  draft · 1 file          │+crates/lastcall/src/tui/wrap.rs::layout::a_single_unbroken_token_that_│"

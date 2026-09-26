@@ -380,7 +380,13 @@ impl StatusReport {
                 out.push_str(&format!("  {}\n", row_line(row)));
             }
             for g in &root.groups {
-                out.push_str(&format!("  {} · {} files\n", g.kind.name(), g.paths.len()));
+                // `[seen] 2 files`: the nav's group row, bracketed like the badge its files
+                // carry (the sponsor's 2026-09-26 ruling); `1 file`, never `1 files`.
+                out.push_str(&format!(
+                    "  [{}] {}\n",
+                    g.kind.name(),
+                    crate::count::plural(g.paths.len(), "file")
+                ));
             }
         }
         out
@@ -442,4 +448,61 @@ pub fn row_line(row: &RowStatus) -> String {
         s.push_str(&format!("  ⚑ {}", f.note));
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn root_with_groups(groups: Vec<GroupStatus>) -> StatusReport {
+        StatusReport {
+            status_version: STATUS_VERSION,
+            state_dir: "state".to_owned(),
+            notices: Vec::new(),
+            roots: vec![RootStatus {
+                root: "parent/demo".to_owned(),
+                kind: RootKind::Git,
+                parent: "parent".to_owned(),
+                store: "store".to_owned(),
+                ledger_written_at: None,
+                badge: None,
+                head: None,
+                branch: Some("feat-y".to_owned()),
+                remote: None,
+                in_progress: None,
+                seen_tree: None,
+                seen_head: None,
+                seen_branch: None,
+                parked_branches: Vec::new(),
+                pending: Vec::new(),
+                omitted: 0,
+                groups,
+                undo: 0,
+                snoozed_until: None,
+                notices: Vec::new(),
+                name: String::new(),
+            }],
+        }
+    }
+
+    /// The group lines read like the nav's group rows (`[upstream] 1 file`,
+    /// `[seen] 2 files`): bracketed, no ` · `, and a proper singular.
+    #[test]
+    fn status_human_group_lines_are_bracketed_with_a_proper_plural() {
+        let human = root_with_groups(vec![
+            GroupStatus {
+                kind: GroupKind::Upstream,
+                paths: vec!["u1".to_owned()],
+            },
+            GroupStatus {
+                kind: GroupKind::Seen,
+                paths: vec!["a.rs".to_owned(), "b.rs".to_owned()],
+            },
+        ])
+        .render_human();
+        assert!(human.contains("\n  [upstream] 1 file\n"), "{human}");
+        assert!(human.contains("\n  [seen] 2 files\n"), "{human}");
+        assert!(!human.contains("upstream ·"), "{human}");
+        assert!(!human.contains("seen ·"), "{human}");
+    }
 }

@@ -2464,7 +2464,7 @@ fn tui_wrap_capped_line() {
 /// The cherry-pick scene over the three-root fixture: on alpha, `run-1` commits five
 /// files under `s/` and they are accepted there (and nothing else is); back on `main`, a
 /// fresh `feat-x` cherry-picks the run, so the five come back as rows whose content
-/// `run-1` already accepted and fold into `seen · 5 files`. alpha's own pending rows stay
+/// `run-1` already accepted and fold into `[seen] 5 files`. alpha's own pending rows stay
 /// as they were.
 fn cherry_pick_scene() -> (Scene, Engine, App, PathBuf) {
     let scene = Scene::build();

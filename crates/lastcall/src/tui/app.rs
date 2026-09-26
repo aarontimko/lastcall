@@ -196,7 +196,7 @@ impl RootView {
     }
 
     /// The rows the nav lists on their own (Phase 14 B): every row minus the ones folded
-    /// into the `seen · N files` group ([`Row::folds_seen`]).
+    /// into the `[seen] N files` group ([`Row::folds_seen`]).
     pub fn nav_rows(&self) -> impl Iterator<Item = &Row> {
         self.pile.rows.iter().filter(|r| !r.folds_seen())
     }
@@ -1379,7 +1379,7 @@ pub struct App {
     /// The one collapsed row whose hunks `e` fetched, if any. A view, never a baseline;
     /// see [`Expansion`].
     pub expanded: Option<Expansion>,
-    /// The roots whose `seen · N files` group is open (Phase 14 B, ruling 10): `e` on the
+    /// The roots whose `[seen] N files` group is open (Phase 14 B, ruling 10): `e` on the
     /// group lists its members under it as indented rows. Session state, never persisted;
     /// kept across scans and cleared when the group disappears.
     pub seen_open: BTreeSet<PathBuf>,
@@ -3853,7 +3853,7 @@ impl App {
             // confirm they just answered (ruling P1).
             AcceptScope::Bless { path, .. } => format!("reviewed {}", lossy(path)),
             AcceptScope::Group { kind, .. } => {
-                format!("accepted {} · {}", kind.name(), plural(files, "file"))
+                format!("accepted [{}] {}", kind.name(), plural(files, "file"))
             }
             AcceptScope::Root(_) | AcceptScope::All => match ok_roots {
                 [one] => format!(
@@ -5550,7 +5550,7 @@ pub(crate) mod testfix {
     }
 
     /// alpha's pile (`f1`, `f2`) plus `s1`, `s2`, `s3` cloned from `f1` and marked seen on
-    /// `run-1`, so they fold into alpha's `seen · 3 files` group (Phase 14 B).
+    /// `run-1`, so they fold into alpha's `[seen] 3 files` group (Phase 14 B).
     pub fn alpha_seen() -> Pile {
         let mut p = pile("alpha");
         let template = p.rows[0].clone();
@@ -6082,7 +6082,7 @@ mod tests {
         app.accepted(vec![accepted_ok("beta", 3, without(beta.clone(), &paths))]);
         assert_eq!(
             status(&app),
-            format!("accepted upstream · {}", plural(paths.len(), "file"))
+            format!("accepted [upstream] {}", plural(paths.len(), "file"))
         );
         assert_eq!(
             app.selection,
@@ -6418,7 +6418,7 @@ mod tests {
             3,
             without(alpha.clone(), &["s1", "s2", "s3"]),
         )]);
-        assert_eq!(status(&app), "accepted seen · 3 files");
+        assert_eq!(status(&app), "accepted [seen] 3 files");
 
         // Accept-all counts every row, folded or not, and names the folded ones.
         let app = seen_app();

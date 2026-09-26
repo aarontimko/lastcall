@@ -5498,7 +5498,7 @@ fn pty_reload_adds_a_root_keeps_an_accept_and_refuses_a_broken_file() {
 }
 
 /// Phase 14 B through the real binary: content already accepted on another branch folds
-/// into `seen · N files`, and the fold opens, splits, closes, accepts and undoes. The
+/// into `[seen] N files`, and the fold opens, splits, closes, accepts and undoes. The
 /// "agent" works mid-run: `run-1` commits three files, the person accepts them one by one,
 /// then `main` → a fresh `feat-x` cherry-picks the run. The walk: `e` opens the group, a
 /// member's diff is an ordinary row's, `m` on it splits it out (its own row, the group one
@@ -5550,11 +5550,11 @@ fn pty_seen_group_cherry_pick_expand_flag_accept_undo() {
     repo.git(&["cherry-pick", "main..run-1"]).unwrap();
     pty.wait_for(OVERLOADED, |s| {
         let t = s.contents();
-        t.contains("feat-x · 6 files") && t.contains("seen · 3 files") && !t.contains("A a.rs")
+        t.contains("feat-x · 6 files") && t.contains("[seen] 3 files") && !t.contains("A a.rs")
     })
     .unwrap_or_else(|e| panic!("the fold: {e}\n{}", pty.screen_text()));
     note(&format!(
-        "PTY seen: `seen · 3 files` on the nav {:.3?} after the cherry-pick",
+        "PTY seen: `[seen] 3 files` on the nav {:.3?} after the cherry-pick",
         t.elapsed()
     ));
 
@@ -5602,7 +5602,7 @@ fn pty_seen_group_cherry_pick_expand_flag_accept_undo() {
     pty.send(b"\r").expect("enter");
     pty.wait_for(OVERLOADED, |s| {
         let t = s.contents();
-        t.contains("seen · 2 files")
+        t.contains("[seen] 2 files")
             && t.contains("    A a.rs  +1 −0  [seen]")
             && t.contains("    A c.rs  +1 −0  [seen]")
             && !t.contains("    A b.rs")
@@ -5610,7 +5610,7 @@ fn pty_seen_group_cherry_pick_expand_flag_accept_undo() {
     .unwrap_or_else(|e| panic!("the split: {e}\n{}", pty.screen_text()));
     note(&format!(
         "PTY seen split: {:?}",
-        pty.find_row(|r| r.contains("seen · 2 files")).map(|r| {
+        pty.find_row(|r| r.contains("[seen] 2 files")).map(|r| {
             pty.screen_text()
                 .lines()
                 .nth(r as usize)
@@ -5627,13 +5627,13 @@ fn pty_seen_group_cherry_pick_expand_flag_accept_undo() {
         t.contains("2 files, content accepted on run-1") && !t.contains("    A a.rs")
     })
     .unwrap_or_else(|e| panic!("the close: {e}\n{}", pty.screen_text()));
-    nav_cursor_reaches(&mut pty, "seen · 2 files", "e on a member");
+    nav_cursor_reaches(&mut pty, "[seen] 2 files", "e on a member");
 
     // `A` accepts the group; `z` puts it back.
     pty.send(b"A").expect("A");
     pty.wait_for(OVERLOADED, |s| {
-        // The nav's group line, not the status (which says `seen · 2 files` too).
-        status_is(s, "accepted seen · 2 files") && !s.contents().contains("│  seen · 2 files")
+        // The nav's group line, not the status (which says `[seen] 2 files` too).
+        status_is(s, "accepted [seen] 2 files") && !s.contents().contains("│  [seen] 2 files")
     })
     .unwrap_or_else(|e| panic!("the group accept: {e}\n{}", pty.screen_text()));
     assert!(
@@ -5644,10 +5644,10 @@ fn pty_seen_group_cherry_pick_expand_flag_accept_undo() {
     pty.send(b"z").expect("z");
     pty.wait_for(OVERLOADED, |s| {
         status_is(s, "undid accept of 2 files in alpha")
-            && s.contents().contains("│  seen · 2 files")
+            && s.contents().contains("│  [seen] 2 files")
     })
     .unwrap_or_else(|e| panic!("the undo: {e}\n{}", pty.screen_text()));
-    note("PTY seen: A accepted seen · 2 files; z undid accept of 2 files in alpha");
+    note("PTY seen: A accepted [seen] 2 files; z undid accept of 2 files in alpha");
 
     let since = pty.raw().len();
     pty.send(b"q").expect("q");
