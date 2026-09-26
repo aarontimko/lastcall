@@ -1673,9 +1673,15 @@ impl Engine {
         req: AcceptRequest,
         fault: &dyn FaultInjector,
     ) -> Result<Accepted, EngineError> {
-        let result = {
-            let mut ops = self.ops(root)?;
-            match &req {
+        let result = match self.ops(root) {
+            // Phase 14 C: `ops` hands out nothing for a gone root; for an accept that is
+            // the refusal the preflight would have given, not an error.
+            Err(EngineError::RootGone(_)) => Ok(Outcome {
+                refused: vec![Refused::RootGone],
+                ..Default::default()
+            }),
+            Err(e) => return Err(e),
+            Ok(mut ops) => match &req {
                 AcceptRequest::Hunk {
                     rendered,
                     hunks,
@@ -1692,7 +1698,7 @@ impl Engine {
                     ops.accept_group(rows, rendered_on.as_deref(), fault)
                 }
                 AcceptRequest::All(pile) => ops.accept_all(pile, fault),
-            }
+            },
         };
         let outcome = match result {
             Ok(o) => o,
@@ -2138,6 +2144,13 @@ impl Engine {
             .roots
             .get_mut(root)
             .ok_or_else(|| EngineError::NoSuchRoot(root.to_path_buf()))?;
+        // Phase 14 C, for every write and not only the accepts: a root whose directory is
+        // gone gets no `Ops` at all, so nothing (a flag, a snooze, a restore, an undo, a
+        // trim) can write its ledger, or a file into the missing folder, in the gap
+        // before discovery drops it.
+        if !state.path.is_dir() {
+            return Err(EngineError::RootGone(state.path.clone()));
+        }
         let case_insensitive = state.case_insensitive;
         // R5: the branch this op is staged under, and the `HEAD` file `commit` re-reads
         // under the lock to prove it is still in force.
@@ -5109,6 +5122,25 @@ pub(crate) mod tests {
         let acc = result.expect("a refusal, not an error");
         let refused: Vec<String> = acc.outcome.refused.iter().map(|r| r.to_string()).collect();
         assert_eq!(refused, vec!["folder removed".to_owned()]);
+    }
+
+    /// Verification F5 (Phase 14 C, widened): every write goes through `Engine::ops`, and a
+    /// root whose directory is gone gets none, so a flag in the gap writes nothing either.
+    #[test]
+    fn engine_ops_of_a_removed_root_are_refused_before_any_write() {
+        let (_repo, _state, mut engine, wt, rendered) = removed_root_fixture("eng-gone-ops");
+        let ledger_path = engine.root(&wt).unwrap().paths.ledger.clone();
+        let before = std::fs::read(&ledger_path).expect("the first sight wrote the ledger");
+        std::fs::remove_dir_all(&wt).unwrap();
+        let spawns = crate::git::thread_spawn_count();
+        let err = engine.ops(&wt).err().expect("no `Ops` for a gone root");
+        assert!(
+            matches!(err, EngineError::RootGone(ref p) if *p == wt),
+            "{err}"
+        );
+        assert_eq!(crate::git::thread_spawn_count() - spawns, 0);
+        assert_eq!(std::fs::read(&ledger_path).unwrap(), before, "untouched");
+        let _ = rendered;
     }
 
     /// Phase 14 D: `Engine::reload` replaces the config and rebuilds the glob sets, keeps

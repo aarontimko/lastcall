@@ -1280,8 +1280,8 @@ keymap that keeps growing.
 ### The seen fold and its `e` exit (Phase 14 B)
 
 A row the engine marked `seen_on` (content a parked branch already accepted; `docs/dev/engine.md`,
-the seen marks after pipeline step 9) that also has a present current side, no annotation
-and no flag **folds** (`Row::folds_seen`): the nav does not list it on its own and the
+the seen marks after pipeline step 9) that also has a present current side, no annotation,
+no flag and no rename **folds** (`Row::folds_seen`): the nav does not list it on its own and the
 root's `seen · N files` group row stands for it, after the `upstream` group. The fold is a
 view rule only, so `App` keeps the two lists apart on purpose:
 

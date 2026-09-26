@@ -907,7 +907,7 @@ fn spawn_snooze(
 /// parse reaches [`Engine::reload`]. Runs under the engine lock, on a blocking thread.
 pub fn reload_config(engine: &mut Engine) -> Result<Reload, String> {
     let env = engine.env().clone();
-    let loaded = lastcall_engine::config::load(&env).map_err(|e| e.to_string())?;
+    let loaded = lastcall_engine::config::load(&env).map_err(|e| reload_refusal(&e))?;
     let keymap = Keymap::from_config(&loaded.config.keys).map_err(|e| e.to_string())?;
     let resolved = loaded.resolve(env.cwd());
     let old = engine.config().clone();
@@ -917,6 +917,26 @@ pub fn reload_config(engine: &mut Engine) -> Result<Reload, String> {
         old,
         new: loaded.config,
     })
+}
+
+/// The reason a reload was refused, for the status line: the line number and the message,
+/// without the `config file <path>` prefix launch prints. The user just edited that file,
+/// and with the path in front the reason starts past column 78 at the default location
+/// and is cut off an 80-column terminal (verification F2). An error that is about the
+/// file itself rather than its contents keeps its full text.
+fn reload_refusal(error: &lastcall_engine::config::ConfigError) -> String {
+    use lastcall_engine::config::ConfigError;
+    match error {
+        ConfigError::Parse {
+            line: Some(line),
+            message,
+            ..
+        } => format!("line {line}: {message}"),
+        ConfigError::Parse { message, .. } | ConfigError::Invalid { message, .. } => {
+            message.clone()
+        }
+        other => other.to_string(),
+    }
 }
 
 /// `Effect::Reload`: [`reload_config`] off the UI task, then the watcher's reload pass.
@@ -2402,6 +2422,10 @@ mod tests {
             std::fs::write(&file, text).unwrap();
             let err = reload_config(&mut engine).expect_err(text);
             assert!(err.contains(says), "{text:?}: {err}");
+            assert!(
+                !err.contains("config file"),
+                "{text:?}: the refusal names the reason, not the file: {err}"
+            );
             assert_eq!(engine.config(), &before, "{text:?} touched the engine");
             let mut ui = Ui::new(App::new(), Keymap::defaults());
             let table = ui.app.keymap.clone();

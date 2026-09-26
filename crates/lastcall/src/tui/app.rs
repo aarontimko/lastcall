@@ -1289,6 +1289,11 @@ pub struct App {
     /// selection's whole repo has left the nav, so it is read exactly there:
     /// [`App::neighbour_after`]'s last rule.
     pub nav_anchor: Option<usize>,
+    /// Whether the selection was a member of an open seen group when it was selected,
+    /// read beside [`App::nav_anchor`] once the entry has left the nav: a member's
+    /// neighbours are the other members and then the group row, not the plain rows its
+    /// path happens to sort among.
+    pub nav_in_group: bool,
     pub help: bool,
     pub status: Option<StatusLine>,
     /// Advanced by `Tick`; render computes ages from it, never from `Instant::now()`.
@@ -1425,6 +1430,7 @@ impl App {
             diff_short: 0,
             show_snoozed: false,
             nav_anchor: None,
+            nav_in_group: false,
             help: false,
             status: None,
             now: Instant::now(),
@@ -3997,10 +4003,28 @@ impl App {
     /// the order **as it was while this entry was selected**, and by the time it runs
     /// `apply_pile` has already replaced the pile the order came from.
     pub fn select(&mut self, next: Option<Selection>) -> Changed {
+        // A row folded into a closed seen group is not on the nav: what stands for it is
+        // the group row, so that is what gets selected (a stale click can still name it).
+        let next = match next {
+            Some(Selection::Row(root, path))
+                if !self.seen_open.contains(&root)
+                    && self.roots.get(&root).is_some_and(|v| v.folded(&path)) =>
+            {
+                Some(Selection::Group(root, GroupKind::Seen))
+            }
+            other => other,
+        };
+        let entries = self.nav_entries();
         let anchor = next
             .as_ref()
-            .and_then(|s| self.nav_entries().iter().position(|e| e == s));
+            .and_then(|s| entries.iter().position(|e| e == s));
         self.nav_anchor = anchor;
+        self.nav_in_group = match (&next, anchor) {
+            (Some(Selection::Row(root, _)), Some(at)) => entries[..at]
+                .iter()
+                .any(|e| matches!(e, Selection::Group(r, GroupKind::Seen) if r == root)),
+            _ => false,
+        };
         if self.selection == next {
             return Changed::No;
         }
@@ -4063,13 +4087,31 @@ impl App {
     /// every index while changing nothing about what is below it.
     fn neighbour_after(&self, gone: &Selection, entries: &[Selection]) -> Option<Selection> {
         let root = gone.root();
-        let key = nav_key(gone);
+        // A member of the open seen group sorts after the group row, among the other
+        // members (`nav_in_group` remembers that `gone` was one, since its row is no
+        // longer there to ask), so an accepted member lands on the next member, then on
+        // the group row, never on a plain row above the group.
+        fn key_in<'s>(app: &App, sel: &'s Selection) -> (u8, &'s [u8], u8) {
+            match sel {
+                Selection::Row(r, path)
+                    if app.seen_open.contains(r)
+                        && app.roots.get(r).is_some_and(|v| v.folded(path)) =>
+                {
+                    (3, path.as_slice(), 0)
+                }
+                other => nav_key(other),
+            }
+        }
+        let key = match gone {
+            Selection::Row(_, path) if self.nav_in_group => (3, path.as_slice(), 0),
+            other => nav_key(other),
+        };
         let mine: Vec<&Selection> = entries.iter().filter(|e| e.root() == root).collect();
         if !mine.is_empty() {
             return mine
                 .iter()
-                .find(|e| nav_key(e) > key)
-                .or_else(|| mine.iter().rev().find(|e| nav_key(e) < key))
+                .find(|e| key_in(self, e) > key)
+                .or_else(|| mine.iter().rev().find(|e| key_in(self, e) < key))
                 .map(|e| (*e).clone());
         }
         let at = self.nav_anchor.unwrap_or(0);
@@ -6175,6 +6217,53 @@ mod tests {
         assert_eq!(app.handle(Action::Expand), (Changed::Yes, None));
         assert!(app.seen_open.is_empty());
         assert_eq!(app.selection, Some(seen_group()));
+    }
+
+    /// Verification F3: a member accepted from inside the open group hands the cursor to
+    /// the next member, then to the group row when it was the last one, never to a plain
+    /// row that happens to sort after its path above the group.
+    #[test]
+    fn app_seen_accepting_a_member_inside_the_open_group_lands_on_the_next_member() {
+        let mut app = seen_app();
+        app.select(Some(seen_group()));
+        app.handle(Action::Expand);
+        app.select(Some(row("alpha", "s2")));
+        assert!(app.nav_in_group);
+        // The accept's rescan returns the pile without `s2`.
+        let mut p = alpha_seen();
+        p.rows.retain(|r| r.path != b"s2");
+        app.apply(pile_event("alpha", p));
+        assert_eq!(app.selection, Some(row("alpha", "s3")), "the next member");
+        assert!(app.seen_open.contains(&root("alpha")), "still open");
+        // No member below it: the nearest member above, never the plain rows above the
+        // group (a group with no member left is gone, and the old rule applies then).
+        let mut p = alpha_seen();
+        p.rows.retain(|r| r.path != b"s2" && r.path != b"s3");
+        app.apply(pile_event("alpha", p));
+        assert_eq!(app.selection, Some(row("alpha", "s1")));
+        // A plain row keeps the old rule: `src/parse.rs` accepted lands on the group row
+        // below it, the nearest surviving entry in key order.
+        app.select(Some(row("alpha", "src/parse.rs")));
+        assert!(!app.nav_in_group);
+        let mut p = alpha_seen();
+        p.rows.retain(|r| r.path != b"src/parse.rs");
+        app.apply(pile_event("alpha", p));
+        assert_eq!(app.selection, Some(seen_group()));
+    }
+
+    /// Verification F5: a folded row named while its group is closed (a click on a frame
+    /// the fold has since replaced) selects the group row that stands for it, so the
+    /// selection is always on the nav and `e`, `j` and `k` keep working.
+    #[test]
+    fn app_seen_selecting_a_folded_row_while_closed_selects_the_group() {
+        let mut app = seen_app();
+        assert_eq!(app.select(Some(row("alpha", "s2"))), Changed::Yes);
+        assert_eq!(app.selection, Some(seen_group()));
+        assert_eq!(app.seen_toggle(), Some(false));
+        // Open, the same row is a member and is selected as itself.
+        app.handle(Action::Expand);
+        app.select(Some(row("alpha", "s2")));
+        assert_eq!(app.selection, Some(row("alpha", "s2")));
     }
 
     /// A collapsed member (a lockfile, a large file) would have no way to show its content

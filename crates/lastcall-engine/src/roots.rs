@@ -198,18 +198,26 @@ impl<'a> Skip<'a> {
         }
     }
 
-    /// Whether `rel` (a folder's relative path) matches, as `rel` and as `rel/`: the
-    /// second form is what lets `evals/**` prune the folder `evals` itself.
+    /// Whether `rel` (a folder's relative path) matches: itself or any folder above it
+    /// below the parent dir, each tried as `dir` and as `dir/` (the second form is what
+    /// lets `evals/**` prune the folder `evals` itself). The folders above matter for what
+    /// the walk never reaches on its own, a nested repository a scan reported or a
+    /// worktree kept inside a repository: a pattern naming a folder drops everything found
+    /// under it, exactly as `scan::DraftSkip::skips` reads it inside a watched folder.
     fn matches_dir(&self, rel: &Path) -> bool {
-        if rel.as_os_str().is_empty() {
-            return false;
+        let mut so_far = PathBuf::new();
+        for component in rel.components() {
+            so_far.push(component);
+            if self.set.is_match(&so_far) {
+                return true;
+            }
+            let mut with_slash = so_far.as_os_str().to_os_string();
+            with_slash.push("/");
+            if self.set.is_match(Path::new(&with_slash)) {
+                return true;
+            }
         }
-        if self.set.is_match(rel) {
-            return true;
-        }
-        let mut with_slash = rel.as_os_str().to_os_string();
-        with_slash.push("/");
-        self.set.is_match(Path::new(&with_slash))
+        false
     }
 
     /// Whether discovery leaves `dir` out. A protected directory never is; when a pattern
@@ -262,6 +270,9 @@ pub fn discover(inputs: &DiscoverInputs<'_>) -> Discovery {
     let parent_of = |path: &Path| -> PathBuf { file_under(&parents, path) };
     let depth = inputs.search_depth.clamp(1, WALK_DEPTH as u8);
     let skip = Skip::new(inputs.skip_globs, &parents, inputs.env.cwd());
+    // How many candidates `skip_globs` dropped under each parent dir, so a parent left
+    // with nothing can say why instead of showing an empty screen.
+    let mut skipped_under: Vec<(PathBuf, usize)> = Vec::new();
 
     // Git roots under each parent.
     for p in &parents {
@@ -300,7 +311,10 @@ pub fn discover(inputs: &DiscoverInputs<'_>) -> Discovery {
             .collect();
         children.sort();
         // The skip decides first: a matching child is neither probed nor walked.
+        let before = children.len();
         children.retain(|(child, _)| !skip.skips(child, &mut notices));
+        let slot = skipped_under.len();
+        skipped_under.push((p.clone(), before - children.len()));
         for (child, _) in &children {
             if has_git_entry(child) {
                 record_git_root(inputs.env, &parents, &mut roots, &mut notices, child);
@@ -332,6 +346,7 @@ pub fn discover(inputs: &DiscoverInputs<'_>) -> Discovery {
             entries.sort();
             for entry in entries {
                 if skip.skips(&entry, &mut notices) {
+                    skipped_under[slot].1 += 1;
                     continue;
                 }
                 if has_git_entry(&entry) {
@@ -502,6 +517,18 @@ pub fn discover(inputs: &DiscoverInputs<'_>) -> Discovery {
             })
             .collect();
     }
+    // A parent dir whose every candidate was skipped lists nothing, and the screen would
+    // be empty with nothing saying why: one notice per such parent, with the count.
+    for (parent, skipped) in skipped_under {
+        if skipped > 0 && !roots.iter().any(|r| r.parent == parent) {
+            notices.push(format!(
+                "skip_globs: nothing left under {} ({} skipped)",
+                parent.display(),
+                skipped
+            ));
+        }
+    }
+
     Discovery { roots, notices }
 }
 
@@ -1427,6 +1454,69 @@ mod tests {
         // The sponsor's own line.
         let d = discover_skipping(&env, ps, &[], &nested, 1, &["*/z_ignore/**/evals/**"]);
         assert_eq!(d.paths(), vec![canon(&proj)]);
+    }
+
+    /// Verification F1: a pattern naming a folder drops what promotion finds under it,
+    /// the way the walk never enters a matching folder. `app/vendored` and
+    /// `app/vendored/*` agree, and the promotion's `toplevel` never runs for either.
+    #[test]
+    fn roots_skip_globs_a_folder_pattern_drops_what_promotion_finds_under_it() {
+        let dir = TempDir::new("lc-roots-skip-above");
+        let env = test_env(&dir);
+        let parent = dir.mkdir("P");
+        let app = parent.join("app");
+        init_repo(&env, &app);
+        init_repo(&env, &app.join("vendored/inner"));
+        let canon = |p: &Path| std::fs::canonicalize(p).unwrap();
+        let ps = std::slice::from_ref(&parent);
+        let nested = vec![(canon(&app), app.join("vendored/inner"))];
+
+        let promoted = discover_skipping(&env, ps, &[], &nested, 1, &[]);
+        assert_eq!(
+            promoted.paths(),
+            vec![canon(&app), canon(&app.join("vendored/inner"))]
+        );
+        let (_, base_cost) = spawns(|| discover_skipping(&env, ps, &[], &[], 1, &[]));
+        for pattern in [
+            "app/vendored",
+            "app/vendored/",
+            "app/vendored/*",
+            "*/vendored",
+        ] {
+            let (d, cost) = spawns(|| discover_skipping(&env, ps, &[], &nested, 1, &[pattern]));
+            assert_eq!(d.paths(), vec![canon(&app)], "{pattern}");
+            assert_eq!(
+                cost, base_cost,
+                "{pattern}: the promotion's `toplevel` never ran"
+            );
+        }
+    }
+
+    /// Verification F3: a pattern that skips every candidate under a parent dir leaves the
+    /// screen empty, so the pass says so, once per such parent, with the count. A parent
+    /// that keeps a root says nothing.
+    #[test]
+    fn roots_skip_globs_say_when_a_parent_is_left_with_nothing() {
+        let dir = TempDir::new("lc-roots-skip-empty");
+        let env = test_env(&dir);
+        let parent = dir.mkdir("P");
+        for name in ["app", "evals", "keep"] {
+            init_repo(&env, &parent.join(name));
+        }
+        let ps = std::slice::from_ref(&parent);
+        let d = discover_skipping(&env, ps, &[], &[], 1, &["*"]);
+        assert!(d.paths().is_empty());
+        let canon = std::fs::canonicalize(&parent).unwrap();
+        assert_eq!(
+            d.notices,
+            vec![format!(
+                "skip_globs: nothing left under {} (3 skipped)",
+                canon.display()
+            )]
+        );
+        let d = discover_skipping(&env, ps, &[], &[], 1, &["app", "evals"]);
+        assert_eq!(d.paths(), vec![canon.join("keep")]);
+        assert!(d.notices.is_empty(), "{:?}", d.notices);
     }
 
     /// F9: a parent dir entry and the launch directory are never skipped, and a notice says

@@ -5584,10 +5584,13 @@ mod tests {
         }
 
         /// One row's shape: seen somewhere, its annotation (none / upstream / mixed),
-        /// flagged, a pending deletion.
-        type Shape = (bool, u8, bool, bool);
+        /// flagged, a pending deletion, one half of a rename, collapsed.
+        type Shape = (bool, u8, bool, bool, bool, bool);
 
-        fn shaped(path: &str, (seen, annotation, flagged, deleted): Shape) -> Row {
+        fn shaped(
+            path: &str,
+            (seen, annotation, flagged, deleted, renamed, collapsed): Shape,
+        ) -> Row {
             let mut r = pile("alpha").rows[0].clone();
             r.path = path.as_bytes().to_vec();
             if seen {
@@ -5608,20 +5611,40 @@ mod tests {
                 r.change = Change::Deleted;
                 r.current = None;
             }
+            if renamed {
+                r.rename = Some(lastcall_engine::scan::Rename::From {
+                    from: b"elsewhere".to_vec(),
+                    similarity: 100,
+                });
+            }
+            if collapsed {
+                r.collapsed = Some(lastcall_engine::scan::Collapsed::Size);
+                r.hunks.clear();
+            }
             r
         }
 
         /// F20's shape: every pile holds a seen-and-flagged path, a seen-and-upstream
-        /// path, a seen-plain path and a pending deletion (seen too), then random rows.
+        /// path, a seen-plain path, a pending deletion (seen too), the added half of a
+        /// seen rename (a row) and a seen collapsed file (folds), then random rows.
         fn any_pile() -> impl Strategy<Value = Pile> {
-            let shape = (any::<bool>(), 0u8..3, any::<bool>(), any::<bool>());
+            let shape = (
+                any::<bool>(),
+                0u8..3,
+                any::<bool>(),
+                any::<bool>(),
+                any::<bool>(),
+                any::<bool>(),
+            );
             prop::collection::vec(shape, 0..10).prop_map(|shapes| {
                 let mut p = pile("alpha");
                 p.rows = vec![
-                    shaped("fixed/del", (true, 0, false, true)),
-                    shaped("fixed/flagged", (true, 0, true, false)),
-                    shaped("fixed/plain", (true, 0, false, false)),
-                    shaped("fixed/up", (true, 1, false, false)),
+                    shaped("fixed/del", (true, 0, false, true, false, false)),
+                    shaped("fixed/flagged", (true, 0, true, false, false, false)),
+                    shaped("fixed/plain", (true, 0, false, false, false, false)),
+                    shaped("fixed/up", (true, 1, false, false, false, false)),
+                    shaped("fixed/renamed", (true, 0, false, false, true, false)),
+                    shaped("fixed/collapsed", (true, 0, false, false, false, true)),
                 ];
                 for (i, s) in shapes.into_iter().enumerate() {
                     p.rows.push(shaped(&format!("r{i:02}"), s));
@@ -5674,6 +5697,8 @@ mod tests {
                 prop_assert!(seen_set.contains(b"fixed/plain".as_slice()));
                 prop_assert!(up_set.contains(b"fixed/up".as_slice()));
                 prop_assert!(!seen_set.contains(b"fixed/up".as_slice()));
+                prop_assert!(nav.contains(b"fixed/renamed".as_slice()));
+                prop_assert!(seen_set.contains(b"fixed/collapsed".as_slice()));
 
                 // The nav lists each own row once, and the members only when open.
                 let listed: Vec<Selection> = app

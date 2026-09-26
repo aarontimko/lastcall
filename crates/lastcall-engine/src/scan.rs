@@ -146,15 +146,17 @@ impl Row {
     /// Whether this row folds into the `seen · N files` group (Phase 14 B): its content
     /// was accepted on another branch, it is not an upstream or mixed row, and it carries
     /// nothing of the user's own: no flag, so no note. A pending deletion is always a row.
-    /// A flagged row stays a row (with a `[seen]` badge). An accept-only override is
-    /// **not** a reason to stay: compaction
-    /// folds those into the seen tree, and whether a row folds must not change when the
-    /// record is compacted (the pile is identical across a compaction).
+    /// A flagged row stays a row (with a `[seen]` badge), and so does either half of a
+    /// rename pair, so the deleted half never points at a path folded out of sight and the
+    /// pair is accepted together. An accept-only override is **not** a reason to stay:
+    /// compaction folds those into the seen tree, and whether a row folds must not change
+    /// when the record is compacted (the pile is identical across a compaction).
     pub fn folds_seen(&self) -> bool {
         !self.seen_on.is_empty()
             && self.current.is_some()
             && self.annotation.is_none()
             && self.flags.is_empty()
+            && self.rename.is_none()
     }
 }
 
