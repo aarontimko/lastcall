@@ -30,11 +30,18 @@ binary rather than for the commit log.
 - Work you already reviewed on another branch no longer comes back as a pile of rows. When
   a cherry-pick, a rebase or a squash-merge brings files whose content is exactly what you
   accepted on another branch of the same repository, they fold into one row,
-  `seen · N files`; selecting it names the branches and lists the files. `e` opens it and
+  `[seen] N files`; selecting it names the branches and lists the files. `e` opens it and
   each file is an ordinary row again, badged `[seen]`, to open, flag or restore. A file you
   edit or flag afterwards leaves the group for its own row. `A` accepts the group, `z` puts
   it back, and `lastcall status` still lists every file (`status --json` adds `seen_on` to
   each row and a `seen` group).
+
+### Changed
+
+- The row that groups files arriving from a fetch now reads `[upstream] N files`, bracketed
+  like the `[upstream]` badge its files carry, so it can no longer be mistaken for the
+  branch line above it; `lastcall status` prints both group rows the same way, and says
+  `1 file` where it used to say `1 files`.
 
 ### Fixed
 

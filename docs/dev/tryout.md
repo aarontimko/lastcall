@@ -159,7 +159,7 @@ as `STEPS.md` in the sandbox. What each one is for:
 | `wrap` | word wrap in the diff pane: prose, code, other scripts, the cap, paging, `alt-z` |
 | `ignored` | `review_ignored`: gitignored scratch files listed under their repository, never from inside an ignored folder |
 | `reload` | `R`: a watched folder uncommented and listed without a restart, an accept that survives it, `skip_globs` taking a repository out, a broken file refused |
-| `cherry-pick` | the `seen · N files` fold: a cherry-pick, a rebase and a squash-merge of reviewed work, the group opened with `e`, a member edited or flagged out of it, the group accepted and undone, and nothing hidden from `status` |
+| `cherry-pick` | the `[seen] N files` fold: a cherry-pick, a rebase and a squash-merge of reviewed work, the group opened with `e`, a member edited or flagged out of it, the group accepted and undone, and nothing hidden from `status` |
 
 ### `ignored`
 
@@ -201,7 +201,7 @@ the scenario prints them (the engine half of each is pinned by
    `git commit -qam "run-1 work"`, it stays empty.
 2. The switch: `git switch feat-x`, the branch line says `feat-x`, the list stays empty.
 3. The cherry-pick: `git cherry-pick run-1`, within a second or two one row,
-   `seen · 3 files`, not three.
+   `[seen] 3 files`, not three.
 4. Read it: select it, the right pane says `3 files, content accepted on run-1` and lists
    the three paths with `run-1` beside each.
 5. Open it: `e`, the three files indented under the group row, badged `[seen]` (the hint
@@ -209,23 +209,23 @@ the scenario prints them (the engine half of each is pinned by
    `b.rs`, its diff like any row's with `[seen]` on the header; `e` again folds them back
    and selects the group row.
 6. One file changes: `printf 'extra\n' >> b.rs`, `b.rs` becomes its own row (no badge)
-   above `seen · 2 files`.
+   above `[seen] 2 files`.
 7. Flag a member: `e`, select `c.rs`, `m`, a note, Enter; `c.rs` leaves as its own row
-   with the flag mark and `[seen]`; `seen · 1 file` remains, still open.
+   with the flag mark and `[seen]`; `[seen] 1 file` remains, still open.
 8. Accept the group: select it, `a` is refused (`A accepts the group`), `A` says
-   `accepted seen · 1 file`, `z` says `undid accept of a.rs` and the group is back.
+   `accepted [seen] 1 file`, `z` says `undid accept of a.rs` and the group is back.
 9. Accept all: ten scratch files
    (`for i in 1 2 3 4 5 6 7 8 9 10; do echo "note $i" > note-$i.txt; done`) so `ctrl-a`
    asks; the modal says `Accept all 13 files in demo?` and
    `0 grouped upstream · 1 grouped seen · 0 collapsed`; `y` empties the list; then
    `git add -A && git commit -qm "feat-x work"` so the next switch starts clean.
 10. The rebase variant: `git switch run-2` shows `d.rs` and `e.rs`, `ctrl-a`;
-    `git switch feat-y`, empty; `git rebase run-2`, `seen · 2 files`, accepted on `run-2`.
+    `git switch feat-y`, empty; `git rebase run-2`, `[seen] 2 files`, accepted on `run-2`.
 11. The squash-merge variant: `git switch feat-z`, empty; `git merge --squash run-2`,
-    `seen · 2 files`.
+    `[seen] 2 files`.
 12. Nothing hidden: `lastcall status` (the printed line carries the sandbox's
     `LASTCALL_STATE_DIR` and `LASTCALL_CONFIG`) lists `d.rs` and `e.rs` with `[seen]` and
-    the line `seen · 2 files`; `--json` shows a `seen_on` list holding `run-2` on each row
+    the line `[seen] 2 files`; `--json` shows a `seen_on` list holding `run-2` on each row
     and a group of kind `seen`.
 
 The scratch files in step 9 are there because the accept-all modal only asks above ten

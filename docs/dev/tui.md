@@ -401,7 +401,7 @@ from what the user is looking at:
   row showed when the accept was asked; the cursor's slot is always 1 again once the
   accepted hunk slides out, so it is not quoted), `accepted f1 · file complete` when that
   was the file's last hunk,
-  `accepted f1`, `accepted f3 (deleted)`, `accepted upstream · 4 files`, `accepted 12 files
+  `accepted f1`, `accepted f3 (deleted)`, `accepted [upstream] 4 files`, `accepted 12 files
   in alpha`, `accepted 30 files in 3 repos`; on refusals the `Refused` texts joined by
   ` · ` (the first only plus ` (+N more)` beyond two); an `Err` for one root is reported as
   `alpha: <error>` and does not undo the others.
@@ -1282,8 +1282,12 @@ keymap that keeps growing.
 A row the engine marked `seen_on` (content a parked branch already accepted; `docs/dev/engine.md`,
 the seen marks after pipeline step 9) that also has a present current side, no annotation,
 no flag and no rename **folds** (`Row::folds_seen`): the nav does not list it on its own and the
-root's `seen · N files` group row stands for it, after the `upstream` group. The fold is a
-view rule only, so `App` keeps the two lists apart on purpose:
+root's `[seen] N files` group row stands for it, after the `upstream` group. Both group rows
+wear their files' badge in brackets with no dot (`[upstream] 1 file`, `[seen] 2 files`), so
+the branch line is the only nav line shaped `name · N files`: the sponsor's 2026-09-26 walk
+read `seen · 2 files`, drawn just under `feat-y · 2 files`, as a branch
+(`render_group_rows_are_bracketed_and_only_the_branch_line_reads_name_dot_count` holds it).
+The fold is a view rule only, so `App` keeps the two lists apart on purpose:
 
 - `RootView::rows()` is still the whole pile. The header's counts, the per-repo `A`, `^A`
   and its modal (`ConfirmCounts.grouped_seen`, shown as `… · N grouped seen · …` only when
@@ -1317,7 +1321,7 @@ closed; and a selected row that has just folded moves the selection to the group
 than to a neighbour. A member that is flagged or edited leaves the group on the next pile
 for its own row above it, and the group stays open. `a` on the group is refused (`A
 accepts the group`, as for `upstream`); `A` sends one `AcceptRequest::Group` and the status
-reads `accepted seen · N files`. The fold's property test
+reads `accepted [seen] N files`. The fold's property test
 (`render_seen_fold_hides_nothing_and_every_count_agrees`, 8 cases in the unit tier, 64 in
 the pre-push hook) holds that the nav's own rows and the seen group partition the pile, that
 the upstream group is a subset of the nav rows (upstream rows are listed as well as grouped)

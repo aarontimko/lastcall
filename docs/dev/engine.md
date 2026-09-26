@@ -1212,7 +1212,8 @@ already accepted exactly this row's content (empty for most rows; see the seen m
 step 9 of the pipeline), and the `seen` group lists the rows that fold (`Row::folds_seen`),
 so a row can carry `seen_on` without being in the group (flagged, annotated, or a
 deletion). The human form appends `  [seen]` to a marked row's line and prints the group as
-`seen · N files` after `upstream · N files`.
+`[seen] N files` after `[upstream] N files`, the TUI's group-row label, with `1 file` in the
+singular (`count::plural`).
 
 `omitted` (additive, Phase 4; `status_version` stays 1 — an Amendment v1.4 candidate) is
 the number of changed paths beyond the row cap that this scan did not hash (see step 4 of

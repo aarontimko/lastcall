@@ -367,8 +367,8 @@ def scenario_cherry_pick(sandbox):
         "empty (the status line says it is your first time on feat-x, carried over from "
         "run-1).",
         "The cherry-pick. `git cherry-pick run-1`: within a second or two the list shows "
-        "one row, `seen · 3 files`, not three rows.",
-        "Read it. Select `seen · 3 files`: the right pane says `3 files, content accepted "
+        "one row, `[seen] 3 files`, not three rows.",
+        "Read it. Select `[seen] 3 files`: the right pane says `3 files, content accepted "
         "on run-1` and lists the three paths, each with `run-1` beside it.",
         "Open it. Press `e`: `a.rs`, `b.rs` and `c.rs` appear indented under the group "
         "row, each badged `[seen]`; once the `HEAD moved` status line has cleared (it stays "
@@ -376,13 +376,13 @@ def scenario_cherry_pick(sandbox):
         "like any row's, `[seen]` on its header. Press `e` again: they fold back and the "
         "group row is selected.",
         "One file changes. `printf 'extra\\n' >> b.rs`: `b.rs` becomes its own row above "
-        "`seen · 2 files`, with no badge (its content is new).",
+        "`[seen] 2 files`, with no badge (its content is new).",
         "Flag a member. Press `e` on the group, select `c.rs`, press `m`, type a note, "
         "press Enter: `c.rs` leaves the group as its own row with the flag mark and "
-        "`[seen]`, and `seen · 1 file` remains, still open with `a.rs` under it.",
-        "Accept the group. Select `seen · 1 file`, press `a`: refused, the status line "
-        "says `A accepts the group`. Press `A`: `accepted seen · 1 file` and the group "
-        "row is gone. Press `z`: `undid accept of a.rs` and `seen · 1 file` is back.",
+        "`[seen]`, and `[seen] 1 file` remains, still open with `a.rs` under it.",
+        "Accept the group. Select `[seen] 1 file`, press `a`: refused, the status line "
+        "says `A accepts the group`. Press `A`: `accepted [seen] 1 file` and the group "
+        "row is gone. Press `z`: `undid accept of a.rs` and `[seen] 1 file` is back.",
         "Accept all. In the second terminal make ten scratch files so `ctrl-a` asks first: "
         "`for i in 1 2 3 4 5 6 7 8 9 10; do echo \"note $i\" > note-$i.txt; done`. Press "
         "`ctrl-a`: the modal says `Accept all 13 files in demo?` and `0 grouped upstream "
@@ -397,15 +397,15 @@ def scenario_cherry_pick(sandbox):
         "feat-y`. The branch line says `feat-y`; the `demo` list still has no rows, "
         "because `feat-y` has no changes of its own. Then `git rebase run-2`, which brings "
         "the `d.rs` and `e.rs` commit onto `feat-y`: within a second or two the `demo` list "
-        "shows one row, `seen · 2 files`, not two plain rows. Select it: the right pane "
+        "shows one row, `[seen] 2 files`, not two plain rows. Select it: the right pane "
         "says `2 files, content accepted on run-2`.",
         "The squash-merge variant. In the second terminal: `git switch feat-z`. The branch "
         "line says `feat-z` and the `demo` list has no rows. Then `git merge --squash "
         "run-2`, which copies the `d.rs` and `e.rs` changes into the working tree without "
-        "committing: the `demo` list shows `seen · 2 files` again, for the same reason.",
+        "committing: the `demo` list shows `[seen] 2 files` again, for the same reason.",
         "Nothing hidden. In the second terminal run lastcall's status command against this "
         "sandbox: `%s`. It prints `d.rs` and `e.rs`, each tagged `[seen]`, then the line "
-        "`seen · 2 files`. Run the same command with `--json` added at the end: in the "
+        "`[seen] 2 files`. Run the same command with `--json` added at the end: in the "
         "JSON, each of the two pending rows has a `seen_on` list containing `run-2`, and "
         "`groups` has one entry whose `\"kind\"` is `\"seen\"`." % status,
     ]
