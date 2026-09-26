@@ -549,7 +549,7 @@ fn render_status(app: &App, buf: &mut Buffer, area: Rect) {
 /// Phase 9a deliverable 4, and the orchestrator's post-checkpoint note for `hide_empty`'s
 /// place). Names are keymap action names, so a rebind moves the key and never the order.
 ///
-/// The shape of it: the diff pane's two extras go first (they are named in the overlay and
+/// The shape of it: the right pane's two extras go first (they are named in the overlay and
 /// in `SELECT_NOTE`), then the three whose surface says the same thing another way (`r`
 /// refreshes what the watcher does anyway, `Tab` and `w` are visible in the pane layout and
 /// the scope notice), then `^A` — which the header's `[Accept All]` duplicates at every
@@ -683,7 +683,7 @@ pub fn hints(app: &App, width: u16) -> String {
         _ => None,
     };
     // (hint, tier): when the line must shrink, tier 4 goes first (`t hide empty`), then
-    // tier 3 (the diff pane's two), then tier 2 (`focus`, `refresh`; always below
+    // tier 3 (the right pane's two, `v select` and `y copy`), then tier 2 (`focus`, `refresh`; always below
     // `NAV_MIN_COLS`), then tier 1 (the file and global accept hints).
     // The herdr hints are conditional: `d`/`g` only while the selected root carries a
     // flag, `w` only while a scope is active (deliverable 5's hint ladder).
