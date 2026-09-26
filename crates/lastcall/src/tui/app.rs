@@ -1868,7 +1868,7 @@ impl App {
     /// How many lines a selection may cover in the right pane (Phase 14 G): the diff
     /// lines for a file row, as before; for any other pane its lines, but never more than
     /// the pane's rows, because nothing scrolls there and the keyboard must not select a
-    /// line the mouse cannot reach (design review F13). Zero means `v`, `y` and their
+    /// line the mouse cannot reach. Zero means `v`, `y` and their
     /// hints answer nothing.
     pub fn selectable_lines(&self) -> usize {
         if self.row_pane() {
@@ -4082,7 +4082,7 @@ impl App {
         // A selection is a range of *this* row's diff lines; the moment the row changes the
         // range means nothing, so it goes rather than pointing at another file's text.
         self.sel = None;
-        // …and a drag in progress ends with it (Phase 14 G, design review F3): the lines
+        // …and a drag in progress ends with it (Phase 14 G): the lines
         // under the pointer are another pane's now, so the next `Drag` selects nothing and
         // the release copies nothing.
         self.press_line = None;
@@ -4363,7 +4363,7 @@ impl App {
         if next == sel.cursor {
             return Changed::No;
         }
-        // Phase 14 G (design review F2): a pane built from lines does not scroll, so the
+        // Phase 14 G: a pane built from lines does not scroll, so the
         // far end moves and nothing else does.
         if !self.row_pane() {
             self.sel = Some(Sel {
@@ -11255,7 +11255,7 @@ mod tests {
     /// alpha's pane, line by line, as the renderer draws it at any width the fixture fits.
     const ALPHA_PANE: &str = "alpha  main · 3 files\n~/W/alpha\n  M f1  +1 −1\n  M f2  +1 −0\n  M src/parse.rs  +10 −2\n";
 
-    /// The sponsor's case: a drag over a repository's pane copies its name and its path,
+    /// Phase 14 G: a drag over a repository's pane copies its name and its path,
     /// home written `~` as the pane draws it.
     #[test]
     fn app_drag_on_a_root_pane_copies_the_name_and_the_path() {
@@ -11277,7 +11277,7 @@ mod tests {
         assert_eq!(app.cue.as_ref().map(|c| c.text.as_str()), Some(COPIED));
     }
 
-    /// Design review F2 and F13: the mouse and the keyboard stop at the pane's last line.
+    /// Phase 14 G: the mouse and the keyboard stop at the pane's last line.
     #[test]
     fn app_root_pane_selection_clamps_to_the_pane_lines() {
         let mut app = root_pane();
@@ -11318,7 +11318,7 @@ mod tests {
         assert_eq!(copied(app.handle(Action::Copy).1), ALPHA_PANE);
     }
 
-    /// Design review F12: `y` with nothing selected copies the whole pane, and a pane over
+    /// Phase 14 G: `y` with nothing selected copies the whole pane, and a pane over
     /// the cap is refused with the diff's own words, the selection left alone.
     #[test]
     fn app_y_on_a_root_pane_copies_it_whole_and_refuses_over_the_cap() {
@@ -11374,7 +11374,7 @@ mod tests {
         );
     }
 
-    /// Design review F3: a selection that moves in the middle of a drag ends the gesture,
+    /// Phase 14 G: a selection that moves in the middle of a drag ends the gesture,
     /// so the next `Drag` selects nothing and the release copies nothing.
     #[test]
     fn app_a_selection_change_mid_drag_ends_the_gesture() {
@@ -11408,7 +11408,7 @@ mod tests {
         assert!(app.drag_moved);
     }
 
-    /// Design review F6: a hunkless row's body is not selectable, so `v` is refused there
+    /// Phase 14 G: a hunkless row's body is not selectable, so `v` is refused there
     /// as it always was.
     #[test]
     fn app_a_hunkless_row_body_is_not_selectable() {
