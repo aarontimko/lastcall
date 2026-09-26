@@ -86,17 +86,19 @@ pub fn nothing_pending_short(status: &str) -> String {
     format!("agent {status}")
 }
 
-/// The help overlay's mouse note (ruling 3): `term::enter` turns mouse capture on, so the
-/// terminal's own text selection needs the shift override. It stays now that deliverable 9
-/// has landed — shift+drag is still the terminal-native path, and the one that works where
-/// OSC 52 does not — with `v`/`y` named beside it. 62 columns, so the note fits inside the
-/// overlay at 80 (design review F19).
-pub const SELECT_NOTE: &str = "shift+drag selects text (mouse capture is on) · v/y copies";
+/// The help overlay's mouse note (Phase 14 G): a plain drag selects any text in the right
+/// pane, a diff, a repository's path, a group's file list, and the release copies it over
+/// OSC 52; `v`/`y` do the same from the keyboard. Inside a herdr pane that drag is the only
+/// copy there is, because the host honours mouse reporting and has no bypass modifier.
+/// Outside one, `shift`+drag is still the terminal's own selection, which is the path that
+/// works where OSC 52 is switched off; the overlay no longer spends a row on it, and
+/// `docs/review-loop.md` says it.
+pub const SELECT_NOTE: &str = "drag selects text · v/y copies";
 
 /// The help overlay's last footer row (Amendment v1.11): the welcome card runs once and
 /// then never again, so the one place a reader looks up a key is also the place that says
-/// how to get it back. 44 columns, narrower than [`SELECT_NOTE`], so it costs the overlay
-/// no width.
+/// how to get it back. 43 columns, narrower than either newline note beside it, so it
+/// costs the overlay no width.
 pub const TOUR_NOTE: &str = "lastcall tui --tour shows the welcome again";
 
 /// The inline editor's line-number gutter: four columns of number and one for the `▎` that
@@ -726,10 +728,11 @@ pub fn hints(app: &App, width: u16) -> String {
     };
     let diff = app.effective_focus() == Focus::Diff;
     // Verifier (b) F4, the same rule as `accept all in <root>` above: a hint the line
-    // promises has to do something. `v` and `y` work on diff *lines*, and a hunkless entry
-    // (binary, collapsed, deleted, unreadable, or a repo row) has none, so on one of those
-    // the pair is not offered even though the diff pane holds the focus.
-    let selectable = diff && !app.view_hunks().is_empty();
+    // promises has to do something. `v` and `y` work on the right pane's selectable lines
+    // (Phase 14 G: a repository's or a group's pane has them too), and a hunkless file
+    // (binary, collapsed, deleted, unreadable) has none, so there the pair is not offered
+    // even though the diff pane holds the focus. The predicate is the reducer's own.
+    let selectable = diff && app.selectable_lines() > 0;
     let select_hint = selectable
         .then(|| first("select").map(|k| format!("{k} select")))
         .flatten();
@@ -1216,7 +1219,48 @@ fn render_main(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
         return;
     }
     hits.targets.push((area, Target::DiffBody));
-    let mut lines: Vec<Line> = Vec::new();
+    if let Some(Selection::Row(root, path)) = &app.selection
+        && let Some((view, row)) = app
+            .roots
+            .get(root)
+            .and_then(|v| v.row(path).map(|r| (v, r)))
+    {
+        render_row_pane(app, buf, area, view, row, path, hits);
+        return;
+    }
+    // Phase 14 G: every other pane is a list of lines, and the whole pane is the region a
+    // drag selects in, exactly as the diff body is for a row: `diff_body` is the pane,
+    // `diff_rows` one line per drawn row. Published here, after the row path has returned,
+    // so a frame can never carry both. A press in the blank under a short pane answers the
+    // last drawn line, as it does under a short diff.
+    let lines = main_pane_lines(app, area.width);
+    let drawn = lines.len().min(area.height as usize);
+    hits.diff_body = Some(area);
+    hits.diff_rows = (0..drawn).collect();
+    let selected = app.sel.map(|s| s.range());
+    for (i, mut line) in lines.into_iter().take(drawn).enumerate() {
+        // The same full-width reverse run `render_hunks` draws over a selected diff line.
+        if selected.is_some_and(|(a, b)| i >= a && i <= b) {
+            band(
+                &mut line,
+                area.width,
+                Style::new().add_modifier(Modifier::REVERSED),
+            );
+        }
+        buf.set_line(area.x, area.y + i as u16, &line, area.width);
+    }
+}
+
+/// The right pane's lines for every selection that is not a file row (Phase 14 G): the
+/// launch hold, the empty states and the prompt, a repository, a group. The one builder
+/// both halves read: [`render_main`] draws these, one per row, and
+/// [`App::pane_lines`] flattens the same lines into the text a drag or `y` copies, so what
+/// is copied is what was drawn whenever the last frame was drawn at `width`.
+///
+/// Pure: the app and the width, nothing else. A file row's pane is not built here (its
+/// header, notices and hunks are drawn by [`render_row_pane`]), so for one this is empty.
+pub fn main_pane_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
     match &app.selection {
         None => {
             if let Some(loading) = &app.loading {
@@ -1385,7 +1429,7 @@ fn render_main(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
                 .get(root)
                 .and_then(|v| v.group(GroupKind::Seen).map(|g| (v, g)))
             {
-                seen_group_pane(view, group, area.width as usize, &mut lines);
+                seen_group_pane(view, group, width as usize, &mut lines);
             }
         }
         Some(Selection::Group(root, kind)) => {
@@ -1400,73 +1444,80 @@ fn render_main(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
                 }
             }
         }
-        Some(Selection::Row(root, path)) => {
-            if let Some((view, row)) = app
-                .roots
-                .get(root)
-                .and_then(|v| v.row(path).map(|r| (v, r)))
-            {
-                let control = format!("[{} accept file]", control_key(app, "accept_file"));
-                let restore = format!("[{} restore file]", control_key(app, "restore_file"));
-                // The header is built knowing what will be right-aligned after it, so the
-                // flag marker takes the leftover and not the controls' room.
-                let used = row_header(row, 0).width();
-                let mut header = row_header(
-                    row,
-                    marker_budget(area.width, used, &[control.as_str(), restore.as_str()]),
-                );
-                // Two controls here, not three: `[m flag]` is a hunk control, and the nav's
-                // own `m` (which flags the file) has no header line to hang off.
-                let at = right_align_run(
-                    &mut header,
-                    &[control.as_str(), restore.as_str()],
-                    area.width,
-                    dim(),
-                );
-                let (at_accept, at_restore) = (at[0], at[1]);
-                if let Some(x) = at_accept {
-                    hits.targets.push((
-                        Rect::new(area.x + x, area.y, control.width() as u16, 1),
-                        Target::FileAccept,
-                    ));
-                }
-                if let Some(x) = at_restore {
-                    hits.targets.push((
-                        Rect::new(area.x + x, area.y, restore.width() as u16, 1),
-                        Target::FileRestore,
-                    ));
-                }
-                lines.push(header);
-                // The row's own `<path>: …` notice is the body of an unreadable row, so the
-                // dimmed list above it carries only the root's other notices.
-                let own = format!("{}: ", row.path_lossy());
-                let others: Vec<String> = view
-                    .notices()
-                    .iter()
-                    .filter(|n| !n.starts_with(&own))
-                    .cloned()
-                    .collect();
-                push_notices(&mut lines, &others);
-                // Header and notices are bounded by the pane: a root with more notices than
-                // rows must not write past the buffer.
-                let fixed = lines.len().min(area.height as usize);
-                for (i, line) in lines.iter().take(fixed).enumerate() {
-                    buf.set_line(area.x, area.y + i as u16, line, area.width);
-                }
-                let rest = Rect::new(
-                    area.x,
-                    area.y + fixed as u16,
-                    area.width,
-                    area.height - fixed as u16,
-                );
-                render_row_body(app, buf, rest, view, row, &path.clone(), hits);
-                return;
-            }
-        }
+        // A file row's pane is drawn by `render_row_pane`; one whose row has gone draws
+        // nothing until the selection is reconciled.
+        Some(Selection::Row(..)) => {}
     }
-    for (i, line) in lines.iter().take(area.height as usize).enumerate() {
+    lines
+}
+
+/// A file row's pane: the header with its controls, the root's other notices, then the
+/// body. Unchanged by Phase 14 G: the drag region here is the hunk lines alone, published
+/// by `render_hunks`.
+fn render_row_pane(
+    app: &App,
+    buf: &mut Buffer,
+    area: Rect,
+    view: &RootView,
+    row: &Row,
+    path: &[u8],
+    hits: &mut HitMap,
+) {
+    let mut lines: Vec<Line> = Vec::new();
+    let control = format!("[{} accept file]", control_key(app, "accept_file"));
+    let restore = format!("[{} restore file]", control_key(app, "restore_file"));
+    // The header is built knowing what will be right-aligned after it, so the
+    // flag marker takes the leftover and not the controls' room.
+    let used = row_header(row, 0).width();
+    let mut header = row_header(
+        row,
+        marker_budget(area.width, used, &[control.as_str(), restore.as_str()]),
+    );
+    // Two controls here, not three: `[m flag]` is a hunk control, and the nav's
+    // own `m` (which flags the file) has no header line to hang off.
+    let at = right_align_run(
+        &mut header,
+        &[control.as_str(), restore.as_str()],
+        area.width,
+        dim(),
+    );
+    let (at_accept, at_restore) = (at[0], at[1]);
+    if let Some(x) = at_accept {
+        hits.targets.push((
+            Rect::new(area.x + x, area.y, control.width() as u16, 1),
+            Target::FileAccept,
+        ));
+    }
+    if let Some(x) = at_restore {
+        hits.targets.push((
+            Rect::new(area.x + x, area.y, restore.width() as u16, 1),
+            Target::FileRestore,
+        ));
+    }
+    lines.push(header);
+    // The row's own `<path>: …` notice is the body of an unreadable row, so the
+    // dimmed list above it carries only the root's other notices.
+    let own = format!("{}: ", row.path_lossy());
+    let others: Vec<String> = view
+        .notices()
+        .iter()
+        .filter(|n| !n.starts_with(&own))
+        .cloned()
+        .collect();
+    push_notices(&mut lines, &others);
+    // Header and notices are bounded by the pane: a root with more notices than
+    // rows must not write past the buffer.
+    let fixed = lines.len().min(area.height as usize);
+    for (i, line) in lines.iter().take(fixed).enumerate() {
         buf.set_line(area.x, area.y + i as u16, line, area.width);
     }
+    let rest = Rect::new(
+        area.x,
+        area.y + fixed as u16,
+        area.width,
+        area.height - fixed as u16,
+    );
+    render_row_body(app, buf, rest, view, row, path, hits);
 }
 
 /// `editing <path> · line <n>/<total> · ^S save   Esc close` — the header row while the
@@ -3268,7 +3319,8 @@ mod tests {
 
     /// Amendment v1.11, deliverable 5. The welcome card shows itself once and then writes a
     /// marker; the only way back to it is the flag, and the one place a reader looks
-    /// something up is this overlay. The row is narrower than `SELECT_NOTE`, so it costs
+    /// something up is this overlay. The row is narrower than either newline note, which
+    /// sits in the same footer (Phase 14 G made `SELECT_NOTE` the narrowest), so it costs
     /// the box no width — that is what keeps it from pushing the table into a clip.
     #[test]
     fn render_help_says_how_to_see_the_welcome_again() {
@@ -3278,10 +3330,12 @@ mod tests {
             let (frame, _) = frame_of(&app, w, h);
             assert!(frame.contains(TOUR_NOTE), "{w}x{h}:\n{frame}");
         }
-        assert!(
-            TOUR_NOTE.width() <= SELECT_NOTE.width(),
-            "the row would widen the overlay"
-        );
+        for enhanced in [false, true] {
+            assert!(
+                TOUR_NOTE.width() <= newline_note(enhanced).width(),
+                "the row would widen the overlay"
+            );
+        }
     }
 
     /// Ruling P9 in the one place a reviewer looks a key up: the overlay names `⇧⏎` only
@@ -3647,18 +3701,21 @@ mod tests {
         );
         // What the line says depends on the selection: a root row trades
         // `a accept hunk  A accept file` for `A accept all in <root>`. Verifier (b) F4: it
-        // also carries no hunks, so with the diff focused it is offered neither `n/p hunk`
-        // nor the diff pane's `v select  y copy` — at any width, since a hint that answers
-        // nothing is not a hint the line is short of.
+        // also carries no hunks, so with the diff focused it is not offered `n/p hunk` —
+        // at any width, since a hint that answers nothing is not a hint the line is short
+        // of. Phase 14 G: its pane has lines to select, so `v select  y copy` are offered.
         let mut at_root = app.clone();
         at_root.select(Some(Selection::Root(root("alpha"))));
-        for hint in ["n/p hunk", "v select", "y copy"] {
-            assert!(
-                !hints(&at_root, 200).contains(hint),
-                "`{hint}` on a root row: {}",
-                hints(&at_root, 200)
-            );
-        }
+        assert!(
+            !hints(&at_root, 200).contains("n/p hunk"),
+            "`n/p hunk` on a root row: {}",
+            hints(&at_root, 200)
+        );
+        assert!(
+            hints(&at_root, 200).contains("v select  y copy"),
+            "{}",
+            hints(&at_root, 200)
+        );
         assert!(
             hints(&at_root, 200).contains("A accept all in alpha"),
             "{}",
@@ -3737,7 +3794,8 @@ mod tests {
             hints(&at_file, 200)
         );
 
-        // `v`/`y` on a hunkless file with the diff focused: there is no line to select.
+        // `v`/`y` where the pane has no line to select: a hunkless file with the diff
+        // focused (Phase 14 G: the gate is `selectable_lines`, the reducer's own count).
         let mut collapsed = three_roots();
         collapsed.handle(Action::Resize(100, 30));
         collapsed.apply(pile_event_seq("alpha", 1, alpha_collapsed(Collapsed::Glob)));
@@ -3745,6 +3803,7 @@ mod tests {
         collapsed.handle(Action::Open);
         assert_eq!(collapsed.effective_focus(), Focus::Diff);
         assert!(collapsed.view_hunks().is_empty());
+        assert_eq!(collapsed.selectable_lines(), 0);
         assert_eq!(collapsed.clone().handle(Action::Select).0, Changed::No);
         for hint in ["v select", "y copy"] {
             assert!(
@@ -3762,6 +3821,41 @@ mod tests {
             "{}",
             hints(&with_hunks, 200)
         );
+        // …and a file row whose row has gone (the selection not yet reconciled) draws
+        // an empty pane: nothing to select, so neither hint.
+        let mut gone = with_hunks.clone();
+        gone.select(Some(row("alpha", "no-such-file")));
+        gone.focus = Focus::Diff;
+        assert_eq!(gone.selectable_lines(), 0);
+        assert_eq!(gone.clone().handle(Action::Select).0, Changed::No);
+        for hint in ["v select", "y copy"] {
+            assert!(!hints(&gone, 200).contains(hint), "{}", hints(&gone, 200));
+        }
+        // Phase 14 G: the converse on every pane built from lines. A repository row, a
+        // group, and the all-clean pane with nothing selected all have lines, so the pair
+        // is offered with the diff focused, and `v` answers.
+        let mut root_row = three_roots();
+        root_row.handle(Action::Resize(100, 30));
+        root_row.select(Some(Selection::Root(root("alpha"))));
+        let mut group = three_roots();
+        group.handle(Action::Resize(100, 30));
+        group.select(Some(Selection::Group(
+            root("beta"),
+            lastcall_engine::scan::GroupKind::Upstream,
+        )));
+        let mut none = clean.clone();
+        none.handle(Action::Resize(100, 30));
+        none.select(None);
+        for (name, mut app) in [("root", root_row), ("group", group), ("none", none)] {
+            app.focus = Focus::Diff;
+            assert!(app.selectable_lines() > 0, "{name}");
+            assert!(
+                hints(&app, 200).contains("v select  y copy"),
+                "{name}: {}",
+                hints(&app, 200)
+            );
+            assert_eq!(app.handle(Action::Select).0, Changed::Yes, "{name}");
+        }
     }
 
     /// Verifier (b) F5: `any key closes` is on the overlay at **every** height it draws at,
@@ -5232,6 +5326,36 @@ mod tests {
         }
     }
 
+    /// Deliverable G: a selection on a repository's pane is the same full-width band a
+    /// diff selection is, over exactly the selected lines.
+    #[test]
+    fn render_a_repository_pane_selection_is_a_full_width_band() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.select(Some(Selection::Root(root("alpha"))));
+        app.handle(Action::FocusToggle);
+        app.press_line = Some(1);
+        app.handle(Action::SelectTo(2));
+        assert_eq!(app.sel.map(|s| s.range()), Some((1, 2)));
+        let (buf, hits) = drawn(&app, 100, 30);
+        let body = hits.diff_body.expect("the pane's rectangle");
+        assert_eq!(row_text(&buf, body, body.y + 1).trim_end(), "~/W/alpha");
+        for y in [body.y + 1, body.y + 2] {
+            for x in body.x..body.right() {
+                assert!(
+                    buf[(x, y)].modifier.contains(Modifier::REVERSED),
+                    "({x}, {y}) is outside the band"
+                );
+            }
+        }
+        for y in [body.y, body.y + 3] {
+            assert!(
+                !buf[(body.x, y)].modifier.contains(Modifier::REVERSED),
+                "row {y} is not selected"
+            );
+        }
+    }
+
     /// The header's own row still carries its controls, with a wrapped line underneath.
     #[test]
     fn render_wrap_a_header_keeps_its_controls_over_a_wrapped_line() {
@@ -5783,6 +5907,57 @@ mod tests {
                     .map(|g| g.paths)
                     .unwrap_or_default();
                 prop_assert_eq!(&status_seen, &seen);
+            });
+        }
+
+        /// Deliverable G, the honest rule: on every pane built from lines (nothing
+        /// selected, a repository, its seen group open or closed, its upstream group), at
+        /// any width, each line the renderer draws is the line `pane_lines` answers, and a
+        /// copy of any range is those lines, one newline each.
+        #[test]
+        fn render_every_line_pane_copies_what_it_draws() {
+            proptest!(config(), |(
+                p in any_pile(),
+                which in 0u8..5,
+                w in 60u16..160,
+                a in 0usize..40,
+                b in 0usize..40,
+            )| {
+                let mut app = App::new();
+                app.sync_roots(vec![meta("alpha")]);
+                app.apply(pile_event("alpha", p));
+                app.handle(Action::Resize(w, 40));
+                let selection = match which {
+                    0 => None,
+                    1 => Some(Selection::Root(root("alpha"))),
+                    2 | 3 => Some(Selection::Group(root("alpha"), GroupKind::Seen)),
+                    _ => Some(Selection::Group(root("alpha"), GroupKind::Upstream)),
+                };
+                app.select(selection.clone());
+                if which == 3 {
+                    app.handle(Action::Expand);
+                }
+                if app.selection != selection {
+                    // A group this pile has none of: nothing to draw a pane for.
+                    return Ok(());
+                }
+                let (buf, hits) = drawn(&app, w, 40);
+                let body = hits.diff_body.expect("the pane's rectangle");
+                app.measured_diff_body(Some((body.width, body.height)));
+                let lines = app.pane_lines();
+                let n = lines.len().min(usize::from(body.height));
+                prop_assert_eq!(hits.diff_rows.len(), n);
+                prop_assert_eq!(app.selectable_lines(), n);
+                for (i, line) in lines.iter().take(n).enumerate() {
+                    let row = row_text(&buf, body, body.y + i as u16);
+                    prop_assert_eq!(row.trim_end(), line.as_str(), "row {}", i);
+                }
+                prop_assume!(n > 0);
+                let (a, b) = (a % n, b % n);
+                app.sel = Some(crate::tui::app::Sel { anchor: a, cursor: b });
+                let (lo, hi) = (a.min(b), a.max(b));
+                let want: String = lines[lo..=hi].iter().map(|l| format!("{l}\n")).collect();
+                prop_assert_eq!(app.copy_payload(), Some(want.into_bytes()));
             });
         }
     }

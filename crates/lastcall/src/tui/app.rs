@@ -1842,6 +1842,44 @@ impl App {
         }
     }
 
+    /// Whether the right pane is a file row's (its hunks are what a selection indexes) or
+    /// one of the panes built from lines (Phase 14 G).
+    fn row_pane(&self) -> bool {
+        matches!(self.selection, Some(Selection::Row(..)))
+    }
+
+    /// The text of the right pane when it is not a file row's: the lines
+    /// [`render::main_pane_lines`] builds, each flattened to its spans' text with the
+    /// trailing blanks trimmed, laid out at the width the last frame measured (else the
+    /// `diff_cols` fallback). Copied = drawn whenever that frame was drawn at this width,
+    /// the contract [`Self::move_sel_cursor`] already lives with. Empty for a file row.
+    ///
+    /// Rebuilt on every call, so once per motion event of a drag; nothing is cached.
+    pub fn pane_lines(&self) -> Vec<String> {
+        super::render::main_pane_lines(self, self.diff_body_size().0)
+            .iter()
+            .map(|line| {
+                let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                text.trim_end().to_owned()
+            })
+            .collect()
+    }
+
+    /// How many lines a selection may cover in the right pane (Phase 14 G): the diff
+    /// lines for a file row, as before; for any other pane its lines, but never more than
+    /// the pane's rows, because nothing scrolls there and the keyboard must not select a
+    /// line the mouse cannot reach (design review F13). Zero means `v`, `y` and their
+    /// hints answer nothing.
+    pub fn selectable_lines(&self) -> usize {
+        if self.row_pane() {
+            diff_lines(self.view_hunks())
+        } else {
+            self.pane_lines()
+                .len()
+                .min(usize::from(self.diff_body_size().1))
+        }
+    }
+
     /// Whether a row can be expanded at all: collapsed, and not by being binary.
     fn expandable(row: &Row) -> bool {
         matches!(row.collapsed, Some(Collapsed::Glob) | Some(Collapsed::Size))
@@ -2937,7 +2975,12 @@ impl App {
     /// this after every draw.
     pub(super) fn measured_diff_body(&mut self, size: Option<(u16, u16)>) {
         self.diff_size = size;
-        if let Some((_, rows)) = size {
+        // Phase 14 G: a pane built from lines reports the whole pane, which says nothing
+        // about what a file's header and notices take off the top of its body, so the
+        // shortfall is the last file frame's still.
+        if let Some((_, rows)) = size
+            && self.row_pane()
+        {
             self.diff_short = self.plain_body_rows().saturating_sub(rows);
         }
     }
@@ -4028,11 +4071,22 @@ impl App {
         if self.selection == next {
             return Changed::No;
         }
+        // Phase 14 G: the measure a pane built from lines reported is the whole pane, one
+        // row taller than a file's body at the least; the next file must lay out against
+        // the fallback until its own frame reports, which errs short, never tall.
+        if !self.row_pane() {
+            self.diff_size = None;
+        }
         self.selection = next;
         self.diff = DiffCursor::default();
         // A selection is a range of *this* row's diff lines; the moment the row changes the
         // range means nothing, so it goes rather than pointing at another file's text.
         self.sel = None;
+        // …and a drag in progress ends with it (Phase 14 G, design review F3): the lines
+        // under the pointer are another pane's now, so the next `Drag` selects nothing and
+        // the release copies nothing.
+        self.press_line = None;
+        self.drag_moved = false;
         self.drop_stale_expansion();
         Changed::Yes
     }
@@ -4178,7 +4232,7 @@ impl App {
     /// move of the whole diff's length and not a second scroll path. While a selection is
     /// running it moves the selection's far end instead, exactly as the page keys do.
     fn jump_diff_end(&mut self, down: bool) -> Changed {
-        let span = diff_lines(self.view_hunks()) as isize;
+        let span = self.selectable_lines() as isize;
         let delta = if down { span } else { -span };
         if self.sel.is_some() {
             // A jump is asked for by name and passes what is between, with a selection as
@@ -4304,10 +4358,19 @@ impl App {
         let Some(sel) = self.sel else {
             return Changed::No;
         };
-        let max = diff_lines(self.view_hunks()).saturating_sub(1) as isize;
+        let max = self.selectable_lines().saturating_sub(1) as isize;
         let mut next = (sel.cursor as isize + delta).clamp(0, max) as usize;
         if next == sel.cursor {
             return Changed::No;
+        }
+        // Phase 14 G (design review F2): a pane built from lines does not scroll, so the
+        // far end moves and nothing else does.
+        if !self.row_pane() {
+            self.sel = Some(Sel {
+                cursor: next,
+                ..sel
+            });
+            return Changed::Yes;
         }
         // Phase 13: "on screen" is a statement about rows, and a line can be several of
         // them, so the smallest scroll that keeps the moving end **whole** comes from the
@@ -4386,10 +4449,14 @@ impl App {
     /// *is* [`DiffCursor::scroll`], the first visible line — so `v j j y` copies three
     /// lines, which is the sequence the kickoff names.
     fn start_selection(&mut self) -> Changed {
-        if self.selected_row().is_none() || self.view_hunks().is_empty() {
+        // Phase 14 G: any pane with a line to select, a repository's or a group's too; a
+        // file row still needs its row and a hunk.
+        let lines = self.selectable_lines();
+        if lines == 0 || (self.row_pane() && self.selected_row().is_none()) {
             return Changed::No;
         }
-        let at = self.diff.scroll;
+        // Only a file's diff scrolls; every other pane's top line is its first.
+        let at = self.diff.scroll.min(lines - 1);
         let next = Sel {
             anchor: self.sel.map_or(at, |s| s.anchor),
             cursor: at,
@@ -4402,8 +4469,26 @@ impl App {
     }
 
     /// The bytes `y` would put on the clipboard: the selection's lines, or — with no
-    /// selection — the hunk under the cursor whole, header included.
+    /// selection — the hunk under the cursor whole, header included. On a pane that is not
+    /// a file row's, the selected pane lines, or with no selection all it drew.
     pub fn copy_payload(&self) -> Option<Vec<u8>> {
+        // Phase 14 G: a pane built from lines copies the selected lines as drawn, or with
+        // no selection the whole pane (what it drew: the keyboard reaches no further than
+        // the mouse), each with its newline.
+        if !self.row_pane() {
+            let lines = self.pane_lines();
+            let last = lines
+                .len()
+                .min(usize::from(self.diff_body_size().1))
+                .checked_sub(1)?;
+            let (a, b) = self.sel.map_or((0, last), |s| s.range());
+            let mut out = String::new();
+            for line in &lines[a.min(last)..=b.min(last)] {
+                out.push_str(line);
+                out.push('\n');
+            }
+            return Some(out.into_bytes());
+        }
         let hunks = self.view_hunks();
         if hunks.is_empty() {
             return None;
@@ -4583,7 +4668,7 @@ impl App {
             // divider is still a divider drag (design review F13).
             SelectTo(line) => match self.press_line {
                 Some(anchor) => {
-                    let last = diff_lines(self.view_hunks()).saturating_sub(1);
+                    let last = self.selectable_lines().saturating_sub(1);
                     let cursor = line.min(last);
                     let next = Sel {
                         anchor: anchor.min(last),
@@ -11153,6 +11238,188 @@ mod tests {
         let sel = app.sel;
         app.handle(Action::Copy);
         assert_eq!(app.sel, sel, "still there to shrink");
+    }
+
+    // ---- Phase 14 G: the drag copies every text in the right pane ------------------------
+
+    /// alpha's repository row selected and the right pane focused, as a click on the pane
+    /// leaves it. Its pane is five lines: the name, the path, and the three rows.
+    fn root_pane() -> App {
+        let mut app = three_roots();
+        app.select(Some(Selection::Root(root("alpha"))));
+        app.handle(Action::FocusToggle);
+        assert_eq!(app.effective_focus(), Focus::Diff);
+        app
+    }
+
+    /// alpha's pane, line by line, as the renderer draws it at any width the fixture fits.
+    const ALPHA_PANE: &str = "alpha  main · 3 files\n~/W/alpha\n  M f1  +1 −1\n  M f2  +1 −0\n  M src/parse.rs  +10 −2\n";
+
+    /// The sponsor's case: a drag over a repository's pane copies its name and its path,
+    /// home written `~` as the pane draws it.
+    #[test]
+    fn app_drag_on_a_root_pane_copies_the_name_and_the_path() {
+        let mut app = root_pane();
+        app.press_line = Some(0);
+        assert_eq!(app.handle(Action::SelectTo(1)).0, Changed::Yes);
+        assert!(app.drag_moved);
+        assert_eq!(
+            app.sel,
+            Some(Sel {
+                anchor: 0,
+                cursor: 1
+            })
+        );
+        let (changed, effect) = app.handle(Action::Release);
+        assert_eq!(changed, Changed::Yes);
+        assert_eq!(copied(effect), "alpha  main · 3 files\n~/W/alpha\n");
+        assert_eq!(app.sel, None, "a copy clears the selection");
+        assert_eq!(app.cue.as_ref().map(|c| c.text.as_str()), Some(COPIED));
+    }
+
+    /// Design review F2 and F13: the mouse and the keyboard stop at the pane's last line.
+    #[test]
+    fn app_root_pane_selection_clamps_to_the_pane_lines() {
+        let mut app = root_pane();
+        // A drag past the last line stops at it.
+        app.press_line = Some(3);
+        app.handle(Action::SelectTo(999));
+        assert_eq!(
+            app.sel,
+            Some(Sel {
+                anchor: 3,
+                cursor: 4
+            })
+        );
+        app.handle(Action::Back);
+        assert_eq!(app.sel, None);
+        // `v` anchors at the top line, `↓` extends it, and `y` copies what is selected.
+        assert_eq!(app.handle(Action::Select), (Changed::Yes, None));
+        assert_eq!(app.handle(Action::NavDown).0, Changed::Yes);
+        assert_eq!(
+            copied(app.handle(Action::Copy).1),
+            "alpha  main · 3 files\n~/W/alpha\n"
+        );
+        // `↓` past the end stays on the last line.
+        app.handle(Action::Select);
+        for _ in 0..4 {
+            assert_eq!(app.handle(Action::NavDown).0, Changed::Yes);
+        }
+        assert_eq!(app.handle(Action::NavDown), (Changed::No, None));
+        assert_eq!(app.handle(Action::NavPageDown), (Changed::No, None));
+        assert_eq!(
+            app.sel,
+            Some(Sel {
+                anchor: 0,
+                cursor: 4
+            })
+        );
+        assert_eq!(app.diff.scroll, 0, "nothing scrolls in this pane");
+        assert_eq!(copied(app.handle(Action::Copy).1), ALPHA_PANE);
+    }
+
+    /// Design review F12: `y` with nothing selected copies the whole pane, and a pane over
+    /// the cap is refused with the diff's own words, the selection left alone.
+    #[test]
+    fn app_y_on_a_root_pane_copies_it_whole_and_refuses_over_the_cap() {
+        let mut app = root_pane();
+        assert_eq!(copied(app.handle(Action::Copy).1), ALPHA_PANE);
+
+        let mut big = rows_n(1000, 0, 0);
+        for (i, r) in big.rows.iter_mut().enumerate() {
+            r.path = format!("{}/{i:04}.rs", "d".repeat(40)).into_bytes();
+        }
+        let mut app = three_roots();
+        app.handle(Action::Resize(200, 1100));
+        app.apply(pile_event("alpha", big));
+        app.select(Some(Selection::Root(root("alpha"))));
+        app.handle(Action::FocusToggle);
+        let payload = app.copy_payload().expect("a payload to refuse");
+        assert!(payload.len() > super::super::clipboard::CAP);
+        let (changed, effect) = app.handle(Action::Copy);
+        assert_eq!(changed, Changed::Yes);
+        assert_eq!(effect, None, "nothing is written over the cap");
+        assert_eq!(app.cue, None);
+        assert!(
+            app.status
+                .as_ref()
+                .is_some_and(|s| s.text.starts_with("selection too large to copy (")),
+            "{:?}",
+            app.status
+        );
+    }
+
+    /// A group's pane copies its file lines: the seen group's with the branch column it
+    /// draws, the upstream group's as bare paths.
+    #[test]
+    fn app_group_panes_copy_their_path_lines() {
+        let mut app = seen_app();
+        app.select(Some(seen_group()));
+        app.handle(Action::FocusToggle);
+        app.press_line = Some(1);
+        app.handle(Action::SelectTo(3));
+        assert_eq!(
+            copied(app.handle(Action::Release).1),
+            "  s1  run-1\n  s2  run-1\n  s3  run-1\n"
+        );
+
+        let mut app = three_roots();
+        app.select(Some(Selection::Group(root("beta"), GroupKind::Upstream)));
+        app.handle(Action::FocusToggle);
+        app.press_line = Some(0);
+        app.handle(Action::SelectTo(1));
+        assert_eq!(
+            copied(app.handle(Action::Release).1),
+            "[upstream] 1 file\n  u1\n"
+        );
+    }
+
+    /// Design review F3: a selection that moves in the middle of a drag ends the gesture,
+    /// so the next `Drag` selects nothing and the release copies nothing.
+    #[test]
+    fn app_a_selection_change_mid_drag_ends_the_gesture() {
+        // On a file's diff, the pane the gesture always had.
+        let mut app = diff_at_f1();
+        app.press_line = Some(1);
+        app.handle(Action::SelectTo(2));
+        assert!(app.sel.is_some());
+        app.select(Some(row("alpha", "f2")));
+        assert_eq!(app.press_line, None);
+        assert!(!app.drag_moved);
+        assert_eq!(app.handle(Action::SelectTo(3)), (Changed::No, None));
+        assert_eq!(app.sel, None);
+        assert_eq!(app.handle(Action::Release), (Changed::No, None));
+
+        // And on a repository's pane.
+        let mut app = root_pane();
+        app.press_line = Some(0);
+        app.handle(Action::SelectTo(1));
+        app.select(Some(Selection::Root(root("beta"))));
+        assert_eq!(app.handle(Action::SelectTo(1)), (Changed::No, None));
+        assert_eq!(app.sel, None);
+        assert_eq!(app.handle(Action::Release), (Changed::No, None));
+
+        // The same selection is not a change, and the gesture carries on.
+        let mut app = root_pane();
+        app.press_line = Some(0);
+        app.handle(Action::SelectTo(1));
+        app.select(Some(Selection::Root(root("alpha"))));
+        assert_eq!(app.press_line, Some(0));
+        assert!(app.drag_moved);
+    }
+
+    /// Design review F6: a hunkless row's body is not selectable, so `v` is refused there
+    /// as it always was.
+    #[test]
+    fn app_a_hunkless_row_body_is_not_selectable() {
+        let mut app = three_roots();
+        app.apply(pile_event("alpha", alpha_collapsed(Collapsed::Glob)));
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Open);
+        assert_eq!(app.effective_focus(), Focus::Diff);
+        assert_eq!(app.selectable_lines(), 0);
+        assert_eq!(app.handle(Action::Select), (Changed::No, None));
+        assert_eq!(app.handle(Action::Copy), (Changed::No, None));
     }
 
     // ---- deliverable 2: undo ---------------------------------------------------------------
