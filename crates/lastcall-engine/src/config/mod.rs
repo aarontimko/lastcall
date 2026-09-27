@@ -1456,6 +1456,43 @@ nav_down = ["down", "j", "ctrl-n"]
         assert_eq!(toml::from_str::<Config>(&text).unwrap(), c);
     }
 
+    /// Phase 14 I: the new names parse, validate and survive a round trip through TOML
+    /// and JSON under the new names, and neither old name is written back.
+    #[test]
+    fn config_the_renamed_keys_parse_and_round_trip() {
+        let dir = TempDir::new("lc-config");
+        let (env, _) = env_with_config(
+            &dir,
+            "include_gitignored = [\"z_ignore_*\"]\nwatch_ignore_globs = [\"build/**\"]\n",
+        );
+        let c = load(&env).unwrap().config;
+        assert_eq!(c.include_gitignored, vec!["z_ignore_*"]);
+        assert_eq!(c.watch_ignore_globs, vec!["build/**"]);
+        let text = toml::to_string_pretty(&c).unwrap();
+        assert!(
+            text.contains("include_gitignored = [\"z_ignore_*\"]"),
+            "{text}"
+        );
+        assert!(
+            text.contains("watch_ignore_globs = [\"build/**\"]"),
+            "{text}"
+        );
+        assert!(!text.contains("review_ignored"), "{text}");
+        assert!(
+            !text.lines().any(|l| l.starts_with("ignore_globs")),
+            "{text}"
+        );
+        assert_eq!(toml::from_str::<Config>(&text).unwrap(), c);
+        let json = serde_json::to_value(&c).unwrap();
+        assert_eq!(
+            json["include_gitignored"],
+            serde_json::json!(["z_ignore_*"])
+        );
+        assert_eq!(json["watch_ignore_globs"], serde_json::json!(["build/**"]));
+        assert!(json.get("review_ignored").is_none(), "{json}");
+        assert!(json.get("ignore_globs").is_none(), "{json}");
+    }
+
     #[test]
     fn config_parse_error_reports_line() {
         let dir = TempDir::new("lc-config");
