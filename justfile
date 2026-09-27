@@ -63,7 +63,7 @@ test-e2e:
     cargo test --workspace --test 'test_e2e_*'
 
 # What the pre-push hook runs (`just hooks-install`): the integration tier, then every
-# proptest at 64 cases — the store-backed ones in ops::tests::proptests and the text
+# proptest at 64 cases: the store-backed ones in ops::tests::proptests and the text
 # buffer's round trip in tui::textbuf (Phase 8). The unit tier runs them at 8 so every
 # commit stays fast. Run it by hand before a push from a machine without the hook. Each
 # step says what it is doing; the first failure stops the push.
@@ -257,7 +257,7 @@ hooks-install:
 # and prints what it would send.
 #
 #   a change:   push the branch, open its pull request  ->  just merge
-#   a release:  the same pull request, with `just release-prep 0.7.0` run on its branch
+#   a release:  the same pull request, with `just release-prep 0.4.0` run on its branch
 #               as the last commit  ->  push  ->  just merge  ->  just release-tag
 # ---------------------------------------------------------------------------------------
 
@@ -389,7 +389,7 @@ probe-watch:
 # git config locations are pointed away exactly as `probe-watch` does). The two env lines
 # are printed first so the same screen can be re-run by hand; edit a file under the printed
 # parent from another shell and watch the counts change. `q` quits. The fixture is left in
-# place for that re-run — remove it with the `rm -rf` printed at the end.
+# place for that re-run; remove it with the `rm -rf` printed at the end.
 probe-tui:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -424,7 +424,7 @@ probe-tui-screen:
 # `probe-tui` with the scans stretched: scripts/slowgit/git goes first on PATH and sleeps
 # before the scan-only git calls (SLOWGIT_MS per call, default 800; four per root), with
 # one root slower (SLOWGIT_SLOW_REPO, default alpha; SLOWGIT_SLOW_MS per call, default
-# 2500) — the launch hold's counter and per-root ✓ marks, as a user with hundreds of repos
+# 2500): the launch hold's counter and per-root ✓ marks, as a user with hundreds of repos
 # or a slow disk would see them (docs/dev/tui.md "Seeing the hold slowly"). Discovery,
 # before the screen opens, runs at full speed. `r` (refresh) is stretched the same way.
 probe-tui-slow:
@@ -449,8 +449,8 @@ tryout SCENARIO="list" *ARGS:
     python3 scripts/tryout.py {{quote(SCENARIO)}} {{ARGS}}
 
 # The performance baseline (docs/dev/bench.md; not a gate): the four scenarios of
-# crates/lastcall/tests/test_bench.rs — 100 clones / 4,000 rows, one 100,000-line diff, a
-# 1,000-file burst under watch, a 50,000-file drop against the row cap — on the RELEASE
+# crates/lastcall/tests/test_bench.rs (100 clones / 4,000 rows, one 100,000-line diff, a
+# 1,000-file burst under watch, a 50,000-file drop against the row cap) on the RELEASE
 # build only, one `BENCH <scenario> <metric>=<value>` stderr line per metric. Fixtures are
 # built outside the timed regions under temp dirs the test removes; about four minutes.
 bench:

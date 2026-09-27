@@ -28,7 +28,7 @@ just snapshots-update       # rewrite the TUI snapshots, then prove they pass; r
 just test-prepush           # what the pre-push hook runs: integration tier + 64-case proptests
 just hooks-install          # pre-commit = just lint && just test-unit; pre-push = just test-prepush
 just install-smoke          # docs/install.md's steps, executed in a container (Docker; exits 2 without it)
-just release-prep 0.4.0     # the release branch and its one five-file commit; pushes nothing
+just release-prep 0.4.0     # the bump, as the last commit on the branch whose PR carries it; pushes nothing
 ```
 
 Probes against the built binary: `just probe-config`, `just probe-hello`, `just probe-status`,
@@ -39,7 +39,7 @@ Probes against the built binary: `just probe-config`, `just probe-hello`, `just 
 Crates: `crates/lastcall-engine` (library: config, herdr client; the review engine from
 Phase 2; no terminal code), `crates/lastcall` (the binary and the Ratatui TUI under
 `src/tui/`), `crates/lastcall-testkit` (test-only: mock herdr, PTY spawner, fixture repos,
-the TUI PTY harness — dev-dependency only).
+the TUI PTY harness; dev-dependency only).
 
 Rules that are enforced by grep or test: no `deny_unknown_fields` on herdr-facing types
 (`crates/lastcall-engine/src/herdr`), `deny_unknown_fields` required on config types;
@@ -51,7 +51,7 @@ Rules that are enforced by grep or test: no `deny_unknown_fields` on herdr-facin
 
 The stamped spec (v1.0). §5 (the herdr surface) and §6 (our contracts) are **frozen**: do not
 edit them; implement additive/no-op-when-absent and propose an amendment in the PR. Read §2
-(invariants — events are hints, snapshots are truth), §8 (the phase gates), §10 (rulings).
+(invariants: events are hints, snapshots are truth), §8 (the phase gates), §10 (rulings).
 
 ### Scenario plan: `docs/spec/01-scenarios.md`
 
@@ -92,7 +92,7 @@ before touching `crates/lastcall/src/tui/` or either e2e test.
 
 ### Testing: `docs/dev/testing.md`
 
-Tiers, file naming, how skips are reported, and the isolation rules — including the sacred
+Tiers, file naming, how skips are reported, and the isolation rules, including the sacred
 one: tests never touch the real herdr config or socket.
 
 ### The user documentation: `docs/install.md`, `docs/config.md`, `docs/review-loop.md`, `docs/herdr.md`
@@ -104,7 +104,7 @@ one screen per step from the `just probe-tui` fixture (`review-loop.md`); what t
 adds, session discovery and the agent picker (`herdr.md`). Read the relevant page before
 changing anything a user can see, and update it in the same commit. **House style for all
 four, plus the README and `CHANGELOG.md`:** no em-dashes (commas, colons or a new sentence),
-no email addresses, no home paths, and none of the program's own process vocabulary — that
+no email addresses, no home paths, and none of the program's own process vocabulary, which
 stays in `docs/spec` and `docs/dev`.
 
 ### The install smoke check: `just install-smoke`
@@ -126,12 +126,14 @@ that; nothing in it is needed to build or test.
 
 ### Operating the released project: `docs/dev/operations.md`
 
-The standing handoff written when the last gate closed: how a release is cut (hand tags,
-the crate version equal to the tag), the weekly jobs and what to do when each goes red,
-the invariants that must not drift, what is deferred, and where the evidence for every
-gate lives. Read it before cutting a release or answering a Dependabot, compat or scan
-result. `just merge` and `just release-tag` merge and tag, so they are the maintainer's and
-refuse inside an agent's shell; `just release-prep` is the half an agent may run.
+The standing handoff written when the last gate closed: how a release is cut (one pull
+request whose branch ends with the `just release-prep` commit, the tag on its merge commit
+and only there, the crate version equal to the tag, the release's record ticked by the next
+pull request), the weekly jobs and what to do when each goes red, the invariants that must
+not drift, what is deferred, and where the evidence for every gate lives. Read it before
+cutting a release or answering a Dependabot, compat or scan result. `just merge` and
+`just release-tag` merge and tag, so they are the maintainer's and refuse inside an agent's
+shell; `just release-prep` is the half an agent may run.
 
 ### The performance baseline: `docs/dev/bench.md`
 
