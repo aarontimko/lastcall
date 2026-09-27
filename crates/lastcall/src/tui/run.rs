@@ -241,7 +241,7 @@ impl Ui {
                 }
                 Event::Mouse(_) => {
                     return match to_action(event, &self.keymap) {
-                        Some(Action::Press(x, y)) => {
+                        Some(Action::Press(x, y) | Action::ShiftPress(x, y)) => {
                             match self.hits.as_ref().and_then(|h| h.at(x, y)).cloned() {
                                 Some(target) => self.app.hit(target),
                                 None => (Changed::No, None),
@@ -330,12 +330,14 @@ impl Ui {
                 }
                 Event::Mouse(_) => {
                     return match to_action(event, &self.keymap) {
-                        Some(Action::Press(x, y)) => match self.editor_text_at(x, y) {
-                            Some((dy, dx)) => {
-                                self.app.handle(Action::Editor(EditorKey::Click(dy, dx)))
+                        Some(Action::Press(x, y) | Action::ShiftPress(x, y)) => {
+                            match self.editor_text_at(x, y) {
+                                Some((dy, dx)) => {
+                                    self.app.handle(Action::Editor(EditorKey::Click(dy, dx)))
+                                }
+                                None => (Changed::No, None),
                             }
-                            None => (Changed::No, None),
-                        },
+                        }
                         Some(Action::ScrollUp(n)) => self
                             .app
                             .handle(Action::Editor(EditorKey::Scroll(-(n as i32)))),
@@ -359,7 +361,7 @@ impl Ui {
                 self.hits = None;
                 self.app.handle(action)
             }
-            Action::Press(x, y) => {
+            Action::Press(x, y) | Action::ShiftPress(x, y) => {
                 // Deliverable 9: the anchor is taken from the frame the user pressed on,
                 // **before** `hit` runs — a press on a hunk header moves the diff cursor,
                 // and an anchor read after that would be the header's new scroll rather
@@ -369,7 +371,11 @@ impl Ui {
                 self.app.press_line = self.diff_line_at(x, y);
                 self.app.drag_moved = false;
                 self.app.sel = None;
+                // A shifted press resolves through the same map; `shift_hit` extends a run
+                // of rows on a file row and is a plain press anywhere else.
+                let shifted = matches!(action, Action::ShiftPress(..));
                 match self.hits.as_ref().and_then(|h| h.at(x, y)).cloned() {
+                    Some(target) if shifted => self.app.shift_hit(target),
                     Some(target) => self.app.hit(target),
                     None => (Changed::No, None),
                 }
@@ -2488,12 +2494,12 @@ mod tests {
         }
     }
 
-    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> Event {
+    fn mouse(kind: MouseEventKind, column: u16, row: u16, modifiers: KeyModifiers) -> Event {
         Event::Mouse(MouseEvent {
             kind,
             column,
             row,
-            modifiers: KeyModifiers::NONE,
+            modifiers,
         })
     }
 
@@ -2669,7 +2675,12 @@ mod tests {
         wires.input_tx.send(key(KeyCode::PageDown)).unwrap();
         wires
             .input_tx
-            .send(mouse(MouseEventKind::Down(MouseButton::Left), x, y))
+            .send(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                x,
+                y,
+                KeyModifiers::NONE,
+            ))
             .unwrap();
         let pass = wires.drain_into(&mut ui, (Changed::No, None));
         assert_eq!(pass.changed, Changed::Yes, "the page key moved something");
@@ -2695,10 +2706,119 @@ mod tests {
         wires.input_tx.send(key(KeyCode::PageUp)).unwrap();
         wires
             .input_tx
-            .send(mouse(MouseEventKind::ScrollDown, x, y))
+            .send(mouse(MouseEventKind::ScrollDown, x, y, KeyModifiers::NONE))
             .unwrap();
         let pass = wires.drain_into(&mut ui, (Changed::No, None));
         assert!(pass.held.is_none(), "the wheel is not a press");
+    }
+
+    /// Range selection: a left press with shift held on a file row of the selected row's
+    /// repository extends the run exactly as `shift-j` does, key for click.
+    #[test]
+    fn run_shift_press_on_a_nav_row_equals_the_shift_j_run() {
+        let shift = |c: KeyCode| Event::Key(KeyEvent::new(c, KeyModifiers::SHIFT));
+        let mut by_key = ui();
+        by_key.app.select(Some(row("alpha", "f1")));
+        render_into(&mut by_key);
+        by_key.event(&shift(KeyCode::Char('J')));
+        render_into(&mut by_key);
+        by_key.event(&shift(KeyCode::Char('J')));
+        assert_eq!(by_key.app.selection, Some(row("alpha", "src/parse.rs")));
+        assert!(by_key.app.range.is_some());
+
+        // `App::new` reads the clock; the twins share one reading so only the moves differ.
+        let mut by_arrow = ui();
+        by_arrow.app.now = by_key.app.now;
+        by_arrow.app.select(Some(row("alpha", "f1")));
+        render_into(&mut by_arrow);
+        by_arrow.event(&shift(KeyCode::Down));
+        by_arrow.event(&shift(KeyCode::Down));
+        assert_eq!(by_arrow.app, by_key.app, "shift-down is shift-j");
+
+        let mut by_click = ui();
+        by_click.app.now = by_key.app.now;
+        by_click.app.select(Some(row("alpha", "f1")));
+        render_into(&mut by_click);
+        let (x, y) = target_center(
+            &by_click,
+            &Target::NavRow(root("alpha"), b"src/parse.rs".to_vec()),
+        );
+        let (changed, effect) = by_click.event(&mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            x,
+            y,
+            KeyModifiers::SHIFT,
+        ));
+        assert_eq!((changed, effect), (Changed::Yes, None));
+        assert_eq!(by_click.app, by_key.app);
+    }
+
+    /// Anywhere but a file row of the same repository, a shifted press is a plain one:
+    /// the other repository's row, a repository row, the diff body.
+    #[test]
+    fn run_shift_press_off_the_run_is_a_plain_press() {
+        let targets = [
+            Target::NavRow(root("beta"), b"u1".to_vec()),
+            Target::NavRoot(root("alpha")),
+            Target::DiffBody,
+        ];
+        for target in targets {
+            let mut plain = ui();
+            plain.app.select(Some(row("alpha", "f1")));
+            render_into(&mut plain);
+            let mut shifted = ui();
+            shifted.app.now = plain.app.now;
+            shifted.app.select(Some(row("alpha", "f1")));
+            render_into(&mut shifted);
+            let (x, y) = target_center(&plain, &target);
+            let down = MouseEventKind::Down(MouseButton::Left);
+            let a = plain.event(&mouse(down, x, y, KeyModifiers::NONE));
+            let b = shifted.event(&mouse(down, x, y, KeyModifiers::SHIFT));
+            assert_eq!(a, b, "{target:?}");
+            assert_eq!(plain.app, shifted.app, "{target:?}");
+            assert_eq!(shifted.app.range, None, "{target:?}");
+        }
+    }
+
+    /// A shifted press resolves through the hit map like any press, so it is held behind
+    /// an undrawn change and folded against the frame the user saw.
+    #[test]
+    fn run_drain_holds_a_shift_press_behind_an_undrawn_change() {
+        let mut ui = ui();
+        ui.app.select(Some(row("alpha", "f1")));
+        render_into(&mut ui);
+        let (x, y) = target_center(
+            &ui,
+            &Target::NavRow(root("alpha"), b"src/parse.rs".to_vec()),
+        );
+        let mut wires = Wires::new();
+        // `o` changes the frame and moves nothing.
+        wires.input_tx.send(key(KeyCode::Char('o'))).unwrap();
+        wires
+            .input_tx
+            .send(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                x,
+                y,
+                KeyModifiers::SHIFT,
+            ))
+            .unwrap();
+        let pass = wires.drain_into(&mut ui, (Changed::No, None));
+        assert_eq!(pass.changed, Changed::Yes);
+        let held = pass.held.expect("the shifted press stayed queued");
+        assert!(is_press(&held));
+        assert_eq!(ui.app.range, None, "not folded yet");
+
+        render_into(&mut ui);
+        ui.event(&held);
+        assert_eq!(ui.app.selection, Some(row("alpha", "src/parse.rs")));
+        assert_eq!(
+            ui.app.range_rows(),
+            Some((
+                root("alpha"),
+                vec![b"f1".to_vec(), b"f2".to_vec(), b"src/parse.rs".to_vec()]
+            ))
+        );
     }
 
     /// `Quit` and `Local::Fatal` end the drain where they are: whatever is behind them is
@@ -2968,7 +3088,12 @@ mod tests {
         let beta = Target::NavRoot(root("beta"));
         // Before any render a press hits nothing.
         assert_eq!(
-            ui.event(&mouse(MouseEventKind::Down(MouseButton::Left), 5, 5)),
+            ui.event(&mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                5,
+                5,
+                KeyModifiers::NONE
+            )),
             (Changed::No, None)
         );
         assert_eq!(ui.app.selection, None);
@@ -2976,8 +3101,13 @@ mod tests {
         render_into(&mut ui);
         let (x, y) = target_center(&ui, &beta);
         assert_eq!(
-            ui.event(&mouse(MouseEventKind::Down(MouseButton::Left), x, y))
-                .0,
+            ui.event(&mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                x,
+                y,
+                KeyModifiers::NONE
+            ))
+            .0,
             Changed::Yes
         );
         assert_eq!(ui.app.selection, Some(Selection::Root(root("beta"))));
@@ -2991,7 +3121,8 @@ mod tests {
             ui.event(&mouse(
                 MouseEventKind::Down(MouseButton::Left),
                 alpha.0,
-                alpha.1
+                alpha.1,
+                KeyModifiers::NONE
             )),
             (Changed::No, None)
         );
@@ -2999,7 +3130,12 @@ mod tests {
 
         render_into(&mut ui);
         let (x, y) = target_center(&ui, &Target::NavRoot(root("alpha")));
-        ui.event(&mouse(MouseEventKind::Down(MouseButton::Left), x, y));
+        ui.event(&mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            x,
+            y,
+            KeyModifiers::NONE,
+        ));
         assert_eq!(ui.app.selection, Some(Selection::Root(root("alpha"))));
     }
 
@@ -3020,6 +3156,7 @@ mod tests {
             MouseEventKind::Down(MouseButton::Left),
             body.x + 2,
             body.y + 1,
+            KeyModifiers::NONE,
         );
         ui.event(&press);
         assert_eq!(ui.app.press_line, Some(1), "absolute, not a screen row");
@@ -3028,12 +3165,14 @@ mod tests {
             MouseEventKind::Drag(MouseButton::Left),
             body.x + 2,
             body.y + 3,
+            KeyModifiers::NONE,
         ));
         assert_eq!(ui.app.sel.map(|s| s.range()), Some((1, 3)));
         let (changed, effect) = ui.event(&mouse(
             MouseEventKind::Up(MouseButton::Left),
             body.x + 2,
             body.y + 3,
+            KeyModifiers::NONE,
         ));
         assert_eq!(changed, Changed::Yes);
         assert_eq!(
@@ -3052,6 +3191,7 @@ mod tests {
             MouseEventKind::Up(MouseButton::Left),
             body.x + 2,
             body.y + 1,
+            KeyModifiers::NONE,
         ));
         assert_eq!((changed, effect), (Changed::No, None));
         assert_eq!(ui.app.diff, before);
@@ -3061,14 +3201,29 @@ mod tests {
         // anchor is taken and the drag resizes the nav as it always has.
         render_into(&mut ui);
         let (dx, dy) = target_center(&ui, &Target::Divider);
-        ui.event(&mouse(MouseEventKind::Down(MouseButton::Left), dx, dy));
+        ui.event(&mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            dx,
+            dy,
+            KeyModifiers::NONE,
+        ));
         assert_eq!(ui.app.press_line, None);
         assert!(ui.app.dragging);
         let width = ui.app.nav_width;
-        ui.event(&mouse(MouseEventKind::Drag(MouseButton::Left), dx + 4, dy));
+        ui.event(&mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            dx + 4,
+            dy,
+            KeyModifiers::NONE,
+        ));
         assert_eq!(ui.app.nav_width, width + 4);
         assert!(ui.app.sel.is_none(), "and it selects nothing");
-        ui.event(&mouse(MouseEventKind::Up(MouseButton::Left), dx + 4, dy));
+        ui.event(&mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            dx + 4,
+            dy,
+            KeyModifiers::NONE,
+        ));
         assert!(!ui.app.dragging);
     }
 
@@ -3080,8 +3235,18 @@ mod tests {
         let mut ui = ui();
         render_into(&mut ui);
         let (x, y) = target_center(&ui, &Target::NavRoot(root("alpha")));
-        ui.event(&mouse(MouseEventKind::Down(MouseButton::Left), x, y));
-        ui.event(&mouse(MouseEventKind::Up(MouseButton::Left), x, y));
+        ui.event(&mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            x,
+            y,
+            KeyModifiers::NONE,
+        ));
+        ui.event(&mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            x,
+            y,
+            KeyModifiers::NONE,
+        ));
         assert_eq!(ui.app.selection, Some(Selection::Root(root("alpha"))));
         render_into(&mut ui);
         let body = ui
@@ -3097,18 +3262,21 @@ mod tests {
             MouseEventKind::Down(MouseButton::Left),
             body.x + 2,
             body.y,
+            KeyModifiers::NONE,
         ));
         assert_eq!(ui.app.press_line, Some(0));
         ui.event(&mouse(
             MouseEventKind::Drag(MouseButton::Left),
             body.x + 2,
             body.y + 1,
+            KeyModifiers::NONE,
         ));
         assert_eq!(ui.app.sel.map(|s| s.range()), Some((0, 1)));
         let (changed, effect) = ui.event(&mouse(
             MouseEventKind::Up(MouseButton::Left),
             body.x + 2,
             body.y + 1,
+            KeyModifiers::NONE,
         ));
         assert_eq!(changed, Changed::Yes);
         let Some(Effect::Copy(bytes)) = effect else {
@@ -3141,6 +3309,7 @@ mod tests {
             MouseEventKind::Down(MouseButton::Left),
             body.x + 2,
             body.y + 8,
+            KeyModifiers::NONE,
         ));
         assert_eq!(
             ui.app.press_line,
@@ -3151,12 +3320,14 @@ mod tests {
             MouseEventKind::Drag(MouseButton::Left),
             body.x + 2,
             body.y,
+            KeyModifiers::NONE,
         ));
         assert_eq!(ui.app.sel.map(|s| s.range()), Some((0, 1)));
         let (_, effect) = ui.event(&mouse(
             MouseEventKind::Up(MouseButton::Left),
             body.x + 2,
             body.y,
+            KeyModifiers::NONE,
         ));
         assert_eq!(
             effect,
@@ -3207,19 +3378,21 @@ mod tests {
         // Over the nav the selection moves even though the diff has focus.
         let (x, y) = (nav.x + 1, nav.y + 1);
         assert_eq!(
-            ui.event(&mouse(MouseEventKind::ScrollDown, x, y)).0,
+            ui.event(&mouse(MouseEventKind::ScrollDown, x, y, KeyModifiers::NONE))
+                .0,
             Changed::Yes
         );
         assert_eq!(ui.app.selection, Some(row("alpha", "f2")));
         assert_eq!(ui.app.focus, Focus::Diff, "focus untouched");
-        ui.event(&mouse(MouseEventKind::ScrollUp, x, y));
+        ui.event(&mouse(MouseEventKind::ScrollUp, x, y, KeyModifiers::NONE));
         assert_eq!(ui.app.selection, Some(row("alpha", "f1")));
 
         // Over the diff it scrolls the diff by WHEEL_LINES.
         let (x, y) = (main.x + 1, main.y + 1);
         assert_eq!(ui.app.diff.scroll, 0);
         assert_eq!(
-            ui.event(&mouse(MouseEventKind::ScrollDown, x, y)).0,
+            ui.event(&mouse(MouseEventKind::ScrollDown, x, y, KeyModifiers::NONE))
+                .0,
             Changed::Yes
         );
         assert_eq!(
@@ -3231,12 +3404,17 @@ mod tests {
             Some(row("alpha", "f1")),
             "selection untouched"
         );
-        ui.event(&mouse(MouseEventKind::ScrollUp, x, y));
+        ui.event(&mouse(MouseEventKind::ScrollUp, x, y, KeyModifiers::NONE));
         assert_eq!(ui.app.diff.scroll, 0);
 
         // Without a hit map (after a resize) the wheel falls back to the app's own rule.
         ui.event(&Event::Resize(100, 30));
-        ui.event(&mouse(MouseEventKind::ScrollDown, nav.x + 1, nav.y + 1));
+        ui.event(&mouse(
+            MouseEventKind::ScrollDown,
+            nav.x + 1,
+            nav.y + 1,
+            KeyModifiers::NONE,
+        ));
         assert_eq!(ui.app.diff.scroll, 3, "no map: scrolls the diff");
         assert_eq!(ui.app.selection, Some(row("alpha", "f1")));
     }
@@ -3249,8 +3427,13 @@ mod tests {
         assert!(ui.app.help);
         let nav = ui.hits.as_ref().unwrap().nav.unwrap();
         assert_eq!(
-            ui.event(&mouse(MouseEventKind::ScrollDown, nav.x + 1, nav.y + 1))
-                .0,
+            ui.event(&mouse(
+                MouseEventKind::ScrollDown,
+                nav.x + 1,
+                nav.y + 1,
+                KeyModifiers::NONE
+            ))
+            .0,
             Changed::Yes
         );
         assert!(!ui.app.help);
@@ -3352,12 +3535,32 @@ mod tests {
         let open = ui.app.clone();
         let (nx, ny) = (nav.x + 1, nav.y + 1);
         for ev in [
-            mouse(MouseEventKind::ScrollDown, nx, ny),
-            mouse(MouseEventKind::ScrollUp, nx, ny),
-            mouse(MouseEventKind::ScrollDown, main.x + 1, main.y + 1),
-            mouse(MouseEventKind::Down(MouseButton::Left), nx, ny + 1),
-            mouse(MouseEventKind::Drag(MouseButton::Left), nx + 3, ny + 1),
-            mouse(MouseEventKind::Up(MouseButton::Left), nx + 3, ny + 1),
+            mouse(MouseEventKind::ScrollDown, nx, ny, KeyModifiers::NONE),
+            mouse(MouseEventKind::ScrollUp, nx, ny, KeyModifiers::NONE),
+            mouse(
+                MouseEventKind::ScrollDown,
+                main.x + 1,
+                main.y + 1,
+                KeyModifiers::NONE,
+            ),
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                nx,
+                ny + 1,
+                KeyModifiers::NONE,
+            ),
+            mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                nx + 3,
+                ny + 1,
+                KeyModifiers::NONE,
+            ),
+            mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                nx + 3,
+                ny + 1,
+                KeyModifiers::NONE,
+            ),
             Event::FocusGained,
         ] {
             assert_eq!(ui.event(&ev), (Changed::No, None), "{ev:?} dropped");
@@ -3621,7 +3824,12 @@ mod tests {
         render_into(&mut ui);
         let (x, y) = target_center(&ui, &Target::TourRow(1));
         assert_eq!(
-            ui.event(&mouse(MouseEventKind::Down(MouseButton::Left), x, y)),
+            ui.event(&mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                x,
+                y,
+                KeyModifiers::NONE
+            )),
             (
                 Changed::Yes,
                 Some(Effect::TourWrite(
@@ -3637,16 +3845,21 @@ mod tests {
         let before = ui.app.selection.clone();
         // Row 1 of the nav pane, well outside the centred box.
         assert_eq!(
-            ui.event(&mouse(MouseEventKind::Down(MouseButton::Left), 3, 2)),
+            ui.event(&mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                3,
+                2,
+                KeyModifiers::NONE
+            )),
             (Changed::No, None),
             "a press on the screen under the welcome is dropped"
         );
         assert_eq!(
-            ui.event(&mouse(MouseEventKind::ScrollDown, 3, 5)),
+            ui.event(&mouse(MouseEventKind::ScrollDown, 3, 5, KeyModifiers::NONE)),
             (Changed::No, None)
         );
         assert_eq!(
-            ui.event(&mouse(MouseEventKind::ScrollUp, 60, 5)),
+            ui.event(&mouse(MouseEventKind::ScrollUp, 60, 5, KeyModifiers::NONE)),
             (Changed::No, None)
         );
         assert_eq!(ui.app.selection, before);
@@ -3758,6 +3971,7 @@ mod tests {
             MouseEventKind::Down(MouseButton::Left),
             body.x + 3,
             third,
+            KeyModifiers::NONE,
         ));
         assert_eq!(ui.app.press_line, Some(2));
     }

@@ -712,6 +712,11 @@ impl PtyTui {
         self.send(&sgr_click(col, row))
     }
 
+    /// A left click with shift held at `(col, row)`, 0-based ([`sgr_shift_click`]).
+    pub fn shift_click(&mut self, col: u16, row: u16) -> io::Result<()> {
+        self.send(&sgr_shift_click(col, row))
+    }
+
     /// Press the left button at `(col, row)` and hold it: the first half of a drag.
     pub fn press(&mut self, col: u16, row: u16) -> io::Result<()> {
         self.send(&sgr_press(col, row))
@@ -803,6 +808,22 @@ pub fn sgr_drag(col: u16, row: u16) -> Vec<u8> {
     sgr_mouse(32, col, row, 'M')
 }
 
+/// The SGR left-button press **with shift held** for `(col, row)`, 0-based: SGR 1006
+/// adds the modifiers to the button (shift is `4`), and crossterm reads button 4 as
+/// `Down(Left)` with `KeyModifiers::SHIFT`. What a terminal that forwards a shift-click to
+/// the program sends (a herdr pane does; most terminals keep shift plus the mouse for
+/// their own text selection).
+pub fn sgr_shift_press(col: u16, row: u16) -> Vec<u8> {
+    sgr_mouse(4, col, row, 'M')
+}
+
+/// A shifted left click: the shifted press, then its release (shift still held).
+pub fn sgr_shift_click(col: u16, row: u16) -> Vec<u8> {
+    let mut bytes = sgr_shift_press(col, row);
+    bytes.extend(sgr_mouse(4, col, row, 'm'));
+    bytes
+}
+
 /// One SGR mouse report: `CSI < button ; col ; row (M|m)`, with the 1-based coordinates
 /// the protocol uses.
 fn sgr_mouse(button: u16, col: u16, row: u16, final_byte: char) -> Vec<u8> {
@@ -846,6 +867,15 @@ mod tests {
         whole.extend(sgr_drag(40, 5));
         whole.extend(sgr_release(40, 5));
         assert_eq!(whole, b"\x1b[<0;28;6M\x1b[<32;41;6M\x1b[<0;41;6m");
+    }
+
+    /// SGR 1006 carries the modifiers in the button: shift is `+4`, so a shifted left
+    /// press is button 4, which crossterm reads as `Down(Left)` with `SHIFT`.
+    #[test]
+    fn pty_tui_sgr_shift_click_is_button_four_press_then_release() {
+        assert_eq!(sgr_shift_press(0, 0), b"\x1b[<4;1;1M");
+        assert_eq!(sgr_shift_click(0, 0), b"\x1b[<4;1;1M\x1b[<4;1;1m");
+        assert_eq!(sgr_shift_click(27, 5), b"\x1b[<4;28;6M\x1b[<4;28;6m");
     }
 
     #[test]

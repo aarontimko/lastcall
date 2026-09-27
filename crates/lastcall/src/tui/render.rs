@@ -602,8 +602,8 @@ const HINT_NAV_ONLY: &[&str] = &[
 /// accept all  t hide empty  Tab focus  r refresh  ? help  q quit`, where `<accept>` follows
 /// the selection — `a accept hunk  A accept file` on a file row with hunks in **either**
 /// pane, `a/A accept file` on a hunkless file row (binary, collapsed, deleted, unreadable),
-/// `A accept group` on a group entry, `A accept all in <root>` on a **non-empty** root entry
-/// (Amendment v1.11: `A` is the key that takes a whole entry, and it is how the per-repo
+/// `A accept group` on a group entry, `A accept N files` while a run of rows is selected,
+/// `A accept all in <root>` on a **non-empty** root entry (Amendment v1.11: `A` is the key that takes a whole entry, and it is how the per-repo
 /// fold is told from the header's global one; on an empty repo row neither key accepts
 /// anything, so the line does not offer it — verifier (a) F2). With the **diff** focused
 /// the first two hints are `↑↓ scroll  ← back` instead, because that is what those keys do
@@ -665,6 +665,11 @@ pub fn hints(app: &App, width: u16) -> String {
         (_, Some(AcceptScope::Group { .. })) => {
             accept_file.as_ref().map(|k| format!("{k} accept group"))
         }
+        // A run of rows: `A` takes the run, counted as the accept will count it.
+        (_, Some(scope @ AcceptScope::Rows { .. })) => accept_file.as_ref().and_then(|k| {
+            let files = app.counts_of(scope).files;
+            (files > 0).then(|| format!("{k} accept {}", plural(files, "file")))
+        }),
         // Verifier (a) F2: since v1.9 a repo with nothing pending is a selectable nav row,
         // and `A` on it lands on `nothing to accept`. A hint the line promises has to do
         // something, so the phrase is offered only while the repo has rows.
@@ -927,6 +932,9 @@ struct NavLine<'a> {
     line: Line<'a>,
     target: Option<Target>,
     selected: bool,
+    /// A row of the run of rows ([`App::range_rows`]) other than the cursor row: drawn
+    /// `REVERSED | DIM`, so the run reads as one block and the cursor end stands out.
+    in_range: bool,
 }
 
 fn render_nav(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
@@ -940,6 +948,7 @@ fn render_nav(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
     // screen row is known (below).
     let mut dots: Vec<(usize, u16, std::path::PathBuf)> = Vec::new();
     let mut first = true;
+    let run = app.range_rows();
     for (path, view) in &app.roots {
         if !app.is_listed(view) {
             continue;
@@ -949,6 +958,7 @@ fn render_nav(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
                 line: Line::from(Span::styled("─".repeat(width), dim())),
                 target: None,
                 selected: false,
+                in_range: false,
             });
         }
         first = false;
@@ -1002,6 +1012,7 @@ fn render_nav(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
             line: Line::from(spans),
             target: Some(Target::NavRoot(path.clone())),
             selected: is_sel,
+            in_range: false,
         });
         let branch = format!(
             "  {} · {}",
@@ -1025,6 +1036,7 @@ fn render_nav(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
             line: Line::from(branch_spans),
             target: None,
             selected: false,
+            in_range: false,
         });
         if let Some(status) = empty
             .then(|| app.herdr.flag(path).map(|f| f.status.as_str()))
@@ -1043,6 +1055,7 @@ fn render_nav(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
                 line: Line::from(Span::styled(text, dim())),
                 target: Some(Target::NavRoot(path.clone())),
                 selected: false,
+                in_range: false,
             });
         }
         // Phase 14 B: the nav's own rows (the seen group's members are folded out), then
@@ -1053,6 +1066,11 @@ fn render_nav(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
                 line: nav_row_line(row, app.full_paths, width, member),
                 target: Some(Target::NavRow(path.clone(), row.path.clone())),
                 selected: app.selection.as_ref() == Some(&sel),
+                in_range: !member
+                    && app.selection.as_ref() != Some(&sel)
+                    && run
+                        .as_ref()
+                        .is_some_and(|(root, paths)| root == path && paths.contains(&row.path)),
             }
         };
         for row in view.nav_rows() {
@@ -1079,6 +1097,7 @@ fn render_nav(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
                 )),
                 target: Some(Target::NavGroup(path.clone(), group.kind)),
                 selected: is_sel,
+                in_range: false,
             });
             if group.kind == GroupKind::Seen && app.seen_open.contains(path) {
                 for member in group.paths.iter().filter_map(|p| view.row(p)) {
@@ -1116,6 +1135,11 @@ fn render_nav(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
         buf.set_line(area.x, y, &entry.line, area.width);
         if entry.selected {
             buf.set_style(row_rect, Style::new().add_modifier(Modifier::REVERSED));
+        } else if entry.in_range {
+            buf.set_style(
+                row_rect,
+                Style::new().add_modifier(Modifier::REVERSED | Modifier::DIM),
+            );
         }
         if let Some(t) = &entry.target {
             hits.targets.push((row_rect, t.clone()));
@@ -1464,7 +1488,15 @@ fn render_row_pane(
     hits: &mut HitMap,
 ) {
     let mut lines: Vec<Line> = Vec::new();
-    let control = format!("[{} accept file]", control_key(app, "accept_file"));
+    // The control follows what `A` takes: the row, or the run of rows it ends.
+    let control = match app.accept_file_scope() {
+        Some(scope @ AcceptScope::Rows { .. }) => format!(
+            "[{} accept {}]",
+            control_key(app, "accept_file"),
+            plural(app.counts_of(&scope).files, "file")
+        ),
+        _ => format!("[{} accept file]", control_key(app, "accept_file")),
+    };
     let restore = format!("[{} restore file]", control_key(app, "restore_file"));
     // The header is built knowing what will be right-aligned after it, so the
     // flag marker takes the leftover and not the controls' room.
@@ -2407,10 +2439,13 @@ fn render_confirm(app: &App, buf: &mut Buffer, area: Rect) {
                 [one] => format!("in {one}"),
                 many => format!("across {}", plural(many.len(), "repo")),
             };
-            let mut rows = vec![format!(
-                "Accept all {} {target}?",
-                plural(counts.files, "file")
-            )];
+            // A run of rows is the reader's own choice out of a repository that may hold
+            // more, so it is never called `all`.
+            let mut rows = vec![if app.confirm_rows() {
+                format!("Accept the {} selected files {target}?", counts.files)
+            } else {
+                format!("Accept all {} {target}?", plural(counts.files, "file"))
+            }];
             // Phase 14 B: folded rows are counted in `files` like every row, and named
             // here when there are any, so the modal says what the nav folded away.
             if counts.grouped_seen > 0 {
@@ -4271,6 +4306,39 @@ mod tests {
             frame.contains("Accept all 15 files across 3 repos?"),
             "{frame}"
         );
+    }
+
+    /// A run of rows: the header's control, the hint and the confirm all say how many
+    /// files `A` takes, and the confirm never calls the run `all`.
+    #[test]
+    fn render_a_run_of_rows_names_its_count_in_the_control_the_hint_and_the_confirm() {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::ExtendDown);
+        app.handle(Action::ExtendDown);
+        let (frame, _) = frame_of(&app, 100, 30);
+        assert!(frame.contains("[A accept 3 files]"), "{frame}");
+        assert!(!frame.contains("[A accept file]"), "{frame}");
+        assert!(
+            hints(&app, 100).contains("A accept 3 files"),
+            "{}",
+            hints(&app, 100)
+        );
+        assert!(!hints(&app, 100).contains("a accept hunk"));
+
+        app.apply(pile_event_seq("alpha", 1, rows_n(12, 0, 0)));
+        app.select(Some(row("alpha", "p00")));
+        for _ in 0..11 {
+            app.handle(Action::ExtendDown);
+        }
+        assert_eq!(app.handle(Action::AcceptFile), (Changed::Yes, None));
+        let (frame, _) = frame_of(&app, 100, 30);
+        assert!(
+            frame.contains("Accept the 12 selected files in alpha?"),
+            "{frame}"
+        );
+        assert!(!frame.contains("Accept all"), "{frame}");
     }
 
     #[test]
