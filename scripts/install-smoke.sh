@@ -16,7 +16,8 @@
 #   scripts/install-smoke.sh --from-dir <dir> [<ignored> ...]
 #   scripts/install-smoke.sh --platform linux/amd64 v0.1.0
 #
-#   <tag>         the release to install. Default: the repository's latest release.
+#   <tag>         the release to install, `v0.5.0` or `0.5.0`. Default: the repository's latest
+#                 release.
 #   <newer-tag>   a second, newer release whose real assets drive the update leg. Without it
 #                 the smoke serves the installed binary back under the next patch version, so
 #                 the update path is exercised end to end even when only one release exists.
@@ -156,6 +157,9 @@ else
             || die "no releases in $repo yet; name a tag or use --from-dir"
     fi
     version="${tag#v}"
+    # Spelled with its v whichever way it was given, as the newer tag already is: the
+    # release, its assets and the attestation are all looked up by the tag.
+    tag="v$version"
 fi
 
 if [ -n "$newer_tag" ]; then
