@@ -29,8 +29,7 @@ toolchain:
 build:
     cargo build --workspace --all-targets
 
-# rustfmt + clippy (deny warnings) + prove the engine compiles without the herdr client,
-# then the release script's self-test.
+# rustfmt + clippy (deny warnings) + the engine without the herdr client + release.py's self-test.
 lint:
     cargo fmt --all --check
     cargo clippy --workspace --all-targets -- -D warnings
@@ -258,11 +257,13 @@ hooks-install:
 # and prints what it would send.
 #
 #   a change:   push the branch, open its pull request  ->  just merge
-#   a release:  just release-prep 0.4.0  ->  push, pull request  ->  just merge
-#               ->  just release-tag
+#   a release:  the same pull request, with `just release-prep 0.7.0` run on its branch
+#               as the last commit  ->  push  ->  just merge  ->  just release-tag
 # ---------------------------------------------------------------------------------------
 
-# From an up-to-date main: the release branch and its one five-file commit. Pushes nothing.
+# The five files are the version, the lockfile, the dated CHANGELOG and the install pages;
+# the branch must hold all of origin/main first.
+# The release's one commit, on the branch whose pull request carries it (never main). Pushes nothing.
 release-prep VERSION:
     python3 scripts/release.py prep {{quote(VERSION)}}
 
@@ -270,9 +271,11 @@ release-prep VERSION:
 merge NUMBER="":
     python3 scripts/release.py merge {{quote(NUMBER)}}
 
-# On the merged main: the checks release.yml would fail on later, one yes, the tag, its push.
-release-tag:
-    python3 scripts/release.py tag
+# The commit defaults to main's tip; name it when something merged after the release merge.
+# Then the checks release.yml would fail on later, one yes, the tag, its push.
+# On the merged main: tag the merge commit that carried the bump, and only that one.
+release-tag COMMIT="":
+    python3 scripts/release.py tag {{quote(COMMIT)}}
 
 # ---------------------------------------------------------------------------------------
 # Probes and demos (built-artifact passes exercise the release binary)

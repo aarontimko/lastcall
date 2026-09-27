@@ -3,22 +3,32 @@
 
 Nothing here changes what a release is (docs/dev/operations.md, "Cutting a release"):
 `main` still takes every change through a pull request with the checks green, the tag is
-still an annotated `v<crate version>` on the merge commit, and `release.yml` still builds
+still an annotated `v<crate version>` on a merge commit, and `release.yml` still builds
 from the tag. The verbs replace the run of commands typed at each step, and refuse where a
 person would have had to notice something by eye.
 
-    release.py prep <version>    from an up-to-date `main`: the branch `release/v<version>`
-                                 and its one commit. For a release that is five files: the
-                                 crate version, the lockfile, the dated CHANGELOG heading,
-                                 and the version README.md and docs/install.md name. A
-                                 candidate (`0.4.0-rc.1`) leaves the two install pages
-                                 alone. Pushes nothing.
+A release is one pull request: the branch carrying the change also carries the version
+bump as its last commit, and the tag goes on that pull request's merge commit.
+
+    release.py prep <version>    on the branch whose pull request carries the release (any
+                                 branch but `main`), clean and holding all of origin/main:
+                                 one commit on that branch. For a release that is five
+                                 files: the crate version, the lockfile, the dated CHANGELOG
+                                 heading, and the version README.md and docs/install.md
+                                 name. A candidate (`0.4.0-rc.1`) leaves the two install
+                                 pages alone. Refuses a version not later than the crate's
+                                 and than every `v*` tag on origin. Pushes nothing.
     release.py merge [number]    any pull request, release or not: wait for the required
                                  checks, one yes, a merge commit, then local `main` pulled
-                                 and the merged branch deleted.
-    release.py tag               on the merged `main`: refuse what `release.yml` would
-                                 refuse after the builds, one yes, the annotated tag, its
-                                 push, the release run watched to the end.
+                                 and the merged branch deleted. When the merge carried a
+                                 bump, it says so and names the tag step.
+    release.py tag [commit]      on the merged `main`: the commit (main's tip unless named)
+                                 must be on origin/main and be the merge commit whose
+                                 first-parent diff carries the bump, so nothing merged
+                                 after it ships under its number. Then what `release.yml`
+                                 would refuse after the builds, one yes, the annotated tag
+                                 on that commit, its push, the release run watched to the
+                                 end. Name the commit when something merged after it.
     release.py self-test         the rules above over made-up text, with no repository and
                                  no network; `just lint` runs it.
 
@@ -27,7 +37,7 @@ agent's shell (operations.md, "The maintainer pushes and tags; agents do not"). 
 anyone's.
 
 RELEASE_DRY_RUN=1 runs every check and prints, instead of running, each command that would
-write a branch, a commit or a tag or leave the machine. It is allowed in an agent's shell.
+write a file, a commit or a tag or leave the machine. It is allowed in an agent's shell.
 
 Standard library only, and nothing newer than Python 3.9 (what macOS ships).
 """
@@ -192,9 +202,12 @@ def later(new, old):
 
 
 def check_prep_branch(name):
-    """The branch `prep` may start from."""
-    if name != "main":
-        raise Refusal("start from main")
+    """The branch `prep` commits the bump on: the one whose pull request carries the
+    release, never `main`, which takes changes only through a pull request."""
+    if name == "main":
+        raise Refusal("prep commits the bump on the branch whose pull request carries the "
+                      "release, never on main; switch to that branch (or make a new one for "
+                      "the final after a candidate)")
 
 
 def date_changelog(changelog, new, today):
@@ -240,6 +253,59 @@ def name_new_version(page, text, shown, new):
     return names(shown).sub(new, text)
 
 
+def remote_versions(listing):
+    """The versions of the `v*` tags in `git ls-remote --tags` output."""
+    found = set()
+    for line in listing.splitlines():
+        ref = line.split("\t")[-1].strip()
+        if ref.endswith("^{}"):
+            ref = ref[:-3]
+        name = ref[len("refs/tags/"):] if ref.startswith("refs/tags/") else ""
+        if name.startswith("v") and parse(name[1:]):
+            found.add(name[1:])
+    return found
+
+
+def check_later(new, crate, listing):
+    """`new` must be later than the crate's version and than the newest `v*` tag in
+    `listing` (`git ls-remote --tags` output): a version is never released twice, and
+    never below one already out."""
+    if not later(new, crate):
+        raise Refusal("%s is not later than the crate's %s" % (new, crate))
+    released = remote_versions(listing)
+    if released:
+        newest = max(released, key=parse)
+        if not later(new, newest):
+            raise Refusal("%s is not later than v%s, the newest tag on origin" % (new, newest))
+
+
+def check_tag_absent(new, listing, local):
+    """The tag `v<new>` must be neither on origin (`listing`) nor in this clone."""
+    if new in remote_versions(listing):
+        raise Refusal("the tag v%s is on origin already" % new)
+    if local:
+        raise Refusal("the tag v%s exists locally; if it was never pushed, remove it (git tag -d v%s)"
+                      % (new, new))
+
+
+def check_release_merge(parents, cargo_diff, version):
+    """The commit tag takes: a merge commit (two parents) whose first-parent diff of
+    Cargo.toml (`git diff <c>^1 <c> -- Cargo.toml`) sets the `[workspace.package]` version
+    line to `version`, the crate version at that commit. That is the merge that brought the
+    bump, and not a merge made after it, whose own diff would not carry the bump.
+
+    The version line is the file's one unindented `version = "..."` line, which
+    crate_version has already required to be unique, so in a diff it is the line that
+    begins `-version = ` or `+version = `."""
+    if parents != 2:
+        raise Refusal("not a merge commit (%d parent%s): the tag goes on the merge of the pull "
+                      "request that carried the bump" % (parents, "" if parents == 1 else "s"))
+    removed = re.findall(r'^-version = "([^"]*)"$', cargo_diff, flags=re.M)
+    added = re.findall(r'^\+version = "([^"]*)"$', cargo_diff, flags=re.M)
+    if len(removed) != 1 or added != [version] or removed == added:
+        raise Refusal("a merge, but its first-parent diff does not change Cargo.toml's version "
+                      "line to %s: this is not the merge that carried the bump" % version)
+
 def check_tag_notes(changelog, version):
     """What release.yml would fail on after the four builds, and a sign the commit is not
     the release: no section with a body for the version, or `## Unreleased` still there."""
@@ -249,26 +315,29 @@ def check_tag_notes(changelog, version):
     if not (changelog_section(changelog, version) or changelog_section(changelog, base)):
         raise Refusal("CHANGELOG.md has no '## %s' section with a body; release.yml would fail after the builds" % base)
     if changelog_section(changelog, "Unreleased") is not None:
-        raise Refusal("CHANGELOG.md still has '## Unreleased': the release commit is not on main")
+        raise Refusal("CHANGELOG.md still has '## Unreleased' at this commit: the bump dates it, "
+                      "so this is not the release")
 
 
 def cmd_prep(args):
     new = args[0] if len(args) == 1 else ""
     if not parse(new):
         die("usage: prep <version>, like 0.4.0 or 0.4.0-rc.1 (no leading v, no leading zeros)")
-    check_prep_branch(branch())
+    current = branch()
+    check_prep_branch(current)
     clean()
-    at_origin_main()
+    fetch()
+    listing = out("git", "ls-remote", "--tags", "origin", "refs/tags/v*", why="could not list origin's tags")
 
     cargo_toml = read("Cargo.toml")
     old = crate_version(cargo_toml)
-    if not later(new, old):
-        die("%s is not later than the crate's %s" % (new, old))
-    if ok("git", "rev-parse", "--quiet", "--verify", "refs/tags/v" + new):
-        die("the tag v%s exists" % new)
-    release_branch = "release/v" + new
-    if ok("git", "show-ref", "--verify", "--quiet", "refs/heads/" + release_branch):
-        die("the branch %s exists" % release_branch)
+    check_later(new, old, listing)
+    # Branch protection wants the branch up to date with main before it merges. Bringing
+    # main in after the bump would put a merge commit after it, so main comes in first.
+    if not ok("git", "merge-base", "--is-ancestor", "origin/main", "HEAD"):
+        die("%s is behind origin/main; merge origin/main into it first, so the bump is the "
+            "last commit the branch adds" % current)
+    check_tag_absent(new, listing, ok("git", "rev-parse", "--quiet", "--verify", "refs/tags/v" + new))
 
     # Every file's new text is worked out, and every refusal made, before the first write:
     # a refusal leaves nothing to clean up.
@@ -283,12 +352,14 @@ def cmd_prep(args):
         for page in INSTALL_PAGES:
             changes[page] = name_new_version(page, read(page), shown, new)
 
-    must("git", "switch", "-c", release_branch)
+    subject = "chore(release): " + new
     if DRY:
         say("would write %s -> %s into %s, and the three workspace crates into Cargo.lock"
             % (old, new, ", ".join(sorted(changes))))
+        say("would commit '%s' on %s, the branch checked out now" % (subject, current))
         return
-    undo = "git restore . && git switch main && git branch -D " + release_branch
+    before = out("git", "rev-parse", "HEAD")
+    files = ["Cargo.toml", "Cargo.lock", "CHANGELOG.md"] + (list(INSTALL_PAGES) if final else [])
     try:
         for path, text in changes.items():
             write(path, text)
@@ -300,15 +371,22 @@ def cmd_prep(args):
             die("Cargo.lock moved by %s lines, expected 3/3" % "/".join(moved or ["0", "0"]))
         body = "The changelog section is dated and the workspace version is %s" % new
         body += "; the two install documents name v%s." % new if final else "."
-        must("git", "add", "Cargo.toml", "Cargo.lock", "CHANGELOG.md", *(INSTALL_PAGES if final else ()))
-        must("git", "commit", "--quiet", "-m", "chore(release): " + new, "-m", body)
+        must("git", "add", *files)
+        must("git", "commit", "--quiet", "-m", subject, "-m", body)
     except SystemExit:
-        say("stopped halfway, on %s. To undo: %s" % (release_branch, undo))
+        # The tree was clean at the start, so the undo puts back exactly what this wrote.
+        if out("git", "rev-parse", "HEAD") != before:
+            undo = "git reset --hard HEAD~1"
+        else:
+            undo = "git restore --staged --worktree -- " + " ".join(files)
+        say("stopped halfway, on %s. To undo: %s" % (current, undo))
         raise
     subprocess.run(["git", "--no-pager", "show", "-U0", "--format=%h %s%n", "HEAD", "--",
                     "Cargo.toml", "CHANGELOG.md", *INSTALL_PAGES])
     say("every changed line is above (Cargo.lock: the three workspace crates)")
-    say("next: push %s, open its pull request, then: just merge" % release_branch)
+    say("to take it back before the push: git reset --hard HEAD~1")
+    say("next: push %s, open its pull request (or let the open one take the commit), "
+        "then: just merge" % current)
 
 
 def cmd_merge(args):
@@ -356,8 +434,54 @@ def cmd_merge(args):
     must("git", "fetch", "--prune", "origin")
     if not DRY:
         say("main is at " + out("git", "log", "-1", "--format=%h %s"))
-        if head.startswith("release/v"):
+        release = merged_release(number)
+        if release == out("git", "rev-parse", "HEAD"):
             say("next: just release-tag")
+        elif release:
+            say("next: just release-tag %s (main has moved past the merge that carried the "
+                "bump; the tag goes on that merge, named by its hash)" % release[:12])
+
+
+def merged_release(number):
+    """The merge commit this pull request just made, when it is one tag would take; None
+    otherwise. The predicate is asked of the merge commit, not of the branch's head: an
+    update from main merged into the branch after the bump leaves the bump in the head's
+    history but not in the head's own diff."""
+    done = subprocess.run(["gh", "pr", "view", number, "--json", "mergeCommit"],
+                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True)
+    try:
+        oid = json.loads(done.stdout)["mergeCommit"]["oid"]
+    except (ValueError, KeyError, TypeError):
+        return None
+    if not ok("git", "cat-file", "-e", oid + "^{commit}"):
+        return None
+    try:
+        check_release_merge(*release_merge_facts(oid))
+    except Refusal:
+        return None
+    return oid
+
+
+def release_merge_facts(sha):
+    """What check_release_merge asks of a commit: its parent count, the first-parent diff
+    of Cargo.toml, and the crate version at the commit."""
+    parents = len(out("git", "rev-list", "--parents", "-n", "1", sha).split()) - 1
+    diff = out("git", "diff", sha + "^1", sha, "--", "Cargo.toml") if parents else ""
+    return parents, diff, crate_version(out("git", "show", sha + ":Cargo.toml"))
+
+
+def untagged_release_merge(listing):
+    """The newest merge on main's first-parent line that carried a bump whose tag origin
+    lacks, or None: named in tag's refusal when main's tip is not that merge."""
+    released = remote_versions(listing)
+    for sha in out("git", "rev-list", "--first-parent", "--merges", "-n", "50", "origin/main").split():
+        try:
+            facts = release_merge_facts(sha)
+            check_release_merge(*facts)
+        except Refusal:
+            continue
+        return None if facts[2] in released else sha
+    return None
 
 
 def ci_runs(sha):
@@ -367,17 +491,30 @@ def ci_runs(sha):
 
 def cmd_tag(args):
     by_hand("tag")
-    if args:
-        die("usage: tag (the version comes from Cargo.toml)")
+    if len(args) > 1:
+        die("usage: tag [commit] (the commit defaults to main's tip; the version comes from its Cargo.toml)")
     if branch() != "main":
         die("tags are made on main")
     clean()
-    sha = at_origin_main()
-    version = crate_version(read("Cargo.toml"))
+    at_origin_main()
+    named = args[0] if args else "HEAD"
+    sha = out("git", "rev-parse", "--verify", "--quiet", named + "^{commit}", why="no commit named " + named)
+    if not ok("git", "merge-base", "--is-ancestor", sha, "origin/main"):
+        die("%s is not on origin/main; the tag goes on a merge main already holds" % named)
+    parents, cargo_diff, version = release_merge_facts(sha)
     tag = "v" + version
 
     if out("git", "ls-remote", "--tags", "origin", "refs/tags/" + tag):
         die("%s is on GitHub already: the crate version was not bumped, or this release is cut" % tag)
+    try:
+        check_release_merge(parents, cargo_diff, version)
+    except Refusal as refusal:
+        found = None if args else untagged_release_merge(
+            out("git", "ls-remote", "--tags", "origin", "refs/tags/v*", why="could not list origin's tags"))
+        if found:
+            die("%s is %s. Something merged after the release merge; tag that merge by its "
+                "hash: just release-tag %s" % (named, refusal, found[:12]))
+        die("%s is %s" % (named, refusal))
     reuse = ok("git", "rev-parse", "--quiet", "--verify", "refs/tags/" + tag)
     if reuse:
         # A local tag that never reached GitHub: an earlier run whose push did not finish.
@@ -386,7 +523,7 @@ def cmd_tag(args):
                 "remove it (git tag -d %s) and run this again" % (tag, tag))
         say("reusing the local %s: it is on this commit and not on GitHub" % tag)
 
-    check_tag_notes(read("CHANGELOG.md"), version)
+    check_tag_notes(out("git", "show", sha + ":CHANGELOG.md"), version)
 
     # The ci workflow ran on this commit and passed. The weekly jobs are early warnings
     # (operations.md) and do not gate a release.
@@ -400,14 +537,14 @@ def cmd_tag(args):
     if any(r["status"] != "completed" or r["conclusion"] != "success" for r in runs):
         die("ci did not pass on this commit")
 
-    done = subprocess.run(["git", "describe", "--tags", "--abbrev=0", "--match", "v*", "--exclude", tag],
+    done = subprocess.run(["git", "describe", "--tags", "--abbrev=0", "--match", "v*", "--exclude", tag, sha],
                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True)
     previous = done.stdout.strip() if done.returncode == 0 else ""
     say("%s on %s; previous tag %s; ci green"
-        % (tag, out("git", "log", "-1", "--format=%h %s"), previous or "none"))
+        % (tag, out("git", "log", "-1", "--format=%h %s", sha), previous or "none"))
     confirm("tag and publish %s? A published release is not taken back" % tag)
     if not reuse:
-        must("git", "tag", "-a", tag, "-m", tag)
+        must("git", "tag", "-a", tag, "-m", tag, sha)
     say("pushing the tag (the pre-push hook runs the integration tier first; let it finish)")
     if not run("git", "push", "origin", tag):
         # Leave nothing behind that a bare push of the tag could publish unchecked.
@@ -488,6 +625,41 @@ edition = "2024"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
+"""
+
+LS_REMOTE = """1111111111111111111111111111111111111111\trefs/tags/v0.5.0
+2222222222222222222222222222222222222222\trefs/tags/v0.5.0^{}
+3333333333333333333333333333333333333333\trefs/tags/v0.6.0
+4444444444444444444444444444444444444444\trefs/tags/v0.6.0^{}
+5555555555555555555555555555555555555555\trefs/tags/vnext
+"""
+
+LS_V070 = """6666666666666666666666666666666666666666\trefs/tags/v0.7.0
+7777777777777777777777777777777777777777\trefs/tags/v0.7.0^{}
+"""
+
+BUMP_DIFF = """diff --git a/Cargo.toml b/Cargo.toml
+index 07e4e7c..91925a7 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -7,7 +7,7 @@ members = [
+ ]
+ 
+ [workspace.package]
+-version = "0.6.0"
++version = "0.7.0"
+ edition = "2024"
+ license = "MIT OR Apache-2.0"
+"""
+
+DEPS_DIFF = """diff --git a/Cargo.toml b/Cargo.toml
+index 07e4e7c..91925a8 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -20,7 +20,7 @@ lastcall-testkit = { path = "crates/lastcall-testkit" }
+ 
+-serde = { version = "1.0.1", features = ["derive"] }
++serde = { version = "1.0.2", features = ["derive"] }
 """
 
 
@@ -580,6 +752,39 @@ def cmd_self_test(args):
     refuses("Unreleased still there", "Unreleased", check_tag_notes,
             dated.replace("# Changelog\n", "# Changelog\n\n## Unreleased\n\n- more\n"), "0.7.0")
 
+    # The branch prep commits on: any but main.
+    refuses("prep on main", "main", check_prep_branch, "main")
+    for name in ("feat/phase15", "release/v0.7.0", "fix/a-thing"):
+        passes("prep on " + name, check_prep_branch, name)
+
+    # The version against the crate and against origin's tags, over a fake ls-remote listing.
+    check("remote_versions", sorted(remote_versions(LS_REMOTE)), ["0.5.0", "0.6.0"])
+    passes("0.7.0 over 0.6.0", check_later, "0.7.0", "0.6.0", LS_REMOTE)
+    passes("0.7.0 with no tags at all", check_later, "0.7.0", "0.6.0", "")
+    refuses("not later than the crate", "the crate's 0.6.0", check_later, "0.6.0", "0.6.0", LS_REMOTE)
+    refuses("origin already has v0.7.0", "v0.7.0, the newest tag on origin",
+            check_later, "0.7.0", "0.6.0", LS_REMOTE + LS_V070)
+    refuses("origin has a later tag than the crate", "the newest tag on origin",
+            check_later, "0.7.0", "0.6.0", LS_REMOTE + LS_V070.replace("0.7.0", "0.8.0"))
+    passes("the final after its candidate", check_later, "0.7.0", "0.7.0-rc.1",
+           LS_REMOTE + LS_V070.replace("0.7.0", "0.7.0-rc.1"))
+    refuses("a candidate already tagged", "the newest tag on origin", check_later, "0.7.0-rc.1", "0.6.0",
+            LS_REMOTE + LS_V070.replace("0.7.0", "0.7.0-rc.1"))
+    passes("the tag is absent", check_tag_absent, "0.7.0", LS_REMOTE, False)
+    refuses("the tag is on origin", "on origin", check_tag_absent, "0.7.0", LS_REMOTE + LS_V070, False)
+    refuses("the tag is local", "locally", check_tag_absent, "0.7.0", LS_REMOTE, True)
+
+    # The commit tag takes: a merge whose first-parent diff carries the bump.
+    passes("the release merge", check_release_merge, 2, BUMP_DIFF, "0.7.0")
+    refuses("a plain commit", "not a merge commit", check_release_merge, 1, BUMP_DIFF, "0.7.0")
+    refuses("an octopus", "not a merge commit", check_release_merge, 3, BUMP_DIFF, "0.7.0")
+    refuses("a merge without the version line", "version line", check_release_merge, 2, DEPS_DIFF, "0.7.0")
+    refuses("a merge that leaves Cargo.toml alone", "version line", check_release_merge, 2, "", "0.7.0")
+    refuses("a merge that bumps rust-version only", "version line", check_release_merge, 2,
+            BUMP_DIFF.replace('-version = "0.6.0"\n+version = "0.7.0"',
+                              '-rust-version = "1.98.0"\n+rust-version = "1.99.0"'), "0.7.0")
+    refuses("a merge that bumps to another version", "version line", check_release_merge, 2, BUMP_DIFF, "0.8.0")
+
     for failure in failures:
         say("self-test FAILED " + failure)
     if failures:
@@ -594,7 +799,7 @@ def main():
         cmd_self_test(sys.argv[2:])
         return
     if len(sys.argv) < 2 or sys.argv[1] not in verbs:
-        die("usage: release.py prep <version> | merge [number] | tag | self-test")
+        die("usage: release.py prep <version> | merge [number] | tag [commit] | self-test")
     top = subprocess.run(["git", "rev-parse", "--show-toplevel"], stdout=subprocess.PIPE,
                          stderr=subprocess.DEVNULL, universal_newlines=True)
     if top.returncode != 0:
