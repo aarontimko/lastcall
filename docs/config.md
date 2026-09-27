@@ -155,7 +155,10 @@ plain entry reviews **the files in that folder**, and nothing below it; add `/**
 the folder and everything below it, minus any git repository inside it and anything an inner
 entry of its own already reviews. `*` matches within one folder name and never across a
 `/`; `**` as a whole component reaches up to four folders down, and an entry may name at
-most four folders. A file of `collapse_size_bytes` or more is never read in a watched
+most four folders. An entry may not be empty, may not contain `..` or start with `~`, and
+may not be a bare `**` or anything else that would match every folder under a parent
+directory: name the folder (`notes`, `notes/**`) or give the pattern a fixed part
+(`*_drafts`, `**/notes`). A file of `collapse_size_bytes` or more is never read in a watched
 folder, whatever the shape: it is counted in one notice instead.
 
 **The live watcher.** While lastcall is open it watches your files so the list updates as
@@ -183,8 +186,8 @@ repository inside yours, or the ignored folder holding one (`"z_ignore/"` for a 
 `z_ignore/dependencies/`), lists that repository as a nested repository with a row of its
 own, which `skip_globs` can take out again.
 
-An entry may not be empty, may not begin with `!` (every entry already re-includes), and is
-one line; write a trailing space as `\ `, as in `.gitignore`. Removing an entry later never
+An entry may not be empty or only spaces, may not begin with `!` (every entry already
+re-includes), and is one line; write a trailing space as `\ `, as in `.gitignore`. Removing an entry later never
 hides anything: a file you accepted while it was in force stops being listed, but a later
 change to it, or its deletion, is still a row until you accept that too.
 
