@@ -1734,6 +1734,17 @@ they survive libtest's capture. Ratatui draws only the cells that changed, so a 
 frame's words are not contiguous in the raw transcript — assert on the `vt100` screen, and
 use the raw log only for escape sequences and ordering.
 
+**A bare Esc is sent only when the scene then waits for its visible effect.** A lone `\x1b`
+is an ambiguous prefix: when the next key lands in the same read, crossterm parses the two as
+`Alt-<key>`, the Esc is swallowed and the key is not the key the scene sent (a slow runner
+does exactly that). So a scene sends `\x1b` only where Esc is what it is testing or the only
+key that does the job (closing the note, snooze or picker modal, cancelling a confirm,
+leaving the inline editor), and waits for the screen to show the result before the next
+key. Where Esc would only mean `back`, the scene sends `h`, which is `back` in the default
+keymap and carries no prefix: `select_until` takes the focus to the nav that way, and a
+help overlay a scene is done with is closed with `h` and waited on. A scene that rebinds
+`back` under `[keys]` sends a key it still binds.
+
 The two Phase 4 scenes drive the accept loop through the same binary:
 
 - `pty_accept_loop_and_restart` — a fixture "agent" (`FixtureRepo::open_in` on the
