@@ -583,12 +583,12 @@ absent) already equals `M`'s entry is skipped, since there is nothing to write. 
 not ask whether the record had finished with a path on the branch left: a commit the agent made
 on `A` that nobody has read yet stays with `A`, whose record is parked whole before the fold
 runs, so it shows again on the next return there, and the entry that becomes seen state on `B`
-is `M`'s, never the one at `A`'s tip (Amendment v1.17, proposed). The fold takes only entries the ledger
-can point at and say where they were seen. Everything else keeps the copied baseline and shows,
-which is the honest answer: a version committed and reverted while its row was never accepted,
-a mode flip, a symlink, a deletion nobody accepted, the content of a branch merged or rebased
-in without ever being checked out, whichever of two merge-bases git happens to pick for a
-criss-cross. A root whose state file predates `first_sight_head` has no answer to the first
+is `M`'s, never the one at `A`'s tip (Amendment v1.17, proposed). The fold takes only entries
+the ledger can point at and say where they were seen. Everything else keeps the copied baseline
+and shows, which is the honest answer: a version committed and reverted while its row was never
+accepted, a mode flip, a symlink, a deletion nobody accepted, the content of a branch merged or
+rebased in without ever being checked out, whichever of two merge-bases git happens to pick for
+a criss-cross. A root whose state file predates `first_sight_head` has no answer to the first
 half of seen state and folds through the records alone, which over-shows and hides nothing.
 The folded paths take their entries in one `write_tree` (absent at `M` removes them) and lose
 the blob and mode of any override they carried; a flag-only override stays, as `Ops::fold`

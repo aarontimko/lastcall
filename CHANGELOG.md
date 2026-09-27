@@ -14,6 +14,8 @@ binary rather than for the commit log.
   accepted yet, the file showed as changed on the new branch, though its content there was
   what you had already seen, and whether it showed depended on whether lastcall was open
   when you switched. The unfinished change is still waiting for you on the branch you left.
+  The other way round, a file you accepted on the branch you left and then cherry-picked
+  onto the new branch is listed there again, in the seen group, instead of silently matching.
 
 ## 0.6.0 - 2026-09-26
 

@@ -1300,9 +1300,11 @@ fn draft_edited() -> String {
 /// with `f1` above it).
 fn select_until(pty: &mut PtyTui, header: &str) {
     // The walk needs the **nav** focused: in the diff pane `k`/`j` scroll the pane and the
-    // selection never moves. `back` puts the focus there from either pane (clearing a live
-    // selection first) and does nothing else once it is there, so it is safe to send
-    // unconditionally. It is sent as `h`, never as `Esc`: a bare `\x1b` is an ambiguous
+    // selection never moves. `back` puts the focus there from either pane, one layer per
+    // key: with a right-pane text selection live it clears the selection and stops, so a
+    // caller with one live would need a second `h` (no call site has one: no scene drags
+    // or sends `v` before calling this). Once the focus is in the nav it does nothing else,
+    // so it is safe to send unconditionally. It is sent as `h`, never as `Esc`: a bare `\x1b` is an ambiguous
     // prefix, and a `k` that lands in the same read turns it into `Alt-k`, which is no
     // `back` at all, so the walk would run in the diff pane and never move. `h` is `back`
     // in the default keymap and no scene that calls this rebinds it; every call site is on

@@ -2123,8 +2123,8 @@ fn d24_main_at_c3(name: &str) -> (Fresh, String) {
     (s, c2)
 }
 
-/// D24: the fold takes only what the record has accepted at the departed tip, and never a
-/// blob for a path it holds as absent (verifier F2).
+/// D24: the fold takes only a merge-base entry that is seen state, never a blob no screen
+/// has shown, and never a blob for a path it holds as absent (verifier F2).
 #[test]
 fn scenario_d24_the_fold_takes_only_what_the_record_saw_at_the_departed_tip() {
     let (mut s, c2) = d24_main_at_c3("d24");
@@ -2183,8 +2183,9 @@ fn scenario_d24_variant_a_an_accepted_deletion_is_never_refilled_by_the_fold() {
     assert_eq!(pile.row(b"q").unwrap().change, Change::Added);
 }
 
-/// D24 Variant B, the positive fold: a path the record accepted **at** the departed tip
-/// still folds to the arrived-on tip's content, override and all.
+/// D24 Variant B, the positive fold: a path the record accepted on the departed branch folds
+/// to the arrived-on tip's content, override and all, because that content is the first-sight
+/// entry there and so seen state.
 #[test]
 fn scenario_d24_variant_b_content_accepted_at_the_departed_tip_still_folds() {
     // The repo is on `main` at `c1` and `future` is cut from it before lastcall opens, so
