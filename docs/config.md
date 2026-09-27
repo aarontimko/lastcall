@@ -70,15 +70,15 @@ applies at the next launch.
 |---|---|---|
 | `parent_dirs` | `[]`, meaning the directory you launched in | absolute paths. Every git repository directly under each one is watched, and a repository sitting untracked inside one of those is listed too, with a badge. A repository one plain folder deeper (for example `worktrees/<name>`) is reached with `search_depth`, or with its own entry here when it lives somewhere else entirely. A repository's review state is kept per entry here: one that comes to be found under a different entry (say it was reached through its parent folder and is now an entry of its own) starts afresh, as on the day it was first listed, and its old state is left on disk where it was. `R` and a relaunch agree on this. |
 | `draft_dirs` | `[]` | folders that are **not** git repositories, each reviewed as a root of its own. Entries are absolute paths, or globs matched under every parent directory **and under every repository that was found**, so `"z_ignore"` names the `z_ignore` folder of each repository as well as one directly inside a parent directory, and `"*/scratch"` reaches one folder further down from each of those. A plain entry reviews **the files in that folder**, and nothing below it; add `/**` to review the folder and everything below it, minus any git repository inside it and anything an inner entry of its own already reviews. `*` matches within one folder name and never across a `/`; `**` as a whole component reaches up to four folders down, and an entry may name at most four folders. A file of `collapse_size_bytes` or more is never read in a watched folder, whatever the shape: it is counted in one notice instead. |
-| `include_gitignored` | `[]` | gitignored files a repository's review includes after all. Each entry is a pattern as you would write it in `.gitignore`, matched from the repository's own folder: `"z_ignore_*"` lists every gitignored file of that name at any depth, `"/notes-*.md"` only the ones at the top, and `"**/*.scratch.md"` works as it does in a `.gitignore`. A matching file is an ordinary row under its repository, new files pending as any untracked file is, with no badge. Git never looks inside an ignored folder, so a file inside one stays unlisted whatever the pattern says: to review a whole ignored folder, name the folder with a trailing slash (`"z_ignore/"`); `"z_ignore/**"` cannot reach inside it. A pattern that matches an ignored repository inside yours lists it as a nested repository, which `skip_globs` can take out again. An entry may not be empty, may not begin with `!` (every entry already re-includes), and is one line; write a trailing space as `\ `, as in `.gitignore`. Removing an entry later never hides anything: a file you accepted while it was in force stops being listed, but a later change to it, or its deletion, is still a row until you accept that too. |
+| `include_gitignored` | `[]` | Files your `.gitignore` hides are normally not reviewed. A pattern here makes matching gitignored files show as ordinary rows in their repository, with their diffs, so an agent writing into an ignored folder is still reviewed. Written exactly like a `.gitignore` line, and matched from the repository's own folder: `"z_ignore_*"` lists every gitignored file of that name at any depth, `"/notes-*.md"` only the ones at the top, and `"**/*.scratch.md"` works as it does in a `.gitignore`. A matching file is an ordinary row under its repository, new files pending as any untracked file is, with no badge. Git never looks inside an ignored folder, so a file inside one stays unlisted whatever the pattern says: to review a whole ignored folder, name the folder with a trailing slash (`"z_ignore/"`); `"z_ignore/**"` cannot reach inside it. A pattern that reaches an ignored repository inside yours, or the ignored folder holding one (`"z_ignore/"` for a clone in `z_ignore/dependencies/`), lists that repository as a nested repository with a row of its own, which `skip_globs` can take out again. An entry may not be empty, may not begin with `!` (every entry already re-includes), and is one line; write a trailing space as `\ `, as in `.gitignore`. Removing an entry later never hides anything: a file you accepted while it was in force stops being listed, but a later change to it, or its deletion, is still a row until you accept that too. |
 | `draft_dir_parents` | `1` | how many folders above a watched folder its name shows, `0` to `4`. With `1`, a `z_ignore` folder inside a repository is listed as `repo/z_ignore`, which is what tells two folders of the same name apart. `0` is the matched folder's path relative to the directory it was found under, so an entry of `notes` shows `notes` and an entry of `*/notes` shows `a/notes`. |
 | `draft_initial` | `"seen"` | what the first sight of a watched folder means. `seen` starts from zero, so only changes made after that are pending. `pending` treats everything already there as pending. |
-| `collapsed_globs` | the nine common lockfiles | paths shown as one collapsed row instead of a wall of hunks. The default list is `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `Cargo.lock`, `poetry.lock`, `uv.lock`, `Gemfile.lock`, `go.sum`, `composer.lock`. Setting the key replaces the list. |
+| `collapsed_globs` | the nine common lockfiles | paths shown as one collapsed row instead of a wall of hunks. The default list is `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `Cargo.lock`, `poetry.lock`, `uv.lock`, `Gemfile.lock`, `go.sum`, `composer.lock`. Setting the key replaces the list. Each entry is matched from the repository's own folder, a bare name matches at any depth, and a `*` crosses folders here. |
 | `collapse_size_bytes` | `524288` (512 KiB) | files at or above this size collapse too. Must be greater than zero. A file with a NUL byte in its first 8,000 is binary and collapses whatever this says. This is also the size at which a file in a watched folder stops being read at all, so raising it to see larger diffs in your repositories also makes watched folders read larger files, and their records grow with them. |
-| `watch_ignore_globs` | `.git/**`, `node_modules/**`, `target/**`, `vendor/**`, `.venv/**` | these scope the filesystem watcher only. An ignored path never wakes a scan, but the next scan still reports a tracked edit under it, so this is a noise filter and not a way to hide changes. |
-| `skip_globs` | `[]` | what the list leaves out. Each entry is a glob in the `draft_dirs` grammar, matched against a path relative to the parent directory a root is filed under: `"*/z_ignore/**/evals/**"` takes out every clone kept below a repository's `z_ignore/.../evals/` folder. It has two effects. A repository whose path matches is never listed, whichever way it was found (a folder level, a repository inside a watched folder, a worktree); it is never opened, so a folder full of clones costs nothing at launch, and the search never goes into a plain folder that matches. And inside a watched folder, a file or a repository whose path matches is not reviewed. It never reaches a listed repository's own files: a tracked or untracked file inside a repository you see is reported whatever the key says, because no key hides a real change. A parent directory itself and the directory you launched in are never skipped; a notice says the pattern was ignored for it. A skipped repository keeps whatever state lastcall already had for it, and comes back if you remove the entry. An entry is relative, may not be empty, and may not contain `..` or start with `~`. |
+| `watch_ignore_globs` | `.git/**`, `node_modules/**`, `target/**`, `vendor/**`, `.venv/**` | While lastcall is open it watches your files so the list updates as agents write. Folders matching these globs do not wake the watcher, which stops build output and dependency folders from causing constant rescans. This is only about noise: a file that changed under a matching folder still shows at the next scan or when you press `r`. Each entry is matched against a changed file's path from the repository's own folder, a bare name matches at any depth, and a `*` crosses folders here (it does not in `skip_globs` or `draft_dirs`). The key was `ignore_globs` before this release. |
+| `skip_globs` | `[]` | Names repositories and folders to leave out of the list. Without it, the list holds every repository found under where you launched, every clone left untracked inside one of those, every worktree kept inside one, and every repository inside a watched folder. A matching repository is never listed or opened, a matching plain folder is never searched, and inside a watched folder a matching file or clone is not reviewed. Matched against the path below the folder a repository is filed under; a `*` stays inside one folder name and `**` crosses folders. It never hides a changed file inside a repository you do see. Whichever way a repository was found, a match leaves it out before it is opened, so a folder full of clones costs nothing at launch: `"*/z_ignore/**/evals/**"` takes out every clone kept below a repository's `z_ignore/.../evals/` folder. A tracked or untracked file inside a listed repository is reported whatever the key says, because no key hides a real change. A parent directory itself and the directory you launched in are never skipped; a notice says the pattern was ignored for it. A skipped repository keeps whatever state lastcall already had for it, and comes back if you remove the entry. An entry is relative, may not be empty, and may not contain `..` or start with `~`. Worked examples, with directory trees, are in [Which key leaves what out](#which-key-leaves-what-out) below. |
 | `hide_empty_repos` | `false` | what the `t` toggle starts as. `false` lists every repository under a parent directory, whether it has anything pending or not. `true` opens with the empty ones hidden, except one carrying an agent flag. `t` flips it for the session, and the headless commands are unaffected. The welcome on your first launch offers to write `true` here for you. |
-| `search_depth` | `1` | how many folders below each parent directory are read for a repository. `1` is the repositories directly inside it, `2` also reads one plain folder further, such as `worktrees/<name>`, and lists a worktree kept inside a listed repository (one git call per listed repository, each rescan), up to `4`. The walk never enters a repository or a dependency folder such as `node_modules`, `target`, `.venv` or `vendor`, and it runs again every thirty seconds, so `3` and `4` want a narrow parent directory rather than a home directory. The welcome on your first launch offers to write `2` here for you. The key is new in this release: a 0.1.0 binary refuses a config file that has it, so delete the line before going back to that version. |
+| `search_depth` | `1` | how many folders below each parent directory are read for a repository. `1` is the repositories directly inside it, `2` also reads one plain folder further, such as `worktrees/<name>`, and lists a worktree kept inside a listed repository (one git call per listed repository, each rescan), up to `4`. The walk never enters a repository, so no depth reaches a clone kept inside one (a gitignored `z_ignore/dependencies/` say); a watched folder or `include_gitignored` is how such a clone is listed, and `skip_globs` is how it is left out again. Nor does the walk enter a dependency folder such as `node_modules`, `target`, `.venv` or `vendor`, and it runs again every thirty seconds, so `3` and `4` want a narrow parent directory rather than a home directory. The welcome on your first launch offers to write `2` here for you. The key is new in this release: a 0.1.0 binary refuses a config file that has it, so delete the line before going back to that version. |
 
 ```toml
 parent_dirs = ["/home/me/src"]
@@ -98,23 +98,106 @@ search_depth = 1
 If you have a config file and launch somewhere outside `parent_dirs`, that directory is
 watched for the session anyway and a notice says so.
 
-**Four keys take patterns, and each reads them its own way.** `include_gitignored` is
-`.gitignore` grammar, matched from the repository's own folder. `draft_dirs` and
-`skip_globs` are globs where `*` stays inside one folder name and `**` crosses folders,
-matched from the parent directory a root is filed under (a parent directory, or the folder
-above a repository found anywhere else). `watch_ignore_globs` and `collapsed_globs` are globs
-matched from the root itself, where a bare name such as `Cargo.lock` matches at any depth.
+## Which key leaves what out
 
-**Which key for what.** To keep a repository out of the list, a folder of clones say, use
-`skip_globs`. To stop a folder from waking the watcher, use `watch_ignore_globs`; its files still
-show when they change. To review gitignored files as well, use `include_gitignored`. To see a
-set of generated files as short rows instead of their diffs, snapshots or lockfiles say,
-use `collapsed_globs` with the folder (`"crates/app/tests/snapshots/**"`): each file stays
-a row you can accept, with its counts, and no diff is read for it. No key hides a change
-inside a repository you see: a tracked or untracked file that changed is always a row, so
-that nothing an agent did goes by unreviewed. To accept many rows at once, `shift-a` on a
-repository's row accepts everything pending in it, and `ctrl-a` accepts everything
-everywhere.
+**Where a repository comes from.** A repository reaches the list in one of four ways:
+
+1. The folder walk: every repository directly under each parent directory (the directory you
+   launched in, when `parent_dirs` is empty) is listed, and with `search_depth` above `1`,
+   every one under the plain folders further down, though the walk never enters a repository.
+2. A clone inside a listed repository: when the scan of a repository finds another
+   repository sitting untracked in it, that one gets a row of its own, badged as nested in
+   the first.
+3. A worktree kept inside a listed repository: with `search_depth` of `2` or more, each
+   linked worktree a repository keeps inside its own folder gets a row, badged as a worktree
+   of it.
+4. A repository inside a watched folder: when a `draft_dirs` folder holds a clone, the clone
+   gets a row of its own, badged as nested, like the second way.
+
+`skip_globs` is checked on every candidate from all four ways before the repository is
+opened, so a match costs no git call and never reaches the screen.
+
+**Five keys take patterns, and each reads them its own way.**
+
+| key | matched from | `*` | `**` | example |
+|---|---|---|---|---|
+| `draft_dirs` | each parent directory, and each repository found | stays inside one folder name | a whole component, up to four folders down | `"z_ignore/**"` |
+| `include_gitignored` | the repository's own folder, as a `.gitignore` line is; a pattern with no `/` matches at any depth | as in `.gitignore`: stays inside one folder name | as in `.gitignore` | `"z_ignore_*"`, `"z_ignore/"` |
+| `skip_globs` | the parent directory a repository is filed under (a parent directory, or the folder above a repository found anywhere else) | stays inside one folder name | crosses folders | `"archive/**"` |
+| `watch_ignore_globs` | the repository's own folder; a bare name matches at any depth | crosses folders | crosses folders | `"target/**"` |
+| `collapsed_globs` | the repository's own folder; a bare name matches at any depth | crosses folders | crosses folders | `"crates/app/tests/snapshots/**"` |
+
+**A folder of old clones.**
+
+```
+/home/me/src/
+├── app/            .git   (active)
+├── api/            .git   (active)
+├── archive/
+│   ├── old-site/   .git
+│   ├── prototype/  .git
+│   └── ... 30 more
+└── mirrors/
+    └── upstream-x/ .git   (a read-only mirror)
+```
+
+Launched in `/home/me/src` with `search_depth = 2`, the walk finds `app` and `api` at the
+first level and every clone under `archive/` and `mirrors/` at the second. All 35 are opened
+at launch, several git calls each, and all 35 get a row; `t` hides the ones with nothing
+pending, but they were still opened, and a stray file in one puts it back on screen. With
+
+```toml
+skip_globs = ["archive/**", "mirrors/**"]
+```
+
+the walk never enters those two folders: nothing there is opened or listed, and launch is
+two repositories.
+
+**A clone an agent left inside a repository.**
+
+```
+/home/me/src/
+└── app/                    .git
+    ├── src/
+    └── tools/
+        └── linter/         .git   (cloned here by an agent; not in .gitignore)
+```
+
+Launched in `/home/me/src`. `tools/linter/` is untracked and not ignored, so the scan of
+`app` sees it and lastcall gives it a row of its own, badged as nested in `app`; a folder
+holding a repository is never a file row of `app` itself, because git does not look inside
+one. With
+
+```toml
+skip_globs = ["app/tools/linter/**"]
+```
+
+the clone shows nowhere: no row of its own, and no entry under `app`. Use the key for a
+clone you do not want reviewed at all; what an agent writes inside it is not seen. The glob
+starts with `app/` because paths are matched below `/home/me/src`, the folder `app` is filed
+under, which is where this example launched.
+
+**A clone inside a gitignored folder.** Had the agent cloned into `app/z_ignore/dependencies/linter/`
+and `app`'s `.gitignore` named `z_ignore/`, neither door above would reach it: the walk does
+not enter `app`, and git does not look inside an ignored folder, so the scan of `app` never
+reports it. It reaches the list only through a watched folder (`draft_dirs = ["z_ignore/**"]`,
+which watches each repository's `z_ignore/` and lists a clone inside it) or through an
+`include_gitignored` pattern that reaches the ignored folder itself (`"z_ignore/"`; a
+`"z_ignore/**"` does not). `skip_globs` carves it out of what those let in:
+`skip_globs = ["app/z_ignore/dependencies/**"]` is the same key and the same rule, through a
+different door.
+
+`search_depth` counts plain folders under a parent directory, never what is inside a
+repository: no depth reaches a clone kept inside one.
+
+To see a set of generated files as short rows instead of their diffs, snapshots or
+lockfiles say, use `collapsed_globs` with the folder (`"crates/app/tests/snapshots/**"`):
+each file stays a row you can accept, with its counts, and no diff is read for it.
+
+No key hides a change inside a repository you see: a tracked or untracked file that changed
+is always a row, so that nothing an agent did goes by unreviewed. To accept many rows at
+once, `shift-a` on a repository's row accepts everything pending in it, and `ctrl-a` accepts
+everything everywhere.
 
 ## `[keys]`
 
