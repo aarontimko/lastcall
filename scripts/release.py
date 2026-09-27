@@ -754,7 +754,7 @@ def cmd_self_test(args):
 
     # The branch prep commits on: any but main.
     refuses("prep on main", "main", check_prep_branch, "main")
-    for name in ("feat/phase15", "release/v0.7.0", "fix/a-thing"):
+    for name in ("feat/range-select", "release/v0.7.0", "fix/a-thing"):
         passes("prep on " + name, check_prep_branch, name)
 
     # The version against the crate and against origin's tags, over a fake ls-remote listing.
