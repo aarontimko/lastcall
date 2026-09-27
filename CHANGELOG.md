@@ -21,9 +21,8 @@ binary rather than for the commit log.
 
 - `shift-j`, `shift-k`, `shift-down` and `shift-up` are now bound to the new `extend_down`
   and `extend_up` actions. A config that already binds one of them to something else no
-  longer loads, with
-  an error naming the key and both actions; give the other action a different key, or move
-  `extend_down` or `extend_up`.
+  longer loads, with an error naming the key and both actions; give the other action a
+  different key, or move `extend_down` or `extend_up`.
 
 ### Fixed
 
