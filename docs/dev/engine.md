@@ -572,21 +572,24 @@ commits into an unexplained pile), and an empty undo stack. The switch itself th
 nothing new. Then the **fold onto the merge-base**: if the branch left still has a ref and the
 two tips have a commit in common (`merge-base`), that commit is the fold's target `M`, and the
 paths that differ between the branch left and `M` (`diff-tree -r --name-only`) are considered
-one by one. A path is folded onto `M`'s committed content only when **both** of two things
-hold. First, the record's composed baseline for it (the override's blob and mode, else the seen
-tree's entry, else absent) is exactly what the branch left holds at its tip: a commit the agent
-made on `A` that nobody has read yet is not finished there, so it still shows on `B`. Second,
-`M`'s own entry is **already seen state**, which is either that `M` is reachable from
-`first_sight_head`, the commit the root was first sighted at, so everything committed there was
-in the repository before lastcall looked at all, or that some record in the ledger, in force or
-parked, composes exactly that entry as its own baseline, which makes it a first-sight entry, an
-accepted one, or one an earlier fold already carried. The fold takes only entries the ledger
+one by one. One rule decides each: a path is folded onto `M`'s committed content when `M`'s own
+entry is **already seen state**, whatever the branch left holds for it at its tip. Seen state
+is either that `M` is reachable from `first_sight_head`, the commit the root was first sighted
+at, so everything committed there was in the repository before lastcall looked at all, or that
+some record in the ledger, in force or parked, composes exactly that entry as its own baseline,
+which makes it a first-sight entry, an accepted one, or one an earlier fold already carried. A
+path whose composed baseline (the override's blob and mode, else the seen tree's entry, else
+absent) already equals `M`'s entry is skipped, since there is nothing to write. The fold does
+not ask whether the record had finished with a path on the branch left: a commit the agent made
+on `A` that nobody has read yet stays with `A`, whose record is parked whole before the fold
+runs, so it shows again on the next return there, and the entry that becomes seen state on `B`
+is `M`'s, never the one at `A`'s tip (Amendment v1.17, proposed). The fold takes only entries the ledger
 can point at and say where they were seen. Everything else keeps the copied baseline and shows,
 which is the honest answer: a version committed and reverted while its row was never accepted,
 a mode flip, a symlink, a deletion nobody accepted, the content of a branch merged or rebased
 in without ever being checked out, whichever of two merge-bases git happens to pick for a
 criss-cross. A root whose state file predates `first_sight_head` has no answer to the first
-question and folds through the records alone, which over-shows and hides nothing.
+half of seen state and folds through the records alone, which over-shows and hides nothing.
 The folded paths take their entries in one `write_tree` (absent at `M` removes them) and lose
 the blob and mode of any override they carried; a flag-only override stays, as `Ops::fold`
 already keeps flagged overrides, and a gitlink entry is left out because the content model
@@ -600,8 +603,8 @@ the branch left folds back to there instead of being listed on the arriving bran
 of deletions, and the commits the arriving branch made of its own are not in the differing set
 at all, so they show. Content that arrives on another branch by cherry-pick shows again there,
 by design: lastcall never guesses that you have read it. It differs between the branch left and
-`M`, the record accepted it at that tip, so the fold takes it back to `M`'s entry and the
-content here shows against that.
+`M`, so the fold takes it back to `M`'s entry when that entry is seen state, and the content
+here shows against that.
 
 **Parking, loading, pruning, renaming.** Leaving a branch parks its record whole, undo stack
 and all, and arriving on a branch that has one moves it back into force exactly as it was left.

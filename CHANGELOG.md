@@ -5,6 +5,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html). A version's s
 exactly what its GitHub release notes carry, so it is written for the people installing the
 binary rather than for the commit log.
 
+## Unreleased
+
+### Fixed
+
+- The first visit to a branch cut from an older commit no longer lists a file you already
+  reviewed there. When the branch you left had a later change to that file you had not
+  accepted yet, the file showed as changed on the new branch, though its content there was
+  what you had already seen, and whether it showed depended on whether lastcall was open
+  when you switched. The unfinished change is still waiting for you on the branch you left.
+
 ## 0.6.0 - 2026-09-26
 
 ### Added
