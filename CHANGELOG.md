@@ -7,6 +7,23 @@ binary rather than for the commit log.
 
 ## Unreleased
 
+### Added
+
+- A run of rows in the list: from a file row, `J` (or shift-down) and `K` (or shift-up)
+  select the next or previous file row as well, within one repository, and `A` accepts the
+  whole run as one, which one `z` puts back. The file header and the hint line count the
+  files the run holds. A shift-click on a file row of the same repository selects the run up
+  to it inside a herdr pane, and in any terminal that passes a shifted click on; elsewhere
+  shift with the mouse stays the terminal's own text selection, and the keys work
+  everywhere. Every other key still acts on the cursor row alone.
+
+### Changed
+
+- `J`, `K`, shift-down and shift-up are now bound to the new `extend_down` and `extend_up`
+  actions. A config that already binds one of them to something else no longer loads, with
+  an error naming the key and both actions; give the other action a different key, or move
+  `extend_down` or `extend_up`.
+
 ### Fixed
 
 - The first visit to a branch cut from an older commit no longer lists a file you already

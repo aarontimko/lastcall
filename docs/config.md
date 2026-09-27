@@ -196,7 +196,8 @@ each file stays a row you can accept, with its counts, and no diff is read for i
 
 No key hides a change inside a repository you see: a tracked or untracked file that changed
 is always a row, so that nothing an agent did goes by unreviewed. To accept many rows at
-once, `shift-a` on a repository's row accepts everything pending in it, and `ctrl-a` accepts
+once, `shift-a` on a repository's row accepts everything pending in it, `shift-a` on a run
+of rows selected with `shift-j` or `shift-k` accepts just those, and `ctrl-a` accepts
 everything everywhere.
 
 ## `[keys]`
@@ -230,6 +231,8 @@ the character the keyboard sends.
 | `nav_bottom` | `end` | the last entry, or the end of the diff |
 | `nav_prev_root` | `alt-up`, `{` | the previous repository's row. Inside the first one, that repository's own row |
 | `nav_next_root` | `alt-down`, `}` | the next repository's row. On the last one, nothing: these jump, they never wrap |
+| `extend_down` | `shift-j`, `shift-down` | from a file row, select the next file row as well, making a run of rows in one repository that `shift-a` accepts as one. Stops at the repository's last file row |
+| `extend_up` | `shift-k`, `shift-up` | the same run, grown upward |
 | `open` | `enter`, `l`, `right` | open the diff for the selected row |
 | `back` | `esc`, `h`, `left` | close the help overlay, else return to the file list. Never quits. |
 | `focus_toggle` | `tab` | move focus between the two panes |
@@ -243,7 +246,7 @@ the character the keyboard sends.
 | `snooze` | `s` | set a repository aside for a number of days |
 | `show_snoozed` | `shift-s` | show or hide the repositories that are set aside |
 | `accept` | `a` | accept the hunk under the cursor, or a file with no hunks |
-| `accept_file` | `shift-a` | accept the whole file, or the whole repository from its row |
+| `accept_file` | `shift-a` | accept the whole file, the whole repository from its row, or every file of a selected run |
 | `accept_all` | `ctrl-a` | accept everything listed, across every repository |
 | `restore` | `u` | put the hunk back the way it was |
 | `restore_file` | `shift-u` | put the whole file back, asking first |

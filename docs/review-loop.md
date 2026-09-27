@@ -253,6 +253,17 @@ after this point is pending.
 - `ctrl-a` accepts everything listed across every repository. Above ten files it asks
   first, naming the count.
 
+To accept some of a repository's files and leave the rest, select them as a run. From a
+file row in the list, `J` (or shift-down) adds the next file row and `K` (or shift-up) the
+one above; the run's other rows are drawn dimmer than the cursor row, and the file header
+and the hint line read `A accept 3 files`. `A` accepts the run in one go, and one `z` puts
+all of it back. A run stays inside one repository and stops at a group row. Inside a herdr
+pane a shift-click on another file row of the same repository selects the run up to it, as
+it does in any terminal that passes a shifted click on; outside herdr, shift with the mouse
+is usually the terminal's own text selection, so there the keys are the way to build a run.
+Every other key acts on the cursor row alone, and a plain move, a plain click or `Esc` lets
+the run go.
+
 The cursor then moves the way you would want it to: accept the last hunk in a file and it
 goes on to the next file, accept the last file in a repository and it lands on the
 repository row rather than jumping somewhere else.
