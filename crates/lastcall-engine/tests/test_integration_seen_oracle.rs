@@ -625,6 +625,74 @@ fn seen_oracle_the_seed_folds_back_at_the_first_sight_head() {
     assert!(unobserved.pile.is_empty(), "{unobserved:?}");
 }
 
+/// Proptest's shrunk case at 64 cases: `f2 = v0` is committed on `main`, `b0` is cut there
+/// and accepts it, `b0` then deletes `f2` and nobody accepts the deletion, and `b1` is cut
+/// at the seed commit after a checkout of `main`. The unwatched run arrives on `b1` still
+/// holding `b0`'s record, whose baseline for `f2` is the accepted `v0` while `b0`'s tip has
+/// no `f2` at all. The merge-base is the commit lastcall first saw, so its entry is seen
+/// state and the path folds back to it whatever `b0` left unfinished: `b0` keeps its own
+/// record, and the deletion shows there on the next return. Red while the fold also asked
+/// for the record to match the departed tip: the unwatched run manufactured `f2:Modified`.
+#[test]
+fn seen_oracle_a_path_left_unfinished_on_the_departed_branch_still_folds() {
+    let ops = vec![
+        Op::Commit(vec![(1, Some(0))]),
+        Op::Cut(CutAt::Tip),
+        Op::AcceptAll,
+        Op::Commit(vec![(1, None)]),
+        Op::Checkout(2),
+        Op::Cut(CutAt::Older),
+    ];
+    let (observed, unobserved) = both_runs(&ops);
+    assert!(observed.pile.is_empty(), "{observed:?}");
+    assert!(unobserved.pile.is_empty(), "{unobserved:?}");
+}
+
+/// A pinned finding, not a fix: the open item "A seen-oracle random history manufactures a
+/// pending row" in `docs/spec` §11. `f1 = v0` is committed and accepted on `main`, `b0` is
+/// cut there, `main` is checked out again, `f1 = v1` is committed and accepted, and `b1` is
+/// cut at `main~1`, where `f1` is `v0` again. The watching run parked `b0`'s record, which
+/// still holds `v0` as accepted, so at `b1`'s first sight clause (b) of the fold finds the
+/// merge-base's entry in a record and folds it: nothing shows. The unwatched run never
+/// scanned `b0`, so no record holds `v0` any more (`main`'s baseline moved on to `v1`), the
+/// fold refuses, and `f1` shows as modified. That is the direction Property 2 forbids.
+///
+/// The cause is not a fold rule: `v0` was accepted and the record forgot it when the
+/// baseline moved, so only a parked copy remembers, and seen state depends on which
+/// branches were watched. No rule over the records as they are makes the two runs agree.
+/// The hardening is a per-root memory of accepted content, a schema change with its own
+/// amendment. This test asserts today's outcome exactly, so a change in either direction
+/// (the hardening landing, or the watching run starting to show `f1`) is noticed here.
+#[test]
+fn seen_oracle_a_parked_record_is_the_only_witness_of_accepted_content() {
+    let ops = vec![
+        Op::Commit(vec![(0, Some(0))]),
+        Op::AcceptAll,
+        Op::Cut(CutAt::Tip),
+        Op::Checkout(0),
+        Op::Commit(vec![(0, Some(1))]),
+        Op::AcceptAll,
+        Op::Cut(CutAt::Older),
+    ];
+    let (observed, log_o) = run(&ops, true).expect("the watching run");
+    let (unobserved, log_u) = run(&ops, false).expect("the unwatched run");
+    assert_eq!(
+        observed.seen_branch, unobserved.seen_branch,
+        "both runs end on the same branch"
+    );
+    assert!(
+        observed.pile.is_empty(),
+        "the watching run folds f1 through b0's parked record: {observed:?}\n{}",
+        log_o.join("\n")
+    );
+    assert_eq!(
+        unobserved.pile,
+        vec!["f1:Modified".to_owned()],
+        "the unwatched run has no record holding v0 and shows f1\n{}",
+        log_u.join("\n")
+    );
+}
+
 /// The third shape the generator found, pinned here and kept out of it: `f1` is accepted on
 /// `main` at `c2`, a branch is cut at `c1`, and `main` is deleted before lastcall looks. The
 /// watching run folded `f1` back to `c1` while `refs/heads/main` was still there; the
