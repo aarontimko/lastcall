@@ -5732,3 +5732,144 @@ fn pty_seen_group_cherry_pick_expand_flag_accept_undo() {
     assert_eq!(status.exit_code(), 0, "{status:?}");
     assert_clean_exit(&pty, since);
 }
+
+// ---- range selection -------------------------------------------------------------------
+
+/// A shift-click through a real terminal: a click on `f1`, a shift-click on `parse.rs`,
+/// and alpha's three rows are one run. `A` accepts them as one request with one undo
+/// entry, and `z` puts all three back. Nothing between the shift-click and the `A` walks
+/// the nav: `select_until` sends `h`, which is `back`, and `back` clears a run.
+#[test]
+fn pty_range_select_accepts_three_and_undoes_them() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let Some(mut pty) = fx.spawn_tui(&bin()) else {
+        return;
+    };
+    wait_first_piles(&mut pty);
+    assert_eq!(undo_depth(&fx, "alpha"), 0, "nothing accepted yet");
+
+    // (1) a plain click on f1 opens it.
+    let f1_row = pty
+        .find_row(|r| r.starts_with("│  M f1"))
+        .expect("alpha's f1 row is on screen");
+    pty.click(5, f1_row).expect("click f1");
+    pty.wait_for_text("f1  M  +1 −1", Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("clicking f1 opens it: {e}\n{}", pty.screen_text()));
+
+    // (2) a shift-click on parse.rs: the run is f1, f2 and parse.rs, and the header's
+    // control counts it.
+    let parse_row = pty
+        .find_row(|r| r.starts_with("│  M parse.rs"))
+        .expect("alpha's parse.rs row is on screen");
+    let t = Instant::now();
+    pty.shift_click(5, parse_row).expect("shift-click parse.rs");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        let text = s.contents();
+        text.contains("src/parse.rs  M ") && text.contains("[A accept 3 files]")
+    })
+    .unwrap_or_else(|e| panic!("the run of three: {e}\n{}", pty.screen_text()));
+    note(&format!(
+        "PTY range: the shift-click drew the run after {:.3?}",
+        t.elapsed()
+    ));
+    for (row, name) in [(f1_row, "f1"), (f1_row + 1, "f2"), (parse_row, "parse.rs")] {
+        assert!(
+            pty.inverse_at(row, 3),
+            "{name} is drawn as part of the run:\n{}",
+            pty.screen_text()
+        );
+    }
+
+    // (3) `A` accepts the three: under the confirm threshold, so at once.
+    let t = Instant::now();
+    pty.send(b"A").expect("A");
+    pty.wait_for(OVERLOADED, |s| {
+        let text = s.contents();
+        status_is(s, "accepted 3 files in alpha")
+            && !text.contains("M f1")
+            && !text.contains("M f2")
+            && !text.contains("M parse.rs")
+            && text.contains("3 repos · 3 files")
+    })
+    .unwrap_or_else(|e| panic!("the run accepted: {e}\n{}", pty.screen_text()));
+    note(&format!(
+        "PTY range: A accepted the run after {:.3?}",
+        t.elapsed()
+    ));
+    assert_eq!(
+        undo_depth(&fx, "alpha"),
+        1,
+        "one entry for the three files: {}",
+        fx.ledger("alpha")
+    );
+
+    // (4) `z` puts all three back with the one entry.
+    pty.send(b"z").expect("z");
+    pty.wait_for(OVERLOADED, |s| {
+        let text = s.contents();
+        status_is(s, "undid accept of 3 files in alpha")
+            && text.contains("M f1")
+            && text.contains("M f2")
+            && text.contains("M parse.rs")
+            && text.contains("3 repos · 6 files")
+    })
+    .unwrap_or_else(|e| panic!("the undo: {e}\n{}", pty.screen_text()));
+    assert_eq!(undo_depth(&fx, "alpha"), 0, "the entry was spent");
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}
+
+/// The keyboard half, which works in every terminal: `J` and then `shift-down` from f1
+/// grow the run to alpha's three rows, and `A` accepts them as one entry. The walk to f1
+/// happens before the first extend, never after it.
+#[test]
+fn pty_range_select_by_keys_accepts_three() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let Some(mut pty) = fx.spawn_tui(&bin()) else {
+        return;
+    };
+    wait_first_piles(&mut pty);
+    select_until(&mut pty, "f1  M  +1 −1");
+
+    pty.send(b"J").expect("J");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        let text = s.contents();
+        text.contains("f2  M ") && text.contains("[A accept 2 files]")
+    })
+    .unwrap_or_else(|e| panic!("J grew the run to two: {e}\n{}", pty.screen_text()));
+    // shift-down as a terminal sends it: CSI 1;2B, one write.
+    pty.send(b"\x1b[1;2B").expect("shift-down");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        let text = s.contents();
+        text.contains("src/parse.rs  M ") && text.contains("[A accept 3 files]")
+    })
+    .unwrap_or_else(|e| panic!("shift-down grew it to three: {e}\n{}", pty.screen_text()));
+
+    pty.send(b"A").expect("A");
+    pty.wait_for(OVERLOADED, |s| {
+        let text = s.contents();
+        status_is(s, "accepted 3 files in alpha")
+            && !text.contains("M f1")
+            && !text.contains("M parse.rs")
+            && text.contains("3 repos · 3 files")
+    })
+    .unwrap_or_else(|e| panic!("the run accepted: {e}\n{}", pty.screen_text()));
+    assert_eq!(
+        undo_depth(&fx, "alpha"),
+        1,
+        "one entry for the three files: {}",
+        fx.ledger("alpha")
+    );
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}

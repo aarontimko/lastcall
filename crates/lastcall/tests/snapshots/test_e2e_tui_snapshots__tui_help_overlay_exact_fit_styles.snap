@@ -55,7 +55,9 @@ expression: style
 25 0..2 Cyan Reset -
 25 97..98 Cyan Reset -
 26 0..2 Cyan Reset -
-26 3..17 Reset Reset DIM
 26 97..98 Cyan Reset -
-27 0..1 Reset Reset DIM
-27 1..98 Cyan Reset -
+27 0..2 Cyan Reset -
+27 3..17 Reset Reset DIM
+27 97..98 Cyan Reset -
+28 0..1 Reset Reset DIM
+28 1..98 Cyan Reset -
