@@ -221,6 +221,226 @@ Staging the [sponsor] gate's `skip_globs` check on the sponsor's machine found t
 
 `CHANGELOG.md` `## Unreleased` `### Fixed`: one entry, for the people installing the binary: a repository sitting inside a listed one at launch is now on the screen from the start, not only when it appears while the screen is open. `docs/dev/engine.md`: one sentence where the launch scan and `scan_all` are described, naming `take_roots_changed` (**84 em-dash lines, count before and after**). `docs/config.md` needs no change: its sentence becomes true. No em-dash anywhere in the user docs or the CHANGELOG; no personal detail; the sponsor's machine and repositories unnamed.
 
+## Deliverable I: the pattern keys named for what they do, and the page that says when to use each
+
+Ruled 2026-09-26 by the sponsor after a naming workshop, before the branch is pushed:
+`review_ignored` becomes `include_gitignored`, `ignore_globs` becomes `watch_ignore_globs`,
+`skip_globs` keeps its name. The sponsor's reasons, paraphrased: "review" was abstract and
+forgotten within a day; a user should not meet one wildcard grammar here and another there
+without being told which is which; and the configuration page must carry worked examples
+with real directory trees, because a description that stays abstract confuses a person and
+an agent reading the docs alike. `ignore_globs` shipped in `v0.1.0`, so its rename is a
+breaking change and is called one; the other two keys are unreleased, so theirs are plain
+renames. Deliverables A and E above keep the old names as the record of what was built.
+
+### What exists (facts at `3af8024`)
+
+- `crates/lastcall-engine/src/config/mod.rs`: `pub review_ignored: Vec<String>` (line 80,
+  default at 134, validation 498 to 515: empty, leading `!`, more than one line);
+  `pub ignore_globs` (88); `pub skip_globs` (97). `Config` carries `deny_unknown_fields`
+  (65), so a file holding a key that no longer exists fails `Config::parse` (432) with
+  toml's own text, `unknown field `review_ignored`, expected one of ...`, wrapped in
+  `ConfigError::Parse { path, line, .. }`. The same `parse` serves the launch and `R`
+  (`reload_config`, `crates/lastcall/src/tui/run.rs:908`), so a stale key is refused in
+  both places, today without saying what the key is called now.
+- The reload status line names the keys that changed (`crates/lastcall/src/tui/app.rs:683`
+  to 717): `review_ignored` and `skip_globs` by name, `ignore_globs` as `watcher` (705).
+  Its tests at app.rs:7927 to 7953 and 8025 spell the names.
+- The engine exposes `ignore_globs()` (used by `crates/lastcall-engine/src/watcher.rs:737`
+  and 968); `build_globs` (`engine.rs:2245`) builds `ignore_globs` and `collapsed_globs`
+  with `literal_separator(false)`, so in those two keys a `*` crosses `/`; `skip_globs` and
+  `draft_dirs` use `literal_separator(true)` (`config/mod.rs:576`, `roots.rs:690`), so
+  there a `*` stays inside one folder name. A `.gitignore` pattern behaves like the latter.
+  This difference is documented, not changed, in this deliverable.
+- The four ways a repository reaches the list (`crates/lastcall-engine/src/roots.rs`): the
+  folder walk under each parent directory (326 to 372), which never enters a repository
+  (340 to 347) at any `search_depth`; nested repositories reported by a scan, that is a
+  clone left untracked inside a listed repository (377 to 391); worktrees a repository
+  keeps inside itself (393 to 417); and watched folders (466 to 473). `skip_globs` is
+  tested before each candidate is opened, with a backstop at 422. An `include_gitignored`
+  pattern that un-ignores the folder holding a gitignored clone inside a listed
+  repository surfaces it through the second way (`docs/config.md:73` says so; the
+  classification is `index.rs:406` to 423, `Other::NestedRepo` for a listed `dir/` with a
+  `.git` entry, and the pattern must reach the folder itself, `"z_ignore/"`, not only files
+  under it; the worker verifies this before the docs repeat it, and reports what it found).
+- Where the old names occur (grep at `3af8024`, `target/`, `.git/` and `z_ignore/`
+  excluded): `review_ignored` in 14 files, `ignore_globs` in 17, `skip_globs` in 15
+  (unchanged). Outside the spec directory they are: `CHANGELOG.md`, `config/mod.rs`,
+  `engine.rs`, `index.rs`, `watcher.rs`, `roots.rs`, `scan.rs`,
+  `tests/test_integration_scenarios_d.rs`, `tests/test_integration_scenarios_a.rs`,
+  `tests/test_integration_reload.rs`, `tests/test_integration_watcher.rs`, `tui/app.rs`,
+  `tui/run.rs`, `docs/config.md`, `docs/dev/engine.md`, `docs/dev/tryout.md`,
+  `docs/dev/tui.md`, `scripts/tryout.py`. No snapshot, golden or fixture file holds a key
+  name (`crates/lastcall/tests/snapshots`, the `status --json` golden: zero hits).
+- `docs/config.md`: the key rows at lines 72 (`draft_dirs`), 73 (`review_ignored`), 76
+  (`collapsed_globs`), 78 (`ignore_globs`), 79 (`skip_globs`), 81 (`search_depth`); the
+  paragraphs "Four keys take patterns" (101) and "Which key for what" (108) after the
+  example file. `docs/dev/tryout.md:162` to 185 and `scripts/tryout.py:252` to 267 (the
+  `ignored` scenario writes `review_ignored = ["z_ignore_*"]` and its steps quote it) and
+  315 to 317 (the `reload` scenario's `skip_globs` step, unchanged).
+- `lastcall config` and `lastcall config --json` print the loaded `Config` through serde
+  (`crates/lastcall/src/commands/config.rs:28` to 35; `Config` derives `Serialize`,
+  `config/mod.rs:64`), so the field names are the JSON keys a script reads: the rename
+  changes `config.review_ignored` and `config.ignore_globs` in that output. No test,
+  golden or probe asserts those keys today.
+- `docs/spec/00-spec.md` lines 321, 397, 407 and 409 name the old keys inside frozen §6
+  (397 is §6.4); §8 and §10 name `review_ignored`. `docs/spec/01-scenarios.md` names `review_ignored` in D27 and
+  `ignore_globs` in D9. The spec files are not the worker's; the amendment line (v1.16,
+  PROPOSED) and the D27 rename are written at close-out by the orchestrator.
+
+### The model
+
+1. **`review_ignored` is `include_gitignored` everywhere it is ours.** The field, its
+   default, the three validation messages, the reload status part, the engine and index
+   code and comments, every compound identifier (`set_review_ignored` and the like) and
+   every test and test name, `docs/config.md`, `docs/dev/engine.md`,
+   `docs/dev/tryout.md`, `docs/dev/tui.md`, `scripts/tryout.py` and the CHANGELOG's
+   `### Added` bullet. Behaviour is unchanged byte for byte: the `others` argv, the D27
+   integration tests, the accept and reload semantics. A test that asserts the argv keeps
+   asserting the same literal.
+2. **`ignore_globs` is `watch_ignore_globs` everywhere it is ours.** The field, its default
+   list (unchanged), the engine accessor (`watch_ignore_globs()`), the watcher, the reload
+   detection (the status part stays `watcher`), every test, the docs and the CHANGELOG.
+   The CHANGELOG's `## Unreleased` gains a `### Changed` section whose first bullet begins
+   `Breaking:` and says: the key `ignore_globs` is now `watch_ignore_globs`, with the same
+   default and the same meaning; a `config.toml` that still says `ignore_globs` is refused
+   at launch and on `R`, with the new name in the message; rename the line; and
+   `lastcall config --json` prints the key under its new name (`include_gitignored` moves
+   too, but was never released). The bullet is the one place outside the spec directory
+   and the hint where the old name survives. A unit test in `commands/config.rs` asserts
+   the JSON dump names `watch_ignore_globs` and `include_gitignored` and neither old key.
+3. **A stale key is refused by name, with the new name.** `Config::parse` keeps returning
+   `ConfigError::Parse` with the line number, but when toml's message reports an unknown
+   field named exactly `review_ignored` or `ignore_globs`, the message a person sees is
+   `the key `review_ignored` is now `include_gitignored`: rename it` (same shape for the
+   other), in place of toml's "expected one of" list. Detection is a match on the unknown
+   field's name taken from toml's message (`unknown field `<name>``) **and** the message's
+   expected list naming `` `parent_dirs` ``, so the hint fires for the top-level table only
+   (`[ui]`, `[herdr]` and `[update]` also refuse unknown keys, `config/mod.rs:209`, 237,
+   256, and a stray `review_ignored` inside one of them keeps toml's own text); no serde
+   alias, no second parse: the old keys stay refused, which is what the sponsor ruled. The hint
+   reaches both the launch refusal and the `R` status line unchanged, because both come
+   from `parse`. `skip_globs` needs no hint.
+4. **`docs/config.md` says when to use which key, with trees.** Three rows rewritten and
+   one section added; all in house style (no em-dashes, no home paths: the example trees
+   use `/home/me/src` as the file already does, no process vocabulary).
+   - Row `include_gitignored` (replaces `review_ignored`), keeping every fact of today's
+     row (grammar, matching from the repository's own folder, no badge, an ignored folder
+     needs the trailing slash, the nested-repository sentence, the entry rules, removing
+     an entry hides nothing), opening with these sentences: "Files your `.gitignore` hides
+     are normally not reviewed. A pattern here makes matching gitignored files show as
+     ordinary rows in their repository, with their diffs, so an agent writing into an
+     ignored folder is still reviewed. Written exactly like a `.gitignore` line."
+   - Row `watch_ignore_globs` (replaces `ignore_globs`): "While lastcall is open it watches
+     your files so the list updates as agents write. Folders matching these globs do not
+     wake the watcher, which stops build output and dependency folders from causing
+     constant rescans. This is only about noise: a file that changed under a matching
+     folder still shows at the next scan or when you press `r`. Each entry is matched
+     against a changed file's path from the repository's own folder, a bare name matches
+     at any depth, and a `*` crosses folders here (it does not in `skip_globs` or
+     `draft_dirs`). The key was `ignore_globs` before
+     this release."
+   - Row `skip_globs`, keeping every fact of today's row (the two effects, never a listed
+     repository's own files, parent and launch directory never skipped with a notice,
+     state kept, the entry rules), opening with: "Names repositories and folders to leave
+     out of the list. Without it, the list holds every repository found under where you
+     launched, every clone left untracked inside one of those, every worktree kept inside
+     one, and every repository inside a watched folder. A matching repository is never
+     listed or opened, a matching plain folder is never searched, and inside a watched
+     folder a matching file or clone is not reviewed. Matched against the path below the
+     folder a repository is filed under; a `*` stays inside one folder name and `**`
+     crosses folders. It never hides a changed file inside a repository you do see." It
+     ends by pointing at the section below for the worked examples.
+   - Row `search_depth` gains, after "The walk never enters a repository": "so no depth
+     reaches a clone kept inside one (a gitignored `z_ignore/dependencies/` say); a
+     watched folder or `include_gitignored` is how such a clone is listed, and
+     `skip_globs` is how it is left out again". The row's other sentences stay.
+   - Rows `collapsed_globs` and `draft_dirs`: one clause each saying whether a `*` crosses
+     folders (it does in `collapsed_globs`; the `draft_dirs` row already says it does
+     not). Nothing else in those rows changes.
+   - The two paragraphs "Four keys take patterns" and "Which key for what" are replaced by
+     one section, `## Which key leaves what out`, placed where they were, holding in this
+     order: (a) "Where a repository comes from": the four ways, one sentence each, and that
+     `skip_globs` is checked on every candidate from all four before it is opened; (b) a
+     grammar table with the columns key, matched from, `*`, `**`, example, one row per
+     pattern key (`draft_dirs`, `include_gitignored`, `skip_globs`, `watch_ignore_globs`,
+     `collapsed_globs`); (c) two worked examples, each a fenced directory tree followed by
+     the `skip_globs` line and what changes, written from the orchestrator's text below;
+     (d) the third example in prose: a gitignored clone inside a repository reaches the
+     list only through a watched folder (`draft_dirs = ["z_ignore/**"]`) or an
+     `include_gitignored` pattern, and `skip_globs` carves it out of what those let in,
+     which is the same key and the same rule through a different door; (e) the
+     `search_depth` sentence: depth counts plain folders under a parent directory, never
+     what is inside a repository; (f) the retained sentences "No key hides a change inside
+     a repository you see ... nothing an agent did goes by unreviewed" and the `shift-a` /
+     `ctrl-a` sentence. The trees:
+
+     ```
+     /home/me/src/
+     ├── app/            .git   (active)
+     ├── api/            .git   (active)
+     ├── archive/
+     │   ├── old-site/   .git
+     │   ├── prototype/  .git
+     │   └── ... 30 more
+     └── mirrors/
+         └── upstream-x/ .git   (a read-only mirror)
+     ```
+     Launched in `/home/me/src` with `search_depth = 2`, the walk finds `app` and `api` at
+     the first level and every clone under `archive/` and `mirrors/` at the second. All
+     35 are opened at launch, several git calls each, and all 35 get a row; `t`
+     hides the ones with nothing pending, but they were still opened, and a stray file in
+     one puts it back on screen. With `skip_globs = ["archive/**", "mirrors/**"]` the walk
+     never enters those two folders: nothing there is opened or listed, and launch is two
+     repositories.
+
+     ```
+     /home/me/src/
+     └── app/                    .git
+         ├── src/
+         └── tools/
+             └── linter/         .git   (cloned here by an agent; not in .gitignore)
+     ```
+     Launched in `/home/me/src`. `tools/linter/` is untracked and not ignored, so the
+     scan of `app` sees it and lastcall gives it a row of its own, badged as nested in
+     `app`; a folder holding a repository is never a file row of `app` itself, because
+     git does not look inside one. With `skip_globs = ["app/tools/linter/**"]` the clone
+     shows nowhere: no row of its own, and no entry under `app`. Use the key for a clone
+     you do not want reviewed at all; what an agent writes inside it is not seen. The glob
+     starts with `app/` because paths are matched below `/home/me/src`, the folder `app`
+     is filed under, which is where this example launched.
+5. **The other pages.** `docs/dev/engine.md` (eight hits, lines 365 to 1302) and
+   `docs/dev/tui.md` (one, 1423): the new names; each file's count of lines holding an
+   em-dash is unchanged by this deliverable (84 and 210 today; count the lines holding one).
+   `docs/dev/tryout.md`, `scripts/tryout.py` (the `ignored` scenario at 251, its config
+   line and step text), `README.md`, `docs/review-loop.md` and
+   `docs/herdr.md` (a grep of each for the old names; today the last three have none):
+   the new names, nothing else. Historical kickoffs (`docs/spec/9*-`, `1[0-3]*-`) and the
+   frozen spec lines keep the old names.
+6. **Nothing else changes.** No matching semantics, no defaults, no snapshot, no golden,
+   no scenario harness change. If a snapshot or golden changes, that is a behaviour change
+   this deliverable did not ask for: stop and report it.
+
+### Tests first (I)
+
+- `config/mod.rs` in-module: a file with `review_ignored = [...]` fails `parse` with a
+  message containing `is now `include_gitignored`` and the line number; the same for
+  `ignore_globs` and `watch_ignore_globs`; an unknown key that is not one of the two
+  (`reviewignored`) still fails with toml's own text; a file with the new keys parses and
+  round-trips. Red on the unchanged code for the first three.
+- `run.rs` in-module: `reload_config` over a file that says `ignore_globs` refuses with
+  the hint in the returned text, settings kept (extend the reload refusal test's pattern).
+- Every renamed test keeps its assertion; the counts move only by the tests added here.
+- `just lint`, `just test-unit`, `just test-integration`, `just test-e2e`,
+  `just test-scenarios`, `just test-prepush`: green.
+- `grep -rn 'review_ignored' --exclude-dir=target --exclude-dir=.git --exclude-dir=z_ignore .`
+  and `grep -rn 'ignore_globs' ... | grep -v watch_ignore_globs` (no `-w`: compound
+  identifiers and a key after `\n` in a test string must be caught too) return hits only
+  under `docs/spec/`, in the CHANGELOG's `Breaking:` bullet, and in the hint's code and
+  tests.
+- The `[sponsor]` half: reads the new `## Which key leaves what out` section cold and says
+  whether the trees make the key clear.
+
 ## Docs (all deliverables)
 
 `docs/config.md`: the `review_ignored` row (grammar, every depth, never inside an ignored folder, the over-show when an entry is removed); the `skip_globs` row (relative to the parent directory, the two effects, the boundary, what is never skipped); the `reload` row in the keys table; a paragraph after the resolution order saying `R` re-reads the file and what it cannot apply; the parent-key sentence. `docs/review-loop.md`: the `[seen] N files` row where the upstream group is explained, the header line, the badge, how it differs from upstream (folds), and `e` opening it into its members. `docs/herdr.md`: the worktree paragraph gains one sentence on a removed worktree leaving at once. `docs/dev/tui.md`: the key table, the fold rendering, the hint order (**the file stays at 210 lines containing an em-dash; count before and after**). `docs/dev/engine.md`: `others_args`, `seen.rs` and its cache, `RootGone` and `Scheduled::Discover`, `Engine::reload`, the skip in `discover` and in the draft scan (**84 em-dash lines, same rule**). `docs/dev/tryout.md`: the three new scenarios. `CHANGELOG.md`: a new `## Unreleased` above `## 0.5.0` with Added (`review_ignored`, `[seen] N files`, `R`, `skip_globs`) and Fixed (a removed worktree leaves the list at once instead of erroring for up to thirty seconds). House style: no em-dashes in the user docs, README or CHANGELOG; no personal detail; the sponsor's machine and repositories unnamed.
@@ -240,6 +460,7 @@ Staging the [sponsor] gate's `skip_globs` check on the sponsor's machine found t
 - [x] Standing: unit floor 852 grows (count and split in the report); integration, harness, prepush, PTY and snapshot counts stated; the real-herdr subset green in CI; `just audit` in CI only.
 - [x] G: the reducer, loop, render, snapshot, property and PTY tests above, red first for the reducer; one builder (`main_pane_lines(app, width)`) with the honest rule stated; the hint gate on `selectable_lines()`; every doc site above replaced; `tui.md` at 210; the [sponsor] copies a repository's path from a herdr pane with the mouse.
 - [x] H: the engine, watcher and screen tests above, each red on the unfixed code first; `skip_globs` composes (a skipped clone is never announced); CHANGELOG Fixed; `engine.md` at 84.
+- [ ] I: the stale-key hint tests (both old keys at launch and on `R`, a look-alike key and a key inside `[ui]` keep toml's text), red first; every renamed test green; the `config --json` dump names the new keys; the plain grep for the old names hits only `docs/spec/`, the CHANGELOG's `Breaking:` bullet and the hint; every tier green; no snapshot or golden changed; `docs/config.md` carries the four ways, the grammar table, the two trees and the `search_depth` sentence; `[sponsor]` reads `## Which key leaves what out` cold and says the trees make the keys clear.
 - [x] **[sponsor]** on the sponsor's own machine: `just tryout cherry-pick` walked step by step, all twelve steps (ruling 10: "make sure my sponsor really walks throught his in detail"), `just tryout ignored`, `just tryout reload`, and one agent worktree removed while listed in the sponsor's own repositories, with no error on the status line; the evals clones gone with one `skip_globs` line and one `R`; the sponsor's words in §10. *Closed 2026-09-26 on the sponsor's words: cherry-pick "I think this all was good"; ignored "all steps worked now"; reload "all steps worked ---- that is excellent UX and new features"; the worktree "removed within 1-2 seconds and I didn't see any error"; skip_globs "ahh great - I see them now - yes I think that UI/UX makes sense". §10 "the walks".*
 - [ ] Amendment v1.15 ratified by the merge; the §10 close-out entry with the judgment-call list; `v0.6.0` released by the sponsor's tag.
 
