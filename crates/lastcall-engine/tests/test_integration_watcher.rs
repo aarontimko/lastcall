@@ -188,14 +188,14 @@ async fn watcher_worktree_edit_schedules_a_scan_without_polling() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn watcher_ignore_globs_do_not_hide_tracked_edits() {
+async fn watcher_watch_ignore_globs_do_not_hide_tracked_edits() {
     let mut repo = FixtureRepo::new("watch-ignore").unwrap();
     repo.commit_files(&[("vendor/x", "v1\n")], "vendor")
         .unwrap();
     let state = TempDir::new("lc-watch-state");
     let env = repo.engine_env(state.path());
     let engine = open_engine(repo.parent_dir(), &env, state.path(), Config::default());
-    assert!(engine.ignore_globs().is_match("vendor/x"));
+    assert!(engine.watch_ignore_globs().is_match("vendor/x"));
     let root = engine.roots()[0].path.clone();
     let mut w = engine.run(EngineTimings {
         debounce: Duration::from_millis(100),

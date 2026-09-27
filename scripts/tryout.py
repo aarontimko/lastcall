@@ -249,7 +249,7 @@ def scenario_wrap(sandbox):
 
 
 def scenario_ignored(sandbox):
-    """`review_ignored`: gitignored scratch files reviewed inside their repository."""
+    """`include_gitignored`: gitignored scratch files reviewed inside their repository."""
     repo = sandbox.repo("demo")
     repo.commit(
         "base",
@@ -259,12 +259,12 @@ def scenario_ignored(sandbox):
     repo.write("z_ignore_plan.md", "# Plan\n\n- read the code\n- write the fix\n")
     repo.write("src/deep/er/z_ignore_notes.md", "notes from the agent\n")
     repo.write("z_ignore/inside.md", "a file inside an ignored folder\n")
-    sandbox.config_extra(keys='review_ignored = ["z_ignore_*"]')
+    sandbox.config_extra(keys='include_gitignored = ["z_ignore_*"]')
     demo = os.path.join(sandbox.parent, "demo")
     return [
         "Two rows, no badge. Under `demo` the list shows `src/deep/er/z_ignore_notes.md` "
         "and `z_ignore_plan.md`, each as a new file, although `.gitignore` ignores both "
-        "(the config says `review_ignored = [\"z_ignore_*\"]`). `z_ignore/inside.md` is "
+        "(the config says `include_gitignored = [\"z_ignore_*\"]`). `z_ignore/inside.md` is "
         "not listed: git never looks inside an ignored folder, so nothing there can be "
         "re-included.",
         "Accept. Select `z_ignore_plan.md` and press `a`: the row leaves the list.",

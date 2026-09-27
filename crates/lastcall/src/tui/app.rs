@@ -680,7 +680,7 @@ pub struct Reloading {
 /// file's new one ([`reload_changes`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReloadChanges {
-    /// In notice order: `keys`, `ui`, `watcher`, `collapse`, `review_ignored`,
+    /// In notice order: `keys`, `ui`, `watcher`, `collapse`, `include_gitignored`,
     /// `skip_globs`, `discovery`.
     pub parts: Vec<&'static str>,
     /// `[herdr]` or `[update]` differs: those apply at the next launch.
@@ -702,7 +702,7 @@ pub fn reload_changes(
     if old.ui != new.ui || old.hide_empty_repos != new.hide_empty_repos {
         parts.push("ui");
     }
-    if old.ignore_globs != new.ignore_globs {
+    if old.watch_ignore_globs != new.watch_ignore_globs {
         parts.push("watcher");
     }
     if old.collapsed_globs != new.collapsed_globs
@@ -710,8 +710,8 @@ pub fn reload_changes(
     {
         parts.push("collapse");
     }
-    if old.review_ignored != new.review_ignored {
-        parts.push("review_ignored");
+    if old.include_gitignored != new.include_gitignored {
+        parts.push("include_gitignored");
     }
     if old.skip_globs != new.skip_globs {
         parts.push("skip_globs");
@@ -7924,9 +7924,9 @@ mod tests {
         new.keys
             .insert("reload".into(), KeySpecs::One("ctrl-r".into()));
         new.ui.wrap = false;
-        new.ignore_globs.push("scratch/**".into());
+        new.watch_ignore_globs.push("scratch/**".into());
         new.collapse_size_bytes += 1;
-        new.review_ignored.push("z_ignore_*".into());
+        new.include_gitignored.push("z_ignore_*".into());
         new.skip_globs.push("*/evals/**".into());
         new.draft_dirs.push("notes".into());
         let all = reload_changes(&old, &new);
@@ -7937,7 +7937,7 @@ mod tests {
                 "ui",
                 "watcher",
                 "collapse",
-                "review_ignored",
+                "include_gitignored",
                 "skip_globs",
                 "discovery"
             ]
@@ -7945,12 +7945,12 @@ mod tests {
         assert!(!all.next_launch);
         assert_eq!(
             reload_notice(&all, (1, 0)),
-            "config reloaded: 1 root added, keys, ui, watcher, collapse, review_ignored, skip_globs",
+            "config reloaded: 1 root added, keys, ui, watcher, collapse, include_gitignored, skip_globs",
             "the counts say what discovery did"
         );
         assert_eq!(
             reload_notice(&all, (0, 0)),
-            "config reloaded: keys, ui, watcher, collapse, review_ignored, skip_globs, discovery"
+            "config reloaded: keys, ui, watcher, collapse, include_gitignored, skip_globs, discovery"
         );
         // `hide_empty_repos` is a `[ui]`-kind setting though it sits at the top level.
         let mut hide = old.clone();
@@ -8022,7 +8022,7 @@ mod tests {
         use lastcall_engine::config::Config;
         let old = Config::default();
         let mut new = old.clone();
-        new.ignore_globs.push("scratch/**".into());
+        new.watch_ignore_globs.push("scratch/**".into());
         let reload_event = |added: Vec<PathBuf>, removed: Vec<PathBuf>| {
             EngineEvent::RootsChanged(RootsChanged {
                 added,

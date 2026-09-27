@@ -2319,7 +2319,7 @@ mod tests {
 
     /// Phase 14 D: the reload's settings land under the engine lock before the discovery
     /// pass it asks for, exactly as the depth card's do. The file raises `search_depth` and
-    /// adds an `ignore_globs` entry; the watcher's reload `RootsChanged` must already list the
+    /// adds a `watch_ignore_globs` entry; the watcher's reload `RootsChanged` must already list the
     /// root only the new depth reaches, and the engine must hold the new ignore set.
     #[tokio::test]
     async fn run_reload_lands_before_the_discovery_it_asks_for() {
@@ -2341,7 +2341,7 @@ mod tests {
         std::fs::write(
             &file,
             format!(
-                "parent_dirs = [{:?}]\nsearch_depth = 2\nignore_globs = [\"scratch/**\"]\n\n[keys]\nreload = \"ctrl-r\"\n",
+                "parent_dirs = [{:?}]\nsearch_depth = 2\nwatch_ignore_globs = [\"scratch/**\"]\n\n[keys]\nreload = \"ctrl-r\"\n",
                 parent.display().to_string()
             ),
         )
@@ -2391,7 +2391,7 @@ mod tests {
         {
             let g = lock(&watcher.engine);
             assert!(g.root(&deep).is_some());
-            assert!(g.ignore_globs().is_match("scratch/a.txt"));
+            assert!(g.watch_ignore_globs().is_match("scratch/a.txt"));
         }
         watcher.join().await;
     }

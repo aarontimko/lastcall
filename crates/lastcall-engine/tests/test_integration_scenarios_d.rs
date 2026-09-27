@@ -2558,7 +2558,7 @@ fn scenario_d26_variant_c_the_first_sight_entry_folds_back() {
 }
 
 // ---------------------------------------------------------------------------------------
-// D27 — `review_ignored` lists chosen gitignored files inside their repository
+// D27 — `include_gitignored` lists chosen gitignored files inside their repository
 // (Amendment v1.15, Phase 14 deliverable A).
 // ---------------------------------------------------------------------------------------
 
@@ -2637,13 +2637,13 @@ impl D27 {
 
 fn reviewing(patterns: &[&str]) -> Config {
     Config {
-        review_ignored: patterns.iter().map(|p| (*p).to_owned()).collect(),
+        include_gitignored: patterns.iter().map(|p| (*p).to_owned()).collect(),
         ..Config::default()
     }
 }
 
 #[test]
-fn scenario_d27_review_ignored_lists_chosen_gitignored_files() {
+fn scenario_d27_include_gitignored_lists_chosen_gitignored_files() {
     let mut s = D27::new();
     assert_pile!(
         s.engine,
@@ -2748,10 +2748,10 @@ fn scenario_d27_review_ignored_lists_chosen_gitignored_files() {
     assert_eq!(pile.row(b"notes.scratch").unwrap().change, Change::Deleted);
 }
 
-/// D27, `status --json`: a `review_ignored` row is byte-identical in shape to an ordinary
+/// D27, `status --json`: a `include_gitignored` row is byte-identical in shape to an ordinary
 /// untracked row (no badge, no marker, no new field), because it is one.
 #[test]
-fn scenario_d27_a_review_ignored_row_is_shaped_like_an_untracked_row() {
+fn scenario_d27_a_include_gitignored_row_is_shaped_like_an_untracked_row() {
     use lastcall_engine::status::RowStatus;
     let mut s = D27::new();
     s.repo.write("plain_new.md", "top\n");

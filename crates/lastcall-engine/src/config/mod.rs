@@ -46,8 +46,8 @@ pub const DEFAULT_COLLAPSED_GLOBS: &[&str] = &[
     "composer.lock",
 ];
 
-/// Default `ignore_globs`: watch-set noise filters (§6.1).
-pub const DEFAULT_IGNORE_GLOBS: &[&str] = &[
+/// Default `watch_ignore_globs`: watch-set noise filters (§6.1).
+pub const DEFAULT_WATCH_IGNORE_GLOBS: &[&str] = &[
     ".git/**",
     "node_modules/**",
     "target/**",
@@ -77,7 +77,7 @@ pub struct Config {
     /// ordinary untracked candidate, at any depth, but never from inside an ignored folder
     /// (git does not descend into one, so nothing there can be re-included). Git roots
     /// only: a watched folder never applied the user's ignore files in the first place.
-    pub review_ignored: Vec<String>,
+    pub include_gitignored: Vec<String>,
     /// What a draft root's first sight means (§6.2).
     pub draft_initial: DraftInitial,
     /// Generated files rendered as a single accept row.
@@ -85,7 +85,7 @@ pub struct Config {
     /// Files at or above this size are collapsed. Must be > 0.
     pub collapse_size_bytes: u64,
     /// Watch-set noise filters; scope the watcher only, never pending computation (§6.5).
-    pub ignore_globs: Vec<String>,
+    pub watch_ignore_globs: Vec<String>,
     /// What discovery and a watched folder's review leave out (Amendment v1.15, §6.1):
     /// globs in the `draft_dirs` grammar (`literal_separator`, so a `*` stays inside one
     /// folder name), matched against a path relative to the parent directory a root is filed
@@ -131,14 +131,14 @@ impl Default for Config {
         Self {
             parent_dirs: Vec::new(),
             draft_dirs: Vec::new(),
-            review_ignored: Vec::new(),
+            include_gitignored: Vec::new(),
             draft_initial: DraftInitial::Seen,
             collapsed_globs: DEFAULT_COLLAPSED_GLOBS
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect(),
             collapse_size_bytes: DEFAULT_COLLAPSE_SIZE_BYTES,
-            ignore_globs: DEFAULT_IGNORE_GLOBS
+            watch_ignore_globs: DEFAULT_WATCH_IGNORE_GLOBS
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect(),
@@ -495,22 +495,22 @@ impl Config {
                 )));
             }
         }
-        for entry in &self.review_ignored {
+        for entry in &self.include_gitignored {
             if entry.trim().is_empty() {
                 return Err(invalid(format!(
-                    "review_ignored entry {entry:?} is empty: write a pattern as you would \
+                    "include_gitignored entry {entry:?} is empty: write a pattern as you would \
                      in .gitignore (`z_ignore_*`, `**/*.scratch.md`)"
                 )));
             }
             if entry.starts_with('!') {
                 return Err(invalid(format!(
-                    "review_ignored entry {entry:?} must not begin with `!`: every entry is \
+                    "include_gitignored entry {entry:?} must not begin with `!`: every entry is \
                      already a re-include, so write the pattern without it"
                 )));
             }
             if entry.contains('\n') || entry.contains('\0') {
                 return Err(invalid(format!(
-                    "review_ignored entry {entry:?} must be one pattern on one line \
+                    "include_gitignored entry {entry:?} must be one pattern on one line \
                      (no newline or NUL)"
                 )));
             }
@@ -676,7 +676,7 @@ draft_dirs = ["_drafts/**", "/abs/drafts"]
 draft_initial = "pending"
 collapsed_globs = ["*.lock"]
 collapse_size_bytes = 1024
-ignore_globs = [".git/**"]
+watch_ignore_globs = [".git/**"]
 hide_empty_repos = true
 search_depth = 3
 
@@ -718,7 +718,7 @@ nav_down = ["down", "j", "ctrl-n"]
         assert_eq!(c.draft_initial, DraftInitial::Pending);
         assert_eq!(c.collapsed_globs, vec!["*.lock"]);
         assert_eq!(c.collapse_size_bytes, 1024);
-        assert_eq!(c.ignore_globs, vec![".git/**"]);
+        assert_eq!(c.watch_ignore_globs, vec![".git/**"]);
         assert!(c.hide_empty_repos);
         assert_eq!(c.search_depth, 3);
         assert!(!c.ui.wrap);
@@ -881,7 +881,7 @@ nav_down = ["down", "j", "ctrl-n"]
             "vendor/**",
             ".venv/**",
         ] {
-            assert!(d.ignore_globs.iter().any(|g| g == noise), "{noise}");
+            assert!(d.watch_ignore_globs.iter().any(|g| g == noise), "{noise}");
         }
     }
 
@@ -1336,15 +1336,15 @@ nav_down = ["down", "j", "ctrl-n"]
         assert!(err.to_string().contains("unknown field"), "{err}");
     }
 
-    /// Amendment v1.15 (§6.1, scenario D27): `review_ignored` is a list of gitignore
+    /// Amendment v1.15 (§6.1, scenario D27): `include_gitignored` is a list of gitignore
     /// patterns, empty by default. An empty or whitespace entry, one that begins with `!`
     /// (the negation is the engine's to add) and one spanning lines are load errors naming
     /// the key; a wrong type is the usual parse error; a leading `/` anchors and is fine.
     #[test]
-    fn config_review_ignored_defaults_empty_validates_and_round_trips() {
-        assert!(Config::default().review_ignored.is_empty());
+    fn config_include_gitignored_defaults_empty_validates_and_round_trips() {
+        assert!(Config::default().include_gitignored.is_empty());
         let absent: Config = toml::from_str("parent_dirs = []\n").unwrap();
-        assert_eq!(absent.review_ignored, Vec::<String>::new());
+        assert_eq!(absent.include_gitignored, Vec::<String>::new());
 
         let path = Path::new("/x/config.toml");
         for (bad, says) in [
@@ -1355,13 +1355,13 @@ nav_down = ["down", "j", "ctrl-n"]
             ("a\0b", "one pattern on one line"),
         ] {
             let c = Config {
-                review_ignored: vec!["ok_*".to_string(), bad.to_string()],
+                include_gitignored: vec!["ok_*".to_string(), bad.to_string()],
                 ..Config::default()
             };
             let err = c.validate(path).unwrap_err();
             assert!(matches!(err, ConfigError::Invalid { .. }), "{bad:?}: {err}");
             let text = err.to_string();
-            assert!(text.contains("review_ignored"), "{bad:?}: {text}");
+            assert!(text.contains("include_gitignored"), "{bad:?}: {text}");
             assert!(text.contains(says), "{bad:?}: {text}");
             assert!(text.starts_with("config file /x/config.toml: "), "{text}");
         }
@@ -1373,29 +1373,32 @@ nav_down = ["down", "j", "ctrl-n"]
             "a\\ ",
         ] {
             let c = Config {
-                review_ignored: vec![good.to_string()],
+                include_gitignored: vec![good.to_string()],
                 ..Config::default()
             };
             c.validate(path).unwrap_or_else(|e| panic!("{good:?}: {e}"));
         }
 
         let dir = TempDir::new("lc-config");
-        let (env, _) = env_with_config(&dir, "review_ignored = \"z_ignore_*\"\n");
+        let (env, _) = env_with_config(&dir, "include_gitignored = \"z_ignore_*\"\n");
         let err = load(&env).unwrap_err();
         assert!(matches!(err, ConfigError::Parse { .. }), "{err}");
         assert!(
-            err.to_string().contains("review_ignored") || err.to_string().contains("sequence"),
+            err.to_string().contains("include_gitignored") || err.to_string().contains("sequence"),
             "{err}"
         );
-        let (env, _) = env_with_config(&dir, "review_ignored = [\"!x\"]\n");
+        let (env, _) = env_with_config(&dir, "include_gitignored = [\"!x\"]\n");
         let err = load(&env).unwrap_err();
         assert!(matches!(err, ConfigError::Invalid { .. }), "{err}");
 
-        let (env, _) = env_with_config(&dir, "review_ignored = [\"z_ignore_*\"]\n");
+        let (env, _) = env_with_config(&dir, "include_gitignored = [\"z_ignore_*\"]\n");
         let c = load(&env).unwrap().config;
-        assert_eq!(c.review_ignored, vec!["z_ignore_*"]);
+        assert_eq!(c.include_gitignored, vec!["z_ignore_*"]);
         let text = toml::to_string_pretty(&c).unwrap();
-        assert!(text.contains("review_ignored = [\"z_ignore_*\"]"), "{text}");
+        assert!(
+            text.contains("include_gitignored = [\"z_ignore_*\"]"),
+            "{text}"
+        );
         assert_eq!(toml::from_str::<Config>(&text).unwrap(), c);
     }
 

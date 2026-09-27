@@ -9,8 +9,8 @@ binary rather than for the commit log.
 
 ### Added
 
-- `review_ignored` in `config.toml`: gitignored files you want reviewed after all, as
-  patterns in `.gitignore` grammar (`review_ignored = ["z_ignore_*"]`). A matching file is
+- `include_gitignored` in `config.toml`: gitignored files you want reviewed after all, as
+  patterns in `.gitignore` grammar (`include_gitignored = ["z_ignore_*"]`). A matching file is
   an ordinary row under its repository, at any depth, with no badge; a file inside an
   ignored folder stays unlisted, because git never looks there (name the folder itself,
   `"z_ignore/"`, to review what is in it). Removing an entry later hides nothing: a file
@@ -44,6 +44,11 @@ binary rather than for the commit log.
 
 ### Changed
 
+- Breaking: the key `ignore_globs` is now `watch_ignore_globs`, with the same default and
+  the same meaning. A `config.toml` that still says `ignore_globs` is refused at launch and
+  on `R`, with the new name in the message: rename the line. `lastcall config --json`
+  prints the key under its new name too (`include_gitignored`, new in this release, is
+  printed under its name as well).
 - The row that groups files arriving from a fetch now reads `[upstream] N files`, bracketed
   like the `[upstream]` badge its files carry, so it can no longer be mistaken for the
   branch line above it; `lastcall status` prints both group rows the same way, and says

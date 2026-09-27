@@ -4,7 +4,7 @@
 //! work; every scan, head inspection and rescan runs on `spawn_blocking` under the
 //! engine's mutex, and the outcome is published as an [`EngineEvent`].
 //!
-//! `ignore_globs` scope the watcher only: an ignored path never wakes a scan, but the next
+//! `watch_ignore_globs` scope the watcher only: an ignored path never wakes a scan, but the next
 //! scan (manual, or the `rescan` backstop) still shows the tracked edit.
 //!
 //! `Access` events (opens, reads, read-only closes) never schedule work: on Linux they are
@@ -231,9 +231,9 @@ impl RescanTrigger {
 
     /// The rescan a config reload asks for (`R`, Phase 14 D), after [`Engine::reload`] has
     /// landed under the lock. A plain rescan emits `RootsChanged` only when the root set
-    /// changed, so an edit to `ignore_globs`, `[keys]` or `collapsed_globs` alone would
+    /// changed, so an edit to `watch_ignore_globs`, `[keys]` or `collapsed_globs` alone would
     /// never reach the loop (design review F4). This one makes the loop's next rescan re-read
-    /// its roots and its `ignore_globs` from the engine and emit a `RootsChanged` with
+    /// its roots and its `watch_ignore_globs` from the engine and emit a `RootsChanged` with
     /// `reload` set, even when nothing was added or removed. The flag is set before the
     /// notify, so the pass that takes it runs after the reload's setter.
     pub fn request_reload(&self) {
@@ -734,7 +734,7 @@ async fn run_loop(
     let mut watched: BTreeSet<PathBuf> = BTreeSet::new();
     let (mut roots, mut ignore) = {
         let g = lock(&engine);
-        (root_watches(&g), g.ignore_globs().clone())
+        (root_watches(&g), g.watch_ignore_globs().clone())
     };
     // Watches install off the runtime while the initial scans run; when they land, every
     // root is scanned and inspected once more so nothing from the gap is missed.
@@ -963,9 +963,9 @@ async fn run_loop(
                         removed = changed.removed.len(),
                         "config reload"
                     );
-                    // `ignore_globs` is read here and nowhere else in the loop, so this is
+                    // `watch_ignore_globs` is read here and nowhere else in the loop, so this is
                     // what re-points the watcher at the reloaded file.
-                    ignore = lock(&engine).ignore_globs().clone();
+                    ignore = lock(&engine).watch_ignore_globs().clone();
                 }
                 if !changed.is_empty() {
                     // Phase 14 D: the install this change is about to start is a reload's

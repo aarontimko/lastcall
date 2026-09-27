@@ -1420,7 +1420,7 @@ new)` applies `[ui] wrap` and `hide_empty_repos` **only where the file's value c
 watcher's pass runs after `Engine::reload`. The watcher emits a `RootsChanged` with
 `reload: true` for that pass even when the diff is empty; the notice waits for both halves
 (`Reloading { changes, roots }`, either order) and reads `config reloaded: 1 root added,
-2 roots removed, keys, ui, watcher, collapse, review_ignored, skip_globs` (a part appears
+2 roots removed, keys, ui, watcher, collapse, include_gitignored, skip_globs` (a part appears
 only when it changed; `discovery` stands in for the counts when no root moved; `config
 reloaded, nothing changed` when nothing did), with `; herdr and update settings apply at
 the next launch` when either table differs. A `RootsChanged` whose `removed` names the

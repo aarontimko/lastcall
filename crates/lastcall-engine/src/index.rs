@@ -111,10 +111,10 @@ pub struct PrivateIndex {
     kind: RootKind,
     /// The user's `info/exclude` (common dir), passed as `--exclude-from` for git roots.
     exclude_from: Option<PathBuf>,
-    /// `review_ignored` (Amendment v1.15): one `--exclude=!<pattern>` each, git roots
+    /// `include_gitignored` (Amendment v1.15): one `--exclude=!<pattern>` each, git roots
     /// only, in config order. Empty leaves the `others` argv byte-identical to what it was
     /// before the key existed.
-    review_ignored: Vec<String>,
+    include_gitignored: Vec<String>,
     /// How long a seed waits for the ledger lock. The shipping value is
     /// [`DEFAULT_LEDGER_LOCK`]; a test that wants the busy path shortens it rather than
     /// sleeping for two seconds.
@@ -127,22 +127,22 @@ impl PrivateIndex {
         paths: &RepoPaths,
         kind: RootKind,
         exclude_from: Option<PathBuf>,
-        review_ignored: Vec<String>,
+        include_gitignored: Vec<String>,
     ) -> Self {
         Self {
             git,
             paths: paths.clone(),
             kind,
             exclude_from,
-            review_ignored,
+            include_gitignored,
             lock_budget: DEFAULT_LEDGER_LOCK,
         }
     }
 
-    /// Replace the `review_ignored` patterns (a config reload, Amendment v1.15). The next
+    /// Replace the `include_gitignored` patterns (a config reload, Amendment v1.15). The next
     /// `others` listing uses them; nothing is re-read or re-seeded.
-    pub fn set_review_ignored(&mut self, review_ignored: Vec<String>) {
-        self.review_ignored = review_ignored;
+    pub fn set_include_gitignored(&mut self, include_gitignored: Vec<String>) {
+        self.include_gitignored = include_gitignored;
     }
 
     #[cfg(test)]
@@ -402,7 +402,7 @@ impl PrivateIndex {
 
     /// `ls-files -c core.ignorecase=false --others -z` with the user's excludes for git
     /// roots (`--exclude-standard` + `--exclude-from=<user info/exclude>`, then one
-    /// `--exclude=!<pattern>` per `review_ignored` entry), none for drafts.
+    /// `--exclude=!<pattern>` per `include_gitignored` entry), none for drafts.
     pub fn others(&self, scope: Option<&DraftScope>) -> Result<Vec<Other>, IndexError> {
         let args = self.others_args(scope);
         let out = self.git.run(&args)?;
@@ -439,12 +439,12 @@ impl PrivateIndex {
             {
                 args.push(format!("--exclude-from={}", f.display()));
             }
-            // `review_ignored` (Amendment v1.15): a command-line pattern sits above every
+            // `include_gitignored` (Amendment v1.15): a command-line pattern sits above every
             // ignore file, so a negation here lists a gitignored file as an ordinary
             // untracked one. Git never descends into an ignored folder, so a file inside
             // one stays unlisted whatever the pattern says; that is git's rule, stated in
             // the docs rather than worked around.
-            for pattern in &self.review_ignored {
+            for pattern in &self.include_gitignored {
                 args.push(format!("--exclude=!{pattern}"));
             }
         }
@@ -847,14 +847,14 @@ mod tests {
         );
     }
 
-    /// Amendment v1.15 (scenario D27): with `review_ignored` empty the `others` argv is
+    /// Amendment v1.15 (scenario D27): with `include_gitignored` empty the `others` argv is
     /// byte-identical to the one every release before it ran, asserted against the literal
     /// vector; two entries append two `--exclude=!…` in config order after
     /// `--exclude-from`; a draft scope appends none whatever the list holds.
     #[test]
-    fn index_others_args_carry_review_ignored_after_the_existing_arguments() {
-        let repo = FixtureRepo::new("idx-review-ignored").unwrap();
-        let state = TempDir::new("lc-index-review-ignored");
+    fn index_others_args_carry_include_gitignored_after_the_existing_arguments() {
+        let repo = FixtureRepo::new("idx-include-gitignored").unwrap();
+        let state = TempDir::new("lc-index-include-gitignored");
         let (store, index, _tree) = setup(&repo, &state);
         // git answers `rev-parse --git-path` with the canonical path, which is what
         // `setup` handed the index.
@@ -892,7 +892,7 @@ mod tests {
             expected,
             "in order, after --exclude-from"
         );
-        two.set_review_ignored(Vec::new());
+        two.set_include_gitignored(Vec::new());
         assert_eq!(
             two.others_args(None),
             today,
@@ -918,9 +918,9 @@ mod tests {
     /// Amendment v1.15: the negation lists a gitignored file at any depth as an ordinary
     /// untracked one, and nothing inside an ignored folder (git's rule).
     #[test]
-    fn index_others_lists_review_ignored_files_but_never_inside_an_ignored_folder() {
-        let repo = FixtureRepo::new("idx-review-ignored-list").unwrap();
-        let state = TempDir::new("lc-index-review-ignored-list");
+    fn index_others_lists_include_gitignored_files_but_never_inside_an_ignored_folder() {
+        let repo = FixtureRepo::new("idx-include-gitignored-list").unwrap();
+        let state = TempDir::new("lc-index-include-gitignored-list");
         let (store, index, tree) = setup(&repo, &state);
         index.reseed(Some(&tree)).unwrap();
         repo.write(".git/info/exclude", "z_ignore_*\nz_ignore/\n");

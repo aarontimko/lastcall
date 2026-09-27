@@ -159,7 +159,7 @@ as `STEPS.md` in the sandbox. What each one is for:
 | Scenario | What it lets a person judge |
 |---|---|
 | `wrap` | word wrap in the diff pane: prose, code, other scripts, the cap, paging, `alt-z` |
-| `ignored` | `review_ignored`: gitignored scratch files listed under their repository, never from inside an ignored folder |
+| `ignored` | `include_gitignored`: gitignored scratch files listed under their repository, never from inside an ignored folder |
 | `reload` | `R`: a watched folder uncommented and listed without a restart, an accept that survives it, `skip_globs` taking a repository out, a broken file refused |
 | `cherry-pick` | the `[seen] N files` fold: a cherry-pick, a rebase and a squash-merge of reviewed work, the group opened with `e`, a member edited or flagged out of it, the group accepted and undone, and nothing hidden from `status` |
 
@@ -168,7 +168,7 @@ as `STEPS.md` in the sandbox. What each one is for:
 One repository, `demo`, whose committed `.gitignore` ignores `z_ignore_*` and `z_ignore/`,
 with `z_ignore_plan.md` at the top, `src/deep/er/z_ignore_notes.md` three folders down and
 `z_ignore/inside.md` inside the ignored folder; the config says
-`review_ignored = ["z_ignore_*"]`. The steps: the two matching files are rows with no
+`include_gitignored = ["z_ignore_*"]`. The steps: the two matching files are rows with no
 badge and the one inside `z_ignore/` is absent; accept the top file; append a line to it
 from a second terminal (the printed step names the sandbox path and the command) and see
 one hunk; accept; delete it and accept the deletion; the deep file accepts with `A` and

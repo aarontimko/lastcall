@@ -647,7 +647,7 @@ impl Engine {
         let layout = Layout::new(&loaded.state_dir);
         std::fs::create_dir_all(layout.roots_dir()).map_err(|e| io_err(&layout.roots_dir(), e))?;
         let collapsed = build_globs(&loaded.config.collapsed_globs);
-        let ignore = build_globs(&loaded.config.ignore_globs);
+        let ignore = build_globs(&loaded.config.watch_ignore_globs);
         let skip = crate::config::skip_set(&loaded.config.skip_globs);
         let mut engine = Engine {
             env: env.clone(),
@@ -710,7 +710,7 @@ impl Engine {
         &self.git_version
     }
 
-    pub fn ignore_globs(&self) -> &GlobSet {
+    pub fn watch_ignore_globs(&self) -> &GlobSet {
         &self.ignore
     }
 
@@ -770,8 +770,8 @@ impl Engine {
     /// Apply a config file read again while running (`R`, Phase 14 D, Amendment v1.15).
     ///
     /// Replaces the config and the resolved parent dirs, rebuilds the `collapsed_globs`,
-    /// `ignore_globs` and `skip_globs` sets and hands every open repository its new
-    /// `review_ignored` patterns. Every `RootState` and every ledger is kept: nothing here
+    /// `watch_ignore_globs` and `skip_globs` sets and hands every open repository its new
+    /// `include_gitignored` patterns. Every `RootState` and every ledger is kept: nothing here
     /// opens, closes or scans a root. The roots a new `parent_dirs`, `draft_dirs`,
     /// `search_depth` or `skip_globs` implies land on the next [`Engine::rescan`], which the
     /// caller asks the watcher for (`RescanTrigger::request_reload`), so this setter lands
@@ -785,7 +785,7 @@ impl Engine {
         self.config = loaded.config.clone();
         self.resolved = resolved.clone();
         self.collapsed = build_globs(&self.config.collapsed_globs);
-        self.ignore = build_globs(&self.config.ignore_globs);
+        self.ignore = build_globs(&self.config.watch_ignore_globs);
         self.skip = crate::config::skip_set(&self.config.skip_globs);
         for n in &resolved.notices {
             if !self.notices.contains(n) {
@@ -795,7 +795,7 @@ impl Engine {
         for root in self.roots.values_mut() {
             if root.kind == RootKind::Git {
                 root.index
-                    .set_review_ignored(self.config.review_ignored.clone());
+                    .set_include_gitignored(self.config.include_gitignored.clone());
             }
         }
     }
@@ -946,7 +946,7 @@ impl Engine {
             layout: &self.layout,
             clock: self.options.clock.as_ref(),
             draft_initial: self.config.draft_initial,
-            review_ignored: &self.config.review_ignored,
+            include_gitignored: &self.config.include_gitignored,
         }
     }
 
@@ -966,8 +966,8 @@ struct OpenCtx<'a> {
     layout: &'a Layout,
     clock: &'a (dyn Clock + Send + Sync),
     draft_initial: DraftInitial,
-    /// `review_ignored` (Amendment v1.15), handed to a git root's private index.
-    review_ignored: &'a [String],
+    /// `include_gitignored` (Amendment v1.15), handed to a git root's private index.
+    include_gitignored: &'a [String],
 }
 
 fn open_root_with(ctx: &OpenCtx<'_>, d: &roots::DiscoveredRoot) -> Result<RootState, EngineError> {
@@ -1004,10 +1004,10 @@ fn open_root_with(ctx: &OpenCtx<'_>, d: &roots::DiscoveredRoot) -> Result<RootSt
     let (store, store_notices) = Store::open(ctx.env, &d.path, d.kind, &paths, facts.as_ref())?;
     notices.extend(store_notices);
     let exclude_from = git_paths.get(2).cloned();
-    // `review_ignored` reaches git roots only: a watched folder's listing never applied
+    // `include_gitignored` reaches git roots only: a watched folder's listing never applied
     // the user's ignore files, so there is nothing there to re-include.
-    let review_ignored = if d.kind == RootKind::Git {
-        ctx.review_ignored.to_vec()
+    let include_gitignored = if d.kind == RootKind::Git {
+        ctx.include_gitignored.to_vec()
     } else {
         Vec::new()
     };
@@ -1016,7 +1016,7 @@ fn open_root_with(ctx: &OpenCtx<'_>, d: &roots::DiscoveredRoot) -> Result<RootSt
         &paths,
         d.kind,
         exclude_from,
-        review_ignored,
+        include_gitignored,
     );
     let user_email = repo_config
         .get("user.email")
@@ -5232,7 +5232,7 @@ pub(crate) mod tests {
     /// Phase 14 D: `Engine::reload` replaces the config and rebuilds the glob sets, keeps
     /// every `RootState` (same ledger, same last pile, no discovery pass), and the next scan
     /// uses the new sets: a path newly matching `collapsed_globs` is collapsed, and a
-    /// gitignored file newly matching `review_ignored` is a row.
+    /// gitignored file newly matching `include_gitignored` is a row.
     #[test]
     fn engine_reload_keeps_every_root_and_the_next_scan_uses_the_new_sets() {
         let repo = FixtureRepo::new("reload").unwrap();
@@ -5251,8 +5251,8 @@ pub(crate) mod tests {
 
         let (mut loaded, resolved) = loaded_for(&repo, &state, Config::default());
         loaded.config.collapsed_globs.push("*.gen".into());
-        loaded.config.review_ignored.push("z_ignore_*".into());
-        loaded.config.ignore_globs.push("scratch/**".into());
+        loaded.config.include_gitignored.push("z_ignore_*".into());
+        loaded.config.watch_ignore_globs.push("scratch/**".into());
         engine.reload(&loaded, &resolved);
         assert_eq!(
             engine.discovery_runs(),
@@ -5267,7 +5267,7 @@ pub(crate) mod tests {
         );
         assert_eq!(ledger_bytes(&engine, &r), ledger, "no ledger written");
         assert_eq!(engine.config(), &loaded.config);
-        assert!(engine.ignore_globs().is_match("scratch/a"));
+        assert!(engine.watch_ignore_globs().is_match("scratch/a"));
 
         let after = engine.scan(&r).unwrap();
         assert_eq!(

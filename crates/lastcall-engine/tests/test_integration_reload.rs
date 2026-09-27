@@ -250,12 +250,12 @@ fn fs_events_delivered(dir: &Path) -> bool {
     got
 }
 
-/// A reload that changes `ignore_globs` and nothing else moves no root, and still reaches
+/// A reload that changes `watch_ignore_globs` and nothing else moves no root, and still reaches
 /// the watcher (design review F4): the loop emits the reload's `RootsChanged` with both
 /// lists empty, repeats no `watching` notice, and an event under the newly ignored folder
 /// wakes no scan, while the next scan still lists the file there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reload_of_ignore_globs_alone_repoints_the_watcher() {
+async fn reload_of_watch_ignore_globs_alone_repoints_the_watcher() {
     let repo = FixtureRepo::new("reload-ignore").unwrap();
     if !fs_events_delivered(repo.path()) {
         use std::io::Write as _;
@@ -293,7 +293,7 @@ async fn reload_of_ignore_globs_alone_repoints_the_watcher() {
     .await;
 
     let mut config = Config::default();
-    config.ignore_globs.push("scratch/**".into());
+    config.watch_ignore_globs.push("scratch/**".into());
     let (loaded, resolved) = loaded_with(std::slice::from_ref(&parent), state.path(), config);
     reload(&w, &loaded, &resolved);
     let changed = reload_pass(&mut w, &mut seen).await;
@@ -338,7 +338,7 @@ async fn reload_of_ignore_globs_alone_repoints_the_watcher() {
     .await;
     assert!(
         pile.row(b"scratch/b.txt").is_some(),
-        "ignore_globs scope the watcher only: {pile:?}"
+        "watch_ignore_globs scope the watcher only: {pile:?}"
     );
     w.join().await;
 }

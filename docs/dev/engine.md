@@ -362,21 +362,21 @@ still running at the old depth, and the set would then wait for the backstop.
 **Reloading the whole config (Phase 14 D, Amendment v1.15).** `Engine::reload(&Loaded,
 &Resolved)` is the general form of that setter: it replaces `config` and `resolved`,
 rebuilds the `collapsed`, `ignore` and `skip` sets, hands each git root's `PrivateIndex` the
-new `review_ignored`, and adds the resolved notices; it keeps every `RootState` and every
+new `include_gitignored`, and adds the resolved notices; it keeps every `RootState` and every
 ledger and ignores `Loaded.state_dir` (the state directory is the launch environment's). A
 scan in flight holds its `ScanCtx` clone and finishes under the old sets. The TUI follows it
 with `RescanTrigger::request_reload`, which sets the loop's `reload` flag before the notify;
 the rescan block takes the flag, re-reads its `ignore` local from the engine (the watcher's
 routing uses it), reinstalls the watches only when roots moved (the watch set is a function
 of the roots), and emits `RootsChanged { reload: true, .. }` even when the diff is empty, so
-an edit to `ignore_globs` or `[keys]` alone still reaches the TUI. When the reinstall a
+an edit to `watch_ignore_globs` or `[keys]` alone still reaches the TUI. When the reinstall a
 reload started ends with the same watched set, its `watching …` notice is not repeated.
 `Engine::rescan` treats a surviving path whose discovered `parent` changed as removed and
 added in the same pass: the old `RootState` is closed and the root opened (and
 first-sighted) under the new parent id, its old record left on disk, which is what a relaunch
 would do. Tests: `engine_reload_keeps_every_root_and_the_next_scan_uses_the_new_sets`
 (unit) and `test_integration_reload.rs` (parents re-pointed and back, an
-`ignore_globs`-only reload with a real watch, a repository moved between parent entries).
+`watch_ignore_globs`-only reload with a real watch, a repository moved between parent entries).
 
 **`skip_globs`, decided before anything is read (Phase 14, Amendment v1.15).** `discover`
 builds one `Skip` per pass from `config::skip_set` (the `draft_dirs` grammar,
@@ -494,8 +494,8 @@ exactly as it names another repository, so `others` asks each reported folder fo
 entry of either shape before calling it a nested repo; an `lstat` that fails for any reason
 other than "not there" answers yes, which leaves the folder alone.
 
-**`review_ignored` is one argument per entry (Phase 14, Amendment v1.15).** For a git root,
-`Index::others_args` appends `--exclude=!<pattern>` per `review_ignored` entry, in config
+**`include_gitignored` is one argument per entry (Phase 14, Amendment v1.15).** For a git root,
+`Index::others_args` appends `--exclude=!<pattern>` per `include_gitignored` entry, in config
 order, after `--exclude-standard` and `--exclude-from=<info/exclude>`. A command-line
 pattern sits above every ignore file (`.gitignore`, `info/exclude`, `core.excludesFile`),
 so a matching gitignored file is listed as an ordinary untracked candidate and everything
@@ -504,9 +504,9 @@ path's. Git never descends into an ignored folder, so a file inside one stays un
 nothing may be built on `check-ignore`, which still calls a re-included file ignored. A
 watched folder's listing never used `--exclude-standard` and gets no `--exclude` at all.
 With the list empty the argv is byte-identical to the pre-phase one
-(`index_others_args_carry_review_ignored_after_the_existing_arguments` asserts the literal
+(`index_others_args_carry_include_gitignored_after_the_existing_arguments` asserts the literal
 vector). The patterns reach the index through `OpenCtx` at open and
-`PrivateIndex::set_review_ignored` at a config reload. An entry removed later over-shows by
+`PrivateIndex::set_include_gitignored` at a config reload. An entry removed later over-shows by
 design: an accepted file keeps its seen-tree entry, so `diff-files` still reports its later
 change or deletion until accepted (D27; §11).
 
@@ -1299,7 +1299,7 @@ promoted there (a clone untracked inside a listed repository at launch) is re-wa
 announced as a `RootsChanged` like any backstop change (Phase 14 H). Events only *schedule* work: every scan, head inspection and rescan runs on
 `spawn_blocking` under the engine's mutex, and the result is published as an `EngineEvent`
 (`Pile { root, seq, pile }`, `Head` with its transition notice and the seq of the scan it
-ran, `RootsChanged`, `Notice`). `ignore_globs` scope
+ran, `RootsChanged`, `Notice`). `watch_ignore_globs` scope
 the watcher only — an ignored path never wakes a scan, but the next scan still shows the
 tracked edit. `lastcall watch [--json] [--exit-after N] [--poll N]` prints one line per
 event (a pile line is `<root> #<seq>  <n> pending`; the JSON form carries `seq` and
