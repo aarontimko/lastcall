@@ -458,7 +458,7 @@ A run of file rows in one repository, accepted as one by `accept_file`.
   that drops a run and leaves the selection where it was still answers `Changed::Yes`,
   because the frame changed. So a plain move, a plain click, the wheel over the nav, the
   jumps and `nav_top`/`nav_bottom` all clear it. `reconcile_selection` drops the anchor when
-  `range_rows()` stops resolving (either end gone, or a root or a group now between them); a
+  the live walk stops resolving (either end gone, or a root or a group now between them); a
   middle row that goes shrinks the run, since the run is computed. `back` peels one layer
   per key: a live text selection first, then the run (the cursor row stays selected), then
   the focus.
@@ -476,7 +476,10 @@ A run of file rows in one repository, accepted as one by `accept_file`.
   (`Ops::accept_group`, one `UndoOp::AcceptGroup`, so one `z` puts the run back), with no
   engine change. `counts_of` tallies the same rows, so the confirm (`Accept the 12 selected
   files in alpha?`, through `App::confirm_rows`), the header control and the hint agree by
-  construction. Completion reads `accepted 3 files in alpha`; the advance rule picks the
+  construction; and while that confirm is open, `range_rows()` answers the confirm's own
+  snapshot narrowed to the rows still held, not the live walk, so a pile that lands
+  underneath (a row arriving inside the span, the anchor leaving) cannot make the dim rows
+  and the dialog disagree about what `y` sends. Completion reads `accepted 3 files in alpha`; the advance rule picks the
   entry that took the run's place (for an upward run the entry after the anchor, because
   `neighbour_after` keys on the cursor row); the run is cleared, a partial refusal
   included. Every other action acts on the cursor row alone.

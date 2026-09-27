@@ -234,7 +234,7 @@ the character the keyboard sends.
 | `extend_down` | `shift-j`, `shift-down` | from a file row, select the next file row as well, making a run of rows in one repository that `shift-a` accepts as one. Stops at the repository's last file row |
 | `extend_up` | `shift-k`, `shift-up` | the same run, grown upward |
 | `open` | `enter`, `l`, `right` | open the diff for the selected row |
-| `back` | `esc`, `h`, `left` | close the help overlay, else return to the file list. Never quits. |
+| `back` | `esc`, `h`, `left` | close the help overlay, else let a selected run go, else return to the file list. Never quits. |
 | `focus_toggle` | `tab` | move focus between the two panes |
 | `hunk_next` | `n`, `]` | next hunk |
 | `hunk_prev` | `p`, `[` | previous hunk |

@@ -603,8 +603,9 @@ const HINT_NAV_ONLY: &[&str] = &[
 /// the selection — `a accept hunk  A accept file` on a file row with hunks in **either**
 /// pane, `a/A accept file` on a hunkless file row (binary, collapsed, deleted, unreadable),
 /// `A accept group` on a group entry, `A accept N files` while a run of rows is selected,
-/// `A accept all in <root>` on a **non-empty** root entry (Amendment v1.11: `A` is the key that takes a whole entry, and it is how the per-repo
-/// fold is told from the header's global one; on an empty repo row neither key accepts
+/// `A accept all in <root>` on a **non-empty** root entry (Amendment v1.11: `A` is the key
+/// that takes a whole entry, and it is how the per-repo fold is told from the header's
+/// global one; on an empty repo row neither key accepts
 /// anything, so the line does not offer it — verifier (a) F2). With the **diff** focused
 /// the first two hints are `↑↓ scroll  ← back` instead, because that is what those keys do
 /// there (Design pass D2, ruling R3); the two forms are the same width.
@@ -948,7 +949,14 @@ fn render_nav(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
     // screen row is known (below).
     let mut dots: Vec<(usize, u16, std::path::PathBuf)> = Vec::new();
     let mut first = true;
+    // The run's paths as a set, built once: a run can be every row of a repository.
     let run = app.range_rows();
+    let run = run.as_ref().map(|(root, paths)| {
+        (
+            root,
+            paths.iter().map(Vec::as_slice).collect::<BTreeSet<_>>(),
+        )
+    });
     for (path, view) in &app.roots {
         if !app.is_listed(view) {
             continue;
@@ -1068,9 +1076,9 @@ fn render_nav(app: &App, buf: &mut Buffer, area: Rect, hits: &mut HitMap) {
                 selected: app.selection.as_ref() == Some(&sel),
                 in_range: !member
                     && app.selection.as_ref() != Some(&sel)
-                    && run
-                        .as_ref()
-                        .is_some_and(|(root, paths)| root == path && paths.contains(&row.path)),
+                    && run.as_ref().is_some_and(|(root, paths)| {
+                        *root == path && paths.contains(row.path.as_slice())
+                    }),
             }
         };
         for row in view.nav_rows() {

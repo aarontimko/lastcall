@@ -2558,4 +2558,73 @@ mod tests {
             Some(Action::ShowSnoozed)
         );
     }
+
+    /// `shift-j` in a config clashes with `extend_down`; a bare `J` is `j` (the grammar
+    /// case-folds) and clashes with `nav_down`, as it always did. `extend_down` rebinds like
+    /// any action, and `shift-v` is free.
+    #[test]
+    fn keymap_shift_j_clashes_with_extend_down_and_a_capital_j_is_j() {
+        let err = Keymap::from_config(&keys(&[("hunk_next", &["shift-j"])])).unwrap_err();
+        match &err {
+            KeymapError::Duplicate {
+                spec,
+                first,
+                second,
+            } => {
+                assert_eq!(spec, "J");
+                let mut pair = vec![first.as_str(), second.as_str()];
+                pair.sort();
+                assert_eq!(pair, vec!["extend_down", "hunk_next"]);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(err.to_string().contains("extend_down"), "{err}");
+        let err = Keymap::from_config(&keys(&[("hunk_next", &["J"])])).unwrap_err();
+        match &err {
+            KeymapError::Duplicate { first, second, .. } => {
+                let mut pair = vec![first.as_str(), second.as_str()];
+                pair.sort();
+                assert_eq!(pair, vec!["hunk_next", "nav_down"], "J is j");
+            }
+            other => panic!("{other:?}"),
+        }
+        for spec in ["shift-k", "shift-down", "shift-up", "Shift-Down", "K"] {
+            assert!(
+                matches!(
+                    Keymap::from_config(&keys(&[("hunk_next", &[spec])])),
+                    Err(KeymapError::Duplicate { .. })
+                ),
+                "{spec}"
+            );
+        }
+        let km = Keymap::from_config(&keys(&[("extend_down", &["ctrl-j"])])).unwrap();
+        assert_eq!(
+            to_action(&key_code(KeyCode::Char('j'), KeyModifiers::CONTROL), &km),
+            Some(Action::ExtendDown)
+        );
+        assert_eq!(
+            to_action(&key_code(KeyCode::Char('J'), KeyModifiers::SHIFT), &km),
+            None,
+            "the default is gone once rebound"
+        );
+        assert_eq!(
+            to_action(&key_code(KeyCode::Down, KeyModifiers::SHIFT), &km),
+            None
+        );
+        let row = km
+            .table()
+            .into_iter()
+            .find(|(n, _)| n == "extend_down")
+            .unwrap()
+            .1;
+        assert_eq!(row, vec!["ctrl-j"]);
+        assert!(Keymap::from_config(&keys(&[("hunk_next", &["shift-v"])])).is_ok());
+        assert!(
+            Keymap::from_config(&keys(&[
+                ("hunk_next", &["shift-j"]),
+                ("extend_down", &["ctrl-j"])
+            ]))
+            .is_ok()
+        );
+    }
 }
