@@ -164,6 +164,7 @@ fi
 
 if [ -n "$newer_tag" ]; then
     newer_version="${newer_tag#v}"
+    newer_tag="v$newer_version"
 else
     newer_version="$(next_version "$version")"
     newer_tag="v$newer_version"
