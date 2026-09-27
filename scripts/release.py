@@ -19,6 +19,8 @@ person would have had to notice something by eye.
     release.py tag               on the merged `main`: refuse what `release.yml` would
                                  refuse after the builds, one yes, the annotated tag, its
                                  push, the release run watched to the end.
+    release.py self-test         the rules above over made-up text, with no repository and
+                                 no network; `just lint` runs it.
 
 `merge` and `tag` send to GitHub, so they are the maintainer's: they refuse inside a coding
 agent's shell (operations.md, "The maintainer pushes and tags; agents do not"). `prep` is
@@ -42,6 +44,11 @@ import time
 DRY = os.environ.get("RELEASE_DRY_RUN") == "1"
 VERSION = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-rc\.([1-9][0-9]*))?$")
 INSTALL_PAGES = ("README.md", "docs/install.md")
+
+
+class Refusal(Exception):
+    """A rule said no. The pure helpers below raise it, so the self-test can ask them
+    without a repository; `main` prints it and exits 1, as `die` does."""
 
 
 def say(message):
@@ -145,7 +152,7 @@ def crate_version(cargo_toml):
     """`[workspace.package].version`, the one line release.yml reads too."""
     found = re.findall(r'^version = "([^"]*)"$', cargo_toml, flags=re.M)
     if len(found) != 1:
-        die("expected exactly one top-level version line in Cargo.toml, found %d" % len(found))
+        raise Refusal("expected exactly one top-level version line in Cargo.toml, found %d" % len(found))
     return found[0]
 
 
@@ -179,18 +186,83 @@ def names(version):
     return re.compile(r"(?<![0-9.])" + re.escape(version) + r"(?![0-9-]|\.[0-9])")
 
 
+def later(new, old):
+    """Is `new` a later version than `old`? A candidate precedes its release."""
+    return parse(new) is not None and parse(old) is not None and parse(new) > parse(old)
+
+
+def check_prep_branch(name):
+    """The branch `prep` may start from."""
+    if name != "main":
+        raise Refusal("start from main")
+
+
+def date_changelog(changelog, new, today):
+    """CHANGELOG.md with the release's heading dated: `## Unreleased` becomes
+    `## <base> - <today>`, or, after a candidate dated the section already, that heading
+    takes today's date. Refuses an empty section, and a file with both or neither."""
+    base = new.split("-")[0]
+    heading = "## %s - %s" % (base, today)
+    dated = changelog_section(changelog, base)
+    unreleased = changelog_section(changelog, "Unreleased")
+    if dated is not None:
+        # A candidate already dated this section. Notes written since belong inside it, and
+        # the release takes today's date.
+        if unreleased is not None:
+            raise Refusal("CHANGELOG.md has both '## %s' and '## Unreleased'; fold the second into the first" % base)
+        if not dated:
+            raise Refusal("the '## %s' section of CHANGELOG.md is empty" % base)
+        pattern = r"^## " + re.escape(base) + r"( .*)?$"
+    else:
+        if unreleased is None:
+            raise Refusal("CHANGELOG.md has neither a '## %s' section nor '## Unreleased'" % base)
+        if not unreleased:
+            # The section is the release page: refuse to date an empty one.
+            raise Refusal("'## Unreleased' in CHANGELOG.md is empty; the release notes are written first")
+        pattern = r"^## Unreleased$"
+    return re.sub(pattern, heading, changelog, count=1, flags=re.M)
+
+
+def shown_version(install_md):
+    """The release the install pages name: docs/install.md's `version=` line."""
+    hit = re.search(r"^version=([0-9]+\.[0-9]+\.[0-9]+)$", install_md, flags=re.M)
+    if not hit:
+        raise Refusal("docs/install.md has no 'version=<x.y.z>' line; the install steps moved, edit this script")
+    return hit.group(1)
+
+
+def name_new_version(page, text, shown, new):
+    """An install page naming `new` where it named `shown`, which it must name exactly
+    twice, as whole tokens."""
+    count = len(names(shown).findall(text))
+    if count != 2:
+        raise Refusal("%s names %s %d times, expected 2; look, then edit this script" % (page, shown, count))
+    return names(shown).sub(new, text)
+
+
+def check_tag_notes(changelog, version):
+    """What release.yml would fail on after the four builds, and a sign the commit is not
+    the release: no section with a body for the version, or `## Unreleased` still there."""
+    base = version.split("-")[0]
+    # release.yml takes the notes from `## <version>`, then `## <base>` for a candidate, and
+    # fails after the four builds when it finds no body.
+    if not (changelog_section(changelog, version) or changelog_section(changelog, base)):
+        raise Refusal("CHANGELOG.md has no '## %s' section with a body; release.yml would fail after the builds" % base)
+    if changelog_section(changelog, "Unreleased") is not None:
+        raise Refusal("CHANGELOG.md still has '## Unreleased': the release commit is not on main")
+
+
 def cmd_prep(args):
     new = args[0] if len(args) == 1 else ""
     if not parse(new):
         die("usage: prep <version>, like 0.4.0 or 0.4.0-rc.1 (no leading v, no leading zeros)")
-    if branch() != "main":
-        die("start from main")
+    check_prep_branch(branch())
     clean()
     at_origin_main()
 
     cargo_toml = read("Cargo.toml")
     old = crate_version(cargo_toml)
-    if parse(old) is None or parse(new) <= parse(old):
+    if not later(new, old):
         die("%s is not later than the crate's %s" % (new, old))
     if ok("git", "rev-parse", "--quiet", "--verify", "refs/tags/v" + new):
         die("the tag v%s exists" % new)
@@ -200,46 +272,16 @@ def cmd_prep(args):
 
     # Every file's new text is worked out, and every refusal made, before the first write:
     # a refusal leaves nothing to clean up.
-    base = new.split("-")[0]
-    final = base == new
+    final = new.split("-")[0] == new
     changes = {"Cargo.toml": re.sub(r'^version = "[^"]*"$', 'version = "%s"' % new,
                                     cargo_toml, count=1, flags=re.M)}
-
-    changelog = read("CHANGELOG.md")
-    heading = "## %s - %s" % (base, datetime.date.today().isoformat())
-    dated = changelog_section(changelog, base)
-    unreleased = changelog_section(changelog, "Unreleased")
-    if dated is not None:
-        # A candidate already dated this section. Notes written since belong inside it, and
-        # the release takes today's date.
-        if unreleased is not None:
-            die("CHANGELOG.md has both '## %s' and '## Unreleased'; fold the second into the first" % base)
-        if not dated:
-            die("the '## %s' section of CHANGELOG.md is empty" % base)
-        pattern = r"^## " + re.escape(base) + r"( .*)?$"
-    else:
-        if unreleased is None:
-            die("CHANGELOG.md has neither a '## %s' section nor '## Unreleased'" % base)
-        if not unreleased:
-            # The section is the release page: refuse to date an empty one.
-            die("'## Unreleased' in CHANGELOG.md is empty; the release notes are written first")
-        pattern = r"^## Unreleased$"
-    changes["CHANGELOG.md"] = re.sub(pattern, heading, changelog, count=1, flags=re.M)
-
-    shown = None
+    changes["CHANGELOG.md"] = date_changelog(read("CHANGELOG.md"), new, datetime.date.today().isoformat())
     if final:
         # The install pages name the last release, which after a candidate is not the
         # crate's version. docs/install.md's `version=` line says which one they name.
-        hit = re.search(r"^version=([0-9]+\.[0-9]+\.[0-9]+)$", read("docs/install.md"), flags=re.M)
-        if not hit:
-            die("docs/install.md has no 'version=<x.y.z>' line; the install steps moved, edit this script")
-        shown = hit.group(1)
+        shown = shown_version(read("docs/install.md"))
         for page in INSTALL_PAGES:
-            text = read(page)
-            count = len(names(shown).findall(text))
-            if count != 2:
-                die("%s names %s %d times, expected 2; look, then edit this script" % (page, shown, count))
-            changes[page] = names(shown).sub(new, text)
+            changes[page] = name_new_version(page, read(page), shown, new)
 
     must("git", "switch", "-c", release_branch)
     if DRY:
@@ -332,7 +374,6 @@ def cmd_tag(args):
     clean()
     sha = at_origin_main()
     version = crate_version(read("Cargo.toml"))
-    base = version.split("-")[0]
     tag = "v" + version
 
     if out("git", "ls-remote", "--tags", "origin", "refs/tags/" + tag):
@@ -345,13 +386,7 @@ def cmd_tag(args):
                 "remove it (git tag -d %s) and run this again" % (tag, tag))
         say("reusing the local %s: it is on this commit and not on GitHub" % tag)
 
-    # release.yml takes the notes from `## <version>`, then `## <base>` for a candidate, and
-    # fails after the four builds when it finds no body.
-    changelog = read("CHANGELOG.md")
-    if not (changelog_section(changelog, version) or changelog_section(changelog, base)):
-        die("CHANGELOG.md has no '## %s' section with a body; release.yml would fail after the builds" % base)
-    if changelog_section(changelog, "Unreleased") is not None:
-        die("CHANGELOG.md still has '## Unreleased': the release commit is not on main")
+    check_tag_notes(read("CHANGELOG.md"), version)
 
     # The ci workflow ran on this commit and passed. The weekly jobs are early warnings
     # (operations.md) and do not gate a release.
@@ -401,10 +436,165 @@ def cmd_tag(args):
         say("  just install-smoke %s %s" % (previous, tag))
 
 
+# The self-test: the pure helpers above, over made-up text, with no repository and no
+# network. `just lint` runs it, so CI runs it on both runners and release.yml runs it again
+# on the tag.
+
+CHANGELOG_UNRELEASED = """# Changelog
+
+## Unreleased
+
+### Added
+
+- A new thing.
+
+## 0.6.0 - 2026-09-26
+
+### Fixed
+
+- An old thing.
+"""
+
+CHANGELOG_AFTER_RC = """# Changelog
+
+## 0.7.0 - 2026-09-20
+
+### Added
+
+- A new thing.
+
+## 0.6.0 - 2026-09-26
+
+- An old thing.
+"""
+
+INSTALL_MD = """# Install
+
+```sh
+version=0.6.0
+```
+
+cargo install --tag v0.6.0 lastcall
+
+Not these: 10.6.0, 0.6.0-rc.1, 0.6.01, 0.6.0.1.
+"""
+
+CARGO_TOML = """[workspace]
+members = ["crates/a"]
+
+[workspace.package]
+version = "0.6.0"
+edition = "2024"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+"""
+
+
+def cmd_self_test(args):
+    if args:
+        die("usage: self-test")
+    failures = []
+    ran = [0]
+
+    def check(name, got, want):
+        ran[0] += 1
+        if got != want:
+            failures.append("%s: got %r, want %r" % (name, got, want))
+
+    def refusal(fn, *fn_args):
+        """The refusal a helper raises, or None when it lets the input through."""
+        try:
+            fn(*fn_args)
+        except Refusal as refused:
+            return str(refused)
+        return None
+
+    def refuses(name, fragment, fn, *fn_args):
+        said = refusal(fn, *fn_args)
+        check(name, said is not None and fragment in said, True)
+        if said is not None and fragment not in said:
+            failures.append("%s: the refusal read %r" % (name, said))
+
+    def passes(name, fn, *fn_args):
+        check(name + " (no refusal)", refusal(fn, *fn_args), None)
+
+    def value(name, fn, *fn_args):
+        """What a helper returns; a refusal where none was expected is this case failing."""
+        try:
+            return fn(*fn_args)
+        except Refusal as refused:
+            failures.append("%s: refused: %s" % (name, refused))
+            return ""
+
+    # Versions: the shape, and the order a release follows.
+    for text, valid in (("0.7.0", True), ("0.7.0-rc.1", True), ("10.0.0", True),
+                        ("v0.7.0", False), ("0.07.0", False), ("0.7", False),
+                        ("0.7.0-rc.0", False), ("0.7.0-beta.1", False), ("", False)):
+        check("parse %r" % text, parse(text) is not None, valid)
+    for new, old, want in (("0.7.0", "0.6.0", True), ("0.6.0", "0.6.0", False),
+                           ("0.5.9", "0.6.0", False), ("0.10.0", "0.9.0", True),
+                           ("0.7.0-rc.1", "0.6.0", True), ("0.7.0", "0.7.0-rc.1", True),
+                           ("0.7.0-rc.1", "0.7.0", False), ("0.7.0-rc.2", "0.7.0-rc.1", True),
+                           ("0.7.0", "garbage", False)):
+        check("later(%s, %s)" % (new, old), later(new, old), want)
+
+    # The crate version is the one top-level `version =` line.
+    check("crate_version", value("crate_version", crate_version, CARGO_TOML), "0.6.0")
+    refuses("crate_version with two top-level lines", "found 2",
+            crate_version, CARGO_TOML + 'version = "9.9.9"\n')
+
+    # The CHANGELOG dating.
+    dated = value("Unreleased is dated", date_changelog, CHANGELOG_UNRELEASED, "0.7.0", "2026-09-27")
+    check("Unreleased is dated", "## 0.7.0 - 2026-09-27\n\n### Added\n\n- A new thing." in dated, True)
+    check("Unreleased is gone", "## Unreleased" in dated, False)
+    check("the older section is untouched", "## 0.6.0 - 2026-09-26" in dated, True)
+    check("a candidate dates its base",
+          value("a candidate dates its base", date_changelog, CHANGELOG_UNRELEASED, "0.7.0-rc.1",
+                "2026-09-27").count("## 0.7.0 - 2026-09-27"), 1)
+    after_rc = value("the final after a candidate", date_changelog, CHANGELOG_AFTER_RC, "0.7.0", "2026-09-27")
+    check("the final after a candidate takes today's date",
+          ("## 0.7.0 - 2026-09-27" in after_rc, "2026-09-20" in after_rc), (True, False))
+    refuses("both the dated section and Unreleased", "has both", date_changelog,
+            CHANGELOG_AFTER_RC.replace("# Changelog\n", "# Changelog\n\n## Unreleased\n\n- more\n"),
+            "0.7.0", "2026-09-27")
+    refuses("an empty Unreleased", "is empty", date_changelog,
+            "# Changelog\n\n## Unreleased\n\n## 0.6.0 - 2026-09-26\n\n- old\n", "0.7.0", "2026-09-27")
+    refuses("neither section", "neither", date_changelog,
+            "# Changelog\n\n## 0.6.0 - 2026-09-26\n\n- old\n", "0.7.0", "2026-09-27")
+
+    # The install pages: the shown version, the substitution and the two-hits rule.
+    check("shown_version", value("shown_version", shown_version, INSTALL_MD), "0.6.0")
+    refuses("an install page with no version= line", "no 'version=", shown_version, "# Install\n")
+    named = value("two hits", name_new_version, "docs/install.md", INSTALL_MD, "0.6.0", "0.7.0")
+    check("both hits move", ("version=0.7.0" in named, "--tag v0.7.0" in named), (True, True))
+    check("the look-alikes stay", "10.6.0, 0.6.0-rc.1, 0.6.01, 0.6.0.1." in named, True)
+    refuses("three hits", "3 times", name_new_version, "README.md",
+            INSTALL_MD + "v0.6.0\n", "0.6.0", "0.7.0")
+    refuses("one hit", "1 times", name_new_version, "README.md", "v0.6.0\n", "0.6.0", "0.7.0")
+
+    # What tag checks in the release commit's CHANGELOG.md.
+    passes("the notes of a dated release", check_tag_notes, CHANGELOG_AFTER_RC, "0.7.0")
+    passes("a candidate ships its base's notes", check_tag_notes, CHANGELOG_AFTER_RC, "0.7.0-rc.1")
+    refuses("a version with no section", "no '## 0.8.0'", check_tag_notes, CHANGELOG_AFTER_RC, "0.8.0")
+    refuses("Unreleased still there", "Unreleased", check_tag_notes,
+            dated.replace("# Changelog\n", "# Changelog\n\n## Unreleased\n\n- more\n"), "0.7.0")
+
+    for failure in failures:
+        say("self-test FAILED " + failure)
+    if failures:
+        die("self-test: red, %d line(s) above over %d checks" % (len(failures), ran[0]))
+    say("self-test: %d checks passed" % ran[0])
+
+
 def main():
     verbs = {"prep": cmd_prep, "merge": cmd_merge, "tag": cmd_tag}
+    if len(sys.argv) >= 2 and sys.argv[1] == "self-test":
+        # No repository and no network: it runs wherever the script is.
+        cmd_self_test(sys.argv[2:])
+        return
     if len(sys.argv) < 2 or sys.argv[1] not in verbs:
-        die("usage: release.py prep <version> | merge [number] | tag")
+        die("usage: release.py prep <version> | merge [number] | tag | self-test")
     top = subprocess.run(["git", "rev-parse", "--show-toplevel"], stdout=subprocess.PIPE,
                          stderr=subprocess.DEVNULL, universal_newlines=True)
     if top.returncode != 0:
@@ -413,6 +603,8 @@ def main():
     try:
         # `just` passes an optional argument left out as an empty string.
         verbs[sys.argv[1]]([a for a in sys.argv[2:] if a])
+    except Refusal as refusal:
+        die(str(refusal))
     except KeyboardInterrupt:
         die("interrupted")
 

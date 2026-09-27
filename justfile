@@ -29,17 +29,21 @@ toolchain:
 build:
     cargo build --workspace --all-targets
 
-# rustfmt + clippy (deny warnings) + prove the engine compiles without the herdr client.
+# rustfmt + clippy (deny warnings) + prove the engine compiles without the herdr client,
+# then the release script's self-test.
 lint:
     cargo fmt --all --check
     cargo clippy --workspace --all-targets -- -D warnings
     cargo check -p lastcall-engine --no-default-features
     # Safe wrappers only: `nix`, never a direct `libc` call or dependency. A raw
-    # `libc::open` would be `unsafe`, and `unsafe_code = "forbid"` is workspace-wide —
+    # `libc::open` would be `unsafe`, and `unsafe_code = "forbid"` is workspace-wide:
     # this grep catches the dependency edge before someone reaches for the escape hatch
     # (docs/spec/96-phase7-kickoff.md, design review F3).
     ! grep -rn --include='*.rs' 'libc::' crates
     ! grep -rn --include='Cargo.toml' '^libc' crates
+    # The release script's rules over made-up text: no repository, no network, standard
+    # library only. CI runs it on both runners, and release.yml runs it again on the tag.
+    python3 scripts/release.py self-test
 
 # The canonical unit suite: in-module #[cfg(test)] only. Deterministic, no network, no
 # sockets except the in-test mock, no git repos except temp fixtures.
