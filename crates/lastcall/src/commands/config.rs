@@ -25,15 +25,23 @@ pub fn run(json: bool) -> Result<ExitCode, Box<dyn std::error::Error>> {
 }
 
 fn print_json(loaded: &Loaded, resolved: &Resolved) -> Result<(), Box<dyn std::error::Error>> {
-    let out = serde_json::json!({
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json_dump(loaded, resolved))?
+    );
+    Ok(())
+}
+
+/// What `lastcall config --json` prints. The config's field names are the JSON keys a
+/// script reads, so a renamed field is a renamed key here.
+fn json_dump(loaded: &Loaded, resolved: &Resolved) -> serde_json::Value {
+    serde_json::json!({
         "config_path": loaded.source.path(),
         "source": loaded.source,
         "state_dir": loaded.state_dir,
         "config": loaded.config,
         "resolved": resolved,
-    });
-    println!("{}", serde_json::to_string_pretty(&out)?);
-    Ok(())
+    })
 }
 
 fn print_human(loaded: &Loaded, resolved: &Resolved) -> Result<(), Box<dyn std::error::Error>> {
@@ -54,4 +62,32 @@ fn print_human(loaded: &Loaded, resolved: &Resolved) -> Result<(), Box<dyn std::
     println!("--- effective config (toml) ---");
     print!("{}", toml::to_string_pretty(&loaded.config)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lastcall_engine::config::{Config, ConfigSource};
+    use std::path::{Path, PathBuf};
+
+    /// Phase 14 I: the JSON dump names the two renamed keys by their new names, and
+    /// neither old name appears anywhere in it.
+    #[test]
+    fn config_json_names_the_renamed_keys_by_their_new_names() {
+        let loaded = Loaded {
+            config: Config::default(),
+            source: ConfigSource::Defaults {
+                searched: Vec::new(),
+            },
+            state_dir: PathBuf::from("/state"),
+        };
+        let resolved = loaded.resolve(Path::new("/launch"));
+        let out = json_dump(&loaded, &resolved);
+        let config = out["config"].as_object().expect("config is an object");
+        assert!(config.contains_key("watch_ignore_globs"), "{out}");
+        assert!(config.contains_key("include_gitignored"), "{out}");
+        let text = out.to_string();
+        assert!(!text.contains("\"review_ignored\""), "{text}");
+        assert!(!text.contains("\"ignore_globs\""), "{text}");
+    }
 }

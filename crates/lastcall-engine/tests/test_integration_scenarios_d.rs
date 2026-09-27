@@ -1080,6 +1080,143 @@ fn scenario_d13_worktree_kept_inside_its_repository() {
     );
 }
 
+// ---- D28: a root removed while listed (Phase 14 C, Amendment v1.15) ----
+
+/// How the worktree leaves: the agent's own cleanup, or a plain `rm -r` git is not told
+/// about (the admin dir `.git/worktrees/wt` survives it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Removal {
+    WorktreeRemoveForce,
+    RmR,
+}
+
+fn scenario_d28(form: Removal) {
+    let tag = format!("D28 {form:?}");
+    // Setup: D13's layout at search_depth = 2, `wt` listed with its badge.
+    let mut repo = FixtureRepo::new("R").unwrap();
+    repo.commit_files(&[(".gitignore", ".worktrees/\n")], "ignore worktrees")
+        .unwrap();
+    repo.git(&["worktree", "add", "-q", ".worktrees/wt", "-b", "feat-w"])
+        .unwrap();
+    let parent = std::fs::canonicalize(repo.parent_dir()).unwrap();
+    let r = std::fs::canonicalize(repo.path()).unwrap();
+    let wt = std::fs::canonicalize(repo.path().join(".worktrees/wt")).unwrap();
+    let state = TempDir::new("lc-d28-state");
+    let env = repo.engine_env(state.path());
+    let mut engine = at_depth(&parent, &env, state.path(), 2);
+    assert_eq!(
+        listed(&engine, &parent),
+        vec!["R", "R/.worktrees/wt"],
+        "{tag}"
+    );
+    assert_eq!(
+        engine.root(&wt).unwrap().badge,
+        Some(Badge::WorktreeOf(r.clone()))
+    );
+    assert_pile!(engine, wt, "", "D28 first sight");
+    // A pending deletion (the accept that wrote in the gap) and a pending file.
+    std::fs::remove_file(wt.join("f2")).unwrap();
+    std::fs::write(wt.join("pend"), "p\n").unwrap();
+    let pile = assert_pile!(engine, wt, "f2|pend", "D28 pending in wt");
+    let deletion = Rendered::of(pile.row(b"f2").unwrap());
+    let ledger = engine.root(&wt).unwrap().paths.ledger.clone();
+    let seen_tree = engine.root(&wt).unwrap().ledger.seen_tree.clone();
+    assert!(seen_tree.is_some(), "{tag}: a record to keep");
+
+    // Action: the removal.
+    match form {
+        Removal::WorktreeRemoveForce => {
+            let refused = repo.git(&["worktree", "remove", ".worktrees/wt"]);
+            assert!(refused.is_err(), "plain remove refuses pending files");
+            repo.git(&["worktree", "remove", "--force", ".worktrees/wt"])
+                .unwrap();
+            assert!(!repo.path().join(".git/worktrees/wt").exists(), "{tag}");
+        }
+        Removal::RmR => {
+            std::fs::remove_dir_all(&wt).unwrap();
+            assert!(repo.path().join(".git/worktrees/wt").is_dir(), "{tag}");
+        }
+    }
+    assert!(!wt.exists(), "{tag}");
+
+    // In the gap, before discovery: the accept of the pending deletion is refused as
+    // `folder removed`, writes nothing and spawns nothing; the scan is `RootGone`, not a
+    // failed scan, and spawns nothing either.
+    let bytes = std::fs::read(&ledger).unwrap();
+    let n = lastcall_engine::git::thread_spawn_count();
+    let acc = engine
+        .accept(&wt, lastcall_engine::engine::AcceptRequest::File(deletion))
+        .expect("a refusal, not an error");
+    let scan = engine.scan(&wt);
+    assert_eq!(
+        lastcall_engine::git::thread_spawn_count() - n,
+        0,
+        "{tag}: no git against the missing directory"
+    );
+    assert_eq!(acc.outcome.refused, vec![Refused::RootGone], "{tag}");
+    assert_eq!(acc.outcome.refused[0].to_string(), "folder removed");
+    assert_eq!(
+        std::fs::read(&ledger).unwrap(),
+        bytes,
+        "{tag}: nothing written"
+    );
+    assert!(
+        matches!(&scan, Err(lastcall_engine::engine::EngineError::RootGone(p)) if *p == wt),
+        "{tag}: {scan:?}"
+    );
+
+    // The discovery pass drops it; the state directory keeps its record.
+    let changed = engine.rescan().unwrap();
+    assert_eq!(changed.removed, vec![wt.clone()], "{tag}");
+    assert!(changed.added.is_empty(), "{tag}");
+    assert_eq!(listed(&engine, &parent), vec!["R"], "{tag}");
+    assert_eq!(
+        std::fs::read(&ledger).unwrap(),
+        bytes,
+        "{tag}: the record is kept"
+    );
+    drop(engine);
+
+    // Restart: nothing listed for it, and `status` does not name it.
+    let mut engine = at_depth(&parent, &env, state.path(), 2);
+    assert_eq!(listed(&engine, &parent), vec!["R"], "{tag} restart");
+    let report = lastcall_engine::status::StatusReport::build(&mut engine, None).unwrap();
+    let roots: Vec<&str> = report.roots.iter().map(|s| s.root.as_str()).collect();
+    assert_eq!(roots, vec![r.to_str().unwrap()], "{tag} status");
+
+    // Re-added at the same path (the `rm -r` form needs the prune first: git still has it
+    // registered and refuses the add), it is listed again with its old record.
+    if form == Removal::RmR {
+        let refused = repo.git(&["worktree", "add", "-q", ".worktrees/wt", "feat-w"]);
+        assert!(refused.is_err(), "add refuses a registered path");
+        repo.git(&["worktree", "prune"]).unwrap();
+    }
+    repo.git(&["worktree", "add", "-q", ".worktrees/wt", "feat-w"])
+        .unwrap();
+    let changed = engine.rescan().unwrap();
+    assert_eq!(changed.added, vec![wt.clone()], "{tag} re-added");
+    assert_eq!(
+        engine.root(&wt).unwrap().ledger.seen_tree,
+        seen_tree,
+        "{tag}: the old record"
+    );
+    assert_eq!(
+        engine.root(&wt).unwrap().badge,
+        Some(Badge::WorktreeOf(r.clone()))
+    );
+    assert_pile!(engine, wt, "", "D28 the checkout is the seen state again");
+}
+
+#[test]
+fn scenario_d28_a_worktree_removed_by_git_leaves_and_refuses_the_gap() {
+    scenario_d28(Removal::WorktreeRemoveForce);
+}
+
+#[test]
+fn scenario_d28_variant_a_worktree_removed_by_rm_r_leaves_and_refuses_the_gap() {
+    scenario_d28(Removal::RmR);
+}
+
 // ---------------------------------------------------------------------------------------
 // Per-branch seen records (D14 to D23, Amendment v1.12). One record per branch the repo has
 // been checked out on while lastcall watched; the record in force is the one the branch
@@ -1377,12 +1514,32 @@ fn scenario_d16_cherry_picks_show_once_more_by_design() {
     );
     s.repo.git(&["cherry-pick", "main..run-1"]).unwrap();
     s.repo.git(&["cherry-pick", "main..run-2"]).unwrap();
-    assert_pile!(
+    let pile = assert_pile!(
         s.engine,
         s.root,
         "a.rs|b.rs|c.rs",
         "D16 the cherry-picked content shows again"
     );
+    // Amendment v1.15: the rows are still pending, and each says which parked record
+    // already accepted exactly this content; the three fold into one `seen` group.
+    let seen_on: Vec<(String, Vec<String>)> = pile
+        .rows
+        .iter()
+        .map(|r| (r.path_lossy(), r.seen_on.clone()))
+        .collect();
+    assert_eq!(
+        seen_on,
+        vec![
+            ("a.rs".to_owned(), vec!["run-1".to_owned()]),
+            ("b.rs".to_owned(), vec!["run-1".to_owned()]),
+            ("c.rs".to_owned(), vec!["run-2".to_owned()]),
+        ],
+        "D16 seen_on per row"
+    );
+    let groups = pile.groups();
+    assert_eq!(groups.len(), 1, "D16 one group: {groups:?}");
+    assert_eq!(groups[0].kind, lastcall_engine::scan::GroupKind::Seen);
+    assert_eq!(groups[0].paths.len(), 3, "D16 [seen] 3 files");
     let before = s.ledger().seen_tree.clone();
     assert!(s.accept_all().ok());
     assert_pile!(s.engine, s.root, "", "D16 accept-all on feat/x");
@@ -2397,5 +2554,221 @@ fn scenario_d26_variant_c_the_first_sight_entry_folds_back() {
     assert!(
         s.ledger().overrides.is_empty(),
         "the accepted deletion is spent by the fold"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// D27 — `include_gitignored` lists chosen gitignored files inside their repository
+// (Amendment v1.15, Phase 14 deliverable A).
+// ---------------------------------------------------------------------------------------
+
+/// D27's engine: the fixture's own environment with `GIT_CONFIG_GLOBAL` pointed at a
+/// temp file whose `core.excludesFile` ignores `*.scratch`, so the user's global excludes
+/// are in play exactly as on a real machine.
+struct D27 {
+    repo: FixtureRepo,
+    state: TempDir,
+    global: TempDir,
+    engine: lastcall_engine::engine::Engine,
+    root: std::path::PathBuf,
+}
+
+impl D27 {
+    fn new() -> Self {
+        let mut repo = FixtureRepo::new("d27").unwrap();
+        repo.commit_files(
+            &[(".gitignore", "z_ignore_*\nz_ignore/\ntarget/\n")],
+            "ignore the scratch names",
+        )
+        .unwrap();
+        repo.write("z_ignore_top.md", "top\n");
+        repo.write("a/b/c/z_ignore_deep.md", "deep 1\ndeep 2\ndeep 3\n");
+        repo.write("z_ignore/inside.md", "inside\n");
+        repo.write("target/z_ignore_built.md", "built\n");
+        repo.write("notes.scratch", "scratch\n");
+        let global = TempDir::new("lc-d27-global");
+        let excludes = global.write("excludes", "*.scratch\n");
+        global.write(
+            "gitconfig",
+            format!("[core]\n\texcludesFile = {}\n", excludes.display()),
+        );
+        let state = TempDir::new("lc-d27-state");
+        let root = std::fs::canonicalize(repo.path()).unwrap();
+        let engine = Self::open(&repo, &state, &global, Config::default());
+        Self {
+            repo,
+            state,
+            global,
+            engine,
+            root,
+        }
+    }
+
+    fn open(
+        repo: &FixtureRepo,
+        state: &TempDir,
+        global: &TempDir,
+        config: Config,
+    ) -> lastcall_engine::engine::Engine {
+        let env = repo.engine_env(state.path()).with_var(
+            "GIT_CONFIG_GLOBAL",
+            global.path().join("gitconfig").to_string_lossy(),
+        );
+        open_engine(repo.path(), &env, state.path(), config)
+    }
+
+    /// `lc_restart` with this config.
+    fn restart(&mut self, config: Config) {
+        self.engine = Self::open(&self.repo, &self.state, &self.global, config);
+    }
+
+    fn accept(&mut self, path: &str) {
+        let pile = self.engine.scan(&self.root).unwrap();
+        let row = pile.row(path.as_bytes()).expect("pending");
+        let out = self
+            .engine
+            .ops(&self.root)
+            .unwrap()
+            .accept_file(&Rendered::of(row), &NoFault)
+            .unwrap();
+        assert!(out.ok(), "{out:?}");
+    }
+}
+
+fn reviewing(patterns: &[&str]) -> Config {
+    Config {
+        include_gitignored: patterns.iter().map(|p| (*p).to_owned()).collect(),
+        ..Config::default()
+    }
+}
+
+#[test]
+fn scenario_d27_include_gitignored_lists_chosen_gitignored_files() {
+    let mut s = D27::new();
+    assert_pile!(
+        s.engine,
+        s.root,
+        "",
+        "D27 with no key every scratch file is ignored"
+    );
+
+    let config = reviewing(&["z_ignore_*", "*.scratch"]);
+    s.restart(config.clone());
+    let pile = assert_pile!(
+        s.engine,
+        s.root,
+        "a/b/c/z_ignore_deep.md|notes.scratch|z_ignore_top.md",
+        "D27 the matches at every depth, never inside an ignored folder"
+    );
+    for row in &pile.rows {
+        assert_eq!(row.change, Change::Added, "{}", row.path_lossy());
+        assert_eq!(row.annotation, None, "no badge (ruling 4)");
+    }
+    s.restart(config.clone());
+    assert_pile!(
+        s.engine,
+        s.root,
+        "a/b/c/z_ignore_deep.md|notes.scratch|z_ignore_top.md",
+        "D27 restart: identical"
+    );
+
+    // The deep file through the whole loop: accept, edit (one hunk), delete, accept.
+    s.accept("a/b/c/z_ignore_deep.md");
+    assert_pile!(s.engine, s.root, "notes.scratch|z_ignore_top.md");
+    s.repo
+        .write("a/b/c/z_ignore_deep.md", "deep 1\ndeep two\ndeep 3\n");
+    let pile = assert_pile!(
+        s.engine,
+        s.root,
+        "a/b/c/z_ignore_deep.md|notes.scratch|z_ignore_top.md",
+        "D27 an edit to the accepted file is pending"
+    );
+    let row = pile.row(b"a/b/c/z_ignore_deep.md").unwrap();
+    assert_eq!(row.change, Change::Modified);
+    assert_eq!(row.hunks.len(), 1, "D27 one hunk");
+    s.restart(config.clone());
+    assert_pile!(
+        s.engine,
+        s.root,
+        "a/b/c/z_ignore_deep.md|notes.scratch|z_ignore_top.md",
+        "D27 restart: identical"
+    );
+    s.accept("a/b/c/z_ignore_deep.md");
+    s.repo.remove("a/b/c/z_ignore_deep.md");
+    let pile = assert_pile!(
+        s.engine,
+        s.root,
+        "a/b/c/z_ignore_deep.md|notes.scratch|z_ignore_top.md",
+        "D27 the deletion is pending"
+    );
+    assert_eq!(
+        pile.row(b"a/b/c/z_ignore_deep.md").unwrap().change,
+        Change::Deleted
+    );
+    s.accept("a/b/c/z_ignore_deep.md");
+    assert_pile!(
+        s.engine,
+        s.root,
+        "notes.scratch|z_ignore_top.md",
+        "D27 the accepted deletion is gone"
+    );
+    s.restart(config.clone());
+    assert_pile!(s.engine, s.root, "notes.scratch|z_ignore_top.md");
+
+    // The key removed: the file never accepted is ignored again; the accepted one keeps
+    // its seen-tree entry, so its later change and its deletion are rows (the over-show).
+    s.accept("notes.scratch");
+    assert_pile!(s.engine, s.root, "z_ignore_top.md");
+    s.restart(Config::default());
+    assert_pile!(
+        s.engine,
+        s.root,
+        "",
+        "D27 without the key the unaccepted file is not listed"
+    );
+    s.repo.write("notes.scratch", "scratch, changed\n");
+    let pile = assert_pile!(
+        s.engine,
+        s.root,
+        "notes.scratch",
+        "D27 the accepted file's change is still a row (the honest over-show)"
+    );
+    assert_eq!(pile.row(b"notes.scratch").unwrap().change, Change::Modified);
+    s.restart(Config::default());
+    assert_pile!(s.engine, s.root, "notes.scratch", "D27 restart: identical");
+    s.accept("notes.scratch");
+    assert_pile!(s.engine, s.root, "", "D27 one accept clears the over-show");
+    s.repo.remove("notes.scratch");
+    let pile = assert_pile!(
+        s.engine,
+        s.root,
+        "notes.scratch",
+        "D27 its deletion is a row too"
+    );
+    assert_eq!(pile.row(b"notes.scratch").unwrap().change, Change::Deleted);
+}
+
+/// D27, `status --json`: a `include_gitignored` row is byte-identical in shape to an ordinary
+/// untracked row (no badge, no marker, no new field), because it is one.
+#[test]
+fn scenario_d27_a_include_gitignored_row_is_shaped_like_an_untracked_row() {
+    use lastcall_engine::status::RowStatus;
+    let mut s = D27::new();
+    s.repo.write("plain_new.md", "top\n");
+    s.restart(reviewing(&["z_ignore_*"]));
+    let pile = assert_pile!(
+        s.engine,
+        s.root,
+        "a/b/c/z_ignore_deep.md|plain_new.md|z_ignore_top.md"
+    );
+    let json = |path: &str| {
+        let mut row = RowStatus::of(pile.row(path.as_bytes()).unwrap());
+        row.path = "P".to_owned();
+        serde_json::to_string_pretty(&row).unwrap()
+    };
+    assert_eq!(
+        json("z_ignore_top.md"),
+        json("plain_new.md"),
+        "same content, same shape, same bytes"
     );
 }

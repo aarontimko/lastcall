@@ -17,13 +17,17 @@ setup as code, plus the numbered steps to follow and what each should show.
 
 `just tryout <scenario>` builds the release binary first and then runs this.
 
-The sandbox is a fresh directory under the system temp directory holding the repositories
-(`parent/`), a state directory (`state/`), a `config.toml` naming only `parent/`, the steps
-(`STEPS.md`) and a `run.py` that reopens the same sandbox. lastcall is pointed at it with
+The sandbox is one directory per scenario under the system temp directory,
+`lastcall-tryout-<scenario>/`, holding the repositories (`parent/`), a state directory
+(`state/`), a `config.toml` naming only `parent/`, the steps (`STEPS.md`) and a `run.py`
+that reopens the same sandbox. The path is the same on every run, so a second terminal can
+`cd` to it once: a run moves the previous run's sandbox aside first (to
+`lastcall-tryout-<scenario>.<built-at>`) and refuses to start while a lastcall opened by an
+earlier run is still open over the path. lastcall is pointed at the sandbox with
 LASTCALL_STATE_DIR and LASTCALL_CONFIG, so the real `~/.local/state/lastcall` and
 `~/.config/lastcall` are never read or written. HOME is left alone on purpose: outside a
 herdr pane lastcall looks for the herdr session under the real home directory. Nothing is
-deleted afterwards; the path is printed, and the directory is the person's to remove.
+deleted afterwards; the path is printed, and the directories are the person's to remove.
 
 Adding a scenario: write a function that takes a `Sandbox`, builds what it needs with
 `sandbox.repo(...)`, `Repo.write`, `Repo.commit` and `sandbox.config_extra`, and returns the
@@ -37,6 +41,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BINARY = os.path.join(ROOT, "target", "release", "lastcall")
@@ -88,10 +93,16 @@ class Sandbox:
     """The directory a scenario builds into, and the config it opens with."""
 
     def __init__(self, scenario):
-        self.base = tempfile.mkdtemp(prefix="lastcall-tryout-%s-" % scenario)
+        self.base = os.path.join(tempfile.gettempdir(), "lastcall-tryout-%s" % scenario)
+        # The previous run's sandbox, moved aside so this run's steps and git commands
+        # always name the same path; None on a first run.
+        self.moved = move_aside(self.base)
+        os.makedirs(self.base)
         self.parent = os.path.join(self.base, "parent")
         self.state = os.path.join(self.base, "state")
         self.config = os.path.join(self.state, "config.toml")
+        # `run.py` writes the pid of the lastcall it opens here; the next run reads it.
+        self.pidfile = os.path.join(self.base, "tui.pid")
         os.makedirs(self.parent)
         os.makedirs(self.state)
         # Extra TOML for the scenario: top-level keys first, then tables.
@@ -108,6 +119,13 @@ class Sandbox:
         # False leaves `parent_dirs` out of the config, so lastcall watches whatever
         # directory it is opened from: the way it runs with no config at all.
         self.name_parent = True
+        # The first repository built, for the printed `shell:` line.
+        self.first_repo = None
+
+    def shell_dir(self):
+        """Where the person's second terminal stands: the first repository the scenario
+        built, else the parent directory."""
+        return self.first_repo or self.parent
 
     def launch_dir(self):
         """The directory lastcall opens from; refused if it is not under `parent/`."""
@@ -118,7 +136,10 @@ class Sandbox:
         return full
 
     def repo(self, name):
-        return Repo(os.path.join(self.parent, name))
+        path = os.path.join(self.parent, name)
+        if self.first_repo is None:
+            self.first_repo = path
+        return Repo(path)
 
     def config_extra(self, keys="", tables=""):
         """Top-level `key = value` lines and whole `[table]` blocks for config.toml.
@@ -227,7 +248,183 @@ def scenario_wrap(sandbox):
     ]
 
 
+def scenario_ignored(sandbox):
+    """`include_gitignored`: gitignored scratch files reviewed inside their repository."""
+    repo = sandbox.repo("demo")
+    repo.commit(
+        "base",
+        repo.write(".gitignore", "z_ignore_*\nz_ignore/\n"),
+        repo.write("src/lib.rs", "pub fn answer() -> u32 {\n    42\n}\n"),
+    )
+    repo.write("z_ignore_plan.md", "# Plan\n\n- read the code\n- write the fix\n")
+    repo.write("src/deep/er/z_ignore_notes.md", "notes from the agent\n")
+    repo.write("z_ignore/inside.md", "a file inside an ignored folder\n")
+    sandbox.config_extra(keys='include_gitignored = ["z_ignore_*"]')
+    demo = os.path.join(sandbox.parent, "demo")
+    return [
+        "Two rows, no badge. Under `demo` the list shows `src/deep/er/z_ignore_notes.md` "
+        "and `z_ignore_plan.md`, each as a new file, although `.gitignore` ignores both "
+        "(the config says `include_gitignored = [\"z_ignore_*\"]`). `z_ignore/inside.md` is "
+        "not listed: git never looks inside an ignored folder, so nothing there can be "
+        "re-included.",
+        "Accept. Select `z_ignore_plan.md` and press `a`: the row leaves the list.",
+        "Edit. In a second terminal: `cd '%s'` then "
+        "`printf -- '- run the tests\\n' >> z_ignore_plan.md`. Within a second or two the "
+        "row is back as a change, one hunk with the added line." % demo,
+        "Accept the edit with `a`: the row leaves again.",
+        "Delete. In the second terminal: `rm z_ignore_plan.md`. The row comes back as a "
+        "deletion. Press `a`: it leaves for good.",
+        "The deep file is an ordinary row. Select `src/deep/er/z_ignore_notes.md`, press "
+        "`A`: it leaves, and `demo` has nothing pending. `z` brings it back.",
+    ]
+
+
+def scenario_reload(sandbox):
+    """`R` reads the config file again: a new watched folder, a skipped clone, a refusal."""
+    demo = sandbox.repo("demo")
+    demo.commit("base", demo.write("app.py", "def main():\n    return 1\n"))
+    demo.write("app.py", "def main():\n    return 2\n")
+    clone = sandbox.repo("evals-clone")
+    clone.commit("base", clone.write("README.md", "a clone nobody reviews\n"))
+    clone.write("README.md", "a clone nobody reviews, changed\n")
+    notes = os.path.join(sandbox.parent, "notes")
+    scratch = os.path.join(sandbox.parent, "scratch")
+    for folder, name, text in (
+        (notes, "todo.md", "- ship it\n"),
+        (scratch, "idea.md", "an idea\n"),
+    ):
+        os.makedirs(folder)
+        with open(os.path.join(folder, name), "w", encoding="utf-8") as f:
+            f.write(text)
+    sandbox.config_extra(keys='draft_dirs = [\n  "notes",\n  # "scratch",\n]')
+    config = sandbox.config
+    return [
+        "Three roots. The list shows `demo` (one change, `app.py`), `evals-clone` (one "
+        "change) and `parent/notes` (nothing pending). `parent/scratch` is not listed: its "
+        "line in the "
+        "config is commented out.",
+        "Accept something. Select `app.py` under `demo` and press `A`: the row leaves and "
+        "`demo` has nothing pending.",
+        "Uncomment the second watched folder. In a second terminal open `%s` in an editor, "
+        "delete the `# ` in front of `\"scratch\",` and save. The screen does not change: "
+        "nothing reads the file until you ask." % config,
+        "Press `R`. The status line says `config reloaded: 1 root added` and `parent/scratch` is "
+        "listed, with nothing pending (`draft_initial` is `seen`). `demo` still has nothing "
+        "pending: the accept from step 2 is intact. Edit `%s/idea.md` in the second "
+        "terminal and it shows up as a change." % scratch,
+        "Skip a repository. Add the line `skip_globs = [\"evals-clone\"]` at the very top "
+        "of the config file (above `[update]`: a top-level key cannot follow a table), save, "
+        "press `R`. The status line says `config reloaded: 1 root removed, skip_globs` and "
+        "`evals-clone` leaves the list. Delete the line and press `R` again: it is back.",
+        "Break the file. Add a last line `this is not toml` and save, then press `R`. The "
+        "status line says `config not reloaded:` then the line number and what is wrong. "
+        "Nothing on the screen changed and every key still works: `r` rescans and says "
+        "`refreshed`.",
+        "Mend it. Remove the bad line, press `R`: `config reloaded, nothing changed`.",
+        "The key. `?` lists `R  reload the config file` next to `r`. In a terminal wide "
+        "enough, the hint line at the bottom names `R reload` after `r refresh`; it is the "
+        "first hint to go when the line is short.",
+    ]
+
+
+def scenario_cherry_pick(sandbox):
+    """Content already accepted on another branch folds into one `seen` row, and opens."""
+    repo = sandbox.repo("demo")
+    # The person runs git by hand in this repository, so its own config carries what their
+    # global config might not have (an identity) or might add (signing, hooks).
+    for key, value in (
+        ("user.name", "tryout"),
+        ("user.email", "tryout@example.invalid"),
+        ("commit.gpgsign", "false"),
+        ("core.hooksPath", "/dev/null"),
+    ):
+        repo.git("config", key, value)
+    repo.commit(
+        "base",
+        repo.write("a.rs", "pub fn a() -> u32 {\n    1\n}\n"),
+        repo.write("b.rs", "pub fn b() -> u32 {\n    2\n}\n"),
+        repo.write("c.rs", "pub fn c() -> u32 {\n    3\n}\n"),
+    )
+    for branch in ("feat-x", "feat-y", "feat-z"):
+        repo.git("branch", branch)
+    repo.git("switch", "-q", "-c", "run-2")
+    repo.commit(
+        "run-2 work",
+        repo.write("d.rs", "pub fn d() -> u32 {\n    4\n}\n"),
+        repo.write("e.rs", "pub fn e() -> u32 {\n    5\n}\n"),
+    )
+    repo.git("switch", "-q", "main")
+    repo.git("switch", "-q", "-c", "run-1")
+    for name, n in (("a.rs", 10), ("b.rs", 20), ("c.rs", 30)):
+        stem = name[0]
+        repo.write(
+            name,
+            "pub fn %s() -> u32 {\n    %d\n}\n\npub fn %s_twice() -> u32 {\n    %s() * 2\n}\n"
+            % (stem, n, stem, stem),
+        )
+    demo = os.path.join(sandbox.parent, "demo")
+    status = "LASTCALL_STATE_DIR='%s' LASTCALL_CONFIG='%s' '%s' status" % (
+        sandbox.state,
+        sandbox.config,
+        BINARY,
+    )
+    return [
+        "The reviewed work. Keep lastcall open and use a second terminal for git: "
+        "`cd '%s'`. The list shows `demo` on `run-1 · 3 files`: `a.rs`, `b.rs`, `c.rs`, "
+        "each edited. Read them, then press `ctrl-a`: the list empties. In the second "
+        "terminal: `git commit -qam \"run-1 work\"`. The list stays empty." % demo,
+        "The switch. `git switch feat-x`: the branch line says `feat-x` and the list stays "
+        "empty (the status line says it is your first time on feat-x, carried over from "
+        "run-1).",
+        "The cherry-pick. `git cherry-pick run-1`: within a second or two the list shows "
+        "one row, `[seen] 3 files`, not three rows.",
+        "Read it. Select `[seen] 3 files`: the right pane says `3 files, content accepted "
+        "on run-1` and lists the three paths, each with `run-1` beside it.",
+        "Open it. Press `e`: `a.rs`, `b.rs` and `c.rs` appear indented under the group "
+        "row, each badged `[seen]`; once the `HEAD moved` status line has cleared (it stays "
+        "for half a minute) the hint line says `e collapse`. Select `b.rs`: its diff shows "
+        "like any row's, `[seen]` on its header. Press `e` again: they fold back and the "
+        "group row is selected.",
+        "One file changes. `printf 'extra\\n' >> b.rs`: `b.rs` becomes its own row above "
+        "`[seen] 2 files`, with no badge (its content is new).",
+        "Flag a member. Press `e` on the group, select `c.rs`, press `m`, type a note, "
+        "press Enter: `c.rs` leaves the group as its own row with the flag mark and "
+        "`[seen]`, and `[seen] 1 file` remains, still open with `a.rs` under it.",
+        "Accept the group. Select `[seen] 1 file`, press `a`: refused, the status line "
+        "says `A accepts the group`. Press `A`: `accepted [seen] 1 file` and the group "
+        "row is gone. Press `z`: `undid accept of a.rs` and `[seen] 1 file` is back.",
+        "Accept all. In the second terminal make ten scratch files so `ctrl-a` asks first: "
+        "`for i in 1 2 3 4 5 6 7 8 9 10; do echo \"note $i\" > note-$i.txt; done`. Press "
+        "`ctrl-a`: the modal says `Accept all 13 files in demo?` and `0 grouped upstream "
+        "· 1 grouped seen · 0 collapsed`: every pending file, folded or not. Press `y`: "
+        "the list empties. Then commit so the next switch starts clean: "
+        "`git add -A && git commit -qm \"feat-x work\"`.",
+        "The rebase variant. In the second terminal: `git switch run-2`. lastcall's branch "
+        "line says `run-2` and two plain rows appear under it, `d.rs` and `e.rs`, with no "
+        "`seen` row: on `run-2` this content has never been accepted. In lastcall press "
+        "`ctrl-a` (hold Control, press `a`: accept all), which accepts both `d.rs` and "
+        "`e.rs`; the `demo` list now has no rows. In the second terminal: `git switch "
+        "feat-y`. The branch line says `feat-y`; the `demo` list still has no rows, "
+        "because `feat-y` has no changes of its own. Then `git rebase run-2`, which brings "
+        "the `d.rs` and `e.rs` commit onto `feat-y`: within a second or two the `demo` list "
+        "shows one row, `[seen] 2 files`, not two plain rows. Select it: the right pane "
+        "says `2 files, content accepted on run-2`.",
+        "The squash-merge variant. In the second terminal: `git switch feat-z`. The branch "
+        "line says `feat-z` and the `demo` list has no rows. Then `git merge --squash "
+        "run-2`, which copies the `d.rs` and `e.rs` changes into the working tree without "
+        "committing: the `demo` list shows `[seen] 2 files` again, for the same reason.",
+        "Nothing hidden. In the second terminal run lastcall's status command against this "
+        "sandbox: `%s`. It prints `d.rs` and `e.rs`, each tagged `[seen]`, then the line "
+        "`[seen] 2 files`. Run the same command with `--json` added at the end: in the "
+        "JSON, each of the two pending rows has a `seen_on` list containing `run-2`, and "
+        "`groups` has one entry whose `\"kind\"` is `\"seen\"`." % status,
+    ]
+
+
 SCENARIOS = {
+    "cherry-pick": scenario_cherry_pick,
+    "ignored": scenario_ignored,
+    "reload": scenario_reload,
     "wrap": scenario_wrap,
 }
 
@@ -270,10 +467,59 @@ def build(name, launch_in=None):
             "os.environ['LASTCALL_STATE_DIR'] = %r\n"
             "os.environ['LASTCALL_CONFIG'] = %r\n"
             "os.chdir(%r)\n"
+            "with open(%r, 'w') as f:\n"
+            "    f.write(str(os.getpid()))\n"
             "os.execv(%r, ['lastcall', 'tui'])\n"
-            % (sandbox.state, sandbox.config, launch_dir, BINARY)
+            % (sandbox.state, sandbox.config, launch_dir, sandbox.pidfile, BINARY)
         )
     return sandbox, "\n".join(text)
+
+
+def running_tui(base):
+    """The pid of a lastcall that an earlier run's `run.py` opened over `base` and that is
+    still running, or None. The pid file is written by `run.py` just before it execs the
+    binary, so the pid is the TUI's own."""
+    try:
+        with open(os.path.join(base, "tui.pid"), encoding="utf-8") as f:
+            pid = int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True
+        ).stdout
+    except OSError:
+        return None
+    return pid if "lastcall" in out else None
+
+
+def move_aside(base):
+    """Move the previous run's sandbox at `base` to `<base>.<built-at>` and return the new
+    path, or None when there was none.
+
+    One path per scenario is what lets a second terminal `cd` to the sandbox once and
+    stay right across runs. The move keeps the previous run's evidence, and a lastcall
+    still open over `base` would otherwise carry on writing the old run's state into the
+    new run's directory, so that is refused: quit it and run again.
+    """
+    if not os.path.lexists(base):
+        return None
+    pid = running_tui(base)
+    if pid is not None:
+        raise ValueError(
+            "a lastcall opened by an earlier run (pid %d) is still open over %s: "
+            "quit it with `q`, then run this again" % (pid, base)
+        )
+    steps = os.path.join(base, "STEPS.md")
+    built = os.path.getmtime(steps if os.path.exists(steps) else base)
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(built))
+    target = "%s.%s" % (base, stamp)
+    n = 1
+    while os.path.lexists(target):
+        n += 1
+        target = "%s.%s-%d" % (base, stamp, n)
+    os.rename(base, target)
+    return target
 
 
 def main(argv):
@@ -307,8 +553,14 @@ def main(argv):
     print(steps)
     print("sandbox: %s" % sandbox.base)
     print("opens in: %s" % os.path.join(sandbox.parent, sandbox.launch_in).rstrip(os.sep))
+    # The second terminal's first command, spelled out: a `cd` built on `$TMPDIR` fails
+    # silently in a shell that does not carry the variable (a pane, a multiplexer), and the
+    # next command then runs wherever that shell was.
+    print("shell:    cd '%s'   (the second terminal, before step 1)" % sandbox.shell_dir())
     print("steps:   %s" % os.path.join(sandbox.base, "STEPS.md"))
     print("reopen:  python3 '%s'" % run)
+    if sandbox.moved:
+        print("note:    the previous %s sandbox was moved to %s" % (name, sandbox.moved))
     if "--no-launch" in flags:
         return 0
     try:

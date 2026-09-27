@@ -154,6 +154,11 @@ pub enum Refused {
     /// "everything but hunk k" would silently drop whatever is missing from it (verifier
     /// F3). The one refusal that is about the *caller's* view rather than the file.
     Incomplete { path: Vec<u8> },
+    /// The root's directory is gone (Phase 14 C): a removed worktree, a folder moved away.
+    /// Checked before anything is staged, so nothing is written, a pending deletion
+    /// included (its path is absent, which is all a deletion accept asks). Names no path:
+    /// the TUI adds the root (`wt: folder removed`).
+    RootGone,
 }
 
 impl Refused {
@@ -228,6 +233,7 @@ impl Refused {
                 };
                 format!("branch changed under this {noun} (now {now}); try again")
             }
+            Refused::RootGone => "folder removed".to_string(),
         }
     }
 }
@@ -848,6 +854,14 @@ impl Ops<'_> {
     /// comes back "changed since rendered" — true, and useless. The switch is the reason,
     /// so the switch is the refusal.
     fn accept_preflight(&self) -> Result<Option<Outcome>, OpsError> {
+        // Phase 14 C: first, before the ledger is loaded or `HEAD` read. One `metadata`
+        // call; a missing root is refused whatever the row is.
+        if !self.store.root().is_dir() {
+            return Ok(Some(Outcome {
+                refused: vec![Refused::RootGone],
+                ..Default::default()
+            }));
+        }
         Ok(self.branch_refusal()?.map(|r| Outcome {
             refused: vec![r],
             ..Default::default()
@@ -5523,7 +5537,13 @@ mod tests {
                 let (store, notices) =
                     Store::open(&env, &root, RootKind::Draft, &paths, None).unwrap();
                 assert!(notices.is_empty(), "{notices:?}");
-                let index = PrivateIndex::new(store.git().clone(), &paths, RootKind::Draft, None);
+                let index = PrivateIndex::new(
+                    store.git().clone(),
+                    &paths,
+                    RootKind::Draft,
+                    None,
+                    Vec::new(),
+                );
                 let ledger = Ledger::new(&root, RootKind::Draft, None, Self::seen_at());
                 Self {
                     _dir: dir,
@@ -5658,6 +5678,7 @@ mod tests {
                     index_tmp: &self.paths.index_tmp,
                     row_cap: DEFAULT_ROW_CAP,
                     retry_on_reseed: false,
+                    skip: None,
                 })
                 .unwrap()
                 .pile

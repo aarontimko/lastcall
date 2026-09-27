@@ -401,7 +401,7 @@ from what the user is looking at:
   row showed when the accept was asked; the cursor's slot is always 1 again once the
   accepted hunk slides out, so it is not quoted), `accepted f1 · file complete` when that
   was the file's last hunk,
-  `accepted f1`, `accepted f3 (deleted)`, `accepted upstream · 4 files`, `accepted 12 files
+  `accepted f1`, `accepted f3 (deleted)`, `accepted [upstream] 4 files`, `accepted 12 files
   in alpha`, `accepted 30 files in 3 repos`; on refusals the `Refused` texts joined by
   ` · ` (the first only plus ` (+N more)` beyond two); an `Err` for one root is reported as
   `alpha: <error>` and does not undo the others.
@@ -645,7 +645,7 @@ Phase 8 adds the fourth answer: change it. Three keys and one shared buffer.
 |---|---|
 | `i` (`edit`) | the **inline editor**: the file replaces the diff pane, `Ctrl-S` saves it through the engine's CAS |
 | `shift-i` (`edit_external`) | suspend lastcall, hand the terminal to `$VISUAL`/`$EDITOR` at the same line, and ask about what came back |
-| `v` / `y` (`select` / `copy`) | select diff lines and put them on the clipboard over OSC 52 |
+| `v` / `y` (`select` / `copy`) | select lines of the right pane (a diff, a repository's lines, a group's file list) and put them on the clipboard over OSC 52 |
 
 Both editors open on the **same line**: `App::edit_hunk` picks the content hunk under the
 diff cursor when the diff has focus and the row's first content hunk otherwise, and
@@ -909,14 +909,56 @@ carries its own: `Sel { anchor, cursor }` over **absolute diff-line indices**. `
 `PgDn` and the wheel move `sel.cursor` and `App::move_sel_cursor` scrolls the pane only
 enough to keep the cursor on screen, so the selected lines stay under the reader's eye
 instead of sliding off the top. `Esc` clears the selection and keeps the focus. Selected rows
-are drawn full-width reverse-video (`render_hunks`).
+are drawn full-width reverse-video (`render_hunks`, and `render_main` for the other panes).
 
 `y` (`Action::Copy`) copies the selection's lines; **with no selection it copies the hunk
 under the cursor whole**, header included, which is the common case and needs no `v` at all.
 The payload is built by `app::diff_line_text` from the hunks, not from the screen: it keeps
 tabs as tabs (matching `hunk_body` and the flag export) where the pane expands them, because
 the paste target wants the file's own bytes. Both keys are guarded on
-`effective_focus() == Focus::Diff`.
+`effective_focus() == Focus::Diff`; a click on the pane gives the diff focus through
+`Target::DiffBody` and `Tab` is unconditional, so the keyboard reaches a repository's pane
+too. The mouse path never consults the guard.
+
+**One selectable region, two line sources (Phase 14 G).** `Sel` indexes the right pane's
+*selectable lines*: the diff lines when the selection is a `Row`, else the lines the pane
+draws. Those come from one builder, `render::main_pane_lines(app, width) -> Vec<Line>`,
+which `render_main` draws one line per screen row and `App::pane_lines` flattens (the span
+text joined, trailing whitespace trimmed) at `diff_body_size().0`, the last frame's measure.
+`App::selectable_lines()` is `diff_lines(view_hunks())` on a `Row` and
+`min(pane_lines().len(), diff_body_size().1)` elsewhere, so the keyboard cannot select a line
+the mouse cannot reach. `SelectTo`, `start_selection` (`v`, refused at zero) and
+`move_sel_cursor` all clamp to it; on a pane that is not a file's, `move_sel_cursor` runs no
+keep-visible arithmetic, because nothing scrolls there. `copy_payload` there joins the
+lines of `sel.range()`, one newline each, and with no selection copies the whole pane as
+drawn: `y` on a repository row copies the block headed by the repository's name and holding
+its path, and a repository with enough rows meets the same over-the-cap refusal a diff does
+(`app_y_on_a_root_pane_copies_it_whole_and_refuses_over_the_cap`). For such a pane
+`render_main` publishes `HitMap.diff_body` as the whole pane area and `diff_rows` as
+`0..drawn`, so `measured_diff_body` measures the pane; `diff_short` is set only by a file's
+own frame, and `select()` forgets the pane's measure when it leaves it, so the arithmetic
+before a file's first frame falls back rather than using a body too tall. `select()` also
+**ends the gesture** on a real change: `press_line` and `drag_moved` are cleared with `sel`,
+so a pile, a scope or a `t` that moves the selection mid-drag leaves the next `Drag`
+selecting nothing and the release copying nothing
+(`app_a_selection_change_mid_drag_ends_the_gesture`).
+
+**The honest rule.** The copied text equals the drawn text whenever the last frame was drawn
+at the width it measured, the same contract `move_sel_cursor` lives with. The band is drawn
+from `sel.range()` over the current lines every frame, so band and copy agree by
+construction. A path clipped on screen copies whole, with home written `~` as it is drawn; a
+row line copies as drawn, decorations included (`  M src/parse.rs  +12 −3`), and the dim
+path line is the clean one; the seen pane's branch column is copied exactly when it is drawn
+(`render_every_line_pane_copies_what_it_draws`, a property over the empty, repository, seen
+and upstream panes at random widths).
+
+**Known limits.** The file pane's header line and its notices are outside the region (the
+file's path is copyable from the repository pane's row lines). A file body with no hunks
+(`unreadable`, `typechange`, `collapsed (binary)`, `not read (over …)`) publishes no region,
+so it is not selectable and `v select  y copy` is not offered there. Lines past the pane's
+height are neither drawn nor selectable, since these panes do not scroll. `pane_lines()` is
+rebuilt on every motion event, which at the bench's 4,000 rows is one rebuild per row the
+pointer crosses; nothing is cached, because nothing has measured it as a cost.
 
 **The mouse does the same gesture.** A left press inside `HitMap.diff_body` takes the anchor
 **before** `App::hit` runs — a press on a hunk header moves `diff.scroll`, so an anchor read
@@ -924,6 +966,11 @@ afterwards would be wrong — a drag sends `Action::SelectTo(line)`, and the rel
 *only* if the pointer actually moved. A press outside the diff body takes no anchor, which is
 what keeps the divider drag a divider drag, and a press-and-release with no motion is still an
 ordinary click (`run_mouse_drag_in_the_diff_selects_and_the_divider_drag_still_resizes`).
+`HitMap.diff_body` is the diff's body on a file and the whole pane anywhere else, so the same
+drag copies a repository's path or a group's file list, and a press in the blank under a
+short pane answers its last line exactly as under a short diff
+(`run_mouse_drag_on_a_repository_pane_copies_its_lines`,
+`run_a_press_under_a_short_pane_selects_to_its_last_line`).
 
 **Why OSC 52 and nothing else.** lastcall runs over ssh, inside tmux and inside a herdr pane,
 where `pbcopy`/`xclip` would put the text on the *wrong* machine's clipboard. `ESC ] 52 ; c ;
@@ -1076,13 +1123,14 @@ Defaults (`input::DEFAULT_KEYMAP`, in help-overlay order):
 | `unflag` | `shift-m` | clear every flag on the selected file | |
 | `edit` | `i` | open the selected file in the **inline editor**, caret on the current hunk's first changed line ("The inline editor" below) | the same |
 | `edit_external` | `shift-i` | suspend and open `$VISUAL`/`$EDITOR` on that file at that line ("`shift-i`" below) | the same |
-| `select` | `v` | — (diff focus only) | start a line selection at the **top visible** diff line; `↑↓` then extend it |
-| `copy` | `y` | — (diff focus only) | copy the selection, or the hunk under the cursor, over OSC 52 |
-| `expand` | `e` | expand the selected collapsed row into hunks ("Collapsed rows" below) | |
+| `select` | `v` | — (diff focus only) | start a line selection at the **top visible** line of the right pane (a diff, or a repository's or group's lines); `↑↓` then extend it |
+| `copy` | `y` | — (diff focus only) | copy the selection, or the hunk under the cursor (on a repository's or group's pane, the whole pane as drawn), over OSC 52 |
+| `expand` | `e` | expand the selected collapsed row into hunks ("Collapsed rows" below); on the `seen` group row, or on one of its members while it is open, open or close the group ("The seen fold" below) | |
 | `ack` | `d` | ack the selected root's herdr ready flag ("herdr in the UI" below) | |
 | `jump` | `g` | focus the selected root's agent in herdr | |
 | `scope` | `w` | workspace scope on/off | |
 | `refresh` | `r` | rescan every root now (ignored while one is running) | |
+| `reload` | `shift-r` | read the config file again and apply it ("`R` reloads the config" below); ignored while one is pending | the same |
 | `help` | `?` | the help overlay (any key closes it) | |
 | `quit` | `q` `ctrl-c` | exit 0 | |
 | `scroll_up` / `scroll_down` | *(unbound)* | bindable one-line diff scrolls | |
@@ -1121,7 +1169,7 @@ to the widest row in the table costs the second column the width it needs. If tw
 would themselves have to be truncated, one column is no worse, and it stays. The vertical
 clipping that follows eats key rows, never the footer: **four** rows are reserved out of
 the truncation — the clip notice below, the newline note (`render::newline_note`), the
-shift-drag note (`render::SELECT_NOTE`) and the `--tour` line (`render::TOUR_NOTE`) — with
+drag note (`render::SELECT_NOTE`) and the `--tour` line (`render::TOUR_NOTE`) — with
 `any key closes` out of the count by construction, since the last inner row is always its
 own. The blank separator is not reserved; it is the first thing the clip spends. So the
 whole footer survives at any size the overlay is drawn at. At 80 columns,
@@ -1152,12 +1200,14 @@ diff; dragging the divider resizes the nav (clamped to 16..=60); the wheel scrol
 under the pointer, three lines a notch.
 
 **Selecting text.** `term::enter` turns mouse capture on, so a plain drag is ours, not the
-terminal's. Inside the diff pane a plain drag is now lastcall's own line selection, which
-copies on release ("Select to copy" below); anywhere else, hold **shift** while dragging to
-select and copy with the terminal's own selection (every terminal we target honours the
-shift override). The help overlay says both in its
-second-to-last line (`render::SELECT_NOTE` — `shift+drag selects text (mouse capture is on) ·
-v/y copies`); the last is `render::TOUR_NOTE`, `lastcall tui --tour shows the welcome again`.
+terminal's. Anywhere in the right pane a plain drag is lastcall's own line selection, which
+copies on release ("Select to copy" above): a diff, a repository's lines, a group's file
+list. Inside a herdr pane that is the only copy there is, since herdr honours mouse
+reporting and has no bypass modifier. Outside herdr, **shift** and drag is still the
+terminal's own selection (every terminal we target honours the shift override), which works
+where OSC 52 is switched off, and it is how the nav is copied. The help overlay says it in its
+second-to-last line (`render::SELECT_NOTE` — `drag selects text · v/y copies`); the last is
+`render::TOUR_NOTE`, `lastcall tui --tour shows the welcome again`.
 
 ### Undo (`z`) and snooze (`s`), and the snooze modal (Phase 10)
 
@@ -1276,6 +1326,60 @@ is where the split starts — the tall frame is the control that keeps one colum
 The pair is the design pass's input on whether a two-column box is the right answer for a
 keymap that keeps growing.
 
+### The seen fold and its `e` exit (Phase 14 B)
+
+A row the engine marked `seen_on` (content a parked branch already accepted; `docs/dev/engine.md`,
+the seen marks after pipeline step 9) that also has a present current side, no annotation,
+no flag and no rename **folds** (`Row::folds_seen`): the nav does not list it on its own and the
+root's `[seen] N files` group row stands for it, after the `upstream` group. Both group rows
+wear their files' badge in brackets with no dot (`[upstream] 1 file`, `[seen] 2 files`), so
+the branch line is the only nav line shaped `name · N files`: the sponsor's 2026-09-26 walk
+read `seen · 2 files`, drawn just under `feat-y · 2 files`, as a branch
+(`render_group_rows_are_bracketed_and_only_the_branch_line_reads_name_dot_count` holds it).
+The fold is a view rule only, so `App` keeps the two lists apart on purpose:
+
+- `RootView::rows()` is still the whole pile. The header's counts, the per-repo `A`, `^A`
+  and its modal (`ConfirmCounts.grouped_seen`, shown as `… · N grouped seen · …` only when
+  it is non-zero, so no older frame moved) and every accept go by it.
+- `RootView::nav_rows()` is `rows()` minus the folded ones; `nav_entries()` and the nav's
+  render loop list those, then each group.
+
+`Selection::Group(root, GroupKind)`, `Target::NavGroup(root, GroupKind)` and
+`AcceptScope::Group { root, kind }` carry the kind, so the two groups of one root are two
+entries. Selecting the seen group draws `seen_group_pane`: `N files, content accepted on
+b1, b2, b3` (more than three branches read `on N branches`) and one line per path with its
+branches dim beside it when every line fits, the paths alone when not.
+
+**The exit.** `App.seen_open: BTreeSet<PathBuf>` holds the roots whose seen group is open.
+`e` (`request_expand`'s first arm, ahead of the collapsed-row expansion) on the closed group
+opens it; on the open group, or on any of its members, closes it and selects the group row.
+While open, `nav_entries()` lists the members right after the group row as ordinary
+`Selection::Row` entries in path order, and the render draws them indented four with the
+`[seen]` badge (`nav_row_line`'s `member` flag); a member has its own hit target, so a
+click selects it, and its diff, `m`, `u` and `U` are an ordinary row's. `seen_toggle()` is
+the one predicate behind both the key and the `e expand` / `e collapse` hint, which sits in
+`HINT_DROP_ORDER` just before `A accept file` and is built only on the group or a member.
+One exception keeps a collapsed member (a lockfile, a large file) readable: on a member
+that is collapsed and not yet expanded, `seen_toggle()` answers `None`, so `e` and its
+`[e expand]` click expand the file as on any collapsed row and the group stays open; once
+the file is expanded, `e` closes the group as on any other member.
+
+`reconcile_selection` does the rest after every pile: it drops `seen_open` for a root
+whose group is gone (accepted, or the pile changed), so a returning group comes back
+closed; and a selected row that has just folded moves the selection to the group row rather
+than to a neighbour. A member that is flagged or edited leaves the group on the next pile
+for its own row above it, and the group stays open. `a` on the group is refused (`A
+accepts the group`, as for `upstream`); `A` sends one `AcceptRequest::Group` and the status
+reads `accepted [seen] N files`. The fold's property test
+(`render_seen_fold_hides_nothing_and_every_count_agrees`, 8 cases in the unit tier, 64 in
+the pre-push hook) holds that the nav's own rows and the seen group partition the pile, that
+the upstream group is a subset of the nav rows (upstream rows are listed as well as grouped)
+and disjoint from the seen group, and that the group line, the header, the modal and
+`status` count the same list. Snapshots: `tui_seen_group_closed`, `tui_seen_group_view`,
+`tui_seen_group_open` (each also at 80×24), `tui_seen_group_member_diff`,
+`tui_seen_accept_all_modal`; the PTY scene is
+`pty_seen_group_cherry_pick_expand_flag_accept_undo`.
+
 ### The `[keys]` table (`config.toml`)
 
 ```toml
@@ -1300,6 +1404,37 @@ mode) and by `lastcall config` (exit 2, so a bad table is visible headlessly):
 The effective table is what the hint line and the help overlay show (`App.keymap`), so a
 user sees their own bindings, not the defaults.
 
+### `R` reloads the config (Phase 14 D)
+
+`Action::Reload` sets `App.reload = Some(Reloading::default())` and returns
+`Effect::Reload`; a second press while one is pending is `Changed::No`. `spawn_reload`
+(`run.rs`) runs `reload_config` on the blocking pool: `config::load(engine.env())` (the
+launch `Env`, so the same `LASTCALL_CONFIG`/XDG order, never `std::env`), then
+`Keymap::from_config`, then `Loaded::resolve(env.cwd())`, then `Engine::reload`. Either
+`Err` comes back as `Local::Reloaded(Err(text))` and `App::reload_failed` sets
+`config not reloaded: <text>` (the text launch prints after `lastcall: `); nothing else
+moved. `Ok` swaps `Ui.keymap` and `App.keymap` in `Ui::local`, then `App::reloaded(old,
+new)` applies `[ui] wrap` and `hide_empty_repos` **only where the file's value changed**
+(compared with the engine's previous `Config`, never with the session toggle), and records
+`reload_changes`; after the send the task calls `RescanTrigger::request_reload`, so the
+watcher's pass runs after `Engine::reload`. The watcher emits a `RootsChanged` with
+`reload: true` for that pass even when the diff is empty; the notice waits for both halves
+(`Reloading { changes, roots }`, either order) and reads `config reloaded: 1 root added,
+2 roots removed, keys, ui, watcher, collapse, include_gitignored, skip_globs` (a part appears
+only when it changed; `discovery` stands in for the counts when no root moved; `config
+reloaded, nothing changed` when nothing did), with `; herdr and update settings apply at
+the next launch` when either table differs. A `RootsChanged` whose `removed` names the
+root of an open single-root confirm (accept or restore) closes it with `<name>: no longer
+listed`. The hint `R reload` sits after `r refresh` and is the first hint dropped.
+Tests: `keys_config_reload_is_shift_r_after_refresh_and_rebinds`,
+`app_reload_changes_name_what_the_file_changed`,
+`app_reload_applies_a_ui_value_only_when_the_file_changed_it`,
+`app_reload_notice_waits_for_both_halves_in_either_order`,
+`app_roots_changed_closes_a_confirm_whose_root_left`,
+`run_reload_lands_before_the_discovery_it_asks_for`,
+`run_an_invalid_config_file_changes_nothing`, and the PTY scene
+`pty_reload_adds_a_root_keeps_an_accept_and_refuses_a_broken_file`.
+
 ## Design pass inputs: the responsive rules (for the Phase 9 Claude Design pass)
 
 The sponsor ruled at the Phase 7 close (§10 2026-09-05) that the bottom hint line and the
@@ -1315,7 +1450,7 @@ rule adds a row. Nothing here is a promise about the final design.
 | Whole frame | below `MIN_SIZE` = 40×10 the frame is only `too small: 40×10 min` and the hit map is empty | `tui_too_small_30x8`, `render_too_small_is_one_line` |
 | Header (**Design pass D14**, confirmed as built) | `lastcall  N repos · N files · N hunks  [Accept All]` + the watch notice right-aligned; when the control and the notice do not both fit (about 60 columns) the control is dropped, **then the badge** (`^A` duplicates the control; nothing else says what is watched or whether herdr is answering); a notice that cannot fit beside the counts at all is dropped and the badge and control return, rather than leaving the right half empty. At 60 columns with the fixture's counts the ladder lands on counts + notice only — badge and control both gone (D14's earlier doc row said only the control was dropped) | `tui_narrow_60x20`, `render_narrow_header_keeps_the_notice_and_drops_the_control`, `render_header_drops_the_accept_control_before_the_herdr_badge` |
 | Nav pane | outer width `App.nav_width`, 16..=60 (default 28), draggable; hidden below `NAV_MIN_COLS` = 70 columns, when the diff takes the whole body and has focus; keeps its scroll offset across selection changes | `tui_narrow_60x20`, `tui_nav_*` |
-| Hint line (status bar) | built from the keymap, **ruling R4** (Phase 9a deliverable 4): every applicable hint is built, the whole line is tried, and while it does not fit **one hint at a time** is removed from a fixed drop order — the wrap hint (first, so at 100 columns with a full line it is simply not shown and no existing frame moved), `y copy`, `v select`, `r refresh`, `Tab focus`, `w scope`, `s snooze/wake`, `^A accept all`, `t hide/show empty`, `z undo`, `g jump`, `d ack`, `A accept file`, `n/p hunk`, the accept phrase (`HINT_DROP_ORDER`, keyed by **action name**, so a rebind moves the key and never the order). There are no width constants (D1's 110/128 were not built) and no all-or-nothing tiers. **The first two hints follow the focus** (Design pass D2, **ruling R3**, Phase 9a deliverable 3): with the nav focused the line opens `↑↓ select  ⏎ open`; with the diff focused `↑`/`↓` scroll a line and `⏎` does nothing (see Keys), so it opens `↑↓ scroll  ← back` — `back` is the keymap's own action and `←` its arrow spelling, so a rebind renames the hint (a keymap binding no arrow to `back` falls back to its first key). The two forms are exactly the same width, so no drop step moves; the 19 diff-focused frames say `↑↓ scroll  ← back`. **`? help  q quit` are never dropped and are always the last two hints on the line**, so a cut line still says where the rest of the keys are; the floor is `↑↓ select  ⏎ open  ? help  q quit` at 33 columns, inside `MIN_SIZE`'s 40. Below `NAV_MIN_COLS` = 70 the five that a nav-less frame cannot promise (`w scope`, `Tab focus`, `r refresh`, `v select`, `y copy`) are not offered whatever the arithmetic says. What is on the line follows the state: the accept phrase follows the selection (`a accept hunk  A accept file` / `a/A accept file` on a hunkless row / `A accept group` / `A accept all in <root>` on a **non-empty** repo row only — on an empty one neither key accepts anything, verifier (a) F2); `t`'s label follows the toggle (`t hide empty` while showing all, `t show empty` while hiding); the wrap hint likewise says what the key will do, not what the pane is doing (`Alt-z clip` while wrapping, `Alt-z wrap` while clipping; `Opt-z` on a Mac build), and like `n/p hunk` it is gated on `view_hunks()` being non-empty; `v select  y copy` only with the diff focused; `d ack` only for a ready episode and `g jump` for either flag; `w scope` only under a scope. **A hint is not offered where its key answers nothing** (Phase 9b, verifier (b) F4): `n/p hunk` and `v select  y copy` are gated on `view_hunks()` being non-empty (so a repo row, an empty repo row, the all-clean state, and a collapsed, binary, deleted or unreadable entry drop them), and `^A accept all` on `counts_of(&AcceptScope::All).files > 0` — the same predicate the accept itself uses, so the hint and the key agree by construction rather than by a second rule that can drift. An inapplicable hint is never **built**, so it is not a hint the line is short of and `HINT_DROP_ORDER` is untouched: every width step keeps the order it had. `z undo` is offered only where the selected repo's `Pile::undo` is non-zero, on the same terms — so the key and the hint agree by construction, and the hint is what tells a reader the stack has anything in it. While a confirm modal is open the line is exactly `y confirm  n cancel  q quit`. `s snooze` is offered on a repository row only, and reads `s wake` on a snoozed one that `shift-s` is showing (the maintainer's own Phase 10 run: the wake was not apparent), so the label says which of the key's two jobs it will do; on a file row `s` refuses, so it is not offered there. The Phase 7 keys (`u`, `U`, `m`, `M`) and `S` are **not** on the hint line — they live on the hunk controls, the `?` overlay and the modal's own key row. | `render_hints_drop_one_at_a_time_from_the_right`, `render_hints_keep_help_and_quit_at_every_width` (40–70), `render_hints_at_80_keep_accept_file`, `render_hints_follow_the_selection` (the 124-column nav line, the 142-column diff line with its focus-true opening, the rebound-`back` case, and every step below them), `render_hint_line_names_the_toggle_by_state`, `render_hints_and_help_follow_the_app_keymap`, `render_hints_never_promise_a_key_that_answers_nothing`, `render_hint_line_offers_z_undo_only_when_there_is_something_to_undo`, `hints_offer_snooze_on_a_repo_row_and_wake_on_a_snoozed_one`, `tui_hint_diff_focus` (142×20), `tui_undo_hint`, `tui_narrow_60x20`, `tui_nav_empty_repo_row`, `tui_status_line_head_notice` |
+| Hint line (status bar) | built from the keymap, **ruling R4** (Phase 9a deliverable 4): every applicable hint is built, the whole line is tried, and while it does not fit **one hint at a time** is removed from a fixed drop order — `R reload` (Phase 14 D, first of all), the wrap hint (then, so at 100 columns with a full line it is simply not shown and no existing frame moved), `y copy`, `v select`, `r refresh`, `Tab focus`, `w scope`, `s snooze/wake`, `^A accept all`, `t hide/show empty`, `z undo`, `g jump`, `d ack`, `e expand/collapse` (Phase 14 B, built on the seen group and its members only), `A accept file`, `n/p hunk`, the accept phrase (`HINT_DROP_ORDER`, keyed by **action name**, so a rebind moves the key and never the order). There are no width constants (D1's 110/128 were not built) and no all-or-nothing tiers. **The first two hints follow the focus** (Design pass D2, **ruling R3**, Phase 9a deliverable 3): with the nav focused the line opens `↑↓ select  ⏎ open`; with the diff focused `↑`/`↓` scroll a line and `⏎` does nothing (see Keys), so it opens `↑↓ scroll  ← back` — `back` is the keymap's own action and `←` its arrow spelling, so a rebind renames the hint (a keymap binding no arrow to `back` falls back to its first key). The two forms are exactly the same width, so no drop step moves; the 19 diff-focused frames say `↑↓ scroll  ← back`. **`? help  q quit` are never dropped and are always the last two hints on the line**, so a cut line still says where the rest of the keys are; the floor is `↑↓ select  ⏎ open  ? help  q quit` at 33 columns, inside `MIN_SIZE`'s 40. Below `NAV_MIN_COLS` = 70 the six that a nav-less frame cannot promise (`w scope`, `Tab focus`, `r refresh`, `R reload`, `v select`, `y copy`) are not offered whatever the arithmetic says. What is on the line follows the state: the accept phrase follows the selection (`a accept hunk  A accept file` / `a/A accept file` on a hunkless row / `A accept group` / `A accept all in <root>` on a **non-empty** repo row only — on an empty one neither key accepts anything, verifier (a) F2); `t`'s label follows the toggle (`t hide empty` while showing all, `t show empty` while hiding); the wrap hint likewise says what the key will do, not what the pane is doing (`Alt-z clip` while wrapping, `Alt-z wrap` while clipping; `Opt-z` on a Mac build), and like `n/p hunk` it is gated on `view_hunks()` being non-empty; `v select  y copy` only with the diff focused and lines to select; `d ack` only for a ready episode and `g jump` for either flag; `w scope` only under a scope. **A hint is not offered where its key answers nothing** (Phase 9b, verifier (b) F4): `n/p hunk` is gated on `view_hunks()` being non-empty (so a repo row, an empty repo row, the all-clean state, and a collapsed, binary, deleted or unreadable entry drop it), `v select  y copy` on `App::selectable_lines() > 0` (Phase 14 G: a repository's, a group's and the all-clean pane have lines, so only a file with no hunks drops the pair), and `^A accept all` on `counts_of(&AcceptScope::All).files > 0` — the same predicate the accept itself uses, so the hint and the key agree by construction rather than by a second rule that can drift. An inapplicable hint is never **built**, so it is not a hint the line is short of and `HINT_DROP_ORDER` is untouched: every width step keeps the order it had. `z undo` is offered only where the selected repo's `Pile::undo` is non-zero, on the same terms — so the key and the hint agree by construction, and the hint is what tells a reader the stack has anything in it. While a confirm modal is open the line is exactly `y confirm  n cancel  q quit`. `s snooze` is offered on a repository row only, and reads `s wake` on a snoozed one that `shift-s` is showing (the maintainer's own Phase 10 run: the wake was not apparent), so the label says which of the key's two jobs it will do; on a file row `s` refuses, so it is not offered there. The Phase 7 keys (`u`, `U`, `m`, `M`) and `S` are **not** on the hint line — they live on the hunk controls, the `?` overlay and the modal's own key row. | `render_hints_drop_one_at_a_time_from_the_right`, `render_hints_keep_help_and_quit_at_every_width` (40–70), `render_hints_at_80_keep_accept_file`, `render_hints_follow_the_selection` (the 124-column nav line, the 142-column diff line with its focus-true opening, the rebound-`back` case, and every step below them), `render_hint_line_names_the_toggle_by_state`, `render_hints_and_help_follow_the_app_keymap`, `render_hints_never_promise_a_key_that_answers_nothing`, `render_hint_line_offers_z_undo_only_when_there_is_something_to_undo`, `hints_offer_snooze_on_a_repo_row_and_wake_on_a_snoozed_one`, `tui_hint_diff_focus` (142×20), `tui_undo_hint`, `tui_narrow_60x20`, `tui_nav_empty_repo_row`, `tui_status_line_head_notice` |
 | Status bar vs hints | the latest engine notice with its age replaces the hints for `STATUS_TTL` = 30 s, then the hints return | `tui_status_line_head_notice` |
 | Scope notice | `scope: <ws> · N repos hidden (w shows all)` (43 columns) crowds the header at 100 columns — carried to the pass since Phase 5 | `tui_herdr_scope_notice`, `tui_herdr_scope_notice_with_status` |
 | File header controls | `[A accept file] [U restore file]` right-aligned as one run; a run that does not fit is retried without its last label, so a narrow pane loses the newest control first and `[A accept file]` goes last | `tui_accept_controls`, `tui_narrow_60x20` |

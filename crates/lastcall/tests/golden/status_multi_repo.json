@@ -38,7 +38,8 @@
           "collapsed": null,
           "flag": null,
           "flags": [],
-          "rename": null
+          "rename": null,
+          "seen_on": []
         },
         {
           "path": "f2",
@@ -59,7 +60,8 @@
           "collapsed": null,
           "flag": null,
           "flags": [],
-          "rename": null
+          "rename": null,
+          "seen_on": []
         },
         {
           "path": "src/parse.rs",
@@ -80,7 +82,8 @@
           "collapsed": null,
           "flag": null,
           "flags": [],
-          "rename": null
+          "rename": null,
+          "seen_on": []
         }
       ],
       "omitted": 0,
@@ -121,7 +124,8 @@
           "collapsed": null,
           "flag": null,
           "flags": [],
-          "rename": null
+          "rename": null,
+          "seen_on": []
         },
         {
           "path": "u2",
@@ -139,7 +143,8 @@
           "collapsed": null,
           "flag": null,
           "flags": [],
-          "rename": null
+          "rename": null,
+          "seen_on": []
         }
       ],
       "omitted": 0,
@@ -190,7 +195,8 @@
           "collapsed": null,
           "flag": null,
           "flags": [],
-          "rename": null
+          "rename": null,
+          "seen_on": []
         }
       ],
       "omitted": 0,

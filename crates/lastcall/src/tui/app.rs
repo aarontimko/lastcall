@@ -9,7 +9,7 @@
 //! Selection is by path bytes, never by index: a rescan that reorders or removes rows can
 //! only move the selection through [`App::reconcile_selection`]'s documented fallback.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -25,7 +25,7 @@ use lastcall_engine::hunks::{Expanded, Hunk, Tag};
 use lastcall_engine::ledger::{FlagHunk, FlagSummary, LedgerError, iso8601_date, parse_iso8601};
 use lastcall_engine::ops::{OpsError, Refused, Rendered};
 use lastcall_engine::roots::Badge;
-use lastcall_engine::scan::{Annotation, Change, Collapsed, Entry, Group, Pile, Row};
+use lastcall_engine::scan::{Annotation, Change, Collapsed, Entry, Group, GroupKind, Pile, Row};
 use lastcall_engine::store::{Current, RootKind};
 use lastcall_engine::watcher::EngineEvent;
 
@@ -189,8 +189,21 @@ impl RootView {
         self.pile = pile;
     }
 
+    /// Every row of the pile. The header, the accept paths, the confirm modal and the
+    /// repository pane go by this; only the nav goes by [`RootView::nav_rows`].
     pub fn rows(&self) -> &[Row] {
         &self.pile.rows
+    }
+
+    /// The rows the nav lists on their own (Phase 14 B): every row minus the ones folded
+    /// into the `[seen] N files` group ([`Row::folds_seen`]).
+    pub fn nav_rows(&self) -> impl Iterator<Item = &Row> {
+        self.pile.rows.iter().filter(|r| !r.folds_seen())
+    }
+
+    /// Whether `path` is a row folded into this root's seen group.
+    pub fn folded(&self, path: &[u8]) -> bool {
+        self.row(path).is_some_and(Row::folds_seen)
     }
 
     pub fn notices(&self) -> &[String] {
@@ -209,7 +222,7 @@ impl RootView {
         self.pile.rows.iter().find(|r| r.path == path)
     }
 
-    pub fn group(&self, kind: Annotation) -> Option<&Group> {
+    pub fn group(&self, kind: GroupKind) -> Option<&Group> {
         self.groups.iter().find(|g| g.kind == kind)
     }
 }
@@ -219,7 +232,7 @@ impl RootView {
 pub enum Selection {
     Root(PathBuf),
     Row(PathBuf, Vec<u8>),
-    Group(PathBuf, Annotation),
+    Group(PathBuf, GroupKind),
 }
 
 impl Selection {
@@ -243,8 +256,9 @@ fn nav_key(sel: &Selection) -> (u8, &[u8], u8) {
             2,
             b"",
             match kind {
-                Annotation::Upstream => 0,
-                Annotation::Mixed => 1,
+                GroupKind::Upstream => 0,
+                GroupKind::Mixed => 1,
+                GroupKind::Seen => 2,
             },
         ),
     }
@@ -255,7 +269,7 @@ fn nav_key(sel: &Selection) -> (u8, &[u8], u8) {
 pub enum Target {
     NavRoot(PathBuf),
     NavRow(PathBuf, Vec<u8>),
-    NavGroup(PathBuf, Annotation),
+    NavGroup(PathBuf, GroupKind),
     /// The header line of hunk `i` in the diff.
     DiffHunk(usize),
     DiffBody,
@@ -339,6 +353,9 @@ impl Changed {
 pub enum Effect {
     /// Rescan every root (`Engine::scan_all` under the lock); `refresh_done` clears the flag.
     Refresh,
+    /// Read the config file again and apply it (Phase 14 D): the answer is
+    /// `Local::Reloaded`, and the watcher's reload `RootsChanged` completes the notice.
+    Reload,
     /// Re-read `RootMeta::of` for every root and feed it to `sync_roots`.
     SyncRoots,
     Quit,
@@ -601,7 +618,7 @@ pub enum AcceptScope {
     },
     Group {
         root: PathBuf,
-        kind: Annotation,
+        kind: GroupKind,
     },
     /// Every row of one root.
     Root(PathBuf),
@@ -646,6 +663,105 @@ pub enum AcceptAnswer {
 pub struct Accepting {
     pub scope: AcceptScope,
     pub files: Vec<(PathBuf, usize)>,
+}
+
+/// A config reload between `R` and its notice (Phase 14 D). The two halves arrive on
+/// different channels: the loop's own answer (`Local::Reloaded`, what the file changed) and
+/// the watcher's `RootsChanged` with `reload` set (the roots its discovery pass added and
+/// removed). The notice waits for both, so it can say both.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Reloading {
+    pub changes: Option<ReloadChanges>,
+    /// `(added, removed)`; a root reopened under another parent dir counts as added only.
+    pub roots: Option<(usize, usize)>,
+}
+
+/// What a reloaded config changed that the notice names, from the running config and the
+/// file's new one ([`reload_changes`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReloadChanges {
+    /// In notice order: `keys`, `ui`, `watcher`, `collapse`, `include_gitignored`,
+    /// `skip_globs`, `discovery`.
+    pub parts: Vec<&'static str>,
+    /// `[herdr]` or `[update]` differs: those apply at the next launch.
+    pub next_launch: bool,
+}
+
+/// The notice fragments for a reload from `old` to `new` (Phase 14 D). `discovery` covers
+/// the keys whose effect is the root set (`parent_dirs`, `draft_dirs`, `search_depth`,
+/// `draft_dir_parents`, `draft_initial`); the notice drops it when the root counts already
+/// say what happened.
+pub fn reload_changes(
+    old: &lastcall_engine::config::Config,
+    new: &lastcall_engine::config::Config,
+) -> ReloadChanges {
+    let mut parts = Vec::new();
+    if old.keys != new.keys {
+        parts.push("keys");
+    }
+    if old.ui != new.ui || old.hide_empty_repos != new.hide_empty_repos {
+        parts.push("ui");
+    }
+    if old.watch_ignore_globs != new.watch_ignore_globs {
+        parts.push("watcher");
+    }
+    if old.collapsed_globs != new.collapsed_globs
+        || old.collapse_size_bytes != new.collapse_size_bytes
+    {
+        parts.push("collapse");
+    }
+    if old.include_gitignored != new.include_gitignored {
+        parts.push("include_gitignored");
+    }
+    if old.skip_globs != new.skip_globs {
+        parts.push("skip_globs");
+    }
+    if old.parent_dirs != new.parent_dirs
+        || old.draft_dirs != new.draft_dirs
+        || old.search_depth != new.search_depth
+        || old.draft_dir_parents != new.draft_dir_parents
+        || old.draft_initial != new.draft_initial
+    {
+        parts.push("discovery");
+    }
+    ReloadChanges {
+        parts,
+        next_launch: old.herdr != new.herdr || old.update != new.update,
+    }
+}
+
+/// The sentence a reload that changed `[herdr]` or `[update]` adds to its notice.
+pub const NEXT_LAUNCH: &str = "herdr and update settings apply at the next launch";
+
+/// The reload's status line: `config reloaded: 1 root added, keys`, or `config reloaded,
+/// nothing changed`, with [`NEXT_LAUNCH`] after a semicolon when it applies.
+pub fn reload_notice(changes: &ReloadChanges, (added, removed): (usize, usize)) -> String {
+    let plural = |n: usize| if n == 1 { "root" } else { "roots" };
+    let mut parts: Vec<String> = Vec::new();
+    if added > 0 {
+        parts.push(format!("{added} {} added", plural(added)));
+    }
+    if removed > 0 {
+        parts.push(format!("{removed} {} removed", plural(removed)));
+    }
+    for part in &changes.parts {
+        if *part == "discovery" && (added > 0 || removed > 0) {
+            continue;
+        }
+        parts.push((*part).to_owned());
+    }
+    let head = if parts.is_empty() && !changes.next_launch {
+        "config reloaded, nothing changed".to_owned()
+    } else if parts.is_empty() {
+        "config reloaded".to_owned()
+    } else {
+        format!("config reloaded: {}", parts.join(", "))
+    };
+    if changes.next_launch {
+        format!("{head}; {NEXT_LAUNCH}")
+    } else {
+        head
+    }
 }
 
 /// What one restore covers (§6.3). Deliberately fewer variants than [`AcceptScope`]: there
@@ -934,6 +1050,8 @@ pub struct ConfirmCounts {
     pub files: usize,
     /// Rows inside an upstream group.
     pub grouped: usize,
+    /// Rows folded into a seen group (Phase 14 B); counted in `files` like every row.
+    pub grouped_seen: usize,
     /// Collapsed rows.
     pub collapsed: usize,
     /// Names of the listed roots covered.
@@ -1009,6 +1127,10 @@ pub type SaveResult = Result<Saved, AcceptFailed>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AcceptFailed {
     LedgerBusy,
+    /// The root's folder went away between the op and the scan after it (Phase 14 C). The
+    /// usual gap answer is the `Refused::RootGone` refusal; this is the same news arriving
+    /// one step later, and it reads the same way.
+    RootGone,
     Other(String),
 }
 
@@ -1018,8 +1140,34 @@ impl AcceptFailed {
     pub fn of(e: &EngineError) -> Self {
         match e {
             EngineError::Ops(OpsError::Ledger(LedgerError::LockBusy { .. })) => Self::LedgerBusy,
+            EngineError::RootGone(_) => Self::RootGone,
             other => Self::Other(other.to_string()),
         }
+    }
+}
+
+/// What a failure reads as after `<root>: `. `LedgerBusy` has its own sentence at every
+/// call site and is written here only for completeness.
+impl std::fmt::Display for AcceptFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LedgerBusy => f.write_str("ledger busy"),
+            Self::RootGone => f.write_str("folder removed"),
+            Self::Other(e) => f.write_str(e),
+        }
+    }
+}
+
+/// Whether one root's accept result says its folder is gone, as a refusal or as the
+/// error of the scan after the op (Phase 14 C): the loop asks for discovery on it.
+pub fn accept_found_root_gone(result: &AcceptResult) -> bool {
+    match result {
+        Ok(acc) => acc
+            .outcome
+            .refused
+            .iter()
+            .any(|r| matches!(r, Refused::RootGone)),
+        Err(e) => *e == AcceptFailed::RootGone,
     }
 }
 
@@ -1141,6 +1289,11 @@ pub struct App {
     /// selection's whole repo has left the nav, so it is read exactly there:
     /// [`App::neighbour_after`]'s last rule.
     pub nav_anchor: Option<usize>,
+    /// Whether the selection was a member of an open seen group when it was selected,
+    /// read beside [`App::nav_anchor`] once the entry has left the nav: a member's
+    /// neighbours are the other members and then the group row, not the plain rows its
+    /// path happens to sort among.
+    pub nav_in_group: bool,
     pub help: bool,
     pub status: Option<StatusLine>,
     /// Advanced by `Tick`; render computes ages from it, never from `Instant::now()`.
@@ -1158,6 +1311,9 @@ pub struct App {
     /// in `handle` (render uses the frame's own area).
     pub size: (u16, u16),
     pub refreshing: bool,
+    /// A config reload in flight (`R`, Phase 14 D): its notice is posted once both halves
+    /// are in, whichever lands first. `None` when no reload is running.
+    pub reload: Option<Reloading>,
     /// Piles that arrived before `sync_roots` delivered their root's meta; adopted then.
     pub orphan_piles: BTreeMap<PathBuf, Pile>,
     /// The scan seq of the last pile applied per root: an older pile is dropped untouched
@@ -1223,6 +1379,10 @@ pub struct App {
     /// The one collapsed row whose hunks `e` fetched, if any. A view, never a baseline;
     /// see [`Expansion`].
     pub expanded: Option<Expansion>,
+    /// The roots whose `[seen] N files` group is open (Phase 14 B, ruling 10): `e` on the
+    /// group lists its members under it as indented rows. Session state, never persisted;
+    /// kept across scans and cleared when the group disappears.
+    pub seen_open: BTreeSet<PathBuf>,
     /// The effective key bindings, `(action name, key specs)` in `DEFAULT_KEYMAP` order.
     /// Seeded from the defaults; worker 3b replaces it after `Keymap::from_config` so the
     /// hint line and the help overlay show the user's own bindings.
@@ -1270,12 +1430,14 @@ impl App {
             diff_short: 0,
             show_snoozed: false,
             nav_anchor: None,
+            nav_in_group: false,
             help: false,
             status: None,
             now: Instant::now(),
             wall: None,
             size: (80, 24),
             refreshing: false,
+            reload: None,
             orphan_piles: BTreeMap::new(),
             seq: BTreeMap::new(),
             unscannable: std::collections::BTreeSet::new(),
@@ -1295,6 +1457,7 @@ impl App {
             tour: None,
             loading: None,
             expanded: None,
+            seen_open: BTreeSet::new(),
             // The canonical spellings (`shift-a` shows as `A`), as `Keymap::table` gives.
             keymap: Keymap::defaults().table(),
             enhanced: false,
@@ -1591,7 +1754,9 @@ impl App {
         ))
     }
 
-    /// Nav order: for each listed root by path, `[Root, rows…, groups…]`.
+    /// Nav order: for each listed root by path, `[Root, rows…, groups…]`. The rows are
+    /// [`RootView::nav_rows`] (the seen group's members are folded out), and an open seen
+    /// group is followed by its members, in path order, as ordinary row entries.
     pub fn nav_entries(&self) -> Vec<Selection> {
         let mut out = Vec::new();
         for (path, view) in &self.roots {
@@ -1599,14 +1764,45 @@ impl App {
                 continue;
             }
             out.push(Selection::Root(path.clone()));
-            for r in view.rows() {
+            for r in view.nav_rows() {
                 out.push(Selection::Row(path.clone(), r.path.clone()));
             }
             for g in &view.groups {
                 out.push(Selection::Group(path.clone(), g.kind));
+                if g.kind == GroupKind::Seen && self.seen_open.contains(path) {
+                    for p in &g.paths {
+                        out.push(Selection::Row(path.clone(), p.clone()));
+                    }
+                }
             }
         }
         out
+    }
+
+    /// What `e` does to the seen group from the current selection, for the hint line:
+    /// `Some(false)` opens it (the closed group is selected), `Some(true)` closes it (the
+    /// open group or one of its members is selected), `None` when `e` is not about it,
+    /// which includes a collapsed member not yet expanded (`e` expands that file first).
+    pub fn seen_toggle(&self) -> Option<bool> {
+        match self.selection.as_ref()? {
+            Selection::Group(root, GroupKind::Seen) => Some(self.seen_open.contains(root)),
+            Selection::Row(root, path)
+                if self.seen_open.contains(root)
+                    && self.roots.get(root).is_some_and(|v| v.folded(path)) =>
+            {
+                // A collapsed member not expanded yet: `e` is its own `[e expand]` first,
+                // or a folded lockfile would have no way to show its content at all.
+                let expands = self.selected_row().is_some_and(|r| {
+                    Self::expandable(r)
+                        && !self
+                            .expanded
+                            .as_ref()
+                            .is_some_and(|e| e.root == *root && e.path == *path)
+                });
+                (!expands).then_some(true)
+            }
+            _ => None,
+        }
     }
 
     pub fn listed_roots(&self) -> impl Iterator<Item = &RootView> {
@@ -1646,6 +1842,44 @@ impl App {
         }
     }
 
+    /// Whether the right pane is a file row's (its hunks are what a selection indexes) or
+    /// one of the panes built from lines (Phase 14 G).
+    fn row_pane(&self) -> bool {
+        matches!(self.selection, Some(Selection::Row(..)))
+    }
+
+    /// The text of the right pane when it is not a file row's: the lines
+    /// [`render::main_pane_lines`] builds, each flattened to its spans' text with the
+    /// trailing blanks trimmed, laid out at the width the last frame measured (else the
+    /// `diff_cols` fallback). Copied = drawn whenever that frame was drawn at this width,
+    /// the contract [`Self::move_sel_cursor`] already lives with. Empty for a file row.
+    ///
+    /// Rebuilt on every call, so once per motion event of a drag; nothing is cached.
+    pub fn pane_lines(&self) -> Vec<String> {
+        super::render::main_pane_lines(self, self.diff_body_size().0)
+            .iter()
+            .map(|line| {
+                let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                text.trim_end().to_owned()
+            })
+            .collect()
+    }
+
+    /// How many lines a selection may cover in the right pane (Phase 14 G): the diff
+    /// lines for a file row, as before; for any other pane its lines, but never more than
+    /// the pane's rows, because nothing scrolls there and the keyboard must not select a
+    /// line the mouse cannot reach. Zero means `v`, `y` and their
+    /// hints answer nothing.
+    pub fn selectable_lines(&self) -> usize {
+        if self.row_pane() {
+            diff_lines(self.view_hunks())
+        } else {
+            self.pane_lines()
+                .len()
+                .min(usize::from(self.diff_body_size().1))
+        }
+    }
+
     /// Whether a row can be expanded at all: collapsed, and not by being binary.
     fn expandable(row: &Row) -> bool {
         matches!(row.collapsed, Some(Collapsed::Glob) | Some(Collapsed::Size))
@@ -1655,6 +1889,21 @@ impl App {
     /// draw — on a binary row, on a row that is not collapsed, and on a row already
     /// expanded, so the key is silent exactly where it has nothing to do.
     fn request_expand(&mut self) -> (Changed, Option<Effect>) {
+        // Phase 14 B (ruling 10): on the seen group, or on one of its open members, `e`
+        // opens or closes the group. Pure state: no engine call, no `Effect::Expand`.
+        match (self.seen_toggle(), self.selection.clone()) {
+            (Some(false), Some(Selection::Group(root, _))) => {
+                self.seen_open.insert(root);
+                return (Changed::Yes, None);
+            }
+            (Some(true), Some(sel)) => {
+                let root = sel.root().to_path_buf();
+                self.seen_open.remove(&root);
+                self.select(Some(Selection::Group(root, GroupKind::Seen)));
+                return (Changed::Yes, None);
+            }
+            _ => {}
+        }
         let Some(Selection::Row(root, path)) = self.selection.clone() else {
             return (Changed::No, None);
         };
@@ -1797,6 +2046,30 @@ impl App {
             }
             EngineEvent::RootsChanged(changed) => {
                 let mut result = Changed::No;
+                // Design review F19: a confirm modal whose root just left would confirm an
+                // op on a root the engine no longer has. It closes and says why.
+                if let Some(root) = self.confirm_root()
+                    && changed.removed.contains(&root)
+                    && !changed.added.contains(&root)
+                {
+                    let name = self.root_name(&root);
+                    self.confirm = None;
+                    self.set_status(format!("{name}: no longer listed"));
+                    result = Changed::Yes;
+                }
+                if changed.reload
+                    && let Some(reload) = self.reload.as_mut()
+                {
+                    let added = changed.added.len();
+                    let removed = changed
+                        .removed
+                        .iter()
+                        .filter(|r| !changed.added.contains(r))
+                        .count();
+                    reload.roots = Some((added, removed));
+                    self.finish_reload();
+                    result = Changed::Yes;
+                }
                 for root in &changed.removed {
                     if self.roots.remove(root).is_some() {
                         result = Changed::Yes;
@@ -2152,6 +2425,7 @@ impl App {
                 .iter()
                 .filter(|r| r.annotation == Some(Annotation::Upstream))
                 .count();
+            counts.grouped_seen += rows.iter().filter(|r| r.folds_seen()).count();
             counts.collapsed += rows.iter().filter(|r| r.collapsed.is_some()).count();
             counts.roots.push(self.root_name(root));
         };
@@ -2296,7 +2570,7 @@ impl App {
         (Changed::Yes, None)
     }
 
-    fn group_rows(&self, root: &Path, kind: Annotation) -> Vec<&Row> {
+    fn group_rows(&self, root: &Path, kind: GroupKind) -> Vec<&Row> {
         let Some(view) = self.roots.get(root) else {
             return Vec::new();
         };
@@ -2701,7 +2975,12 @@ impl App {
     /// this after every draw.
     pub(super) fn measured_diff_body(&mut self, size: Option<(u16, u16)>) {
         self.diff_size = size;
-        if let Some((_, rows)) = size {
+        // Phase 14 G: a pane built from lines reports the whole pane, which says nothing
+        // about what a file's header and notices take off the top of its body, so the
+        // shortfall is the last file frame's still.
+        if let Some((_, rows)) = size
+            && self.row_pane()
+        {
             self.diff_short = self.plain_body_rows().saturating_sub(rows);
         }
     }
@@ -2771,7 +3050,7 @@ impl App {
                 "ledger busy in {} — try again",
                 self.root_name(&root)
             )),
-            Err(AcceptFailed::Other(e)) => {
+            Err(e @ (AcceptFailed::Other(_) | AcceptFailed::RootGone)) => {
                 self.set_status(format!("{}: {e}", self.root_name(&root)))
             }
         }
@@ -2921,7 +3200,7 @@ impl App {
                 ));
                 return (Changed::Yes, None);
             }
-            Err(AcceptFailed::Other(e)) => {
+            Err(e @ (AcceptFailed::Other(_) | AcceptFailed::RootGone)) => {
                 self.set_status(format!("{}: {e}", self.root_name(&root)));
                 return (Changed::Yes, None);
             }
@@ -3135,7 +3414,9 @@ impl App {
             Err(AcceptFailed::LedgerBusy) => {
                 parts.push(format!("ledger busy in {name} — try again"))
             }
-            Err(AcceptFailed::Other(e)) => parts.push(format!("{name}: {e}")),
+            Err(e @ (AcceptFailed::Other(_) | AcceptFailed::RootGone)) => {
+                parts.push(format!("{name}: {e}"))
+            }
         }
         if inflight.is_none() && parts.is_empty() {
             return changed;
@@ -3393,7 +3674,9 @@ impl App {
             Err(AcceptFailed::LedgerBusy) => {
                 parts.push(format!("ledger busy in {name} — try again"))
             }
-            Err(AcceptFailed::Other(e)) => parts.push(format!("{name}: {e}")),
+            Err(e @ (AcceptFailed::Other(_) | AcceptFailed::RootGone)) => {
+                parts.push(format!("{name}: {e}"))
+            }
         }
         if inflight.is_none() && parts.is_empty() {
             return changed;
@@ -3465,7 +3748,7 @@ impl App {
                     "ledger busy in {} — try again",
                     self.root_name(&root)
                 )),
-                Err(AcceptFailed::Other(e)) => {
+                Err(e @ (AcceptFailed::Other(_) | AcceptFailed::RootGone)) => {
                     errors.push(format!("{}: {e}", self.root_name(&root)))
                 }
             }
@@ -3538,7 +3821,14 @@ impl App {
         let mut errors: Vec<String> = Vec::new();
         let mut ok_roots: Vec<PathBuf> = Vec::new();
         for (root, result) in results {
+            let gone = accept_found_root_gone(&result);
             match result {
+                // Phase 14 C: the folder is gone, nothing was written, and discovery is
+                // about to drop the root; the pile that came back is its last one, so it
+                // is not applied. The refusal names the root, since it names no row.
+                Ok(_) | Err(AcceptFailed::RootGone) if gone => {
+                    refusals.push(format!("{}: folder removed", self.root_name(&root)));
+                }
                 Ok(acc) => {
                     refusals.extend(acc.outcome.refused.iter().map(|r| r.to_string()));
                     ok_roots.push(root.clone());
@@ -3551,7 +3841,7 @@ impl App {
                     "ledger busy in {} — try again",
                     self.root_name(&root)
                 )),
-                Err(AcceptFailed::Other(e)) => {
+                Err(e @ (AcceptFailed::Other(_) | AcceptFailed::RootGone)) => {
                     errors.push(format!("{}: {e}", self.root_name(&root)))
                 }
             }
@@ -3605,11 +3895,9 @@ impl App {
             // content the user's own editor session left, which is the whole point of the
             // confirm they just answered (ruling P1).
             AcceptScope::Bless { path, .. } => format!("reviewed {}", lossy(path)),
-            AcceptScope::Group { kind, .. } => format!(
-                "accepted {} · {}",
-                annotation_name(*kind),
-                plural(files, "file")
-            ),
+            AcceptScope::Group { kind, .. } => {
+                format!("accepted [{}] {}", kind.name(), plural(files, "file"))
+            }
             AcceptScope::Root(_) | AcceptScope::All => match ok_roots {
                 [one] => format!(
                     "accepted {} in {}",
@@ -3667,6 +3955,74 @@ impl App {
     }
 
     /// The loop calls this when an `Effect::Refresh` finished (its piles arrive as events).
+    /// The root a single-root confirm modal would act on (an accept or a restore of one
+    /// root); `None` for accept-all, the editor's discard, and no modal.
+    fn confirm_root(&self) -> Option<PathBuf> {
+        match &self.confirm.as_ref()?.scope {
+            ConfirmScope::Accept(scope) => match scope {
+                AcceptScope::Hunk { root, .. }
+                | AcceptScope::File { root, .. }
+                | AcceptScope::Group { root, .. }
+                | AcceptScope::Root(root)
+                | AcceptScope::Bless { root, .. } => Some(root.clone()),
+                AcceptScope::All => None,
+            },
+            ConfirmScope::Restore(scope) => Some(scope.root().to_path_buf()),
+            ConfirmScope::Discard { .. } => None,
+        }
+    }
+
+    /// The loop applied a reloaded config (Phase 14 D): the keymap is already swapped by
+    /// [`super::run::Ui::local`]; this applies `[ui]` and records what changed for the
+    /// notice. A `[ui]` value reaches the session toggle only when the **file** changed it
+    /// (design review F14): a toggle the reader flipped is theirs until they edit the line.
+    pub fn reloaded(
+        &mut self,
+        old: &lastcall_engine::config::Config,
+        new: &lastcall_engine::config::Config,
+    ) -> Changed {
+        if old.ui.wrap != new.ui.wrap {
+            self.wrap = new.ui.wrap;
+        }
+        if old.hide_empty_repos != new.hide_empty_repos {
+            self.hide_empty = new.hide_empty_repos;
+            self.reconcile_selection();
+        }
+        let changes = reload_changes(old, new);
+        match self.reload.as_mut() {
+            Some(reload) => reload.changes = Some(changes),
+            None => {
+                self.reload = Some(Reloading {
+                    changes: Some(changes),
+                    roots: None,
+                })
+            }
+        }
+        self.finish_reload();
+        Changed::Yes
+    }
+
+    /// The reload did not apply: the file did not load or its `[keys]` did not parse.
+    /// Nothing else changed.
+    pub fn reload_failed(&mut self, error: &str) -> Changed {
+        self.reload = None;
+        self.set_status(format!("config not reloaded: {error}"));
+        Changed::Yes
+    }
+
+    /// Post the reload's notice once both halves are in.
+    fn finish_reload(&mut self) {
+        let Some(Reloading {
+            changes: Some(changes),
+            roots: Some(roots),
+        }) = self.reload.clone()
+        else {
+            return;
+        };
+        self.reload = None;
+        self.set_status(reload_notice(&changes, roots));
+    }
+
     pub fn refresh_done(&mut self) -> Changed {
         if !self.refreshing {
             return Changed::No;
@@ -3690,18 +4046,47 @@ impl App {
     /// the order **as it was while this entry was selected**, and by the time it runs
     /// `apply_pile` has already replaced the pile the order came from.
     pub fn select(&mut self, next: Option<Selection>) -> Changed {
+        // A row folded into a closed seen group is not on the nav: what stands for it is
+        // the group row, so that is what gets selected (a stale click can still name it).
+        let next = match next {
+            Some(Selection::Row(root, path))
+                if !self.seen_open.contains(&root)
+                    && self.roots.get(&root).is_some_and(|v| v.folded(&path)) =>
+            {
+                Some(Selection::Group(root, GroupKind::Seen))
+            }
+            other => other,
+        };
+        let entries = self.nav_entries();
         let anchor = next
             .as_ref()
-            .and_then(|s| self.nav_entries().iter().position(|e| e == s));
+            .and_then(|s| entries.iter().position(|e| e == s));
         self.nav_anchor = anchor;
+        self.nav_in_group = match (&next, anchor) {
+            (Some(Selection::Row(root, _)), Some(at)) => entries[..at]
+                .iter()
+                .any(|e| matches!(e, Selection::Group(r, GroupKind::Seen) if r == root)),
+            _ => false,
+        };
         if self.selection == next {
             return Changed::No;
+        }
+        // Phase 14 G: the measure a pane built from lines reported is the whole pane, one
+        // row taller than a file's body at the least; the next file must lay out against
+        // the fallback until its own frame reports, which errs short, never tall.
+        if !self.row_pane() {
+            self.diff_size = None;
         }
         self.selection = next;
         self.diff = DiffCursor::default();
         // A selection is a range of *this* row's diff lines; the moment the row changes the
         // range means nothing, so it goes rather than pointing at another file's text.
         self.sel = None;
+        // …and a drag in progress ends with it (Phase 14 G): the lines
+        // under the pointer are another pane's now, so the next `Drag` selects nothing and
+        // the release copies nothing.
+        self.press_line = None;
+        self.drag_moved = false;
         self.drop_stale_expansion();
         Changed::Yes
     }
@@ -3712,6 +4097,13 @@ impl App {
     /// accept, a restore, `t`, `w`, a herdr scope or roots update, the end of the launch
     /// hold — comes through here, so the rule is stated once.
     pub fn reconcile_selection(&mut self) {
+        // Phase 14 B: an open seen group stays open across scans until it disappears.
+        let roots = &self.roots;
+        self.seen_open.retain(|r| {
+            roots
+                .get(r)
+                .is_some_and(|v| v.group(GroupKind::Seen).is_some())
+        });
         let Some(sel) = self.selection.clone() else {
             return;
         };
@@ -3719,6 +4111,14 @@ impl App {
         if let Some(at) = entries.iter().position(|e| *e == sel) {
             self.nav_anchor = Some(at);
             self.clamp_cursor();
+            return;
+        }
+        // A selected row that folded into the (closed) seen group is still pending: the
+        // selection follows it to the group row rather than to a neighbour.
+        if let Selection::Row(root, path) = &sel
+            && self.roots.get(root).is_some_and(|v| v.folded(path))
+        {
+            self.select(Some(Selection::Group(root.clone(), GroupKind::Seen)));
             return;
         }
         let next = self.neighbour_after(&sel, &entries);
@@ -3741,13 +4141,31 @@ impl App {
     /// every index while changing nothing about what is below it.
     fn neighbour_after(&self, gone: &Selection, entries: &[Selection]) -> Option<Selection> {
         let root = gone.root();
-        let key = nav_key(gone);
+        // A member of the open seen group sorts after the group row, among the other
+        // members (`nav_in_group` remembers that `gone` was one, since its row is no
+        // longer there to ask), so an accepted member lands on the next member, then on
+        // the group row, never on a plain row above the group.
+        fn key_in<'s>(app: &App, sel: &'s Selection) -> (u8, &'s [u8], u8) {
+            match sel {
+                Selection::Row(r, path)
+                    if app.seen_open.contains(r)
+                        && app.roots.get(r).is_some_and(|v| v.folded(path)) =>
+                {
+                    (3, path.as_slice(), 0)
+                }
+                other => nav_key(other),
+            }
+        }
+        let key = match gone {
+            Selection::Row(_, path) if self.nav_in_group => (3, path.as_slice(), 0),
+            other => nav_key(other),
+        };
         let mine: Vec<&Selection> = entries.iter().filter(|e| e.root() == root).collect();
         if !mine.is_empty() {
             return mine
                 .iter()
-                .find(|e| nav_key(e) > key)
-                .or_else(|| mine.iter().rev().find(|e| nav_key(e) < key))
+                .find(|e| key_in(self, e) > key)
+                .or_else(|| mine.iter().rev().find(|e| key_in(self, e) < key))
                 .map(|e| (*e).clone());
         }
         let at = self.nav_anchor.unwrap_or(0);
@@ -3814,7 +4232,7 @@ impl App {
     /// move of the whole diff's length and not a second scroll path. While a selection is
     /// running it moves the selection's far end instead, exactly as the page keys do.
     fn jump_diff_end(&mut self, down: bool) -> Changed {
-        let span = diff_lines(self.view_hunks()) as isize;
+        let span = self.selectable_lines() as isize;
         let delta = if down { span } else { -span };
         if self.sel.is_some() {
             // A jump is asked for by name and passes what is between, with a selection as
@@ -3940,10 +4358,19 @@ impl App {
         let Some(sel) = self.sel else {
             return Changed::No;
         };
-        let max = diff_lines(self.view_hunks()).saturating_sub(1) as isize;
+        let max = self.selectable_lines().saturating_sub(1) as isize;
         let mut next = (sel.cursor as isize + delta).clamp(0, max) as usize;
         if next == sel.cursor {
             return Changed::No;
+        }
+        // Phase 14 G: a pane built from lines does not scroll, so the
+        // far end moves and nothing else does.
+        if !self.row_pane() {
+            self.sel = Some(Sel {
+                cursor: next,
+                ..sel
+            });
+            return Changed::Yes;
         }
         // Phase 13: "on screen" is a statement about rows, and a line can be several of
         // them, so the smallest scroll that keeps the moving end **whole** comes from the
@@ -4022,10 +4449,14 @@ impl App {
     /// *is* [`DiffCursor::scroll`], the first visible line — so `v j j y` copies three
     /// lines, which is the sequence the kickoff names.
     fn start_selection(&mut self) -> Changed {
-        if self.selected_row().is_none() || self.view_hunks().is_empty() {
+        // Phase 14 G: any pane with a line to select, a repository's or a group's too; a
+        // file row still needs its row and a hunk.
+        let lines = self.selectable_lines();
+        if lines == 0 || (self.row_pane() && self.selected_row().is_none()) {
             return Changed::No;
         }
-        let at = self.diff.scroll;
+        // Only a file's diff scrolls; every other pane's top line is its first.
+        let at = self.diff.scroll.min(lines - 1);
         let next = Sel {
             anchor: self.sel.map_or(at, |s| s.anchor),
             cursor: at,
@@ -4038,8 +4469,26 @@ impl App {
     }
 
     /// The bytes `y` would put on the clipboard: the selection's lines, or — with no
-    /// selection — the hunk under the cursor whole, header included.
+    /// selection — the hunk under the cursor whole, header included. On a pane that is not
+    /// a file row's, the selected pane lines, or with no selection all it drew.
     pub fn copy_payload(&self) -> Option<Vec<u8>> {
+        // Phase 14 G: a pane built from lines copies the selected lines as drawn, or with
+        // no selection the whole pane (what it drew: the keyboard reaches no further than
+        // the mouse), each with its newline.
+        if !self.row_pane() {
+            let lines = self.pane_lines();
+            let last = lines
+                .len()
+                .min(usize::from(self.diff_body_size().1))
+                .checked_sub(1)?;
+            let (a, b) = self.sel.map_or((0, last), |s| s.range());
+            let mut out = String::new();
+            for line in &lines[a.min(last)..=b.min(last)] {
+                out.push_str(line);
+                out.push('\n');
+            }
+            return Some(out.into_bytes());
+        }
         let hunks = self.view_hunks();
         if hunks.is_empty() {
             return None;
@@ -4219,7 +4668,7 @@ impl App {
             // divider is still a divider drag (design review F13).
             SelectTo(line) => match self.press_line {
                 Some(anchor) => {
-                    let last = diff_lines(self.view_hunks()).saturating_sub(1);
+                    let last = self.selectable_lines().saturating_sub(1);
                     let cursor = line.min(last);
                     let next = Sel {
                         anchor: anchor.min(last),
@@ -4273,6 +4722,15 @@ impl App {
                 self.refreshing = true;
                 self.set_status("refreshing…");
                 return (Changed::Yes, Some(Effect::Refresh));
+            }
+            // Phase 14 D: the same shape as `Refresh`, one at a time.
+            Reload => {
+                if self.reload.is_some() {
+                    return (Changed::No, None);
+                }
+                self.reload = Some(Reloading::default());
+                self.set_status("reloading…");
+                return (Changed::Yes, Some(Effect::Reload));
             }
             Help => {
                 self.help = true;
@@ -5176,6 +5634,34 @@ pub(crate) mod testfix {
         p
     }
 
+    /// alpha's pile (`f1`, `f2`) plus `s1`, `s2`, `s3` cloned from `f1` and marked seen on
+    /// `run-1`, so they fold into alpha's `[seen] 3 files` group (Phase 14 B).
+    pub fn alpha_seen() -> Pile {
+        let mut p = pile("alpha");
+        let template = p.rows[0].clone();
+        for name in ["s1", "s2", "s3"] {
+            let mut r = template.clone();
+            r.path = name.as_bytes().to_vec();
+            r.seen_on = vec!["run-1".to_owned()];
+            p.rows.push(r);
+        }
+        p
+    }
+
+    /// [`alpha_seen`] with a flag on `path`, as the engine's rescan after `m` returns it.
+    pub fn alpha_seen_flagged(path: &str) -> Pile {
+        let mut p = alpha_seen();
+        for r in &mut p.rows {
+            if r.path == path.as_bytes() {
+                r.flags.push(lastcall_engine::ledger::Flag::file(
+                    "look",
+                    "2026-09-26T00:00:00Z",
+                ));
+            }
+        }
+        p
+    }
+
     pub fn row(root: &str, path: &str) -> Selection {
         Selection::Row(self::root(root), path.as_bytes().to_vec())
     }
@@ -5265,7 +5751,7 @@ mod tests {
         assert_eq!(app.handle(Action::Expand), (Changed::No, None));
         assert!(app.expanded.is_none());
         // A group entry.
-        app.select(Some(Selection::Group(root("beta"), Annotation::Upstream)));
+        app.select(Some(Selection::Group(root("beta"), GroupKind::Upstream)));
         assert_eq!(app.handle(Action::Expand), (Changed::No, None));
     }
 
@@ -5655,7 +6141,7 @@ mod tests {
         assert!(!app.roots[&root("alpha")].listed(), "no rows left");
         assert!(app.nav_entries().contains(&Selection::Root(root("alpha"))));
 
-        app.select(Some(Selection::Group(root("beta"), Annotation::Upstream)));
+        app.select(Some(Selection::Group(root("beta"), GroupKind::Upstream)));
         let beta = pile("beta");
         let group = beta.groups().into_iter().next().unwrap();
         let rendered: Vec<Rendered> = group
@@ -5681,7 +6167,7 @@ mod tests {
         app.accepted(vec![accepted_ok("beta", 3, without(beta.clone(), &paths))]);
         assert_eq!(
             status(&app),
-            format!("accepted upstream · {}", plural(paths.len(), "file"))
+            format!("accepted [upstream] {}", plural(paths.len(), "file"))
         );
         assert_eq!(
             app.selection,
@@ -5727,12 +6213,312 @@ mod tests {
         );
     }
 
+    // --- Phase 14 B: the seen fold and its expand exit ----------------------------------
+
+    /// three_roots with alpha's pile replaced by [`alpha_seen`].
+    fn seen_app() -> App {
+        let mut app = three_roots();
+        app.apply(pile_event("alpha", alpha_seen()));
+        app
+    }
+
+    fn seen_group() -> Selection {
+        Selection::Group(root("alpha"), GroupKind::Seen)
+    }
+
+    /// alpha's nav block, in order.
+    fn alpha_nav(app: &App) -> Vec<Selection> {
+        app.nav_entries()
+            .into_iter()
+            .filter(|e| e.root() == root("alpha"))
+            .collect()
+    }
+
+    #[test]
+    fn app_seen_rows_fold_out_of_the_nav_into_one_group_entry() {
+        let app = seen_app();
+        assert_eq!(
+            alpha_nav(&app),
+            vec![
+                Selection::Root(root("alpha")),
+                row("alpha", "f1"),
+                row("alpha", "f2"),
+                row("alpha", "src/parse.rs"),
+                seen_group(),
+            ]
+        );
+        // `rows()` is still the whole pile: the header and the accept paths go by it.
+        assert_eq!(app.roots[&root("alpha")].rows().len(), 6);
+        assert_eq!(app.roots[&root("alpha")].nav_rows().count(), 3);
+    }
+
+    #[test]
+    fn app_seen_e_opens_the_group_members_follow_it_and_e_again_closes() {
+        let mut app = seen_app();
+        app.select(Some(seen_group()));
+        assert_eq!(app.seen_toggle(), Some(false));
+        assert_eq!(app.handle(Action::Expand), (Changed::Yes, None));
+        assert!(app.seen_open.contains(&root("alpha")));
+        assert_eq!(
+            alpha_nav(&app),
+            vec![
+                Selection::Root(root("alpha")),
+                row("alpha", "f1"),
+                row("alpha", "f2"),
+                row("alpha", "src/parse.rs"),
+                seen_group(),
+                row("alpha", "s1"),
+                row("alpha", "s2"),
+                row("alpha", "s3"),
+            ],
+            "members in path order right after the group row"
+        );
+        assert_eq!(
+            app.selection,
+            Some(seen_group()),
+            "opening keeps the selection"
+        );
+        assert_eq!(app.seen_toggle(), Some(true));
+        assert_eq!(app.handle(Action::Expand), (Changed::Yes, None));
+        assert!(app.seen_open.is_empty());
+        assert_eq!(alpha_nav(&app).len(), 5);
+    }
+
+    #[test]
+    fn app_seen_e_on_a_member_closes_the_group_and_selects_it() {
+        let mut app = seen_app();
+        app.select(Some(seen_group()));
+        app.handle(Action::Expand);
+        app.handle(Action::NavDown);
+        app.handle(Action::NavDown);
+        assert_eq!(app.selection, Some(row("alpha", "s2")));
+        // A member is an ordinary row: its diff is the row's.
+        assert_eq!(
+            app.selected_row().map(|r| r.path.clone()),
+            Some(b"s2".to_vec())
+        );
+        assert!(!app.view_hunks().is_empty());
+        assert_eq!(app.seen_toggle(), Some(true));
+        assert_eq!(app.handle(Action::Expand), (Changed::Yes, None));
+        assert!(app.seen_open.is_empty());
+        assert_eq!(app.selection, Some(seen_group()));
+    }
+
+    /// Verification F3: a member accepted from inside the open group hands the cursor to
+    /// the next member, then to the group row when it was the last one, never to a plain
+    /// row that happens to sort after its path above the group.
+    #[test]
+    fn app_seen_accepting_a_member_inside_the_open_group_lands_on_the_next_member() {
+        let mut app = seen_app();
+        app.select(Some(seen_group()));
+        app.handle(Action::Expand);
+        app.select(Some(row("alpha", "s2")));
+        assert!(app.nav_in_group);
+        // The accept's rescan returns the pile without `s2`.
+        let mut p = alpha_seen();
+        p.rows.retain(|r| r.path != b"s2");
+        app.apply(pile_event("alpha", p));
+        assert_eq!(app.selection, Some(row("alpha", "s3")), "the next member");
+        assert!(app.seen_open.contains(&root("alpha")), "still open");
+        // No member below it: the nearest member above, never the plain rows above the
+        // group (a group with no member left is gone, and the old rule applies then).
+        let mut p = alpha_seen();
+        p.rows.retain(|r| r.path != b"s2" && r.path != b"s3");
+        app.apply(pile_event("alpha", p));
+        assert_eq!(app.selection, Some(row("alpha", "s1")));
+        // A plain row keeps the old rule: `src/parse.rs` accepted lands on the group row
+        // below it, the nearest surviving entry in key order.
+        app.select(Some(row("alpha", "src/parse.rs")));
+        assert!(!app.nav_in_group);
+        let mut p = alpha_seen();
+        p.rows.retain(|r| r.path != b"src/parse.rs");
+        app.apply(pile_event("alpha", p));
+        assert_eq!(app.selection, Some(seen_group()));
+    }
+
+    /// Verification F5: a folded row named while its group is closed (a click on a frame
+    /// the fold has since replaced) selects the group row that stands for it, so the
+    /// selection is always on the nav and `e`, `j` and `k` keep working.
+    #[test]
+    fn app_seen_selecting_a_folded_row_while_closed_selects_the_group() {
+        let mut app = seen_app();
+        assert_eq!(app.select(Some(row("alpha", "s2"))), Changed::Yes);
+        assert_eq!(app.selection, Some(seen_group()));
+        assert_eq!(app.seen_toggle(), Some(false));
+        // Open, the same row is a member and is selected as itself.
+        app.handle(Action::Expand);
+        app.select(Some(row("alpha", "s2")));
+        assert_eq!(app.selection, Some(row("alpha", "s2")));
+    }
+
+    /// A collapsed member (a lockfile, a large file) would have no way to show its content
+    /// if `e` always closed the group, so on one not yet expanded `e` expands it first;
+    /// once it is expanded, `e` closes the group as on any other member.
+    #[test]
+    fn app_seen_e_on_a_collapsed_member_expands_it_first_then_closes_the_group() {
+        let mut app = three_roots();
+        let mut p = alpha_seen();
+        for r in &mut p.rows {
+            if r.path == b"s2" {
+                r.collapsed = Some(Collapsed::Size);
+                r.hunks.clear();
+            }
+        }
+        app.apply(pile_event("alpha", p));
+        app.select(Some(seen_group()));
+        app.handle(Action::Expand);
+        app.select(Some(row("alpha", "s2")));
+        assert_eq!(
+            app.seen_toggle(),
+            None,
+            "the hint says expand, not collapse"
+        );
+        let (changed, effect) = app.handle(Action::Expand);
+        assert_eq!(changed, Changed::No);
+        let Some(Effect::Expand(asked_root, asked_row)) = effect else {
+            panic!("an expand effect: {effect:?}");
+        };
+        assert_eq!(asked_root, root("alpha"));
+        assert!(
+            app.seen_open.contains(&root("alpha")),
+            "the group stays open"
+        );
+        assert_eq!(
+            app.set_expanded(root("alpha"), &asked_row, expansion_of(2, 0)),
+            Changed::Yes
+        );
+        assert_eq!(app.view_hunks().len(), 2);
+        assert_eq!(app.seen_toggle(), Some(true));
+        assert_eq!(app.handle(Action::Expand), (Changed::Yes, None));
+        assert!(app.seen_open.is_empty());
+        assert_eq!(app.selection, Some(seen_group()));
+    }
+
+    #[test]
+    fn app_seen_a_flagged_member_leaves_the_group_and_the_group_stays_open() {
+        let mut app = seen_app();
+        app.select(Some(seen_group()));
+        app.handle(Action::Expand);
+        app.select(Some(row("alpha", "s3")));
+        // `m` wrote a flag; the rescan brings the row back flagged.
+        app.apply(pile_event("alpha", alpha_seen_flagged("s3")));
+        assert!(app.seen_open.contains(&root("alpha")), "still open");
+        assert_eq!(
+            alpha_nav(&app),
+            vec![
+                Selection::Root(root("alpha")),
+                row("alpha", "f1"),
+                row("alpha", "f2"),
+                row("alpha", "src/parse.rs"),
+                row("alpha", "s3"),
+                seen_group(),
+                row("alpha", "s1"),
+                row("alpha", "s2"),
+            ],
+            "its own row above the group, the group one shorter"
+        );
+        assert_eq!(
+            app.selection,
+            Some(row("alpha", "s3")),
+            "the selection follows it"
+        );
+        assert_eq!(
+            app.roots[&root("alpha")]
+                .group(GroupKind::Seen)
+                .map(|g| g.paths.len()),
+            Some(2)
+        );
+        assert_eq!(app.seen_toggle(), None, "`e` on it is not about the group");
+    }
+
+    #[test]
+    fn app_seen_open_survives_a_scan_and_clears_when_the_group_goes() {
+        let mut app = seen_app();
+        app.select(Some(seen_group()));
+        app.handle(Action::Expand);
+        app.apply(pile_event_seq("alpha", 1, alpha_seen()));
+        assert!(
+            app.seen_open.contains(&root("alpha")),
+            "same pile, still open"
+        );
+        app.apply(pile_event_seq("alpha", 2, pile("alpha")));
+        assert!(app.seen_open.is_empty(), "the group vanished");
+        assert_ne!(app.selection, Some(seen_group()));
+        // It comes back closed.
+        app.apply(pile_event_seq("alpha", 3, alpha_seen()));
+        assert!(app.seen_open.is_empty());
+        assert_eq!(alpha_nav(&app).len(), 5);
+    }
+
+    #[test]
+    fn app_seen_e_elsewhere_does_nothing_to_the_group() {
+        let mut app = seen_app();
+        app.select(Some(row("alpha", "f1")));
+        assert_eq!(app.seen_toggle(), None);
+        assert_eq!(app.handle(Action::Expand), (Changed::No, None));
+        assert!(app.seen_open.is_empty());
+        app.select(Some(Selection::Root(root("alpha"))));
+        assert_eq!(app.handle(Action::Expand), (Changed::No, None));
+        assert!(app.seen_open.is_empty());
+    }
+
+    #[test]
+    fn app_seen_a_selected_row_that_folds_moves_the_selection_to_the_group() {
+        let mut app = three_roots();
+        let mut plain = alpha_seen();
+        for r in &mut plain.rows {
+            r.seen_on.clear();
+        }
+        app.apply(pile_event("alpha", plain));
+        app.select(Some(row("alpha", "s2")));
+        app.apply(pile_event_seq("alpha", 1, alpha_seen()));
+        assert_eq!(app.selection, Some(seen_group()), "not the neighbour");
+    }
+
+    #[test]
+    fn app_seen_group_accepts_with_the_file_key_and_counts_in_accept_all() {
+        let mut app = seen_app();
+        app.select(Some(seen_group()));
+        assert_eq!(
+            app.accept_scope(),
+            Some(AcceptAnswer::Refuse("A accepts the group".to_owned()))
+        );
+        let alpha = alpha_seen();
+        let rendered: Vec<Rendered> = ["s1", "s2", "s3"]
+            .iter()
+            .map(|p| Rendered::of(alpha.row(p.as_bytes()).unwrap()))
+            .collect();
+        assert_eq!(
+            requests(app.handle(Action::AcceptFile).1),
+            vec![(
+                root("alpha"),
+                AcceptRequest::Group {
+                    rows: rendered,
+                    rendered_on: alpha.seen_branch.clone(),
+                }
+            )]
+        );
+        app.accepted(vec![accepted_ok(
+            "alpha",
+            3,
+            without(alpha.clone(), &["s1", "s2", "s3"]),
+        )]);
+        assert_eq!(status(&app), "accepted [seen] 3 files");
+
+        // Accept-all counts every row, folded or not, and names the folded ones.
+        let app = seen_app();
+        let counts = app.counts_of(&AcceptScope::All);
+        let every: usize = app.roots.values().map(|v| v.rows().len()).sum();
+        assert_eq!(counts.files, every);
+        assert_eq!(counts.grouped_seen, 3);
+    }
+
     /// A group is several files too, so `a` refuses there on the same terms and `A` folds
     /// it. The refusal names the group rather than a repository.
     #[test]
     fn app_accept_on_a_group_refuses_and_accept_file_folds_it() {
         let mut app = three_roots();
-        app.select(Some(Selection::Group(root("beta"), Annotation::Upstream)));
+        app.select(Some(Selection::Group(root("beta"), GroupKind::Upstream)));
         let before = app.roots[&root("beta")].clone();
 
         assert_eq!(
@@ -5748,7 +6534,7 @@ mod tests {
             app.accept_file_scope(),
             Some(AcceptScope::Group {
                 root: root("beta"),
-                kind: Annotation::Upstream,
+                kind: GroupKind::Upstream,
             })
         );
     }
@@ -5791,7 +6577,7 @@ mod tests {
                 "Ctrl-W accepts all in alpha".to_owned()
             ))
         );
-        app.select(Some(Selection::Group(root("beta"), Annotation::Upstream)));
+        app.select(Some(Selection::Group(root("beta"), GroupKind::Upstream)));
         assert_eq!(
             app.accept_scope(),
             Some(AcceptAnswer::Refuse("Ctrl-W accepts the group".to_owned()))
@@ -6045,6 +6831,7 @@ mod tests {
         app.apply(EngineEvent::RootsChanged(RootsChanged {
             added: vec![],
             removed: vec![root("alpha")],
+            reload: false,
         }));
         assert!(
             !app.seq.contains_key(&root("alpha")),
@@ -6136,6 +6923,7 @@ mod tests {
             Some(ConfirmCounts {
                 files: 11,
                 grouped: 1,
+                grouped_seen: 0,
                 collapsed: 2,
                 roots: vec!["alpha".into()],
             })
@@ -6441,7 +7229,7 @@ mod tests {
 
     /// The classification is on the typed error, not on the message text.
     #[test]
-    fn app_accept_failed_classifies_lock_busy_and_nothing_else() {
+    fn app_accept_failed_classifies_lock_busy_root_gone_and_nothing_else() {
         use lastcall_engine::paths::RepoPaths;
         let busy = EngineError::Ops(OpsError::Ledger(LedgerError::LockBusy {
             path: RepoPaths::under("/state/repo".into()).lock,
@@ -6453,6 +7241,47 @@ mod tests {
             AcceptFailed::of(&other),
             AcceptFailed::Other("no such root: /gone".into())
         );
+        // Phase 14 C: the scan after an op found the folder gone.
+        let gone = EngineError::RootGone("/w/wt".into());
+        assert_eq!(AcceptFailed::of(&gone), AcceptFailed::RootGone);
+        assert_eq!(AcceptFailed::RootGone.to_string(), "folder removed");
+    }
+
+    /// Phase 14 C: an accept in a root whose folder is gone comes back refused as
+    /// `RootGone` with that root's last pile. The status line names the root (the refusal
+    /// names no row), the pile is not applied, the cursor stays, and the loop is told to
+    /// ask for discovery. The same words when the news is the error of the scan after it.
+    #[test]
+    fn app_accept_in_a_removed_root_says_folder_removed_and_applies_nothing() {
+        use lastcall_engine::ops::{Outcome, Refused};
+        let mut app = three_roots();
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Accept);
+        let before = app.roots[&root("alpha")].clone();
+        let result: AcceptResult = Ok(Accepted {
+            outcome: Outcome {
+                refused: vec![Refused::RootGone],
+                ..Outcome::default()
+            },
+            seq: 99,
+            pile: Pile::default(),
+        });
+        assert!(accept_found_root_gone(&result));
+        assert_eq!(app.accepted(vec![(root("alpha"), result)]), Changed::Yes);
+        assert_eq!(status(&app), "alpha: folder removed");
+        assert_eq!(app.roots[&root("alpha")], before, "no pile applied");
+        assert_eq!(app.selection, Some(row("alpha", "f1")));
+        assert_eq!(app.accepting, None);
+
+        app.handle(Action::Accept);
+        let result: AcceptResult = Err(AcceptFailed::RootGone);
+        assert!(accept_found_root_gone(&result));
+        app.accepted(vec![(root("alpha"), result)]);
+        assert_eq!(status(&app), "alpha: folder removed");
+        assert!(!accept_found_root_gone(&Err(AcceptFailed::LedgerBusy)));
+        assert!(!accept_found_root_gone(
+            &accepted_ok("alpha", 3, Pile::default()).1
+        ));
     }
 
     #[test]
@@ -6575,7 +7404,7 @@ mod tests {
                 Selection::Root(root("beta")),
                 row("beta", "u1"),
                 row("beta", "u2"),
-                Selection::Group(root("beta"), Annotation::Upstream),
+                Selection::Group(root("beta"), GroupKind::Upstream),
                 Selection::Root(root("notes")),
                 row("notes", "n2.md"),
             ]
@@ -6609,7 +7438,7 @@ mod tests {
             "the repo is still listed, so the cursor stays in it — its name row"
         );
 
-        app.select(Some(Selection::Group(root("beta"), Annotation::Upstream)));
+        app.select(Some(Selection::Group(root("beta"), GroupKind::Upstream)));
         let mut p = pile("beta");
         for r in &mut p.rows {
             r.annotation = Some(Annotation::Mixed);
@@ -7079,6 +7908,224 @@ mod tests {
         );
     }
 
+    /// Phase 14 D: the notice fragments come from the running config and the file's new
+    /// one, key group by key group, and the notice says the root counts first.
+    #[test]
+    fn app_reload_changes_name_what_the_file_changed() {
+        use lastcall_engine::config::{Config, KeySpecs};
+        let old = Config::default();
+        let same = reload_changes(&old, &old.clone());
+        assert_eq!(same, ReloadChanges::default());
+        assert_eq!(
+            reload_notice(&same, (0, 0)),
+            "config reloaded, nothing changed"
+        );
+        let mut new = old.clone();
+        new.keys
+            .insert("reload".into(), KeySpecs::One("ctrl-r".into()));
+        new.ui.wrap = false;
+        new.watch_ignore_globs.push("scratch/**".into());
+        new.collapse_size_bytes += 1;
+        new.include_gitignored.push("z_ignore_*".into());
+        new.skip_globs.push("*/evals/**".into());
+        new.draft_dirs.push("notes".into());
+        let all = reload_changes(&old, &new);
+        assert_eq!(
+            all.parts,
+            vec![
+                "keys",
+                "ui",
+                "watcher",
+                "collapse",
+                "include_gitignored",
+                "skip_globs",
+                "discovery"
+            ]
+        );
+        assert!(!all.next_launch);
+        assert_eq!(
+            reload_notice(&all, (1, 0)),
+            "config reloaded: 1 root added, keys, ui, watcher, collapse, include_gitignored, skip_globs",
+            "the counts say what discovery did"
+        );
+        assert_eq!(
+            reload_notice(&all, (0, 0)),
+            "config reloaded: keys, ui, watcher, collapse, include_gitignored, skip_globs, discovery"
+        );
+        // `hide_empty_repos` is a `[ui]`-kind setting though it sits at the top level.
+        let mut hide = old.clone();
+        hide.hide_empty_repos = true;
+        assert_eq!(reload_changes(&old, &hide).parts, vec!["ui"]);
+        // `[herdr]` and `[update]` apply at the next launch, and the notice says so.
+        let mut later = old.clone();
+        later.update.check = !later.update.check;
+        let changes = reload_changes(&old, &later);
+        assert_eq!(changes.parts, Vec::<&str>::new());
+        assert!(changes.next_launch);
+        assert_eq!(
+            reload_notice(&changes, (0, 0)),
+            format!("config reloaded; {NEXT_LAUNCH}")
+        );
+        let mut herdr = old.clone();
+        herdr.herdr.toast = !herdr.herdr.toast;
+        assert!(reload_changes(&old, &herdr).next_launch);
+        assert_eq!(
+            reload_notice(&reload_changes(&old, &herdr), (2, 1)),
+            format!("config reloaded: 2 roots added, 1 root removed; {NEXT_LAUNCH}")
+        );
+    }
+
+    /// Phase 14 D (design review F14): a `[ui]` value reaches the session toggle only when
+    /// the file changed it; a toggle the reader flipped is kept through a reload that did
+    /// not touch the line.
+    #[test]
+    fn app_reload_applies_a_ui_value_only_when_the_file_changed_it() {
+        use lastcall_engine::config::Config;
+        let mut app = three_roots();
+        let old = Config::default();
+        app.handle(Action::ToggleWrap);
+        app.handle(Action::HideEmpty);
+        let (wrap, hide) = (app.wrap, app.hide_empty);
+        assert_eq!((wrap, hide), (!old.ui.wrap, !old.hide_empty_repos));
+        let mut keys_only = old.clone();
+        keys_only.keys.insert(
+            "reload".into(),
+            lastcall_engine::config::KeySpecs::One("ctrl-r".into()),
+        );
+        app.reloaded(&old, &keys_only);
+        assert_eq!(
+            (app.wrap, app.hide_empty),
+            (wrap, hide),
+            "the file left both lines alone, so the session keeps its own"
+        );
+        let mut edited = old.clone();
+        edited.ui.wrap = !old.ui.wrap;
+        app.handle(Action::ToggleWrap); // the session is back to the old file value
+        app.reloaded(&old, &edited);
+        assert_eq!(
+            app.wrap, edited.ui.wrap,
+            "the file changed it: the file wins"
+        );
+        assert_eq!(app.hide_empty, hide, "untouched line, session value kept");
+        let mut shown = old.clone();
+        shown.hide_empty_repos = !old.hide_empty_repos;
+        app.reloaded(&old, &shown);
+        assert_eq!(app.hide_empty, shown.hide_empty_repos);
+    }
+
+    /// Phase 14 D: `R` says `reloading…` and asks for `Effect::Reload`, once; the notice
+    /// lands when both the loop's answer and the watcher's reload `RootsChanged` are in,
+    /// whichever comes first; a plain `RootsChanged` does not finish it; a refused file
+    /// ends it with the error.
+    #[test]
+    fn app_reload_notice_waits_for_both_halves_in_either_order() {
+        use lastcall_engine::config::Config;
+        let old = Config::default();
+        let mut new = old.clone();
+        new.watch_ignore_globs.push("scratch/**".into());
+        let reload_event = |added: Vec<PathBuf>, removed: Vec<PathBuf>| {
+            EngineEvent::RootsChanged(RootsChanged {
+                added,
+                removed,
+                reload: true,
+            })
+        };
+        // The loop's answer first.
+        let mut app = three_roots();
+        assert_eq!(
+            app.handle(Action::Reload),
+            (Changed::Yes, Some(Effect::Reload))
+        );
+        assert_eq!(status(&app), "reloading…");
+        assert_eq!(
+            app.handle(Action::Reload),
+            (Changed::No, None),
+            "one at a time"
+        );
+        app.reloaded(&old, &new);
+        assert_eq!(status(&app), "reloading…", "the root counts are not in yet");
+        app.apply(EngineEvent::RootsChanged(RootsChanged {
+            added: vec![root("delta")],
+            removed: vec![],
+            reload: false,
+        }));
+        assert_eq!(
+            status(&app),
+            "reloading…",
+            "an ordinary rescan is not the reload's"
+        );
+        let (_, effect) = app.apply(reload_event(vec![root("gamma2")], vec![root("beta")]));
+        assert_eq!(effect, Some(Effect::SyncRoots));
+        assert_eq!(
+            status(&app),
+            "config reloaded: 1 root added, 1 root removed, watcher"
+        );
+        assert!(app.reload.is_none());
+        // The watcher's event first; an empty one still finishes the reload.
+        let mut app = three_roots();
+        app.handle(Action::Reload);
+        let (_, effect) = app.apply(reload_event(vec![], vec![]));
+        assert_eq!(effect, None, "nothing to sync");
+        assert_eq!(status(&app), "reloading…");
+        app.reloaded(&old, &old);
+        assert_eq!(status(&app), "config reloaded, nothing changed");
+        // A root reopened under another parent dir is added, not also removed.
+        let mut app = three_roots();
+        app.handle(Action::Reload);
+        app.reloaded(&old, &old);
+        app.apply(reload_event(vec![root("alpha")], vec![root("alpha")]));
+        assert_eq!(status(&app), "config reloaded: 1 root added");
+        // A refused file.
+        let mut app = three_roots();
+        app.handle(Action::Reload);
+        assert_eq!(
+            app.reload_failed("config file /c.toml, line 3: expected `=`"),
+            Changed::Yes
+        );
+        assert_eq!(
+            status(&app),
+            "config not reloaded: config file /c.toml, line 3: expected `=`"
+        );
+        assert!(app.reload.is_none());
+        assert_eq!(
+            app.handle(Action::Reload).1,
+            Some(Effect::Reload),
+            "free again"
+        );
+    }
+
+    /// Design review F19: a confirm modal over a root that just left the list closes and
+    /// says so; one over a root that stays, or over every root, is left open.
+    #[test]
+    fn app_roots_changed_closes_a_confirm_whose_root_left() {
+        let removed = |r: &str| {
+            EngineEvent::RootsChanged(RootsChanged {
+                added: vec![],
+                removed: vec![root(r)],
+                reload: false,
+            })
+        };
+        let mut app = three_roots();
+        app.confirm = Some(Confirm {
+            scope: ConfirmScope::Accept(AcceptScope::Root(root("beta"))),
+        });
+        app.apply(removed("gamma"));
+        assert!(app.confirm.is_some(), "another root left");
+        let name = app.root_name(&root("beta"));
+        app.apply(removed("beta"));
+        assert!(app.confirm.is_none());
+        assert_eq!(status(&app), format!("{name}: no longer listed"));
+        let mut app = three_roots();
+        app.confirm = Some(Confirm {
+            scope: ConfirmScope::Accept(AcceptScope::All),
+        });
+        app.apply(removed("beta"));
+        assert!(
+            app.confirm.is_some(),
+            "accept-all recounts over what is left"
+        );
+    }
+
     #[test]
     fn app_roots_changed_drops_removed_and_adopts_orphan_piles_on_sync() {
         let mut app = three_roots();
@@ -7086,6 +8133,7 @@ mod tests {
         let (changed, effect) = app.apply(EngineEvent::RootsChanged(RootsChanged {
             added: vec![root("gamma")],
             removed: vec![root("beta")],
+            reload: false,
         }));
         assert_eq!((changed, effect), (Changed::Yes, Some(Effect::SyncRoots)));
         assert!(!app.roots.contains_key(&root("beta")));
@@ -10190,6 +11238,188 @@ mod tests {
         let sel = app.sel;
         app.handle(Action::Copy);
         assert_eq!(app.sel, sel, "still there to shrink");
+    }
+
+    // ---- Phase 14 G: the drag copies every text in the right pane ------------------------
+
+    /// alpha's repository row selected and the right pane focused, as a click on the pane
+    /// leaves it. Its pane is five lines: the name, the path, and the three rows.
+    fn root_pane() -> App {
+        let mut app = three_roots();
+        app.select(Some(Selection::Root(root("alpha"))));
+        app.handle(Action::FocusToggle);
+        assert_eq!(app.effective_focus(), Focus::Diff);
+        app
+    }
+
+    /// alpha's pane, line by line, as the renderer draws it at any width the fixture fits.
+    const ALPHA_PANE: &str = "alpha  main · 3 files\n~/W/alpha\n  M f1  +1 −1\n  M f2  +1 −0\n  M src/parse.rs  +10 −2\n";
+
+    /// Phase 14 G: a drag over a repository's pane copies its name and its path,
+    /// home written `~` as the pane draws it.
+    #[test]
+    fn app_drag_on_a_root_pane_copies_the_name_and_the_path() {
+        let mut app = root_pane();
+        app.press_line = Some(0);
+        assert_eq!(app.handle(Action::SelectTo(1)).0, Changed::Yes);
+        assert!(app.drag_moved);
+        assert_eq!(
+            app.sel,
+            Some(Sel {
+                anchor: 0,
+                cursor: 1
+            })
+        );
+        let (changed, effect) = app.handle(Action::Release);
+        assert_eq!(changed, Changed::Yes);
+        assert_eq!(copied(effect), "alpha  main · 3 files\n~/W/alpha\n");
+        assert_eq!(app.sel, None, "a copy clears the selection");
+        assert_eq!(app.cue.as_ref().map(|c| c.text.as_str()), Some(COPIED));
+    }
+
+    /// Phase 14 G: the mouse and the keyboard stop at the pane's last line.
+    #[test]
+    fn app_root_pane_selection_clamps_to_the_pane_lines() {
+        let mut app = root_pane();
+        // A drag past the last line stops at it.
+        app.press_line = Some(3);
+        app.handle(Action::SelectTo(999));
+        assert_eq!(
+            app.sel,
+            Some(Sel {
+                anchor: 3,
+                cursor: 4
+            })
+        );
+        app.handle(Action::Back);
+        assert_eq!(app.sel, None);
+        // `v` anchors at the top line, `↓` extends it, and `y` copies what is selected.
+        assert_eq!(app.handle(Action::Select), (Changed::Yes, None));
+        assert_eq!(app.handle(Action::NavDown).0, Changed::Yes);
+        assert_eq!(
+            copied(app.handle(Action::Copy).1),
+            "alpha  main · 3 files\n~/W/alpha\n"
+        );
+        // `↓` past the end stays on the last line.
+        app.handle(Action::Select);
+        for _ in 0..4 {
+            assert_eq!(app.handle(Action::NavDown).0, Changed::Yes);
+        }
+        assert_eq!(app.handle(Action::NavDown), (Changed::No, None));
+        assert_eq!(app.handle(Action::NavPageDown), (Changed::No, None));
+        assert_eq!(
+            app.sel,
+            Some(Sel {
+                anchor: 0,
+                cursor: 4
+            })
+        );
+        assert_eq!(app.diff.scroll, 0, "nothing scrolls in this pane");
+        assert_eq!(copied(app.handle(Action::Copy).1), ALPHA_PANE);
+    }
+
+    /// Phase 14 G: `y` with nothing selected copies the whole pane, and a pane over
+    /// the cap is refused with the diff's own words, the selection left alone.
+    #[test]
+    fn app_y_on_a_root_pane_copies_it_whole_and_refuses_over_the_cap() {
+        let mut app = root_pane();
+        assert_eq!(copied(app.handle(Action::Copy).1), ALPHA_PANE);
+
+        let mut big = rows_n(1000, 0, 0);
+        for (i, r) in big.rows.iter_mut().enumerate() {
+            r.path = format!("{}/{i:04}.rs", "d".repeat(40)).into_bytes();
+        }
+        let mut app = three_roots();
+        app.handle(Action::Resize(200, 1100));
+        app.apply(pile_event("alpha", big));
+        app.select(Some(Selection::Root(root("alpha"))));
+        app.handle(Action::FocusToggle);
+        let payload = app.copy_payload().expect("a payload to refuse");
+        assert!(payload.len() > super::super::clipboard::CAP);
+        let (changed, effect) = app.handle(Action::Copy);
+        assert_eq!(changed, Changed::Yes);
+        assert_eq!(effect, None, "nothing is written over the cap");
+        assert_eq!(app.cue, None);
+        assert!(
+            app.status
+                .as_ref()
+                .is_some_and(|s| s.text.starts_with("selection too large to copy (")),
+            "{:?}",
+            app.status
+        );
+    }
+
+    /// A group's pane copies its file lines: the seen group's with the branch column it
+    /// draws, the upstream group's as bare paths.
+    #[test]
+    fn app_group_panes_copy_their_path_lines() {
+        let mut app = seen_app();
+        app.select(Some(seen_group()));
+        app.handle(Action::FocusToggle);
+        app.press_line = Some(1);
+        app.handle(Action::SelectTo(3));
+        assert_eq!(
+            copied(app.handle(Action::Release).1),
+            "  s1  run-1\n  s2  run-1\n  s3  run-1\n"
+        );
+
+        let mut app = three_roots();
+        app.select(Some(Selection::Group(root("beta"), GroupKind::Upstream)));
+        app.handle(Action::FocusToggle);
+        app.press_line = Some(0);
+        app.handle(Action::SelectTo(1));
+        assert_eq!(
+            copied(app.handle(Action::Release).1),
+            "[upstream] 1 file\n  u1\n"
+        );
+    }
+
+    /// Phase 14 G: a selection that moves in the middle of a drag ends the gesture,
+    /// so the next `Drag` selects nothing and the release copies nothing.
+    #[test]
+    fn app_a_selection_change_mid_drag_ends_the_gesture() {
+        // On a file's diff, the pane the gesture always had.
+        let mut app = diff_at_f1();
+        app.press_line = Some(1);
+        app.handle(Action::SelectTo(2));
+        assert!(app.sel.is_some());
+        app.select(Some(row("alpha", "f2")));
+        assert_eq!(app.press_line, None);
+        assert!(!app.drag_moved);
+        assert_eq!(app.handle(Action::SelectTo(3)), (Changed::No, None));
+        assert_eq!(app.sel, None);
+        assert_eq!(app.handle(Action::Release), (Changed::No, None));
+
+        // And on a repository's pane.
+        let mut app = root_pane();
+        app.press_line = Some(0);
+        app.handle(Action::SelectTo(1));
+        app.select(Some(Selection::Root(root("beta"))));
+        assert_eq!(app.handle(Action::SelectTo(1)), (Changed::No, None));
+        assert_eq!(app.sel, None);
+        assert_eq!(app.handle(Action::Release), (Changed::No, None));
+
+        // The same selection is not a change, and the gesture carries on.
+        let mut app = root_pane();
+        app.press_line = Some(0);
+        app.handle(Action::SelectTo(1));
+        app.select(Some(Selection::Root(root("alpha"))));
+        assert_eq!(app.press_line, Some(0));
+        assert!(app.drag_moved);
+    }
+
+    /// Phase 14 G: a hunkless row's body is not selectable, so `v` is refused there
+    /// as it always was.
+    #[test]
+    fn app_a_hunkless_row_body_is_not_selectable() {
+        let mut app = three_roots();
+        app.apply(pile_event("alpha", alpha_collapsed(Collapsed::Glob)));
+        app.select(Some(row("alpha", "f1")));
+        app.handle(Action::Open);
+        assert_eq!(app.effective_focus(), Focus::Diff);
+        assert_eq!(app.selectable_lines(), 0);
+        assert_eq!(app.handle(Action::Select), (Changed::No, None));
+        assert_eq!(app.handle(Action::Copy), (Changed::No, None));
     }
 
     // ---- deliverable 2: undo ---------------------------------------------------------------

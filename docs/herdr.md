@@ -46,6 +46,10 @@ you are sitting in front of: a second one over the same session tracks its own.
 
 Clicking the dot selects that repository and acknowledges it in one gesture.
 
+Copying inside a herdr pane is by drag, since the terminal's own selection does not reach
+it there: drag across any text in the right pane, a diff, a repository's path or a group's
+file list, and the release copies it.
+
 **A badge in the header** saying what the link is doing: `herdr <version>` when connected,
 `herdr ⟳` while reconnecting, `standalone` when there is no link, and, under `mode = "on"`,
 `standalone: <reason>` when one was asked for and did not happen. Click the badge to put the
@@ -127,6 +131,11 @@ outside every repository is hidden by any scope; `w` shows it.
 the welcome on your first launch inside a herdr session offers to write that line for you. A
 hidden repository is still watched and still scanned: the scope is a view, not a filter, so
 turning it off shows a current list rather than starting a fresh scan.
+
+A worktree an agent works in is listed like any repository (`search_depth = 2` reaches one
+kept inside a listed repository), and when the run ends by removing it, with `git worktree
+remove` or by deleting the folder, its row leaves the list at once; an accept aimed at it in
+that moment is refused with `folder removed` and writes nothing.
 
 Nothing is listed until the first scope verdict arrives, including the verdict "no scope".
 The wait is part of the launch screen rather than a second one. This exists because the

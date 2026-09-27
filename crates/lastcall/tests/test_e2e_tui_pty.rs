@@ -3073,6 +3073,73 @@ fn pty_copy_writes_osc52_with_the_selected_lines() {
     assert_clean_exit(&pty, since);
 }
 
+/// Phase 14 G: the mouse copies a repository's pane, not only a diff. A click on beta's
+/// repository row, a drag over the pane's first two lines (the name line and the path),
+/// and the release writes exactly one OSC 52 whose payload is those two lines as drawn.
+#[test]
+fn pty_drag_on_a_repository_pane_copies_its_name_and_path() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let Some(mut pty) = fx.spawn_tui(&bin()) else {
+        return;
+    };
+    wait_first_piles(&mut pty);
+    wait_watching(&mut pty);
+
+    let beta_row = pty
+        .find_row(|r| r.starts_with("│beta"))
+        .expect("beta's repo row is on screen");
+    pty.click(3, beta_row).expect("click");
+    pty.wait_for_text("beta  main · 2 files", Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("clicking beta shows its pane: {e}"));
+
+    // The two lines, read before the drag: the cue covers the pane's centre after it.
+    let rows = pty.rows();
+    let top = pty
+        .find_row(|r| r.contains("beta  main · 2 files"))
+        .expect("the pane's name line");
+    let pane = col_of(&rows[top as usize], "beta  main").expect("the pane's left edge");
+    let on_screen: Vec<String> = (top..top + 2)
+        .map(|r| {
+            let text: String = rows[r as usize].chars().skip(pane as usize).collect();
+            text.trim_end().trim_end_matches('│').trim_end().to_owned()
+        })
+        .collect();
+    assert!(
+        !on_screen[1].is_empty(),
+        "the path line is drawn: {on_screen:?}"
+    );
+
+    let before = pty.raw().len();
+    pty.press(pane + 2, top).expect("press on the name line");
+    pty.drag_to(pane + 2, top + 1)
+        .expect("drag onto the path line");
+    pty.release(pane + 2, top + 1).expect("release");
+    pty.wait_for_text("copied to clipboard", Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("the cue says the copy happened: {e}"));
+
+    let raw = pty.raw();
+    let osc: Vec<usize> = (0..raw.len())
+        .filter(|i| raw[*i..].starts_with(b"\x1b]52;c;"))
+        .collect();
+    assert_eq!(osc.len(), 1, "one OSC 52 write, at {osc:?}");
+    assert!(osc[0] >= before, "and it is the one the release asked for");
+    let payload = &raw[osc[0] + b"\x1b]52;c;".len()..];
+    let end = payload.iter().position(|b| *b == 0x07).expect("the BEL");
+    let encoded = String::from_utf8(payload[..end].to_vec()).expect("base64 is ascii");
+    assert_eq!(
+        String::from_utf8(base64_decode(&encoded)).expect("the payload is the pane's text"),
+        format!("{}\n{}\n", on_screen[0], on_screen[1]),
+        "the payload decodes to the two lines that were on screen (encoded: {encoded})"
+    );
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}
+
 // ---- Phase 9b deliverable 2.6: the once-a-day update check --------------------------------
 
 /// A served release directory holding just the release answer (the notice needs nothing
@@ -3368,7 +3435,7 @@ fn help_box_of(s: &vt100::Screen) -> Option<(usize, usize)> {
 /// height that holds the whole box the box is `rows + 4` tall (`render::render_help`), and
 /// the exact fit is one row less — the height at which the body fills the box and the draw
 /// used to spend the footer's row on a key. Every resize waits on a marker only the **new**
-/// frame can satisfy: at the exact fit the box's top border is on row 0 (at 30 rows it is
+/// frame can satisfy: at the exact fit the box's top border is on row 0 (at 34 rows it is
 /// not), and one row below that the clip notice appears.
 #[test]
 fn pty_help_overlay_says_how_to_leave_and_any_key_closes() {
@@ -3384,8 +3451,15 @@ fn pty_help_overlay_says_how_to_leave_and_any_key_closes() {
         s.contents().contains("any key closes")
     })
     .unwrap_or_else(|e| panic!("the help overlay: {e}"));
+    // Phase 14 D's `reload` row made 30 rows the exact fit itself, so the scene measures
+    // the natural box in a taller frame, where it is centred and not flush.
+    pty.resize(100, 34).expect("resize");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        help_box_of(s).is_some_and(|(top, _)| top > 0)
+    })
+    .unwrap_or_else(|e| panic!("the box centred in 34 rows: {e}\n{}", pty.screen_text()));
 
-    // 100 columns is past the 97 two columns need and 30 rows hold them: every row of the
+    // 100 columns is past the 97 two columns need and 34 rows hold them: every row of the
     // keymap is on the frame, the modal keys included, and nothing is clipped.
     let text = pty.screen_text();
     for row in [
@@ -3399,6 +3473,7 @@ fn pty_help_overlay_says_how_to_leave_and_any_key_closes() {
         "clear the file's flags",
         "workspace scope on/off",
         "rescan now",
+        "reload the config file",
         "this help",
         "quit",
         "confirm",
@@ -3411,7 +3486,7 @@ fn pty_help_overlay_says_how_to_leave_and_any_key_closes() {
         .screen(help_box_of)
         .unwrap_or_else(|| panic!("the overlay's box:\n{text}"));
     let natural = (bottom - top + 1) as u16;
-    assert!(top > 0, "at 30 rows the box is centred, not flush:\n{text}");
+    assert!(top > 0, "at 34 rows the box is centred, not flush:\n{text}");
 
     // The exact fit: one row less than the box's natural height. The body fills the box and
     // the way out is still the last thing in it.
@@ -3474,7 +3549,7 @@ fn pty_help_overlay_says_how_to_leave_and_any_key_closes() {
     );
     for footer in [
         "^J is a newline in the note",
-        "shift+drag selects text",
+        "drag selects text · v/y copies",
         "any key closes",
     ] {
         assert!(
@@ -3487,11 +3562,11 @@ fn pty_help_overlay_says_how_to_leave_and_any_key_closes() {
     // A key that means something elsewhere closes the overlay and is **spent** on it: `j`
     // does not also move the selection (`app_help_opens_and_any_key_closes_it`). The next
     // `j` does, which is how the scene knows the loop kept the keys rather than the overlay.
-    pty.resize(100, 30).expect("resize");
+    pty.resize(100, 34).expect("resize");
     pty.wait_for(Duration::from_secs(5), |s| {
         help_box_of(s).is_some_and(|(top, _)| top > 0)
     })
-    .unwrap_or_else(|e| panic!("the overlay is centred again at 30 rows: {e}"));
+    .unwrap_or_else(|e| panic!("the overlay is centred again at 34 rows: {e}"));
     pty.send(b"j").expect("j closes the overlay");
     pty.wait_for(Duration::from_secs(5), |s| {
         !s.contents().contains("any key closes") && rows_listed(s)
@@ -5288,6 +5363,358 @@ fn pty_wrap_toggles_and_alt_z_is_not_an_undo() {
     pty.wait_for(Duration::from_secs(5), |s| s.contents().contains(tail))
         .unwrap_or_else(|e| panic!("Option-z wraps again: {e}\n{}", pty.screen_text()));
     assert_eq!(undo_depth(&fx, "alpha"), 1);
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}
+
+/// Phase 14 C, D28 through the binary: a listed linked worktree removed mid-scene leaves
+/// the nav on the removal's own events, launched **without** `--poll` so the only other
+/// way out is the thirty-second backstop; and `A` on its pending deletion sent at once,
+/// inside the debounce before the discovery pass, answers `alpha-wt: folder removed` and
+/// writes nothing. The `rm -r` form: it leaves no git-dir event behind to shorten the gap.
+#[test]
+fn pty_removed_worktree_leaves_without_the_backstop_and_the_gap_refuses() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let checkout = fx.parent.join("alpha-wt");
+    fx.repo("alpha")
+        .git(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "wt",
+            &checkout.to_string_lossy(),
+            "HEAD",
+        ])
+        .expect("git worktree add");
+
+    let Ok(mut pty) = fx.command(&bin()).args(["tui"]).spawn() else {
+        note("SKIP: this host cannot open a pty");
+        return;
+    };
+    // Four roots here, so not `wait_first_piles` (which pins the fixture's three).
+    pty.wait_for(LONG, rows_listed)
+        .unwrap_or_else(|e| panic!("first piles: {e}"));
+    wait_watching(&mut pty);
+    // The agent deletes a file in the worktree: a pending deletion, the accept that wrote
+    // the ledger in the gap before the fix.
+    std::fs::remove_file(checkout.join("f3")).expect("delete f3 in the worktree");
+    pty.wait_for(LONG, |s| {
+        let t = s.contents();
+        t.contains("alpha-wt") && t.contains("D f3")
+    })
+    .unwrap_or_else(|e| panic!("the deletion in alpha-wt: {e}\n{}", pty.screen_text()));
+    select_until(&mut pty, "f3  D");
+    let (state_dir, _) = fx.ledger_in("alpha-wt");
+    let ledger = state_dir.join("ledger.json");
+    let bytes = std::fs::read(&ledger).expect("the worktree's ledger");
+    let since = pty.raw().len();
+
+    let t = Instant::now();
+    std::fs::remove_dir_all(&checkout).expect("rm -r alpha-wt");
+    pty.send(b"A").expect("A");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        status_is(s, "alpha-wt: folder removed")
+    })
+    .unwrap_or_else(|e| panic!("the gap's refusal: {e}\n{}", pty.screen_text()));
+    let refused = t.elapsed();
+    pty.wait_for(Duration::from_secs(5), |s| {
+        !s.contents().contains("alpha-wt")
+    })
+    .unwrap_or_else(|e| panic!("the row never left: {e}\n{}", pty.screen_text()));
+    let gone = t.elapsed();
+    note(&format!(
+        "PTY D28: `alpha-wt: folder removed` after {refused:.3?}; the row gone after \
+         {gone:.3?} (no --poll; backstop 30 s)"
+    ));
+    assert!(gone < Duration::from_secs(5), "{gone:?}");
+    assert_eq!(
+        std::fs::read(&ledger).expect("the record is kept"),
+        bytes,
+        "nothing written in the gap"
+    );
+    let raw = pty.raw();
+    assert!(
+        find(&raw[since..], b"scan failed").is_none()
+            && find(&raw[since..], b"head inspection failed").is_none(),
+        "no failure notice on the way out"
+    );
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}
+
+/// Phase 14 D through the binary: the config file edited mid-scene to add a watched folder
+/// and `R` pressed: the folder is a root on the nav, the accept made before the reload is
+/// still in its ledger, and the status line says what changed. Then an invalid file and
+/// `R` again: the refusal is on the status line and a key only the running file binds (`x`,
+/// a second `refresh` key) still works. `?` lists `R`.
+#[test]
+fn pty_reload_adds_a_root_keeps_an_accept_and_refuses_a_broken_file() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let base = fixture_parent::config_toml(&fx.parent);
+    let keys = "[keys]\nrefresh = [\"r\", \"x\"]\n";
+    std::fs::write(&fx.config, format!("{base}{keys}")).expect("config written");
+    let scratch = fx.parent.join("scratch");
+    std::fs::create_dir_all(&scratch).expect("scratch folder");
+    std::fs::write(scratch.join("s1.md"), "a draft the reload brings in\n").expect("s1.md");
+
+    let Some(mut pty) = fx.spawn_tui(&bin()) else {
+        return;
+    };
+    wait_first_piles(&mut pty);
+    wait_watching(&mut pty);
+    assert!(
+        !pty.screen_text().contains("scratch"),
+        "not a root before the reload"
+    );
+
+    // An accept before the reload.
+    select_until(&mut pty, "n2.md  M ");
+    pty.send(b"A").expect("A");
+    pty.wait_for(OVERLOADED, |s| status_is(s, "accepted n2.md"))
+        .unwrap_or_else(|e| panic!("the accept: {e}\n{}", pty.screen_text()));
+    let (notes_dir, _) = fx.ledger_in("notes");
+    let notes_ledger = std::fs::read(notes_dir.join("ledger.json")).expect("notes ledger");
+    assert_eq!(undo_depth(&fx, "notes"), 1);
+
+    // The second watched folder, and `R`.
+    let edited = base.replace(
+        "draft_dirs = [\"notes\"]",
+        "draft_dirs = [\"notes\", \"scratch\"]",
+    );
+    assert_ne!(edited, base, "the fixture's draft_dirs line");
+    std::fs::write(&fx.config, format!("{edited}{keys}")).expect("config edited");
+    let t = Instant::now();
+    pty.send(b"R").expect("R");
+    pty.wait_for(LONG, |s| {
+        let text = s.contents();
+        text.contains("config reloaded: 1 root added") && text.contains("W/scratch")
+    })
+    .unwrap_or_else(|e| panic!("the reload: {e}\n{}", pty.screen_text()));
+    let reloaded = t.elapsed();
+    let line = pty
+        .screen_text()
+        .lines()
+        .last()
+        .unwrap_or_default()
+        .trim_end()
+        .to_owned();
+    pty.wait_for(Duration::from_secs(5), |s| {
+        s.contents().contains("4 repos · ")
+    })
+    .unwrap_or_else(|e| panic!("four roots: {e}\n{}", pty.screen_text()));
+    assert_eq!(
+        std::fs::read(notes_dir.join("ledger.json")).expect("notes ledger"),
+        notes_ledger,
+        "the reload wrote no ledger"
+    );
+    assert!(
+        pty.screen_text().contains("nothing pending in W/notes"),
+        "the accept survives:\n{}",
+        pty.screen_text()
+    );
+
+    // A broken file: refused, and the running keymap still answers `x`.
+    std::fs::write(&fx.config, format!("{edited}{keys}this is not toml\n")).expect("broken");
+    pty.send(b"R").expect("R");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        s.contents().contains("config not reloaded: ")
+    })
+    .unwrap_or_else(|e| panic!("the refusal: {e}\n{}", pty.screen_text()));
+    let refusal = pty
+        .screen_text()
+        .lines()
+        .last()
+        .unwrap_or_default()
+        .trim_end()
+        .to_owned();
+    pty.send(b"x").expect("x");
+    pty.wait_for(OVERLOADED, |s| status_is(s, "refreshed"))
+        .unwrap_or_else(|e| panic!("`x` still refreshes: {e}\n{}", pty.screen_text()));
+    assert!(pty.screen_text().contains("W/scratch"), "the root stays");
+
+    // `?` lists `R`.
+    pty.send(b"?").expect("?");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        let (_, cols) = s.size();
+        s.rows(0, cols)
+            .any(|r| r.contains("reload the config file") && r.contains('R'))
+    })
+    .unwrap_or_else(|e| panic!("the help row: {e}\n{}", pty.screen_text()));
+    note(&format!(
+        "PTY D reload: {line:?} after {reloaded:.3?}; then {refusal:?}; `x` still refreshes"
+    ));
+    pty.send(b"\x1b").expect("esc");
+    std::thread::sleep(Duration::from_millis(50));
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}
+
+/// Phase 14 B through the real binary: content already accepted on another branch folds
+/// into `[seen] N files`, and the fold opens, splits, closes, accepts and undoes. The
+/// "agent" works mid-run: `run-1` commits three files, the person accepts them one by one,
+/// then `main` → a fresh `feat-x` cherry-picks the run. The walk: `e` opens the group, a
+/// member's diff is an ordinary row's, `m` on it splits it out (its own row, the group one
+/// shorter), `e` on another member closes the group and selects it, `A` accepts the rest,
+/// `z` puts them back.
+#[test]
+fn pty_seen_group_cherry_pick_expand_flag_accept_undo() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let Some(mut pty) = fx.spawn_tui(&bin()) else {
+        return;
+    };
+    wait_first_piles(&mut pty);
+    let repo = fx.repo("alpha");
+    let names = ["s/a.rs", "s/b.rs", "s/c.rs"];
+
+    // The run: three committed files on `run-1`, accepted there one at a time.
+    repo.checkout_b("run-1").unwrap();
+    for (i, name) in names.iter().enumerate() {
+        repo.write(name, format!("fn run_{i}() {{}}\n"));
+    }
+    let mut add = vec!["add", "--"];
+    add.extend(names);
+    repo.git(&add).unwrap();
+    repo.git(&["commit", "-q", "-m", "run-1 work"]).unwrap();
+    pty.wait_for(OVERLOADED, |s| {
+        let t = s.contents();
+        t.contains("run-1 · 6 files") && t.contains("A c.rs")
+    })
+    .unwrap_or_else(|e| panic!("the run's rows: {e}\n{}", pty.screen_text()));
+    for name in names {
+        select_until(&mut pty, &format!("{name}  A "));
+        pty.send(b"A").expect("A");
+        let want = format!("accepted {name}");
+        pty.wait_for(OVERLOADED, move |s| status_is(s, &want))
+            .unwrap_or_else(|e| panic!("accept {name}: {e}\n{}", pty.screen_text()));
+    }
+    pty.wait_for(OVERLOADED, |s| s.contents().contains("run-1 · 3 files"))
+        .unwrap_or_else(|e| panic!("run-1 reviewed: {e}\n{}", pty.screen_text()));
+
+    // Back on `main`, then a fresh `feat-x` cherry-picks the run.
+    repo.checkout("main").unwrap();
+    pty.wait_for(OVERLOADED, |s| s.contents().contains("main · 3 files"))
+        .unwrap_or_else(|e| panic!("back on main: {e}\n{}", pty.screen_text()));
+    repo.checkout_b("feat-x").unwrap();
+    pty.wait_for(OVERLOADED, |s| s.contents().contains("feat-x · 3 files"))
+        .unwrap_or_else(|e| panic!("feat-x: {e}\n{}", pty.screen_text()));
+    let t = Instant::now();
+    repo.git(&["cherry-pick", "main..run-1"]).unwrap();
+    pty.wait_for(OVERLOADED, |s| {
+        let t = s.contents();
+        t.contains("feat-x · 6 files") && t.contains("[seen] 3 files") && !t.contains("A a.rs")
+    })
+    .unwrap_or_else(|e| panic!("the fold: {e}\n{}", pty.screen_text()));
+    note(&format!(
+        "PTY seen: `[seen] 3 files` on the nav {:.3?} after the cherry-pick",
+        t.elapsed()
+    ));
+
+    // `e` on the group opens it: the members, indented, badged.
+    select_until(&mut pty, "3 files, content accepted on run-1");
+    pty.send(b"e").expect("e");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        let t = s.contents();
+        ["a.rs", "b.rs", "c.rs"]
+            .iter()
+            .all(|n| t.contains(&format!("    A {n}  +1 −0  [seen]")))
+    })
+    .unwrap_or_else(|e| panic!("the open group: {e}\n{}", pty.screen_text()));
+    note(&format!(
+        "PTY seen open: {:?}",
+        pty.find_row(|r| r.contains("    A a.rs")).map(|r| {
+            pty.screen_text()
+                .lines()
+                .nth(r as usize)
+                .unwrap_or("")
+                .to_owned()
+        })
+    ));
+
+    // A member's diff is an ordinary row's, with the badge on its header.
+    pty.send(b"jj").expect("to b.rs");
+    nav_cursor_reaches(&mut pty, "A b.rs  +1 −0  [seen]", "jj");
+    pty.send(b"\r").expect("open");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        let t = s.contents();
+        t.contains("s/b.rs  A  +1 −0  [seen]") && t.contains("+fn run_1() {}")
+    })
+    .unwrap_or_else(|e| panic!("the member's diff: {e}\n{}", pty.screen_text()));
+
+    // `m` flags it: the rescan brings it back flagged, its own row, the group one shorter
+    // and still open.
+    pty.send(b"m").expect("m");
+    pty.wait_for(Duration::from_secs(5), |s| s.contents().contains("⏎ send"))
+        .unwrap_or_else(|e| panic!("the note modal: {e}\n{}", pty.screen_text()));
+    pty.send(b"look at this one").expect("the note");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        s.contents().contains("look at this one")
+    })
+    .unwrap_or_else(|e| panic!("the note is echoed: {e}"));
+    pty.send(b"\r").expect("enter");
+    pty.wait_for(OVERLOADED, |s| {
+        let t = s.contents();
+        t.contains("[seen] 2 files")
+            && t.contains("    A a.rs  +1 −0  [seen]")
+            && t.contains("    A c.rs  +1 −0  [seen]")
+            && !t.contains("    A b.rs")
+    })
+    .unwrap_or_else(|e| panic!("the split: {e}\n{}", pty.screen_text()));
+    note(&format!(
+        "PTY seen split: {:?}",
+        pty.find_row(|r| r.contains("[seen] 2 files")).map(|r| {
+            pty.screen_text()
+                .lines()
+                .nth(r as usize)
+                .unwrap_or("")
+                .to_owned()
+        })
+    ));
+
+    // `e` on a member closes the group and selects it.
+    select_until(&mut pty, "s/a.rs  A ");
+    pty.send(b"e").expect("e on a member");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        let t = s.contents();
+        t.contains("2 files, content accepted on run-1") && !t.contains("    A a.rs")
+    })
+    .unwrap_or_else(|e| panic!("the close: {e}\n{}", pty.screen_text()));
+    nav_cursor_reaches(&mut pty, "[seen] 2 files", "e on a member");
+
+    // `A` accepts the group; `z` puts it back.
+    pty.send(b"A").expect("A");
+    pty.wait_for(OVERLOADED, |s| {
+        // The nav's group line, not the status (which says `[seen] 2 files` too).
+        status_is(s, "accepted [seen] 2 files") && !s.contents().contains("│  [seen] 2 files")
+    })
+    .unwrap_or_else(|e| panic!("the group accept: {e}\n{}", pty.screen_text()));
+    assert!(
+        pty.screen_text().contains("feat-x · 4 files"),
+        "the flagged file stays:\n{}",
+        pty.screen_text()
+    );
+    pty.send(b"z").expect("z");
+    pty.wait_for(OVERLOADED, |s| {
+        status_is(s, "undid accept of 2 files in alpha")
+            && s.contents().contains("│  [seen] 2 files")
+    })
+    .unwrap_or_else(|e| panic!("the undo: {e}\n{}", pty.screen_text()));
+    note("PTY seen: A accepted [seen] 2 files; z undid accept of 2 files in alpha");
 
     let since = pty.raw().len();
     pty.send(b"q").expect("q");

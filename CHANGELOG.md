@@ -5,6 +5,65 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html). A version's s
 exactly what its GitHub release notes carry, so it is written for the people installing the
 binary rather than for the commit log.
 
+## Unreleased
+
+### Added
+
+- `include_gitignored` in `config.toml`: gitignored files you want reviewed after all, as
+  patterns in `.gitignore` grammar (`include_gitignored = ["z_ignore_*"]`). A matching file is
+  an ordinary row under its repository, at any depth, with no badge; a file inside an
+  ignored folder stays unlisted, because git never looks there (name the folder itself,
+  `"z_ignore/"`, to review what is in it). Removing an entry later hides nothing: a file
+  you accepted under it still shows a later change or its deletion until you accept that.
+- `skip_globs` in `config.toml`: paths the list leaves out, as globs relative to the
+  parent directory (`skip_globs = ["*/z_ignore/**/evals/**"]`). A repository that matches is
+  never listed and never opened, so a folder full of cloned repositories costs nothing at
+  launch, and a file or repository that matches inside a watched folder is not reviewed. It
+  never reaches a listed repository's own files, and a parent directory or the directory
+  you launched in is never skipped.
+- `R` reads the config file again and applies it without a restart: key bindings,
+  patterns, `[ui]` values you changed in the file, and the list of repositories and watched
+  folders. A file that does not load is refused with the reason on the status line and the
+  running settings kept; nothing you accepted is touched either way. `[herdr]` and
+  `[update]` still apply at the next launch, and the status line says so. Rebind it with
+  `reload` under `[keys]`.
+- Work you already reviewed on another branch no longer comes back as a pile of rows. When
+  a cherry-pick, a rebase or a squash-merge brings files whose content is exactly what you
+  accepted on another branch of the same repository, they fold into one row,
+  `[seen] N files`; selecting it names the branches and lists the files. `e` opens it and
+  each file is an ordinary row again, badged `[seen]`, to open, flag or restore. A file you
+  edit or flag afterwards leaves the group for its own row. `A` accepts the group, `z` puts
+  it back, and `lastcall status` still lists every file (`status --json` adds `seen_on` to
+  each row and a `seen` group).
+- The mouse copies any text in the right pane, not only diff lines: drag across a
+  repository's path, its file list or a group's files, and the release puts those lines on
+  the clipboard. Inside a herdr pane, where the terminal's own selection does not reach,
+  that is how you copy. `v` and `y` work there too, and `y` on a repository or group row
+  copies its whole pane. Outside herdr, `shift` and drag is still your terminal's own
+  selection.
+
+### Changed
+
+- Breaking: the key `ignore_globs` is now `watch_ignore_globs`, with the same default and
+  the same meaning. A `config.toml` that still says `ignore_globs` is refused at launch and
+  on `R`, with the new name in the message: rename the line. `lastcall config --json`
+  prints the key under its new name too (`include_gitignored`, new in this release, is
+  printed under its name as well).
+- The row that groups files arriving from a fetch now reads `[upstream] N files`, bracketed
+  like the `[upstream]` badge its files carry, so it can no longer be mistaken for the
+  branch line above it; `lastcall status` prints both group rows the same way, and says
+  `1 file` where it used to say `1 files`.
+
+### Fixed
+
+- A removed worktree now leaves the list at once, whether it was removed with `git worktree
+  remove` or by deleting the folder, instead of showing an error for up to thirty seconds.
+  An accept aimed at it in that moment is refused with `folder removed` and changes nothing.
+- A repository sitting inside a listed one when lastcall starts (a clone in an untracked
+  folder, say) is now on the screen from the start, badged, watched and kept up to date,
+  not only when it appears while the screen is open. Pressing `r` no longer hides one it
+  finds either.
+
 ## 0.5.0 - 2026-09-20
 
 ### Added

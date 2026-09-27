@@ -1,0 +1,28 @@
+---
+source: crates/lastcall/tests/test_e2e_tui_snapshots.rs
+expression: frame
+---
+"lastcall  3 repos · 11 files · 13 hunks  standalone  [Accept All]     watching W"
+"┌──────────────────────────┬───────────────────────────────────────────────────┐"
+"│alpha                     │5 files, content accepted on run-1                 │"
+"│  feat-x · 8 files        │  s/a.rs  run-1                                    │"
+"│  M f1  +1 −1             │  s/b.rs  run-1                                    │"
+"│  M f2  +1 −0             │  s/c.rs  run-1                                    │"
+"│  M parse.rs  +10 −2      │  s/d.rs  run-1                                    │"
+"│  [seen] 5 files          │  s/e.rs  run-1                                    │"
+"│──────────────────────────│                                                   │"
+"│beta                      │                                                   │"
+"│  main · 2 files          │                                                   │"
+"│  A u1  +1 −0  [upstream] │                                                   │"
+"│  A u2  +2 −0  [mixed]    │                                                   │"
+"│  [upstream] 1 file       │                                                   │"
+"│──────────────────────────│                                                   │"
+"│W/notes                   │                                                   │"
+"│  draft · 1 file          │                                                   │"
+"│  M n2.md  +2 −0          │                                                   │"
+"│                          │                                                   │"
+"│                          │                                                   │"
+"│                          │                                                   │"
+"│                          │                                                   │"
+"└──────────────────────────┴───────────────────────────────────────────────────┘"
+"↑↓ select  ⏎ open  A accept group  e expand  t hide empty  ? help  q quit       "

@@ -428,3 +428,212 @@ fn scenario_a8_two_hunk_flags_on_one_file_survive_accept_all() {
     // The captured text is what was on screen, not a re-derivation from a moved file.
     assert!(over.flags[0].hunk.as_ref().unwrap().text.contains("A1"));
 }
+
+// ---------------------------------------------------------------------------------------
+// A9 — `skip_globs` keeps repositories and watched-folder files out (Amendment v1.15,
+// Phase 14 deliverable E).
+// ---------------------------------------------------------------------------------------
+
+mod a9 {
+    use std::path::{Path, PathBuf};
+
+    use lastcall_engine::config::{Config, DraftInitial};
+    use lastcall_engine::engine::Engine;
+    use lastcall_engine::roots::Badge;
+    use lastcall_engine::status::StatusReport;
+    use lastcall_engine::store::RootKind;
+    use lastcall_testkit::engine::open_engine;
+    use lastcall_testkit::fixture_repo::FixtureRepo;
+    use lastcall_testkit::tmp::TempDir;
+
+    /// `W/r`: a tracked `t.rs`, a gitignored `z_ignore/` watched with its whole tree,
+    /// holding `notes.md`, `evals/run.log` and two clones `evals/c1`, `evals/c2`.
+    struct A9 {
+        repo: FixtureRepo,
+        state: TempDir,
+        w: PathBuf,
+        r: PathBuf,
+    }
+
+    impl A9 {
+        fn new() -> Self {
+            let mut repo = FixtureRepo::new("r").unwrap();
+            repo.commit_files(&[("t.rs", "t\n"), (".gitignore", "z_ignore/\n")], "t")
+                .unwrap();
+            repo.write("z_ignore/notes.md", "notes\n");
+            repo.write("z_ignore/evals/run.log", "log\n");
+            for clone in ["c1", "c2"] {
+                Self::clone_into(&repo, &format!("z_ignore/evals/{clone}"));
+            }
+            let w = std::fs::canonicalize(repo.parent_dir()).unwrap();
+            let r = std::fs::canonicalize(repo.path()).unwrap();
+            Self {
+                repo,
+                state: TempDir::new("lc-a9-state"),
+                w,
+                r,
+            }
+        }
+
+        fn clone_into(repo: &FixtureRepo, rel: &str) {
+            repo.git(&["init", "-q", rel]).unwrap();
+            let at = repo.path().join(rel);
+            repo.write(&format!("{rel}/x"), "x\n");
+            repo.git_at(&at, &["add", "x"]).unwrap();
+            repo.git_at(&at, &["commit", "-qm", "x"]).unwrap();
+        }
+
+        fn config(skip: &[&str]) -> Config {
+            Config {
+                draft_dirs: vec!["z_ignore/**".to_owned()],
+                draft_initial: DraftInitial::Pending,
+                skip_globs: skip.iter().map(|s| (*s).to_owned()).collect(),
+                ..Config::default()
+            }
+        }
+
+        /// Open with `parent_dirs = [parent]`, launched from `W` so `r` is no launch
+        /// directory, and let discovery take in what the first scans report.
+        fn open(&self, parent: &Path, skip: &[&str]) -> Engine {
+            let env = self.repo.engine_env(self.state.path()).with_cwd(&self.w);
+            let mut engine = open_engine(parent, &env, self.state.path(), Self::config(skip));
+            settle(&mut engine);
+            engine
+        }
+
+        fn at(&self, rel: &str) -> PathBuf {
+            self.r.join(rel)
+        }
+    }
+
+    /// Scan until discovery stops changing (a nested report promotes on the next pass).
+    fn settle(engine: &mut Engine) {
+        for _ in 0..3 {
+            engine.scan_all();
+        }
+    }
+
+    fn rows(engine: &mut Engine, root: &Path) -> Vec<String> {
+        let pile = engine.scan(root).unwrap();
+        let mut out: Vec<String> = pile
+            .rows
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.path).into_owned())
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// `status --json`'s roots, and each root's pending paths.
+    fn status(engine: &mut Engine) -> Vec<(String, Vec<String>)> {
+        let json = StatusReport::build(engine, None).unwrap().to_json();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        v["roots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|root| {
+                let mut paths: Vec<String> = root["pending"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|row| row["path"].as_str().unwrap().to_owned())
+                    .collect();
+                paths.sort();
+                (root["root"].as_str().unwrap().to_owned(), paths)
+            })
+            .collect()
+    }
+
+    fn s(p: &Path) -> String {
+        p.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn scenario_a9_skip_globs_keep_clones_and_their_files_out() {
+        let a = A9::new();
+        let (c1, c2, draft) = (
+            a.at("z_ignore/evals/c1"),
+            a.at("z_ignore/evals/c2"),
+            a.at("z_ignore"),
+        );
+
+        // Without the key: both clones are roots badged nested, and `run.log` is a row.
+        let mut e = a.open(&a.w, &[]);
+        assert_eq!(
+            e.root_paths(),
+            vec![a.r.clone(), draft.clone(), c1.clone(), c2.clone()]
+        );
+        for clone in [&c1, &c2] {
+            let badge = e.root(clone).unwrap().badge.clone();
+            assert!(
+                matches!(badge, Some(Badge::NestedIn(_))),
+                "{clone:?}: {badge:?}"
+            );
+        }
+        assert_eq!(e.root(&draft).unwrap().kind, RootKind::Draft);
+        assert_eq!(rows(&mut e, &draft), vec!["evals/run.log", "notes.md"]);
+        let stores: Vec<PathBuf> = [&c1, &c2]
+            .iter()
+            .map(|c| e.root(c).unwrap().paths.repo_dir.clone())
+            .collect();
+        drop(e);
+
+        // With the sponsor's line, at a restart.
+        a.repo.write("t.rs", "t edited\n");
+        let skip = ["*/z_ignore/**/evals/**"];
+        let mut e = a.open(&a.w, &skip);
+        assert_eq!(e.root_paths(), vec![a.r.clone(), draft.clone()]);
+        assert_eq!(
+            rows(&mut e, &draft),
+            vec!["notes.md"],
+            "run.log is not a row"
+        );
+        assert_eq!(
+            rows(&mut e, &a.r),
+            vec!["t.rs"],
+            "the key never reaches a listed repository's own files"
+        );
+        assert_eq!(
+            status(&mut e),
+            vec![
+                (s(&a.r), vec!["t.rs".to_owned()]),
+                (s(&draft), vec!["notes.md".to_owned()]),
+            ],
+            "status --json agrees"
+        );
+        for store in &stores {
+            assert!(store.is_dir(), "a skipped clone's state is kept: {store:?}");
+        }
+
+        // A clone created later under `evals/` is never promoted.
+        A9::clone_into(&a.repo, "z_ignore/evals/c3");
+        settle(&mut e);
+        e.rescan().unwrap();
+        assert_eq!(e.root_paths(), vec![a.r.clone(), draft.clone()]);
+        drop(e);
+
+        // Restart: identical.
+        let mut e = a.open(&a.w, &skip);
+        assert_eq!(e.root_paths(), vec![a.r.clone(), draft.clone()]);
+        assert_eq!(rows(&mut e, &draft), vec!["notes.md"]);
+        assert_eq!(rows(&mut e, &a.r), vec!["t.rs"]);
+        drop(e);
+
+        // `skip_globs = ["r"]` under `W`: a level-1 repository, skipped with everything in it.
+        let e = a.open(&a.w, &["r"]);
+        assert!(e.root_paths().is_empty(), "{:?}", e.root_paths());
+        drop(e);
+
+        // Under `parent_dirs = [W/r]` the entry itself is never skipped, and says so.
+        let e = a.open(&a.r, &["r"]);
+        assert!(e.root_paths().contains(&a.r), "{:?}", e.root_paths());
+        assert!(
+            e.notices()
+                .iter()
+                .any(|n| n.contains("skip_globs") && n.contains("ignored")),
+            "{:?}",
+            e.notices()
+        );
+    }
+}

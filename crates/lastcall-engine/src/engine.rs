@@ -31,6 +31,7 @@ use crate::ops::{self, FaultInjector, NoFault, Ops, OpsError, Outcome, Refused, 
 use crate::paths::{Layout, ParentId, ParentMeta, RepoPaths, RootId};
 use crate::roots::{self, Badge, DiscoverInputs, Discovery, RootsChanged};
 use crate::scan::{self, Entry, Pile, Row, ScanError, ScanInputs};
+use crate::seen::{self, SeenCache};
 use crate::store::{Current, DraftScope, ExcludedDir, RepoFacts, RootKind, Store, StoreError};
 use crate::upstream::{self, Classifier};
 
@@ -76,6 +77,12 @@ pub enum EngineError {
     /// row); this is the engine-side guard behind that.
     #[error("{path} is binary; there is no text expansion")]
     BinaryRow { root: PathBuf, path: String },
+    /// The root's directory is no longer there (Phase 14 C): a linked worktree removed, a
+    /// folder moved away or put in the trash. Not a failed scan: nothing is spawned against
+    /// the missing path, the root is not marked unscannable, and the answer is a discovery
+    /// pass, which no longer finds it. Its state on disk is kept.
+    #[error("{}: folder removed", .0.display())]
+    RootGone(PathBuf),
 }
 
 fn io_err(path: &Path, source: std::io::Error) -> EngineError {
@@ -216,6 +223,8 @@ pub struct RootState {
     pub tree: TreeEntries,
     pub head: HeadState,
     pub classifier: Classifier,
+    /// Parked trees listed for the seen-on-another-branch marks (Phase 14 B, `seen.rs`).
+    pub seen_cache: SeenCache,
     pub case_insensitive: bool,
     /// Root-relative folders inside this root that another root looks after (their files
     /// are theirs), with whether the whole tree below each belongs there.
@@ -588,9 +597,15 @@ pub struct Engine {
     discovery: Discovery,
     collapsed: GlobSet,
     ignore: GlobSet,
+    /// `skip_globs` (Amendment v1.15), for a watched folder's scan; discovery reads the
+    /// config's list itself.
+    skip: GlobSet,
     /// Engine-level notices (config resolution, discovery).
     notices: Vec<String>,
     pending_nested: Vec<(PathBuf, PathBuf)>,
+    /// What the discovery passes inside [`Engine::scan_all_with`] changed, merged, until
+    /// [`Engine::take_roots_changed`] drains it.
+    pending_roots_changed: RootsChanged,
     /// How many times discovery re-ran after open (a budget probe for tests).
     discovery_runs: u64,
     git_version: String,
@@ -632,7 +647,8 @@ impl Engine {
         let layout = Layout::new(&loaded.state_dir);
         std::fs::create_dir_all(layout.roots_dir()).map_err(|e| io_err(&layout.roots_dir(), e))?;
         let collapsed = build_globs(&loaded.config.collapsed_globs);
-        let ignore = build_globs(&loaded.config.ignore_globs);
+        let ignore = build_globs(&loaded.config.watch_ignore_globs);
+        let skip = crate::config::skip_set(&loaded.config.skip_globs);
         let mut engine = Engine {
             env: env.clone(),
             config: loaded.config.clone(),
@@ -643,8 +659,10 @@ impl Engine {
             discovery: Discovery::default(),
             collapsed,
             ignore,
+            skip,
             notices: resolved.notices.clone(),
             pending_nested: Vec::new(),
+            pending_roots_changed: RootsChanged::default(),
             discovery_runs: 0,
             git_version,
             home_shown: env
@@ -692,7 +710,7 @@ impl Engine {
         &self.git_version
     }
 
-    pub fn ignore_globs(&self) -> &GlobSet {
+    pub fn watch_ignore_globs(&self) -> &GlobSet {
         &self.ignore
     }
 
@@ -725,6 +743,17 @@ impl Engine {
         self.discovery_runs
     }
 
+    /// Drain the roots the discovery passes inside [`Engine::scan_all_with`] added or
+    /// removed since the last call.
+    ///
+    /// Those passes open and scan what they find, so [`Engine::rescan`] diffs against a
+    /// discovery that already has it: without this, a repository promoted during the
+    /// launch scan would reach no consumer (Phase 14 H). The watcher drains it under the
+    /// same lock as the `scan_all` that filled it; `reload` is always `false`.
+    pub fn take_roots_changed(&mut self) -> RootsChanged {
+        std::mem::take(&mut self.pending_roots_changed)
+    }
+
     /// Change how many folders below each parent dir the next discovery pass reads
     /// (Amendment v1.11, deliverable 8). The value the first-launch tour's depth card
     /// applies for the session, whether or not it could write it to the config file.
@@ -736,6 +765,39 @@ impl Engine {
     /// not a panic in the middle of a keystroke.
     pub fn set_search_depth(&mut self, depth: u8) {
         self.config.search_depth = depth.clamp(1, crate::config::MAX_SEARCH_DEPTH);
+    }
+
+    /// Apply a config file read again while running (`R`, Phase 14 D, Amendment v1.15).
+    ///
+    /// Replaces the config and the resolved parent dirs, rebuilds the `collapsed_globs`,
+    /// `watch_ignore_globs` and `skip_globs` sets and hands every open repository its new
+    /// `include_gitignored` patterns. Every `RootState` and every ledger is kept: nothing here
+    /// opens, closes or scans a root. The roots a new `parent_dirs`, `draft_dirs`,
+    /// `search_depth` or `skip_globs` implies land on the next [`Engine::rescan`], which the
+    /// caller asks the watcher for (`RescanTrigger::request_reload`), so this setter lands
+    /// first, the way [`Engine::set_search_depth`] does. A scan already running holds its
+    /// own `ScanCtx` clone and finishes under the old sets; the next one uses these.
+    ///
+    /// The environment, the state directory and the layout are the launch's and are never
+    /// replaced: `loaded.state_dir` is ignored. A `draft_initial` change reaches roots opened
+    /// from now on; an open root is never first-sighted again.
+    pub fn reload(&mut self, loaded: &Loaded, resolved: &Resolved) {
+        self.config = loaded.config.clone();
+        self.resolved = resolved.clone();
+        self.collapsed = build_globs(&self.config.collapsed_globs);
+        self.ignore = build_globs(&self.config.watch_ignore_globs);
+        self.skip = crate::config::skip_set(&self.config.skip_globs);
+        for n in &resolved.notices {
+            if !self.notices.contains(n) {
+                self.notices.push(n.clone());
+            }
+        }
+        for root in self.roots.values_mut() {
+            if root.kind == RootKind::Git {
+                root.index
+                    .set_include_gitignored(self.config.include_gitignored.clone());
+            }
+        }
     }
 
     /// How many folders below each parent dir discovery currently reads.
@@ -779,8 +841,22 @@ impl Engine {
             search_depth: self.config.search_depth,
             collapse_size_bytes: self.config.collapse_size_bytes,
             draft_dir_parents: self.config.draft_dir_parents,
+            skip_globs: &self.config.skip_globs,
         });
-        let changed = roots::diff(&self.discovery, &next);
+        let mut changed = roots::diff(&self.discovery, &next);
+        // Phase 14 D (design review F5): a root that discovery now files under another
+        // parent dir is a new root in the state layout (§6.1), so it is closed here and
+        // opened below under the new parent, first-sighted there, its old record left where
+        // it was. It is reported as removed and added, so every consumer drops the old view
+        // before it takes the new one; a reload and the next launch agree on it.
+        for d in &next.roots {
+            if let Some(prev) = self.discovery.get(&d.path)
+                && prev.parent != d.parent
+            {
+                changed.removed.push(d.path.clone());
+                changed.added.push(d.path.clone());
+            }
+        }
         for n in &next.notices {
             if !self.notices.contains(n) {
                 self.notices.push(n.clone());
@@ -870,6 +946,7 @@ impl Engine {
             layout: &self.layout,
             clock: self.options.clock.as_ref(),
             draft_initial: self.config.draft_initial,
+            include_gitignored: &self.config.include_gitignored,
         }
     }
 
@@ -889,6 +966,8 @@ struct OpenCtx<'a> {
     layout: &'a Layout,
     clock: &'a (dyn Clock + Send + Sync),
     draft_initial: DraftInitial,
+    /// `include_gitignored` (Amendment v1.15), handed to a git root's private index.
+    include_gitignored: &'a [String],
 }
 
 fn open_root_with(ctx: &OpenCtx<'_>, d: &roots::DiscoveredRoot) -> Result<RootState, EngineError> {
@@ -925,7 +1004,20 @@ fn open_root_with(ctx: &OpenCtx<'_>, d: &roots::DiscoveredRoot) -> Result<RootSt
     let (store, store_notices) = Store::open(ctx.env, &d.path, d.kind, &paths, facts.as_ref())?;
     notices.extend(store_notices);
     let exclude_from = git_paths.get(2).cloned();
-    let index = PrivateIndex::new(store.git().clone(), &paths, d.kind, exclude_from);
+    // `include_gitignored` reaches git roots only: a watched folder's listing never applied
+    // the user's ignore files, so there is nothing there to re-include.
+    let include_gitignored = if d.kind == RootKind::Git {
+        ctx.include_gitignored.to_vec()
+    } else {
+        Vec::new()
+    };
+    let index = PrivateIndex::new(
+        store.git().clone(),
+        &paths,
+        d.kind,
+        exclude_from,
+        include_gitignored,
+    );
     let user_email = repo_config
         .get("user.email")
         .filter(|e| !e.is_empty())
@@ -1074,6 +1166,7 @@ fn open_root_with(ctx: &OpenCtx<'_>, d: &roots::DiscoveredRoot) -> Result<RootSt
         tree,
         head,
         classifier: Classifier::default(),
+        seen_cache: SeenCache::default(),
         excluded_dirs: d.excluded_dirs.clone(),
         notices,
         last_pile: None,
@@ -1100,6 +1193,8 @@ fn open_root_with(ctx: &OpenCtx<'_>, d: &roots::DiscoveredRoot) -> Result<RootSt
 /// by reference across the scan pool; nothing in it is mutated there.
 struct ScanCtx {
     collapsed: GlobSet,
+    /// `skip_globs`, for a watched folder's candidates (empty: nothing is skipped).
+    skip: GlobSet,
     collapse_size_bytes: u64,
     row_cap: usize,
     /// The engine's injected wall clock, read once per `scan_all` so every root in one
@@ -1164,8 +1259,20 @@ fn scan_root(state: &mut RootState, ctx: &ScanCtx) -> Result<Pile, EngineError> 
             Err(e) if !last && moved_under_this_scan(&e) => attempt += 1,
             // On exhaustion `LedgerMoved` is the answer; `IndexMoved` cannot reach here,
             // because the last attempt keeps its pile and reports a notice instead.
-            other => return other,
+            other => return other.map_err(|e| gone_or(&state.path, e)),
         }
+    }
+}
+
+/// Phase 14 C: an error from a scan or a head inspection, re-checked against the root's
+/// directory. A folder removed while git was running in it fails with git's own `fatal:`
+/// or a spawn error; that is the folder leaving, not a scan that failed, so it is reported
+/// as [`EngineError::RootGone`] and the caller asks for discovery.
+fn gone_or(root: &Path, e: EngineError) -> EngineError {
+    match e {
+        EngineError::RootGone(_) => e,
+        _ if !root.is_dir() => EngineError::RootGone(root.to_path_buf()),
+        _ => e,
     }
 }
 
@@ -1174,6 +1281,12 @@ fn scan_root_once(
     ctx: &ScanCtx,
     retry_on_reseed: bool,
 ) -> Result<Pile, EngineError> {
+    // Phase 14 C: one `metadata` call before anything else, so a root whose directory is
+    // gone spawns no git (every runner uses it as the cwd) and adopts no branch switch
+    // from a `HEAD` its admin dir still holds (`sync_branch` would write the ledger).
+    if !state.path.is_dir() {
+        return Err(EngineError::RootGone(state.path.clone()));
+    }
     state.reload_ledger_if_changed();
     // R1: which record is in force, before a single baseline is read. A scan that arrives
     // on file events alone, with no head inspection behind it, still sees the switch.
@@ -1205,6 +1318,17 @@ fn scan_root_once(
     }
     #[cfg(test)]
     SCAN_ROOT_HOOK.with(|h| h.fire(()));
+    // A watched folder's `skip_globs` test is anchored at the parent dir it is filed
+    // under, the same path discovery matched; a repository's own files are never skipped.
+    let skip_prefix: Vec<u8> = state
+        .path
+        .strip_prefix(&state.parent)
+        .map(|rel| rel.as_os_str().as_bytes().to_vec())
+        .unwrap_or_default();
+    let skip = (state.kind == RootKind::Draft && !ctx.skip.is_empty()).then(|| scan::DraftSkip {
+        globs: &ctx.skip,
+        prefix: &skip_prefix,
+    });
     let out = scan::scan(&ScanInputs {
         store: &state.store,
         index: &state.index,
@@ -1220,6 +1344,7 @@ fn scan_root_once(
         index_tmp: &state.paths.index_tmp,
         row_cap: ctx.row_cap,
         retry_on_reseed,
+        skip,
     })?;
     let mut pile = out.pile;
     // The two per-root ledger facts the reducer may never read for itself (design review
@@ -1263,6 +1388,25 @@ fn scan_root_once(
         if let Some(n) = skipped {
             pile.notices.push(n);
         }
+        // Phase 14 B: after upstream, so an upstream or mixed row is never marked seen. A
+        // parked tree the store no longer holds lists as empty (nothing matches, nothing
+        // is hidden); any other failure is a notice and a pile with no seen marks.
+        let store = &state.store;
+        if let Err(e) = seen::mark(
+            &mut pile,
+            &state.ledger,
+            store.filemode(),
+            &mut state.seen_cache,
+            |t| {
+                if store.exists(t) {
+                    store.ls_tree(t)
+                } else {
+                    Ok(TreeEntries::new())
+                }
+            },
+        ) {
+            pile.notices.push(format!("seen annotation skipped: {e}"));
+        }
     }
     state.last_pile = Some(pile.clone());
     Ok(pile)
@@ -1272,6 +1416,7 @@ impl Engine {
     fn scan_ctx(&self) -> ScanCtx {
         ScanCtx {
             collapsed: self.collapsed.clone(),
+            skip: self.skip.clone(),
             collapse_size_bytes: self.config.collapse_size_bytes,
             row_cap: self.options.row_cap,
             now: self.options.clock.now(),
@@ -1367,8 +1512,14 @@ impl Engine {
                 break;
             }
             match self.rescan() {
-                Ok(changed) if !changed.added.is_empty() => continue,
-                _ => break,
+                Ok(changed) => {
+                    let added = !changed.added.is_empty();
+                    self.pending_roots_changed.merge(changed);
+                    if !added {
+                        break;
+                    }
+                }
+                Err(_) => break,
             }
         }
         let mut v: Vec<(PathBuf, u64, Result<Pile, EngineError>)> = results
@@ -1453,6 +1604,16 @@ impl Engine {
 
     /// Re-inspect HEAD; when it moved (or an operation finished), scan and describe it.
     pub fn inspect_head(&mut self, root: &Path) -> Result<Option<HeadChange>, EngineError> {
+        // Phase 14 C: first, before `sync_branch` (which spawns git with the root as its
+        // cwd and writes the ledger on a switch) and before `headstate::inspect`.
+        if !root.is_dir() {
+            return Err(EngineError::RootGone(root.to_path_buf()));
+        }
+        self.inspect_head_present(root)
+            .map_err(|e| gone_or(root, e))
+    }
+
+    fn inspect_head_present(&mut self, root: &Path) -> Result<Option<HeadChange>, EngineError> {
         let clock = self.options.clock.clone();
         let state = self
             .roots
@@ -1533,9 +1694,15 @@ impl Engine {
         req: AcceptRequest,
         fault: &dyn FaultInjector,
     ) -> Result<Accepted, EngineError> {
-        let result = {
-            let mut ops = self.ops(root)?;
-            match &req {
+        let result = match self.ops(root) {
+            // Phase 14 C: `ops` hands out nothing for a gone root; for an accept that is
+            // the refusal the preflight would have given, not an error.
+            Err(EngineError::RootGone(_)) => Ok(Outcome {
+                refused: vec![Refused::RootGone],
+                ..Default::default()
+            }),
+            Err(e) => return Err(e),
+            Ok(mut ops) => match &req {
                 AcceptRequest::Hunk {
                     rendered,
                     hunks,
@@ -1552,7 +1719,7 @@ impl Engine {
                     ops.accept_group(rows, rendered_on.as_deref(), fault)
                 }
                 AcceptRequest::All(pile) => ops.accept_all(pile, fault),
-            }
+            },
         };
         let outcome = match result {
             Ok(o) => o,
@@ -1564,6 +1731,25 @@ impl Engine {
                 return Err(EngineError::Ops(e));
             }
         };
+        // Phase 14 C: refused because the folder is gone, so nothing was written and a
+        // scan could only fail. The refusal is the answer the status line shows; the pile
+        // is the last one this root had, and discovery takes the row away.
+        if outcome
+            .refused
+            .iter()
+            .any(|r| matches!(r, Refused::RootGone))
+        {
+            let pile = self
+                .roots
+                .get(root)
+                .and_then(|s| s.last_pile.clone())
+                .unwrap_or_default();
+            return Ok(Accepted {
+                outcome,
+                seq: self.scan_seq,
+                pile,
+            });
+        }
         let pile = self.scan(root)?;
         Ok(Accepted {
             outcome,
@@ -1979,6 +2165,13 @@ impl Engine {
             .roots
             .get_mut(root)
             .ok_or_else(|| EngineError::NoSuchRoot(root.to_path_buf()))?;
+        // Phase 14 C, for every write and not only the accepts: a root whose directory is
+        // gone gets no `Ops` at all, so nothing (a flag, a snooze, a restore, an undo, a
+        // trim) can write its ledger, or a file into the missing folder, in the gap
+        // before discovery drops it.
+        if !state.path.is_dir() {
+            return Err(EngineError::RootGone(state.path.clone()));
+        }
         let case_insensitive = state.case_insensitive;
         // R5: the branch this op is staged under, and the `HEAD` file `commit` re-reads
         // under the lock to prove it is still in force.
@@ -4550,6 +4743,7 @@ pub(crate) mod tests {
             collapsed: Some(crate::scan::Collapsed::Glob),
             flags: Vec::new(),
             rename: None,
+            seen_on: Vec::new(),
         };
         let err = engine
             .hunks_of(Path::new("/nope/not/a/root"), &row)
@@ -4834,6 +5028,71 @@ pub(crate) mod tests {
         );
     }
 
+    /// Phase 14 H: a repository held untracked inside a listed one at launch (`r/evals/c1`)
+    /// is promoted by the discovery pass inside `scan_all`, and that pass's `RootsChanged`
+    /// is kept for [`Engine::take_roots_changed`] instead of being dropped, so the watcher
+    /// can announce it. Drained once; a `skip_globs` entry that covers the clone means it
+    /// is never promoted and so never announced.
+    #[test]
+    fn engine_scan_all_keeps_what_its_discovery_added_for_take_roots_changed() {
+        let clone_under = |repo: &FixtureRepo| {
+            let clone = repo.path().join("evals").join("c1");
+            std::fs::create_dir_all(&clone).unwrap();
+            repo.git_at(&clone, &["init", "-q", "-b", "main"]).unwrap();
+            std::fs::write(clone.join("x"), "x\n").unwrap();
+            repo.git_at(&clone, &["add", "x"]).unwrap();
+            repo.git_at(&clone, &["commit", "-qm", "x"]).unwrap();
+            std::fs::canonicalize(&clone).unwrap()
+        };
+
+        let repo = FixtureRepo::new("r").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let clone = clone_under(&repo);
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let r = only_root(&engine);
+        assert_eq!(engine.take_roots_changed(), RootsChanged::default());
+        let results = engine.scan_all();
+        assert!(
+            results
+                .iter()
+                .any(|(p, _, pile)| *p == clone && pile.is_ok()),
+            "the clone was promoted and scanned: {results:?}"
+        );
+        assert_eq!(engine.root_paths(), vec![r.clone(), clone.clone()]);
+        let changed = engine.take_roots_changed();
+        assert_eq!(changed.added, vec![clone.clone()], "{changed:?}");
+        assert!(changed.removed.is_empty(), "{changed:?}");
+        assert!(!changed.reload);
+        assert_eq!(
+            engine.take_roots_changed(),
+            RootsChanged::default(),
+            "drained by the first take"
+        );
+        engine.scan_all();
+        assert_eq!(
+            engine.take_roots_changed(),
+            RootsChanged::default(),
+            "a second scan_all finds nothing new"
+        );
+
+        // `skip_globs` composes: a skipped clone is never promoted, so never announced.
+        let repo = FixtureRepo::new("r").unwrap();
+        let state = TempDir::new("lc-eng-state");
+        clone_under(&repo);
+        let mut engine = open_engine(
+            &repo,
+            &state,
+            Config {
+                skip_globs: vec!["r/evals/**".to_owned()],
+                ..Config::default()
+            },
+        );
+        let r = only_root(&engine);
+        engine.scan_all();
+        assert_eq!(engine.root_paths(), vec![r]);
+        assert_eq!(engine.take_roots_changed(), RootsChanged::default());
+    }
+
     /// Deliverable 8: the depth the tour's card applies is a session setting the next
     /// discovery pass reads. The repository two folders down is invisible at the default
     /// depth, appears after `set_search_depth(2)` and one `rescan`, and the ledger of the
@@ -4898,6 +5157,172 @@ pub(crate) mod tests {
         engine.set_search_depth(1);
         engine.rescan().unwrap();
         assert_eq!(engine.root_paths(), vec![root]);
+    }
+
+    /// Phase 14 C: a linked worktree beside the fixture repository, opened and seen once,
+    /// with `f2` deleted in it so a pending deletion is on its pile. Returns the worktree's
+    /// canonical path and that deletion's rendered row; the directory is still there.
+    fn removed_root_fixture(name: &str) -> (FixtureRepo, TempDir, Engine, PathBuf, Rendered) {
+        let repo = FixtureRepo::new(name).unwrap();
+        let state = TempDir::new("lc-eng-state");
+        let wt = repo.parent_dir().join("wt");
+        repo.git(&["worktree", "add", "-q", "-b", "wt", wt.to_str().unwrap()])
+            .unwrap();
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let wt = std::fs::canonicalize(&wt).unwrap();
+        assert!(
+            engine.root_paths().contains(&wt),
+            "{:?}",
+            engine.root_paths()
+        );
+        assert!(engine.scan(&wt).unwrap().is_empty(), "first sight");
+        std::fs::remove_file(wt.join("f2")).unwrap();
+        let pile = engine.scan(&wt).unwrap();
+        let row = pile.row(b"f2").expect("the deletion is pending");
+        let rendered = Rendered::of(row);
+        assert!(rendered.oid.is_none(), "a deletion: {rendered:?}");
+        (repo, state, engine, wt, rendered)
+    }
+
+    /// Phase 14 C, the gap: the worktree's directory is gone but discovery has not run yet.
+    /// An accept of the pending **deletion** is the one that wrote the ledger before the
+    /// fix (the path is absent, which is what a deletion accept checks for), and the scan
+    /// after it then failed on the missing directory. Now it is refused as `folder
+    /// removed` before the write, no git runs, and there is no post-op scan.
+    #[test]
+    fn engine_accept_of_a_pending_deletion_in_a_removed_root_writes_nothing() {
+        let (_repo, _state, mut engine, wt, rendered) = removed_root_fixture("eng-gone-accept");
+        let ledger_path = engine.root(&wt).unwrap().paths.ledger.clone();
+        std::fs::remove_dir_all(&wt).unwrap();
+        let read = || std::fs::read(&ledger_path).map(|b| String::from_utf8_lossy(&b).into_owned());
+        let before = read().expect("the first sight wrote the ledger");
+        let spawns = crate::git::thread_spawn_count();
+        let result = engine.accept(&wt, AcceptRequest::File(rendered));
+        let spawned = crate::git::thread_spawn_count() - spawns;
+        assert_eq!(
+            read().unwrap(),
+            before,
+            "the ledger was written in the gap (accept returned {result:?})"
+        );
+        assert_eq!(spawned, 0, "no git against a missing directory");
+        let acc = result.expect("a refusal, not an error");
+        let refused: Vec<String> = acc.outcome.refused.iter().map(|r| r.to_string()).collect();
+        assert_eq!(refused, vec!["folder removed".to_owned()]);
+    }
+
+    /// Verification F5 (Phase 14 C, widened): every write goes through `Engine::ops`, and a
+    /// root whose directory is gone gets none, so a flag in the gap writes nothing either.
+    #[test]
+    fn engine_ops_of_a_removed_root_are_refused_before_any_write() {
+        let (_repo, _state, mut engine, wt, rendered) = removed_root_fixture("eng-gone-ops");
+        let ledger_path = engine.root(&wt).unwrap().paths.ledger.clone();
+        let before = std::fs::read(&ledger_path).expect("the first sight wrote the ledger");
+        std::fs::remove_dir_all(&wt).unwrap();
+        let spawns = crate::git::thread_spawn_count();
+        let err = engine.ops(&wt).err().expect("no `Ops` for a gone root");
+        assert!(
+            matches!(err, EngineError::RootGone(ref p) if *p == wt),
+            "{err}"
+        );
+        assert_eq!(crate::git::thread_spawn_count() - spawns, 0);
+        assert_eq!(std::fs::read(&ledger_path).unwrap(), before, "untouched");
+        let _ = rendered;
+    }
+
+    /// Phase 14 D: `Engine::reload` replaces the config and rebuilds the glob sets, keeps
+    /// every `RootState` (same ledger, same last pile, no discovery pass), and the next scan
+    /// uses the new sets: a path newly matching `collapsed_globs` is collapsed, and a
+    /// gitignored file newly matching `include_gitignored` is a row.
+    #[test]
+    fn engine_reload_keeps_every_root_and_the_next_scan_uses_the_new_sets() {
+        let repo = FixtureRepo::new("reload").unwrap();
+        let state = TempDir::new("lc-reload-state");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let r = only_root(&engine);
+        repo.write(".gitignore", "z_ignore_*\n");
+        repo.write("out.gen", "generated\n");
+        repo.write("z_ignore_notes.md", "mine\n");
+        let before = engine.scan(&r).unwrap();
+        let row = |pile: &Pile, p: &str| pile.rows.iter().find(|x| x.path == p.as_bytes()).cloned();
+        assert_eq!(row(&before, "out.gen").unwrap().collapsed, None);
+        assert!(row(&before, "z_ignore_notes.md").is_none());
+        let ledger = ledger_bytes(&engine, &r);
+        let runs = engine.discovery_runs();
+
+        let (mut loaded, resolved) = loaded_for(&repo, &state, Config::default());
+        loaded.config.collapsed_globs.push("*.gen".into());
+        loaded.config.include_gitignored.push("z_ignore_*".into());
+        loaded.config.watch_ignore_globs.push("scratch/**".into());
+        engine.reload(&loaded, &resolved);
+        assert_eq!(
+            engine.discovery_runs(),
+            runs,
+            "a reload runs no discovery itself"
+        );
+        assert_eq!(engine.root_paths(), vec![r.clone()]);
+        assert_eq!(
+            engine.root(&r).unwrap().last_pile.as_ref(),
+            Some(&before),
+            "the same RootState"
+        );
+        assert_eq!(ledger_bytes(&engine, &r), ledger, "no ledger written");
+        assert_eq!(engine.config(), &loaded.config);
+        assert!(engine.watch_ignore_globs().is_match("scratch/a"));
+
+        let after = engine.scan(&r).unwrap();
+        assert_eq!(
+            row(&after, "out.gen").unwrap().collapsed,
+            Some(crate::scan::Collapsed::Glob)
+        );
+        assert!(
+            row(&after, "z_ignore_notes.md").is_some(),
+            "{:?}",
+            after.rows
+        );
+    }
+
+    /// Phase 14 C: a scan and a head inspection of a root whose directory is gone spawn no
+    /// git and write nothing. The `rm -r` form leaves `.git/worktrees/wt` behind, and a
+    /// branch switch is made pending in its `HEAD`, so the test proves the `is_dir` check
+    /// comes before `sync_branch` (which would adopt the switch and write the ledger).
+    /// Discovery then drops the root and its state stays on disk.
+    #[test]
+    fn engine_scan_and_inspect_head_of_a_removed_root_spawn_nothing() {
+        let (repo, _state, mut engine, wt, _) = removed_root_fixture("eng-gone-scan");
+        repo.git(&["branch", "other"]).unwrap();
+        let ledger_path = engine.root(&wt).unwrap().paths.ledger.clone();
+        std::fs::remove_dir_all(&wt).unwrap();
+        let admin = repo.path().join(".git").join("worktrees").join("wt");
+        assert!(admin.is_dir(), "the rm -r form keeps the admin dir");
+        std::fs::write(admin.join("HEAD"), "ref: refs/heads/other\n").unwrap();
+        let read = || std::fs::read(&ledger_path).map(|b| String::from_utf8_lossy(&b).into_owned());
+        let before = read().unwrap();
+
+        let n = crate::git::thread_spawn_count();
+        let scan = engine.scan(&wt);
+        let scan_spawns = crate::git::thread_spawn_count() - n;
+        let n = crate::git::thread_spawn_count();
+        let head = engine.inspect_head(&wt);
+        let head_spawns = crate::git::thread_spawn_count() - n;
+        assert_eq!(read().unwrap(), before, "the ledger was written");
+        assert_eq!(
+            (scan_spawns, head_spawns),
+            (0, 0),
+            "git spawned against a missing directory: scan {scan:?}, inspect_head {head:?}"
+        );
+        assert!(
+            matches!(&scan, Err(EngineError::RootGone(p)) if *p == wt),
+            "{scan:?}"
+        );
+        assert!(
+            matches!(&head, Err(EngineError::RootGone(p)) if *p == wt),
+            "{head:?}"
+        );
+
+        let changed = engine.rescan().unwrap();
+        assert_eq!(changed.removed, vec![wt.clone()]);
+        assert!(!engine.root_paths().contains(&wt));
+        assert_eq!(read().unwrap(), before, "the record is kept on disk");
     }
 
     /// Out-of-range depths clamp rather than panic: the binary's callers are keystrokes.

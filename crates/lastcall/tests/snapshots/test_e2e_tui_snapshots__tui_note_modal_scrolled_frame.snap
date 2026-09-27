@@ -14,7 +14,7 @@ expression: frame
 "│  main · 2 files   ┌ flag hunk 1 of 1 ────────────────────────────────────────┐                   │"
 "│  A u1  +1 −0  [ups│ f1 · hunk 1 of 1                                         │                   │"
 "│  A u2  +2 −0  [mix│                                                          │                   │"
-"│  upstream · 1 file│ note line 3                                              │                   │"
+"│  [upstream] 1 file│ note line 3                                              │                   │"
 "│───────────────────│ note line 4                                              │                   │"
 "│W/notes            │ note line 5                                              │                   │"
 "│  draft · 1 file   │ note line 6                                              │                   │"

@@ -145,7 +145,7 @@ Refused by construction: `status`, `diff`, `add`, `update-index`, `checkout`, `s
 6. Row iff baseline ≠ current by oid or mode (D1); on `core.filemode=false` roots the executable bit is normalized away on both sides, so a mode-only row cannot appear there.
 7. Every baseline and current blob of every row fetched in **one** `cat-file --batch` (2,000 unseen files cost 16 git processes per scan, not 2,000); hunks from a byte diff of the two blobs (`hunks.rs`); binary (NUL in the first 8000 bytes) or ≥ `collapse_size_bytes` or matching `collapsed_globs` → collapsed (D7/D8). A blob the batch cannot produce renders that row without content and a notice.
 8. Conflict state from the user's `ls-files -u` (C4); the override's flag; rename pairing (D5) — presentation only, the ledger stores delete + add. The pairing reads the **pile's rows**: a temp index (`index.<pid>.tmp`, this process's own) holds exactly the `deleted` rows at their baselines (`read-tree --empty` + `update-index --index-info`), the `added` rows are `add -N`ed, then `diff -M -z --name-status`. It is not a copy of the private index — that is the seen tree, and a path the user accepted as deleted (override `null`, no row) or a deleted row whose baseline is an override blob would otherwise pair or score differently before and after a compaction that changes no baseline.
-9. Annotation (`upstream.rs`): heads = HEAD (+ `MERGE_HEAD`); range `seen_head..head` or from the merge-base; commits reachable from a remote ref by someone else are upstream; a pending path whose content equals a head's blob is `upstream`, touched upstream but different is `mixed`, otherwise plain. No merge-base, detached with no upstream, shallow, or no remotes → nothing annotated (C7).
+9. Annotation (`upstream.rs`): heads = HEAD (+ `MERGE_HEAD`); range `seen_head..head` or from the merge-base; commits reachable from a remote ref by someone else are upstream; a pending path whose content equals a head's blob is `upstream`, touched upstream but different is `mixed`, otherwise plain. No merge-base, detached with no upstream, shallow, or no remotes → nothing annotated (C7). Then the seen marks (`seen.rs`, Phase 14 B, Amendment v1.15): every row with a present current side and no annotation is compared with each **parked** record's composed baseline (an override blob with its mode, else that record's `seen_tree` entry; an absent or flag-only override never matches; the record in force is never compared), and an exact oid and mode match (filemode-normalized as in step 6) pushes that branch onto `row.seen_on`, sorted. `RootState.seen_cache` holds one `ls-tree -r` per (branch, parked tree oid) and is pruned to the records still parked at that tree before each call; with no candidate row nothing is listed. A parked tree the store no longer has lists as empty; a listing error takes back every mark and adds the notice `seen annotation skipped: …`. A branch deleted after its record was parked still matches until the next switch prunes the record (`prune_parked`). The marks never add or remove a row: `Row::folds_seen` (marked, current present, no annotation, no flag, no rename: either half of a rename pair stays a row) is what the TUI folds and `Pile::groups()` reports as the `seen` group, after the `upstream` one.
 10. Notices from every step ride along in `pile.notices`; nothing after step 6 removes a row.
 
 ## Many roots at once, many lastcalls at once (Phase 5)
@@ -359,6 +359,62 @@ the value the next `rescan` uses; it discovers nothing by itself. The TUI pairs 
 matters because a notify is coalesced: one that arrives first would be answered by a rescan
 still running at the old depth, and the set would then wait for the backstop.
 
+**Reloading the whole config (Phase 14 D, Amendment v1.15).** `Engine::reload(&Loaded,
+&Resolved)` is the general form of that setter: it replaces `config` and `resolved`,
+rebuilds the `collapsed`, `ignore` and `skip` sets, hands each git root's `PrivateIndex` the
+new `include_gitignored`, and adds the resolved notices; it keeps every `RootState` and every
+ledger and ignores `Loaded.state_dir` (the state directory is the launch environment's). A
+scan in flight holds its `ScanCtx` clone and finishes under the old sets. The TUI follows it
+with `RescanTrigger::request_reload`, which sets the loop's `reload` flag before the notify;
+the rescan block takes the flag, re-reads its `ignore` local from the engine (the watcher's
+routing uses it), reinstalls the watches only when roots moved (the watch set is a function
+of the roots), and emits `RootsChanged { reload: true, .. }` even when the diff is empty, so
+an edit to `watch_ignore_globs` or `[keys]` alone still reaches the TUI. When the reinstall a
+reload started ends with the same watched set, its `watching …` notice is not repeated.
+`Engine::rescan` treats a surviving path whose discovered `parent` changed as removed and
+added in the same pass: the old `RootState` is closed and the root opened (and
+first-sighted) under the new parent id, its old record left on disk, which is what a relaunch
+would do. Tests: `engine_reload_keeps_every_root_and_the_next_scan_uses_the_new_sets`
+(unit) and `test_integration_reload.rs` (parents re-pointed and back, an
+`watch_ignore_globs`-only reload with a real watch, a repository moved between parent entries).
+
+**`skip_globs`, decided before anything is read (Phase 14, Amendment v1.15).** `discover`
+builds one `Skip` per pass from `config::skip_set` (the `draft_dirs` grammar,
+`literal_separator(true)`) and asks it about every candidate directory **before** the `.git`
+probe: a level-1 child is dropped from `children` before `has_git_entry`/`record_git_root`,
+a level-2..N entry before the same pair (so a matching plain folder is never pushed on the
+walk stack), a scan's nested report before the promotion's `toplevel`, a `worktrees_inside`
+entry before it is inserted, and a watched folder before it is recorded; `matching_dirs`
+takes the same test as a predicate and neither returns nor enters a matching folder. A
+`retain` over the map before the badge pass is the backstop for whatever found a root. The
+path matched is the directory relative to `file_under(parents, dir)` (what
+`DiscoveredRoot.parent` will be), tried as `rel` and as `rel/` (which is what lets
+`evals/**` prune the folder `evals` itself) and then every folder above it below the parent
+the same two ways, so a pattern naming a folder drops a promoted nested repository or an
+inside worktree found under it as surely as the walk never enters it. A level-1 symlink is
+tested by its own name only; a pattern that names its target's folder catches it at the
+`retain` backstop, after one `rev-parse`. A parent dir whose every candidate was skipped
+gets one notice, `skip_globs: nothing left under <parent> (N skipped)`, so an empty screen
+says why. A directory that is or contains a parent entry or
+the canonical launch directory (`env.cwd()`) is protected: never skipped, and when a pattern
+would have matched it (its own name, or its path below the parent it is filed under) one
+deduplicated notice says the pattern was ignored for it. The spawn budget is the test:
+`roots_skip_globs_leave_a_matching_repository_unopened` asserts a tree with three skipped
+repositories costs exactly the `git::thread_spawn_count()` of the same tree without them.
+Inside a watched folder the scan gets a `DraftSkip { globs, prefix }` from `scan_root_once`
+(draft roots only, and only when the list is non-empty), where `prefix` is the folder's own
+path below `RootState.parent`; each candidate is matched as `prefix/rel`, and each of its
+folders inside the root as `dir` and `dir/`, at the two places `excluded_dirs` are dropped
+(the `others` filter and the scope filter), and a matching `NestedRepo` is dropped from
+`nested_repos` so it is never reported for promotion. Joining the prefix rather than
+stripping it from the patterns is deliberate: a pattern that starts with a glob
+(`*/z_ignore/**/evals/**`) cannot be stripped textually, and the join makes the scan match
+exactly the path discovery matched. The discover-side filter is what removes a clone reported
+before the key was added (`RootState.nested_repos` persists); the scan-side one only stops
+new reports. A repository's own files are never matched: `DraftSkip` is `None` for a git
+root. A file already in a watched folder's record that becomes skipped is not trimmed from
+the record (no ledger write); it is only never a candidate again.
+
 ## Draft roots and collapsed classes (Phase 6)
 
 **A draft root is a directory, not a repo.** `draft_dirs` (globs relative to a parent dir,
@@ -438,6 +494,22 @@ exactly as it names another repository, so `others` asks each reported folder fo
 entry of either shape before calling it a nested repo; an `lstat` that fails for any reason
 other than "not there" answers yes, which leaves the folder alone.
 
+**`include_gitignored` is one argument per entry (Phase 14, Amendment v1.15).** For a git root,
+`Index::others_args` appends `--exclude=!<pattern>` per `include_gitignored` entry, in config
+order, after `--exclude-standard` and `--exclude-from=<info/exclude>`. A command-line
+pattern sits above every ignore file (`.gitignore`, `info/exclude`, `core.excludesFile`),
+so a matching gitignored file is listed as an ordinary untracked candidate and everything
+downstream (pending on first sight, hashing, hunks, accept, deletion) is the untracked
+path's. Git never descends into an ignored folder, so a file inside one stays unlisted;
+nothing may be built on `check-ignore`, which still calls a re-included file ignored. A
+watched folder's listing never used `--exclude-standard` and gets no `--exclude` at all.
+With the list empty the argv is byte-identical to the pre-phase one
+(`index_others_args_carry_include_gitignored_after_the_existing_arguments` asserts the literal
+vector). The patterns reach the index through `OpenCtx` at open and
+`PrivateIndex::set_include_gitignored` at a config reload. An entry removed later over-shows by
+design: an accepted file keeps its seen-tree entry, so `diff-files` still reports its later
+change or deletion until accepted (D27; §11).
+
 **A collapsed row is one accept, not a diff.** `render_content` (step 7) runs a ladder and
 returns *before* hunks are computed: `collapsed_globs` (the nine common lockfiles by
 default) → binary (a NUL byte in the first 8,000 of either side) → size (either side
@@ -474,6 +546,9 @@ A git root keeps one seen record per branch. One of them is **in force** and liv
 level of `ledger.json` exactly where the only record used to live; the rest are **parked** in
 `branches`, keyed by branch name. Nothing here changes what a pile is: it is still
 `diff(baseline, worktree)` against the record in force.
+Parked records are read for one thing besides the switch: the seen marks after step 9 of
+the pipeline (Phase 14 B), which label a row with the parked branches that already accepted
+its exact content and never add or remove one.
 
 **Which record.** The branch is the name in `<git_dir>/HEAD` when that file reads
 `ref: refs/heads/<name>`, one file read and no git process (`headstate::head_branch`; a linked
@@ -597,6 +672,7 @@ jq -r '.branches // {} | keys[]' ledger.json                  # the parked branc
 jq -r '.branches["feat-x"].seen_tree' ledger.json             # one parked record's tree
 GIT_DIR=store git ls-tree -r "$(jq -r '.branches["feat-x"].seen_tree' ledger.json)"
 lastcall status --json | jq -r '.roots[] | "\(.root) \(.seen_branch) \(.parked_branches)"'
+lastcall status --json | jq -r '.roots[].pending[] | select(.seen_on != []) | "\(.path) \(.seen_on)"'
 ```
 
 ## The fail-open ladder
@@ -1105,11 +1181,12 @@ $EDITOR admits of.
           "conflicted": false,
           "collapsed": null | "glob" | "binary" | "size",
           "flag": null | {"note": "…"},
-          "rename": null | {"from": "old", "similarity": 90} | {"to": "new", "similarity": 90}
+          "rename": null | {"from": "old", "similarity": 90} | {"to": "new", "similarity": 90},
+          "seen_on": ["run-1"]
         }
       ],
       "omitted": 0,
-      "groups": [{"kind": "upstream", "paths": ["u1"]}],
+      "groups": [{"kind": "upstream", "paths": ["u1"]}, {"kind": "seen", "paths": ["a.rs"]}],
       "undo": 0,
       "snoozed_until": "2026-09-20T09:00:00Z | null",
       "notices": ["root-level and scan notices"]
@@ -1128,6 +1205,15 @@ no remote, a local-path or `file://` origin (the fixtures' origins), and anythin
 give `null`. The committed example is
 `crates/lastcall/tests/golden/status_multi_repo.json` (two repos and a draft dir, produced by
 `lastcall_testkit::fixture_parent`; `just golden-update` rewrites it).
+
+`seen_on` and the `seen` group kind (additive, Phase 14 B, Amendment v1.15;
+`status_version` stays 1): `seen_on` is the sorted list of parked branches whose record
+already accepted exactly this row's content (empty for most rows; see the seen marks after
+step 9 of the pipeline), and the `seen` group lists the rows that fold (`Row::folds_seen`),
+so a row can carry `seen_on` without being in the group (flagged, annotated, or a
+deletion). The human form appends `  [seen]` to a marked row's line and prints the group as
+`[seen] N files` after `[upstream] N files`, the TUI's group-row label, with `1 file` in the
+singular (`count::plural`).
 
 `omitted` (additive, Phase 4; `status_version` stays 1 — an Amendment v1.4 candidate) is
 the number of changed paths beyond the row cap that this scan did not hash (see step 4 of
@@ -1206,10 +1292,14 @@ and the next event opens a fresh one; a scan the loop did **not** initiate (the 
 `Effect::Refresh`, or the rescan an accept leaves behind) does not, which costs at most one
 redundant scan per window.
 `scan_all` re-runs discovery only when a scan saw a root's set of nested repositories change,
-not on every tick while one exists. Events only *schedule* work: every scan, head inspection and rescan runs on
+not on every tick while one exists; what those passes add or remove is kept on the engine
+until `Engine::take_roots_changed` drains it, which the loop does under the launch scan's own
+lock (and the backstop on every pass, for a TUI refresh's `scan_all`), so a repository
+promoted there (a clone untracked inside a listed repository at launch) is re-watched and
+announced as a `RootsChanged` like any backstop change (Phase 14 H). Events only *schedule* work: every scan, head inspection and rescan runs on
 `spawn_blocking` under the engine's mutex, and the result is published as an `EngineEvent`
 (`Pile { root, seq, pile }`, `Head` with its transition notice and the seq of the scan it
-ran, `RootsChanged`, `Notice`). `ignore_globs` scope
+ran, `RootsChanged`, `Notice`). `watch_ignore_globs` scope
 the watcher only — an ignored path never wakes a scan, but the next scan still shows the
 tracked edit. `lastcall watch [--json] [--exit-after N] [--poll N]` prints one line per
 event (a pile line is `<root> #<seq>  <n> pending`; the JSON form carries `seq` and
@@ -1219,3 +1309,25 @@ or missing (the development machine's fseventsd delivered nothing during Phase 2
 `crates/lastcall-engine/tests/test_integration_watcher.rs` proves delivery where it works and
 skips with a reason where it does not). `just probe-watch` demonstrates the B1
 notice (`committed on main (1 commit)`) arriving while the pending row stays.
+
+**A removed root (Phase 14 C, D28).** `scan_root_once`, `inspect_head` and
+`Ops::accept_preflight` each begin with `root.is_dir()`, before any git call and before
+`reload_ledger_if_changed` or `sync_branch` (which, unguarded, rewrote `seen_branch` from a
+worktree's still-present admin dir). A missing root is `EngineError::RootGone(path)` from
+a scan or an inspection, and `Refused::RootGone` (`folder removed`) from an accept: the
+ledger is byte-identical and the spawn count is zero, and `accept_with` returns the last pile
+without the post-op scan. A git failure that lands after the check (the folder removed
+mid-scan) is mapped to `RootGone` by `gone_or` when the folder is gone by then. The loop never
+reports `RootGone` as a failure notice: it asks for discovery at once through the rescan
+trigger, once per root until that root scans again (`gone_asked`), and the rescan's
+`removed` takes the row out. Events are classified by `classify_path`, which returns
+`Scheduled::Discover` for a path at or above a listed root that is no longer a directory,
+decided by `!path.is_dir()` and never by the event kind (FSEvents reports an `rm -r` as a
+rename as often as a remove). Discover events share one trailing-edge deadline
+(`DiscoverDue`, the same 750 ms and 3 s cap as a root's scan), so a burst of removals costs one
+discovery pass, and any rescan clears it. The TUI does the same: `spawn_refresh` drops a
+`RootGone` silently and asks for the rescan, and an accept whose result is root-gone shows
+`<root>: folder removed` and applies nothing. Undo, flag, snooze and restore are not guarded:
+each needs a selected row, and the row is gone within one debounce window. The record stays
+in the state dir, so re-adding the worktree at the same path finds its `seen_tree`
+(`scenario_d28_*`).

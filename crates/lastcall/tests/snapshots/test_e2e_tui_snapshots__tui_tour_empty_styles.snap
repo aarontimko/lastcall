@@ -77,4 +77,4 @@ expression: style
 27 1..17 Reset Reset DIM
 27 27..28 Cyan Reset -
 28 0..28 Cyan Reset -
-29 0..84 Reset Reset DIM
+29 0..94 Reset Reset DIM

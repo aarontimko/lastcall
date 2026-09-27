@@ -42,7 +42,9 @@ use std::time::Duration;
 use crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, Event, MouseButton, MouseEvent, MouseEventKind,
 };
-use lastcall_engine::engine::{AcceptRequest, Engine, RenderedHunk, RestoreRequest, SaveRequest};
+use lastcall_engine::engine::{
+    AcceptRequest, Engine, EngineError, RenderedHunk, RestoreRequest, SaveRequest,
+};
 use lastcall_engine::env::Env;
 use lastcall_engine::herdr::HerdrEvent;
 use lastcall_engine::herdr::client::{Cache, ClientHandle};
@@ -58,6 +60,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use tokio::sync::mpsc;
 
+use super::app::accept_found_root_gone;
 use super::app::{
     AcceptFailed, AcceptResult, App, Changed, EditOpen, Effect, FlagKind, FlagResult,
     RestoreResult, RootMeta, SaveResult, SnoozeResult, UndoResult,
@@ -133,6 +136,9 @@ pub enum Local {
     Roots(Vec<RootMeta>),
     /// The `Refresh` finished (all its piles were sent first).
     RefreshDone,
+    /// An `Effect::Reload` finished (Phase 14 D): the config applied, or the error that
+    /// kept it from applying (the `ConfigError` or `KeymapError` text launch would print).
+    Reloaded(Result<Box<Reload>, String>),
     /// A root's scan failed during a `Refresh`; its previous pile stays.
     Notice(Option<PathBuf>, String),
     /// An engine task died (panicked): the panic hook has already restored the terminal,
@@ -171,6 +177,15 @@ pub enum Local {
     /// The row `hunks_of` was given travels back with the answer, so the app can tell an
     /// answer for the oids on screen from one for oids a pile has since replaced.
     Expanded(PathBuf, Box<Row>, Expanded),
+}
+
+/// A config file read again and applied to the engine (Phase 14 D): the new keymap for
+/// [`Ui`], and the running config beside the file's new one for the notice and `[ui]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Reload {
+    pub keymap: Keymap,
+    pub old: lastcall_engine::config::Config,
+    pub new: lastcall_engine::config::Config,
 }
 
 /// The terminal-free core of the loop: the app, the keymap, and the hit map of the last
@@ -432,6 +447,15 @@ impl Ui {
             Local::Exported { label, result } => (self.app.exported(label, result), None),
             Local::Roots(metas) => (self.app.sync_roots(metas), None),
             Local::RefreshDone => (self.app.refresh_done(), None),
+            // Phase 14 D: the keymap is the loop's (`Ui`) and the table the app's; both are
+            // swapped here, together, so a key and the hint that names it never disagree.
+            Local::Reloaded(Ok(reload)) => {
+                let Reload { keymap, old, new } = *reload;
+                self.app.keymap = keymap.table();
+                self.keymap = keymap;
+                (self.app.reloaded(&old, &new), None)
+            }
+            Local::Reloaded(Err(error)) => (self.app.reload_failed(&error), None),
             Local::Notice(root, text) => self.app.apply(EngineEvent::Notice { root, text }),
             Local::Fatal(text) => {
                 self.app.set_status(text);
@@ -737,22 +761,35 @@ fn root_metas(engine: &Engine) -> Vec<RootMeta> {
 }
 
 /// `Effect::Refresh`: scan every root off the UI task, one `Local::Pile` per root, then
-/// `Local::RefreshDone`.
-fn spawn_refresh(engine: &Arc<Mutex<Engine>>, tx: mpsc::UnboundedSender<Local>) {
+/// `Local::RefreshDone`. A root whose folder is gone (Phase 14 C) is no failed scan: it
+/// sends nothing and the watcher is asked for the discovery pass that drops it.
+fn spawn_refresh(
+    engine: &Arc<Mutex<Engine>>,
+    tx: mpsc::UnboundedSender<Local>,
+    rescan: RescanTrigger,
+) {
     let engine = engine.clone();
     tokio::spawn(async move {
         let scan = tokio::spawn(async move { blocking(&engine, |e| e.scan_all()).await });
         let Some(results) = joined(scan, &tx, "refresh").await else {
             return;
         };
+        let mut gone = false;
         for (root, seq, result) in results {
             let local = match result {
                 Ok(pile) => Local::Pile(root, seq, pile),
+                Err(EngineError::RootGone(_)) => {
+                    gone = true;
+                    continue;
+                }
                 Err(e) => Local::Notice(Some(root), format!("scan failed: {e}")),
             };
             if tx.send(local).is_err() {
                 return;
             }
+        }
+        if gone {
+            rescan.request_rescan();
         }
         let _ = tx.send(Local::RefreshDone);
     });
@@ -765,6 +802,7 @@ fn spawn_accept(
     engine: &Arc<Mutex<Engine>>,
     tx: mpsc::UnboundedSender<Local>,
     reqs: Vec<(PathBuf, AcceptRequest)>,
+    rescan: RescanTrigger,
 ) {
     let engine = engine.clone();
     tokio::spawn(async move {
@@ -780,6 +818,11 @@ fn spawn_accept(
             .await
         });
         if let Some(results) = joined(accept, &tx, "accept").await {
+            // Phase 14 C: an accept in a root whose folder is gone was refused before any
+            // write; the watcher's discovery pass is what takes the row away.
+            if results.iter().any(|(_, r)| accept_found_root_gone(r)) {
+                rescan.request_rescan();
+            }
             let _ = tx.send(Local::Accepted(results));
         }
     });
@@ -853,6 +896,72 @@ fn spawn_snooze(
         };
         if let Some(result) = joined(snooze, &tx, "snooze").await {
             let _ = tx.send(Local::Snoozed(root, result));
+        }
+    });
+}
+
+/// Read the config file again and apply it to the engine (Phase 14 D). The same
+/// resolution as launch (`config::load` over the launch `Env`, so `LASTCALL_CONFIG` and then
+/// XDG), then the `[keys]` table, then `resolve` against the launch directory. Either
+/// failure returns its text and touches nothing; only a file that loads and whose keys
+/// parse reaches [`Engine::reload`]. Runs under the engine lock, on a blocking thread.
+pub fn reload_config(engine: &mut Engine) -> Result<Reload, String> {
+    let env = engine.env().clone();
+    let loaded = lastcall_engine::config::load(&env).map_err(|e| reload_refusal(&e))?;
+    let keymap = Keymap::from_config(&loaded.config.keys).map_err(|e| e.to_string())?;
+    let resolved = loaded.resolve(env.cwd());
+    let old = engine.config().clone();
+    engine.reload(&loaded, &resolved);
+    Ok(Reload {
+        keymap,
+        old,
+        new: loaded.config,
+    })
+}
+
+/// The reason a reload was refused, for the status line: the line number and the message,
+/// without the `config file <path>` prefix launch prints. The user just edited that file,
+/// and with the path in front the reason starts past column 78 at the default location
+/// and is cut off an 80-column terminal (verification F2). An error that is about the
+/// file itself rather than its contents keeps its full text.
+fn reload_refusal(error: &lastcall_engine::config::ConfigError) -> String {
+    use lastcall_engine::config::ConfigError;
+    match error {
+        ConfigError::Parse {
+            line: Some(line),
+            message,
+            ..
+        } => format!("line {line}: {message}"),
+        ConfigError::Parse { message, .. } | ConfigError::Invalid { message, .. } => {
+            message.clone()
+        }
+        other => other.to_string(),
+    }
+}
+
+/// `Effect::Reload`: [`reload_config`] off the UI task, then the watcher's reload pass.
+///
+/// The order is `spawn_set_search_depth`'s: the settings land under the lock first, and
+/// only then is the loop asked for the pass that reads them, so no discovery can run on
+/// the old config after the answer says the new one applied. A refused file asks for
+/// nothing.
+fn spawn_reload(
+    engine: &Arc<Mutex<Engine>>,
+    tx: mpsc::UnboundedSender<Local>,
+    rescan: RescanTrigger,
+) {
+    let engine = engine.clone();
+    tokio::spawn(async move {
+        let work = tokio::spawn(async move { blocking(&engine, reload_config).await });
+        let Some(result) = joined(work, &tx, "reload").await else {
+            return;
+        };
+        let applied = result.is_ok();
+        if tx.send(Local::Reloaded(result.map(Box::new))).is_err() {
+            return;
+        }
+        if applied {
+            rescan.request_reload();
         }
     });
 }
@@ -1836,10 +1945,24 @@ pub fn run(
                         // this arm is belt and braces — and never a `break`, which would only
                         // leave this `for` and drop the rest of the pass's effects.
                         Effect::Quit => stop = Some(Stop::Quit),
-                        Effect::Refresh => spawn_refresh(&watcher.engine, local_tx.clone()),
+                        Effect::Refresh => spawn_refresh(
+                            &watcher.engine,
+                            local_tx.clone(),
+                            watcher.rescan_trigger(),
+                        ),
                         Effect::SyncRoots => spawn_sync_roots(&watcher.engine, local_tx.clone()),
+                        Effect::Reload => spawn_reload(
+                            &watcher.engine,
+                            local_tx.clone(),
+                            watcher.rescan_trigger(),
+                        ),
                         Effect::Accept(reqs) => {
-                            spawn_accept(&watcher.engine, local_tx.clone(), reqs)
+                            spawn_accept(
+                                &watcher.engine,
+                                local_tx.clone(),
+                                reqs,
+                                watcher.rescan_trigger(),
+                            )
                         }
                         Effect::Restore(reqs) => {
                             spawn_restore(&watcher.engine, local_tx.clone(), reqs)
@@ -2140,6 +2263,7 @@ mod tests {
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
+    use lastcall_engine::scan::GroupKind;
     use ratatui::backend::TestBackend;
 
     fn key(code: KeyCode) -> Event {
@@ -2191,6 +2315,177 @@ mod tests {
         assert!(found, "the watcher ended before the rescan landed");
         assert_eq!(lock(&watcher.engine).search_depth(), 2);
         watcher.join().await;
+    }
+
+    /// Phase 14 D: the reload's settings land under the engine lock before the discovery
+    /// pass it asks for, exactly as the depth card's do. The file raises `search_depth` and
+    /// adds a `watch_ignore_globs` entry; the watcher's reload `RootsChanged` must already list the
+    /// root only the new depth reaches, and the engine must hold the new ignore set.
+    #[tokio::test]
+    async fn run_reload_lands_before_the_discovery_it_asks_for() {
+        use lastcall_engine::config::Config;
+        use lastcall_engine::watcher::{EngineTimings, lock};
+        use lastcall_testkit::engine::open_engine;
+        use lastcall_testkit::fixture_repo::FixtureRepo;
+        use lastcall_testkit::tmp::TempDir;
+
+        let repo = FixtureRepo::new("run-reload").unwrap();
+        let state = TempDir::new("lc-run-reload-state");
+        let conf = TempDir::new("lc-run-reload-conf");
+        let deep = repo.parent_dir().join("worktrees").join("b");
+        std::fs::create_dir_all(&deep).unwrap();
+        repo.git_at(&deep, &["init", "-q", "-b", "main"]).unwrap();
+        let deep = std::fs::canonicalize(&deep).unwrap();
+        let parent = std::fs::canonicalize(repo.parent_dir()).unwrap();
+        let file = conf.path().join("config.toml");
+        std::fs::write(
+            &file,
+            format!(
+                "parent_dirs = [{:?}]\nsearch_depth = 2\nwatch_ignore_globs = [\"scratch/**\"]\n\n[keys]\nreload = \"ctrl-r\"\n",
+                parent.display().to_string()
+            ),
+        )
+        .unwrap();
+        let env = repo
+            .engine_env(state.path())
+            .with_var("LASTCALL_CONFIG", file.to_string_lossy());
+        let engine = open_engine(repo.parent_dir(), &env, state.path(), Config::default());
+        let mut watcher = engine.run(EngineTimings::default());
+        assert!(lock(&watcher.engine).root(&deep).is_none());
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        spawn_reload(&watcher.engine, tx, watcher.rescan_trigger());
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(20), rx.recv())
+            .await
+            .expect("the loop's answer arrives")
+            .expect("the channel is open");
+        let Local::Reloaded(Ok(reload)) = answer else {
+            panic!("{answer:?}")
+        };
+        assert_eq!(reload.new.search_depth, 2);
+        assert_eq!(reload.old.search_depth, 1);
+        assert_ne!(
+            reload.keymap,
+            Keymap::defaults(),
+            "the file's [keys] came back"
+        );
+        let changed = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while let Some(event) = watcher.events.recv().await {
+                if let EngineEvent::RootsChanged(changed) = event
+                    && changed.reload
+                {
+                    return Some(changed);
+                }
+            }
+            None
+        })
+        .await
+        .expect("the reload pass arrives")
+        .expect("the watcher ended before the reload pass landed");
+        assert_eq!(
+            changed.added,
+            vec![deep.clone()],
+            "discovered at the new depth"
+        );
+        assert!(changed.removed.is_empty());
+        {
+            let g = lock(&watcher.engine);
+            assert!(g.root(&deep).is_some());
+            assert!(g.watch_ignore_globs().is_match("scratch/a.txt"));
+        }
+        watcher.join().await;
+    }
+
+    /// Phase 14 D: a file that does not load, or whose `[keys]` do not parse, changes
+    /// nothing: the engine keeps its config and sets, and `Ui` keeps its keymap and table,
+    /// and the status line carries the text launch would have printed.
+    #[test]
+    fn run_an_invalid_config_file_changes_nothing() {
+        use lastcall_engine::config::Config;
+        use lastcall_testkit::engine::open_engine;
+        use lastcall_testkit::fixture_repo::FixtureRepo;
+        use lastcall_testkit::tmp::TempDir;
+
+        let repo = FixtureRepo::new("run-reload-bad").unwrap();
+        let state = TempDir::new("lc-run-reload-bad-state");
+        let conf = TempDir::new("lc-run-reload-bad-conf");
+        let file = conf.path().join("config.toml");
+        let env = repo
+            .engine_env(state.path())
+            .with_var("LASTCALL_CONFIG", file.to_string_lossy());
+        let mut engine = open_engine(repo.parent_dir(), &env, state.path(), Config::default());
+        let before = engine.config().clone();
+        for (text, says) in [
+            ("search_depth = \n", "line 1"),
+            ("no_such_key = 1\n", "no_such_key"),
+            ("[keys]\nrefresh = \"shift-r\"\n", "reload"),
+        ] {
+            std::fs::write(&file, text).unwrap();
+            let err = reload_config(&mut engine).expect_err(text);
+            assert!(err.contains(says), "{text:?}: {err}");
+            assert!(
+                !err.contains("config file"),
+                "{text:?}: the refusal names the reason, not the file: {err}"
+            );
+            assert_eq!(engine.config(), &before, "{text:?} touched the engine");
+            let mut ui = Ui::new(App::new(), Keymap::defaults());
+            let table = ui.app.keymap.clone();
+            ui.local(Local::Reloaded(Err(err.clone())));
+            assert_eq!(ui.keymap, Keymap::defaults());
+            assert_eq!(ui.app.keymap, table);
+            assert_eq!(
+                ui.app.status.as_ref().map(|s| s.text.clone()),
+                Some(format!("config not reloaded: {err}"))
+            );
+        }
+        // And a good file swaps both halves together.
+        std::fs::write(&file, "[keys]\nreload = \"ctrl-r\"\n").unwrap();
+        let reload = reload_config(&mut engine).unwrap();
+        let mut ui = Ui::new(App::new(), Keymap::defaults());
+        ui.local(Local::Reloaded(Ok(Box::new(reload))));
+        assert_eq!(ui.app.keymap, ui.keymap.table());
+        assert_eq!(ui.app.keys_for("reload"), ["ctrl-r".to_owned()]);
+    }
+
+    /// Phase 14 I: `R` over a file that still says a key's old name is refused with the
+    /// new name and the line, from the same `parse` launch uses, and nothing is applied.
+    #[test]
+    fn run_a_renamed_key_refuses_the_reload_with_its_new_name() {
+        use lastcall_engine::config::Config;
+        use lastcall_testkit::engine::open_engine;
+        use lastcall_testkit::fixture_repo::FixtureRepo;
+        use lastcall_testkit::tmp::TempDir;
+
+        let repo = FixtureRepo::new("run-reload-renamed").unwrap();
+        let state = TempDir::new("lc-run-reload-renamed-state");
+        let conf = TempDir::new("lc-run-reload-renamed-conf");
+        let file = conf.path().join("config.toml");
+        let env = repo
+            .engine_env(state.path())
+            .with_var("LASTCALL_CONFIG", file.to_string_lossy());
+        let mut engine = open_engine(repo.parent_dir(), &env, state.path(), Config::default());
+        let before = engine.config().clone();
+        for (text, says) in [
+            (
+                "ignore_globs = [\"build/**\"]\n",
+                "line 1: the key `ignore_globs` is now `watch_ignore_globs`: rename it",
+            ),
+            (
+                "search_depth = 1\nreview_ignored = [\"z_ignore_*\"]\n",
+                "line 2: the key `review_ignored` is now `include_gitignored`: rename it",
+            ),
+        ] {
+            std::fs::write(&file, text).unwrap();
+            let err = reload_config(&mut engine).expect_err(text);
+            assert_eq!(err, says, "{text:?}");
+            assert_eq!(engine.config(), &before, "{text:?} touched the engine");
+            let mut ui = Ui::new(App::new(), Keymap::defaults());
+            ui.local(Local::Reloaded(Err(err.clone())));
+            assert_eq!(
+                ui.app.status.as_ref().map(|s| s.text.clone()),
+                Some(format!("config not reloaded: {says}"))
+            );
+        }
     }
 
     fn mouse(kind: MouseEventKind, column: u16, row: u16) -> Event {
@@ -2777,6 +3072,126 @@ mod tests {
         assert!(!ui.app.dragging);
     }
 
+    /// Deliverable G: a repository's pane is text the mouse can copy. The click on the
+    /// nav row draws the pane, the next frame's hit map carries its rectangle, and a drag
+    /// over its first two lines copies exactly those two lines on the release.
+    #[test]
+    fn run_mouse_drag_on_a_repository_pane_copies_its_lines() {
+        let mut ui = ui();
+        render_into(&mut ui);
+        let (x, y) = target_center(&ui, &Target::NavRoot(root("alpha")));
+        ui.event(&mouse(MouseEventKind::Down(MouseButton::Left), x, y));
+        ui.event(&mouse(MouseEventKind::Up(MouseButton::Left), x, y));
+        assert_eq!(ui.app.selection, Some(Selection::Root(root("alpha"))));
+        render_into(&mut ui);
+        let body = ui
+            .hits
+            .as_ref()
+            .unwrap()
+            .diff_body
+            .expect("the pane's rectangle");
+        let lines = ui.app.pane_lines();
+        assert!(lines.len() >= 2);
+
+        ui.event(&mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            body.x + 2,
+            body.y,
+        ));
+        assert_eq!(ui.app.press_line, Some(0));
+        ui.event(&mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            body.x + 2,
+            body.y + 1,
+        ));
+        assert_eq!(ui.app.sel.map(|s| s.range()), Some((0, 1)));
+        let (changed, effect) = ui.event(&mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            body.x + 2,
+            body.y + 1,
+        ));
+        assert_eq!(changed, Changed::Yes);
+        let Some(Effect::Copy(bytes)) = effect else {
+            panic!("expected a copy, got {effect:?}");
+        };
+        let text = String::from_utf8(bytes).unwrap();
+        assert_eq!(text, format!("{}\n{}\n", lines[0], lines[1]));
+        assert!(text.contains("~/W/alpha"), "the path line: {text:?}");
+        assert!(ui.app.sel.is_none());
+    }
+
+    /// Deliverable G: the blank under a short pane answers its last line, as the blank
+    /// under a short diff always has, so a press there and a drag up covers the pane.
+    #[test]
+    fn run_a_press_under_a_short_pane_selects_to_its_last_line() {
+        let mut ui = ui();
+        ui.app
+            .select(Some(Selection::Group(root("beta"), GroupKind::Upstream)));
+        render_into(&mut ui);
+        let body = ui
+            .hits
+            .as_ref()
+            .unwrap()
+            .diff_body
+            .expect("the pane's rectangle");
+        assert_eq!(ui.app.pane_lines(), ["[upstream] 1 file", "  u1"]);
+        assert_eq!(ui.hits.as_ref().unwrap().diff_rows, [0, 1]);
+
+        ui.event(&mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            body.x + 2,
+            body.y + 8,
+        ));
+        assert_eq!(
+            ui.app.press_line,
+            Some(1),
+            "the blank answers the last line"
+        );
+        ui.event(&mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            body.x + 2,
+            body.y,
+        ));
+        assert_eq!(ui.app.sel.map(|s| s.range()), Some((0, 1)));
+        let (_, effect) = ui.event(&mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            body.x + 2,
+            body.y,
+        ));
+        assert_eq!(
+            effect,
+            Some(Effect::Copy(b"[upstream] 1 file\n  u1\n".to_vec()))
+        );
+    }
+
+    /// Deliverable G: a repository frame reports the whole pane as its body, and the
+    /// measure it takes never touches `diff_short`, which only a file's own frame may set;
+    /// the next file frame measures its body afresh.
+    #[test]
+    fn run_a_repository_frame_measures_the_whole_pane_and_leaves_the_diff_short_alone() {
+        let mut ui = ui();
+        ui.app.select(Some(Selection::Root(root("alpha"))));
+        let short = ui.app.diff_short;
+        render_into(&mut ui);
+        let hits = ui.hits.clone().unwrap();
+        let body = hits.diff_body.expect("the pane's rectangle");
+        assert_eq!(
+            body,
+            hits.main.unwrap().intersection(body),
+            "inside the main pane"
+        );
+        assert_eq!(ui.app.diff_size, Some((body.width, body.height)));
+        assert_eq!(
+            ui.app.diff_short, short,
+            "a short pane is not a short file body"
+        );
+
+        // Moving to a file forgets the whole-pane measure, so the reducer's arithmetic
+        // before the next frame uses the fallback rather than a too-tall body.
+        ui.app.select(Some(row("alpha", "f1")));
+        assert_eq!(ui.app.diff_size, None);
+    }
+
     #[test]
     fn run_wheel_scrolls_the_pane_under_the_pointer() {
         let mut ui = ui();
@@ -3012,6 +3427,56 @@ mod tests {
             notice: Some("committed on main (1 commit)".into()),
         });
         assert_eq!((changed, effect), (Changed::Yes, Some(Effect::SyncRoots)));
+    }
+
+    /// Phase 14 H, end to end once: the launch scan's pile for a repository it found on
+    /// the way (`beta`, nested in a listed one) lands before the watcher announces the
+    /// root. The pile is held; the `RootsChanged` asks for the root metadata and nothing
+    /// else; the metadata lists `beta` with the pile it already has, and no scan is asked
+    /// for on the way.
+    #[test]
+    fn run_a_pile_before_the_roots_changed_that_adds_its_root_is_listed_without_a_rescan() {
+        use lastcall_engine::roots::RootsChanged;
+        let mut ui = Ui::new(App::new(), Keymap::defaults());
+        ui.local(Local::Roots(vec![meta("alpha"), meta("notes")]));
+        for name in ["alpha", "notes"] {
+            assert_eq!(ui.engine(pile_event(name, pile(name))).1, None);
+        }
+        assert!(!ui.app.roots.contains_key(&root("beta")));
+
+        let (_, effect) = ui.engine(pile_event_seq("beta", 3, pile("beta")));
+        assert_eq!(effect, None, "a pile for an unknown root asks for nothing");
+        assert!(
+            !ui.app.roots.contains_key(&root("beta")),
+            "held, not listed"
+        );
+        assert!(ui.app.orphan_piles.contains_key(&root("beta")));
+
+        let (_, effect) = ui.engine(EngineEvent::RootsChanged(RootsChanged {
+            added: vec![root("beta")],
+            removed: vec![],
+            reload: false,
+        }));
+        assert_eq!(
+            effect,
+            Some(Effect::SyncRoots),
+            "the root metadata, not a scan"
+        );
+
+        assert_eq!(
+            ui.local(Local::Roots(vec![
+                meta("alpha"),
+                meta("beta"),
+                meta("notes")
+            ])),
+            (Changed::Yes, None),
+            "listed from the held pile; no further effect"
+        );
+        let beta = &ui.app.roots[&root("beta")];
+        assert!(beta.listed());
+        assert_eq!(beta.pile, pile("beta"));
+        assert!(ui.app.orphan_piles.is_empty());
+        assert!(!ui.app.refreshing, "no refresh was started");
     }
 
     /// Verifier (b) F4: `$EDITOR` is often an absolute path, `render_status` ellipsizes from

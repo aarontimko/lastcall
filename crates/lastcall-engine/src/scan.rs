@@ -131,18 +131,61 @@ pub struct Row {
     #[serde(default)]
     pub flags: Vec<Flag>,
     pub rename: Option<Rename>,
+    /// The branches whose parked record already accepted exactly this content (Phase 14
+    /// B, Amendment v1.15), sorted; empty when none. Set by `seen.rs` after the scan,
+    /// never by it. `#[serde(default)]` so recorded-pile fixtures written before it load.
+    #[serde(default)]
+    pub seen_on: Vec<String>,
 }
 
 impl Row {
     pub fn path_lossy(&self) -> String {
         String::from_utf8_lossy(&self.path).into_owned()
     }
+
+    /// Whether this row folds into the `[seen] N files` group (Phase 14 B): its content
+    /// was accepted on another branch, it is not an upstream or mixed row, and it carries
+    /// nothing of the user's own: no flag, so no note. A pending deletion is always a row.
+    /// A flagged row stays a row (with a `[seen]` badge), and so does either half of a
+    /// rename pair, so the deleted half never points at a path folded out of sight and the
+    /// pair is accepted together. An accept-only override is **not** a reason to stay:
+    /// compaction folds those into the seen tree, and whether a row folds must not change
+    /// when the record is compacted (the pile is identical across a compaction).
+    pub fn folds_seen(&self) -> bool {
+        !self.seen_on.is_empty()
+            && self.current.is_some()
+            && self.annotation.is_none()
+            && self.flags.is_empty()
+            && self.rename.is_none()
+    }
 }
 
-/// A derived group row (§6.7 "upstream · N files").
+/// What a derived group row gathers. `Annotation` stays the row's own label, so a row is
+/// never annotated `Seen`; the seen group is built from [`Row::seen_on`] instead.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum GroupKind {
+    Upstream,
+    Mixed,
+    Seen,
+}
+
+impl GroupKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            GroupKind::Upstream => "upstream",
+            GroupKind::Mixed => "mixed",
+            GroupKind::Seen => "seen",
+        }
+    }
+}
+
+/// A derived group row (§6.7 `[upstream] N files`, Phase 14 B `[seen] N files`).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Group {
-    pub kind: Annotation,
+    pub kind: GroupKind,
     pub paths: Vec<Vec<u8>>,
 }
 
@@ -191,22 +234,34 @@ impl Pile {
         self.rows.iter().find(|r| r.path == path)
     }
 
-    /// The rows tagged `upstream`, as one group (empty when none).
+    /// The derived groups, in nav order: the rows tagged `upstream`, then the rows that
+    /// fold into `seen` ([`Row::folds_seen`]). A group with no rows is not listed.
     pub fn groups(&self) -> Vec<Group> {
-        let paths: Vec<Vec<u8>> = self
-            .rows
-            .iter()
-            .filter(|r| r.annotation == Some(Annotation::Upstream))
-            .map(|r| r.path.clone())
-            .collect();
-        if paths.is_empty() {
-            Vec::new()
-        } else {
-            vec![Group {
-                kind: Annotation::Upstream,
-                paths,
-            }]
-        }
+        let of = |kind: GroupKind, keep: &dyn Fn(&Row) -> bool| {
+            let paths: Vec<Vec<u8>> = self
+                .rows
+                .iter()
+                .filter(|r| keep(r))
+                .map(|r| r.path.clone())
+                .collect();
+            (!paths.is_empty()).then_some(Group { kind, paths })
+        };
+        [
+            of(GroupKind::Upstream, &|r: &Row| {
+                r.annotation == Some(Annotation::Upstream)
+            }),
+            of(GroupKind::Seen, &Row::folds_seen),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    /// The paths folded into the seen group, if any.
+    pub fn seen_group(&self) -> Option<Group> {
+        self.groups()
+            .into_iter()
+            .find(|g| g.kind == GroupKind::Seen)
     }
 }
 
@@ -240,6 +295,50 @@ pub struct ScanInputs<'a> {
     /// it on every attempt but the last; on the last one the scan keeps the pile it built
     /// and says so in a notice, which is what every scan did before Phase 13.
     pub retry_on_reseed: bool,
+    /// `skip_globs` for a watched folder (Amendment v1.15): a candidate or a nested
+    /// repository whose parent-relative path matches is dropped where `excluded_dirs` are.
+    /// `None` for a repository, whose own files no key may hide, and when the list is empty.
+    pub skip: Option<DraftSkip<'a>>,
+}
+
+/// A watched folder's `skip_globs` test. The patterns are relative to the parent dir the
+/// folder is filed under and the scan's paths to the folder itself, so each path is
+/// matched with the folder's own parent-relative `prefix` in front of it (design review
+/// F13): exactly the path discovery matches, so the two never disagree about a pattern
+/// that starts with a glob (`*/z_ignore/**/evals/**`).
+#[derive(Debug, Clone, Copy)]
+pub struct DraftSkip<'a> {
+    pub globs: &'a GlobSet,
+    /// The folder's path below its parent dir, `/`-separated; empty when it is the parent
+    /// dir itself.
+    pub prefix: &'a [u8],
+}
+
+impl DraftSkip<'_> {
+    /// Whether the root-relative `rel` is left out: it matches, or a folder above it inside
+    /// the root matches (as `dir` or `dir/`), the way discovery never walks into one.
+    pub fn skips(&self, rel: &[u8]) -> bool {
+        let rel = rel.strip_suffix(b"/").unwrap_or(rel);
+        let mut full = Vec::with_capacity(self.prefix.len() + 1 + rel.len() + 1);
+        if !self.prefix.is_empty() {
+            full.extend_from_slice(self.prefix);
+            full.push(b'/');
+        }
+        let start = full.len();
+        full.extend_from_slice(rel);
+        let is_match = |b: &[u8]| self.globs.is_match(Path::new(OsStr::from_bytes(b)));
+        if is_match(&full) {
+            return true;
+        }
+        for i in start..full.len() {
+            if full[i] == b'/' && (is_match(&full[..i]) || is_match(&full[..=i])) {
+                return true;
+            }
+        }
+        let mut dir = full;
+        dir.push(b'/');
+        is_match(&dir)
+    }
 }
 
 /// What a scan produced besides the pile.
@@ -408,6 +507,8 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
             Other::NestedRepo(d) => Some(d.clone()),
             Other::File(_) => None,
         })
+        // A nested repository `skip_globs` names is not reported for promotion.
+        .filter(|d| !inputs.skip.is_some_and(|s| s.skips(d)))
         .collect();
     nested_repos.sort();
 
@@ -472,6 +573,7 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
         if let Other::File(p) = o
             && !under_any(p, &nested_repos)
             && !under_excluded(p, inputs.excluded_dirs)
+            && !inputs.skip.is_some_and(|s| s.skips(p))
         {
             candidates.insert(p.clone());
         }
@@ -517,7 +619,10 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
         Some(scope) => {
             let mut kept: Vec<Vec<u8>> = Vec::with_capacity(candidates.len());
             for p in candidates {
-                if !scope.admits_shape(&p) || under_excluded(&p, inputs.excluded_dirs) {
+                if !scope.admits_shape(&p)
+                    || under_excluded(&p, inputs.excluded_dirs)
+                    || inputs.skip.is_some_and(|s| s.skips(&p))
+                {
                     continue;
                 }
                 let meta = store.lstat(&p);
@@ -636,6 +741,7 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
                     collapsed: Some(Collapsed::Unread { over_bytes }),
                     flags,
                     rename: None,
+                    seen_on: Vec::new(),
                 });
                 continue;
             }
@@ -678,6 +784,7 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
                 collapsed: None,
                 flags,
                 rename: None,
+                seen_on: Vec::new(),
             };
             rows.push(row);
         }
@@ -1030,7 +1137,13 @@ mod tests {
                 .with_var("GIT_CONFIG_NOSYSTEM", "1");
             let paths = RepoPaths::under(state.join("repo"));
             let (store, _) = Store::open(&env, &root, RootKind::Draft, &paths, None).unwrap();
-            let index = PrivateIndex::new(store.git().clone(), &paths, RootKind::Draft, None);
+            let index = PrivateIndex::new(
+                store.git().clone(),
+                &paths,
+                RootKind::Draft,
+                None,
+                Vec::new(),
+            );
             let ledger = Ledger::new(
                 &root,
                 RootKind::Draft,
@@ -1087,6 +1200,10 @@ mod tests {
         }
 
         fn scan(&self, scope: &DraftScope) -> ScanOutput {
+            self.scan_skipping(scope, None)
+        }
+
+        fn scan_skipping(&self, scope: &DraftScope, skip: Option<DraftSkip<'_>>) -> ScanOutput {
             super::scan(&ScanInputs {
                 store: &self.store,
                 index: &self.index,
@@ -1102,9 +1219,102 @@ mod tests {
                 index_tmp: &self.paths.index_tmp,
                 row_cap: crate::engine::DEFAULT_ROW_CAP,
                 retry_on_reseed: false,
+                skip,
             })
             .unwrap()
         }
+    }
+
+    /// Amendment v1.15 (scenario A9): inside a watched folder, a file or a nested
+    /// repository whose parent-relative path matches `skip_globs` is neither a candidate
+    /// nor reported for promotion; the folder's other files are untouched.
+    #[test]
+    fn scan_watched_folder_drops_what_skip_globs_name() {
+        let max = 1 << 20;
+        let w = Watched::new(max);
+        w.write("notes.md", 4);
+        w.write("evals/run.log", 4);
+        w.write("evals/sub/x.md", 4);
+        let env = crate::env::Env::empty(w.dir.path())
+            .with_home(w.dir.path().join("home"))
+            .with_var("GIT_CONFIG_GLOBAL", "/dev/null")
+            .with_var("GIT_CONFIG_SYSTEM", "/dev/null")
+            .with_var("GIT_CONFIG_NOSYSTEM", "1");
+        for clone in ["evals/c1", "other/c2"] {
+            assert!(
+                crate::git::base_command(&env, &w.root)
+                    .args(["init", "-q", clone])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            w.write(&format!("{clone}/x"), 2);
+        }
+        let tree = DraftScope::tree(max);
+        let globs = crate::config::skip_set(&["*/z_ignore/**/evals/**".to_owned()]);
+        // The folder is `proj/z_ignore` below its parent dir.
+        let skip = DraftSkip {
+            globs: &globs,
+            prefix: b"proj/z_ignore",
+        };
+
+        let all = w.scan(&tree);
+        assert_eq!(
+            row_paths(&all),
+            vec!["evals/run.log", "evals/sub/x.md", "notes.md"]
+        );
+        assert_eq!(
+            all.nested_repos,
+            vec![b"evals/c1".to_vec(), b"other/c2".to_vec()]
+        );
+
+        let out = w.scan_skipping(&tree, Some(skip));
+        assert_eq!(row_paths(&out), vec!["notes.md"]);
+        assert_eq!(out.nested_repos, vec![b"other/c2".to_vec()]);
+
+        // A pattern that names the folder `evals` alone prunes everything below it too.
+        let globs = crate::config::skip_set(&["proj/z_ignore/evals".to_owned()]);
+        let out = w.scan_skipping(
+            &tree,
+            Some(DraftSkip {
+                globs: &globs,
+                prefix: b"proj/z_ignore",
+            }),
+        );
+        assert_eq!(row_paths(&out), vec!["notes.md"]);
+        assert_eq!(out.nested_repos, vec![b"other/c2".to_vec()]);
+
+        // A folder watched on its own: unaffected unless its own files match.
+        let plain = DraftScope::plain(max);
+        let globs = crate::config::skip_set(&["*/z_ignore/evals/**".to_owned()]);
+        let out = w.scan_skipping(
+            &plain,
+            Some(DraftSkip {
+                globs: &globs,
+                prefix: b"proj/z_ignore",
+            }),
+        );
+        assert_eq!(row_paths(&out), vec!["notes.md"]);
+        assert_eq!(row_paths(&w.scan(&plain)), vec!["notes.md"]);
+        let globs = crate::config::skip_set(&["*/z_ignore/notes.md".to_owned()]);
+        let out = w.scan_skipping(
+            &plain,
+            Some(DraftSkip {
+                globs: &globs,
+                prefix: b"proj/z_ignore",
+            }),
+        );
+        assert!(row_paths(&out).is_empty(), "{:?}", row_paths(&out));
+
+        // The folder filed as the parent dir itself: no prefix.
+        let globs = crate::config::skip_set(&["evals/**".to_owned()]);
+        let bare = DraftSkip {
+            globs: &globs,
+            prefix: b"",
+        };
+        assert!(bare.skips(b"evals/run.log"));
+        assert!(bare.skips(b"evals/c1/"));
+        assert!(!bare.skips(b"notes.md"));
     }
 
     fn row_paths(out: &ScanOutput) -> Vec<String> {
@@ -1407,8 +1617,13 @@ pub(crate) mod fixture_tests {
                 .parent()
                 .expect("a git dir above HEAD")
                 .to_path_buf();
-            let index =
-                PrivateIndex::new(store.git().clone(), &paths, RootKind::Git, Some(exclude));
+            let index = PrivateIndex::new(
+                store.git().clone(),
+                &paths,
+                RootKind::Git,
+                Some(exclude),
+                Vec::new(),
+            );
             let tree = Oid::parse(repo.git(&["rev-parse", "HEAD^{tree}"]).unwrap().trim()).unwrap();
             let tree_entries = store.ls_tree(&tree).unwrap();
             let head_commit = Oid::parse(repo.git(&["rev-parse", "HEAD"]).unwrap().trim()).unwrap();
@@ -1471,6 +1686,7 @@ pub(crate) mod fixture_tests {
                 index_tmp: &self.paths.index_tmp,
                 row_cap: crate::engine::DEFAULT_ROW_CAP,
                 retry_on_reseed: false,
+                skip: None,
             };
             super::scan(&inputs).unwrap()
         }

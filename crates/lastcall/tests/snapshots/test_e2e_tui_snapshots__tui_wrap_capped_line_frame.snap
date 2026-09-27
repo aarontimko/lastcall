@@ -12,7 +12,7 @@ expression: frame
 "│  main · 2 files          │+payload payload payload payload payload payload payload payload       │"
 "│  A u1  +1 −0  [upstream] │+payload payload payload payload payload payload payload payload       │"
 "│  A u2  +2 −0  [mixed]    │+payload payload payload payload payload payload payload payload       │"
-"│  upstream · 1 file       │+payload payload payload payload payload payload payload payload       │"
+"│  [upstream] 1 file       │+payload payload payload payload payload payload payload payload       │"
 "│──────────────────────────│+payload payload payload payload payload payload payload payload       │"
 "│W/notes                   │+payload payload payload payload payload payload payload payload       │"
 "│  draft · 1 file          │+payload payload payload payload payload payload payload payload       │"

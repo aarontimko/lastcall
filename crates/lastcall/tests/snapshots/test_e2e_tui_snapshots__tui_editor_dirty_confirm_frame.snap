@@ -14,7 +14,7 @@ expression: frame
 "│  main · 2 files          │   8     pub key: String,                                              │"
 "│  A u1  +1 −0  [upstream] │   9     pub value: String,                                            │"
 "│  A u2  +2 −0  [mixed]    │  10     pub line: usize,                                              │"
-"│  upstream · 1 file       │  11┌ discard ─────────────────────────┐                               │"
+"│  [upstream] 1 file       │  11┌ discard ─────────────────────────┐                               │"
 "│──────────────────────────│  12│ Discard changes to src/parse.rs? │                               │"
 "│W/notes                   │  13│                                  │r `key = value` line.          │"
 "│  draft · 1 file          │  14│ y / ⏎ confirm    n / Esc cancel  │                               │"

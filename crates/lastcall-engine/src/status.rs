@@ -10,7 +10,7 @@ use crate::engine::{Engine, RootState};
 use crate::git::Oid;
 use crate::headstate::InProgress;
 use crate::roots::Badge;
-use crate::scan::{Annotation, Change, Collapsed, Entry, Pile, Rename, Row};
+use crate::scan::{Annotation, Change, Collapsed, Entry, GroupKind, Pile, Rename, Row};
 use crate::store::RootKind;
 
 pub const STATUS_VERSION: u32 = 1;
@@ -125,11 +125,15 @@ pub struct RowStatus {
     /// Every flag on the row, oldest first. Additive in v1.7 (`status_version` stays 1).
     pub flags: Vec<FlagEntryStatus>,
     pub rename: Option<RenameStatus>,
+    /// The branches whose parked record already accepted this content, sorted; empty
+    /// when none (Phase 14 B). Additive in v1.15 (`status_version` stays 1).
+    pub seen_on: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct GroupStatus {
-    pub kind: Annotation,
+    /// `upstream` or `seen` (v1.15 adds `seen`; additive).
+    pub kind: GroupKind,
     pub paths: Vec<String>,
 }
 
@@ -186,6 +190,7 @@ impl RowStatus {
                     similarity: *similarity,
                 },
             }),
+            seen_on: row.seen_on.clone(),
         }
     }
 }
@@ -375,11 +380,13 @@ impl StatusReport {
                 out.push_str(&format!("  {}\n", row_line(row)));
             }
             for g in &root.groups {
-                let kind = match g.kind {
-                    Annotation::Upstream => "upstream",
-                    Annotation::Mixed => "mixed",
-                };
-                out.push_str(&format!("  {kind} · {} files\n", g.paths.len()));
+                // `[seen] 2 files`: the nav's group row, bracketed like the badge its files
+                // carry (the sponsor's 2026-09-26 ruling); `1 file`, never `1 files`.
+                out.push_str(&format!(
+                    "  [{}] {}\n",
+                    g.kind.name(),
+                    crate::count::plural(g.paths.len(), "file")
+                ));
             }
         }
         out
@@ -423,6 +430,11 @@ pub fn row_line(row: &RowStatus) -> String {
         Some(Annotation::Mixed) => s.push_str("  [mixed]"),
         None => {}
     }
+    // Phase 14 B: every row is listed here, folded or not; the mark says which ones the
+    // `seen` line counts or would, had they no override.
+    if !row.seen_on.is_empty() {
+        s.push_str("  [seen]");
+    }
     match &row.rename {
         Some(RenameStatus::From { from, similarity }) => {
             s.push_str(&format!("  (renamed from {from}, {similarity}%)"));
@@ -436,4 +448,61 @@ pub fn row_line(row: &RowStatus) -> String {
         s.push_str(&format!("  ⚑ {}", f.note));
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn root_with_groups(groups: Vec<GroupStatus>) -> StatusReport {
+        StatusReport {
+            status_version: STATUS_VERSION,
+            state_dir: "state".to_owned(),
+            notices: Vec::new(),
+            roots: vec![RootStatus {
+                root: "parent/demo".to_owned(),
+                kind: RootKind::Git,
+                parent: "parent".to_owned(),
+                store: "store".to_owned(),
+                ledger_written_at: None,
+                badge: None,
+                head: None,
+                branch: Some("feat-y".to_owned()),
+                remote: None,
+                in_progress: None,
+                seen_tree: None,
+                seen_head: None,
+                seen_branch: None,
+                parked_branches: Vec::new(),
+                pending: Vec::new(),
+                omitted: 0,
+                groups,
+                undo: 0,
+                snoozed_until: None,
+                notices: Vec::new(),
+                name: String::new(),
+            }],
+        }
+    }
+
+    /// The group lines read like the nav's group rows (`[upstream] 1 file`,
+    /// `[seen] 2 files`): bracketed, no ` · `, and a proper singular.
+    #[test]
+    fn status_human_group_lines_are_bracketed_with_a_proper_plural() {
+        let human = root_with_groups(vec![
+            GroupStatus {
+                kind: GroupKind::Upstream,
+                paths: vec!["u1".to_owned()],
+            },
+            GroupStatus {
+                kind: GroupKind::Seen,
+                paths: vec!["a.rs".to_owned(), "b.rs".to_owned()],
+            },
+        ])
+        .render_human();
+        assert!(human.contains("\n  [upstream] 1 file\n"), "{human}");
+        assert!(human.contains("\n  [seen] 2 files\n"), "{human}");
+        assert!(!human.contains("upstream ·"), "{human}");
+        assert!(!human.contains("seen ·"), "{human}");
+    }
 }

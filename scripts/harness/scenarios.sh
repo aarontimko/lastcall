@@ -365,6 +365,31 @@ git -C "$R" branch -q Y "$c2"; git -C "$R" checkout -q Y
 assert_pile "D26D the deletion nobody accepted shows on Y" "f1"
 assert_str "D26D the record still holds f1" "$(git -C "$R" rev-parse "$c2^:f1")" "$(lc_baseline f1)"
 
+# D28: a root removed while listed. The git half: what each removal form leaves behind,
+# that the record lives outside the worktree and so outlives it, and how the path is
+# re-added (the engine half, the discovery pass and the refused accept, is the E test).
+new_repo d28; printf '.worktrees/\n' > "$R/.gitignore"; git -C "$R" add .gitignore; git -C "$R" commit -qm ignore
+WT="$R/.worktrees/wt"; git -C "$R" worktree add -q "$WT" -b feat-w; R28="$R"; S28="$W/d28-wt.state"; mkdir -p "$S28"
+lc_init "$WT" "$S28" git; lc_first_sight; rm "$WT/f2"; echo p > "$WT/pend"
+assert_pile "D28 wt holds a pending deletion and a pending file" "f2|pend"
+seen28="$(cat "$S28/seen_tree")"
+git -C "$R28" worktree remove "$WT" 2>/dev/null && r=removed || r=refused
+assert_str "D28 plain worktree remove refuses a worktree with pending files" "refused" "$r"
+git -C "$R28" worktree remove --force "$WT"
+assert_str "D28 remove --force takes the directory and the admin dir" "gone|gone" \
+  "$([ -e "$WT" ] && echo there || echo gone)|$([ -e "$R28/.git/worktrees/wt" ] && echo there || echo gone)"
+assert_str "D28 the record outlives the worktree" "$seen28" "$(cat "$S28/seen_tree")"
+git -C "$R28" worktree add -q "$WT" feat-w; lc_restart
+assert_pile "D28 re-added at the same path: the old record, nothing pending" ""
+assert_str "D28 re-added: seen_tree equal" "$seen28" "$(cat "$S28/seen_tree")"
+find "$WT" -depth -delete   # the rm -r form: git is not told
+assert_str "D28 rm -r keeps the admin dir" "there" "$([ -d "$R28/.git/worktrees/wt" ] && echo there || echo gone)"
+git -C "$R28" worktree add -q "$WT" feat-w 2>/dev/null && r=added || r=refused
+assert_str "D28 add refuses a path git still has registered" "refused" "$r"
+git -C "$R28" worktree prune; git -C "$R28" worktree add -q "$WT" feat-w && r=added || r=refused
+assert_str "D28 after prune the same path is added again" "added" "$r"
+lc_restart; assert_str "D28 and it has its old record" "$seen28" "$(cat "$S28/seen_tree")"
+
 echo "== E. storage =="
 fresh e2; echo edit >> "$R/f1"; lc_accept_file f1; echo deadbeefdeadbeefdeadbeefdeadbeefdeadbeef > "$S/overrides/f1"
 assert_pile "E2 corrupt override -> falls to tree baseline (over-show)" "f1"

@@ -68,7 +68,7 @@ lastcall  3 repos · 6 files · 8 hunks  standalone  [Accept All]               
 │  main · 2 files          │                                                                       │
 │  A u1  +1 −0  [upstream] │                                                                       │
 │  A u2  +2 −0  [mixed]    │                                                                       │
-│  upstream · 1 file       │                                                                       │
+│  [upstream] 1 file       │                                                                       │
 │──────────────────────────│                                                                       │
 │W/notes                   │                                                                       │
 │  draft · 1 file          │                                                                       │
@@ -85,6 +85,73 @@ Two labels are worth knowing on sight. **`[upstream]`** means every line in that
 arrived from a fetch, so it is somebody else's work and not the agent's. **`[mixed]`**
 means some of it did and some of it did not. They are a hint about who to ask, not a
 restriction: the keys all work the same.
+
+A third group appears when an agent brings over work you have already reviewed on another
+branch of the same repository: a cherry-pick, a rebase onto a branch you reviewed, or a
+squash-merge of one. Every file whose content matches exactly what you accepted on another
+branch folds into one row, `[seen] N files`, instead of being listed again. Selecting it
+says which branches accepted that content and lists the files:
+
+```text
+lastcall  3 repos · 11 files · 13 hunks  standalone  [Accept All]                         watching W
+┌──────────────────────────┬───────────────────────────────────────────────────────────────────────┐
+│alpha                     │5 files, content accepted on run-1                                     │
+│  feat-x · 8 files        │  s/a.rs  run-1                                                        │
+│  M f1  +1 −1             │  s/b.rs  run-1                                                        │
+│  M f2  +1 −0             │  s/c.rs  run-1                                                        │
+│  M parse.rs  +10 −2      │  s/d.rs  run-1                                                        │
+│  [seen] 5 files          │  s/e.rs  run-1                                                        │
+│──────────────────────────│                                                                       │
+│beta                      │                                                                       │
+│  main · 2 files          │                                                                       │
+│  A u1  +1 −0  [upstream] │                                                                       │
+│  A u2  +2 −0  [mixed]    │                                                                       │
+│  [upstream] 1 file       │                                                                       │
+│──────────────────────────│                                                                       │
+│W/notes                   │                                                                       │
+│  draft · 1 file          │                                                                       │
+│  M n2.md  +2 −0          │                                                                       │
+└──────────────────────────┴───────────────────────────────────────────────────────────────────────┘
+↑↓ select  ⏎ open  A accept group  e expand  ^A accept all  t hide empty  Tab focus  ? help  q quit
+```
+
+Nothing is hidden by the fold. `e` on the group row opens it, and its files appear indented
+under it with a `[seen]` badge; each one is an ordinary row you can open, flag or restore.
+`e` on the group or on any of its files closes it again:
+
+```text
+lastcall  3 repos · 11 files · 13 hunks  standalone  [Accept All]                         watching W
+┌──────────────────────────┬───────────────────────────────────────────────────────────────────────┐
+│alpha                     │5 files, content accepted on run-1                                     │
+│  feat-x · 8 files        │  s/a.rs  run-1                                                        │
+│  M f1  +1 −1             │  s/b.rs  run-1                                                        │
+│  M f2  +1 −0             │  s/c.rs  run-1                                                        │
+│  M parse.rs  +10 −2      │  s/d.rs  run-1                                                        │
+│  [seen] 5 files          │  s/e.rs  run-1                                                        │
+│    A a.rs  +1 −0  [seen] │                                                                       │
+│    A b.rs  +1 −0  [seen] │                                                                       │
+│    A c.rs  +1 −0  [seen] │                                                                       │
+│    A d.rs  +1 −0  [seen] │                                                                       │
+│    A e.rs  +1 −0  [seen] │                                                                       │
+│──────────────────────────│                                                                       │
+│beta                      │                                                                       │
+│  main · 2 files          │                                                                       │
+│  A u1  +1 −0  [upstream] │                                                                       │
+│  A u2  +2 −0  [mixed]    │                                                                       │
+│  [upstream] 1 file       │                                                                       │
+│──────────────────────────│                                                                       │
+│W/notes                   │                                                                       │
+│  draft · 1 file          │                                                                       │
+│  M n2.md  +2 −0          │                                                                       │
+└──────────────────────────┴───────────────────────────────────────────────────────────────────────┘
+↑↓ select  ⏎ open  A accept group  e collapse  ^A accept all  t hide empty  ? help  q quit
+```
+
+A file leaves the group as soon as it stops matching (it was edited after it arrived) or
+as soon as you flag it; it then has its own row, still badged `[seen]` while its content
+matches. `A` on the group accepts every file in it, `a` there is refused, and `z` puts them
+back. `ctrl-a` counts the folded files with the rest, and `lastcall status` lists every one
+of them with `[seen]` and the group's line.
 
 A watched folder that is not a repository carries the folder above it in its name, so the
 `W/notes` row says which `notes` it is when more than one is being watched. Selecting that
@@ -131,7 +198,7 @@ lastcall  3 repos · 4 files · 6 hunks  standalone  [Accept All]               
 │  main · 2 files          │-line 45                                                               │
 │  A u1  +1 −0  [upstream] │+LINE 45 (edited)                                                      │
 │  A u2  +2 −0  [mixed]    │ line 46                                                               │
-│  upstream · 1 file       │ line 47                                                               │
+│  [upstream] 1 file       │ line 47                                                               │
 │──────────────────────────│ line 48                                                               │
 │W/notes                   │                                                                       │
 │  draft · 1 file          │@@ -75,6 +75,6 @@                       [a accept] [u restore] [m flag]│
@@ -209,7 +276,7 @@ back the way it was, `U` puts the whole file back. Because it is the one destruc
 in the program, the file form asks:
 
 ```text
-│  upstream · 1 file       │    ┌ restore ────────────────────────┐                                │
+│  [upstream] 1 file       │    ┌ restore ────────────────────────┐                                │
 │──────────────────────────│    │ Restore f1 · 1 hunk?            │                                │
 │W/notes                   │    │                                 │                                │
 │  draft · 1 file          │    │ y / ⏎ confirm    n / Esc cancel │                                │
@@ -244,7 +311,7 @@ When a change is wrong, `m` opens a note on the hunk:
 │  main · 2 files   ┌ flag hunk 1 of 1 ────────────────────────────────────────┐                   │
 │  A u1  +1 −0  [ups│ f1 · hunk 1 of 1                                         │                   │
 │  A u2  +2 −0  [mix│                                                          │                   │
-│  upstream · 1 file│ this rewrite loses the guard                             │                   │
+│  [upstream] 1 file│ this rewrite loses the guard                             │                   │
 │───────────────────│ why?▌                                                    │                   │
 │W/notes            │                                                          │                   │
 │  draft · 1 file   │                                                          │                   │
@@ -285,7 +352,7 @@ editing src/parse.rs · line 21/62
 │  main · 2 files          │   8     pub key: String,                                              │
 │  A u1  +1 −0  [upstream] │   9     pub value: String,                                            │
 │  A u2  +2 −0  [mixed]    │  10     pub line: usize,                                              │
-│  upstream · 1 file       │  11 }                                                                 │
+│  [upstream] 1 file       │  11 }                                                                 │
 │──────────────────────────│  12                                                                   │
 │W/notes                   │  13 /// Parse `text` into one record per `key = value` line.          │
 │  draft · 1 file          │  14 ///                                                               │
@@ -318,9 +385,11 @@ or over the collapse size.
 
 ## 7. Copy
 
-`v` starts a line selection in the diff, `↑` and `↓` extend it, and `y` copies. With no
-selection, `y` copies the hunk under the cursor. `esc` drops the selection without leaving
-the file.
+Drag across any text in the right pane, a diff, a repository's path, a group's file list,
+and the release copies it. From the keyboard, `v` starts a line selection in the right
+pane, `↑` and `↓` extend it, and `y` copies. With no selection, `y` copies the hunk under
+the cursor, or on a repository or a group the whole pane. `esc` drops the selection without
+leaving the file.
 
 ```text
 │──────────────────────────│@@ -51,4 +53,10 @@                      [a accept] [u restore] [m flag]│
@@ -334,8 +403,8 @@ larger than about 32 KiB is refused rather than truncated, with a line saying so
 half-pasted patch is worse than none.
 
 Some terminals have this switched off by default, in which case nothing lands and the
-terminal, not lastcall, is the place to look. `shift` and drag still selects text the
-ordinary way, since the mouse is otherwise being used for clicks.
+terminal, not lastcall, is the place to look. Outside a herdr pane, `shift` and drag still
+uses the terminal's own selection, which works where OSC 52 is switched off.
 
 ## What it remembers
 

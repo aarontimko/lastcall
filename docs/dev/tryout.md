@@ -32,7 +32,7 @@ a packaged run exists to surface.
 
 ## What a run leaves on disk
 
-A fresh directory under the system temp directory, `lastcall-tryout-<scenario>-<random>/`:
+One directory per scenario under the system temp directory, `lastcall-tryout-<scenario>/`:
 
 | Path | What it is |
 |---|---|
@@ -41,10 +41,27 @@ A fresh directory under the system temp directory, `lastcall-tryout-<scenario>-<
 | `state/config.toml` | `parent_dirs`, whatever the scenario added, and `[update] check = false` |
 | `STEPS.md` | the numbered steps, as printed |
 | `run.py` | reopens the same sandbox: `python3 <sandbox>/run.py` |
+| `tui.pid` | written by `run.py`: the pid of the lastcall it opened, read by the next run |
 
 Nothing is deleted afterwards. The path is printed; the directory is yours to remove, and
 it is also the evidence if a step failed: the state directory can be read with the `jq` and
 `git` recipes in [`engine.md`](engine.md).
+
+The path is the same on every run, so a second terminal can `cd` to it once and stay
+right across runs. The printout's `shell:` line is that `cd`, spelled out in full: a `cd`
+built on `$TMPDIR` fails silently in a shell that does not carry the variable, and the
+next command then runs wherever that shell was. A run moves the previous run's sandbox aside first, to
+`lastcall-tryout-<scenario>.<built-at>/`, and says so under the paths (`note: the previous
+cherry-pick sandbox was moved to …`); the old run's state is kept as evidence. A run refuses
+to start while a lastcall opened by an earlier run is still open over the path (the pid in
+`tui.pid` is alive and is a lastcall): that lastcall would otherwise carry on writing the
+old run's state into the new run's directory. Quit it with `q` and run again.
+
+The stable path replaced a random suffix. The Phase 14 hands-on walk was run three times
+with a suffix per run, and each time the shell's git commands landed in an earlier run's
+sandbox while the open lastcall watched the new one, so nothing changed on screen. A walk
+that goes wrong is restarted from `just tryout <scenario>`, never patched midway: one
+command, one directory, the steps from the top.
 
 ## What it never touches
 
@@ -113,19 +130,108 @@ Rules a scenario follows:
    there at any terminal size (the help overlay folds under 97 columns, too): the hint line drops entries in a narrow terminal (`wrap` is
    the first to go, under 154 columns with the diff focused), so a step never rests on a
    hint alone.
-3. **Put a landmark at the far end of anything long.** The wrap scenario ends its long
+3. **Spell it out.** A key is named with what it does and to what: "press `ctrl-a` (hold
+   Control, press `a`: accept all), which accepts both `d.rs` and `e.rs`", never "press
+   `ctrl-a`: empty". "Empty" says what is empty ("the `demo` list has no rows"), "no group"
+   says what is missing ("no `seen` row: on `run-2` this content has never been accepted"),
+   and a git command says what it does to the repository when the reason for the next
+   screen depends on it. The sponsor's Phase 14 walk stalled at step 10 on exactly those
+   two abbreviations.
+4. **Put a landmark at the far end of anything long.** The wrap scenario ends its long
    lines in `THE-END-OF-THE-PROSE-LINE` and `END-OF-MINIFIED`, so "is the end visible" is
    a word to look for, not a judgement.
-4. **Check the keys against `DEFAULT_KEYMAP`** in `crates/lastcall/src/tui/input.rs` before
+5. **Check the keys against `DEFAULT_KEYMAP`** in `crates/lastcall/src/tui/input.rs` before
    writing them into a step, and say the laptop spelling where there is one (`End` is
    fn-Right). A step naming a key that is not bound wastes the run.
-5. **Name the run that matters.** If the feature can differ inside a herdr pane, or on a
+6. **Name the run that matters.** If the feature can differ inside a herdr pane, or on a
    second terminal, say so in a step. The footer already asks for both a standalone run and
    one inside herdr.
-6. **Nothing personal and nothing real.** File names, content and repository names are
+7. **Nothing personal and nothing real.** File names, content and repository names are
    invented. A scenario never copies from a real repository.
-7. **One scenario per thing being judged.** A scenario that has grown past a dozen steps
+8. **One scenario per thing being judged.** A scenario that has grown past a dozen steps
    is two scenarios.
+
+## The scenarios
+
+`just tryout list` is the authority; the steps are printed by the scenario itself and saved
+as `STEPS.md` in the sandbox. What each one is for:
+
+| Scenario | What it lets a person judge |
+|---|---|
+| `wrap` | word wrap in the diff pane: prose, code, other scripts, the cap, paging, `alt-z` |
+| `ignored` | `include_gitignored`: gitignored scratch files listed under their repository, never from inside an ignored folder |
+| `reload` | `R`: a watched folder uncommented and listed without a restart, an accept that survives it, `skip_globs` taking a repository out, a broken file refused |
+| `cherry-pick` | the `[seen] N files` fold: a cherry-pick, a rebase and a squash-merge of reviewed work, the group opened with `e`, a member edited or flagged out of it, the group accepted and undone, and nothing hidden from `status` |
+
+### `ignored`
+
+One repository, `demo`, whose committed `.gitignore` ignores `z_ignore_*` and `z_ignore/`,
+with `z_ignore_plan.md` at the top, `src/deep/er/z_ignore_notes.md` three folders down and
+`z_ignore/inside.md` inside the ignored folder; the config says
+`include_gitignored = ["z_ignore_*"]`. The steps: the two matching files are rows with no
+badge and the one inside `z_ignore/` is absent; accept the top file; append a line to it
+from a second terminal (the printed step names the sandbox path and the command) and see
+one hunk; accept; delete it and accept the deletion; the deep file accepts with `A` and
+comes back with `z`.
+
+### `reload`
+
+Two repositories, `demo` (one change to `app.py`) and `evals-clone` (one change), and two
+plain folders, `notes` and `scratch`; the config lists the watched folders one per line,
+with `# "scratch",` commented out. The steps: three roots; accept `app.py`; uncomment the
+line (nothing moves until asked); `R` lists `scratch` with the notice
+`config reloaded: 1 root added`, and `demo` still has nothing pending; a
+`skip_globs = ["evals-clone"]` line at the top and `R` takes the clone out
+(`1 root removed, skip_globs`) and deleting it brings it back; a last line that is not TOML
+and `R` is refused on the status line with the line number and the reason (the file's
+path is left off, since it would push the reason past an 80-column screen), every key
+still working; mended, `R` says `nothing changed`; `?` and the hint line name `R`.
+
+### `cherry-pick`
+
+One repository, `demo`: `a.rs`, `b.rs` and `c.rs` committed on `main`; `run-2` commits
+`d.rs` and `e.rs`; `feat-x`, `feat-y` and `feat-z` are cut from `main` before that; the
+repository is left on `run-1` (from `main`) with the three files edited and uncommitted.
+The repository's own git config carries an identity with signing and hooks off, because
+the person runs git in it by hand from a second terminal while lastcall stays open. Every
+git command is printed verbatim in the steps, with the sandbox path. The twelve steps, as
+the scenario prints them (the engine half of each is pinned by
+`seen_group_the_tryout_walk_gives_what_each_step_promises` in
+`crates/lastcall-engine/tests/test_integration_seen_group.rs`):
+
+1. The reviewed work: `demo` on `run-1 · 3 files`; read them, `ctrl-a`, the list empties;
+   `git commit -qam "run-1 work"`, it stays empty.
+2. The switch: `git switch feat-x`, the branch line says `feat-x`, the list stays empty.
+3. The cherry-pick: `git cherry-pick run-1`, within a second or two one row,
+   `[seen] 3 files`, not three.
+4. Read it: select it, the right pane says `3 files, content accepted on run-1` and lists
+   the three paths with `run-1` beside each.
+5. Open it: `e`, the three files indented under the group row, badged `[seen]` (the hint
+   line reads `e collapse` once the `HEAD moved` status line has cleared); select
+   `b.rs`, its diff like any row's with `[seen]` on the header; `e` again folds them back
+   and selects the group row.
+6. One file changes: `printf 'extra\n' >> b.rs`, `b.rs` becomes its own row (no badge)
+   above `[seen] 2 files`.
+7. Flag a member: `e`, select `c.rs`, `m`, a note, Enter; `c.rs` leaves as its own row
+   with the flag mark and `[seen]`; `[seen] 1 file` remains, still open.
+8. Accept the group: select it, `a` is refused (`A accepts the group`), `A` says
+   `accepted [seen] 1 file`, `z` says `undid accept of a.rs` and the group is back.
+9. Accept all: ten scratch files
+   (`for i in 1 2 3 4 5 6 7 8 9 10; do echo "note $i" > note-$i.txt; done`) so `ctrl-a`
+   asks; the modal says `Accept all 13 files in demo?` and
+   `0 grouped upstream · 1 grouped seen · 0 collapsed`; `y` empties the list; then
+   `git add -A && git commit -qm "feat-x work"` so the next switch starts clean.
+10. The rebase variant: `git switch run-2` shows `d.rs` and `e.rs`, `ctrl-a`;
+    `git switch feat-y`, empty; `git rebase run-2`, `[seen] 2 files`, accepted on `run-2`.
+11. The squash-merge variant: `git switch feat-z`, empty; `git merge --squash run-2`,
+    `[seen] 2 files`.
+12. Nothing hidden: `lastcall status` (the printed line carries the sandbox's
+    `LASTCALL_STATE_DIR` and `LASTCALL_CONFIG`) lists `d.rs` and `e.rs` with `[seen]` and
+    the line `[seen] 2 files`; `--json` shows a `seen_on` list holding `run-2` on each row
+    and a group of kind `seen`.
+
+The scratch files in step 9 are there because the accept-all modal only asks above ten
+files; without them `ctrl-a` accepts at once and there is no count to read.
 
 ## Where it sits among the other tools
 

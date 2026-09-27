@@ -12,7 +12,7 @@ expression: frame
 "│  main · 2 files          │+the reviewer gets to read this line all the way   │"
 "│  A u1  +1 −0  [upstream] │+to its end, because the pane wrapped it instead   │"
 "│  A u2  +2 −0  [mixed]    │+of cutting it off wherever the window happened to │"
-"│  upstream · 1 file       │+stop                                              │"
+"│  [upstream] 1 file       │+stop                                              │"
 "│──────────────────────────│ line 4                                            │"
 "│W/notes                   │ line 5                                            │"
 "│  draft · 1 file          │-line 6                                            │"

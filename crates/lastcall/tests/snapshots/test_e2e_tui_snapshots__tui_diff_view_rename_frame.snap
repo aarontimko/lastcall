@@ -13,7 +13,7 @@ expression: frame
 "│  main · 2 files          │+l5                                                                    │"
 "│  A u1  +1 −0  [upstream] │+l6                                                                    │"
 "│  A u2  +2 −0  [mixed]    │+l7                                                                    │"
-"│  upstream · 1 file       │+l8                                                                    │"
+"│  [upstream] 1 file       │+l8                                                                    │"
 "│──────────────────────────│+l9                                                                    │"
 "│W/notes                   │+l10                                                                   │"
 "│  draft · 1 file          │                                                                       │"

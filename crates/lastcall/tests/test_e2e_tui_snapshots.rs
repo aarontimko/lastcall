@@ -24,7 +24,7 @@ use lastcall::tui::tour::{Card, Tour};
 use lastcall_engine::engine::{Engine, EngineOptions, SaveRequest};
 use lastcall_engine::env::Env;
 use lastcall_engine::ops::NoFault;
-use lastcall_engine::scan::{Annotation, Change, Collapsed, Pile};
+use lastcall_engine::scan::{Annotation, Change, Collapsed, GroupKind, Pile};
 use lastcall_engine::store::RootKind;
 use lastcall_engine::watcher::EngineEvent;
 use lastcall_testkit::engine::{open_engine, open_engine_with};
@@ -627,10 +627,29 @@ fn tui_group_view() {
     let mut engine = scene.engine();
     let mut app = app_of(&mut engine);
     let beta = root_named(&engine, "beta");
-    app.select(Some(Selection::Group(beta.clone(), Annotation::Upstream)));
-    assert!(app.roots[&beta].group(Annotation::Upstream).is_some());
+    app.select(Some(Selection::Group(beta.clone(), GroupKind::Upstream)));
+    assert!(app.roots[&beta].group(GroupKind::Upstream).is_some());
     app.handle(Action::Open);
     snapshot("tui_group_view", &app, W, H);
+}
+
+/// A repository's pane with its first two lines selected (the name line and the path):
+/// the band spans the pane's width (the styles file). At this width the hint line is full,
+/// so `v select  y copy` has dropped, as it does beside a file's diff.
+#[test]
+fn tui_root_pane_selection() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    let alpha = root_named(&engine, "alpha");
+    app.select(Some(Selection::Root(alpha)));
+    app.handle(Action::FocusToggle);
+    assert_eq!(app.handle(Action::Select).0, Changed::Yes);
+    app.handle(Action::NavDown);
+    assert_eq!(app.sel.map(|s| s.range()), Some((0, 1)));
+    let (frame, _) = draw(&app, W, H);
+    assert!(frame.contains("~/W/alpha"), "{frame}");
+    snapshot("tui_root_pane_selection", &app, W, H);
 }
 
 #[test]
@@ -2457,4 +2476,87 @@ fn tui_wrap_capped_line() {
         "and the line after the capped one is still reachable:\n{frame}"
     );
     snapshot("tui_wrap_capped_line", &app, W, H);
+}
+
+// --- the seen fold (Phase 14 B) ------------------------------------------------------------
+
+/// The cherry-pick scene over the three-root fixture: on alpha, `run-1` commits five
+/// files under `s/` and they are accepted there (and nothing else is); back on `main`, a
+/// fresh `feat-x` cherry-picks the run, so the five come back as rows whose content
+/// `run-1` already accepted and fold into `[seen] 5 files`. alpha's own pending rows stay
+/// as they were.
+fn cherry_pick_scene() -> (Scene, Engine, App, PathBuf) {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let alpha = root_named(&engine, "alpha");
+    let repo = scene.repo("alpha");
+    engine.scan(&alpha).expect("first sight on main");
+    repo.checkout_b("run-1").unwrap();
+    let names = ["s/a.rs", "s/b.rs", "s/c.rs", "s/d.rs", "s/e.rs"];
+    for (i, name) in names.iter().enumerate() {
+        repo.write(name, format!("fn run_{i}() {{}}\n"));
+    }
+    let mut add = vec!["add", "--"];
+    add.extend(names);
+    repo.git(&add).unwrap();
+    repo.git(&["commit", "-q", "-m", "run-1 work"]).unwrap();
+    let pile = engine.scan(&alpha).expect("run-1 scans");
+    let rendered: Vec<lastcall_engine::ops::Rendered> = names
+        .iter()
+        .map(|n| lastcall_engine::ops::Rendered::of(pile.row(n.as_bytes()).expect(n)))
+        .collect();
+    let out = engine
+        .ops(&alpha)
+        .unwrap()
+        .accept_group(&rendered, pile.seen_branch.as_deref(), &NoFault)
+        .unwrap();
+    assert!(out.ok(), "{out:?}");
+    repo.checkout("main").unwrap();
+    engine.scan(&alpha).expect("main scans");
+    repo.checkout_b("feat-x").unwrap();
+    engine.scan(&alpha).expect("feat-x scans");
+    repo.git(&["cherry-pick", "main..run-1"]).unwrap();
+    // What the watcher's head check does in the loop, so the nav names `feat-x`.
+    engine.inspect_head(&alpha).expect("head");
+    let app = app_of(&mut engine);
+    let group = app.roots[&alpha]
+        .group(GroupKind::Seen)
+        .expect("the seen group");
+    assert_eq!(group.paths.len(), 5, "{group:?}");
+    (scene, engine, app, alpha)
+}
+
+#[test]
+fn tui_seen_group_closed() {
+    let (_scene, _engine, app, _alpha) = cherry_pick_scene();
+    snapshot("tui_seen_group_closed", &app, W, H);
+    snapshot("tui_seen_group_closed_80x24", &app, 80, 24);
+}
+
+#[test]
+fn tui_seen_group_view() {
+    let (_scene, _engine, mut app, alpha) = cherry_pick_scene();
+    app.select(Some(Selection::Group(alpha, GroupKind::Seen)));
+    snapshot("tui_seen_group_view", &app, W, H);
+    snapshot("tui_seen_group_view_80x24", &app, 80, 24);
+}
+
+#[test]
+fn tui_seen_group_open() {
+    let (_scene, _engine, mut app, alpha) = cherry_pick_scene();
+    app.select(Some(Selection::Group(alpha.clone(), GroupKind::Seen)));
+    assert_eq!(app.handle(Action::Expand), (Changed::Yes, None));
+    snapshot("tui_seen_group_open", &app, W, H);
+    snapshot("tui_seen_group_open_80x24", &app, 80, 24);
+    // A member is an ordinary row: its diff, with the `[seen]` badge on the header.
+    select_row(&mut app, &alpha, "s/b.rs");
+    app.handle(Action::Open);
+    snapshot("tui_seen_group_member_diff", &app, W, H);
+}
+
+#[test]
+fn tui_seen_accept_all_modal() {
+    let (_scene, _engine, mut app, _alpha) = cherry_pick_scene();
+    assert_eq!(app.handle(Action::AcceptAll), (Changed::Yes, None));
+    snapshot("tui_seen_accept_all_modal", &app, W, H);
 }

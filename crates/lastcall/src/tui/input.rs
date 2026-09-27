@@ -84,6 +84,10 @@ pub enum Action {
     ToggleWrap,
     /// Ask the loop for a rescan (`Effect::Refresh`); ignored while one is running.
     Refresh,
+    /// `R` (Phase 14 D, Amendment v1.15): read the config file again and apply it
+    /// (`Effect::Reload`); ignored while a reload is running. A file that does not load or
+    /// whose `[keys]` do not parse changes nothing and says why on the status line.
+    Reload,
     Help,
     Quit,
     /// Mouse press at (column, row); the loop resolves it through the last `HitMap` and calls
@@ -508,6 +512,9 @@ pub const DEFAULT_KEYMAP: &[(&str, &[&str])] = &[
     ("jump", &["g"]),
     ("scope", &["w"]),
     ("refresh", &["r"]),
+    // Phase 14 D, directly after `refresh`: the same kind of key (it asks the engine to look
+    // again), and below the 80×24 fold like it.
+    ("reload", &["shift-r"]),
     // This table is the help overlay's display order, and at 80 columns the overlay is one
     // column with room for sixteen rows before the fold. What goes above it is the loop
     // itself: move, open, accept, put back, undo. The keys that only change what the list
@@ -599,6 +606,7 @@ impl Action {
             "jump" => Action::Jump,
             "scope" => Action::ScopeToggle,
             "refresh" => Action::Refresh,
+            "reload" => Action::Reload,
             "help" => Action::Help,
             "quit" => Action::Quit,
             _ => return None,
@@ -671,6 +679,8 @@ impl Action {
             "jump" => "jump to the agent in herdr",
             "scope" => "workspace scope on/off",
             "refresh" => "rescan now",
+            // 22 columns, inside the overlay's 30-column cap (design review F15).
+            "reload" => "reload the config file",
             "help" => "this help",
             "quit" => "quit",
             "scroll_up" => "scroll the diff up",
@@ -1276,6 +1286,44 @@ mod tests {
     /// Amendment v1.14: `wrap` is an action like every other one — two default keys, a
     /// help row inside the overlay's column, a `[keys]` override that replaces both, and a
     /// clash with a key already spoken for that names both actions rather than picking one.
+    /// Phase 14 D: `reload` is a `[keys]` action bound to `shift-r` by default, directly
+    /// after `refresh` in the table (the help overlay's order); `r` stays `refresh`; it
+    /// rebinds like any action; and taking `shift-r` for another action is the duplicate
+    /// error that names both.
+    #[test]
+    fn keys_config_reload_is_shift_r_after_refresh_and_rebinds() {
+        assert_eq!(Action::from_name("reload"), Some(Action::Reload));
+        let described = Action::describe("reload");
+        assert_eq!(described, "reload the config file");
+        assert!(described.chars().count() < 30, "{described:?}");
+        let at = |name: &str| DEFAULT_KEYMAP.iter().position(|(n, _)| *n == name).unwrap();
+        assert_eq!(at("reload"), at("refresh") + 1, "directly after refresh");
+        let km = Keymap::defaults();
+        assert_eq!(to_action(&key('R'), &km), Some(Action::Reload));
+        assert_eq!(to_action(&key('r'), &km), Some(Action::Refresh));
+        let rebound = Keymap::from_config(&keys(&[("reload", &["ctrl-r"])])).unwrap();
+        assert_eq!(
+            to_action(
+                &key_code(KeyCode::Char('r'), KeyModifiers::CONTROL),
+                &rebound
+            ),
+            Some(Action::Reload)
+        );
+        assert_eq!(
+            to_action(&key('R'), &rebound),
+            None,
+            "the default is replaced"
+        );
+        assert_eq!(to_action(&key('r'), &rebound), Some(Action::Refresh));
+        let err = Keymap::from_config(&keys(&[("refresh", &["shift-r"])])).unwrap_err();
+        assert!(matches!(&err, KeymapError::Duplicate { .. }), "{err:?}");
+        let text = err.to_string();
+        assert!(
+            text.contains("refresh") && text.contains("reload"),
+            "{text}"
+        );
+    }
+
     #[test]
     fn keys_config_accepts_the_wrap_action() {
         assert_eq!(Action::from_name("wrap"), Some(Action::ToggleWrap));
@@ -1902,6 +1950,7 @@ mod tests {
             (Action::HideEmpty, "key"),
             (Action::ToggleWrap, "key"),
             (Action::Refresh, "key"),
+            (Action::Reload, "key"),
             (Action::Help, "key"),
             (Action::Quit, "key"),
             (Action::Accept, "key"),
@@ -1974,6 +2023,7 @@ mod tests {
             | Action::HideEmpty
             | Action::ToggleWrap
             | Action::Refresh
+            | Action::Reload
             | Action::Help
             | Action::Quit
             | Action::Press(_, _)
@@ -2006,9 +2056,9 @@ mod tests {
             | Action::Ack
             | Action::Jump
             | Action::ScopeToggle
-            | Action::Herdr(_) => 54,
+            | Action::Herdr(_) => 55,
         };
-        assert_eq!(table.len(), 54);
+        assert_eq!(table.len(), 55);
     }
 
     #[test]

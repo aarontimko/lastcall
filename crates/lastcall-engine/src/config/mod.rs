@@ -46,8 +46,8 @@ pub const DEFAULT_COLLAPSED_GLOBS: &[&str] = &[
     "composer.lock",
 ];
 
-/// Default `ignore_globs`: watch-set noise filters (§6.1).
-pub const DEFAULT_IGNORE_GLOBS: &[&str] = &[
+/// Default `watch_ignore_globs`: watch-set noise filters (§6.1).
+pub const DEFAULT_WATCH_IGNORE_GLOBS: &[&str] = &[
     ".git/**",
     "node_modules/**",
     "target/**",
@@ -71,6 +71,13 @@ pub struct Config {
     /// suffix it reads that one folder. The pattern that picks the folder is the entry
     /// without the suffix, so `notes/**` and `notes` match the same folders.
     pub draft_dirs: Vec<String>,
+    /// Gitignored files a repository's review includes after all (Amendment v1.15, §6.1):
+    /// each entry is one pattern in gitignore grammar, matched against the repository root
+    /// the way a `.gitignore` line is. A gitignored file matching one is listed as an
+    /// ordinary untracked candidate, at any depth, but never from inside an ignored folder
+    /// (git does not descend into one, so nothing there can be re-included). Git roots
+    /// only: a watched folder never applied the user's ignore files in the first place.
+    pub include_gitignored: Vec<String>,
     /// What a draft root's first sight means (§6.2).
     pub draft_initial: DraftInitial,
     /// Generated files rendered as a single accept row.
@@ -78,7 +85,16 @@ pub struct Config {
     /// Files at or above this size are collapsed. Must be > 0.
     pub collapse_size_bytes: u64,
     /// Watch-set noise filters; scope the watcher only, never pending computation (§6.5).
-    pub ignore_globs: Vec<String>,
+    pub watch_ignore_globs: Vec<String>,
+    /// What discovery and a watched folder's review leave out (Amendment v1.15, §6.1):
+    /// globs in the `draft_dirs` grammar (`literal_separator`, so a `*` stays inside one
+    /// folder name), matched against a path relative to the parent directory a root is filed
+    /// under. A repository whose path matches is never listed (never opened, no git spawned
+    /// for it) and the folder walk never enters a matching folder; a watched folder's file
+    /// or nested repository that matches is not a candidate. Never a repository's own files:
+    /// no key hides a real change. A parent directory itself and the launch directory are
+    /// never skipped.
+    pub skip_globs: Vec<String>,
     /// The TUI's opening answer to `t` (Amendment v1.9, §6.1): `false` — the default the
     /// sponsor ruled — lists **every** repo under the parent dirs, the ones with nothing
     /// pending included; `true` starts with those hidden. Engine-side only as a value the
@@ -115,16 +131,18 @@ impl Default for Config {
         Self {
             parent_dirs: Vec::new(),
             draft_dirs: Vec::new(),
+            include_gitignored: Vec::new(),
             draft_initial: DraftInitial::Seen,
             collapsed_globs: DEFAULT_COLLAPSED_GLOBS
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect(),
             collapse_size_bytes: DEFAULT_COLLAPSE_SIZE_BYTES,
-            ignore_globs: DEFAULT_IGNORE_GLOBS
+            watch_ignore_globs: DEFAULT_WATCH_IGNORE_GLOBS
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect(),
+            skip_globs: Vec::new(),
             hide_empty_repos: false,
             search_depth: DEFAULT_SEARCH_DEPTH,
             draft_dir_parents: DEFAULT_DRAFT_DIR_PARENTS,
@@ -420,7 +438,7 @@ impl Config {
                     .count()
                     + 1
             }),
-            message: err.message().to_string(),
+            message: renamed_key_hint(err.message()).unwrap_or_else(|| err.message().to_string()),
         })?;
         config.validate(path)?;
         Ok(config)
@@ -477,6 +495,42 @@ impl Config {
                 )));
             }
         }
+        for entry in &self.include_gitignored {
+            if entry.trim().is_empty() {
+                return Err(invalid(format!(
+                    "include_gitignored entry {entry:?} is empty: write a pattern as you would \
+                     in .gitignore (`z_ignore_*`, `**/*.scratch.md`)"
+                )));
+            }
+            if entry.starts_with('!') {
+                return Err(invalid(format!(
+                    "include_gitignored entry {entry:?} must not begin with `!`: every entry is \
+                     already a re-include, so write the pattern without it"
+                )));
+            }
+            if entry.contains('\n') || entry.contains('\0') {
+                return Err(invalid(format!(
+                    "include_gitignored entry {entry:?} must be one pattern on one line \
+                     (no newline or NUL)"
+                )));
+            }
+        }
+        for entry in &self.skip_globs {
+            if entry.is_empty()
+                || Path::new(entry).is_absolute()
+                || !is_absolute_or_relative_glob(entry)
+            {
+                return Err(invalid(format!(
+                    "skip_globs entry {entry:?} must be a relative glob (non-empty, not \
+                     absolute, no `..` components, no `~`), matched below a parent dir"
+                )));
+            }
+            if let Err(e) = skip_matcher(entry) {
+                return Err(invalid(format!(
+                    "skip_globs entry {entry:?} is not a valid glob: {e}"
+                )));
+            }
+        }
         if let Some(session) = &self.herdr.session
             && (session.trim().is_empty() || session.contains('/'))
         {
@@ -486,6 +540,27 @@ impl Config {
         }
         Ok(())
     }
+}
+
+/// Top-level keys renamed in a release, old name first. The old names are not aliases: a
+/// file that still says one is refused, and [`renamed_key_hint`] puts the new name in the
+/// message in place of toml's list of every valid key.
+const RENAMED_KEYS: &[(&str, &str)] = &[
+    ("review_ignored", "include_gitignored"),
+    ("ignore_globs", "watch_ignore_globs"),
+];
+
+/// The message for a parse error that is an unknown top-level key renamed in a release, or
+/// `None` for any other error. toml says `unknown field `<name>`, expected one of ...`; the
+/// hint applies only when that list names `parent_dirs`, so the key sat in the top-level
+/// table: the same name inside `[ui]`, `[herdr]` or `[update]` keeps toml's own text.
+fn renamed_key_hint(message: &str) -> Option<String> {
+    let name = message.strip_prefix("unknown field `")?.split('`').next()?;
+    if !message.contains("`parent_dirs`") {
+        return None;
+    }
+    let (old, new) = RENAMED_KEYS.iter().find(|(old, _)| *old == name)?;
+    Some(format!("the key `{old}` is now `{new}`: rename it"))
 }
 
 /// The pattern a `draft_dirs` entry picks folders with: the entry without its `/**`
@@ -513,6 +588,28 @@ pub fn draft_entry_walk_depth(entry: &str) -> usize {
         .split('/')
         .count()
         .clamp(1, MAX_SEARCH_DEPTH as usize)
+}
+
+/// The matcher for one `skip_globs` entry: the `draft_dirs` grammar, where a `*` stays
+/// inside one folder name and only a `**` component crosses folders.
+pub fn skip_matcher(entry: &str) -> Result<globset::Glob, globset::Error> {
+    globset::GlobBuilder::new(entry)
+        .literal_separator(true)
+        .build()
+}
+
+/// The `skip_globs` entries as one set. An entry that does not compile is left out
+/// (`validate` refuses one, so only a hand-built `Config` can carry it).
+pub fn skip_set(entries: &[String]) -> globset::GlobSet {
+    let mut builder = globset::GlobSetBuilder::new();
+    for entry in entries {
+        if let Ok(glob) = skip_matcher(entry) {
+            builder.add(glob);
+        }
+    }
+    builder
+        .build()
+        .unwrap_or_else(|_| globset::GlobSet::empty())
 }
 
 /// A `draft_dirs` entry is either absolute or a relative glob: non-empty, not `~`-prefixed,
@@ -600,7 +697,7 @@ draft_dirs = ["_drafts/**", "/abs/drafts"]
 draft_initial = "pending"
 collapsed_globs = ["*.lock"]
 collapse_size_bytes = 1024
-ignore_globs = [".git/**"]
+watch_ignore_globs = [".git/**"]
 hide_empty_repos = true
 search_depth = 3
 
@@ -642,7 +739,7 @@ nav_down = ["down", "j", "ctrl-n"]
         assert_eq!(c.draft_initial, DraftInitial::Pending);
         assert_eq!(c.collapsed_globs, vec!["*.lock"]);
         assert_eq!(c.collapse_size_bytes, 1024);
-        assert_eq!(c.ignore_globs, vec![".git/**"]);
+        assert_eq!(c.watch_ignore_globs, vec![".git/**"]);
         assert!(c.hide_empty_repos);
         assert_eq!(c.search_depth, 3);
         assert!(!c.ui.wrap);
@@ -805,7 +902,7 @@ nav_down = ["down", "j", "ctrl-n"]
             "vendor/**",
             ".venv/**",
         ] {
-            assert!(d.ignore_globs.iter().any(|g| g == noise), "{noise}");
+            assert!(d.watch_ignore_globs.iter().any(|g| g == noise), "{noise}");
         }
     }
 
@@ -1258,6 +1355,227 @@ nav_down = ["down", "j", "ctrl-n"]
         let (env, _) = env_with_config(&dir, "[ui]\nwrapp = true\n");
         let err = load(&env).unwrap_err();
         assert!(err.to_string().contains("unknown field"), "{err}");
+    }
+
+    /// Amendment v1.15 (§6.1, scenario D27): `include_gitignored` is a list of gitignore
+    /// patterns, empty by default. An empty or whitespace entry, one that begins with `!`
+    /// (the negation is the engine's to add) and one spanning lines are load errors naming
+    /// the key; a wrong type is the usual parse error; a leading `/` anchors and is fine.
+    #[test]
+    fn config_include_gitignored_defaults_empty_validates_and_round_trips() {
+        assert!(Config::default().include_gitignored.is_empty());
+        let absent: Config = toml::from_str("parent_dirs = []\n").unwrap();
+        assert_eq!(absent.include_gitignored, Vec::<String>::new());
+
+        let path = Path::new("/x/config.toml");
+        for (bad, says) in [
+            ("", "is empty"),
+            ("   ", "is empty"),
+            ("!z_ignore_*", "must not begin with `!`"),
+            ("a\nb", "one pattern on one line"),
+            ("a\0b", "one pattern on one line"),
+        ] {
+            let c = Config {
+                include_gitignored: vec!["ok_*".to_string(), bad.to_string()],
+                ..Config::default()
+            };
+            let err = c.validate(path).unwrap_err();
+            assert!(matches!(err, ConfigError::Invalid { .. }), "{bad:?}: {err}");
+            let text = err.to_string();
+            assert!(text.contains("include_gitignored"), "{bad:?}: {text}");
+            assert!(text.contains(says), "{bad:?}: {text}");
+            assert!(text.starts_with("config file /x/config.toml: "), "{text}");
+        }
+        for good in [
+            "z_ignore_*",
+            "**/*.scratch.md",
+            "/notes-*.md",
+            "z_ignore/",
+            "a\\ ",
+        ] {
+            let c = Config {
+                include_gitignored: vec![good.to_string()],
+                ..Config::default()
+            };
+            c.validate(path).unwrap_or_else(|e| panic!("{good:?}: {e}"));
+        }
+
+        let dir = TempDir::new("lc-config");
+        let (env, _) = env_with_config(&dir, "include_gitignored = \"z_ignore_*\"\n");
+        let err = load(&env).unwrap_err();
+        assert!(matches!(err, ConfigError::Parse { .. }), "{err}");
+        assert!(
+            err.to_string().contains("include_gitignored") || err.to_string().contains("sequence"),
+            "{err}"
+        );
+        let (env, _) = env_with_config(&dir, "include_gitignored = [\"!x\"]\n");
+        let err = load(&env).unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid { .. }), "{err}");
+
+        let (env, _) = env_with_config(&dir, "include_gitignored = [\"z_ignore_*\"]\n");
+        let c = load(&env).unwrap().config;
+        assert_eq!(c.include_gitignored, vec!["z_ignore_*"]);
+        let text = toml::to_string_pretty(&c).unwrap();
+        assert!(
+            text.contains("include_gitignored = [\"z_ignore_*\"]"),
+            "{text}"
+        );
+        assert_eq!(toml::from_str::<Config>(&text).unwrap(), c);
+    }
+
+    /// Amendment v1.15 (Phase 14 E): `skip_globs` is the `draft_dirs` grammar, relative
+    /// only, absent means empty, and it survives a round trip.
+    #[test]
+    fn config_skip_globs_defaults_empty_validates_and_round_trips() {
+        assert!(Config::default().skip_globs.is_empty());
+        let absent: Config = toml::from_str("parent_dirs = []\n").unwrap();
+        assert_eq!(absent.skip_globs, Vec::<String>::new());
+
+        let path = Path::new("/x/config.toml");
+        for (bad, says) in [
+            ("", "must be a relative glob"),
+            ("/abs/evals", "must be a relative glob"),
+            ("~/evals", "must be a relative glob"),
+            ("a/../b", "must be a relative glob"),
+            ("..", "must be a relative glob"),
+            ("evals/[", "is not a valid glob"),
+        ] {
+            let c = Config {
+                skip_globs: vec!["ok/**".to_string(), bad.to_string()],
+                ..Config::default()
+            };
+            let err = c.validate(path).unwrap_err();
+            assert!(matches!(err, ConfigError::Invalid { .. }), "{bad:?}: {err}");
+            let text = err.to_string();
+            assert!(text.contains("skip_globs"), "{bad:?}: {text}");
+            assert!(text.contains(says), "{bad:?}: {text}");
+        }
+        for good in ["*/z_ignore/**/evals/**", "c1", "evals/*", "**/fixtures"] {
+            let c = Config {
+                skip_globs: vec![good.to_string()],
+                ..Config::default()
+            };
+            c.validate(path).unwrap_or_else(|e| panic!("{good:?}: {e}"));
+        }
+        // The grammar: a `*` stays inside one folder name.
+        let set = skip_set(&["evals/*".to_string()]);
+        assert!(set.is_match("evals/c1"));
+        assert!(!set.is_match("evals/c1/deeper"));
+
+        let dir = TempDir::new("lc-config");
+        let (env, _) = env_with_config(&dir, "skip_globs = [\"/abs\"]\n");
+        let err = load(&env).unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid { .. }), "{err}");
+        let (env, _) = env_with_config(&dir, "skip_globs = [\"*/z_ignore/**/evals/**\"]\n");
+        let c = load(&env).unwrap().config;
+        assert_eq!(c.skip_globs, vec!["*/z_ignore/**/evals/**"]);
+        let text = toml::to_string_pretty(&c).unwrap();
+        assert!(
+            text.contains("skip_globs = [\"*/z_ignore/**/evals/**\"]"),
+            "{text}"
+        );
+        assert_eq!(toml::from_str::<Config>(&text).unwrap(), c);
+    }
+
+    /// Phase 14 I: two keys were renamed in this release, and a file that still says the
+    /// old name is refused (the old keys are not aliases) with the new name in the message,
+    /// in place of toml's list of every valid key, and with the line number kept.
+    #[test]
+    fn config_a_renamed_key_is_refused_with_its_new_name() {
+        let dir = TempDir::new("lc-config");
+        for (old, new) in [
+            ("review_ignored", "include_gitignored"),
+            ("ignore_globs", "watch_ignore_globs"),
+        ] {
+            let (env, path) = env_with_config(&dir, &format!("parent_dirs = []\n\n{old} = []\n"));
+            let err = load(&env).unwrap_err();
+            let text = err.to_string();
+            match err {
+                ConfigError::Parse {
+                    path: p,
+                    line,
+                    message,
+                } => {
+                    assert_eq!(p, path);
+                    assert_eq!(line, Some(3), "{text}");
+                    assert_eq!(
+                        message,
+                        format!("the key `{old}` is now `{new}`: rename it"),
+                        "{text}"
+                    );
+                }
+                other => panic!("expected Parse, got {other:?}"),
+            }
+            assert!(text.contains(&format!("is now `{new}`")), "{text}");
+            assert!(text.contains("line 3"), "{text}");
+            assert!(!text.contains("expected one of"), "{text}");
+        }
+    }
+
+    /// Phase 14 I: the hint is for the two renamed top-level keys only. A look-alike
+    /// unknown key, and an old key name inside a sub-table (which refuses unknown keys
+    /// too), keep toml's own text.
+    #[test]
+    fn config_an_unknown_key_that_was_not_renamed_keeps_tomls_text() {
+        let dir = TempDir::new("lc-config");
+        let (env, _) = env_with_config(&dir, "reviewignored = []\n");
+        let text = load(&env).unwrap_err().to_string();
+        assert!(text.contains("unknown field `reviewignored`"), "{text}");
+        assert!(text.contains("expected one of"), "{text}");
+        assert!(!text.contains("is now"), "{text}");
+        for table in ["ui", "herdr", "update"] {
+            for old in ["review_ignored", "ignore_globs"] {
+                let (env, _) = env_with_config(&dir, &format!("[{table}]\n{old} = []\n"));
+                let err = load(&env).unwrap_err();
+                assert!(
+                    matches!(err, ConfigError::Parse { line: Some(2), .. }),
+                    "[{table}] {old}: {err}"
+                );
+                let text = err.to_string();
+                assert!(
+                    text.contains(&format!("unknown field `{old}`")),
+                    "[{table}] {old}: {text}"
+                );
+                assert!(!text.contains("is now"), "[{table}] {old}: {text}");
+            }
+        }
+    }
+
+    /// Phase 14 I: the new names parse, validate and survive a round trip through TOML
+    /// and JSON under the new names, and neither old name is written back.
+    #[test]
+    fn config_the_renamed_keys_parse_and_round_trip() {
+        let dir = TempDir::new("lc-config");
+        let (env, _) = env_with_config(
+            &dir,
+            "include_gitignored = [\"z_ignore_*\"]\nwatch_ignore_globs = [\"build/**\"]\n",
+        );
+        let c = load(&env).unwrap().config;
+        assert_eq!(c.include_gitignored, vec!["z_ignore_*"]);
+        assert_eq!(c.watch_ignore_globs, vec!["build/**"]);
+        let text = toml::to_string_pretty(&c).unwrap();
+        assert!(
+            text.contains("include_gitignored = [\"z_ignore_*\"]"),
+            "{text}"
+        );
+        assert!(
+            text.contains("watch_ignore_globs = [\"build/**\"]"),
+            "{text}"
+        );
+        assert!(!text.contains("review_ignored"), "{text}");
+        assert!(
+            !text.lines().any(|l| l.starts_with("ignore_globs")),
+            "{text}"
+        );
+        assert_eq!(toml::from_str::<Config>(&text).unwrap(), c);
+        let json = serde_json::to_value(&c).unwrap();
+        assert_eq!(
+            json["include_gitignored"],
+            serde_json::json!(["z_ignore_*"])
+        );
+        assert_eq!(json["watch_ignore_globs"], serde_json::json!(["build/**"]));
+        assert!(json.get("review_ignored").is_none(), "{json}");
+        assert!(json.get("ignore_globs").is_none(), "{json}");
     }
 
     #[test]

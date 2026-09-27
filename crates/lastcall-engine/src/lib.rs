@@ -21,6 +21,7 @@ pub mod paths;
 pub mod restore;
 pub mod roots;
 pub mod scan;
+pub mod seen;
 pub mod status;
 pub mod store;
 pub mod upstream;
