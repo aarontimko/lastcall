@@ -105,6 +105,17 @@ matched from the parent directory a root is filed under (a parent directory, or 
 above a repository found anywhere else). `ignore_globs` and `collapsed_globs` are globs
 matched from the root itself, where a bare name such as `Cargo.lock` matches at any depth.
 
+**Which key for what.** To keep a repository out of the list, a folder of clones say, use
+`skip_globs`. To stop a folder from waking the watcher, use `ignore_globs`; its files still
+show when they change. To review gitignored files as well, use `review_ignored`. To see a
+set of generated files as short rows instead of their diffs, snapshots or lockfiles say,
+use `collapsed_globs` with the folder (`"crates/app/tests/snapshots/**"`): each file stays
+a row you can accept, with its counts, and no diff is read for it. No key hides a change
+inside a repository you see: a tracked or untracked file that changed is always a row, so
+that nothing an agent did goes by unreviewed. To accept many rows at once, `shift-a` on a
+repository's row accepts everything pending in it, and `ctrl-a` accepts everything
+everywhere.
+
 ## `[keys]`
 
 One entry per action: a key spec, or a list of them. An entry **replaces** that action's
