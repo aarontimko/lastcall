@@ -25,7 +25,7 @@ the tag goes on that pull request's merge commit. From the branch, once its work
 ```sh
 git fetch origin && git merge origin/main   # only when main has moved; the bump comes last
 just release-prep 0.4.0    # step 1's commit on this branch; pushes nothing
-git push                   # then the pull request is opened, or the open one takes the commit
+git push -u origin HEAD    # then the pull request is opened, or the open one takes the commit
 just merge                 # required checks green, one yes, the merge commit, main pulled
 just release-tag           # step 2's checks, one yes, the tag, its push, the run watched
 ```
@@ -122,7 +122,8 @@ ideas go to Discussions (Q&A, Ideas).
   for the dependency edge.
 - **The public surface keeps its house style**: README, `CHANGELOG.md`, the four user docs
   under `docs/`, `SECURITY.md`, `CONTRIBUTING.md` and the workflows carry no em-dashes
-  (`AGENTS.md`, `docs/spec/`, the scripts and the `justfile` are exempt from that rule);
+  (`docs/spec/`, the other pages under `docs/dev/` and the shell harness are exempt from
+  that rule; `AGENTS.md`, the `justfile` and the Python scripts carry none and stay so);
   nothing in the tree carries an email address, a home path or the build program's process
   vocabulary outside the design record.
 - **The maintainer pushes and tags; agents do not.** Every branch crosses the network by a

@@ -36,8 +36,9 @@ bump as its last commit, and the tag goes on that pull request's merge commit.
 agent's shell (operations.md, "The maintainer pushes and tags; agents do not"). `prep` is
 anyone's.
 
-RELEASE_DRY_RUN=1 runs every check and prints, instead of running, each command that would
-write a file, a commit or a tag or leave the machine. It is allowed in an agent's shell.
+RELEASE_DRY_RUN=1 runs every check that needs no write (the lockfile's 3/3 check needs
+the write) and prints, instead of running, each command that would write a file, a
+commit or a tag or leave the machine. It is allowed in an agent's shell.
 
 Standard library only, and nothing newer than Python 3.9 (what macOS ships).
 """
@@ -452,9 +453,11 @@ def merged_release(number):
     try:
         oid = json.loads(done.stdout)["mergeCommit"]["oid"]
     except (ValueError, KeyError, TypeError):
-        return None
-    if not ok("git", "cat-file", "-e", oid + "^{commit}"):
-        return None
+        oid = None
+    if not oid or not ok("git", "cat-file", "-e", oid + "^{commit}"):
+        # GitHub can answer null for a moment right after the merge. main was just pulled,
+        # so its tip is that merge unless main moved meanwhile, and the predicate decides.
+        oid = out("git", "rev-parse", "HEAD")
     try:
         check_release_merge(*release_merge_facts(oid))
     except Refusal:
@@ -663,6 +666,9 @@ index 07e4e7c..91925a8 100644
 """
 
 
+SELF_TEST_CHECKS = 63  # raise it with every case added below
+
+
 def cmd_self_test(args):
     if args:
         die("usage: self-test")
@@ -683,10 +689,12 @@ def cmd_self_test(args):
         return None
 
     def refuses(name, fragment, fn, *fn_args):
+        ran[0] += 1
         said = refusal(fn, *fn_args)
-        check(name, said is not None and fragment in said, True)
-        if said is not None and fragment not in said:
-            failures.append("%s: the refusal read %r" % (name, said))
+        if said is None:
+            failures.append("%s: got no refusal, want one saying %r" % (name, fragment))
+        elif fragment not in said:
+            failures.append("%s: the refusal read %r, want %r in it" % (name, said, fragment))
 
     def passes(name, fn, *fn_args):
         check(name + " (no refusal)", refusal(fn, *fn_args), None)
@@ -784,7 +792,17 @@ def cmd_self_test(args):
             BUMP_DIFF.replace('-version = "0.6.0"\n+version = "0.7.0"',
                               '-rust-version = "1.98.0"\n+rust-version = "1.99.0"'), "0.7.0")
     refuses("a merge that bumps to another version", "version line", check_release_merge, 2, BUMP_DIFF, "0.8.0")
+    refuses("a merge that only removes the version line", "version line", check_release_merge, 2,
+            BUMP_DIFF.replace('+version = "0.7.0"\n', ''), "0.7.0")
+    refuses("a merge that moves the version line", "version line", check_release_merge, 2,
+            BUMP_DIFF.replace('-version = "0.6.0"', '-version = "0.7.0"'), "0.7.0")
+    refuses("a merge that sets rust-version to the crate version", "version line", check_release_merge, 2,
+            BUMP_DIFF.replace('-version = "0.6.0"\n+version = "0.7.0"',
+                              '-rust-version = "0.6.0"\n+rust-version = "0.7.0"'), "0.7.0")
 
+    # A hollowed-out self-test (an early return, an empty loop) must not pass as green.
+    if ran[0] < SELF_TEST_CHECKS:
+        failures.append("only %d of the %d checks ran" % (ran[0], SELF_TEST_CHECKS))
     for failure in failures:
         say("self-test FAILED " + failure)
     if failures:
