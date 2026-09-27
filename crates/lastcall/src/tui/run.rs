@@ -2447,6 +2447,47 @@ mod tests {
         assert_eq!(ui.app.keys_for("reload"), ["ctrl-r".to_owned()]);
     }
 
+    /// Phase 14 I: `R` over a file that still says a key's old name is refused with the
+    /// new name and the line, from the same `parse` launch uses, and nothing is applied.
+    #[test]
+    fn run_a_renamed_key_refuses_the_reload_with_its_new_name() {
+        use lastcall_engine::config::Config;
+        use lastcall_testkit::engine::open_engine;
+        use lastcall_testkit::fixture_repo::FixtureRepo;
+        use lastcall_testkit::tmp::TempDir;
+
+        let repo = FixtureRepo::new("run-reload-renamed").unwrap();
+        let state = TempDir::new("lc-run-reload-renamed-state");
+        let conf = TempDir::new("lc-run-reload-renamed-conf");
+        let file = conf.path().join("config.toml");
+        let env = repo
+            .engine_env(state.path())
+            .with_var("LASTCALL_CONFIG", file.to_string_lossy());
+        let mut engine = open_engine(repo.parent_dir(), &env, state.path(), Config::default());
+        let before = engine.config().clone();
+        for (text, says) in [
+            (
+                "ignore_globs = [\"build/**\"]\n",
+                "line 1: the key `ignore_globs` is now `watch_ignore_globs`: rename it",
+            ),
+            (
+                "search_depth = 1\nreview_ignored = [\"z_ignore_*\"]\n",
+                "line 2: the key `review_ignored` is now `include_gitignored`: rename it",
+            ),
+        ] {
+            std::fs::write(&file, text).unwrap();
+            let err = reload_config(&mut engine).expect_err(text);
+            assert_eq!(err, says, "{text:?}");
+            assert_eq!(engine.config(), &before, "{text:?} touched the engine");
+            let mut ui = Ui::new(App::new(), Keymap::defaults());
+            ui.local(Local::Reloaded(Err(err.clone())));
+            assert_eq!(
+                ui.app.status.as_ref().map(|s| s.text.clone()),
+                Some(format!("config not reloaded: {says}"))
+            );
+        }
+    }
+
     fn mouse(kind: MouseEventKind, column: u16, row: u16) -> Event {
         Event::Mouse(MouseEvent {
             kind,

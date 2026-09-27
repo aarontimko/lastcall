@@ -438,7 +438,7 @@ impl Config {
                     .count()
                     + 1
             }),
-            message: err.message().to_string(),
+            message: renamed_key_hint(err.message()).unwrap_or_else(|| err.message().to_string()),
         })?;
         config.validate(path)?;
         Ok(config)
@@ -540,6 +540,27 @@ impl Config {
         }
         Ok(())
     }
+}
+
+/// Top-level keys renamed in a release, old name first. The old names are not aliases: a
+/// file that still says one is refused, and [`renamed_key_hint`] puts the new name in the
+/// message in place of toml's list of every valid key.
+const RENAMED_KEYS: &[(&str, &str)] = &[
+    ("review_ignored", "include_gitignored"),
+    ("ignore_globs", "watch_ignore_globs"),
+];
+
+/// The message for a parse error that is an unknown top-level key renamed in a release, or
+/// `None` for any other error. toml says `unknown field `<name>`, expected one of ...`; the
+/// hint applies only when that list names `parent_dirs`, so the key sat in the top-level
+/// table: the same name inside `[ui]`, `[herdr]` or `[update]` keeps toml's own text.
+fn renamed_key_hint(message: &str) -> Option<String> {
+    let name = message.strip_prefix("unknown field `")?.split('`').next()?;
+    if !message.contains("`parent_dirs`") {
+        return None;
+    }
+    let (old, new) = RENAMED_KEYS.iter().find(|(old, _)| *old == name)?;
+    Some(format!("the key `{old}` is now `{new}`: rename it"))
 }
 
 /// The pattern a `draft_dirs` entry picks folders with: the entry without its `/**`
@@ -1454,6 +1475,70 @@ nav_down = ["down", "j", "ctrl-n"]
             "{text}"
         );
         assert_eq!(toml::from_str::<Config>(&text).unwrap(), c);
+    }
+
+    /// Phase 14 I: two keys were renamed in this release, and a file that still says the
+    /// old name is refused (the old keys are not aliases) with the new name in the message,
+    /// in place of toml's list of every valid key, and with the line number kept.
+    #[test]
+    fn config_a_renamed_key_is_refused_with_its_new_name() {
+        let dir = TempDir::new("lc-config");
+        for (old, new) in [
+            ("review_ignored", "include_gitignored"),
+            ("ignore_globs", "watch_ignore_globs"),
+        ] {
+            let (env, path) = env_with_config(&dir, &format!("parent_dirs = []\n\n{old} = []\n"));
+            let err = load(&env).unwrap_err();
+            let text = err.to_string();
+            match err {
+                ConfigError::Parse {
+                    path: p,
+                    line,
+                    message,
+                } => {
+                    assert_eq!(p, path);
+                    assert_eq!(line, Some(3), "{text}");
+                    assert_eq!(
+                        message,
+                        format!("the key `{old}` is now `{new}`: rename it"),
+                        "{text}"
+                    );
+                }
+                other => panic!("expected Parse, got {other:?}"),
+            }
+            assert!(text.contains(&format!("is now `{new}`")), "{text}");
+            assert!(text.contains("line 3"), "{text}");
+            assert!(!text.contains("expected one of"), "{text}");
+        }
+    }
+
+    /// Phase 14 I: the hint is for the two renamed top-level keys only. A look-alike
+    /// unknown key, and an old key name inside a sub-table (which refuses unknown keys
+    /// too), keep toml's own text.
+    #[test]
+    fn config_an_unknown_key_that_was_not_renamed_keeps_tomls_text() {
+        let dir = TempDir::new("lc-config");
+        let (env, _) = env_with_config(&dir, "reviewignored = []\n");
+        let text = load(&env).unwrap_err().to_string();
+        assert!(text.contains("unknown field `reviewignored`"), "{text}");
+        assert!(text.contains("expected one of"), "{text}");
+        assert!(!text.contains("is now"), "{text}");
+        for table in ["ui", "herdr", "update"] {
+            for old in ["review_ignored", "ignore_globs"] {
+                let (env, _) = env_with_config(&dir, &format!("[{table}]\n{old} = []\n"));
+                let err = load(&env).unwrap_err();
+                assert!(
+                    matches!(err, ConfigError::Parse { line: Some(2), .. }),
+                    "[{table}] {old}: {err}"
+                );
+                let text = err.to_string();
+                assert!(
+                    text.contains(&format!("unknown field `{old}`")),
+                    "[{table}] {old}: {text}"
+                );
+                assert!(!text.contains("is now"), "[{table}] {old}: {text}");
+            }
+        }
     }
 
     /// Phase 14 I: the new names parse, validate and survive a round trip through TOML
