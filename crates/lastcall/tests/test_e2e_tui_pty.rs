@@ -1300,11 +1300,14 @@ fn draft_edited() -> String {
 /// with `f1` above it).
 fn select_until(pty: &mut PtyTui, header: &str) {
     // The walk needs the **nav** focused: in the diff pane `k`/`j` scroll the pane and the
-    // selection never moves. `Esc` (`back`) puts the focus there from either pane and does
-    // nothing else once it is there, so it is safe to send unconditionally. The wait after
-    // it is not cosmetic — a bare `\x1b` is an ambiguous prefix, and a key that lands in
-    // the same read makes it `Alt-<key>`, which swallows the Esc.
-    pty.send(b"\x1b").expect("esc to the nav");
+    // selection never moves. `back` puts the focus there from either pane (clearing a live
+    // selection first) and does nothing else once it is there, so it is safe to send
+    // unconditionally. It is sent as `h`, never as `Esc`: a bare `\x1b` is an ambiguous
+    // prefix, and a `k` that lands in the same read turns it into `Alt-k`, which is no
+    // `back` at all, so the walk would run in the diff pane and never move. `h` is `back`
+    // in the default keymap and no scene that calls this rebinds it; every call site is on
+    // the review screen with no modal open, where `h` and `Esc` are the same action.
+    pty.send(b"h").expect("h to the nav");
     if pty
         .wait_for(Duration::from_millis(400), |s| {
             s.contents().contains(header)
@@ -5554,8 +5557,13 @@ fn pty_reload_adds_a_root_keeps_an_accept_and_refuses_a_broken_file() {
     note(&format!(
         "PTY D reload: {line:?} after {reloaded:.3?}; then {refusal:?}; `x` still refreshes"
     ));
-    pty.send(b"\x1b").expect("esc");
-    std::thread::sleep(Duration::from_millis(50));
+    // Any key closes the overlay; `h` (`back`) does it without a bare Esc, and the close
+    // is waited on so `q` below is read as its own key.
+    pty.send(b"h").expect("h closes help");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        !s.contents().contains("any key closes")
+    })
+    .unwrap_or_else(|e| panic!("h closes the help overlay: {e}\n{}", pty.screen_text()));
 
     let since = pty.raw().len();
     pty.send(b"q").expect("q");
