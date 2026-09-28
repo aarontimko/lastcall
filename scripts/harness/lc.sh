@@ -150,13 +150,12 @@ lc_rec_base() {   # lc_rec_base <record dir> <path>
 }
 # R2's second half: arriving on B from A's record, when refs/heads/A still exists and the
 # two tips have a merge-base M (the same commit and "B behind A" both give M = B's head).
-# Of the paths that differ between A's tip and M, a path is folded onto M's entry only when
-# both hold:
-#   1. the record's composed baseline for it equals A's tip entry — the user has finished
-#      with that path on the branch they left;
-#   2. M's entry is already seen state, which is (a) M reachable from the commit the root
-#      was first sighted at, so it was committed before lastcall ever looked, or (b) some
-#      other record composes exactly that entry as its own baseline.
+# Of the paths that differ between A's tip and M, a path is folded onto M's entry when M's
+# entry is already seen state, whatever A's tip holds for it: (a) M reachable from the
+# commit the root was first sighted at, so it was committed before lastcall ever looked, or
+# (b) some other record composes exactly that entry as its own baseline. What the record
+# had not finished on A stays with A, whose record is parked whole before the fold runs.
+# A path whose composed baseline already equals M's entry is skipped as a no-op.
 # A folded path takes M's entry (absent at M -> removed from the record) and loses its
 # override; every other differing path keeps the copy's baseline and over-shows. A gitlink
 # is left alone.
@@ -174,9 +173,9 @@ lc_branch_fold() {
   local cov=0
   if [ -n "$fsh" ] && rg merge-base --is-ancestor "$mb" "$fsh" >/dev/null 2>&1; then cov=1; fi
   # (b): the parked records to ask, built only when (a) did not settle the fold. The record
-  # just parked is left out — it is the same record as the copy now in force, and rule 1
-  # has already required base == tipA while every path here differs between tipA and M, so
-  # it could never match.
+  # just parked is left out: it is the same record as the copy now in force, so it composes
+  # base for every path; a path whose base already equals M's entry is skipped as a no-op
+  # below, and for every other path base differs from M's entry, so it could never match.
   local recs="" d
   if [ "$cov" = 0 ]; then
     for d in "$LC_STATE/branches"/*; do
@@ -190,15 +189,15 @@ lc_branch_fold() {
   local folded="$LC_STATE/fold.paths" info="$LC_STATE/fold.info"
   : > "$folded"; : > "$info"
   printf '%s\n' "$paths" | while IFS= read -r p; do
-    local tipm base tipa seen r
+    local tipm base seen r
     tipm="$(lc_entry rg "$mb" "$p")"
     case "$tipm" in 160000\ *) continue;; esac
     base="$(lc_rec_base "$LC_STATE" "$p")"
     # The record in force composes against its tree, empty when it has none, as the engine's
     # Ops does; only a parked record's UNKNOWN stays UNKNOWN and matches nothing below.
     [ "$base" = UNKNOWN ] && base=ABSENT
-    tipa="$(lc_entry rg "refs/heads/$a" "$p")"
-    [ "$base" = "$tipa" ] || continue
+    # The copy already says what the fold would write: nothing to do for this path.
+    [ "$base" = "$tipm" ] && continue
     seen="$cov"
     if [ "$seen" = 0 ] && [ -n "$recs" ]; then
       while IFS= read -r r; do

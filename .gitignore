@@ -25,4 +25,5 @@ z_ignore/
 .claude/worktrees/
 .claude/settings.local.json
 scripts/harness/work/
+__pycache__/
 .DS_Store

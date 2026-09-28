@@ -223,7 +223,7 @@ assert_str "D23 the override survives the copy" "$h1" "$(lc_baseline f1)"
 git -C "$R" checkout -q main
 assert_pile "D23 back on main: the parked record and its override" "f1"
 assert_str "D23 the override is back with main's record" "$h1" "$(lc_baseline f1)"
-# D24: the fold takes only what the record has accepted at the departed tip.
+# D24: the fold takes only a merge-base entry that is seen state, never a blob no screen has shown.
 # P = f1 (seen at v1), Q = q (absent at c1), f = f2. c2: all three written; c3: P and Q deleted.
 fresh d24; assert_pile "D24 first sight on main at c1" ""
 printf 'P v2\n' > "$R/f1"; printf 'Q w1\n' > "$R/q"; printf 'f v2\n' > "$R/f2"
@@ -252,6 +252,21 @@ lc_accept_file f2; assert_pile "D24B accepted on future" ""
 git -C "$R" checkout -q main
 assert_pile "D24B the fold takes main's v1 for f" ""
 assert_str "D24B the folded path lost its override" "$(git -C "$R" rev-parse "main:f2")" "$(lc_baseline f2)"
+# Variant C: a path the departed branch left unfinished still folds. D24B, then a deletion on
+# b0 nobody accepted: the record's entry (v2) is not b0's tip entry (absent), and the fold no
+# longer cares; main's v1 is the first-sight content, so it folds and nothing shows on main.
+new_repo d24c
+git -C "$R" checkout -q -b b0
+lc_init "$R" "$S" git; lc_first_sight
+printf 'f v2\n' > "$R/f2"; git -C "$R" add -A; git -C "$R" commit -qm "f = v2 on b0"
+lc_accept_file f2; assert_pile "D24C accepted on b0" ""
+git -C "$R" rm -q f2; git -C "$R" commit -qm "f deleted on b0, never accepted"
+assert_pile "D24C the deletion is pending on b0" "f2"
+git -C "$R" checkout -q main
+assert_pile "D24C on main: v1 at the first-sight head folds, the unfinished deletion stays with b0" ""
+assert_str "D24C f's baseline on main is its v1" "$(git -C "$R" rev-parse "main:f2")" "$(lc_baseline f2)"
+git -C "$R" checkout -q b0
+assert_pile "D24C back on b0: the deletion nobody accepted" "f2"
 # D25: a branch cut from the shared ancestor and committed to before lastcall looks.
 # The fold's target is the merge-base of the two tips, so the work accepted on the branch
 # left is not carried onto a branch that never had it.

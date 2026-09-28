@@ -51,6 +51,11 @@ pub enum Action {
     /// The repository row of the listed root **after** the selection's own root; on the
     /// last one, nothing — these jump, they never wrap.
     NavNextRoot,
+    /// Range selection: with the nav focused and a file row selected, move the selection
+    /// one entry down and keep the rows passed as one run of that repository.
+    ExtendDown,
+    /// The same, one entry up.
+    ExtendUp,
     /// Focus the diff for the selected row/group (the cursor stays on that file's current
     /// hunk); on a root entry, select its first row. Bound to `enter`, `l` and `right`.
     Open,
@@ -93,6 +98,11 @@ pub enum Action {
     /// Mouse press at (column, row); the loop resolves it through the last `HitMap` and calls
     /// `App::hit`, so the reducer itself treats `Press` as a no-op.
     Press(u16, u16),
+    /// A left press with shift held (range selection). The loop resolves it through the
+    /// last `HitMap` like [`Action::Press`], holds it behind an undrawn change the same
+    /// way, and calls `App::shift_hit`: a file row of the selected row's repository
+    /// extends the run, anything else is a plain press.
+    ShiftPress(u16, u16),
     /// Pointer moved with the button held (only the divider drag uses it).
     Drag(u16, u16),
     Release,
@@ -502,6 +512,10 @@ pub const DEFAULT_KEYMAP: &[(&str, &[&str])] = &[
     ("nav_bottom", &["end"]),
     ("nav_prev_root", &["alt-up", "{"]),
     ("nav_next_root", &["alt-down", "}"]),
+    // Range selection, beside the moves it extends and below the fold with the jumps. The
+    // descriptions stay inside the right column's width (26) for the same reason theirs do.
+    ("extend_down", &["shift-j", "shift-down"]),
+    ("extend_up", &["shift-k", "shift-up"]),
     ("flag", &["m"]),
     ("unflag", &["shift-m"]),
     ("select", &["v"]),
@@ -576,6 +590,8 @@ impl Action {
             "nav_bottom" => Action::NavBottom,
             "nav_prev_root" => Action::NavPrevRoot,
             "nav_next_root" => Action::NavNextRoot,
+            "extend_down" => Action::ExtendDown,
+            "extend_up" => Action::ExtendUp,
             "open" => Action::Open,
             "back" => Action::Back,
             "focus_toggle" => Action::FocusToggle,
@@ -627,6 +643,8 @@ impl Action {
             "nav_bottom" => "last entry / end of diff",
             "nav_prev_root" => "previous repository",
             "nav_next_root" => "next repository",
+            "extend_down" => "extend selection down",
+            "extend_up" => "extend selection up",
             "open" => "open the diff",
             "back" => "back to the file list (close help)",
             "focus_toggle" => "toggle focus",
@@ -1020,6 +1038,11 @@ pub fn to_action(event: &Event, keymap: &Keymap) -> Option<Action> {
 
 fn mouse_action(m: &MouseEvent) -> Option<Action> {
     Some(match m.kind {
+        // SGR 1006 reports shift as `+4` on the button; crossterm reads it into the
+        // modifiers. Only shift makes a press a different action.
+        MouseEventKind::Down(MouseButton::Left) if m.modifiers.contains(KeyModifiers::SHIFT) => {
+            Action::ShiftPress(m.column, m.row)
+        }
         MouseEventKind::Down(MouseButton::Left) => Action::Press(m.column, m.row),
         MouseEventKind::Drag(MouseButton::Left) => Action::Drag(m.column, m.row),
         MouseEventKind::Up(_) => Action::Release,
@@ -1622,8 +1645,11 @@ mod tests {
                 let key = Key::parse(spec).unwrap();
                 // `shift-a` and `shift-u` are the defaults spelled by their modifier (a
                 // bare `A` would case-fold onto `a`); the canonical form is the capital,
-                // and it round-trips.
-                let upper = spec.strip_prefix("shift-").map(str::to_uppercase);
+                // and it round-trips. A named key keeps its `shift-` (`shift-down`).
+                let upper = spec
+                    .strip_prefix("shift-")
+                    .filter(|k| k.chars().count() == 1)
+                    .map(str::to_uppercase);
                 let canonical = upper.as_deref().unwrap_or(spec);
                 assert_eq!(key.spec(), canonical, "default {spec} is canonical");
             }
@@ -1640,7 +1666,7 @@ mod tests {
             (
                 "hunk_next".to_owned(),
                 KeySpecs::Many(vec![
-                    "shift-k".to_owned(),
+                    "shift-v".to_owned(),
                     "Ctrl-N".to_owned(),
                     "Shift-Tab".to_owned(),
                 ]),
@@ -1652,7 +1678,7 @@ mod tests {
         let table = km.table();
         let row = |n: &str| table.iter().find(|(name, _)| name == n).unwrap().1.clone();
         assert_eq!(row("quit"), vec!["q"]);
-        assert_eq!(row("hunk_next"), vec!["K", "ctrl-n", "backtab"]);
+        assert_eq!(row("hunk_next"), vec!["V", "ctrl-n", "backtab"]);
         assert_eq!(Action::describe("scroll_up"), "scroll the diff up");
         assert_eq!(Action::describe("scroll_down"), "scroll the diff down");
     }
@@ -1937,6 +1963,8 @@ mod tests {
             (Action::NavBottom, "key"),
             (Action::NavPrevRoot, "key"),
             (Action::NavNextRoot, "key"),
+            (Action::ExtendDown, "key"),
+            (Action::ExtendUp, "key"),
             (Action::Open, "key"),
             (Action::Back, "key"),
             (Action::FocusToggle, "key"),
@@ -1979,6 +2007,7 @@ mod tests {
             (Action::Confirm, "modal"),
             (Action::Cancel, "modal"),
             (Action::Press(1, 1), "mouse"),
+            (Action::ShiftPress(1, 1), "mouse"),
             (Action::Drag(1, 1), "mouse"),
             (Action::Release, "mouse"),
             (Action::Resize(80, 24), "terminal"),
@@ -2010,6 +2039,8 @@ mod tests {
             | Action::NavBottom
             | Action::NavPrevRoot
             | Action::NavNextRoot
+            | Action::ExtendDown
+            | Action::ExtendUp
             | Action::Open
             | Action::Back
             | Action::FocusToggle
@@ -2027,6 +2058,7 @@ mod tests {
             | Action::Help
             | Action::Quit
             | Action::Press(_, _)
+            | Action::ShiftPress(_, _)
             | Action::Drag(_, _)
             | Action::Release
             | Action::Resize(_, _)
@@ -2056,9 +2088,57 @@ mod tests {
             | Action::Ack
             | Action::Jump
             | Action::ScopeToggle
-            | Action::Herdr(_) => 55,
+            | Action::Herdr(_) => 58,
         };
-        assert_eq!(table.len(), 55);
+        assert_eq!(table.len(), 58);
+    }
+
+    /// A left press with shift held is its own action (range selection); every other
+    /// modifier leaves it a plain press, and the release and the drag never read them.
+    #[test]
+    fn input_a_shifted_left_press_is_shift_press() {
+        let with = |kind, modifiers| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column: 7,
+                row: 3,
+                modifiers,
+            })
+        };
+        let km = Keymap::defaults();
+        let down = MouseEventKind::Down(MouseButton::Left);
+        assert_eq!(
+            to_action(&with(down, KeyModifiers::SHIFT), &km),
+            Some(Action::ShiftPress(7, 3))
+        );
+        assert_eq!(
+            to_action(&with(down, KeyModifiers::NONE), &km),
+            Some(Action::Press(7, 3))
+        );
+        assert_eq!(
+            to_action(&with(down, KeyModifiers::CONTROL), &km),
+            Some(Action::Press(7, 3))
+        );
+        assert_eq!(
+            to_action(
+                &with(MouseEventKind::Up(MouseButton::Left), KeyModifiers::SHIFT),
+                &km
+            ),
+            Some(Action::Release)
+        );
+        // The keys: `shift-j` / `shift-down` extend down, `shift-k` / `shift-up` up.
+        for (code, modifiers, action) in [
+            (KeyCode::Char('J'), KeyModifiers::SHIFT, Action::ExtendDown),
+            (KeyCode::Down, KeyModifiers::SHIFT, Action::ExtendDown),
+            (KeyCode::Char('K'), KeyModifiers::SHIFT, Action::ExtendUp),
+            (KeyCode::Up, KeyModifiers::SHIFT, Action::ExtendUp),
+        ] {
+            assert_eq!(
+                to_action(&key_code(code, modifiers), &km),
+                Some(action.clone()),
+                "{code:?}"
+            );
+        }
     }
 
     #[test]
@@ -2476,6 +2556,75 @@ mod tests {
         assert_eq!(
             km.lookup(Key::of(&KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT)).unwrap()),
             Some(Action::ShowSnoozed)
+        );
+    }
+
+    /// `shift-j` in a config clashes with `extend_down`; a bare `J` is `j` (the grammar
+    /// case-folds) and clashes with `nav_down`, as it always did. `extend_down` rebinds like
+    /// any action, and `shift-v` is free.
+    #[test]
+    fn keymap_shift_j_clashes_with_extend_down_and_a_capital_j_is_j() {
+        let err = Keymap::from_config(&keys(&[("hunk_next", &["shift-j"])])).unwrap_err();
+        match &err {
+            KeymapError::Duplicate {
+                spec,
+                first,
+                second,
+            } => {
+                assert_eq!(spec, "J");
+                let mut pair = vec![first.as_str(), second.as_str()];
+                pair.sort();
+                assert_eq!(pair, vec!["extend_down", "hunk_next"]);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(err.to_string().contains("extend_down"), "{err}");
+        let err = Keymap::from_config(&keys(&[("hunk_next", &["J"])])).unwrap_err();
+        match &err {
+            KeymapError::Duplicate { first, second, .. } => {
+                let mut pair = vec![first.as_str(), second.as_str()];
+                pair.sort();
+                assert_eq!(pair, vec!["hunk_next", "nav_down"], "J is j");
+            }
+            other => panic!("{other:?}"),
+        }
+        for spec in ["shift-k", "shift-down", "shift-up", "Shift-Down", "K"] {
+            assert!(
+                matches!(
+                    Keymap::from_config(&keys(&[("hunk_next", &[spec])])),
+                    Err(KeymapError::Duplicate { .. })
+                ),
+                "{spec}"
+            );
+        }
+        let km = Keymap::from_config(&keys(&[("extend_down", &["ctrl-j"])])).unwrap();
+        assert_eq!(
+            to_action(&key_code(KeyCode::Char('j'), KeyModifiers::CONTROL), &km),
+            Some(Action::ExtendDown)
+        );
+        assert_eq!(
+            to_action(&key_code(KeyCode::Char('J'), KeyModifiers::SHIFT), &km),
+            None,
+            "the default is gone once rebound"
+        );
+        assert_eq!(
+            to_action(&key_code(KeyCode::Down, KeyModifiers::SHIFT), &km),
+            None
+        );
+        let row = km
+            .table()
+            .into_iter()
+            .find(|(n, _)| n == "extend_down")
+            .unwrap()
+            .1;
+        assert_eq!(row, vec!["ctrl-j"]);
+        assert!(Keymap::from_config(&keys(&[("hunk_next", &["shift-v"])])).is_ok());
+        assert!(
+            Keymap::from_config(&keys(&[
+                ("hunk_next", &["shift-j"]),
+                ("extend_down", &["ctrl-j"])
+            ]))
+            .is_ok()
         );
     }
 }

@@ -30,7 +30,8 @@ gate greps at the end of this page are how that is enforced).
   event sequence always yields the same `App` (`app_unchanged_pile_is_no_change` feeds one
   pile twice and asserts nothing changed). Selection is by root path and row path *bytes*,
   never by index, so a rescan that reorders or removes rows can only move it through
-  `reconcile_selection`'s documented fallback (row → its root entry → nothing). Piles that
+  `reconcile_selection`'s documented fallback (row → its root entry → nothing). A run of
+  rows is one more path beside it, `App.range` ("Range selection" below). Piles that
   arrive before their root's metadata are parked in `orphan_piles` and adopted on the next
   `sync_roots`. `App.now` advances only on `Action::Tick`; render computes status-line ages
   from it, never from `Instant::now()`, which is why two renders of one `App` are identical.
@@ -119,7 +120,8 @@ ten, and a herdr resync that re-derives an identical root map is now no draw at 
 - **Press pushback.** A left `Press` that arrives once the pass is already
   `Changed::Yes` is **held**, not folded: it would be hit-tested against a `HitMap` from a
   frame the user never saw. It is replayed as the first event of the next pass, against the
-  frame it was aimed at (`run_drain_holds_a_press_behind_an_undrawn_change`). Wheel and
+  frame it was aimed at (`run_drain_holds_a_press_behind_an_undrawn_change`). A shifted
+  press is held the same way (`run_drain_holds_a_shift_press_behind_an_undrawn_change`). Wheel and
   release events have no such hazard and fold freely.
 
 `run_drain_folds_a_burst_of_piles_into_one_pass` is the shape test: 17 piles pushed into
@@ -386,7 +388,8 @@ from what the user is looking at:
   the group, or every row of a root (the per-repo fold, asking above `CONFIRM_ABOVE` as
   `^A` does). `ctrl-a` and the header's `[Accept All]` are every listed root. Amendment
   v1.11, the maintainer's ruling of 2026-09-14: before it a repository of ten files or
-  fewer folded on a lowercase `a` with no confirm at all.
+  fewer folded on a lowercase `a` with no confirm at all. With a run of rows live, `A`
+  takes the run and `a` refuses ("Range selection" below).
 - **Requests are built from the held rows, never from the engine.** `accept_requests`
   makes one `(root, AcceptRequest)` per root covered, with `Rendered::of` on the `App`'s own
   `Row` (`rg -n 'Rendered::of' crates/lastcall/src` finds only `app.rs`) and, for a fold,
@@ -430,12 +433,68 @@ from what the user is looking at:
   removed, so a re-added root receives piles again.
 - **Hints follow the selection** so the per-repo fold and the global one are told apart:
   `a accept hunk  A accept file` on a file row **in both panes**, `a/A accept file` on a
-  hunkless file row, `A accept group`, `A accept all in <root>` (both built from
+  hunkless file row, `A accept group`, `A accept 3 files` for a run of rows,
+  `A accept all in <root>` (all built from
   `accept_file_scope`, so the line names the key that will do it), and `^A accept all`. When
   the line would not fit it drops `Tab focus  r refresh` first (always below 70 columns),
   then the file and global accept hints. While the confirm modal is open the line is
   `y confirm  n cancel  q quit` — exactly the keys that work there, the `quit` label being
   the user's own binding (`render_hint_line_under_the_modal_names_only_its_keys`).
+
+### Range selection (`J`, `K`, shift-click)
+
+A run of file rows in one repository, accepted as one by `accept_file`.
+
+- **State.** `App.range: Option<RangeAnchor>`, `RangeAnchor { root, path }`: the anchor is a
+  row path, never an index, and is named apart from `nav_anchor`, the scroll bookkeeping.
+  The run itself is never stored. `App::range_rows()` walks `nav_entries()` from the anchor
+  to the selection on every call and answers `Some((root, paths))`, in nav order, only when
+  both ends are file rows of one root, they differ, and every entry between them is a `Row`
+  of that root that is not an open seen group's member. Members are `Row` entries too,
+  pushed after their `Group` entry, so stopping at `Group` alone would admit a run of
+  members. A one-row run is no run.
+- **Keeping it and dropping it.** `select()` drops the anchor on every path but
+  `extend_to`, which takes the anchor before it moves and puts it back after. A `select()`
+  that drops a run and leaves the selection where it was still answers `Changed::Yes`,
+  because the frame changed. So a plain move, a plain click, the wheel over the nav, the
+  jumps and `nav_top`/`nav_bottom` all clear it. `reconcile_selection` drops the anchor when
+  the live walk stops resolving (either end gone, or a root or a group now between them); a
+  middle row that goes shrinks the run, since the run is computed. `back` peels one layer
+  per key: a live text selection first, then the run (the cursor row stays selected), then
+  the focus.
+- **The reducer arms.** `extend_down` / `extend_up` (`App::extend(1)` / `extend(-1)`) need
+  the nav focused and the neighbour in `nav_entries()` to be a file row of the selected
+  row's root. Anything else is `Changed::No`: from or onto a member, onto a root row or a
+  group row, and with the diff focused. `extend_to(root, path)` sets the anchor to the
+  current row when there is none, moves the selection, and clears the anchor when the
+  cursor lands back on it.
+- **Accept.** While `range_rows()` is `Some`, `accept_file_scope()` is
+  `AcceptScope::Rows { root, paths }`, and `accept_scope()` (the hunk key) refuses with
+  `A accepts the 3 selected files`, the key spelled from the keymap as the group refusal
+  spells it. `accept_requests` builds one `AcceptRequest::Group { rows, rendered_on:
+  pile.seen_branch }` over the held rows in nav order: the engine path a group takes
+  (`Ops::accept_group`, one `UndoOp::AcceptGroup`, so one `z` puts the run back), with no
+  engine change. `counts_of` tallies the same rows, so the confirm (`Accept the 12 selected
+  files in alpha?`, through `App::confirm_rows`), the header control and the hint agree by
+  construction; and while that confirm is open, `range_rows()` answers the confirm's own
+  snapshot narrowed to the rows still held, not the live walk, so a pile that lands
+  underneath (a row arriving inside the span, the anchor leaving) cannot make the dim rows
+  and the dialog disagree about what `y` sends. Completion reads `accepted 3 files in alpha`; the advance rule picks the
+  entry that took the run's place (for an upward run the entry after the anchor, because
+  `neighbour_after` keys on the cursor row); the run is cleared, a partial refusal
+  included. Every other action acts on the cursor row alone.
+- **Render.** `NavLine.in_range`: a row of the run that is not the cursor row is drawn
+  `REVERSED | DIM` and the cursor row plain `REVERSED`, so the `_styles` snapshot tells them
+  apart (`tui_nav_range_selection`). The main view's header control reads
+  `[A accept 3 files]` and the hint's accept slot `A accept 3 files`, offered only while the
+  run holds files; no new drop-order entry.
+- **The mouse half.** A left press with `SHIFT` is `Action::ShiftPress(x, y)`
+  (`mouse_action`; SGR 1006 spells it as button 4, which crossterm decodes as a shifted
+  left press). It resolves through the hit map as `Press` does, and `App::shift_hit` calls
+  `extend_to` on a `NavRow` that `extends_to` admits (a file row of the selected file row's
+  root) and focuses the nav, so the keys carry on from there; any other target, and any
+  open modal, overlay or tour, gets a plain `hit`. Where a shifted press arrives at all is
+  the terminal's choice: "Where the mouse half of a run works", under Keys below.
 
 ## Restore and flag (Phase 7)
 
@@ -1102,7 +1161,7 @@ Defaults (`input::DEFAULT_KEYMAP`, in help-overlay order):
 | `nav_up` / `nav_down` | `up` `k` / `down` `j` | previous / next entry | scroll one line |
 | `nav_page_up` / `nav_page_down` | `pageup` `b` / `pagedown` `space` | a page of entries | a page of lines |
 | `open` | `enter` `l` `right` | open the selected row's diff, cursor on that file's current hunk (on a root: its first row) | — |
-| `back` | `esc` `h` `left` | — | back to the file list with the same row selected; closes help first; never quits |
+| `back` | `esc` `h` `left` | — (with a run of rows live: clears the run, the cursor row stays selected) | back to the file list with the same row selected; closes help first; never quits |
 | `focus_toggle` | `tab` | toggle focus between the panes | |
 | `hunk_next` / `hunk_prev` | `n` `]` / `p` `[` | next / previous hunk (the current hunk's header is a full-width inverted band) | |
 | `toggle_full_paths` | `f` | root-relative paths instead of basenames | |
@@ -1112,13 +1171,14 @@ Defaults (`input::DEFAULT_KEYMAP`, in help-overlay order):
 | `snooze` | `s` | on a repo row: open the snooze modal (a day count), or wake a repo that is already snoozed ("The snooze modal" below); on any other row a notice, not a modal | |
 | `show_snoozed` | `shift-s` | list the snoozed repos too, each with `snoozed until <date>` on its branch line | |
 | `accept` | `a` | on a file row: the one hunk under the diff cursor (a hunkless row — binary, collapsed, deleted, unreadable — whole); on a group or a non-empty repo row: **refused**, the status naming the `accept_file` key (Amendment v1.11); on an empty repo row: `nothing to accept` | the same hunk |
-| `accept_file` | `shift-a` | the selected entry whole — the file, the branch group, or every row of a repo from its row (asks above 10 files). The only key that takes a whole entry | |
+| `accept_file` | `shift-a` | the selected entry whole — the file, the branch group, or every row of a repo from its row (asks above 10 files). The only key that takes a whole entry; with a run of rows live, the run as one | |
 | `accept_all` | `ctrl-a` | accept everything listed, every root (asks above 10 files) | |
 | `restore` | `u` | put the hunk under the diff cursor back to its baseline (a hunkless, deleted, or one-hunk added row: the file, which asks) | the same hunk |
 | `restore_file` | `shift-u` | put the selected file back whole — always asks first | |
 | `undo` | `z` | reverse the selected repo's most recent accept: the paths it covered go back to pending and the selection moves to the first of them. Never touches the working tree; the stack is in the ledger, at most `ledger::UNDO_CAP` = 20 deep, and survives a restart | the same |
 | `nav_top` / `nav_bottom` | `home` / `end` | the first / the last entry of `nav_entries()` | the diff's first line / the line a long `↓` run ends on (a live `v` selection's far end instead) |
 | `nav_prev_root` / `nav_next_root` | `alt-up` `{` / `alt-down` `}` | the repository row of the listed root before / after the selection's own (`Selection::root()`); `{` inside the first root is that root's own row, `}` on the last is `Changed::No` | the same, and the focus comes back to the nav |
+| `extend_down` / `extend_up` | `shift-j` `shift-down` / `shift-k` `shift-up` | from a file row, grow a run of file rows in the same root by the next / previous entry; never onto a root, a group or an open seen group's member ("Range selection" above) | `Changed::No` |
 | `flag` | `m` | flag it with a note: the hunk under the diff cursor (an expansion's hunk counts), or the file from the nav | the same hunk |
 | `unflag` | `shift-m` | clear every flag on the selected file | |
 | `edit` | `i` | open the selected file in the **inline editor**, caret on the current hunk's first changed line ("The inline editor" below) | the same |
@@ -1161,7 +1221,7 @@ The confirm modal answers `y` / `enter` (confirm) and `n` / `esc` (cancel) — f
 `quit` keys, which quit from inside it; nothing else. The note modal and the agent picker
 have their own key sets, printed on the modal itself ("Restore and flag" above).
 
-**The help overlay is two columns when one does not fit.** With 37 bindable rows plus the
+**The help overlay is two columns when one does not fit.** With 41 bindable rows plus the
 modal keys, a single column runs off the bottom of a 30-row terminal, so
 `render::help_columns` splits the rows in half whenever one column would overflow the height
 *and* the pair fits the width — each column sized to its own widest row, because padding both
@@ -1187,7 +1247,10 @@ two-column form's right column: the split is by row count, so a longer descripti
 on the right for some tables, the form then needs 103 columns instead of 100, and 100×30
 folds sixteen keys. (Their first placement, right after the page keys, pushed `Ctrl-A`,
 the two restores and `z` under the 80×24 fold, which reversed the verifier's F3 fix; the
-order is a decision, so the fix was the order.)
+order is a decision, so the fix was the order.) The two extends (2026-09-27) follow the
+jumps, below the same fold, and their descriptions (`extend selection down` / `up`) stay
+inside the same 26 columns; in the two-column form they end the left column, so the overlay
+grew by a row and not by a column.
 A clipped overlay now **says** it is clipped (**ruling R12**): the row above the pinned
 `quit` is a dim `… N more keys (100 columns shows all)`, so `q / Ctrl-C  quit` as the last
 key row can no longer be read as the whole table.
@@ -1197,7 +1260,8 @@ hunk header's `[a accept]` it accepts that hunk, on `[u restore]` it restores it
 `[m flag]` it opens the note modal on it; on the main view's `[A accept file]` /
 `[U restore file]` the file, on the header's `[Accept All]` everything listed; on the diff body it focuses the
 diff; dragging the divider resizes the nav (clamped to 16..=60); the wheel scrolls the pane
-under the pointer, three lines a notch.
+under the pointer, three lines a notch. A shifted left press on a file row of the selected
+row's root extends a run of rows to it ("Range selection" above).
 
 **Selecting text.** `term::enter` turns mouse capture on, so a plain drag is ours, not the
 terminal's. Anywhere in the right pane a plain drag is lastcall's own line selection, which
@@ -1208,6 +1272,14 @@ terminal's own selection (every terminal we target honours the shift override), 
 where OSC 52 is switched off, and it is how the nav is copied. The help overlay says it in its
 second-to-last line (`render::SELECT_NOTE` — `drag selects text · v/y copies`); the last is
 `render::TOUR_NOTE`, `lastcall tui --tour shows the welcome again`.
+
+**Where the mouse half of a run works.** The same split decides whether a shift-click
+reaches lastcall at all. Inside a herdr pane every mouse event reaches the program, the
+shifted press included, so a shift-click on a file row extends the run. Outside herdr,
+shift plus the mouse is the terminal's own selection in every terminal we target, so there
+the shift-click selects text and lastcall never sees it; a terminal that does forward a
+shifted press gets the same extend. The keyboard half, `J` / `shift-down` and `K` /
+`shift-up`, works everywhere, and it is what the docs lead with.
 
 ### Undo (`z`) and snooze (`s`), and the snooze modal (Phase 10)
 
@@ -1656,6 +1728,10 @@ stale (`run_press_resolves_through_the_hit_map_and_resize_invalidates_it`). A pr
 `NavGroup`, `DiffHunk(i)`, `DiffBody`, `Divider`, `HeaderAcceptAll`, `FileAccept`,
 `HunkAccept(i)`, `RootDot`, `HeaderHerdr`) and calls `App::hit`, which is the same reducer path the equivalent key
 takes (`app_hunk_click_equals_hunk_key`, `app_accept_hunk_by_keys_equals_hunk_accept_click`).
+A shifted press becomes `Action::ShiftPress(col, row)`, resolved the same way and handed to
+`App::shift_hit`, which extends a run on a `NavRow` it admits and is `App::hit` for every
+other target (`run_shift_press_on_a_nav_row_equals_the_shift_j_run`,
+`run_shift_press_off_the_run_is_a_plain_press`).
 While the confirm modal is open `hit` ignores every target, and `Ui::event` drops every
 mouse event — press, drag, release, wheel — before it reaches the app at all (the wheel over
 the nav otherwise calls `move_selection` directly, around `handle`'s gate); only its keys,
@@ -1733,6 +1809,17 @@ The scenes are serialized with a mutex; timings are printed with `stderr().write
 they survive libtest's capture. Ratatui draws only the cells that changed, so a fresh
 frame's words are not contiguous in the raw transcript — assert on the `vt100` screen, and
 use the raw log only for escape sequences and ordering.
+
+**A bare Esc is sent only when the scene then waits for its visible effect.** A lone `\x1b`
+is an ambiguous prefix: when the next key lands in the same read, crossterm parses the two as
+`Alt-<key>`, the Esc is swallowed and the key is not the key the scene sent (a slow runner
+does exactly that). So a scene sends `\x1b` only where Esc is what it is testing or the only
+key that does the job (closing the note, snooze or picker modal, cancelling a confirm,
+leaving the inline editor), and waits for the screen to show the result before the next
+key. Where Esc would only mean `back`, the scene sends `h`, which is `back` in the default
+keymap and carries no prefix: `select_until` takes the focus to the nav that way, and a
+help overlay a scene is done with is closed with `h` and waited on. A scene that rebinds
+`back` under `[keys]` sends a key it still binds.
 
 The two Phase 4 scenes drive the accept loop through the same binary:
 

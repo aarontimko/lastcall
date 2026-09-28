@@ -29,17 +29,20 @@ toolchain:
 build:
     cargo build --workspace --all-targets
 
-# rustfmt + clippy (deny warnings) + prove the engine compiles without the herdr client.
+# rustfmt + clippy (deny warnings) + the engine without the herdr client + release.py's self-test.
 lint:
     cargo fmt --all --check
     cargo clippy --workspace --all-targets -- -D warnings
     cargo check -p lastcall-engine --no-default-features
     # Safe wrappers only: `nix`, never a direct `libc` call or dependency. A raw
-    # `libc::open` would be `unsafe`, and `unsafe_code = "forbid"` is workspace-wide —
+    # `libc::open` would be `unsafe`, and `unsafe_code = "forbid"` is workspace-wide:
     # this grep catches the dependency edge before someone reaches for the escape hatch
     # (docs/spec/96-phase7-kickoff.md, design review F3).
     ! grep -rn --include='*.rs' 'libc::' crates
     ! grep -rn --include='Cargo.toml' '^libc' crates
+    # The release script's rules over made-up text: no repository, no network, standard
+    # library only. CI runs it on both runners, and release.yml runs it again on the tag.
+    python3 scripts/release.py self-test
 
 # The canonical unit suite: in-module #[cfg(test)] only. Deterministic, no network, no
 # sockets except the in-test mock, no git repos except temp fixtures.
@@ -60,7 +63,7 @@ test-e2e:
     cargo test --workspace --test 'test_e2e_*'
 
 # What the pre-push hook runs (`just hooks-install`): the integration tier, then every
-# proptest at 64 cases — the store-backed ones in ops::tests::proptests and the text
+# proptest at 64 cases: the store-backed ones in ops::tests::proptests and the text
 # buffer's round trip in tui::textbuf (Phase 8). The unit tier runs them at 8 so every
 # commit stays fast. Run it by hand before a push from a machine without the hook. Each
 # step says what it is doing; the first failure stops the push.
@@ -254,11 +257,13 @@ hooks-install:
 # and prints what it would send.
 #
 #   a change:   push the branch, open its pull request  ->  just merge
-#   a release:  just release-prep 0.4.0  ->  push, pull request  ->  just merge
-#               ->  just release-tag
+#   a release:  the same pull request, with `just release-prep 0.4.0` run on its branch
+#               as the last commit  ->  push  ->  just merge  ->  just release-tag
 # ---------------------------------------------------------------------------------------
 
-# From an up-to-date main: the release branch and its one five-file commit. Pushes nothing.
+# The five files are the version, the lockfile, the dated CHANGELOG and the install pages;
+# the branch must hold all of origin/main first.
+# The release's one commit, on the branch whose pull request carries it (never main). Pushes nothing.
 release-prep VERSION:
     python3 scripts/release.py prep {{quote(VERSION)}}
 
@@ -266,9 +271,11 @@ release-prep VERSION:
 merge NUMBER="":
     python3 scripts/release.py merge {{quote(NUMBER)}}
 
-# On the merged main: the checks release.yml would fail on later, one yes, the tag, its push.
-release-tag:
-    python3 scripts/release.py tag
+# The commit defaults to main's tip; name it when something merged after the release merge.
+# Then the checks release.yml would fail on later, one yes, the tag, its push.
+# On the merged main: tag the merge commit that carried the bump, and only that one.
+release-tag COMMIT="":
+    python3 scripts/release.py tag {{quote(COMMIT)}}
 
 # ---------------------------------------------------------------------------------------
 # Probes and demos (built-artifact passes exercise the release binary)
@@ -382,7 +389,7 @@ probe-watch:
 # git config locations are pointed away exactly as `probe-watch` does). The two env lines
 # are printed first so the same screen can be re-run by hand; edit a file under the printed
 # parent from another shell and watch the counts change. `q` quits. The fixture is left in
-# place for that re-run — remove it with the `rm -rf` printed at the end.
+# place for that re-run; remove it with the `rm -rf` printed at the end.
 probe-tui:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -417,7 +424,7 @@ probe-tui-screen:
 # `probe-tui` with the scans stretched: scripts/slowgit/git goes first on PATH and sleeps
 # before the scan-only git calls (SLOWGIT_MS per call, default 800; four per root), with
 # one root slower (SLOWGIT_SLOW_REPO, default alpha; SLOWGIT_SLOW_MS per call, default
-# 2500) — the launch hold's counter and per-root ✓ marks, as a user with hundreds of repos
+# 2500): the launch hold's counter and per-root ✓ marks, as a user with hundreds of repos
 # or a slow disk would see them (docs/dev/tui.md "Seeing the hold slowly"). Discovery,
 # before the screen opens, runs at full speed. `r` (refresh) is stretched the same way.
 probe-tui-slow:
@@ -442,8 +449,8 @@ tryout SCENARIO="list" *ARGS:
     python3 scripts/tryout.py {{quote(SCENARIO)}} {{ARGS}}
 
 # The performance baseline (docs/dev/bench.md; not a gate): the four scenarios of
-# crates/lastcall/tests/test_bench.rs — 100 clones / 4,000 rows, one 100,000-line diff, a
-# 1,000-file burst under watch, a 50,000-file drop against the row cap — on the RELEASE
+# crates/lastcall/tests/test_bench.rs (100 clones / 4,000 rows, one 100,000-line diff, a
+# 1,000-file burst under watch, a 50,000-file drop against the row cap) on the RELEASE
 # build only, one `BENCH <scenario> <metric>=<value>` stderr line per metric. Fixtures are
 # built outside the timed regions under temp dirs the test removes; about four minutes.
 bench:

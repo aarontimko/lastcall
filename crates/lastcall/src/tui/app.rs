@@ -243,6 +243,15 @@ impl Selection {
     }
 }
 
+/// The fixed end of a run of file rows (range selection): the row `shift-j`, `shift-k` or
+/// a shift-click started from, by path, never by index. The run itself is not stored: it
+/// is whatever [`App::range_rows`] finds between this row and the selection now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RangeAnchor {
+    pub root: PathBuf,
+    pub path: Vec<u8>,
+}
+
 /// Where an entry sits **inside its own repo's** nav block, which `nav_entries` builds as
 /// `[Root, rows by path, groups]`. Ordering by this key rather than by nav index is what
 /// makes "the entry below" mean the same thing before and after the pile that removed the
@@ -619,6 +628,12 @@ pub enum AcceptScope {
     Group {
         root: PathBuf,
         kind: GroupKind,
+    },
+    /// A run of file rows of one root, in nav order, as the range held them when the
+    /// accept was asked; resolved against the held view like every other scope.
+    Rows {
+        root: PathBuf,
+        paths: Vec<Vec<u8>>,
     },
     /// Every row of one root.
     Root(PathBuf),
@@ -1294,6 +1309,9 @@ pub struct App {
     /// neighbours are the other members and then the group row, not the plain rows its
     /// path happens to sort among.
     pub nav_in_group: bool,
+    /// The anchor of a run of file rows in one repository, `None` while the selection is
+    /// one entry. See [`RangeAnchor`] and [`App::range_rows`].
+    pub range: Option<RangeAnchor>,
     pub help: bool,
     pub status: Option<StatusLine>,
     /// Advanced by `Tick`; render computes ages from it, never from `Instant::now()`.
@@ -1431,6 +1449,7 @@ impl App {
             show_snoozed: false,
             nav_anchor: None,
             nav_in_group: false,
+            range: None,
             help: false,
             status: None,
             now: Instant::now(),
@@ -1807,6 +1826,128 @@ impl App {
 
     pub fn listed_roots(&self) -> impl Iterator<Item = &RootView> {
         self.roots.values().filter(|v| self.is_listed(v))
+    }
+
+    /// The run of file rows between the range's anchor and the selection, in nav order,
+    /// with their root: `None` while no range is live, and whenever the run is not one
+    /// unbroken stretch of one repository's file rows. The walk stops at a `Root` or a
+    /// `Group` entry and at an open seen group's member (a `Row` entry too, listed after
+    /// its group), so a run of members is never one. Computed on every call from the held
+    /// piles, so a middle row that left the pile shrinks the run and nothing is stored.
+    ///
+    /// While the confirm modal is asking about a run, the run is the confirm's own
+    /// snapshot, narrowed to the rows still held: the dim rows, the header control, the
+    /// hint and the dialog then name one set, the set `y` will accept, whatever a pile
+    /// applied underneath did to the anchor or added inside the span. Once the modal
+    /// closes the run is the live walk again.
+    pub fn range_rows(&self) -> Option<(PathBuf, Vec<Vec<u8>>)> {
+        if let Some(ConfirmScope::Accept(AcceptScope::Rows { root, paths })) =
+            self.confirm.as_ref().map(|c| &c.scope)
+        {
+            let held: Vec<Vec<u8>> = self
+                .held_rows(root, paths)
+                .iter()
+                .map(|r| r.path.clone())
+                .collect();
+            return (!held.is_empty()).then(|| (root.clone(), held));
+        }
+        self.walk_range()
+    }
+
+    /// The live walk behind [`Self::range_rows`], from the anchor to the selection over
+    /// the held piles as they are now.
+    fn walk_range(&self) -> Option<(PathBuf, Vec<Vec<u8>>)> {
+        let anchor = self.range.as_ref()?;
+        let Some(Selection::Row(root, cursor)) = &self.selection else {
+            return None;
+        };
+        if *root != anchor.root || *cursor == anchor.path {
+            return None;
+        }
+        let view = self.roots.get(root)?;
+        let entries = self.nav_entries();
+        let at = |path: &[u8]| {
+            entries
+                .iter()
+                .position(|e| matches!(e, Selection::Row(r, p) if r == root && p == path))
+        };
+        let (a, c) = (at(&anchor.path)?, at(cursor)?);
+        let mut paths = Vec::new();
+        for entry in &entries[a.min(c)..=a.max(c)] {
+            match entry {
+                Selection::Row(r, p) if r == root && !view.folded(p) => paths.push(p.clone()),
+                _ => return None,
+            }
+        }
+        Some((root.clone(), paths))
+    }
+
+    /// Whether `path` is one of `root`'s file rows on the nav in its own right: a held row
+    /// that is not folded into the seen group. Either end of a run must be one.
+    fn is_file_row(&self, root: &Path, path: &[u8]) -> bool {
+        self.roots
+            .get(root)
+            .is_some_and(|v| v.row(path).is_some() && !v.folded(path))
+    }
+
+    /// Whether the run may be extended to `root`'s row `path` from the selection: both are
+    /// file rows ([`Self::is_file_row`]) of the same repository.
+    fn extends_to(&self, root: &Path, path: &[u8]) -> bool {
+        match &self.selection {
+            Some(Selection::Row(r, at)) => {
+                r == root && self.is_file_row(r, at) && self.is_file_row(root, path)
+            }
+            _ => false,
+        }
+    }
+
+    /// Move the selection to `root`'s row `path` and keep the rows passed as one run: the
+    /// anchor is the range's own, or the row selected now if there was none. Landing back
+    /// on the anchor ends the run, since a run of one row is the plain selection. Refused
+    /// (`Changed::No`, nothing moved) unless [`Self::extends_to`] admits the row.
+    pub fn extend_to(&mut self, root: PathBuf, path: Vec<u8>) -> Changed {
+        if !self.extends_to(&root, &path) {
+            return Changed::No;
+        }
+        let Some(Selection::Row(_, at)) = self.selection.clone() else {
+            return Changed::No;
+        };
+        let before = self.range.clone();
+        let anchor = self.range.take().unwrap_or(RangeAnchor {
+            root: root.clone(),
+            path: at,
+        });
+        let moved = self.select(Some(Selection::Row(root, path.clone())));
+        if anchor.path != path {
+            self.range = Some(anchor);
+        }
+        moved.or(if self.range == before {
+            Changed::No
+        } else {
+            Changed::Yes
+        })
+    }
+
+    /// `extend_down` / `extend_up`: with the nav focused, extend the run one entry, which
+    /// must be a file row of the same repository ([`Self::extend_to`]'s rule). With the
+    /// diff focused they do nothing, where `nav_down` would scroll.
+    fn extend(&mut self, delta: isize) -> Changed {
+        if self.effective_focus() != Focus::Nav {
+            return Changed::No;
+        }
+        let Some(sel) = self.selection.clone() else {
+            return Changed::No;
+        };
+        let entries = self.nav_entries();
+        let next = entries
+            .iter()
+            .position(|e| *e == sel)
+            .and_then(|at| at.checked_add_signed(delta))
+            .and_then(|at| entries.get(at));
+        match next {
+            Some(Selection::Row(root, path)) => self.extend_to(root.clone(), path.clone()),
+            _ => Changed::No,
+        }
     }
 
     /// The selected row, if the selection is a row that still exists.
@@ -2201,6 +2342,14 @@ impl App {
     /// reader who rebound it is sent to their own key. `None` with nothing selected or a
     /// vanished row.
     pub fn accept_scope(&self) -> Option<AcceptAnswer> {
+        // A run of rows is several files: `A` takes it, `a` names it.
+        if let Some((_, paths)) = self.range_rows() {
+            return Some(AcceptAnswer::Refuse(format!(
+                "{} accepts the {} selected files",
+                self.accept_file_key(),
+                paths.len()
+            )));
+        }
         match self.selection.clone()? {
             Selection::Row(root, path) => {
                 let row = self.roots.get(&root)?.row(&path)?;
@@ -2253,6 +2402,9 @@ impl App {
     /// file row, a branch group, or every row of a repository from its row (Amendment
     /// v1.11). Above [`CONFIRM_ABOVE`] files it asks first, exactly as `^A` does.
     pub fn accept_file_scope(&self) -> Option<AcceptScope> {
+        if let Some((root, paths)) = self.range_rows() {
+            return Some(AcceptScope::Rows { root, paths });
+        }
         match self.selection.clone()? {
             Selection::Row(root, path) => {
                 let row = self.roots.get(&root)?.row(&path)?;
@@ -2392,6 +2544,28 @@ impl App {
                     ));
                 }
             }
+            // One group request, as a branch group sends: the engine stages each row and
+            // writes one undo entry for the set, so `z` puts the whole run back.
+            AcceptScope::Rows { root, paths } => {
+                let rendered: Vec<Rendered> = self
+                    .held_rows(root, paths)
+                    .into_iter()
+                    .map(Rendered::of)
+                    .collect();
+                if !rendered.is_empty() {
+                    let rendered_on = self
+                        .roots
+                        .get(root)
+                        .and_then(|v| v.pile.seen_branch.clone());
+                    out.push((
+                        root.clone(),
+                        AcceptRequest::Group {
+                            rows: rendered,
+                            rendered_on,
+                        },
+                    ));
+                }
+            }
             AcceptScope::Root(root) => {
                 if let Some(view) = self.roots.get(root).filter(|v| v.listed()) {
                     out.push((root.clone(), AcceptRequest::All(view.pile.clone())));
@@ -2438,6 +2612,7 @@ impl App {
                 }
             }
             AcceptScope::Group { root, kind } => tally(root, &self.group_rows(root, *kind)),
+            AcceptScope::Rows { root, paths } => tally(root, &self.held_rows(root, paths)),
             AcceptScope::Root(root) => {
                 if let Some(view) = self.roots.get(root) {
                     tally(root, &view.rows().iter().collect::<Vec<_>>());
@@ -2464,6 +2639,15 @@ impl App {
             // come from the scope itself (F11).
             ConfirmScope::Restore(_) | ConfirmScope::Discard { .. } => None,
         }
+    }
+
+    /// Whether the confirm modal is asking about a run of rows: the modal says `the N
+    /// selected files`, not `all N files`, since the repository may hold more.
+    pub fn confirm_rows(&self) -> bool {
+        matches!(
+            self.confirm.as_ref().map(|c| &c.scope),
+            Some(ConfirmScope::Accept(AcceptScope::Rows { .. }))
+        )
     }
 
     /// The restore the confirm modal is asking about, if it is asking about one.
@@ -2568,6 +2752,14 @@ impl App {
             }),
         });
         (Changed::Yes, None)
+    }
+
+    /// The rows of `root` named by `paths` that the held pile still has, in that order.
+    fn held_rows(&self, root: &Path, paths: &[Vec<u8>]) -> Vec<&Row> {
+        let Some(view) = self.roots.get(root) else {
+            return Vec::new();
+        };
+        paths.iter().filter_map(|p| view.row(p)).collect()
     }
 
     fn group_rows(&self, root: &Path, kind: GroupKind) -> Vec<&Row> {
@@ -3860,6 +4052,10 @@ impl App {
             };
         }
         self.advance_after(&scope, before, taken);
+        // The run was the accept's scope; what is left of it (rows refused) is per row.
+        if matches!(scope, AcceptScope::Rows { .. }) {
+            self.range = None;
+        }
         let accepted: usize = files
             .iter()
             .filter(|(r, _)| ok_roots.contains(r))
@@ -3898,6 +4094,11 @@ impl App {
             AcceptScope::Group { kind, .. } => {
                 format!("accepted [{}] {}", kind.name(), plural(files, "file"))
             }
+            AcceptScope::Rows { root, .. } => format!(
+                "accepted {} in {}",
+                plural(files, "file"),
+                self.root_name(root)
+            ),
             AcceptScope::Root(_) | AcceptScope::All => match ok_roots {
                 [one] => format!(
                     "accepted {} in {}",
@@ -3963,6 +4164,7 @@ impl App {
                 AcceptScope::Hunk { root, .. }
                 | AcceptScope::File { root, .. }
                 | AcceptScope::Group { root, .. }
+                | AcceptScope::Rows { root, .. }
                 | AcceptScope::Root(root)
                 | AcceptScope::Bless { root, .. } => Some(root.clone()),
                 AcceptScope::All => None,
@@ -4046,6 +4248,10 @@ impl App {
     /// the order **as it was while this entry was selected**, and by the time it runs
     /// `apply_pile` has already replaced the pile the order came from.
     pub fn select(&mut self, next: Option<Selection>) -> Changed {
+        // Every selection change but the extend path's ends a run of rows, and so does a
+        // plain move that goes nowhere (`j` on the last row, a click on the cursor row):
+        // [`Self::extend_to`] puts the anchor back after calling this.
+        let dropped = self.range.take().is_some();
         // A row folded into a closed seen group is not on the nav: what stands for it is
         // the group row, so that is what gets selected (a stale click can still name it).
         let next = match next {
@@ -4069,7 +4275,7 @@ impl App {
             _ => false,
         };
         if self.selection == next {
-            return Changed::No;
+            return if dropped { Changed::Yes } else { Changed::No };
         }
         // Phase 14 G: the measure a pane built from lines reported is the whole pane, one
         // row taller than a file's body at the least; the next file must lay out against
@@ -4097,6 +4303,16 @@ impl App {
     /// accept, a restore, `t`, `w`, a herdr scope or roots update, the end of the launch
     /// hold — comes through here, so the rule is stated once.
     pub fn reconcile_selection(&mut self) {
+        self.reconcile_entry();
+        // A run whose anchor left the pile (or folded away) is no run; one that lost a
+        // middle row is simply shorter, since it is computed. The live walk, not
+        // `range_rows`: an open confirm shows its snapshot, and its anchor may be gone.
+        if self.range.is_some() && self.walk_range().is_none() {
+            self.range = None;
+        }
+    }
+
+    fn reconcile_entry(&mut self) {
         // Phase 14 B: an open seen group stays open across scans until it disappears.
         let roots = &self.roots;
         self.seen_open.retain(|r| {
@@ -4545,7 +4761,7 @@ impl App {
         if self.tour.is_some()
             && !matches!(
                 action,
-                Tick | Resize(..) | Tour(_) | Quit | Herdr(_) | Press(..)
+                Tick | Resize(..) | Tour(_) | Quit | Herdr(_) | Press(..) | ShiftPress(..)
             )
         {
             return (Changed::No, None);
@@ -4590,7 +4806,13 @@ impl App {
         if self.help
             && !matches!(
                 action,
-                Tick | Resize(..) | Drag(..) | Release | Press(..) | Quit | Tour(_)
+                Tick | Resize(..)
+                    | Drag(..)
+                    | Release
+                    | Press(..)
+                    | ShiftPress(..)
+                    | Quit
+                    | Tour(_)
             )
         {
             self.help = false;
@@ -4651,11 +4873,16 @@ impl App {
                 }
                 None => self.move_selection(1),
             },
-            // Esc peels one layer: a live selection first (cleared, never copied), and only
-            // then the focus. A reader who selected by mistake gets out of it without
-            // losing the pane they were reading.
+            // Esc peels one layer: a live selection first (cleared, never copied), then a
+            // run of rows (the cursor row stays selected), and only then the focus. A
+            // reader who selected by mistake gets out of it without losing the pane they
+            // were reading.
             Back if self.sel.is_some() => {
                 self.sel = None;
+                Changed::Yes
+            }
+            Back if self.range.is_some() => {
+                self.range = None;
                 Changed::Yes
             }
             Back => self.set_focus(Focus::Nav),
@@ -4832,7 +5059,9 @@ impl App {
             }
             Herdr(_) => unreachable!("handled above, before the help gate"),
             Quit => return (Changed::No, Some(Effect::Quit)),
-            Press(_, _) => Changed::No,
+            Press(_, _) | ShiftPress(_, _) => Changed::No,
+            ExtendDown => self.extend(1),
+            ExtendUp => self.extend(-1),
             Drag(x, _) => {
                 if !self.dragging {
                     return (Changed::No, None);
@@ -5031,6 +5260,26 @@ impl App {
                 (Changed::Yes, None)
             }
         }
+    }
+
+    /// A shifted press, resolved like [`Self::hit`]: on a file row of the selected row's
+    /// repository, with a file row selected and nothing open above the screen, it extends
+    /// the run to that row ([`Self::extend_to`]) and leaves the keys in the nav, where
+    /// `shift-j` and `shift-k` go on from it. Anywhere else it is a plain press.
+    pub fn shift_hit(&mut self, target: Target) -> (Changed, Option<Effect>) {
+        let covered = self.tour.is_some()
+            || self.confirm.is_some()
+            || self.note.is_some()
+            || self.picker.is_some()
+            || self.help;
+        if let Target::NavRow(root, path) = &target
+            && !covered
+            && self.extends_to(root, path)
+        {
+            let changed = self.extend_to(root.clone(), path.clone());
+            return (changed.or(self.set_focus(Focus::Nav)), None);
+        }
+        self.hit(target)
     }
 
     /// Fold a resolved mouse target in (the loop maps `Press(x, y)` through the `HitMap`).
@@ -12558,5 +12807,644 @@ mod tests {
             "and the pane did cap it: {} rows",
             table.len()
         );
+    }
+
+    // --- range selection: a run of file rows accepted as one ----------------------------
+
+    /// three_roots at 100×30 (the nav visible, so it can hold the keys) with `at` selected.
+    fn range_app(at: Selection) -> App {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.select(Some(at));
+        assert_eq!(app.effective_focus(), Focus::Nav);
+        app
+    }
+
+    /// alpha replaced by `rows_n(n, 0, 0)` (`p00`..), at 100×30, with `at` selected.
+    fn range_rows_app(n: usize, at: &str) -> App {
+        let mut app = three_roots();
+        app.handle(Action::Resize(100, 30));
+        app.apply(pile_event_seq("alpha", 1, rows_n(n, 0, 0)));
+        app.select(Some(row("alpha", at)));
+        app
+    }
+
+    fn paths(names: &[&str]) -> Vec<Vec<u8>> {
+        names.iter().map(|n| n.as_bytes().to_vec()).collect()
+    }
+
+    fn anchor(root_name: &str, path: &str) -> Option<RangeAnchor> {
+        Some(RangeAnchor {
+            root: root(root_name),
+            path: path.as_bytes().to_vec(),
+        })
+    }
+
+    #[test]
+    fn app_range_shift_j_twice_from_f1_holds_three_rows_in_nav_order() {
+        let mut app = range_app(row("alpha", "f1"));
+        assert_eq!(app.range_rows(), None, "one selected row is no range");
+        assert_eq!(app.handle(Action::ExtendDown), (Changed::Yes, None));
+        assert_eq!(app.handle(Action::ExtendDown), (Changed::Yes, None));
+        assert_eq!(app.selection, Some(row("alpha", "src/parse.rs")));
+        assert_eq!(app.range, anchor("alpha", "f1"));
+        assert_eq!(
+            app.range_rows(),
+            Some((root("alpha"), paths(&["f1", "f2", "src/parse.rs"])))
+        );
+        // Back up one: the run shrinks from the cursor end, the anchor stays.
+        assert_eq!(app.handle(Action::ExtendUp), (Changed::Yes, None));
+        assert_eq!(
+            app.range_rows(),
+            Some((root("alpha"), paths(&["f1", "f2"])))
+        );
+        // Back onto the anchor: a run of one row is no run at all.
+        assert_eq!(app.handle(Action::ExtendUp), (Changed::Yes, None));
+        assert_eq!(app.selection, Some(row("alpha", "f1")));
+        assert_eq!(app.range, None);
+        assert_eq!(app.range_rows(), None);
+    }
+
+    #[test]
+    fn app_range_refuses_a_root_a_group_another_root_and_the_diff_focus() {
+        // Onto the repository row above the first file.
+        let mut app = range_app(row("alpha", "f1"));
+        assert_eq!(app.handle(Action::ExtendUp), (Changed::No, None));
+        assert_eq!(app.selection, Some(row("alpha", "f1")));
+        assert_eq!(app.range, None);
+        // Across into the next repository: its row is the neighbour.
+        let mut app = range_app(row("alpha", "f1"));
+        app.handle(Action::ExtendDown);
+        app.handle(Action::ExtendDown);
+        assert_eq!(app.handle(Action::ExtendDown), (Changed::No, None));
+        assert_eq!(app.selection, Some(row("alpha", "src/parse.rs")));
+        assert_eq!(
+            app.range_rows(),
+            Some((root("alpha"), paths(&["f1", "f2", "src/parse.rs"]))),
+            "kept, not grown into beta"
+        );
+        // Onto a group entry.
+        let mut app = range_app(row("beta", "u2"));
+        let after_u2 = {
+            let entries = app.nav_entries();
+            let at = entries
+                .iter()
+                .position(|e| *e == row("beta", "u2"))
+                .unwrap();
+            entries[at + 1].clone()
+        };
+        assert!(matches!(after_u2, Selection::Group(..)), "{after_u2:?}");
+        assert_eq!(app.handle(Action::ExtendDown), (Changed::No, None));
+        assert_eq!(app.selection, Some(row("beta", "u2")));
+        // From a repository row or a group entry there is no file row to extend from.
+        let mut app = range_app(Selection::Root(root("alpha")));
+        assert_eq!(app.handle(Action::ExtendDown), (Changed::No, None));
+        let mut app = range_app(Selection::Group(root("beta"), GroupKind::Upstream));
+        assert_eq!(app.handle(Action::ExtendUp), (Changed::No, None));
+        // With the diff focused the keys do nothing at all.
+        let mut app = range_app(row("alpha", "f1"));
+        app.handle(Action::FocusToggle);
+        assert_eq!(app.effective_focus(), Focus::Diff);
+        assert_eq!(app.handle(Action::ExtendDown), (Changed::No, None));
+        assert_eq!(app.selection, Some(row("alpha", "f1")));
+        assert_eq!(app.range, None);
+    }
+
+    /// An open seen group's members are `Row` entries too, after the group row: neither
+    /// end of a run may be one (F5), so a run of members is never built.
+    #[test]
+    fn app_range_refuses_an_open_seen_groups_members_either_way() {
+        let mut app = seen_app();
+        app.handle(Action::Resize(100, 30));
+        app.select(Some(seen_group()));
+        app.handle(Action::Expand);
+        assert!(app.seen_open.contains(&root("alpha")));
+        // From the last plain row the neighbour is the group row.
+        app.select(Some(row("alpha", "src/parse.rs")));
+        assert_eq!(app.handle(Action::ExtendDown), (Changed::No, None));
+        // From a member, onto the next member: refused, the selected row is a member.
+        app.select(Some(row("alpha", "s1")));
+        assert_eq!(app.handle(Action::ExtendDown), (Changed::No, None));
+        assert_eq!(app.selection, Some(row("alpha", "s1")));
+        assert_eq!(app.range, None);
+        assert_eq!(app.handle(Action::ExtendUp), (Changed::No, None));
+    }
+
+    #[test]
+    fn app_range_clears_on_a_plain_move_a_plain_click_back_and_the_wheel() {
+        let ranged = || {
+            let mut app = range_app(row("alpha", "f1"));
+            app.handle(Action::ExtendDown);
+            assert_eq!(app.range, anchor("alpha", "f1"));
+            app
+        };
+        let mut app = ranged();
+        assert_eq!(app.handle(Action::NavDown), (Changed::Yes, None));
+        assert_eq!(app.selection, Some(row("alpha", "src/parse.rs")));
+        assert_eq!(app.range, None, "a plain j");
+
+        let mut app = ranged();
+        app.hit(Target::NavRow(root("alpha"), b"f1".to_vec()));
+        assert_eq!(app.range, None, "a plain click");
+        // A plain click on the cursor row itself still drops the run, and says so.
+        let mut app = ranged();
+        let (changed, _) = app.hit(Target::NavRow(root("alpha"), b"f2".to_vec()));
+        assert_eq!(changed, Changed::Yes);
+        assert_eq!(app.selection, Some(row("alpha", "f2")));
+        assert_eq!(app.range, None, "a plain click on the cursor row");
+
+        let mut app = ranged();
+        assert_eq!(app.handle(Action::Back), (Changed::Yes, None));
+        assert_eq!(app.range, None, "back");
+        assert_eq!(
+            app.selection,
+            Some(row("alpha", "f2")),
+            "back keeps the row"
+        );
+
+        // The wheel over the nav is the loop's `move_selection`: a plain move.
+        let mut app = ranged();
+        assert_eq!(app.move_selection(-1), Changed::Yes);
+        assert_eq!(app.range, None, "the wheel");
+    }
+
+    #[test]
+    fn app_range_a_pile_dropping_the_anchor_clears_it_and_one_dropping_a_middle_row_shrinks_it() {
+        let ranged = || {
+            let mut app = range_app(row("alpha", "f1"));
+            app.handle(Action::ExtendDown);
+            app.handle(Action::ExtendDown);
+            app
+        };
+        let mut app = ranged();
+        app.apply(pile_event_seq("alpha", 1, without(pile("alpha"), &["f2"])));
+        assert_eq!(
+            app.range_rows(),
+            Some((root("alpha"), paths(&["f1", "src/parse.rs"]))),
+            "a middle row gone: the run is what is between its ends"
+        );
+        let mut app = ranged();
+        app.apply(pile_event_seq("alpha", 1, without(pile("alpha"), &["f1"])));
+        assert_eq!(app.selection, Some(row("alpha", "src/parse.rs")));
+        assert_eq!(app.range, None, "the anchor gone: no run");
+        assert_eq!(app.range_rows(), None);
+    }
+
+    #[test]
+    fn app_range_accept_refuses_and_names_the_file_key() {
+        let mut app = range_app(row("alpha", "f1"));
+        app.handle(Action::ExtendDown);
+        app.handle(Action::ExtendDown);
+        assert_eq!(
+            app.accept_scope(),
+            Some(AcceptAnswer::Refuse(
+                "A accepts the 3 selected files".to_owned()
+            ))
+        );
+        assert_eq!(app.handle(Action::Accept), (Changed::Yes, None));
+        assert_eq!(status(&app), "A accepts the 3 selected files");
+        assert_eq!(app.accepting, None, "nothing was sent to the engine");
+        // Spelled from the effective keymap, as the group refusal is.
+        for (name, specs) in &mut app.keymap {
+            if name == "accept_file" {
+                *specs = vec!["ctrl-w".to_owned()];
+            }
+        }
+        assert_eq!(
+            app.accept_scope(),
+            Some(AcceptAnswer::Refuse(
+                "Ctrl-W accepts the 3 selected files".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn app_range_accept_file_sends_one_group_request_and_advances_past_the_run() {
+        let mut app = range_rows_app(6, "p01");
+        app.handle(Action::ExtendDown);
+        app.handle(Action::ExtendDown);
+        let scope = AcceptScope::Rows {
+            root: root("alpha"),
+            paths: paths(&["p01", "p02", "p03"]),
+        };
+        assert_eq!(app.accept_file_scope(), Some(scope.clone()));
+        assert_eq!(app.counts_of(&scope).files, 3);
+        let (changed, effect) = app.handle(Action::AcceptFile);
+        assert_eq!(changed, Changed::Yes);
+        let reqs = requests(effect);
+        assert_eq!(reqs.len(), 1, "one request: {reqs:?}");
+        let (asked, AcceptRequest::Group { rows, rendered_on }) = &reqs[0] else {
+            panic!("a group request: {reqs:?}");
+        };
+        assert_eq!(*asked, root("alpha"));
+        assert_eq!(
+            rows.iter().map(|r| r.path.clone()).collect::<Vec<_>>(),
+            paths(&["p01", "p02", "p03"]),
+            "the run's rows, in nav order"
+        );
+        assert_eq!(*rendered_on, None, "the pile's own seen branch");
+
+        let back = without(rows_n(6, 0, 0), &["p01", "p02", "p03"]);
+        assert_eq!(
+            app.accepted(vec![accepted_ok("alpha", 2, back)]),
+            Changed::Yes
+        );
+        assert_eq!(status(&app), "accepted 3 files in alpha");
+        assert_eq!(app.range, None);
+        assert_eq!(
+            app.selection,
+            Some(row("alpha", "p04")),
+            "the entry that took the run's place"
+        );
+    }
+
+    /// An upward run (the anchor below the cursor): `neighbour_after` keys on the cursor
+    /// row and searches the survivors, so the entry after the anchor is where it lands.
+    #[test]
+    fn app_range_upward_accept_lands_on_the_entry_after_the_anchor() {
+        let mut app = range_rows_app(6, "p03");
+        app.handle(Action::ExtendUp);
+        app.handle(Action::ExtendUp);
+        assert_eq!(app.selection, Some(row("alpha", "p01")));
+        assert_eq!(app.range, anchor("alpha", "p03"));
+        assert_eq!(
+            app.range_rows(),
+            Some((root("alpha"), paths(&["p01", "p02", "p03"]))),
+            "nav order whichever way it was extended"
+        );
+        let reqs = requests(app.handle(Action::AcceptFile).1);
+        let AcceptRequest::Group { rows, .. } = &reqs[0].1 else {
+            panic!("a group request: {reqs:?}");
+        };
+        assert_eq!(rows.len(), 3);
+        let back = without(rows_n(6, 0, 0), &["p01", "p02", "p03"]);
+        app.accepted(vec![accepted_ok("alpha", 2, back)]);
+        assert_eq!(app.selection, Some(row("alpha", "p04")));
+        assert_eq!(app.range, None);
+    }
+
+    #[test]
+    fn app_range_over_the_threshold_asks_with_the_count() {
+        let mut app = range_rows_app(12, "p00");
+        for _ in 0..CONFIRM_ABOVE {
+            assert_eq!(app.handle(Action::ExtendDown).0, Changed::Yes);
+        }
+        let names: Vec<String> = (0..=CONFIRM_ABOVE).map(|i| format!("p{i:02}")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let scope = AcceptScope::Rows {
+            root: root("alpha"),
+            paths: paths(&names),
+        };
+        assert_eq!(app.handle(Action::AcceptFile), (Changed::Yes, None));
+        assert_eq!(
+            app.confirm,
+            Some(Confirm {
+                scope: ConfirmScope::Accept(scope)
+            }),
+            "eleven files ask"
+        );
+        assert_eq!(
+            app.confirm_counts().map(|c| c.files),
+            Some(CONFIRM_ABOVE + 1)
+        );
+        let reqs = requests(app.handle(Action::Confirm).1);
+        let AcceptRequest::Group { rows, .. } = &reqs[0].1 else {
+            panic!("a group request: {reqs:?}");
+        };
+        assert_eq!(rows.len(), CONFIRM_ABOVE + 1);
+    }
+
+    /// Everything but the file key stays per row: the flag, the restore and the expand act
+    /// on the cursor end of the run.
+    #[test]
+    fn app_range_other_keys_act_on_the_cursor_row_only() {
+        let mut app = range_app(row("alpha", "f1"));
+        app.handle(Action::ExtendDown);
+        assert!(app.range.is_some());
+        let flagged = match app.flag_target() {
+            Some(FlagTarget::Hunk { path, .. } | FlagTarget::File { path, .. }) => path,
+            other => panic!("a flag target: {other:?}"),
+        };
+        assert_eq!(flagged, b"f2");
+        let restored = match app.restore_file_scope() {
+            Some(RestoreScope::File { path, .. }) => path,
+            other => panic!("a file restore: {other:?}"),
+        };
+        assert_eq!(restored, b"f2");
+    }
+
+    fn fold_seen(mut p: Pile, names: &[&str]) -> Pile {
+        for r in &mut p.rows {
+            if names.iter().any(|n| r.path == n.as_bytes()) {
+                r.seen_on = vec!["run-1".to_owned()];
+            }
+        }
+        p
+    }
+
+    /// With the confirm open on a run, a pile that adds a row inside the span: the run
+    /// shown is the confirm's snapshot, so the new row is neither drawn dim nor sent, and
+    /// the header, the hint and the dialog count the same eleven. Once the modal is
+    /// cancelled the live walk takes over and the run holds twelve.
+    #[test]
+    fn app_range_confirm_shows_its_snapshot_when_a_row_arrives_inside_the_run() {
+        let mut app = range_rows_app(12, "p00");
+        for _ in 0..CONFIRM_ABOVE {
+            assert_eq!(app.handle(Action::ExtendDown).0, Changed::Yes);
+        }
+        assert_eq!(app.handle(Action::AcceptFile), (Changed::Yes, None));
+        assert!(app.confirm.is_some());
+        let mut p = rows_n(12, 0, 0);
+        let mut extra = p.rows[0].clone();
+        extra.path = b"p005".to_vec();
+        p.rows.push(extra);
+        p.rows.sort_by(|a, b| a.path.cmp(&b.path));
+        app.apply(pile_event_seq("alpha", 2, p));
+        assert!(app.confirm.is_some(), "the confirm survives the pile");
+        let shown = app.range_rows().expect("the run is still shown").1;
+        assert_eq!(
+            shown.len(),
+            CONFIRM_ABOVE + 1,
+            "the snapshot's eleven: {shown:?}"
+        );
+        assert!(
+            !shown.contains(&b"p005".to_vec()),
+            "p005 arrived after the snapshot"
+        );
+        assert_eq!(
+            app.confirm_counts().map(|c| c.files),
+            Some(CONFIRM_ABOVE + 1)
+        );
+        let Some(scope @ AcceptScope::Rows { .. }) = app.accept_file_scope() else {
+            panic!("the header's scope is the run");
+        };
+        assert_eq!(app.counts_of(&scope).files, CONFIRM_ABOVE + 1);
+        let mut cancelled = app.clone();
+        assert_eq!(cancelled.handle(Action::Cancel), (Changed::Yes, None));
+        let live = cancelled.range_rows().expect("the live run").1;
+        assert_eq!(
+            live.len(),
+            CONFIRM_ABOVE + 2,
+            "the live walk holds p005: {live:?}"
+        );
+        let reqs = requests(app.handle(Action::Confirm).1);
+        let AcceptRequest::Group { rows, .. } = &reqs[0].1 else {
+            panic!("a group request: {reqs:?}");
+        };
+        assert_eq!(
+            rows.len(),
+            CONFIRM_ABOVE + 1,
+            "the snapshot's eleven are accepted"
+        );
+        assert!(
+            rows.iter().all(|r| r.path != b"p005"),
+            "p005 was never shown, never sent"
+        );
+    }
+
+    /// The anchor leaves while the confirm is open: the anchor is dropped (the live walk
+    /// no longer resolves), but the run shown is the snapshot's remaining ten, which is
+    /// what the dialog counts and what `y` sends. Cancelling leaves no run.
+    #[test]
+    fn app_range_confirm_shows_its_snapshot_when_the_anchor_leaves() {
+        let mut app = range_rows_app(12, "p00");
+        for _ in 0..CONFIRM_ABOVE {
+            app.handle(Action::ExtendDown);
+        }
+        app.handle(Action::AcceptFile);
+        app.apply(pile_event_seq(
+            "alpha",
+            2,
+            without(rows_n(12, 0, 0), &["p00"]),
+        ));
+        assert_eq!(app.range, None, "the anchor is gone");
+        assert!(app.confirm.is_some());
+        let shown = app.range_rows().expect("the snapshot is still shown").1;
+        assert_eq!(shown.len(), CONFIRM_ABOVE, "{shown:?}");
+        assert!(!shown.contains(&b"p00".to_vec()));
+        assert_eq!(app.confirm_counts().map(|c| c.files), Some(CONFIRM_ABOVE));
+        let mut cancelled = app.clone();
+        cancelled.handle(Action::Cancel);
+        assert_eq!(
+            cancelled.range_rows(),
+            None,
+            "no anchor, no confirm: no run"
+        );
+        let reqs = requests(app.handle(Action::Confirm).1);
+        let AcceptRequest::Group { rows, .. } = &reqs[0].1 else {
+            panic!("a group request: {reqs:?}");
+        };
+        assert_eq!(rows.len(), CONFIRM_ABOVE);
+    }
+
+    /// `Open` keeps the run: in the diff `a` refuses, `j` scrolls and keeps it, and the
+    /// first `back` clears the run without leaving the diff.
+    #[test]
+    fn app_range_open_keeps_the_run_and_back_in_the_diff_peels_it_first() {
+        let mut app = range_app(row("alpha", "f1"));
+        app.handle(Action::ExtendDown);
+        assert_eq!(app.handle(Action::Open), (Changed::Yes, None));
+        assert_eq!(app.effective_focus(), Focus::Diff);
+        assert!(app.range.is_some(), "Open keeps the run");
+        app.handle(Action::NavDown);
+        assert!(
+            app.range.is_some(),
+            "j in the diff is a scroll, the run stays"
+        );
+        assert_eq!(app.handle(Action::Accept), (Changed::Yes, None));
+        assert_eq!(status(&app), "A accepts the 2 selected files");
+        assert_eq!(app.handle(Action::Back), (Changed::Yes, None));
+        assert_eq!(app.range, None);
+        assert_eq!(
+            app.effective_focus(),
+            Focus::Diff,
+            "still in the diff after one back"
+        );
+        assert_eq!(app.handle(Action::Back), (Changed::Yes, None));
+        assert_eq!(app.effective_focus(), Focus::Nav);
+    }
+
+    /// The whole repository taken as a run lands on the repository row.
+    #[test]
+    fn app_range_of_every_row_lands_on_the_root_row() {
+        let mut app = range_app(row("alpha", "f1"));
+        app.handle(Action::ExtendDown);
+        app.handle(Action::ExtendDown);
+        let reqs = requests(app.handle(Action::AcceptFile).1);
+        assert_eq!(reqs.len(), 1);
+        app.accepted(vec![accepted_ok(
+            "alpha",
+            2,
+            without(pile("alpha"), &["f1", "f2", "src/parse.rs"]),
+        )]);
+        assert_eq!(status(&app), "accepted 3 files in alpha");
+        assert_eq!(app.selection, Some(Selection::Root(root("alpha"))));
+        assert_eq!(app.range, None);
+    }
+
+    /// An undo result selects the first restored path through `select`, so a live run goes.
+    #[test]
+    fn app_range_is_dropped_by_an_undo_result() {
+        let mut app = range_app(row("alpha", "f1"));
+        app.handle(Action::ExtendDown);
+        assert!(app.range.is_some());
+        let (r, res) = undone_ok("alpha", 2, &["src/parse.rs"], pile("alpha"));
+        app.undone(r, res);
+        assert_eq!(app.range, None);
+    }
+
+    /// A scan that folds the anchor into the closed seen group clears the run; one that
+    /// folds a middle row shrinks it; and with the group open the folded anchor is a
+    /// member behind the group row, so the run is gone too (the walk stops at the group).
+    #[test]
+    fn app_range_a_scan_folding_the_anchor_clears_the_run_and_a_middle_row_shrinks_it() {
+        let ranged = || {
+            let mut app = range_app(row("alpha", "f1"));
+            app.handle(Action::ExtendDown);
+            app.handle(Action::ExtendDown);
+            app
+        };
+        let mut app = ranged();
+        app.apply(pile_event_seq(
+            "alpha",
+            2,
+            fold_seen(pile("alpha"), &["f2"]),
+        ));
+        assert!(app.roots[&root("alpha")].folded(b"f2"));
+        assert_eq!(
+            app.range_rows(),
+            Some((root("alpha"), paths(&["f1", "src/parse.rs"])))
+        );
+        let mut app = ranged();
+        app.apply(pile_event_seq(
+            "alpha",
+            2,
+            fold_seen(pile("alpha"), &["f1"]),
+        ));
+        assert_eq!(app.range, None, "the anchor folded away (closed group)");
+        // Open group: the anchor is a member entry after the group row now.
+        let mut app = ranged();
+        app.apply(pile_event_seq("alpha", 2, alpha_seen()));
+        assert_eq!(
+            app.range_rows(),
+            Some((root("alpha"), paths(&["f1", "f2", "src/parse.rs"]))),
+            "the seen rows are folded away below, the run stands"
+        );
+        app.seen_open.insert(root("alpha"));
+        app.apply(pile_event_seq("alpha", 3, fold_seen(alpha_seen(), &["f1"])));
+        assert_eq!(app.range, None, "the anchor is a member of the open group");
+    }
+
+    /// The cursor row folding away: `reconcile_entry` follows it to the group row through
+    /// `select`, which drops the run.
+    #[test]
+    fn app_range_is_dropped_when_the_cursor_row_folds_away() {
+        let mut app = range_app(row("alpha", "f1"));
+        app.handle(Action::ExtendDown);
+        app.handle(Action::ExtendDown);
+        app.apply(pile_event_seq(
+            "alpha",
+            2,
+            fold_seen(pile("alpha"), &["src/parse.rs"]),
+        ));
+        assert_eq!(app.selection, Some(seen_group()));
+        assert_eq!(app.range, None);
+    }
+
+    /// `A` with the run's cursor row refused and the others taken: the run is cleared, the
+    /// refused row stays pending and selected, the status names the refusal.
+    #[test]
+    fn app_range_partial_refusal_clears_the_run_and_keeps_the_refused_row() {
+        let mut app = range_rows_app(6, "p01");
+        app.handle(Action::ExtendDown);
+        app.handle(Action::ExtendDown);
+        app.handle(Action::AcceptFile);
+        let mut acc = accepted_ok("alpha", 2, without(rows_n(6, 0, 0), &["p01", "p02"]));
+        if let Ok(a) = &mut acc.1 {
+            a.outcome
+                .refused
+                .push(lastcall_engine::ops::Refused::Moved {
+                    path: b"p03".to_vec(),
+                    live: None,
+                });
+        }
+        app.accepted(vec![acc]);
+        assert_eq!(app.range, None);
+        assert_eq!(
+            app.selection,
+            Some(row("alpha", "p03")),
+            "the refused cursor row stays"
+        );
+        assert!(status(&app).contains("p03"), "{}", status(&app));
+        assert!(status(&app).contains("not accepted"), "{}", status(&app));
+    }
+
+    /// Both ends refused: the anchor and the cursor survive the accept, so `reconcile`
+    /// alone would leave a two-row run live; `accepted()` clears it itself.
+    #[test]
+    fn app_range_both_ends_refused_still_clears_the_run() {
+        let mut app = range_rows_app(6, "p01");
+        app.handle(Action::ExtendDown);
+        app.handle(Action::ExtendDown);
+        app.handle(Action::AcceptFile);
+        let mut acc = accepted_ok("alpha", 2, without(rows_n(6, 0, 0), &["p02"]));
+        if let Ok(a) = &mut acc.1 {
+            for p in [&b"p01"[..], &b"p03"[..]] {
+                a.outcome
+                    .refused
+                    .push(lastcall_engine::ops::Refused::Moved {
+                        path: p.to_vec(),
+                        live: None,
+                    });
+            }
+        }
+        app.accepted(vec![acc]);
+        assert_eq!(app.selection, Some(row("alpha", "p03")));
+        assert_eq!(app.range, None, "{:?}", app.range_rows());
+    }
+
+    /// A shift-click under the confirm is ignored like a plain click; under the help
+    /// overlay it closes the overlay and extends nothing.
+    #[test]
+    fn app_range_shift_click_under_a_modal_is_a_plain_click() {
+        let mut app = range_rows_app(12, "p00");
+        for _ in 0..10 {
+            app.handle(Action::ExtendDown);
+        }
+        app.handle(Action::AcceptFile);
+        assert!(app.confirm.is_some());
+        let before = app.range_rows();
+        assert_eq!(
+            app.shift_hit(Target::NavRow(root("alpha"), b"p11".to_vec())),
+            (Changed::No, None)
+        );
+        assert_eq!(app.range_rows(), before, "nothing moved under the confirm");
+        assert_eq!(app.selection, Some(row("alpha", "p10")));
+
+        let mut app = range_rows_app(3, "p00");
+        app.handle(Action::Help);
+        assert!(app.help);
+        assert_eq!(
+            app.shift_hit(Target::NavRow(root("alpha"), b"p02".to_vec())),
+            (Changed::Yes, None)
+        );
+        assert!(!app.help, "the overlay closed");
+        assert_eq!(app.range, None);
+        assert_eq!(app.selection, Some(row("alpha", "p00")));
+    }
+
+    /// A shift-click from the diff focus extends the run and brings the focus back to
+    /// the nav, where the run's keys work.
+    #[test]
+    fn app_range_shift_click_from_the_diff_focuses_the_nav() {
+        let mut app = range_rows_app(3, "p00");
+        app.set_focus(Focus::Diff);
+        assert_eq!(app.effective_focus(), Focus::Diff);
+        app.shift_hit(Target::NavRow(root("alpha"), b"p02".to_vec()));
+        assert_eq!(
+            app.range_rows().map(|(_, p)| p),
+            Some(paths(&["p00", "p01", "p02"]))
+        );
+        assert_eq!(app.effective_focus(), Focus::Nav);
     }
 }

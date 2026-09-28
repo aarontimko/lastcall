@@ -23,6 +23,8 @@ expression: frame
 "│               │ End            last entry / end of diff                          │               │"
 "│               │ Alt-↑ / {      previous repository                               │               │"
 "│               │ Alt-↓ / }      next repository                                   │               │"
+"│               │ J / shift-down extend selection down                             │               │"
+"│               │ K / shift-up   extend selection up                               │               │"
 "│               │ m              flag it with a note                               │               │"
 "│               │ M              clear the file's flags                            │               │"
 "│               │ v              select lines                                      │               │"

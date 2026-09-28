@@ -5,6 +5,35 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html). A version's s
 exactly what its GitHub release notes carry, so it is written for the people installing the
 binary rather than for the commit log.
 
+## 0.7.0 - 2026-09-27
+
+### Added
+
+- A run of rows in the list: from a file row, `J` (or shift-down) and `K` (or shift-up)
+  select the next or previous file row as well, within one repository, and `A` accepts the
+  whole run as one, which one `z` puts back. The file header and the hint line count the
+  files the run holds. A shift-click on a file row of the same repository selects the run up
+  to it inside a herdr pane, and in any terminal that passes a shifted click on; elsewhere
+  shift with the mouse stays the terminal's own text selection, and the keys work
+  everywhere. Every other key still acts on the cursor row alone.
+
+### Changed
+
+- `shift-j`, `shift-k`, `shift-down` and `shift-up` are now bound to the new `extend_down`
+  and `extend_up` actions. A config that already binds one of them to something else no
+  longer loads, with an error naming the key and both actions; give the other action a
+  different key, or move `extend_down` or `extend_up`.
+
+### Fixed
+
+- The first visit to a branch cut from an older commit no longer lists a file you already
+  reviewed there. When the branch you left had a later change to that file you had not
+  accepted yet, the file showed as changed on the new branch, though its content there was
+  what you had already seen, and whether it showed depended on whether lastcall was open
+  when you switched. The unfinished change is still waiting for you on the branch you left.
+  The other way round, a file you accepted on the branch you left and then cherry-picked
+  onto the new branch is listed there again, in the seen group, instead of silently matching.
+
 ## 0.6.0 - 2026-09-26
 
 ### Added

@@ -1300,11 +1300,16 @@ fn draft_edited() -> String {
 /// with `f1` above it).
 fn select_until(pty: &mut PtyTui, header: &str) {
     // The walk needs the **nav** focused: in the diff pane `k`/`j` scroll the pane and the
-    // selection never moves. `Esc` (`back`) puts the focus there from either pane and does
-    // nothing else once it is there, so it is safe to send unconditionally. The wait after
-    // it is not cosmetic — a bare `\x1b` is an ambiguous prefix, and a key that lands in
-    // the same read makes it `Alt-<key>`, which swallows the Esc.
-    pty.send(b"\x1b").expect("esc to the nav");
+    // selection never moves. `back` puts the focus there from either pane, one layer per
+    // key: with a right-pane text selection live it clears the selection and stops, so a
+    // caller with one live would need a second `h` (no call site has one: no scene drags
+    // or sends `v` before calling this). Once the focus is in the nav it does nothing else,
+    // so it is safe to send unconditionally. It is sent as `h`, never as `Esc`: a bare `\x1b` is an ambiguous
+    // prefix, and a `k` that lands in the same read turns it into `Alt-k`, which is no
+    // `back` at all, so the walk would run in the diff pane and never move. `h` is `back`
+    // in the default keymap and no scene that calls this rebinds it; every call site is on
+    // the review screen with no modal open, where `h` and `Esc` are the same action.
+    pty.send(b"h").expect("h to the nav");
     if pty
         .wait_for(Duration::from_millis(400), |s| {
             s.contents().contains(header)
@@ -5554,8 +5559,13 @@ fn pty_reload_adds_a_root_keeps_an_accept_and_refuses_a_broken_file() {
     note(&format!(
         "PTY D reload: {line:?} after {reloaded:.3?}; then {refusal:?}; `x` still refreshes"
     ));
-    pty.send(b"\x1b").expect("esc");
-    std::thread::sleep(Duration::from_millis(50));
+    // Any key closes the overlay; `h` (`back`) does it without a bare Esc, and the close
+    // is waited on so `q` below is read as its own key.
+    pty.send(b"h").expect("h closes help");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        !s.contents().contains("any key closes")
+    })
+    .unwrap_or_else(|e| panic!("h closes the help overlay: {e}\n{}", pty.screen_text()));
 
     let since = pty.raw().len();
     pty.send(b"q").expect("q");
@@ -5715,6 +5725,147 @@ fn pty_seen_group_cherry_pick_expand_flag_accept_undo() {
     })
     .unwrap_or_else(|e| panic!("the undo: {e}\n{}", pty.screen_text()));
     note("PTY seen: A accepted [seen] 2 files; z undid accept of 2 files in alpha");
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}
+
+// ---- range selection -------------------------------------------------------------------
+
+/// A shift-click through a real terminal: a click on `f1`, a shift-click on `parse.rs`,
+/// and alpha's three rows are one run. `A` accepts them as one request with one undo
+/// entry, and `z` puts all three back. Nothing between the shift-click and the `A` walks
+/// the nav: `select_until` sends `h`, which is `back`, and `back` clears a run.
+#[test]
+fn pty_range_select_accepts_three_and_undoes_them() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let Some(mut pty) = fx.spawn_tui(&bin()) else {
+        return;
+    };
+    wait_first_piles(&mut pty);
+    assert_eq!(undo_depth(&fx, "alpha"), 0, "nothing accepted yet");
+
+    // (1) a plain click on f1 opens it.
+    let f1_row = pty
+        .find_row(|r| r.starts_with("│  M f1"))
+        .expect("alpha's f1 row is on screen");
+    pty.click(5, f1_row).expect("click f1");
+    pty.wait_for_text("f1  M  +1 −1", Duration::from_secs(5))
+        .unwrap_or_else(|e| panic!("clicking f1 opens it: {e}\n{}", pty.screen_text()));
+
+    // (2) a shift-click on parse.rs: the run is f1, f2 and parse.rs, and the header's
+    // control counts it.
+    let parse_row = pty
+        .find_row(|r| r.starts_with("│  M parse.rs"))
+        .expect("alpha's parse.rs row is on screen");
+    let t = Instant::now();
+    pty.shift_click(5, parse_row).expect("shift-click parse.rs");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        let text = s.contents();
+        text.contains("src/parse.rs  M ") && text.contains("[A accept 3 files]")
+    })
+    .unwrap_or_else(|e| panic!("the run of three: {e}\n{}", pty.screen_text()));
+    note(&format!(
+        "PTY range: the shift-click drew the run after {:.3?}",
+        t.elapsed()
+    ));
+    for (row, name) in [(f1_row, "f1"), (f1_row + 1, "f2"), (parse_row, "parse.rs")] {
+        assert!(
+            pty.inverse_at(row, 3),
+            "{name} is drawn as part of the run:\n{}",
+            pty.screen_text()
+        );
+    }
+
+    // (3) `A` accepts the three: under the confirm threshold, so at once.
+    let t = Instant::now();
+    pty.send(b"A").expect("A");
+    pty.wait_for(OVERLOADED, |s| {
+        let text = s.contents();
+        status_is(s, "accepted 3 files in alpha")
+            && !text.contains("M f1")
+            && !text.contains("M f2")
+            && !text.contains("M parse.rs")
+            && text.contains("3 repos · 3 files")
+    })
+    .unwrap_or_else(|e| panic!("the run accepted: {e}\n{}", pty.screen_text()));
+    note(&format!(
+        "PTY range: A accepted the run after {:.3?}",
+        t.elapsed()
+    ));
+    assert_eq!(
+        undo_depth(&fx, "alpha"),
+        1,
+        "one entry for the three files: {}",
+        fx.ledger("alpha")
+    );
+
+    // (4) `z` puts all three back with the one entry.
+    pty.send(b"z").expect("z");
+    pty.wait_for(OVERLOADED, |s| {
+        let text = s.contents();
+        status_is(s, "undid accept of 3 files in alpha")
+            && text.contains("M f1")
+            && text.contains("M f2")
+            && text.contains("M parse.rs")
+            && text.contains("3 repos · 6 files")
+    })
+    .unwrap_or_else(|e| panic!("the undo: {e}\n{}", pty.screen_text()));
+    assert_eq!(undo_depth(&fx, "alpha"), 0, "the entry was spent");
+
+    let since = pty.raw().len();
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(QUIT_BUDGET).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+    assert_clean_exit(&pty, since);
+}
+
+/// The keyboard half, which works in every terminal: `J` and then `shift-down` from f1
+/// grow the run to alpha's three rows, and `A` accepts them as one entry. The walk to f1
+/// happens before the first extend, never after it.
+#[test]
+fn pty_range_select_by_keys_accepts_three() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = Fixture::build();
+    let Some(mut pty) = fx.spawn_tui(&bin()) else {
+        return;
+    };
+    wait_first_piles(&mut pty);
+    select_until(&mut pty, "f1  M  +1 −1");
+
+    pty.send(b"J").expect("J");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        let text = s.contents();
+        text.contains("f2  M ") && text.contains("[A accept 2 files]")
+    })
+    .unwrap_or_else(|e| panic!("J grew the run to two: {e}\n{}", pty.screen_text()));
+    // shift-down as a terminal sends it: CSI 1;2B, one write.
+    pty.send(b"\x1b[1;2B").expect("shift-down");
+    pty.wait_for(Duration::from_secs(5), |s| {
+        let text = s.contents();
+        text.contains("src/parse.rs  M ") && text.contains("[A accept 3 files]")
+    })
+    .unwrap_or_else(|e| panic!("shift-down grew it to three: {e}\n{}", pty.screen_text()));
+
+    pty.send(b"A").expect("A");
+    pty.wait_for(OVERLOADED, |s| {
+        let text = s.contents();
+        status_is(s, "accepted 3 files in alpha")
+            && !text.contains("M f1")
+            && !text.contains("M parse.rs")
+            && text.contains("3 repos · 3 files")
+    })
+    .unwrap_or_else(|e| panic!("the run accepted: {e}\n{}", pty.screen_text()));
+    assert_eq!(
+        undo_depth(&fx, "alpha"),
+        1,
+        "one entry for the three files: {}",
+        fx.ledger("alpha")
+    );
 
     let since = pty.raw().len();
     pty.send(b"q").expect("q");

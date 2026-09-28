@@ -18,13 +18,14 @@ the scans run on every pull request, and Dependabot files version bumps weekly.
 Releases are cut by hand for the whole v0.1 line (ruling P14 in
 `docs/spec/99-phase9b-release-kickoff.md`). By hand means a person decides each step, not
 that each step is typed out: three `just` targets carry the commands and the checks
-(`scripts/release.py`: Python 3, standard library only). The whole release from a green
-`main`:
+(`scripts/release.py`: Python 3, standard library only). A release is one pull request:
+the branch that carries the change also carries the version bump, as its last commit, and
+the tag goes on that pull request's merge commit. From the branch, once its work is done:
 
 ```sh
-just release-prep 0.4.0    # step 1's branch and commit; pushes nothing
-git push -u origin release/v0.4.0
-                           # then the pull request is opened (gh pr create, or the web page)
+git fetch origin && git merge origin/main   # only when main has moved; the bump comes last
+just release-prep 0.4.0    # step 1's commit on this branch; pushes nothing
+git push -u origin HEAD    # then the pull request is opened, or the open one takes the commit
 just merge                 # required checks green, one yes, the merge commit, main pulled
 just release-tag           # step 2's checks, one yes, the tag, its push, the run watched
 ```
@@ -34,14 +35,25 @@ give it the number. `merge` and `release-tag` refuse inside an agent's shell (se
 rules below); `RELEASE_DRY_RUN=1` in front of any of the three runs the checks, prints what
 it would send and sends nothing. What the targets do, in order:
 
-1. A pull request sets `[workspace.package].version` in `Cargo.toml`, runs
-   `cargo update --workspace` so the lockfile follows, and adds the version's section to
-   `CHANGELOG.md` with its date in the heading (`## 0.2.0 - YYYY-MM-DD`). The release job
+1. `just release-prep <version>` commits five files on the current branch: it sets
+   `[workspace.package].version` in `Cargo.toml`, runs `cargo update --workspace` so the
+   lockfile follows, turns `## Unreleased` in `CHANGELOG.md` into the version's dated
+   heading (`## 0.2.0 - YYYY-MM-DD`), and names the new version in `README.md` and
+   `docs/install.md`. It refuses on `main`, on a tree with changes, a version not later
+   than the crate's and than every `v*` tag on GitHub, a branch that lacks any of
+   `origin/main` (branch protection wants the branch up to date, and bringing `main` in
+   after the bump would put a merge after it), and a tag that exists. The release job
    takes the notes from the first heading that reads `## <version>` followed by a space or
    nothing (an rc uses the section of the version it is a candidate for) and fails, after
    the four builds, when no such section exists.
-2. The maintainer merges it, pulls `main`, and tags the merge commit with an annotated tag
-   named `v` plus the crate version, then pushes that tag. The pre-push hook runs the
+2. The maintainer merges the pull request with `just merge`, which pulls `main` and, when
+   the merge commit carried the bump, says `next: just release-tag`. `just release-tag`
+   tags that merge commit with an annotated tag named `v` plus the crate version and
+   pushes it. It refuses any commit that is not a merge commit whose first-parent diff
+   changes the version line in `Cargo.toml`, so a pull request merged after the release
+   (a Dependabot bump, a docs fix) never ships under the release's number without its own
+   testing. When something did merge after the release merge, tag the release merge by
+   its hash: `just release-tag <hash>` (the refusal names it). The pre-push hook runs the
    integration tier first; let it finish.
 3. The tag starts `.github/workflows/release.yml`. Its `verify` job refuses a tag that is
    not exactly `v<crate version>`, so a tag on the wrong commit fails before anything is
@@ -52,6 +64,23 @@ it would send and sends nothing. What the targets do, in order:
    fresh Ubuntu container on both Linux architectures and takes the update to the new one.
 5. Nothing else. There is no Homebrew tap (post-v1), and publishing to crates.io was never
    decided either way.
+
+A release candidate is prepared the same way, on the branch whose pull request carries it
+(`just release-prep 0.4.0-rc.1`, which leaves the install pages alone), then merged and
+tagged. The final release after it is a branch of its own made from `main` under any name,
+with `just release-prep 0.4.0` as its one commit, and a pull request of its own; `prep`
+never commits on `main`. Two branches prepared to the same version cannot both ship it:
+once the first has merged, the second one's merge no longer changes the version line, and
+`just release-tag` refuses it.
+
+**What is written when.** The design record's line for a release (`v<version>` released by
+the tag on the pull request's merge commit) and the amendments that pull request ratifies
+are written in it unticked, since neither the merge nor the tag has happened when it is
+opened. The next pull request to `main` ticks both with the tag object and the release run
+id, and adds the run to the evidence table at the end of this page in the same commit. No
+pull request exists only to record a release, and nothing is ticked before it happens.
+Releases through `v0.6.0` took three pull requests (the change, a `release/v<version>` bump
+branch cut from `main`, and one recording the tag afterwards); the flow above makes it one.
 
 A rehearsal without a tag is `gh workflow run release.yml --ref <branch>` (add
 `-f targets=all` for the four legs); it uploads the assets as workflow artifacts and creates
@@ -84,7 +113,8 @@ ideas go to Discussions (Q&A, Ideas).
 - **Nothing is ever written inside a repository lastcall watches.** The ledger lives under
   `$LASTCALL_STATE_DIR`, else `$XDG_STATE_HOME/lastcall`, else `~/.local/state/lastcall`.
 - **The crate version equals the tag** (`v0.1.0` for `0.1.0`); an rc is its own crate
-  version (`0.1.0-rc.1`). The release workflow enforces it.
+  version (`0.1.0-rc.1`). The release workflow enforces it. The tag goes on the merge
+  commit that brought the bump, never on a later one; `just release-tag` enforces that.
 - **Every action in `release.yml` is pinned by commit SHA** with its version in a comment,
   because that workflow signs bytes other people run. `ci.yml`, `scans.yml` and
   `herdr-compat.yml` pin by tag.
@@ -92,7 +122,8 @@ ideas go to Discussions (Q&A, Ideas).
   for the dependency edge.
 - **The public surface keeps its house style**: README, `CHANGELOG.md`, the four user docs
   under `docs/`, `SECURITY.md`, `CONTRIBUTING.md` and the workflows carry no em-dashes
-  (`AGENTS.md`, `docs/spec/`, the scripts and the `justfile` are exempt from that rule);
+  (`docs/spec/`, the other pages under `docs/dev/` and the shell harness are exempt from
+  that rule; `AGENTS.md`, the `justfile` and the Python scripts carry none and stay so);
   nothing in the tree carries an email address, a home path or the build program's process
   vocabulary outside the design record.
 - **The maintainer pushes and tags; agents do not.** Every branch crosses the network by a

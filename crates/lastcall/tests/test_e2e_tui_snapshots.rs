@@ -256,6 +256,34 @@ fn tui_nav_three_roots() {
 }
 
 #[test]
+fn tui_nav_range_selection() {
+    let scene = Scene::build();
+    let mut engine = scene.engine();
+    let mut app = app_of(&mut engine);
+    let alpha = root_named(&engine, "alpha");
+    app.handle(Action::NavDown);
+    app.handle(Action::NavDown);
+    assert_eq!(app.handle(Action::ExtendDown).0, Changed::Yes);
+    assert_eq!(app.handle(Action::ExtendDown).0, Changed::Yes);
+    // parse.rs is alpha's last row: the next entry is beta's root, so the run stops.
+    assert_eq!(app.handle(Action::ExtendDown).0, Changed::No);
+    assert_eq!(
+        app.selection,
+        Some(Selection::Row(alpha.clone(), b"src/parse.rs".to_vec()))
+    );
+    let (root, paths) = app.range_rows().expect("a run of three rows");
+    assert_eq!(root, alpha);
+    assert_eq!(
+        paths,
+        vec![b"f1".to_vec(), b"f2".to_vec(), b"src/parse.rs".to_vec()]
+    );
+    let (frame, _) = draw(&app, W, H);
+    assert!(frame.contains("[A accept 3 files]"), "{frame}");
+    assert!(frame.contains("A accept 3 files"), "{frame}");
+    snapshot("tui_nav_range_selection", &app, W, H);
+}
+
+#[test]
 fn tui_nav_counts_update() {
     let scene = Scene::build();
     let mut engine = scene.engine();
