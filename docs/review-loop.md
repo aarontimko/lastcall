@@ -88,7 +88,8 @@ restriction: the keys all work the same.
 
 A third group appears when an agent brings over work you have already reviewed on another
 branch of the same repository: a cherry-pick, a rebase onto a branch you reviewed, or a
-squash-merge of one. Every file whose content matches exactly what you accepted on another
+squash-merge of one, including a pull request squash-merged on GitHub and then pulled, even
+when you deleted its branch first. Every file whose content matches exactly what you accepted on another
 branch folds into one row, `[seen] N files`, instead of being listed again. Selecting it
 says which branches accepted that content and lists the files:
 
@@ -433,7 +434,11 @@ time. Checking out a branch for the first time carries across what you have seen
 the switch itself shows nothing new, and going back later finds that branch's own pile
 waiting. A change that reaches another branch by cherry-pick shows once more on that branch,
 because lastcall never guesses that you have already read it somewhere else. A detached HEAD
-keeps whichever record you were on, and deleting a branch drops what it remembered.
+keeps whichever record you were on. Deleting a branch keeps what you accepted there for 30
+days, for one use only: content that comes back from it, such as its pull request
+squash-merged and pulled, still folds into `[seen]`, and the group names the branch as it
+was. After 30 days, or once 20 more recently deleted branches are kept, it is forgotten and
+those files are ordinary rows again. A new branch created under the same name starts fresh.
 
 lastcall watches the filesystem, so the screen follows an agent as it writes. Where those
 events do not arrive, which happens on some network filesystems and inside some containers,

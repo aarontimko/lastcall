@@ -1027,6 +1027,15 @@ than anything a user waits for. What each one actually does is short enough to w
 | a copy (`v`, then `y`) | **one OSC 52 write**, through the same `execute!` path as every other escape sequence the loop writes: `ESC ] 52 ; c ; <base64> BEL`, encoded in-process by `tui::clipboard::base64`. There is no reply to wait for, so there is nothing to time; a selection over `clipboard::CAP` (32 KiB raw, ≈ 43 KiB encoded) is **refused** rather than truncated |
 | where it could still get slow | hashing a very large buffer (the one spawn takes the whole file through stdin) and a terminal that is slow to swallow a 43 KiB OSC 52 payload. Neither has been measured, and neither is a scan cost |
 
+### The seen marks' tree cache: bounded by the records it serves
+
+`RootState.seen_cache` (Phase 14 B) holds one `ls-tree -r` listing per tree oid named by a
+parked or retired record, shared by every record at that tree. Phase 16 (Amendment v1.18)
+adds at most 20 retired listings per root beside the parked ones (`ledger::RETIRED_CAP`),
+none older than 30 days; each listing is taken once, only when some row is a candidate, and
+dropped when no record names its tree any more. Not measured: no `BENCH` scenario deletes a
+branch.
+
 ## What the first run found
 
 The first full run hung in S4: with more than about 4,000 paths in one batch, the engine's

@@ -5,6 +5,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html). A version's s
 exactly what its GitHub release notes carry, so it is written for the people installing the
 binary rather than for the commit log.
 
+## Unreleased
+
+### Fixed
+
+- Files you accepted on a branch now fold into `[seen]` after its pull request is
+  squash-merged and pulled, even when the branch was deleted first. Before, they were listed
+  again as ordinary rows whenever lastcall had not looked between the checkout and the
+  delete, and in every case after the next branch switch. What a deleted branch accepted is
+  kept for 30 days, for at most 20 deleted branches, and is used for nothing else.
+
 ## 0.7.0 - 2026-09-27
 
 ### Added
