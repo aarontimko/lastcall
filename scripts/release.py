@@ -568,8 +568,10 @@ def cmd_tag(args):
         die("release.yml did not start for %s after two minutes; look at the Actions page" % tag)
     if subprocess.run(["gh", "run", "watch", run_id, "--exit-status", "--interval", "20"]).returncode != 0:
         die("the release run failed: gh run view %s --log-failed" % run_id)
+    # No pager: on a terminal gh would page this and the script would wait on it.
     subprocess.run(["gh", "release", "view", tag, "--json", "url,assets",
-                    "--jq", '.url, (.assets[] | "  " + .name)'])
+                    "--jq", '.url, (.assets[] | "  " + .name)'],
+                   env=dict(os.environ, GH_PAGER="cat"))
     say("published. Step 4 of operations.md is left: the checksums, the attestations"
         + (", and:" if previous else ""))
     if previous:
