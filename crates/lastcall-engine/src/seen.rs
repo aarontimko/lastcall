@@ -11,32 +11,41 @@
 //! "seen as absent" (`blob: Some(None)`) or carries only flags never matches: the first
 //! has no content to match, the second is a path the user left a note on over there.
 //!
+//! **Retired records** (Amendment v1.18): a deleted branch's record, which the prune keeps
+//! in `Ledger::retired` for a while, is compared after the parked ones by exactly the same
+//! rule, so content accepted on a branch that was deleted before its pull request came
+//! back still folds. A retired name equal to the branch in force is not compared (that is
+//! a recreated branch, whose own record is in force), and a name that is both parked and
+//! retired is listed once. A retired tree the store no longer has lists as empty: no
+//! marks, no notice.
+//!
 //! A row annotated `upstream` or `mixed` is never marked: upstream is the older label and
 //! says "someone else's commit", so such a row stays in the upstream group alone.
 //!
-//! **Cost.** Each parked record's tree is listed once and kept in [`SeenCache`] under
-//! `(branch, tree oid)`. A parked tree changes only when a switch parks a record, so every
-//! scan after the first is a lookup; the cache drops every key whose branch is no longer
-//! parked at that tree (so `prune_parked` shrinks it), overrides are read live from the
-//! ledger and never cached, and nothing is listed when no row is a candidate.
+//! **Cost.** Each parked or retired record's tree is listed once and kept in [`SeenCache`]
+//! under its tree oid, so two records at the same tree share one listing. A record's tree
+//! changes only when a switch parks it or a prune retires it, so every scan after the
+//! first is a lookup; the cache drops every tree no parked or retired record names any
+//! more (so the prune and the retired records' expiry shrink it), overrides are read live
+//! from the ledger and never cached, and nothing is listed when no row is a candidate.
 //!
 //! `scan.rs` stays ignorant of HEAD and of parked records; this module never drops a row
 //! and never reorders one. Whether a marked row folds is [`Row::folds_seen`].
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::git::{Mode, Oid};
-use crate::ledger::{Ledger, TreeEntries};
+use crate::ledger::{Ledger, Override, TreeEntries};
 use crate::scan::Pile;
 
-/// Parked trees listed so far, keyed by `(branch, tree oid)`.
+/// Parked and retired trees listed so far, keyed by tree oid.
 #[derive(Debug, Default)]
 pub struct SeenCache {
-    trees: HashMap<(String, Oid), TreeEntries>,
+    trees: HashMap<Oid, TreeEntries>,
 }
 
 impl SeenCache {
-    /// How many parked trees are held (tests and the engine's debug line).
+    /// How many parked or retired trees are held (tests and the engine's debug line).
     pub fn len(&self) -> usize {
         self.trees.len()
     }
@@ -45,24 +54,24 @@ impl SeenCache {
         self.trees.is_empty()
     }
 
-    /// Drop every tree whose branch is no longer parked at that tree: a branch
-    /// `prune_parked` removed, or one a later switch parked again at another tree.
+    /// Drop every tree no parked or retired record names: one whose record expired, or
+    /// whose branch a later switch parked again at another tree.
     fn prune(&mut self, ledger: &Ledger) {
-        self.trees.retain(|(branch, tree), _| {
-            ledger
-                .branches
-                .get(branch)
-                .and_then(|r| r.seen_tree.as_ref())
-                == Some(tree)
-        });
+        let named: HashSet<&Oid> = ledger
+            .branches
+            .values()
+            .filter_map(|r| r.seen_tree.as_ref())
+            .chain(ledger.retired.values().filter_map(|r| r.seen_tree.as_ref()))
+            .collect();
+        self.trees.retain(|tree, _| named.contains(tree));
     }
 }
 
-/// Mark every row of `pile` whose content a parked record already accepted.
+/// Mark every row of `pile` whose content a parked or retired record already accepted.
 ///
 /// `filemode` is the store's `core.filemode` (the scan's normalisation: with it off, an
 /// executable bit is not a difference). `list` lists one tree (`Store::ls_tree` in the
-/// engine); it runs at most once per parked `(branch, tree)` for the cache's lifetime.
+/// engine); it runs at most once per tree oid for the cache's lifetime.
 /// On an error every mark this call made is taken back and the error returned, so the
 /// caller's notice describes a pile with no seen marks at all rather than some.
 pub fn mark<E>(
@@ -93,28 +102,38 @@ pub fn mark<E>(
     if candidates.is_empty() {
         return Ok(());
     }
-    // `branches` is a BTreeMap, so `seen_on` comes out sorted by branch name.
-    for (branch, record) in &ledger.branches {
+    // Parked first, then retired, each a BTreeMap; `seen_on` is sorted at the end.
+    let records: Vec<(&String, Option<&Oid>, &BTreeMap<String, Override>)> = ledger
+        .branches
+        .iter()
+        .map(|(b, r)| (b, r.seen_tree.as_ref(), &r.overrides))
+        .chain(
+            ledger
+                .retired
+                .iter()
+                .map(|(b, r)| (b, r.seen_tree.as_ref(), &r.overrides)),
+        )
+        .collect();
+    for (branch, seen_tree, overrides) in records {
         if ledger.seen_branch.as_ref() == Some(branch) {
             continue;
         }
         let override_of = |path: &[u8]| {
             std::str::from_utf8(path)
                 .ok()
-                .and_then(|p| record.overrides.get(p))
+                .and_then(|p| overrides.get(p))
         };
         // The tree is listed only when some candidate would read it.
         let needs_tree = candidates
             .iter()
             .any(|&i| override_of(&pile.rows[i].path).is_none());
-        let key = record.seen_tree.clone().map(|t| (branch.clone(), t));
         if needs_tree
-            && let Some(key) = &key
-            && !cache.trees.contains_key(key)
+            && let Some(t) = seen_tree
+            && !cache.trees.contains_key(t)
         {
-            match list(&key.1) {
+            match list(t) {
                 Ok(entries) => {
-                    cache.trees.insert(key.clone(), entries);
+                    cache.trees.insert(t.clone(), entries);
                 }
                 Err(e) => {
                     for row in &mut pile.rows {
@@ -124,7 +143,7 @@ pub fn mark<E>(
                 }
             }
         }
-        let tree = key.as_ref().and_then(|k| cache.trees.get(k));
+        let tree = seen_tree.and_then(|t| cache.trees.get(t));
         for &i in &candidates {
             let row = &pile.rows[i];
             let Some(cur) = row.current.as_ref() else {
@@ -142,10 +161,13 @@ pub fn mark<E>(
             };
             let matched =
                 baseline.is_some_and(|(oid, mode)| *oid == cur.oid && norm(mode) == norm(cur.mode));
-            if matched {
+            if matched && !pile.rows[i].seen_on.contains(branch) {
                 pile.rows[i].seen_on.push(branch.clone());
             }
         }
+    }
+    for &i in &candidates {
+        pile.rows[i].seen_on.sort();
     }
     Ok(())
 }
@@ -157,7 +179,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::ledger::{BranchRecord, Override, SeenAt};
+    use crate::ledger::{BranchRecord, RetiredRecord, SeenAt};
     use crate::scan::{Annotation, Change, Entry, Row};
     use crate::store::RootKind;
 
@@ -510,6 +532,177 @@ mod tests {
         });
         assert!(err.is_err());
         assert!(p.rows[0].seen_on.is_empty());
+    }
+
+    fn retired(tree: char, overrides: &[(&str, Override)]) -> RetiredRecord {
+        RetiredRecord {
+            retired_at: "2026-09-26T00:00:00Z".to_owned(),
+            seen_tree: Some(oid(tree)),
+            overrides: overrides
+                .iter()
+                .map(|(p, o)| ((*p).to_owned(), o.clone()))
+                .collect(),
+        }
+    }
+
+    fn with_retired(mut l: Ledger, gone: Vec<(&str, RetiredRecord)>) -> Ledger {
+        l.retired = gone.into_iter().map(|(b, r)| (b.to_owned(), r)).collect();
+        l
+    }
+
+    #[test]
+    fn seen_a_retired_record_matches_like_a_parked_one() {
+        let lister = Lister::new(&[(
+            'a',
+            &[("a.rs", 'c', Mode::Regular), ("b.rs", 'd', Mode::Regular)],
+        )]);
+        let l = with_retired(
+            ledger("main", vec![]),
+            vec![(
+                "run-1",
+                retired('a', &[("b.rs", blob(Some(Some(oid('e'))), None))]),
+            )],
+        );
+        let mut p = pile(vec![
+            row("a.rs", Some(('c', Mode::Regular))),
+            row("b.rs", Some(('e', Mode::Regular))),
+            row("c.rs", Some(('c', Mode::Regular))),
+        ]);
+        run(&mut p, &l, &lister, &mut SeenCache::default());
+        assert_eq!(
+            marks(&p),
+            vec![
+                ("a.rs".into(), vec!["run-1".into()]),
+                ("b.rs".into(), vec!["run-1".into()]),
+                ("c.rs".into(), vec![]),
+            ],
+            "the tree entry, and the override blob over it"
+        );
+    }
+
+    #[test]
+    fn seen_a_retired_absent_or_flag_only_override_never_matches() {
+        let lister = Lister::new(&[(
+            'a',
+            &[("a.rs", 'c', Mode::Regular), ("b.rs", 'c', Mode::Regular)],
+        )]);
+        let l = with_retired(
+            ledger("main", vec![]),
+            vec![(
+                "run-1",
+                retired(
+                    'a',
+                    &[("a.rs", blob(Some(None), None)), ("b.rs", blob(None, None))],
+                ),
+            )],
+        );
+        let mut p = pile(vec![
+            row("a.rs", Some(('c', Mode::Regular))),
+            row("b.rs", Some(('c', Mode::Regular))),
+        ]);
+        run(&mut p, &l, &lister, &mut SeenCache::default());
+        assert!(
+            p.rows.iter().all(|r| r.seen_on.is_empty()),
+            "{:?}",
+            marks(&p)
+        );
+    }
+
+    #[test]
+    fn seen_a_name_both_parked_and_retired_is_listed_once_and_sorted() {
+        let lister = Lister::new(&[
+            ('a', &[("a.rs", 'c', Mode::Regular)]),
+            ('b', &[("a.rs", 'c', Mode::Regular)]),
+        ]);
+        // `run-1` recreated and parked again beside its retired self; `old` retired only,
+        // sorting between the parked names.
+        let l = with_retired(
+            ledger(
+                "feat",
+                vec![("run-1", record('a', &[])), ("zed", record('a', &[]))],
+            ),
+            vec![("run-1", retired('b', &[])), ("old", retired('b', &[]))],
+        );
+        let mut p = pile(vec![row("a.rs", Some(('c', Mode::Regular)))]);
+        run(&mut p, &l, &lister, &mut SeenCache::default());
+        assert_eq!(
+            p.rows[0].seen_on,
+            vec!["old".to_owned(), "run-1".to_owned(), "zed".to_owned()]
+        );
+    }
+
+    #[test]
+    fn seen_a_retired_name_in_force_is_not_compared() {
+        let lister = Lister::new(&[('a', &[("a.rs", 'c', Mode::Regular)])]);
+        // `run-1` recreated and in force: its retired namesake is not compared.
+        let l = with_retired(ledger("run-1", vec![]), vec![("run-1", retired('a', &[]))]);
+        let mut p = pile(vec![row("a.rs", Some(('c', Mode::Regular)))]);
+        run(&mut p, &l, &lister, &mut SeenCache::default());
+        assert!(p.rows[0].seen_on.is_empty());
+        assert_eq!(lister.calls.get(), 0);
+    }
+
+    #[test]
+    fn seen_a_retired_tree_the_store_no_longer_has_gives_no_marks_and_no_error() {
+        // The engine's lister: a tree the store does not hold lists as empty.
+        let lister = Lister::new(&[('a', &[("a.rs", 'c', Mode::Regular)])]);
+        let l = with_retired(
+            ledger("main", vec![("feat", record('a', &[]))]),
+            vec![("run-1", retired('f', &[]))],
+        );
+        let mut p = pile(vec![
+            row("a.rs", Some(('c', Mode::Regular))),
+            row("b.rs", Some(('c', Mode::Regular))),
+        ]);
+        let listed = mark(&mut p, &l, true, &mut SeenCache::default(), |t| {
+            if lister.trees.contains_key(t) {
+                lister.list(t)
+            } else {
+                Ok(TreeEntries::new())
+            }
+        });
+        assert!(listed.is_ok());
+        assert_eq!(
+            marks(&p),
+            vec![
+                ("a.rs".into(), vec!["feat".into()]),
+                ("b.rs".into(), vec![]),
+            ],
+            "the parked match stands; the missing tree matches nothing"
+        );
+    }
+
+    #[test]
+    fn seen_two_records_sharing_a_tree_are_listed_once() {
+        let lister = Lister::new(&[('a', &[("a.rs", 'c', Mode::Regular)])]);
+        let mut cache = SeenCache::default();
+        let mut l = with_retired(
+            ledger("main", vec![("feat", record('a', &[]))]),
+            vec![("run-1", retired('a', &[]))],
+        );
+        let mut p = pile(vec![row("a.rs", Some(('c', Mode::Regular)))]);
+        run(&mut p, &l, &lister, &mut cache);
+        assert_eq!(
+            p.rows[0].seen_on,
+            vec!["feat".to_owned(), "run-1".to_owned()]
+        );
+        assert_eq!(lister.calls.get(), 1, "one tree, one listing");
+        assert_eq!(cache.len(), 1);
+
+        // The parked one goes; the retired one still names the tree, so it stays.
+        l.branches.clear();
+        let mut p = pile(vec![row("a.rs", Some(('c', Mode::Regular)))]);
+        run(&mut p, &l, &lister, &mut cache);
+        assert_eq!(p.rows[0].seen_on, vec!["run-1".to_owned()]);
+        assert_eq!(lister.calls.get(), 1);
+        assert_eq!(cache.len(), 1);
+
+        // The retired one expires: the cache lets the tree go.
+        l.retired.clear();
+        let mut p = pile(vec![row("a.rs", Some(('c', Mode::Regular)))]);
+        run(&mut p, &l, &lister, &mut cache);
+        assert!(p.rows[0].seen_on.is_empty());
+        assert!(cache.is_empty());
     }
 
     #[test]

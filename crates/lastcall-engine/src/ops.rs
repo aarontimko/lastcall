@@ -2235,15 +2235,21 @@ impl Ops<'_> {
         compose_baseline(Some(self.tree), &self.ledger.overrides, path).flatten()
     }
 
-    /// R3: at every switch the parked names are checked against the repository's branches
-    /// and a name with no ref is dropped.
+    /// R3: at every switch the parked names are checked against the repository's branches,
+    /// and a name with no ref is **retired**, not dropped (Amendment v1.18): its tree and
+    /// overrides move to [`Ledger::retired`], stamped with the clock's now, so content
+    /// accepted on a deleted branch still folds into `[seen]` (D29). Retired records older
+    /// than [`ledger::RETIRED_DAYS`] go first, every time this runs, whatever the listing
+    /// does; [`Ledger::retire`] holds the cap.
     ///
     /// Full names from `%(refname)`, never `%(refname:short)`, which a same-named tag can
-    /// shadow. If the listing fails for any reason the prune is skipped for this switch:
-    /// dropping a record is the fail-closed side (an over-show at that branch's next
-    /// arrival), keeping one costs nothing. The record in force is never a candidate — it
-    /// is not in the map.
+    /// shadow. If the listing fails for any reason the parked half is skipped for this
+    /// switch: retiring a record is the fail-closed side (an over-show at that branch's
+    /// next arrival), keeping one costs nothing. The record in force is never a candidate:
+    /// it is not in the map.
     fn prune_parked(&mut self) {
+        let now = self.clock.now();
+        self.ledger.expire_retired(now);
         if self.ledger.branches.is_empty() {
             return;
         }
@@ -2258,9 +2264,18 @@ impl Ops<'_> {
             .lines()
             .filter_map(|l| l.trim().strip_prefix("refs/heads/"))
             .collect();
-        self.ledger
+        let gone: Vec<String> = self
+            .ledger
             .branches
-            .retain(|name, _| live.contains(name.as_str()));
+            .keys()
+            .filter(|name| !live.contains(name.as_str()))
+            .cloned()
+            .collect();
+        for name in gone {
+            if let Some(record) = self.ledger.branches.remove(&name) {
+                self.ledger.retire(name, record, now);
+            }
+        }
     }
 
     /// Point the cached `ls-tree` at the record in force's seen tree, failing open the way
@@ -3203,6 +3218,37 @@ mod tests {
             ["main"],
             "run-1's ref is gone, run-2's record is in force, main is parked"
         );
+        // Amendment v1.18: retired, not dropped, stamped with the clock's now.
+        assert_eq!(h.ledger.retired.keys().collect::<Vec<_>>(), ["run-1"]);
+        assert_eq!(h.ledger.retired["run-1"].retired_at, h.clock.now_iso8601());
+    }
+
+    /// Amendment v1.18: the retired records' age check runs every time the prune does,
+    /// even when there is no parked record to list refs for (a rename of the branch in
+    /// force, here), and keeps what is younger than [`ledger::RETIRED_DAYS`].
+    #[test]
+    fn ops_the_prune_expires_old_retired_records_with_nothing_parked() {
+        let repo = FixtureRepo::new("ops-retired-expiry").unwrap();
+        let state = TempDir::new("lc-ops");
+        let mut h = Harness::new(&repo, &state);
+        h.ledger.seen_branch = Some("main".into());
+        let now = h.clock.now();
+        let day = Duration::from_secs(86_400);
+        let gone = BranchRecord {
+            seen_tree: h.ledger.seen_tree.clone(),
+            seen_at: h.ledger.seen_at.clone(),
+            overrides: BTreeMap::new(),
+            undo: Vec::new(),
+            parked_at: h.clock.now_iso8601(),
+        };
+        h.ledger.retire("old".into(), gone.clone(), now - 31 * day);
+        h.ledger.retire("young".into(), gone, now - 29 * day);
+        assert!(h.ledger.branches.is_empty());
+        repo.git(&["branch", "-m", "main", "trunk"]).unwrap();
+        let out = h.ops_on("main").switch_branch("trunk", &NoFault).unwrap();
+        assert!(out.happened);
+        assert_eq!(h.ledger.seen_branch.as_deref(), Some("trunk"), "a rename");
+        assert_eq!(h.ledger.retired.keys().collect::<Vec<_>>(), ["young"]);
     }
 
     /// R4: a detached or unreadable `HEAD` never moves the record in force. The engine's

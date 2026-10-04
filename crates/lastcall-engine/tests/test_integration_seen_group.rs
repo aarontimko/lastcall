@@ -4,7 +4,13 @@
 
 mod common;
 
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
 use common::Fresh;
+use lastcall_engine::config::Config;
+use lastcall_engine::engine::EngineOptions;
+use lastcall_engine::ledger::{Clock, iso8601};
 use lastcall_engine::ops::{NoFault, Rendered};
 use lastcall_engine::scan::{Annotation, GroupKind, Pile};
 use lastcall_testkit::assert_pile;
@@ -39,7 +45,11 @@ fn seen_paths(pile: &Pile) -> Vec<String> {
 /// there; back on `main`, then a fresh `feat-x` from `main` is in force with `run-1` and
 /// `main` parked.
 fn reviewed_run(name: &str) -> Fresh {
-    let mut s = Fresh::new(name);
+    reviewed_run_on(Fresh::new(name))
+}
+
+/// [`reviewed_run`] over a caller-built `Fresh` (the retention tests' movable clock).
+fn reviewed_run_on(mut s: Fresh) -> Fresh {
     assert_pile!(s.engine, s.root, "", "first sight on main");
     s.repo.checkout_b("run-1").unwrap();
     s.repo.write("a.rs", "a\n");
@@ -166,8 +176,18 @@ fn seen_group_a_file_flagged_after_the_cherry_pick_keeps_its_row() {
     );
 }
 
+/// The names in the ledger's `retired` map, read from its own JSON (the shape the next
+/// process loads; empty when the field is omitted).
+fn retired(s: &Fresh) -> Vec<String> {
+    let v: serde_json::Value = serde_json::from_str(&s.ledger().to_json()).expect("ledger json");
+    match v.get("retired") {
+        Some(serde_json::Value::Object(m)) => m.keys().cloned().collect(),
+        _ => Vec::new(),
+    }
+}
+
 #[test]
-fn seen_group_a_deleted_branch_matches_until_the_next_switch() {
+fn seen_group_a_deleted_branch_keeps_matching_from_its_retired_record() {
     let mut s = reviewed_run("seen-deleted");
     s.repo.git(&["cherry-pick", "main..run-1"]).unwrap();
     assert_pile!(s.engine, s.root, "a.rs|b.rs|c.rs");
@@ -185,9 +205,18 @@ fn seen_group_a_deleted_branch_matches_until_the_next_switch() {
     assert!(!s.ledger().branches.contains_key("run-1"), "pruned");
     assert_eq!(
         marks(&pile),
-        vec![m("a.rs", &[]), m("b.rs", &[]), m("c.rs", &[])]
+        vec![
+            m("a.rs", &["run-1"]),
+            m("b.rs", &["run-1"]),
+            m("c.rs", &["run-1"])
+        ],
+        "the retired record keeps matching after the prune"
     );
-    assert!(pile.groups().is_empty());
+    assert_eq!(retired(&s), vec!["run-1"], "and retired");
+    assert_eq!(seen_paths(&pile), vec!["a.rs", "b.rs", "c.rs"]);
+    s.restart();
+    let pile = assert_pile!(s.engine, s.root, "a.rs|b.rs|c.rs", "restart");
+    assert_eq!(seen_paths(&pile), vec!["a.rs", "b.rs", "c.rs"]);
 }
 
 #[test]
@@ -341,4 +370,165 @@ fn seen_group_the_tryout_walk_gives_what_each_step_promises() {
     let pile = assert_pile!(s.engine, s.root, "d.rs|e.rs", "step 11: squashed");
     assert_eq!(seen_paths(&pile), vec!["d.rs", "e.rs"]);
     assert!(pile.rows.iter().all(|r| r.seen_on == ["run-2"]));
+}
+
+/// A clock the test moves: the retention tests' route to "31 days later".
+#[derive(Debug)]
+struct MovableClock(Mutex<SystemTime>);
+
+impl MovableClock {
+    fn at(t: SystemTime) -> Arc<Self> {
+        Arc::new(Self(Mutex::new(t)))
+    }
+
+    fn set(&self, t: SystemTime) {
+        *self.0.lock().unwrap() = t;
+    }
+}
+
+impl Clock for MovableClock {
+    fn now(&self) -> SystemTime {
+        *self.0.lock().unwrap()
+    }
+}
+
+/// 2026-01-01T00:00:00Z.
+fn t0() -> SystemTime {
+    UNIX_EPOCH + Duration::from_secs(1_767_225_600)
+}
+
+const DAY: Duration = Duration::from_secs(86_400);
+
+fn fresh_at(name: &str, clock: &Arc<MovableClock>) -> Fresh {
+    Fresh::with(
+        name,
+        Config::default(),
+        EngineOptions {
+            clock: clock.clone(),
+            ..EngineOptions::default()
+        },
+        false,
+    )
+}
+
+/// `retired.<name>.retired_at` from the ledger's own JSON.
+fn retired_at(s: &Fresh, name: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(&s.ledger().to_json()).expect("ledger json");
+    v.get("retired")?
+        .get(name)?
+        .get("retired_at")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// `retired.<name>.seen_tree` from the ledger's own JSON.
+fn retired_tree(s: &Fresh, name: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(&s.ledger().to_json()).expect("ledger json");
+    v.get("retired")?
+        .get(name)?
+        .get("seen_tree")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// Switch away and back (two scans), so the prune and the age check run.
+fn round_trip(s: &mut Fresh, away: &str, back: &str) -> Pile {
+    s.repo.checkout(away).unwrap();
+    let _ = s.scan();
+    s.repo.checkout(back).unwrap();
+    s.scan()
+}
+
+#[test]
+fn seen_group_a_retired_record_is_kept_30_days_then_dropped() {
+    let clock = MovableClock::at(t0());
+    let mut s = reviewed_run_on(fresh_at("retire-age", &clock));
+    s.repo.git(&["cherry-pick", "main..run-1"]).unwrap();
+    assert_pile!(s.engine, s.root, "a.rs|b.rs|c.rs");
+    s.repo.git(&["branch", "-D", "run-1"]).unwrap();
+    let pile = round_trip(&mut s, "main", "feat-x");
+    assert_eq!(
+        retired_at(&s, "run-1").as_deref(),
+        Some("2026-01-01T00:00:00Z"),
+        "stamped with the clock's now at the prune"
+    );
+    assert_eq!(retired_at(&s, "run-1"), Some(iso8601(t0())));
+    assert_eq!(seen_paths(&pile), vec!["a.rs", "b.rs", "c.rs"]);
+
+    clock.set(t0() + 29 * DAY);
+    let pile = round_trip(&mut s, "main", "feat-x");
+    assert_eq!(retired(&s), vec!["run-1"], "29 days: kept");
+    assert_eq!(seen_paths(&pile), vec!["a.rs", "b.rs", "c.rs"]);
+
+    clock.set(t0() + 31 * DAY);
+    let pile = round_trip(&mut s, "main", "feat-x");
+    assert!(
+        retired(&s).is_empty(),
+        "31 days: dropped at the next switch"
+    );
+    assert_eq!(
+        marks(&pile),
+        vec![m("a.rs", &[]), m("b.rs", &[]), m("c.rs", &[])],
+        "and the content no longer folds"
+    );
+    assert!(pile.groups().is_empty());
+}
+
+#[test]
+fn seen_group_twenty_one_retirements_keep_the_twenty_newest() {
+    let clock = MovableClock::at(t0());
+    let mut s = fresh_at("retire-cap", &clock);
+    assert_pile!(s.engine, s.root, "", "first sight on main");
+    let names: Vec<String> = (0..21).map(|i| format!("b{i:02}")).collect();
+    for name in names.iter().map(String::as_str).chain(["hop"]) {
+        s.repo.checkout_b(name).unwrap();
+        let _ = s.scan();
+        s.repo.checkout("main").unwrap();
+        let _ = s.scan();
+    }
+    // Retire b20 first (the oldest) and b00 last, so the name order is the reverse of the
+    // age order and only the age can pick which one goes.
+    let mut on_main = true;
+    for (k, name) in names.iter().rev().enumerate() {
+        clock.set(t0() + Duration::from_secs(60 * k as u64));
+        s.repo.git(&["branch", "-D", name]).unwrap();
+        s.repo
+            .checkout(if on_main { "hop" } else { "main" })
+            .unwrap();
+        on_main = !on_main;
+        let _ = s.scan();
+    }
+    let kept = retired(&s);
+    assert_eq!(kept.len(), 20, "the cap: {kept:?}");
+    assert_eq!(kept, names[..20].to_vec(), "the oldest, b20, went");
+}
+
+#[test]
+fn seen_group_retiring_a_name_twice_keeps_the_newer_record() {
+    let clock = MovableClock::at(t0());
+    let mut s = reviewed_run_on(fresh_at("retire-twice", &clock));
+    s.repo.git(&["branch", "-D", "run-1"]).unwrap();
+    let _ = round_trip(&mut s, "main", "feat-x");
+    let first_tree = retired_tree(&s, "run-1").expect("run-1 retired");
+    assert_eq!(retired_at(&s, "run-1"), Some(iso8601(t0())));
+
+    // run-1 again, with other accepted content, then deleted again a day later.
+    s.repo.checkout_b("run-1").unwrap();
+    let _ = s.scan();
+    s.repo.write("d.rs", "d\n");
+    s.repo.commit("run-1 again").unwrap();
+    assert_pile!(s.engine, s.root, "d.rs", "the second run's work");
+    assert!(s.accept_all().ok());
+    s.repo.checkout("feat-x").unwrap();
+    let _ = s.scan();
+    clock.set(t0() + DAY);
+    s.repo.git(&["branch", "-D", "run-1"]).unwrap();
+    let _ = round_trip(&mut s, "main", "feat-x");
+    assert_eq!(retired(&s), vec!["run-1"], "one entry per name");
+    assert_eq!(retired_at(&s, "run-1"), Some(iso8601(t0() + DAY)));
+    assert_ne!(
+        retired_tree(&s, "run-1"),
+        Some(first_tree),
+        "the newer record replaced the older"
+    );
 }

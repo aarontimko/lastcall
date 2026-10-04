@@ -17,6 +17,11 @@
 //! keyed by path alone, as the sentence is: an entry the user accepted is seen wherever it
 //! turns up, and a screen that leaves it out is not hiding anything from them.
 //!
+//! **Property 1b, no wrong mark:** after every scan, every row marked seen on another
+//! branch (`seen_on` non-empty, the `[seen]` group's candidates) has its current entry in
+//! `Seen(path)`. The mark folds a row into one accept, so a mark on an entry the user never
+//! accepted would be a hide by another route.
+//!
 //! **Property 2, a scan you did not make cannot manufacture work:** each sequence runs
 //! twice, once with a scan after every git command and once with the scans only where the
 //! sequence says (a run of git commands is one unobserved step; an accept has to see a
@@ -275,7 +280,7 @@ impl World {
         Some((text, md.permissions().mode() & 0o111 != 0))
     }
 
-    /// A scan through the engine, with Property 1 checked on what it produced.
+    /// A scan through the engine, with Properties 1 and 1b checked on what it produced.
     fn scan(&mut self) -> Result<Pile, TestCaseError> {
         let pile = self.s.scan();
         self.log.push(format!(
@@ -295,7 +300,17 @@ impl World {
                     self.log.join("\n")
                 );
             }
-            if pile.row(path.as_bytes()).is_some() {
+            if let Some(row) = pile.row(path.as_bytes()) {
+                prop_assert!(
+                    row.seen_on.is_empty() || self.seen[path].contains(&disk),
+                    "WRONG MARK: {} is {:?} on disk, marked seen on {:?}, and it is not in Seen({}) = {:?}\n{}",
+                    path,
+                    disk,
+                    row.seen_on,
+                    path,
+                    self.seen[path],
+                    self.log.join("\n")
+                );
                 continue;
             }
             prop_assert!(

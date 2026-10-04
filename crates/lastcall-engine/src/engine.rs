@@ -1389,8 +1389,9 @@ fn scan_root_once(
             pile.notices.push(n);
         }
         // Phase 14 B: after upstream, so an upstream or mixed row is never marked seen. A
-        // parked tree the store no longer holds lists as empty (nothing matches, nothing
-        // is hidden); any other failure is a notice and a pile with no seen marks.
+        // parked or retired (Amendment v1.18) tree the store no longer holds lists as
+        // empty (nothing matches, nothing is hidden, no notice); any other failure is a
+        // notice and a pile with no seen marks.
         let store = &state.store;
         if let Err(e) = seen::mark(
             &mut pile,
