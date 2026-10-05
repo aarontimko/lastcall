@@ -680,7 +680,7 @@ Gate items marked **[sponsor]** require a human at a real terminal/herdr session
 - [x] Docs and Amendment v1.18 in the same pull request; house style holds. *Closed 2026-10-04: `b0ddbdd`, `26d1442` and the review fold.*
 - [x] Adversarial code review run, findings triaged. *Closed 2026-10-04: F1 to F8, dispositions in §10 2026-10-04.*
 - [x] Amendment v1.18 ratified by the sponsor merging the pull request. *Ratified by the sponsor merging PR #47 (`ed7da4d`, 2026-10-04).*
-- [ ] `v0.7.1` released by the tag on the release pull request's merge commit: ticked by the next PR to `main`, with the tag object and the release run id.
+- [x] `v0.7.1` released by the tag on the release pull request's merge commit: ticked by the next PR to `main`, with the tag object and the release run id. *Closed 2026-10-04: PR #48 merged as `385c29b` (`922d583` the ticks, `0fdac3c` the bump); the tag object `e5a75b7` on it; release run 37257041850 green with the four binaries and `SHA256SUMS`; the checksums and the four attestations verified; `just install-smoke v0.7.0 v0.7.1` passed on linux/amd64 and linux/arm64. The first `just release-tag` refused the sponsor's "y" (input left on the terminal by `gh run watch`), sent nothing, and the rerun tagged; fixed in `7c5f5dd`.*
 
 ---
 

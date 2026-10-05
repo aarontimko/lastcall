@@ -168,7 +168,7 @@ Each of these is recorded with its reason and its trigger; none is a promise.
 | Each phase's operational spec and its review fold | `docs/spec/9N-phaseN-kickoff.md` |
 | The scenario plan the integration tests are named after | `docs/spec/01-scenarios.md` |
 | The performance baseline and every bench run | `docs/dev/bench.md` |
-| The release runs | `v0.1.0-rc.1`: Actions run 34712558530; `v0.1.0`: run 34714870423; `v0.7.0`, the first from one pull request: run 36361898223 |
+| The release runs | `v0.1.0-rc.1`: Actions run 34712558530; `v0.1.0`: run 34714870423; `v0.7.0`, the first from one pull request: run 36361898223; `v0.7.1`: run 37257041850 |
 | The day the repository went public | `docs/dev/publishing.md`; §10 2026-09-12 |
 | The adversarial review records and the maintainer's install and update transcripts | the private notes directory, not committed (§10 cites them by file name) |
 | How the build program was run | `docs/spec/00-spec.md` §3, and the README's last sentence under Status |
