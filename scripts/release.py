@@ -52,6 +52,11 @@ import subprocess
 import sys
 import time
 
+try:
+    import termios
+except ImportError:  # not a Unix: nothing to flush, the prompt reads as before
+    termios = None
+
 DRY = os.environ.get("RELEASE_DRY_RUN") == "1"
 VERSION = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-rc\.([1-9][0-9]*))?$")
 INSTALL_PAGES = ("README.md", "docs/install.md")
@@ -118,12 +123,20 @@ def confirm(question):
         return
     if not sys.stdin.isatty():
         die("no terminal to confirm on: " + question)
+    # Drop whatever is already waiting on the terminal: a command run just before (`gh run
+    # watch`) can leave a terminal's reply to its own query there, which would otherwise
+    # be read in front of the answer and turn a "y" into a refusal (v0.7.1's first try).
+    if termios is not None:
+        try:
+            termios.tcflush(sys.stdin, termios.TCIFLUSH)
+        except (OSError, termios.error):
+            pass
     try:
         answer = input("release: %s [y/N] " % question)
     except EOFError:
         answer = ""
     if answer.strip() not in ("y", "Y"):
-        die("stopped at your word; nothing was sent")
+        die("stopped at your word (read %r); nothing was sent" % answer)
 
 
 def branch():

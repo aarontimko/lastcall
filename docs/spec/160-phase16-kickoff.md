@@ -77,7 +77,7 @@ Red at `3b2c28b` where the behaviour is new, then green:
 - [x] Docs and amendment v1.18 as listed; house style holds.
 - [x] Adversarial code review run, findings triaged. *F1 to F8; see below and §10 2026-10-04.*
 - [x] Amendment v1.18 ratified by the sponsor merging the PR. *PR #47, `ed7da4d`, 2026-10-04.*
-- [ ] `v0.7.1` released by the tag on the release pull request's merge commit (the fix was merged without the bump; the sponsor's "1 rec", 2026-10-04): ticked by the next PR to `main`, with the tag object and the release run id.
+- [x] `v0.7.1` released by the tag on the release pull request's merge commit (the fix was merged without the bump; the sponsor's "1 rec", 2026-10-04): ticked by the next PR to `main`, with the tag object and the release run id. *Closed 2026-10-04: PR #48 merged as `385c29b` (`922d583` the ticks, `0fdac3c` the bump); the tag object `e5a75b7` on it; release run 37257041850 green with the four binaries and `SHA256SUMS`; the checksums and the four attestations verified; `just install-smoke v0.7.0 v0.7.1` passed on linux/amd64 and linux/arm64. The first `just release-tag` refused the sponsor's "y" (input left on the terminal by `gh run watch`), sent nothing, and the rerun tagged; fixed in `7c5f5dd`.*
 
 ## Design review, folded (2026-10-04)
 
