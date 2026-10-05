@@ -89,9 +89,9 @@ restriction: the keys all work the same.
 A third group appears when an agent brings over work you have already reviewed on another
 branch of the same repository: a cherry-pick, a rebase onto a branch you reviewed, or a
 squash-merge of one, including a pull request squash-merged on GitHub and then pulled, even
-when you deleted its branch first. Every file whose content matches exactly what you accepted on another
-branch folds into one row, `[seen] N files`, instead of being listed again. Selecting it
-says which branches accepted that content and lists the files:
+when you deleted its branch first. Every file whose content matches exactly what you
+accepted on another branch folds into one row, `[seen] N files`, instead of being listed
+again. Selecting it says which branches accepted that content and lists the files:
 
 ```text
 lastcall  3 repos · 11 files · 13 hunks  standalone  [Accept All]                         watching W
@@ -433,12 +433,13 @@ are not in that branch's tree, so they are not shown as deletions you have to ac
 time. Checking out a branch for the first time carries across what you have seen so far, so
 the switch itself shows nothing new, and going back later finds that branch's own pile
 waiting. A change that reaches another branch by cherry-pick shows once more on that branch,
-because lastcall never guesses that you have already read it somewhere else. A detached HEAD
-keeps whichever record you were on. Deleting a branch keeps what you accepted there for 30
-days, for one use only: content that comes back from it, such as its pull request
-squash-merged and pulled, still folds into `[seen]`, and the group names the branch as it
-was. After 30 days, or once 20 more recently deleted branches are kept, it is forgotten and
-those files are ordinary rows again. A new branch created under the same name starts fresh.
+folded into `[seen]` when its content is exactly what you accepted elsewhere; lastcall never
+guesses beyond an exact match. A detached HEAD keeps whichever record you were on. Deleting
+a branch keeps what you accepted there for about 30 days, for one use only: content that
+comes back from it, such as its pull request squash-merged and pulled, still folds into
+`[seen]`, and the group names the branch as it was. At the first branch switch after 30
+days, or once 20 more recently deleted branches are kept, it is forgotten and those files
+are ordinary rows again. A new branch created under the same name starts fresh.
 
 lastcall watches the filesystem, so the screen follows an agent as it writes. Where those
 events do not arrive, which happens on some network filesystems and inside some containers,

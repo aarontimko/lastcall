@@ -22,8 +22,8 @@ A squash commit GitHub made for the user's pull request carries the user as auth
 | Shape | Result |
 |---|---|
 | `checkout main`, `pull` (`run-1` kept) | `a.rs`, `b.rs` fold into `[seen]` on `run-1` |
-| `checkout main`, `branch -D run-1`, `pull` | plain rows, no group: **the report** |
-| `checkout main`, `pull`, then `branch -D run-1` | `[seen]` (the record is pruned only at the next switch) |
+| `checkout main`, `branch -D run-1`, `pull`, no scan between the checkout and the delete | plain rows, no group: **the report** |
+| `checkout main`, `pull`, then `branch -D run-1`, a scan between the checkout and the delete | `[seen]` (the record is pruned only at the next switch) |
 
 `gh pr merge --delete-branch` switches to the default branch and deletes the local branch in one command, which is the second shape: the switch prunes `run-1`'s record (`prune_parked`, `ops.rs:2246`, called from the switch at `ops.rs:1984` and the rename at `ops.rs:1940`) before the pull brings the content. Whether lastcall scans between the checkout and the delete decides the result, in either order (review F2: `checkout; pull; branch -D` with no scan between loses the record the same way), which is the "sometimes". A different shape, not this report: with GitHub's email privacy on, the squash commit's author is `<id>+<login>@users.noreply.github.com`, which matches neither email, so the whole squash is `[upstream]` (grouped, never plain), as ruling 1 wants for work nobody here accepted (review F7).
 
@@ -72,12 +72,16 @@ Red at `3b2c28b` where the behaviour is new, then green:
 
 ## Gate
 
-- [ ] D29 red at `3b2c28b`, green after; the flipped test; D20's addition; retention, ledger and `seen.rs` tests as listed.
-- [ ] `just lint`, `just test-unit`, `just test-scenarios`, `just test-prepush`, `just harness` green; `just golden-update` not needed (no `status` change).
-- [ ] Docs and amendment v1.18 as listed; house style holds.
-- [ ] Adversarial code review run, findings triaged.
+- [x] D29 red at `3b2c28b`, green after; the flipped test; D20's addition; retention, ledger and `seen.rs` tests as listed. *Red at `e9c7f17` (this kickoff only on top of `3b2c28b`), green at `c1e82a8`.*
+- [x] `just lint`, `just test-unit`, `just test-scenarios`, `just test-prepush`, `just harness` green; `just golden-update` not needed (no `status` change).
+- [x] Docs and amendment v1.18 as listed; house style holds.
+- [x] Adversarial code review run, findings triaged. *F1 to F8; see below and §10 2026-10-04.*
 - [ ] Amendment v1.18 ratified by the sponsor merging the PR.
 
 ## Design review, folded (2026-10-04)
 
 A fresh-context adversarial design review (Fable), probes in a scratch copy only: the diagnosis table reproduced (8 of 8 probes as predicted), `LedgerWire` confirmed to ignore unknown fields and the v1.11 precedent confirmed; no blocker; verdict safe to build once F1 to F5 were in the text. Folded: F1 (the oracle's Property 1b, the only instrument that would catch a wrong retired mark), F2 (D29 withholds the scan, plus the order variants), F3 (a retired name in force is not compared), F4 (§11 hardening restated), F5 (retention independent of the listing; cap at insertion; unparsable `retired_at` is expired), F6 (the clock route named), F7 (the noreply-author shape named in the diagnosis), F8 in part (the cache keyed by tree oid), F9 (a map keyed by name), F10 (doc pointers; the harness unchanged), F11 (wire placement). **Rejected in part, F8:** dropping flag-only and seen-as-absent overrides at retirement. They are what stops a path matching (model 4), so dropping them would let the path fall through to the tree entry and fold content the record marked as noted or deleted; the ledger bound (the compaction threshold times 20) is accepted.
+
+## Code review, folded (2026-10-04)
+
+A fresh-context adversarial code review (Fable) of `c1e82a8`, `b0ddbdd` and `26d1442`, probes in a scratch copy only: every red claim re-run at the old engine, the seen oracle at 256 cases, two engines over one root and a recreated name probed; verdict safe to push, no gating finding. Fixed: F1 (a `retired_at` in the future now expires, `be15e8e`), F2 (the user docs say the 30 days end at the first branch switch after them), F3 (the review loop's cherry-pick sentence), F4 (the new changelog entry's wording; the 0.3.0 line kept as shipped), F5 (the memory estimate in `bench.md`), F6 (the engine notes' ledger layout line). Deferred: F7, a branch deleted and recreated between two scans gets its old record back, behaviour since Phase 11 (§11). Rejected: F8, a retired record with no tree takes a cap slot, negligible.

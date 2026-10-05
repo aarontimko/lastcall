@@ -1032,9 +1032,13 @@ than anything a user waits for. What each one actually does is short enough to w
 `RootState.seen_cache` (Phase 14 B) holds one `ls-tree -r` listing per tree oid named by a
 parked or retired record, shared by every record at that tree. Phase 16 (Amendment v1.18)
 adds at most 20 retired listings per root beside the parked ones (`ledger::RETIRED_CAP`),
-none older than 30 days; each listing is taken once, only when some row is a candidate, and
-dropped when no record names its tree any more. Not measured: no `BENCH` scenario deletes a
-branch.
+none older than 30 days at the last prune; each listing is taken once, only when some row
+is a candidate, and dropped when no record names its tree any more. Before Phase 16 a deleted
+branch's listing left the cache at the switch; now it stays while its record is retired.
+Estimated, not measured (no `BENCH` scenario deletes a branch): a listing costs roughly 100
+bytes per file, so 20 retired trees of a 5,000-file root are about 10 MB at worst and of a
+50,000-file root about 100 MB, and only trees that differ cost anything, since records at
+one tree share a listing (the code review's F5).
 
 ## What the first run found
 

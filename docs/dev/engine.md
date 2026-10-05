@@ -38,8 +38,10 @@ Ids are the first 16 hex chars of SHA-256 over the canonicalized path.
 <state>/exports/<root basename>/<YYYY-MM-DD>.md      # flags with nowhere to send them (§6.7, ruling P9)
 <state>/roots/<parent-id>/meta.json                  # the parent dir this group was discovered under
 <state>/roots/<parent-id>/repos/<root-id>/
-    ledger.json      # schema 1.1 (§6.2): seen_tree, seen_at, overrides, plus snoozed_until
-                     # and the undo stack (Amendment v1.11; both additive, both optional)
+    ledger.json      # schema 1.2 (§6.2): the record in force (seen_tree, seen_at,
+                     # seen_branch, overrides), the parked `branches` (v1.12), the
+                     # `retired` records (v1.18), snoozed_until and undo (v1.11);
+                     # all fields: `LedgerWire` in ledger.rs (optional ones omitted when empty)
     store/           # bare git repo; objects/info/alternates → the user's objects dir (git roots)
     index            # private index seeded from the seen tree (a cache, never truth)
     index.tree       # the tree `index` was seeded from; mismatch with the ledger → reseed
