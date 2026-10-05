@@ -76,7 +76,8 @@ Red at `3b2c28b` where the behaviour is new, then green:
 - [x] `just lint`, `just test-unit`, `just test-scenarios`, `just test-prepush`, `just harness` green; `just golden-update` not needed (no `status` change).
 - [x] Docs and amendment v1.18 as listed; house style holds.
 - [x] Adversarial code review run, findings triaged. *F1 to F8; see below and §10 2026-10-04.*
-- [ ] Amendment v1.18 ratified by the sponsor merging the PR.
+- [x] Amendment v1.18 ratified by the sponsor merging the PR. *PR #47, `ed7da4d`, 2026-10-04.*
+- [ ] `v0.7.1` released by the tag on the release pull request's merge commit (the fix was merged without the bump; the sponsor's "1 rec", 2026-10-04): ticked by the next PR to `main`, with the tag object and the release run id.
 
 ## Design review, folded (2026-10-04)
 
