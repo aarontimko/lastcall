@@ -467,8 +467,8 @@ pub const RETIRED_CAP: usize = 20;
 /// with a notice, which only means its content stops folding (an over-show).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetiredRecord {
-    /// When the prune retired it (ISO-8601 UTC, the clock's now). Unparsable reads as
-    /// expired.
+    /// When the prune retired it (ISO-8601 UTC, the clock's now). Unparsable, or later
+    /// than the clock's now, reads as expired.
     pub retired_at: String,
     pub seen_tree: Option<Oid>,
     #[serde(default)]
@@ -624,12 +624,13 @@ impl Ledger {
     }
 
     /// Drop the retired records older than [`RETIRED_DAYS`] at `now`, and any whose
-    /// `retired_at` does not parse.
+    /// `retired_at` does not parse or lies after `now` (a clock set back, or a hand edit,
+    /// would otherwise keep one past the 30 days and out of the cap's reach).
     pub fn expire_retired(&mut self, now: SystemTime) {
         let keep = Duration::from_secs(RETIRED_DAYS * 86_400);
         self.retired
             .retain(|_, r| match parse_iso8601(&r.retired_at) {
-                Some(t) => now.duration_since(t).map_or(true, |age| age <= keep),
+                Some(t) => now.duration_since(t).is_ok_and(|age| age <= keep),
                 None => false,
             });
     }
@@ -1666,8 +1667,8 @@ mod tests {
         assert!(!l.retired.contains_key("n10"));
         assert!(l.retired.contains_key("n00") && l.retired.contains_key("new"));
 
-        // Age: exactly 30 days is kept, a second more is not; unparsable is expired; a
-        // stamp in the future is kept.
+        // Age: exactly 30 days is kept, a second more is not; unparsable is expired, and
+        // so is a stamp in the future (code review F1).
         let day = 86_400;
         let mut l = sample();
         l.retire("old".into(), parked_record('a', &[]), t(base));
@@ -1678,8 +1679,8 @@ mod tests {
         l.expire_retired(t(base + RETIRED_DAYS * day + 1));
         assert_eq!(
             l.retired.keys().collect::<Vec<_>>(),
-            ["edge", "future"],
-            "31st day: old gone, the exact 30-day edge kept, unparsable expired"
+            ["edge"],
+            "31st day: old gone, the exact 30-day edge kept, unparsable and future expired"
         );
     }
 

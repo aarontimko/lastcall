@@ -622,7 +622,8 @@ is never the record in force (a recreated name first-sights, D20), never asked b
 never compacted or undone, and not listed in `status --json`'s `parked_branches`. Retention:
 one entry per name (retiring a name again replaces the older entry); the age check runs every
 time the prune runs, whatever the listing does, and drops an entry older than
-`ledger::RETIRED_DAYS` (30 days) or whose `retired_at` does not parse; past
+`ledger::RETIRED_DAYS` (30 days) or whose `retired_at` does not parse or lies in the
+future; past
 `ledger::RETIRED_CAP` (20) the oldest by `retired_at` is dropped as the new one goes in. When `HEAD` names a branch other than
 `seen_branch` and `refs/heads/<seen_branch>` no longer exists, this is `git branch -m` of the
 branch you are on: the record in force is re-labelled with the new name, no park, no first
