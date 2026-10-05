@@ -1760,6 +1760,12 @@ fn scenario_d20_deleted_recreated_renamed() {
         vec!["main".to_string()],
         "the deleted branch's record is pruned; main is parked while run-2 is in force"
     );
+    assert_eq!(
+        retired_names(&s),
+        vec!["run-1".to_string()],
+        "D20 the pruned record is retired"
+    );
+    let retired_run1 = retired_entry(&s, "run-1");
     s.repo.checkout("main").unwrap();
     assert_pile!(s.engine, s.root, "");
     s.repo.checkout_b("run-1").unwrap();
@@ -1768,6 +1774,24 @@ fn scenario_d20_deleted_recreated_renamed() {
         s.root,
         "",
         "D20 the recreated run-1 is a first sight; nothing of the old record survives"
+    );
+    {
+        let l = s.ledger();
+        assert_eq!(seen_branch(&s).as_deref(), Some("run-1"));
+        assert!(
+            l.overrides.is_empty(),
+            "the recreated run-1 carries nothing of the retired record"
+        );
+        assert!(l.undo.is_empty());
+        assert_eq!(
+            l.seen_tree, l.branches["main"].seen_tree,
+            "a copy of main's record"
+        );
+    }
+    assert_eq!(
+        retired_entry(&s, "run-1"),
+        retired_run1,
+        "D20 the retired record is untouched by the recreated name"
     );
 
     // A rename of the branch in force: re-label, no park, no first sight.
@@ -1804,6 +1828,29 @@ fn scenario_d20_deleted_recreated_renamed() {
         vec!["run-1".to_string(), "run-two".to_string()],
         "main's parked record is pruned with its ref"
     );
+    assert_eq!(
+        retired_names(&s),
+        vec!["main".to_string(), "run-1".to_string()],
+        "D20 and retired beside the first run-1's"
+    );
+}
+
+/// The retired names, sorted (the `retired` map's keys; empty when the field is omitted).
+fn retired_names(s: &Fresh) -> Vec<String> {
+    let v: serde_json::Value = serde_json::from_str(&s.ledger().to_json()).expect("ledger json");
+    match v.get("retired") {
+        Some(serde_json::Value::Object(m)) => m.keys().cloned().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// One retired entry as raw JSON (`Null` when absent).
+fn retired_entry(s: &Fresh, name: &str) -> serde_json::Value {
+    let v: serde_json::Value = serde_json::from_str(&s.ledger().to_json()).expect("ledger json");
+    v.get("retired")
+        .and_then(|r| r.get(name))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null)
 }
 
 #[test]
@@ -2772,4 +2819,235 @@ fn scenario_d27_a_include_gitignored_row_is_shaped_like_an_untracked_row() {
         json("plain_new.md"),
         "same content, same shape, same bytes"
     );
+}
+
+/// Who wrote the server's squash commit in D29.
+#[derive(Clone, Copy)]
+enum Squasher {
+    /// The user as author, GitHub as committer: a pull request squash-merged on GitHub.
+    GitHub,
+    /// A coworker as author and committer.
+    Coworker,
+}
+
+/// The three orders D29 runs the checkout, the delete and the pull in.
+#[derive(Clone, Copy, Debug)]
+enum D29Order {
+    /// `checkout main; branch -D run-1; pull`, no scan until the end (the report).
+    DeleteThenPull,
+    /// The same with a scan between the checkout and the delete.
+    ScanBetween,
+    /// `checkout main; pull; branch -D run-1`, no scan until the end.
+    PullThenDelete,
+}
+
+/// `git` in `cwd` with the fixture's isolation and a separate author and committer.
+fn git_as(cwd: &std::path::Path, author: (&str, &str), committer: (&str, &str), args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", author.0)
+        .env("GIT_AUTHOR_EMAIL", author.1)
+        .env("GIT_COMMITTER_NAME", committer.0)
+        .env("GIT_COMMITTER_EMAIL", committer.1)
+        .env("GIT_AUTHOR_DATE", "1767300000 +0000")
+        .env("GIT_COMMITTER_DATE", "1767300000 +0000")
+        .env("LC_ALL", "C")
+        .env("TZ", "UTC")
+        .output()
+        .expect("git runs");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// D29's setup up to the pull: first sight on `main`; `run-1` commits `a.rs` and `b.rs`,
+/// they are accepted there, and `run-1` is pushed; on the server a squash of `run-1` lands
+/// on `main` (`server_edit` changes `b.rs` in the squash). Then the order's checkout,
+/// delete and pull, and the scan that sees them.
+fn d29(name: &str, who: Squasher, server_edit: bool, order: D29Order) -> Fresh {
+    let mut s = Fresh::new(name);
+    assert_pile!(s.engine, s.root, "", "D29 first sight on main");
+    s.repo.checkout_b("run-1").unwrap();
+    s.repo.write("a.rs", "a\n");
+    s.repo.write("b.rs", "b\n");
+    s.repo.commit("run-1 work").unwrap();
+    assert_pile!(s.engine, s.root, "a.rs|b.rs", "D29 the run's work");
+    assert!(s.accept_all().ok());
+    assert_pile!(s.engine, s.root, "", "D29 run-1 reviewed");
+    s.repo
+        .git(&["push", "-q", "-u", "origin", "run-1"])
+        .unwrap();
+
+    // The server: a squash of run-1 onto main.
+    let srv = s.repo.parent_dir().join(format!("{name}.srv"));
+    let origin = s.repo.origin().to_string_lossy().into_owned();
+    let me = ("Me", "me@example.com");
+    let (author, committer) = match who {
+        Squasher::GitHub => (me, ("GitHub", "noreply@github.com")),
+        Squasher::Coworker => (
+            ("Coworker", "coworker@example.com"),
+            ("Coworker", "coworker@example.com"),
+        ),
+    };
+    git_as(
+        s.repo.parent_dir(),
+        me,
+        me,
+        &["clone", "-q", &origin, srv.to_str().unwrap()],
+    );
+    git_as(&srv, me, me, &["merge", "-q", "--squash", "origin/run-1"]);
+    if server_edit {
+        std::fs::write(srv.join("b.rs"), "b\nserver\n").unwrap();
+        git_as(&srv, me, me, &["add", "b.rs"]);
+    }
+    git_as(
+        &srv,
+        author,
+        committer,
+        &["commit", "-q", "-m", "run-1 (#1)"],
+    );
+    git_as(&srv, me, me, &["push", "-q", "origin", "main"]);
+
+    s.repo.checkout("main").unwrap();
+    match order {
+        D29Order::DeleteThenPull => {
+            s.repo.git(&["branch", "-D", "run-1"]).unwrap();
+            s.repo.git(&["pull", "-q", "--ff-only"]).unwrap();
+        }
+        D29Order::ScanBetween => {
+            assert_pile!(s.engine, s.root, "", "D29 on main before the delete");
+            s.repo.git(&["branch", "-D", "run-1"]).unwrap();
+            s.repo.git(&["pull", "-q", "--ff-only"]).unwrap();
+        }
+        D29Order::PullThenDelete => {
+            s.repo.git(&["pull", "-q", "--ff-only"]).unwrap();
+            s.repo.git(&["branch", "-D", "run-1"]).unwrap();
+        }
+    }
+    s
+}
+
+fn d29_seen_on(pile: &lastcall_engine::scan::Pile) -> Vec<(String, Vec<String>)> {
+    pile.rows
+        .iter()
+        .map(|r| (r.path_lossy(), r.seen_on.clone()))
+        .collect()
+}
+
+fn d29_seen_paths(pile: &lastcall_engine::scan::Pile) -> Vec<String> {
+    pile.seen_group()
+        .map(|g| {
+            g.paths
+                .iter()
+                .map(|p| String::from_utf8_lossy(p).into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// D29 at one order: the pulled squash folds into `[seen]` on `run-1`, survives a restart,
+/// and one group accept empties the pile.
+fn d29_folds(name: &str, order: D29Order) {
+    let mut s = d29(name, Squasher::GitHub, false, order);
+    let pile = assert_pile!(s.engine, s.root, "a.rs|b.rs", "D29 the squash pulled");
+    let run1 = vec!["run-1".to_owned()];
+    assert_eq!(
+        d29_seen_on(&pile),
+        vec![("a.rs".to_owned(), run1.clone()), ("b.rs".to_owned(), run1)],
+        "{order:?}: the deleted branch's accepted content folds"
+    );
+    assert_eq!(d29_seen_paths(&pile), vec!["a.rs", "b.rs"], "{order:?}");
+    s.restart();
+    let pile = assert_pile!(s.engine, s.root, "a.rs|b.rs", "D29 restart");
+    assert_eq!(
+        d29_seen_paths(&pile),
+        vec!["a.rs", "b.rs"],
+        "{order:?}: restart identical"
+    );
+    let group = pile.seen_group().expect("a seen group");
+    let rendered: Vec<Rendered> = group
+        .paths
+        .iter()
+        .map(|p| Rendered::of(pile.row(p).unwrap()))
+        .collect();
+    let out = s
+        .engine
+        .ops(&s.root)
+        .unwrap()
+        .accept_group(&rendered, pile.seen_branch.as_deref(), &NoFault)
+        .unwrap();
+    assert!(out.ok(), "{out:?}");
+    assert_pile!(
+        s.engine,
+        s.root,
+        "",
+        "D29 the group accept empties the pile"
+    );
+}
+
+#[test]
+fn scenario_d29_a_squash_merged_pull_request_folds_after_the_branch_is_deleted() {
+    d29_folds("d29", D29Order::DeleteThenPull);
+}
+
+#[test]
+fn scenario_d29_variant_a_scan_between_the_checkout_and_the_delete() {
+    d29_folds("d29-scan", D29Order::ScanBetween);
+}
+
+#[test]
+fn scenario_d29_variant_pull_then_delete_with_no_scan_until_the_end() {
+    d29_folds("d29-pull-first", D29Order::PullThenDelete);
+}
+
+#[test]
+fn scenario_d29_variant_a_file_the_server_edited_stays_a_plain_row() {
+    let mut s = d29("d29-edit", Squasher::GitHub, true, D29Order::DeleteThenPull);
+    let pile = assert_pile!(
+        s.engine,
+        s.root,
+        "a.rs|b.rs",
+        "D29 the edited squash pulled"
+    );
+    assert_eq!(
+        d29_seen_on(&pile),
+        vec![
+            ("a.rs".to_owned(), vec!["run-1".to_owned()]),
+            ("b.rs".to_owned(), vec![])
+        ],
+        "the edited file is a plain row"
+    );
+    assert_eq!(d29_seen_paths(&pile), vec!["a.rs"]);
+}
+
+#[test]
+fn scenario_d29_variant_a_coworkers_squash_stays_upstream() {
+    use lastcall_engine::scan::{Annotation, GroupKind};
+    let mut s = d29(
+        "d29-coworker",
+        Squasher::Coworker,
+        false,
+        D29Order::DeleteThenPull,
+    );
+    let pile = assert_pile!(
+        s.engine,
+        s.root,
+        "a.rs upstream|b.rs upstream",
+        "D29 the coworker's squash pulled"
+    );
+    for row in &pile.rows {
+        assert_eq!(row.annotation, Some(Annotation::Upstream));
+        assert!(row.seen_on.is_empty(), "upstream is never marked seen");
+    }
+    let kinds: Vec<GroupKind> = pile.groups().iter().map(|g| g.kind).collect();
+    assert_eq!(kinds, vec![GroupKind::Upstream], "counted once");
 }

@@ -38,8 +38,10 @@ Ids are the first 16 hex chars of SHA-256 over the canonicalized path.
 <state>/exports/<root basename>/<YYYY-MM-DD>.md      # flags with nowhere to send them (§6.7, ruling P9)
 <state>/roots/<parent-id>/meta.json                  # the parent dir this group was discovered under
 <state>/roots/<parent-id>/repos/<root-id>/
-    ledger.json      # schema 1.1 (§6.2): seen_tree, seen_at, overrides, plus snoozed_until
-                     # and the undo stack (Amendment v1.11; both additive, both optional)
+    ledger.json      # schema 1.2 (§6.2): the record in force (seen_tree, seen_at,
+                     # seen_branch, overrides), the parked `branches` (v1.12), the
+                     # `retired` records (v1.18), snoozed_until and undo (v1.11);
+                     # all fields: `LedgerWire` in ledger.rs (optional ones omitted when empty)
     store/           # bare git repo; objects/info/alternates → the user's objects dir (git roots)
     index            # private index seeded from the seen tree (a cache, never truth)
     index.tree       # the tree `index` was seeded from; mismatch with the ledger → reseed
@@ -145,7 +147,7 @@ Refused by construction: `status`, `diff`, `add`, `update-index`, `checkout`, `s
 6. Row iff baseline ≠ current by oid or mode (D1); on `core.filemode=false` roots the executable bit is normalized away on both sides, so a mode-only row cannot appear there.
 7. Every baseline and current blob of every row fetched in **one** `cat-file --batch` (2,000 unseen files cost 16 git processes per scan, not 2,000); hunks from a byte diff of the two blobs (`hunks.rs`); binary (NUL in the first 8000 bytes) or ≥ `collapse_size_bytes` or matching `collapsed_globs` → collapsed (D7/D8). A blob the batch cannot produce renders that row without content and a notice.
 8. Conflict state from the user's `ls-files -u` (C4); the override's flag; rename pairing (D5) — presentation only, the ledger stores delete + add. The pairing reads the **pile's rows**: a temp index (`index.<pid>.tmp`, this process's own) holds exactly the `deleted` rows at their baselines (`read-tree --empty` + `update-index --index-info`), the `added` rows are `add -N`ed, then `diff -M -z --name-status`. It is not a copy of the private index — that is the seen tree, and a path the user accepted as deleted (override `null`, no row) or a deleted row whose baseline is an override blob would otherwise pair or score differently before and after a compaction that changes no baseline.
-9. Annotation (`upstream.rs`): heads = HEAD (+ `MERGE_HEAD`); range `seen_head..head` or from the merge-base; commits reachable from a remote ref by someone else are upstream; a pending path whose content equals a head's blob is `upstream`, touched upstream but different is `mixed`, otherwise plain. No merge-base, detached with no upstream, shallow, or no remotes → nothing annotated (C7). Then the seen marks (`seen.rs`, Phase 14 B, Amendment v1.15): every row with a present current side and no annotation is compared with each **parked** record's composed baseline (an override blob with its mode, else that record's `seen_tree` entry; an absent or flag-only override never matches; the record in force is never compared), and an exact oid and mode match (filemode-normalized as in step 6) pushes that branch onto `row.seen_on`, sorted. `RootState.seen_cache` holds one `ls-tree -r` per (branch, parked tree oid) and is pruned to the records still parked at that tree before each call; with no candidate row nothing is listed. A parked tree the store no longer has lists as empty; a listing error takes back every mark and adds the notice `seen annotation skipped: …`. A branch deleted after its record was parked still matches until the next switch prunes the record (`prune_parked`). The marks never add or remove a row: `Row::folds_seen` (marked, current present, no annotation, no flag, no rename: either half of a rename pair stays a row) is what the TUI folds and `Pile::groups()` reports as the `seen` group, after the `upstream` one.
+9. Annotation (`upstream.rs`): heads = HEAD (+ `MERGE_HEAD`); range `seen_head..head` or from the merge-base; commits reachable from a remote ref by someone else are upstream; a pending path whose content equals a head's blob is `upstream`, touched upstream but different is `mixed`, otherwise plain. No merge-base, detached with no upstream, shallow, or no remotes → nothing annotated (C7). Then the seen marks (`seen.rs`, Phase 14 B, Amendment v1.15): every row with a present current side and no annotation is compared with each **parked** record's composed baseline, then with each **retired** one's (Amendment v1.18) by the same rule (an override blob with its mode, else that record's `seen_tree` entry; an absent or flag-only override never matches; the record in force is never compared, and neither is a retired record under the name in force), and an exact oid and mode match (filemode-normalized as in step 6) pushes that branch onto `row.seen_on` once, sorted. `RootState.seen_cache` holds one `ls-tree -r` per tree oid, shared by every parked or retired record at that tree, and is pruned to the trees some parked or retired record still names before each call; with no candidate row nothing is listed. A parked or retired tree the store no longer has lists as empty (no marks, no notice); a listing error takes back every mark and adds the notice `seen annotation skipped: …`. A branch deleted after its record was parked keeps matching: until the next switch from its parked record, after it from the retired record the prune (`prune_parked`) moves it to, for 30 days. The marks never add or remove a row: `Row::folds_seen` (marked, current present, no annotation, no flag, no rename: either half of a rename pair stays a row) is what the TUI folds and `Pile::groups()` reports as the `seen` group, after the `upstream` one.
 10. Notices from every step ride along in `pile.notices`; nothing after step 6 removes a row.
 
 ## Many roots at once, many lastcalls at once (Phase 5)
@@ -548,7 +550,9 @@ level of `ledger.json` exactly where the only record used to live; the rest are 
 `diff(baseline, worktree)` against the record in force.
 Parked records are read for one thing besides the switch: the seen marks after step 9 of
 the pipeline (Phase 14 B), which label a row with the parked branches that already accepted
-its exact content and never add or remove one.
+its exact content and never add or remove one. A deleted branch's record is **retired**
+into `retired` rather than dropped (Phase 16, Amendment v1.18), and the seen marks are the
+only reader of a retired record.
 
 **Which record.** The branch is the name in `<git_dir>/HEAD` when that file reads
 `ref: refs/heads/<name>`, one file read and no git process (`headstate::head_branch`; a linked
@@ -609,9 +613,20 @@ here shows against that.
 **Parking, loading, pruning, renaming.** Leaving a branch parks its record whole, undo stack
 and all, and arriving on a branch that has one moves it back into force exactly as it was left.
 At every switch the parked names are checked against `for-each-ref refs/heads` and a name with
-no ref is dropped, so a deleted branch's record goes; if that listing fails the prune is
-skipped for that switch, because keeping a record costs nothing and dropping one hides nothing
-either way. The record in force is never pruned. When `HEAD` names a branch other than
+no ref is **retired**: its `seen_tree` and its overrides, whole (a flag-only or seen-as-absent
+override is what stops a path matching, so it stays), move to `retired[<name>]` with
+`retired_at` set to the clock's now; `undo`, `seen_at` and `parked_at` are not kept. If that
+listing fails the parked half of the prune is skipped for that switch, because keeping a
+record costs nothing and retiring one hides nothing either way. The record in force is never
+pruned. A retired record exists so that content accepted on a branch deleted before its pull
+request came back (squash-merged on GitHub, then pulled) still folds into `[seen]` (D29); it
+is never the record in force (a recreated name first-sights, D20), never asked by the fold,
+never compacted or undone, and not listed in `status --json`'s `parked_branches`. Retention:
+one entry per name (retiring a name again replaces the older entry); the age check runs every
+time the prune runs, whatever the listing does, and drops an entry older than
+`ledger::RETIRED_DAYS` (30 days) or whose `retired_at` does not parse or lies in the
+future; past
+`ledger::RETIRED_CAP` (20) the oldest by `retired_at` is dropped as the new one goes in. When `HEAD` names a branch other than
 `seen_branch` and `refs/heads/<seen_branch>` no longer exists, this is `git branch -m` of the
 branch you are on: the record in force is re-labelled with the new name, no park, no first
 sight, no fold. That re-label is written, unlike the 1.1 adoption below, because the next
@@ -653,7 +668,11 @@ asked and was refused, which is the ordinary answer.
 
 **Schema.** 1.2, additive under major 1 (Amendment v1.12): top-level `seen_branch`,
 `branches` and `first_sight_head`, the last two omitted when they are empty or unknown so an
-untouched ledger still rewrites byte for byte. The record in force stays at the top level, so a 1.1 binary opening a 1.2 file keeps
+untouched ledger still rewrites byte for byte. `retired` (Amendment v1.18, between `branches`
+and `snoozed_until`, raw JSON per entry like `branches`) was added the same way, without a
+version bump, as v1.11's fields were: omitted when empty, each entry parsed strictly at load,
+and a build that predates it drops it on its first write, which only stops those records
+matching (an over-show). The record in force stays at the top level, so a 1.1 binary opening a 1.2 file keeps
 working on the branch it is on; its first write drops the parked records, which is an over-show
 at the next switch and a §11 residual. A 1.1 file read by this build has no `seen_branch`: the
 first sync attributes the record to whatever branch `HEAD` names, with no switch and no fold,
@@ -673,6 +692,8 @@ cd ~/.local/state/lastcall/roots/<parent>/repos/<root>
 jq -r '.seen_branch // "none"' ledger.json                    # the record in force
 jq -r '.branches // {} | keys[]' ledger.json                  # the parked branches
 jq -r '.branches["feat-x"].seen_tree' ledger.json             # one parked record's tree
+jq -r '.retired // {} | to_entries[] | "\(.key) \(.value.retired_at)"' ledger.json  # retired records, when
+GIT_DIR=store git ls-tree -r "$(jq -r '.retired["run-1"].seen_tree' ledger.json)"  # one retired record's tree
 GIT_DIR=store git ls-tree -r "$(jq -r '.branches["feat-x"].seen_tree' ledger.json)"
 lastcall status --json | jq -r '.roots[] | "\(.root) \(.seen_branch) \(.parked_branches)"'
 lastcall status --json | jq -r '.roots[].pending[] | select(.seen_on != []) | "\(.path) \(.seen_on)"'
@@ -704,6 +725,8 @@ Every rung shows *more* than the truth, never less, and says why in a notice:
 | ledger lock busy after 40 × 50 ms (2 s) | the op errors; nothing is written unlocked, and the TUI says `ledger busy in <root> — try again` with the row still pending |
 | `<git_dir>/HEAD` cannot be read, or names no branch (detached, unborn) | no switch: the record in force stays the one it was, and the pile is shown against it |
 | a parked record that does not parse | dropped at load with the notice `the parked seen record for branch "<name>" has an unreadable shape …`; every other record and the file itself survive, and that branch first-sights on its next arrival |
+| a retired record that does not parse | dropped at load with the notice `the retired seen record for deleted branch "<name>" has an unreadable shape …`; the rest survive, and content accepted there no longer folds into `[seen]` (rows, not a hide) |
+| a retired tree the store no longer has | lists as empty: no marks, no notice |
 | the branch left has no ref when the switch is noticed (deleted or renamed before the scan) | no fold and no first sight: the record in force is re-labelled as the branch arrived on (R3's rename rule, since a branch that has no record of its own is where the departed record's ref went); the fold's own "no ref any more" refusal is reachable only if the ref goes between that check and the fold, and then the copy stands with the notice below |
 | no commit in common with the branch left, an unborn head on either side, or a git call in the fold that does not answer | the copy is the record; the reason rides on the root's notices always, and on the head-inspection line only when git's reflog classifies the move as a checkout (a switch whose last reflog entry is a commit reads as "committed on", the wording circle-back named in the spec's §10) |
 | the root's state file knows no `first_sight_head` (written before the field, or first sighted at an unborn head) | not a failure and not a skip: the fold runs and asks the records alone, so it folds less and shows more |

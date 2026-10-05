@@ -17,6 +17,11 @@
 //! keyed by path alone, as the sentence is: an entry the user accepted is seen wherever it
 //! turns up, and a screen that leaves it out is not hiding anything from them.
 //!
+//! **Property 1b, no wrong mark:** after every scan, every row marked seen on another
+//! branch (`seen_on` non-empty, the `[seen]` group's candidates) has its current entry in
+//! `Seen(path)`. The mark folds a row into one accept, so a mark on an entry the user never
+//! accepted would be a hide by another route.
+//!
 //! **Property 2, a scan you did not make cannot manufacture work:** each sequence runs
 //! twice, once with a scan after every git command and once with the scans only where the
 //! sequence says (a run of git commands is one unobserved step; an accept has to see a
@@ -33,6 +38,11 @@
 //! sight copies *that* record rather than the one the unwatched run still carries. The
 //! watching run then over-shows, which §2 allows. The direction that must never happen is
 //! the one D25 caught: a pile that grows because nobody was looking.
+//!
+//! A `Mode` row of the unobserved run counts as shown when the observed run's final pile
+//! has the same path as `Modified` with its mode changed too: that row already shows the
+//! mode flip, beside a content change the unobserved run had accepted elsewhere
+//! ([`seen_oracle_a_mode_flip_after_an_accept_on_a_sibling_branch`], `docs/spec` §11).
 //!
 //! **Shapes the generator cannot express** are pinned as hand-driven tests at the end of
 //! this file, each run through the same two runs and the same two properties: a symlink at
@@ -207,6 +217,9 @@ impl Branch {
 struct Final {
     pile: Vec<String>,
     seen_branch: Option<String>,
+    /// The paths whose row changes the mode (baseline and current both present, modes
+    /// differ), whatever its `change`: a `Modified` row can carry a mode flip too.
+    mode_flips: BTreeSet<String>,
 }
 
 struct World {
@@ -275,7 +288,7 @@ impl World {
         Some((text, md.permissions().mode() & 0o111 != 0))
     }
 
-    /// A scan through the engine, with Property 1 checked on what it produced.
+    /// A scan through the engine, with Properties 1 and 1b checked on what it produced.
     fn scan(&mut self) -> Result<Pile, TestCaseError> {
         let pile = self.s.scan();
         self.log.push(format!(
@@ -295,7 +308,17 @@ impl World {
                     self.log.join("\n")
                 );
             }
-            if pile.row(path.as_bytes()).is_some() {
+            if let Some(row) = pile.row(path.as_bytes()) {
+                prop_assert!(
+                    row.seen_on.is_empty() || self.seen[path].contains(&disk),
+                    "WRONG MARK: {} is {:?} on disk, marked seen on {:?}, and it is not in Seen({}) = {:?}\n{}",
+                    path,
+                    disk,
+                    row.seen_on,
+                    path,
+                    self.seen[path],
+                    self.log.join("\n")
+                );
                 continue;
             }
             prop_assert!(
@@ -514,6 +537,15 @@ impl World {
                 })
                 .collect(),
             seen_branch: ledger.seen_branch.clone(),
+            mode_flips: pile
+                .rows
+                .iter()
+                .filter(|r| match (&r.baseline, &r.current) {
+                    (Some(b), Some(c)) => b.mode != c.mode,
+                    _ => false,
+                })
+                .map(|r| String::from_utf8_lossy(&r.path).into_owned())
+                .collect(),
         })
     }
 }
@@ -528,7 +560,8 @@ fn run(ops: &[Op], observed: bool) -> Result<(Final, Vec<String>), TestCaseError
 }
 
 /// Property 2, as the runs are compared: the unobserved run's rows are rows of the
-/// observed run's, and both end on the same branch.
+/// observed run's, and both end on the same branch. A `Mode` row is also covered by a
+/// `Modified` row of the same path whose mode changed (see the module notes).
 fn no_row_manufactured(
     observed: &Final,
     unobserved: &Final,
@@ -543,8 +576,13 @@ fn no_row_manufactured(
         log_u.join("\n")
     );
     for row in &unobserved.pile {
+        let covered = observed.pile.contains(row)
+            || row.strip_suffix(":Mode").is_some_and(|path| {
+                observed.pile.contains(&format!("{path}:Modified"))
+                    && observed.mode_flips.contains(path)
+            });
         prop_assert!(
-            observed.pile.contains(row),
+            covered,
             "MANUFACTURED: {} is on the pile of the run that skipped the scans and on no \
              screen the watching run ever showed ({:?})\n--- observed ---\n{}\n\
              --- unobserved ---\n{}",
@@ -937,4 +975,37 @@ fn seen_oracle_an_intermediate_version_on_a_diverged_branch_is_not_seen_state() 
     let (observed, unobserved) = both_runs(&ops);
     assert_eq!(rows_for(&observed, "f1").len(), 1, "{observed:?}");
     assert_eq!(rows_for(&unobserved, "f1").len(), 1, "{unobserved:?}");
+}
+
+/// The fourth shape the generator found (a pre-push run, 2026-10-04), the same on `main`
+/// before Phase 16: `f1` committed on `b0`, `b1` and `b2` cut at its tip, everything
+/// accepted on `b2`, back to `b0`, then `f1`'s mode flipped. The watching run gave `b0` a
+/// record of its own before the accept, so `f1` shows as `Modified` (the content `b0` never
+/// accepted, and the mode); the unwatched run reaches `b0` through a first sight that
+/// copies `b2`'s record, where that content is accepted, so only the mode shows. Nothing
+/// unaccepted is hidden: the `Mode` row is covered by the watching run's `Modified` row,
+/// which carries the same flip.
+#[test]
+fn seen_oracle_a_mode_flip_after_an_accept_on_a_sibling_branch() {
+    let ops = vec![
+        Op::Cut(CutAt::Tip),
+        Op::Commit(vec![(0, Some(0))]),
+        Op::Cut(CutAt::Tip),
+        Op::Cut(CutAt::Tip),
+        Op::AcceptAll,
+        Op::Checkout(1),
+        Op::Mode(0),
+    ];
+    let (observed, unobserved) = both_runs(&ops);
+    assert_eq!(
+        observed.pile,
+        vec!["f1:Modified".to_owned()],
+        "{observed:?}"
+    );
+    assert!(observed.mode_flips.contains("f1"), "{observed:?}");
+    assert_eq!(
+        unobserved.pile,
+        vec!["f1:Mode".to_owned()],
+        "{unobserved:?}"
+    );
 }

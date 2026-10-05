@@ -447,6 +447,34 @@ pub struct BranchRecord {
     pub parked_at: String,
 }
 
+/// How long a retired record is kept (Amendment v1.18): one older than this is dropped at
+/// the next prune, so a deleted branch's accepted content stops folding after a month.
+pub const RETIRED_DAYS: u64 = 30;
+
+/// At most this many retired records per root (Amendment v1.18); past it the oldest by
+/// `retired_at` is dropped as the new one is inserted.
+pub const RETIRED_CAP: usize = 20;
+
+/// A deleted branch's record, kept only so the seen-elsewhere annotation (§6.4) can still
+/// match it (Amendment v1.18). The prune moves a parked record here when its branch is
+/// gone, instead of dropping it.
+///
+/// It keeps what matching reads and nothing else: the tree and the overrides, whole
+/// (a flag-only or seen-as-absent override is what stops a path matching, so it stays).
+/// `undo` and `seen_at` are not kept. Nothing but [`crate::seen::mark`] reads one: it is
+/// never the record in force (a recreated name first-sights), never folded, compacted or
+/// undone. Parsed strictly, like [`BranchRecord`]: an entry that does not load is dropped
+/// with a notice, which only means its content stops folding (an over-show).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetiredRecord {
+    /// When the prune retired it (ISO-8601 UTC, the clock's now). Unparsable, or later
+    /// than the clock's now, reads as expired.
+    pub retired_at: String,
+    pub seen_tree: Option<Oid>,
+    #[serde(default)]
+    pub overrides: BTreeMap<String, Override>,
+}
+
 /// The wire shape: overrides as raw JSON so one unparsable entry cannot sink the file.
 #[derive(Debug, Serialize, Deserialize)]
 struct LedgerWire {
@@ -475,6 +503,12 @@ struct LedgerWire {
     /// the same reason `overrides` is.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     branches: BTreeMap<String, serde_json::Value>,
+    /// The retired records (Amendment v1.18, additive without a version bump, as v1.11's
+    /// fields were). Omitted when empty, so a ledger that never retired anything rewrites
+    /// byte-identical; raw JSON for the same reason `branches` is. A build that predates
+    /// the field drops it on rewrite, which only stops those records matching.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    retired: BTreeMap<String, serde_json::Value>,
     /// Amendment v1.11, additive. Omitted when the root is not snoozed, so a ledger that
     /// never met a Phase 10 binary is byte-identical after a rewrite.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -506,6 +540,10 @@ pub struct Ledger {
     /// One parked record per branch this root has been checked out on while lastcall
     /// watched, never including [`Ledger::seen_branch`] (R3).
     pub branches: BTreeMap<String, BranchRecord>,
+    /// Deleted branches' records (Amendment v1.18), one per name, at most [`RETIRED_CAP`],
+    /// none older than [`RETIRED_DAYS`] after the next prune. Read only by the
+    /// seen-elsewhere annotation.
+    pub retired: BTreeMap<String, RetiredRecord>,
     /// The file carried no `seen_branch` field at all (a 1.1 binary wrote it), so the
     /// first sync adopts `HEAD`'s branch as this record's owner with no switch and no fold
     /// (R6). In memory only: it is never written, and `false` the moment a sync has run.
@@ -533,6 +571,7 @@ impl Ledger {
             first_sight_head: None,
             overrides: BTreeMap::new(),
             branches: BTreeMap::new(),
+            retired: BTreeMap::new(),
             adopt_branch: false,
             unparsable: BTreeMap::new(),
             snoozed_until: None,
@@ -558,6 +597,42 @@ impl Ledger {
         while self.undo.len() > UNDO_CAP {
             self.undo.remove(0);
         }
+    }
+
+    /// Retire a deleted branch's parked record (Amendment v1.18): keep its tree and
+    /// overrides under `name`, stamped `now`, replacing an older entry of the same name;
+    /// past [`RETIRED_CAP`] the oldest by `retired_at` goes (an unparsable stamp counts as
+    /// the oldest; ties by name).
+    pub fn retire(&mut self, name: String, record: BranchRecord, now: SystemTime) {
+        self.retired.insert(
+            name,
+            RetiredRecord {
+                retired_at: iso8601(now),
+                seen_tree: record.seen_tree,
+                overrides: record.overrides,
+            },
+        );
+        while self.retired.len() > RETIRED_CAP {
+            let oldest = self
+                .retired
+                .iter()
+                .min_by_key(|(n, r)| (parse_iso8601(&r.retired_at).unwrap_or(UNIX_EPOCH), *n))
+                .map(|(n, _)| n.clone())
+                .expect("over the cap, so not empty");
+            self.retired.remove(&oldest);
+        }
+    }
+
+    /// Drop the retired records older than [`RETIRED_DAYS`] at `now`, and any whose
+    /// `retired_at` does not parse or lies after `now` (a clock set back, or a hand edit,
+    /// would otherwise keep one past the 30 days and out of the cap's reach).
+    pub fn expire_retired(&mut self, now: SystemTime) {
+        let keep = Duration::from_secs(RETIRED_DAYS * 86_400);
+        self.retired
+            .retain(|_, r| match parse_iso8601(&r.retired_at) {
+                Some(t) => now.duration_since(t).is_ok_and(|age| age <= keep),
+                None => false,
+            });
     }
 
     fn to_wire(&self) -> LedgerWire {
@@ -601,6 +676,16 @@ impl Ledger {
                     )
                 })
                 .collect(),
+            retired: self
+                .retired
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        serde_json::to_value(v).expect("retired record is serializable"),
+                    )
+                })
+                .collect(),
             snoozed_until: self.snoozed_until.clone(),
             undo: self.undo.clone(),
         }
@@ -634,6 +719,18 @@ impl Ledger {
                 )),
             }
         }
+        let mut retired = BTreeMap::new();
+        for (name, value) in wire.retired {
+            match serde_json::from_value::<RetiredRecord>(value) {
+                Ok(r) => {
+                    retired.insert(name, r);
+                }
+                Err(e) => notices.push(format!(
+                    "the retired seen record for deleted branch {name:?} has an unreadable \
+                     shape ({e}); content accepted there no longer folds into [seen]"
+                )),
+            }
+        }
         Self {
             schema_version: wire.schema_version,
             root: wire.root,
@@ -647,6 +744,7 @@ impl Ledger {
             first_sight_head: wire.first_sight_head,
             overrides,
             branches,
+            retired,
             unparsable,
             snoozed_until: wire.snoozed_until,
             undo: wire.undo,
@@ -1408,6 +1506,182 @@ mod tests {
         assert!(l.branches.contains_key("good"));
         assert!(!l.branches.contains_key("bad"));
         assert_eq!(l.seen_branch.as_deref(), Some("main"));
+    }
+
+    fn parked_record(tree: char, overrides: &[(&str, Override)]) -> BranchRecord {
+        BranchRecord {
+            seen_tree: Some(oid(tree)),
+            seen_at: SeenAt {
+                head_commit: Some(oid(tree)),
+                branch: Some("x".into()),
+                at: "2026-01-01T00:00:00Z".into(),
+            },
+            overrides: overrides
+                .iter()
+                .map(|(p, o)| ((*p).to_owned(), o.clone()))
+                .collect(),
+            undo: vec![UndoEntry {
+                op: UndoOp::AcceptFile,
+                at: "2026-01-01T00:00:00Z".into(),
+                paths: BTreeMap::new(),
+            }],
+            parked_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    fn t(secs: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    /// Amendment v1.18's wire shape: `retired` between `branches` and `snoozed_until`, one
+    /// entry per name with its tree and overrides whole, through a write and a read.
+    #[test]
+    fn ledger_retired_records_round_trip() {
+        let mut l = sample();
+        l.seen_branch = Some("main".into());
+        l.snoozed_until = Some("2030-01-01T00:00:00Z".into());
+        l.branches.insert("feat".into(), parked_record('d', &[]));
+        let flag_only = l.overrides["flagged"].clone();
+        let absent = l.overrides["gone"].clone();
+        l.retire(
+            "run-1".into(),
+            parked_record('e', &[("f", flag_only), ("g", absent)]),
+            t(1_767_225_600),
+        );
+        let r = &l.retired["run-1"];
+        assert_eq!(r.retired_at, "2026-01-01T00:00:00Z", "stamped with now");
+        assert_eq!(r.seen_tree, Some(oid('e')));
+        assert_eq!(
+            r.overrides.keys().collect::<Vec<_>>(),
+            ["f", "g"],
+            "flag-only and seen-as-absent overrides are kept: they stop a path matching"
+        );
+
+        let json = l.to_json();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["schema_version"], "1.2", "no version bump");
+        assert_eq!(v["retired"]["run-1"]["seen_tree"], oid('e').as_str());
+        assert_eq!(v["retired"]["run-1"]["retired_at"], "2026-01-01T00:00:00Z");
+        assert!(
+            v["retired"]["run-1"].get("undo").is_none(),
+            "undo is not kept"
+        );
+        assert!(
+            v["retired"]["run-1"].get("seen_at").is_none(),
+            "nor is seen_at"
+        );
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        let at = |k: &str| json.find(&format!("\n  \"{k}\"")).unwrap();
+        assert!(keys.contains(&"retired"));
+        assert!(at("branches") < at("retired") && at("retired") < at("snoozed_until"));
+
+        let (back, notices) = parse(json.as_bytes()).unwrap();
+        assert!(notices.is_empty(), "{notices:?}");
+        assert_eq!(back.retired, l.retired);
+        assert_eq!(back.branches, l.branches);
+        assert_eq!(back.to_json(), json, "and the second write is identical");
+    }
+
+    /// A ledger that never retired anything has no `retired` key and rewrites
+    /// byte-identical; a 1.2 file written before the field loads with none.
+    #[test]
+    fn ledger_with_no_retired_records_rewrites_byte_identical() {
+        let mut l = sample();
+        l.seen_branch = Some("main".into());
+        l.branches.insert("feat".into(), parked_record('d', &[]));
+        let once = l.to_json();
+        assert!(
+            !once.contains("\"retired\""),
+            "no retired records, no field: {once}"
+        );
+        let (back, notices) = parse(once.as_bytes()).unwrap();
+        assert!(notices.is_empty(), "{notices:?}");
+        assert!(back.retired.is_empty());
+        assert_eq!(back.to_json(), once, "rewrite is byte-identical");
+
+        let json = r#"{"schema_version":"1.2","root":"/r","kind":"git","seen_tree":null,
+            "seen_at":{"head_commit":null,"branch":null,"at":"x"},"seen_branch":"main",
+            "overrides":{}}"#;
+        let (l, notices) = parse(json.as_bytes()).unwrap();
+        assert!(notices.is_empty(), "{notices:?}");
+        assert!(l.retired.is_empty(), "a 1.2 file without the field loads");
+    }
+
+    /// An unreadable retired entry costs that entry only, with a notice; the rest load.
+    #[test]
+    fn ledger_an_unreadable_retired_record_is_dropped_with_a_notice() {
+        let json = r#"{"schema_version":"1.2","root":"/r","kind":"git","seen_tree":null,
+            "seen_at":{"head_commit":null,"branch":null,"at":"x"},"seen_branch":"main",
+            "overrides":{},
+            "retired":{"bad":{"seen_tree":42},
+                       "good":{"retired_at":"2026-01-01T00:00:00Z","seen_tree":null,
+                               "overrides":{}}}}"#;
+        let (l, notices) = parse(json.as_bytes()).unwrap();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(
+            notices[0].starts_with(
+                "the retired seen record for deleted branch \"bad\" has an unreadable shape"
+            ),
+            "{}",
+            notices[0]
+        );
+        assert!(l.retired.contains_key("good"));
+        assert!(!l.retired.contains_key("bad"));
+        let v: serde_json::Value = serde_json::from_str(&l.to_json()).unwrap();
+        assert!(v["retired"].get("bad").is_none(), "dropped on rewrite");
+    }
+
+    /// Retention: one per name (the newer replaces the older), at most [`RETIRED_CAP`]
+    /// with the oldest by `retired_at` dropped at insertion, and nothing older than
+    /// [`RETIRED_DAYS`] (or unparsable) once [`Ledger::expire_retired`] runs.
+    #[test]
+    fn ledger_retired_retention_one_per_name_cap_and_age() {
+        let base = 1_767_225_600;
+        let mut l = sample();
+        l.retire("x".into(), parked_record('a', &[]), t(base));
+        l.retire("x".into(), parked_record('b', &[]), t(base + 60));
+        assert_eq!(l.retired.len(), 1, "one per name");
+        assert_eq!(l.retired["x"].seen_tree, Some(oid('b')), "the newer wins");
+        assert_eq!(l.retired["x"].retired_at, iso8601(t(base + 60)));
+
+        // 21 retirements, named so that name order is the reverse of age order.
+        let mut l = sample();
+        for k in 0..=RETIRED_CAP as u64 {
+            let name = format!("b{:02}", RETIRED_CAP as u64 - k);
+            l.retire(name, parked_record('a', &[]), t(base + 60 * k));
+        }
+        assert_eq!(l.retired.len(), RETIRED_CAP);
+        assert!(
+            !l.retired.contains_key(&format!("b{RETIRED_CAP:02}")),
+            "the oldest went"
+        );
+        assert!(l.retired.contains_key("b00"), "the newest stayed");
+
+        // An unparsable stamp counts as the oldest at the cap.
+        let mut l = sample();
+        for k in 0..RETIRED_CAP as u64 {
+            l.retire(format!("n{k:02}"), parked_record('a', &[]), t(base + k));
+        }
+        l.retired.get_mut("n10").unwrap().retired_at = "garbage".into();
+        l.retire("new".into(), parked_record('a', &[]), t(base + 1_000));
+        assert!(!l.retired.contains_key("n10"));
+        assert!(l.retired.contains_key("n00") && l.retired.contains_key("new"));
+
+        // Age: exactly 30 days is kept, a second more is not; unparsable is expired, and
+        // so is a stamp in the future (code review F1).
+        let day = 86_400;
+        let mut l = sample();
+        l.retire("old".into(), parked_record('a', &[]), t(base));
+        l.retire("edge".into(), parked_record('a', &[]), t(base + 1));
+        l.retire("future".into(), parked_record('a', &[]), t(base + 90 * day));
+        l.retire("bad".into(), parked_record('a', &[]), t(base));
+        l.retired.get_mut("bad").unwrap().retired_at = "not a time".into();
+        l.expire_retired(t(base + RETIRED_DAYS * day + 1));
+        assert_eq!(
+            l.retired.keys().collect::<Vec<_>>(),
+            ["edge"],
+            "31st day: old gone, the exact 30-day edge kept, unparsable and future expired"
+        );
     }
 
     #[test]
