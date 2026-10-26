@@ -10,7 +10,9 @@ compared against. It is not a gate: nothing here fails a build.
 `crates/lastcall/tests/test_bench.rs` (`cargo test --release -p lastcall --test test_bench
 -- --ignored --nocapture --test-threads=1`). Each scenario prints one
 `BENCH <scenario> <metric>=<value>` line per metric to stderr; the table below is those
-lines, copied. A debug build prints a SKIP line and measures nothing.
+lines, copied. A debug build prints a SKIP line and measures nothing. S5, the worktree
+soak, is skipped by `just bench` and runs alone under `just bench-soak` (its own section,
+"Phase 17 (S5)", below).
 
 - Fixtures are built outside every timed region: the 100 clones and their 4,000 edits, the
   100,000-line file, the 1,000- and 50,000-file drops. Each lives under a `TempDir` that its
@@ -974,6 +976,123 @@ BENCH S4 scan_spawns=15
 BENCH S4 rows_shown=10000
 BENCH S4 omitted=40000
 ```
+
+## Phase 17 (S5): the worktree soak (`just bench-soak`)
+
+Not a gate and not part of `just bench` (whose recipe skips it by name): a soak that answers
+one question, how the TUI's resident set and CPU behave while several agents write into
+linked worktrees of one large repository and the reader keeps accepting. The hypotheses it
+is built to separate (H1 to H6) and the reasoning behind every default are in
+`docs/spec/170-phase17-kickoff.md`; this section is how to run it and how to read it.
+
+### What it does
+
+`just bench-soak` builds the release binary and runs one `#[ignore]`d test,
+`bench_s5_worktree_soak` in `crates/lastcall/tests/test_bench.rs`. A debug build prints
+`SKIP: S5 measures the release build only (run: just bench-soak)` and measures nothing.
+
+- **Fixture**, built before anything is measured, under the scenario's `TempDir`s: one
+  repository `W/repo` of 300 committed text files of 3,000 lines each (`fixture_mb` 32.6, in MiB, of text per
+  checkout), plus six linked worktrees `W/w01` to `W/w06` made with `git worktree add -b
+  agent/wNN`, siblings of the repository. An in-process engine takes first sight and asserts
+  seven roots; the TUI must then show `nothing pending across 7 repos`, and
+  `worktree_badges` counts the worktrees its summary lists with the `[worktree of repo]`
+  badge (six).
+- **Isolation** as every scenario: `isolated_lastcall` (private `HOME`, config and
+  `LASTCALL_STATE_DIR` in the temp dir, no `HERDR_*`, update check and welcome off). The TUI
+  runs as `lastcall tui` with the default timings (debounce 750 ms, 3 s cap), not `--poll 1`.
+- **Writers**: one thread per worktree; the main checkout stays idle. Every 250 ms a writer
+  rewrites its next file (round robin) so that one fifth of the lines, a different fifth each
+  time, carry a new stamp. During churn phases only, every 240 writes (about a minute) a writer
+  runs `git add -A`, `git commit` and `git switch -c agent/wNN-<k>`, leaving the old branch, so
+  parked records pile up behind the accepts and name distinct trees. A git failure is printed
+  (`--- S5 writer …`) and the writer carries on; an `index.lock` in that message would be news.
+- **Cycle**, three times: **ramp** 90 s (writers on, nothing accepted); **churn** 150 s (writers
+  on, `ctrl-a` every 20 s, `y` only once the `Accept all …?` question is on screen, never
+  blind, because a stray `y` is `copy`); **quiet** 60 s (writers stopped and joined, then the
+  final accept, then idle).
+- **Relaunch**: writers on for 60 s with nothing accepted (`phase=prequit`), writers stopped
+  and joined, `q`, then the TUI started again over the same state and sampled for 30 s: the
+  launch's `scan_all` is where up to eight roots' batches are in flight at once.
+- **Sampling**: a harness thread runs `ps -o rss=,time= -p <pid>` once a second. CPU % is the
+  delta of the cumulative CPU time over the wall delta (not `ps -o %cpu`, a decaying average on
+  macOS), so it can exceed 100 on several cores. The 10 ms sampler the other scenarios use is
+  off. At every phase's end, `footprint <pid>` and `heap <pid>` run (macOS only, each
+  time-boxed to 30 s; `n/a` when absent or timed out); each pauses the child for a moment, after
+  the phase's closing sample. `leaks <pid>` runs once, on the relaunched process at the very
+  end.
+- **Scale knobs**: `LASTCALL_BENCH_S5_SCALE` (default 1.0) multiplies every phase length and
+  the 240-write branch interval (so a short rehearsal still parks records); the 20 s accept
+  cadence and the 250 ms write period are the user's and do not scale.
+  `LASTCALL_BENCH_S5_FILES` and `LASTCALL_BENCH_S5_LINES` resize the fixture. At scale 0.2 the
+  run took 225 s in the rehearsal; at 1.0 about 17 minutes plus the fixture.
+
+### What it prints
+
+All on stderr, `BENCH S5 <metric>=<value>`; `n/a` where a tool is missing or timed out.
+
+| metric | what it is |
+|---|---|
+| `trace t=<s> cycle=<n> phase=<name> rss_kb=<n> cpu_pct=<n>` | the curve: one line every 10 s of the run (`t` from the first spawn), and one at every accept with `event=accept` (`event=refused` when a churn `ctrl-a` started nothing). `cycle=0 phase=launch` is before the first ramp; `cycle=4` is the relaunch (`prequit`, then `relaunch`) |
+| `c<n>_<phase>_end_rss_kb`, `_peak_rss_kb` | the RSS sampled as the phase closed, and the largest sample in it |
+| `c<n>_<phase>_cpu_pct_avg` | the child's CPU seconds over the phase divided by its wall time |
+| `c<n>_<phase>_end_footprint_kb` | `footprint`'s `Footprint:` total (its unit read, KB, MB or GB) |
+| `c<n>_<phase>_end_reclaimable_kb` | the `Reclaimable` column summed over the `MALLOC*` rows |
+| `c<n>_<phase>_end_heap_inuse_kb` | `heap`'s `All zones: … (<bytes> bytes)`: what malloc holds as live allocations |
+| `c<n>_{ramp,churn}_end_files`, `_end_hunks` | the header's counts as the phase closed |
+| `c<n>_churn_accepts_started` | accepts that actually started (an accept already running refuses another) |
+| `c<n>_quiet_settle_s` | seconds from the final accept to a screen with nothing pending; `SKIP` when that never happens inside the quiet phase |
+| `c<n>_quiet_accepts_started` | accepts the quiet phase started (more than one means rows came back after the first) |
+| `prequit_*`, `relaunch_*` | the same readings for the relaunch; `relaunch_first_frame_s` is spawn to a header with counts (the launch hold over) |
+| `leaks_count`, `leaks_bytes` | `leaks --nostacks --noContent` on the relaunched process |
+| `parked_records_max` | the most parked records any one root's `ledger.json` holds after the run |
+| `parked_trees_distinct` | distinct parked `seen_tree` oids, counted per root and summed (each root has its own tree cache) |
+| `writer_switches`, `writer_failures` | the writers' branch switches and failed writes or git steps |
+| `roots`, `worktree_badges`, `fixture_mb`, `fixture_s`, `wall_s` | the shape, one checkout's text size, the fixture's build time, the whole test's wall time |
+
+**The quiet phase in detail.** After the writers are joined the harness waits for the header
+to hold still for 5 s (at most half the phase), so the final accept covers the writers' last
+writes instead of racing the watcher's scans of them. It then sends `ctrl-a` (+ `y`), and while
+rows remain it sends `ctrl-a` again every 5 s; a refusal while the first accept runs costs
+nothing. `settle_s` runs from the first of those accepts.
+
+### Reading it
+
+Absolute RSS moves 15 to 33 % between runs on this machine (see "Variance" above), so the
+curve is read as **deltas within one run**:
+
+- **quiet-end against quiet-end across the three cycles** (`c1_quiet_end_*`,
+  `c2_quiet_end_*`, `c3_quiet_end_*`). Flat means memory comes back after the accepts; a
+  steady climb with the same pile shape is growth to explain.
+- **peak against quiet-end within a cycle**: how much of the churn peak the process gives
+  back once nothing is pending.
+- **footprint against heap in-use at the same instant**: heap in use low while footprint stays
+  high is the allocator keeping freed regions (H6, retention); both high is live data (H1 to
+  H4) or a leak, and `leaks_*` and the parked counts (H5) say which.
+- **relaunch peak against the c3 churn peak**: whether launch's parallel `scan_all` is the
+  worst moment of the run.
+- `cpu_pct` is spawn-bound scanning plus diffing under a stress well above the reported 10 %;
+  read its shape (does it fall in quiet, does it climb cycle to cycle), not its level.
+- On macOS `ps`'s RSS still counts pages malloc has freed and marked reclaimable until the
+  kernel takes them back; `footprint`'s total does not, and the `Reclaimable` column is
+  those pages. An RSS several times the footprint, with `reclaimable_kb` near the
+  difference, is that accounting, not live memory (the scale-0.2 rehearsal showed it at
+  every phase end after the first churn).
+- Below scale 0.2 the quiet phase is too short for the still-header wait plus a 5 s retry,
+  so `quiet_settle_s` prints `SKIP` there by construction; read it only at 0.2 and above.
+
+### Runs A and B
+
+> **Placeholders.** The orchestrator runs `just bench-soak` twice at scale 1.0 on a quiet
+> machine and replaces this block with the machine block, the date, the commit and both runs'
+> raw `BENCH S5` lines.
+
+Machine block: _to be filled_ (as "Machine" above: CPU, OS, git, rustc / cargo, profile,
+filesystem watcher, date, commit).
+
+Run A: _to be filled_ (`wall_s`, then the raw `BENCH S5` lines).
+
+Run B: _to be filled_.
 
 ## Known costs
 
