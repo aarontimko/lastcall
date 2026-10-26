@@ -634,10 +634,14 @@ fn thousands(n: usize) -> String {
 
 // ---- S5: the worktree soak (Phase 17 Part A, docs/spec/170-phase17-kickoff.md) ----------
 
-/// Committed text files, and lines in each: about 34 MB of text per checkout, so one root's
-/// pending batch is tens of MB (`LASTCALL_BENCH_S5_FILES` / `_LINES` override both).
+/// Committed text files, and lines in each: 34.2 MB (32.6 MiB) of text per checkout, so one
+/// root's pending batch is tens of MB (`LASTCALL_BENCH_S5_FILES` / `_LINES` override both).
 const S5_FILES: usize = 300;
 const S5_LINES: usize = 3_000;
+/// A write edits every line whose number is `seq` modulo this: 20 lines of a 3,000-line
+/// file, 150 apart, so 20 separate hunks under the diff's 3 lines of context
+/// (`LASTCALL_BENCH_S5_STRIDE` overrides it; at 5 the edits merge into one hunk per file).
+const S5_STRIDE: usize = 150;
 /// Linked worktrees beside the repository (`w01` … on `agent/w01` …), one writer each.
 const S5_WORKTREES: usize = 6;
 /// A writer's period: one file rewritten per tick.
@@ -678,6 +682,7 @@ struct S5Knobs {
     scale: f64,
     files: usize,
     lines: usize,
+    stride: usize,
 }
 
 fn env_number<T: std::str::FromStr>(name: &str) -> Option<T> {
@@ -696,6 +701,9 @@ impl S5Knobs {
             lines: env_number::<usize>("LASTCALL_BENCH_S5_LINES")
                 .filter(|n| *n >= 1)
                 .unwrap_or(S5_LINES),
+            stride: env_number::<usize>("LASTCALL_BENCH_S5_STRIDE")
+                .filter(|n| *n >= 1)
+                .unwrap_or(S5_STRIDE),
         }
     }
 
@@ -732,13 +740,14 @@ fn s5_file(f: usize) -> String {
 }
 
 /// File `f`'s text. `edit` = `(writer, seq)` rewrites every line whose number is `seq`
-/// modulo 5 with a line naming both: a fifth of the file, a different fifth and a new stamp
-/// at every write, so each rewrite changes content already pending.
-fn s5_text(f: usize, lines: usize, edit: Option<(usize, u64)>) -> String {
+/// modulo `stride` with a line naming both: one line in `stride`, a different set and a new
+/// stamp at every write, so each rewrite changes content already pending.
+fn s5_text(f: usize, lines: usize, stride: usize, edit: Option<(usize, u64)>) -> String {
+    let stride = stride.max(1) as u64;
     let mut out = String::with_capacity(lines * 40);
     for j in 0..lines {
         let line = match edit {
-            Some((w, seq)) if j as u64 % 5 == seq % 5 => {
+            Some((w, seq)) if j as u64 % stride == seq % stride => {
                 format!("f{f:03} l{j:04} w{w:02} edit {seq:06} ipsum\n")
             }
             _ => format!("f{f:03} l{j:04} lorem ipsum dolor sit amet\n"),
@@ -773,7 +782,7 @@ fn s5_write_loop(
         let tick = Instant::now();
         let f = (w.seq % knobs.files as u64) as usize;
         w.seq += 1;
-        let text = s5_text(f, knobs.lines, Some((w.index, w.seq)));
+        let text = s5_text(f, knobs.lines, knobs.stride, Some((w.index, w.seq)));
         if let Err(e) = std::fs::write(w.dir.join(s5_file(f)), text) {
             w.failures += 1;
             s5_line(&format!(
@@ -1063,12 +1072,35 @@ fn s5_tool(dir: &Path, tool: &str, args: &[&str]) -> Option<String> {
     text
 }
 
-/// `footprint` and `heap` at a phase's end: (footprint, MALLOC reclaimable, heap in use).
-fn s5_memory(dir: &Path, pid: u32) -> [Option<u64>; 3] {
+/// `footprint` and `heap` at a phase's end, all in KiB. The two tools run one after the
+/// other, seconds apart on a loaded phase while the writers still write, so only
+/// `heap`'s own pair (`heap_footprint`, `heap_inuse`, read while `heap` holds the task
+/// suspended) is one instant; `footprint`'s run gives the total and `Reclaimable`.
+struct S5Memory {
+    footprint: Option<u64>,
+    reclaimable: Option<u64>,
+    heap_footprint: Option<u64>,
+    heap_inuse: Option<u64>,
+}
+
+fn s5_memory(dir: &Path, pid: u32) -> S5Memory {
     let pid = pid.to_string();
     let footprint = s5_tool(dir, "footprint", &[&pid]).and_then(|t| parse_footprint(&t));
-    let heap = s5_tool(dir, "heap", &[&pid]).and_then(|t| parse_heap_inuse_kb(&t));
-    [footprint.map(|f| f.0), footprint.map(|f| f.1), heap]
+    let heap = s5_tool(dir, "heap", &[&pid]);
+    S5Memory {
+        footprint: footprint.map(|f| f.0),
+        reclaimable: footprint.map(|f| f.1),
+        heap_footprint: heap.as_deref().and_then(parse_heap_footprint_kb),
+        heap_inuse: heap.as_deref().and_then(parse_heap_inuse_kb),
+    }
+}
+
+/// `<prefix>_end_footprint_kb` … `<prefix>_end_heap_inuse_kb`.
+fn s5_memory_lines(prefix: &str, m: &S5Memory) {
+    s5_opt(&format!("{prefix}_end_footprint_kb"), m.footprint);
+    s5_opt(&format!("{prefix}_end_reclaimable_kb"), m.reclaimable);
+    s5_opt(&format!("{prefix}_end_heap_footprint_kb"), m.heap_footprint);
+    s5_opt(&format!("{prefix}_end_heap_inuse_kb"), m.heap_inuse);
 }
 
 fn s5_header(s: &vt100::Screen) -> Option<(usize, usize)> {
@@ -1163,9 +1195,7 @@ fn s5_phase_end(sampler: &S5Sampler, pty: &PtyTui, phase: &S5Phase, tools: &Path
         &format!("{p}_cpu_pct_avg"),
         end.cpu_pct_avg.map(|c| format!("{c:.1}")),
     );
-    s5_opt(&format!("{p}_end_footprint_kb"), memory[0]);
-    s5_opt(&format!("{p}_end_reclaimable_kb"), memory[1]);
-    s5_opt(&format!("{p}_end_heap_inuse_kb"), memory[2]);
+    s5_memory_lines(&p, &memory);
     if let Some(header) = header {
         s5_opt(&format!("{p}_end_files"), header.map(|h| h.0));
         s5_opt(&format!("{p}_end_hunks"), header.map(|h| h.1));
@@ -1232,13 +1262,15 @@ fn s5_quiet(sampler: &S5Sampler, pty: &mut PtyTui, phase: &S5Phase, length: Dura
     s5_idle(pty, until);
 }
 
-fn s5_spawn(b: &Bench) -> PtyTui {
-    PtyCommand::new(bin())
+/// `sample_rss` turns on the harness's 10 ms RSS sampler: the relaunch only, where the
+/// launch's `scan_all` peak lasts about a second and the 1 s sampler can miss it.
+fn s5_spawn(b: &Bench, sample_rss: bool) -> PtyTui {
+    let cmd = PtyCommand::new(bin())
         .cwd(&b.parent)
         .isolated_lastcall(&b.home, &b.config_path, &b.state)
-        .args(["tui"])
-        .spawn()
-        .expect("spawn lastcall tui in a pty")
+        .args(["tui"]);
+    let cmd = if sample_rss { cmd.sample_rss() } else { cmd };
+    cmd.spawn().expect("spawn lastcall tui in a pty")
 }
 
 fn s5_quit(pty: &mut PtyTui) {
@@ -1294,22 +1326,26 @@ fn bench_s5_worktree_soak() {
     let run = Instant::now();
     let knobs = S5Knobs::from_env();
     s5_line(&format!(
-        "--- S5 knobs: scale={} files={} lines={} worktrees={S5_WORKTREES} branch_every={}",
+        "--- S5 knobs: scale={} files={} lines={} stride={} worktrees={S5_WORKTREES} \
+         branch_every={}",
         knobs.scale,
         knobs.files,
         knobs.lines,
+        knobs.stride,
         knobs.branch_every()
     ));
+    s5("stride", knobs.stride);
     let b = Bench::new("s5", None);
-    let tools = b.state.join("s5-tools");
-    std::fs::create_dir_all(&tools).expect("tools dir");
+    // The tools' output files live in their own temp dir, beside the state dir, not in it.
+    let tools_dir = TempDir::new("lc-bench-s5-tools");
+    let tools = tools_dir.path().to_path_buf();
 
     // The fixture, outside every measured region.
     let built = Instant::now();
     let mut repo = b.repo("repo");
     let mut bytes = 0usize;
     for f in 0..knobs.files {
-        let text = s5_text(f, knobs.lines, None);
+        let text = s5_text(f, knobs.lines, knobs.stride, None);
         bytes += text.len();
         repo.write(&s5_file(f), text);
     }
@@ -1343,7 +1379,7 @@ fn bench_s5_worktree_soak() {
     s5("fixture_s", format!("{:.1}", built.elapsed().as_secs_f64()));
 
     let t0 = Instant::now();
-    let mut pty = s5_spawn(&b);
+    let mut pty = s5_spawn(&b, false);
     pty.wait_for_text(&format!("nothing pending across {roots} repos"), LONG)
         .unwrap_or_else(|e| panic!("every root listed: {e}"));
     pty.wait_for(LONG, watching)
@@ -1436,7 +1472,7 @@ fn bench_s5_worktree_soak() {
     drop(pty);
 
     let spawned = Instant::now();
-    let mut pty = s5_spawn(&b);
+    let mut pty = s5_spawn(&b, true);
     let pid = pty.pid().expect("pid");
     let mut sampler = S5Sampler::start(pid, t0, relaunch_cycle, "relaunch");
     let phase = sampler.begin(relaunch_cycle, "relaunch");
@@ -1448,16 +1484,19 @@ fn bench_s5_worktree_soak() {
     );
     s5_idle(&pty, spawned + knobs.phase(S5_RELAUNCH_SAMPLE));
     let end = sampler.end(&phase);
-    s5_opt("relaunch_peak_rss_kb", end.peak_kb);
+    // The 10 ms sampler's maximum, read at the window's end before any tool runs: the
+    // launch peak; the 1 s sampler's own maximum beside it.
+    s5_opt("relaunch_peak_rss_kb", pty.peak_rss_kb());
+    if pty.rss_sampler_stopped_early() {
+        s5_line("--- S5 relaunch_peak_rss_kb is PARTIAL: the 10 ms sampler stopped early");
+    }
+    s5_opt("relaunch_peak_rss_kb_1hz", end.peak_kb);
     s5_opt("relaunch_end_rss_kb", end.end_kb);
     s5_opt(
         "relaunch_cpu_pct_avg",
         end.cpu_pct_avg.map(|c| format!("{c:.1}")),
     );
-    let memory = s5_memory(&tools, pid);
-    s5_opt("relaunch_end_footprint_kb", memory[0]);
-    s5_opt("relaunch_end_reclaimable_kb", memory[1]);
-    s5_opt("relaunch_end_heap_inuse_kb", memory[2]);
+    s5_memory_lines("relaunch", &s5_memory(&tools, pid));
     let leaks = s5_tool(
         &tools,
         "leaks",
@@ -1598,6 +1637,18 @@ fn parse_heap_inuse_kb(text: &str) -> Option<u64> {
     })
 }
 
+/// `heap <pid>`'s banner: `Physical footprint:         56.2M`, taken while `heap` holds the
+/// task suspended, so it pairs with [`parse_heap_inuse_kb`] at one instant. The unit is
+/// glued to the number (`752K`, `56.2M`, `1.1G`); the `(peak)` line is not this one.
+fn parse_heap_footprint_kb(text: &str) -> Option<u64> {
+    text.lines().find_map(|line| {
+        let value = line.trim().strip_prefix("Physical footprint:")?.trim();
+        let split = value.find(|c: char| !c.is_ascii_digit() && c != '.')?;
+        let (number, unit) = value.split_at(split);
+        size_kb(number, unit.trim())
+    })
+}
+
 /// `leaks <pid>`: `Process <pid>: <n> leaks for <bytes> total leaked bytes.`
 fn parse_leaks(text: &str) -> Option<(u64, u64)> {
     text.lines().find_map(|line| {
@@ -1718,6 +1769,23 @@ All zones: 678 nodes (65550288 bytes)
 ";
     assert_eq!(parse_heap_inuse_kb(heap), Some(64_014));
     assert_eq!(parse_heap_inuse_kb("heap: no process"), None);
+    assert_eq!(
+        parse_heap_footprint_kb(heap),
+        Some(57_549),
+        "56.2M, glued unit"
+    );
+    let glued = |v: &str| {
+        parse_heap_footprint_kb(&format!(
+            "Physical footprint (peak):  9.9G\nPhysical footprint:         {v}\n"
+        ))
+    };
+    assert_eq!(glued("752K"), Some(752), "the (peak) line is skipped");
+    assert_eq!(glued("55.7M"), Some(57_037));
+    assert_eq!(glued("1.1G"), Some(1_153_434));
+    assert_eq!(glued("0B"), Some(0));
+    assert_eq!(glued("12"), None, "no unit");
+    assert_eq!(glued("4Q"), None);
+    assert_eq!(parse_heap_footprint_kb("heap: no process"), None);
 
     let leaks = "\
 leaks Report Version: 4.0
@@ -1733,6 +1801,27 @@ Process 5535: 501 leaks for 65541120 total leaked bytes.
         parse_leaks("Process 9: 678 nodes malloced for 64014 KB"),
         None
     );
+}
+
+#[test]
+fn bench_s5_stride_edits_one_line_in_stride() {
+    let base = s5_text(7, S5_LINES, S5_STRIDE, None);
+    assert_eq!(
+        base.len(),
+        S5_LINES * 38,
+        "38 bytes a line: 34.2 MB at 300 files"
+    );
+    let edited = s5_text(7, S5_LINES, S5_STRIDE, Some((3, 151)));
+    let changed: Vec<usize> = base
+        .lines()
+        .zip(edited.lines())
+        .enumerate()
+        .filter(|(_, (a, b))| a != b)
+        .map(|(j, _)| j)
+        .collect();
+    assert_eq!(changed.len(), 20, "one line in 150 of 3,000");
+    assert_eq!(changed[0], 1, "seq 151 edits lines 1, 151, 301 …");
+    assert!(changed.windows(2).all(|p| p[1] - p[0] == S5_STRIDE));
 }
 
 #[test]
