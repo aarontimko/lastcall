@@ -623,3 +623,257 @@ fn thousands(n: usize) -> String {
     }
     out
 }
+
+// ---- S5's readers: plain functions over the tools' text, tested below without a run ----
+
+/// `ps -o time=` as seconds. macOS prints unbounded minutes (`3020:03.94`), Linux
+/// `[DD-]HH:MM:SS`: both are fields split on `:` and summed from the right (seconds, then
+/// minutes, then hours), the last one fractional, after an optional `DD-` day prefix.
+fn parse_cpu_time(text: &str) -> Option<f64> {
+    let text = text.trim();
+    let (days, rest) = match text.split_once('-') {
+        Some((d, rest)) => (d.parse::<u64>().ok()?, rest),
+        None => (0, text),
+    };
+    let fields: Vec<&str> = rest.split(':').collect();
+    if fields.len() > 3 {
+        return None;
+    }
+    let mut total = 0.0;
+    let mut unit = 1.0;
+    for (i, field) in fields.iter().rev().enumerate() {
+        let value = if i == 0 {
+            field.parse::<f64>().ok()?
+        } else {
+            field.parse::<u64>().ok()? as f64
+        };
+        if !value.is_finite() || value < 0.0 {
+            return None;
+        }
+        total += value * unit;
+        unit *= 60.0;
+    }
+    Some(total + days as f64 * 86_400.0)
+}
+
+/// `ps -o rss=,time= -p <pid>`: the resident set (KiB) and the cumulative CPU seconds.
+fn parse_ps_sample(text: &str) -> Option<(u64, f64)> {
+    let mut fields = text.split_whitespace();
+    let rss = fields.next()?.parse().ok()?;
+    let cpu = parse_cpu_time(fields.next()?)?;
+    if fields.next().is_some() {
+        return None;
+    }
+    Some((rss, cpu))
+}
+
+/// `56` `MB` → KiB. The macOS memory tools print `B`, `KB`, `MB` and `GB` (binary units),
+/// sometimes with a fraction.
+fn size_kb(number: &str, unit: &str) -> Option<u64> {
+    let n: f64 = number.parse().ok()?;
+    if !n.is_finite() || n < 0.0 {
+        return None;
+    }
+    let kb = match unit {
+        "B" => n / 1024.0,
+        "KB" | "K" => n,
+        "MB" | "M" => n * 1024.0,
+        "GB" | "G" => n * 1024.0 * 1024.0,
+        "TB" | "T" => n * 1024.0 * 1024.0 * 1024.0,
+        _ => return None,
+    };
+    Some(kb.round() as u64)
+}
+
+/// `footprint <pid>`: the `Footprint:` total from the banner, and the `Reclaimable` column
+/// summed over the rows whose category starts with `MALLOC`, both in KiB. A row reads
+/// `<dirty> <unit> <clean> <unit> <reclaimable> <unit> <regions> <category…>`.
+fn parse_footprint(text: &str) -> Option<(u64, u64)> {
+    let total = text.lines().find_map(|line| {
+        let (_, after) = line.split_once("Footprint:")?;
+        let mut tokens = after.split_whitespace();
+        size_kb(tokens.next()?, tokens.next()?)
+    })?;
+    let reclaimable = text
+        .lines()
+        .filter_map(|line| {
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            if tokens.len() < 8 || !tokens[7].starts_with("MALLOC") {
+                return None;
+            }
+            size_kb(tokens[4], tokens[5])
+        })
+        .sum();
+    Some((total, reclaimable))
+}
+
+/// `heap <pid>`: the malloc zones' in-use total, `All zones: <n> nodes (<bytes> bytes)`, in
+/// KiB. The earlier `All zones: … malloced - Sizes:` line has no byte total and is skipped.
+fn parse_heap_inuse_kb(text: &str) -> Option<u64> {
+    text.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix("All zones:")?;
+        let (_, bytes) = rest.split_once('(')?;
+        let bytes: u64 = bytes.strip_suffix(" bytes)")?.trim().parse().ok()?;
+        Some(bytes.div_ceil(1024))
+    })
+}
+
+/// `leaks <pid>`: `Process <pid>: <n> leaks for <bytes> total leaked bytes.`
+fn parse_leaks(text: &str) -> Option<(u64, u64)> {
+    text.lines().find_map(|line| {
+        if !line.contains("total leaked bytes") {
+            return None;
+        }
+        let (_, rest) = line.split_once(": ")?;
+        let tokens: Vec<&str> = rest.split_whitespace().collect();
+        let count = tokens.first()?.parse().ok()?;
+        let bytes = tokens.get(3)?.parse().ok()?;
+        Some((count, bytes))
+    })
+}
+
+/// The header's counts, `lastcall  <R> repos · <F> files · <H> hunks …`, as `(F, H)`; a
+/// capped count (`1,203+ files`) reads as its number. `None` during the launch hold
+/// (`<R> repos · checking status…`) or on any other first row.
+fn parse_header_counts(row: &str) -> Option<(usize, usize)> {
+    let rest = row.trim_start().strip_prefix("lastcall  ")?;
+    let mut parts = rest.split(" · ");
+    parts.next()?;
+    let number = |part: &str, noun: &str| -> Option<usize> {
+        let mut tokens = part.split_whitespace();
+        let n = tokens.next()?.replace([',', '+'], "").parse().ok()?;
+        tokens.next()?.starts_with(noun).then_some(n)
+    };
+    let files = number(parts.next()?, "file")?;
+    let hunks = number(parts.next()?, "hunk")?;
+    Some((files, hunks))
+}
+
+#[test]
+fn bench_s5_ps_time_reads_macos_minutes_and_linux_days() {
+    let close = |text: &str, want: f64| {
+        let got = parse_cpu_time(text).unwrap_or_else(|| panic!("{text:?} parses"));
+        assert!((got - want).abs() < 1e-6, "{text:?}: {got} != {want}");
+    };
+    // macOS: minutes are unbounded, seconds carry hundredths.
+    close("0:00.01", 0.01);
+    close("  0:12.50\n", 12.5);
+    close("3020:03.94", 3020.0 * 60.0 + 3.94);
+    // Linux: `[DD-]HH:MM:SS`.
+    close("00:00:00", 0.0);
+    close("01:02:03", 3723.0);
+    close(
+        "2-03:04:05",
+        2.0 * 86_400.0 + 3.0 * 3600.0 + 4.0 * 60.0 + 5.0,
+    );
+    // A bare seconds field is still a number.
+    close("7.25", 7.25);
+    for bad in [
+        "",
+        "abc",
+        "1:2:3:4",
+        "1:xx.5",
+        "-1",
+        "x-01:02:03",
+        "1:-2.0",
+        "NaN",
+    ] {
+        assert_eq!(parse_cpu_time(bad), None, "{bad:?}");
+    }
+    assert_eq!(
+        parse_ps_sample(" 15888   3020:14.25\n").map(|(r, _)| r),
+        Some(15888)
+    );
+    let (_, cpu) = parse_ps_sample("15888 3020:14.25").expect("two columns");
+    assert!((cpu - 181_214.25).abs() < 1e-6, "{cpu}");
+    assert_eq!(parse_ps_sample(""), None, "a gone process prints nothing");
+    assert_eq!(parse_ps_sample("15888"), None);
+    assert_eq!(
+        parse_ps_sample("RSS TIME\n1 0:00.01"),
+        None,
+        "a header is not a sample"
+    );
+}
+
+#[test]
+fn bench_s5_memory_tools_text_parses() {
+    let footprint = "\
+======================================================================
+lastcall [5535]: 64-bit    Footprint: 1.5 GB (16384 bytes per page)
+======================================================================
+
+  Dirty      Clean  Reclaimable    Regions    Category
+    ---        ---          ---        ---    ---
+  55 MB        0 B       2 MB          6    MALLOC_MEDIUM
+ 273 KB        0 B          0 B          1    page table
+ 144 KB        0 B       16 KB         12    MALLOC metadata
+  64 KB        0 B      512 B           2    MALLOC_SMALL
+    0 B      16 KB          0 B         45    __TEXT
+    ---        ---          ---        ---    ---
+  56 MB      48 KB          3 MB        344    TOTAL
+
+Auxiliary data:
+    phys_footprint: 56 MB
+";
+    assert_eq!(
+        parse_footprint(footprint),
+        Some((1_572_864, 2048 + 16 + 1)),
+        "the banner's total, MALLOC rows' reclaimable only (TOTAL is not a MALLOC row)"
+    );
+    assert_eq!(parse_footprint("no such process"), None);
+    assert_eq!(size_kb("56", "MB"), Some(57_344));
+    assert_eq!(size_kb("776", "B"), Some(1));
+    assert_eq!(size_kb("3", "parsecs"), None);
+
+    let heap = "\
+Physical footprint:         56.2M
+----
+
+Process 5535: 1 zone
+
+All zones: 678 nodes malloced - Sizes: 128KB[500] 5KB[1] 32[144]
+
+-----------------------------------------------------------------------
+All zones: 678 nodes (65550288 bytes)
+";
+    assert_eq!(parse_heap_inuse_kb(heap), Some(64_014));
+    assert_eq!(parse_heap_inuse_kb("heap: no process"), None);
+
+    let leaks = "\
+leaks Report Version: 4.0
+Process 5535: 678 nodes malloced for 64014 KB
+Process 5535: 501 leaks for 65541120 total leaked bytes.
+";
+    assert_eq!(parse_leaks(leaks), Some((501, 65_541_120)));
+    assert_eq!(
+        parse_leaks("Process 9: 0 leaks for 0 total leaked bytes."),
+        Some((0, 0))
+    );
+    assert_eq!(
+        parse_leaks("Process 9: 678 nodes malloced for 64014 KB"),
+        None
+    );
+}
+
+#[test]
+fn bench_s5_header_counts_read_the_first_row() {
+    assert_eq!(
+        parse_header_counts(
+            "lastcall  7 repos · 1,203 files · 45,000 hunks  [Accept All]  watching W"
+        ),
+        Some((1_203, 45_000))
+    );
+    assert_eq!(
+        parse_header_counts("lastcall  1 repo · 1 file · 1 hunk"),
+        Some((1, 1))
+    );
+    assert_eq!(
+        parse_header_counts("lastcall  3 repos · 10,000+ files · 9 hunks"),
+        Some((10_000, 9))
+    );
+    assert_eq!(
+        parse_header_counts("lastcall  7 repos · checking status…"),
+        None
+    );
+    assert_eq!(parse_header_counts("watching W"), None);
+}
