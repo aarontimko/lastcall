@@ -20,9 +20,17 @@
 //! child's resident set as `ps -o rss= -p <pid>` reports it, sampled over the scene with a
 //! `POLL` (10 ms) sleep between samples — a period of ≈10 ms plus one `ps` — while the
 //! screen is read every `POLL`, the granularity of every screen `*_ms` value.
+//!
+//! S5, the worktree soak (Phase 17 Part A), is the exception to both: it is not part of
+//! `just bench` but runs alone under `just bench-soak` (about 17 minutes), and it samples
+//! the child once a second on its own thread rather than with the 10 ms sampler.
 
+use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use lastcall_engine::config::Config;
@@ -622,6 +630,878 @@ fn thousands(n: usize) -> String {
         out.push(ch);
     }
     out
+}
+
+// ---- S5: the worktree soak (Phase 17 Part A, docs/spec/170-phase17-kickoff.md) ----------
+
+/// Committed text files, and lines in each: about 34 MB of text per checkout, so one root's
+/// pending batch is tens of MB (`LASTCALL_BENCH_S5_FILES` / `_LINES` override both).
+const S5_FILES: usize = 300;
+const S5_LINES: usize = 3_000;
+/// Linked worktrees beside the repository (`w01` … on `agent/w01` …), one writer each.
+const S5_WORKTREES: usize = 6;
+/// A writer's period: one file rewritten per tick.
+const S5_WRITE: Duration = Duration::from_millis(250);
+/// Churn-phase writes between a writer's commit-and-switch: about a minute at `S5_WRITE`.
+/// Scaled with the phases, so a short rehearsal still parks records.
+const S5_BRANCH_EVERY: u64 = 240;
+const S5_CYCLES: u32 = 3;
+/// The phase lengths; `LASTCALL_BENCH_S5_SCALE` multiplies every one of them.
+const S5_RAMP: Duration = Duration::from_secs(90);
+const S5_CHURN: Duration = Duration::from_secs(150);
+const S5_QUIET: Duration = Duration::from_secs(60);
+const S5_RELAUNCH_WRITE: Duration = Duration::from_secs(60);
+const S5_RELAUNCH_SAMPLE: Duration = Duration::from_secs(30);
+/// The churn phase's `ctrl-a` cadence: the reader's, so not scaled.
+const S5_ACCEPT_EVERY: Duration = Duration::from_secs(20);
+const S5_SAMPLE_EVERY: Duration = Duration::from_secs(1);
+/// One `trace` line per this many seconds of the run.
+const S5_TRACE_EVERY: u64 = 10;
+/// How long `ctrl-a` gets to open the confirm (or to start or refuse an accept), and how
+/// long `y` gets to close it.
+const S5_MODAL_WAIT: Duration = Duration::from_secs(3);
+/// Every macOS memory tool is time-boxed to this; a timeout prints `n/a`.
+const S5_TOOL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Quiet: the header must hold still this long (at most half the phase) before the final
+/// `ctrl-a`, so the accept covers the writers' last writes rather than racing their scans.
+const S5_QUIET_STILL: Duration = Duration::from_secs(5);
+/// Quiet: while rows remain after the final accept, `ctrl-a` again this often.
+const S5_QUIET_RETRY: Duration = Duration::from_secs(5);
+/// The confirm's question, `Accept all <N> files in <root>?` / `… across <R> repos?`.
+const S5_MODAL: &str = "Accept all ";
+/// `tui::app::ACCEPT_IN_PROGRESS` and `NOTHING_TO_ACCEPT`, spelled out (the binary's
+/// crate is not a dependency of its own tests' harness).
+const S5_REFUSED: [&str; 2] = ["accept in progress", "nothing to accept"];
+
+/// The three knobs, read the way [`parallelism_env`] reads its own.
+struct S5Knobs {
+    scale: f64,
+    files: usize,
+    lines: usize,
+}
+
+fn env_number<T: std::str::FromStr>(name: &str) -> Option<T> {
+    std::env::var_os(name)?.to_str()?.trim().parse::<T>().ok()
+}
+
+impl S5Knobs {
+    fn from_env() -> Self {
+        S5Knobs {
+            scale: env_number::<f64>("LASTCALL_BENCH_S5_SCALE")
+                .filter(|s| s.is_finite() && *s > 0.0)
+                .unwrap_or(1.0),
+            files: env_number::<usize>("LASTCALL_BENCH_S5_FILES")
+                .filter(|n| *n >= 1)
+                .unwrap_or(S5_FILES),
+            lines: env_number::<usize>("LASTCALL_BENCH_S5_LINES")
+                .filter(|n| *n >= 1)
+                .unwrap_or(S5_LINES),
+        }
+    }
+
+    fn phase(&self, length: Duration) -> Duration {
+        length.mul_f64(self.scale)
+    }
+
+    fn branch_every(&self) -> u64 {
+        ((S5_BRANCH_EVERY as f64 * self.scale).round() as u64).max(1)
+    }
+}
+
+/// One whole line to stderr under the lock: the sampler thread and the test's thread both
+/// print, and [`note`]'s two writes could interleave.
+fn s5_line(line: &str) {
+    let mut err = std::io::stderr().lock();
+    let _ = err.write_all(format!("{line}\n").as_bytes());
+    let _ = err.flush();
+}
+
+fn s5(metric: &str, value: impl std::fmt::Display) {
+    s5_line(&format!("BENCH S5 {metric}={value}"));
+}
+
+fn s5_opt(metric: &str, value: Option<impl std::fmt::Display>) {
+    match value {
+        Some(v) => s5(metric, v),
+        None => s5(metric, "n/a"),
+    }
+}
+
+fn s5_file(f: usize) -> String {
+    format!("f{f:03}.txt")
+}
+
+/// File `f`'s text. `edit` = `(writer, seq)` rewrites every line whose number is `seq`
+/// modulo 5 with a line naming both: a fifth of the file, a different fifth and a new stamp
+/// at every write, so each rewrite changes content already pending.
+fn s5_text(f: usize, lines: usize, edit: Option<(usize, u64)>) -> String {
+    let mut out = String::with_capacity(lines * 40);
+    for j in 0..lines {
+        let line = match edit {
+            Some((w, seq)) if j as u64 % 5 == seq % 5 => {
+                format!("f{f:03} l{j:04} w{w:02} edit {seq:06} ipsum\n")
+            }
+            _ => format!("f{f:03} l{j:04} lorem ipsum dolor sit amet\n"),
+        };
+        out.push_str(&line);
+    }
+    out
+}
+
+/// One worktree's writer, kept across cycles so the round-robin and the branch count go on.
+struct S5Writer {
+    index: usize,
+    dir: PathBuf,
+    seq: u64,
+    writes: u64,
+    churn_writes: u64,
+    switches: u64,
+    failures: u64,
+}
+
+/// Rewrite the next file every [`S5_WRITE`] until `stop`; while `churn` holds, every
+/// `branch_every` writes commit and `git switch -c` to a fresh branch.
+fn s5_write_loop(
+    repo: &FixtureRepo,
+    w: &mut S5Writer,
+    knobs: &S5Knobs,
+    stop: &AtomicBool,
+    churn: &AtomicBool,
+) {
+    let branch_every = knobs.branch_every();
+    while !stop.load(Ordering::Relaxed) {
+        let tick = Instant::now();
+        let f = (w.seq % knobs.files as u64) as usize;
+        w.seq += 1;
+        let text = s5_text(f, knobs.lines, Some((w.index, w.seq)));
+        if let Err(e) = std::fs::write(w.dir.join(s5_file(f)), text) {
+            w.failures += 1;
+            s5_line(&format!(
+                "--- S5 writer w{:02}: write {} failed: {e}",
+                w.index,
+                s5_file(f)
+            ));
+        }
+        w.writes += 1;
+        if churn.load(Ordering::Relaxed) {
+            w.churn_writes += 1;
+            if w.churn_writes.is_multiple_of(branch_every) {
+                s5_switch(repo, w);
+            }
+        }
+        while !stop.load(Ordering::Relaxed) {
+            let left = S5_WRITE.saturating_sub(tick.elapsed());
+            if left.is_zero() {
+                break;
+            }
+            std::thread::sleep(left.min(Duration::from_millis(50)));
+        }
+    }
+}
+
+/// Commit what the worktree has and switch to `agent/wNN-<k>`, leaving the old branch in
+/// place. A git failure is printed and the writer carries on.
+fn s5_switch(repo: &FixtureRepo, w: &mut S5Writer) {
+    let k = w.switches + 1;
+    let message = format!("w{:02} checkpoint {k}", w.index);
+    let branch = format!("agent/w{:02}-{k}", w.index);
+    let steps: [&[&str]; 3] = [
+        &["add", "-A"],
+        &["commit", "-q", "-m", &message],
+        &["switch", "-q", "-c", &branch],
+    ];
+    for args in steps {
+        if let Err(e) = repo.git_at(&w.dir, args) {
+            w.failures += 1;
+            let lock = if e.stderr.contains("index.lock") {
+                " (an index.lock: lastcall never writes the user's index, so this is news)"
+            } else {
+                ""
+            };
+            s5_line(&format!(
+                "--- S5 writer w{:02}: git {} failed{lock}: {}",
+                w.index,
+                args.join(" "),
+                e.stderr.trim()
+            ));
+            return;
+        }
+    }
+    w.switches += 1;
+}
+
+/// `ps -o rss=,time= -p <pid>`: KiB and cumulative CPU seconds; `None` once it is gone.
+fn s5_ps(pid: u32) -> Option<(u64, f64)> {
+    let out = Command::new("ps")
+        .args(["-o", "rss=,time=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_ps_sample(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn s5_fmt_pct(pct: Option<f64>) -> String {
+    pct.map_or_else(|| "n/a".to_owned(), |p| format!("{p:.1}"))
+}
+
+/// What the sampler thread shares with the test: the label it prints, the phase's peak
+/// and the last sample.
+#[derive(Default)]
+struct S5Live {
+    cycle: u32,
+    phase: &'static str,
+    peak_kb: u64,
+    last_kb: Option<u64>,
+    last_cpu_pct: Option<f64>,
+    failed: u64,
+}
+
+/// The once-a-second sampler over one child: resident set and CPU time from one `ps`, CPU
+/// percent from the time deltas (not `ps -o %cpu`, a decaying average on macOS), and one
+/// `trace` line every [`S5_TRACE_EVERY`] seconds of the run.
+struct S5Sampler {
+    pid: u32,
+    t0: Instant,
+    stop: Arc<AtomicBool>,
+    live: Arc<Mutex<S5Live>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// A phase as it began: the label, the instant and the child's CPU seconds then.
+struct S5Phase {
+    cycle: u32,
+    name: &'static str,
+    at: Instant,
+    cpu_s: Option<f64>,
+}
+
+struct S5PhaseEnd {
+    end_kb: Option<u64>,
+    peak_kb: Option<u64>,
+    cpu_pct_avg: Option<f64>,
+}
+
+fn s5_lock(live: &Mutex<S5Live>) -> MutexGuard<'_, S5Live> {
+    live.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn s5_sample_loop(pid: u32, t0: Instant, stop: &AtomicBool, live: &Mutex<S5Live>) {
+    let mut prev: Option<(Instant, f64)> = None;
+    let mut next_trace = 0u64;
+    while !stop.load(Ordering::Relaxed) {
+        let tick = Instant::now();
+        match s5_ps(pid) {
+            Some((kb, cpu)) => {
+                let pct = prev.and_then(|(at, was)| {
+                    let dt = tick.duration_since(at).as_secs_f64();
+                    (dt > 0.0).then(|| (cpu - was).max(0.0) / dt * 100.0)
+                });
+                prev = Some((tick, cpu));
+                let mut l = s5_lock(live);
+                l.peak_kb = l.peak_kb.max(kb);
+                l.last_kb = Some(kb);
+                if pct.is_some() {
+                    l.last_cpu_pct = pct;
+                }
+                let t = tick.duration_since(t0).as_secs();
+                if t >= next_trace {
+                    s5_line(&format!(
+                        "BENCH S5 trace t={t} cycle={} phase={} rss_kb={kb} cpu_pct={}",
+                        l.cycle,
+                        l.phase,
+                        s5_fmt_pct(pct)
+                    ));
+                    next_trace = (t / S5_TRACE_EVERY + 1) * S5_TRACE_EVERY;
+                }
+            }
+            None => s5_lock(live).failed += 1,
+        }
+        while !stop.load(Ordering::Relaxed) {
+            let left = S5_SAMPLE_EVERY.saturating_sub(tick.elapsed());
+            if left.is_zero() {
+                break;
+            }
+            std::thread::sleep(left.min(Duration::from_millis(50)));
+        }
+    }
+}
+
+impl S5Sampler {
+    fn start(pid: u32, t0: Instant, cycle: u32, phase: &'static str) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let live = Arc::new(Mutex::new(S5Live {
+            cycle,
+            phase,
+            ..S5Live::default()
+        }));
+        let thread = {
+            let (stop, live) = (stop.clone(), live.clone());
+            std::thread::Builder::new()
+                .name("lastcall-s5-sampler".to_owned())
+                .spawn(move || s5_sample_loop(pid, t0, &stop, &live))
+                .expect("the sampler thread")
+        };
+        S5Sampler {
+            pid,
+            t0,
+            stop,
+            live,
+            thread: Some(thread),
+        }
+    }
+
+    /// Label the samples from now on and restart the peak at a sample taken now.
+    fn begin(&self, cycle: u32, name: &'static str) -> S5Phase {
+        let sample = s5_ps(self.pid);
+        {
+            let mut l = s5_lock(&self.live);
+            l.cycle = cycle;
+            l.phase = name;
+            l.peak_kb = sample.map_or(0, |s| s.0);
+        }
+        S5Phase {
+            cycle,
+            name,
+            at: Instant::now(),
+            cpu_s: sample.map(|s| s.1),
+        }
+    }
+
+    /// A sample taken now closes the phase: its RSS is the end, the peak is the larger of
+    /// it and every sample since `begin`, and the CPU average is the time delta over the wall.
+    fn end(&self, phase: &S5Phase) -> S5PhaseEnd {
+        let sample = s5_ps(self.pid);
+        let wall = phase.at.elapsed().as_secs_f64();
+        let peak = s5_lock(&self.live).peak_kb.max(sample.map_or(0, |s| s.0));
+        let cpu_pct_avg = match (phase.cpu_s, sample) {
+            (Some(was), Some((_, now))) if wall > 0.0 => Some((now - was).max(0.0) / wall * 100.0),
+            _ => None,
+        };
+        S5PhaseEnd {
+            end_kb: sample.map(|s| s.0),
+            peak_kb: (peak > 0).then_some(peak),
+            cpu_pct_avg,
+        }
+    }
+
+    /// A `trace` line now, from the last sample, with `event=<event>`.
+    fn event(&self, event: &str) {
+        let l = s5_lock(&self.live);
+        s5_line(&format!(
+            "BENCH S5 trace t={} cycle={} phase={} rss_kb={} cpu_pct={} event={event}",
+            self.t0.elapsed().as_secs(),
+            l.cycle,
+            l.phase,
+            l.last_kb
+                .map_or_else(|| "n/a".to_owned(), |kb| kb.to_string()),
+            s5_fmt_pct(l.last_cpu_pct)
+        ));
+    }
+
+    /// Stop and join the thread; the count of `ps` ticks that gave no number.
+    fn finish(&mut self) -> u64 {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        s5_lock(&self.live).failed
+    }
+}
+
+impl Drop for S5Sampler {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+/// Run one macOS memory tool against the child, its output to a file (the `leaks` report
+/// can be long, and a pipe nobody drains would stall it), time-boxed to
+/// [`S5_TOOL_TIMEOUT`]. `None` off macOS, when the tool is absent, or on a timeout.
+fn s5_tool(dir: &Path, tool: &str, args: &[&str]) -> Option<String> {
+    static RUNS: AtomicU64 = AtomicU64::new(0);
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let path = dir.join(format!(
+        "{tool}-{}.txt",
+        RUNS.fetch_add(1, Ordering::Relaxed)
+    ));
+    let file = std::fs::File::create(&path).ok()?;
+    let mut child = Command::new(tool)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(file)
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let start = Instant::now();
+    let finished = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break true,
+            Ok(None) if start.elapsed() < S5_TOOL_TIMEOUT => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break false;
+            }
+        }
+    };
+    let text = std::fs::read(&path)
+        .ok()
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+    let _ = std::fs::remove_file(&path);
+    if !finished {
+        s5_line(&format!(
+            "--- S5 {tool} did not finish within {S5_TOOL_TIMEOUT:?}: n/a"
+        ));
+        return None;
+    }
+    text
+}
+
+/// `footprint` and `heap` at a phase's end: (footprint, MALLOC reclaimable, heap in use).
+fn s5_memory(dir: &Path, pid: u32) -> [Option<u64>; 3] {
+    let pid = pid.to_string();
+    let footprint = s5_tool(dir, "footprint", &[&pid]).and_then(|t| parse_footprint(&t));
+    let heap = s5_tool(dir, "heap", &[&pid]).and_then(|t| parse_heap_inuse_kb(&t));
+    [footprint.map(|f| f.0), footprint.map(|f| f.1), heap]
+}
+
+fn s5_header(s: &vt100::Screen) -> Option<(usize, usize)> {
+    let (_, cols) = s.size();
+    s.rows(0, cols)
+        .next()
+        .and_then(|row| parse_header_counts(&row))
+}
+
+fn s5_status(s: &vt100::Screen) -> String {
+    let (_, cols) = s.size();
+    s.rows(0, cols).last().unwrap_or_default()
+}
+
+fn s5_modal(s: &vt100::Screen) -> bool {
+    let (_, cols) = s.size();
+    s.rows(0, cols)
+        .any(|row| row.contains(S5_MODAL) && row.contains('?'))
+}
+
+/// Nothing pending: the empty state, or a header that counts no file.
+fn s5_settled(s: &vt100::Screen) -> bool {
+    s.contents().contains("nothing pending across") || s5_header(s).is_some_and(|(f, _)| f == 0)
+}
+
+fn s5_alive(pty: &PtyTui) {
+    assert!(
+        !pty.eof(),
+        "lastcall exited during the soak; screen:\n{}",
+        pty.screen_text()
+    );
+}
+
+/// Wait until `until`, checking every 100 ms that the child is still there.
+fn s5_idle(pty: &PtyTui, until: Instant) {
+    loop {
+        s5_alive(pty);
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        std::thread::sleep(left.min(Duration::from_millis(100)));
+    }
+}
+
+/// `ctrl-a`, then `y` **only** once the confirm's question is on screen: a blind `y` is
+/// `copy`, and at ten files or fewer (`CONFIRM_ABOVE`) there is no confirm at all.
+/// True when an accept started: the confirm was answered, or the status line newly reads
+/// `accepting…` (no confirm under eleven files). A refusal (`accept in progress`, `nothing
+/// to accept`) or no sign within [`S5_MODAL_WAIT`] is false; the harness never blocks on a
+/// modal that `ctrl-a` with nothing listed never opens.
+fn s5_accept(pty: &mut PtyTui) -> bool {
+    let before = pty.screen(s5_status);
+    let fresh =
+        |s: &vt100::Screen, needle: &str| !before.contains(needle) && s5_status(s).contains(needle);
+    pty.send(b"\x01").expect("ctrl-a");
+    let deadline = Instant::now() + S5_MODAL_WAIT;
+    while Instant::now() < deadline {
+        let (modal, started, refused) = pty.screen(|s| {
+            (
+                s5_modal(s),
+                fresh(s, "accepting…"),
+                S5_REFUSED.iter().any(|r| fresh(s, r)),
+            )
+        });
+        if modal {
+            pty.send(b"y").expect("y");
+            let _ = pty.wait_for(S5_MODAL_WAIT, |s| !s5_modal(s));
+            return true;
+        }
+        if started {
+            return true;
+        }
+        if refused {
+            return false;
+        }
+        std::thread::sleep(lastcall_testkit::pty_tui::POLL);
+    }
+    false
+}
+
+/// Close a phase: the end and peak RSS, the CPU average, the header's counts when asked,
+/// then `footprint` and `heap` (each pauses the child briefly, after the sample).
+fn s5_phase_end(sampler: &S5Sampler, pty: &PtyTui, phase: &S5Phase, tools: &Path, counts: bool) {
+    let end = sampler.end(phase);
+    let header = counts.then(|| pty.screen(s5_header));
+    let memory = s5_memory(tools, sampler.pid);
+    let p = format!("c{}_{}", phase.cycle, phase.name);
+    s5_opt(&format!("{p}_end_rss_kb"), end.end_kb);
+    s5_opt(&format!("{p}_peak_rss_kb"), end.peak_kb);
+    s5_opt(
+        &format!("{p}_cpu_pct_avg"),
+        end.cpu_pct_avg.map(|c| format!("{c:.1}")),
+    );
+    s5_opt(&format!("{p}_end_footprint_kb"), memory[0]);
+    s5_opt(&format!("{p}_end_reclaimable_kb"), memory[1]);
+    s5_opt(&format!("{p}_end_heap_inuse_kb"), memory[2]);
+    if let Some(header) = header {
+        s5_opt(&format!("{p}_end_files"), header.map(|h| h.0));
+        s5_opt(&format!("{p}_end_hunks"), header.map(|h| h.1));
+    }
+}
+
+/// The quiet phase after the writers are joined: let the header hold still, send the
+/// final `ctrl-a` (+ `y`), then `ctrl-a` again every [`S5_QUIET_RETRY`] while rows remain
+/// (rows the first accept's pile predates), until nothing is pending or the phase ends.
+fn s5_quiet(sampler: &S5Sampler, pty: &mut PtyTui, phase: &S5Phase, length: Duration) {
+    let until = phase.at + length;
+    let still_by = phase.at + length / 2;
+    let mut last = pty.screen(s5_header);
+    let mut since = Instant::now();
+    while Instant::now() < still_by && since.elapsed() < S5_QUIET_STILL {
+        s5_idle(
+            pty,
+            still_by.min(Instant::now() + Duration::from_millis(200)),
+        );
+        let now = pty.screen(s5_header);
+        if now != last {
+            last = now;
+            since = Instant::now();
+        }
+    }
+    let mut first: Option<Instant> = None;
+    let mut started = 0u32;
+    let mut settled: Option<Instant> = None;
+    let mut next_try = Instant::now();
+    while Instant::now() < until {
+        if pty.screen(s5_settled) {
+            settled = Some(Instant::now());
+            break;
+        }
+        if Instant::now() >= next_try {
+            let sent = Instant::now();
+            if s5_accept(pty) {
+                started += 1;
+                first.get_or_insert(sent);
+                sampler.event("accept");
+            }
+            next_try = Instant::now() + S5_QUIET_RETRY;
+        }
+        s5_idle(pty, until.min(Instant::now() + Duration::from_millis(100)));
+    }
+    let metric = format!("c{}_quiet_settle_s", phase.cycle);
+    match (settled, first) {
+        (Some(at), Some(from)) => s5(&metric, format!("{:.1}", (at - from).as_secs_f64())),
+        (Some(_), None) => {
+            s5(&metric, "0.0");
+            s5_line("--- S5 nothing was pending when the quiet phase looked: no final accept");
+        }
+        (None, _) => {
+            s5(&metric, "SKIP");
+            s5_line(&format!(
+                "--- S5 c{} quiet never settled within {length:?} ({} accepts started); header: {:?}",
+                phase.cycle,
+                started,
+                pty.screen(s5_header)
+            ));
+        }
+    }
+    s5(&format!("c{}_quiet_accepts_started", phase.cycle), started);
+    s5_idle(pty, until);
+}
+
+fn s5_spawn(b: &Bench) -> PtyTui {
+    PtyCommand::new(bin())
+        .cwd(&b.parent)
+        .isolated_lastcall(&b.home, &b.config_path, &b.state)
+        .args(["tui"])
+        .spawn()
+        .expect("spawn lastcall tui in a pty")
+}
+
+fn s5_quit(pty: &mut PtyTui) {
+    pty.send(b"q").expect("q");
+    let status = pty.wait_exit(LONG).expect("exits after q");
+    assert_eq!(status.exit_code(), 0, "{status:?}");
+}
+
+/// Every root's ledger under the temp state dir: `(parked records, distinct parked trees)`
+/// per root, read with `serde_json` as counts only.
+fn s5_parked(state: &Path) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let Ok(parents) = std::fs::read_dir(state.join("roots")) else {
+        return out;
+    };
+    for parent in parents.flatten() {
+        let Ok(repos) = std::fs::read_dir(parent.path().join("repos")) else {
+            continue;
+        };
+        for repo in repos.flatten() {
+            let Ok(bytes) = std::fs::read(repo.path().join("ledger.json")) else {
+                continue;
+            };
+            let Ok(ledger) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                continue;
+            };
+            let Some(branches) = ledger.get("branches").and_then(|b| b.as_object()) else {
+                out.push((0, 0));
+                continue;
+            };
+            let trees: BTreeSet<&str> = branches
+                .values()
+                .filter_map(|r| r.get("seen_tree").and_then(|t| t.as_str()))
+                .collect();
+            out.push((branches.len(), trees.len()));
+        }
+    }
+    out
+}
+
+/// S5: one repository and six linked worktrees under one parent, six writers, three
+/// ramp / churn / quiet cycles under the default timings, then a relaunch over the same
+/// state. The memory and CPU curve of the TUI under that load (Phase 17 Part A); read as
+/// deltas within one run (`docs/dev/bench.md`, S5).
+#[test]
+#[ignore]
+fn bench_s5_worktree_soak() {
+    fresh_line();
+    if cfg!(debug_assertions) {
+        note("SKIP: S5 measures the release build only (run: just bench-soak)");
+        return;
+    }
+    let run = Instant::now();
+    let knobs = S5Knobs::from_env();
+    s5_line(&format!(
+        "--- S5 knobs: scale={} files={} lines={} worktrees={S5_WORKTREES} branch_every={}",
+        knobs.scale,
+        knobs.files,
+        knobs.lines,
+        knobs.branch_every()
+    ));
+    let b = Bench::new("s5", None);
+    let tools = b.state.join("s5-tools");
+    std::fs::create_dir_all(&tools).expect("tools dir");
+
+    // The fixture, outside every measured region.
+    let built = Instant::now();
+    let mut repo = b.repo("repo");
+    let mut bytes = 0usize;
+    for f in 0..knobs.files {
+        let text = s5_text(f, knobs.lines, None);
+        bytes += text.len();
+        repo.write(&s5_file(f), text);
+    }
+    repo.commit("the soak's tree").expect("commit");
+    let mut writers: Vec<S5Writer> = (1..=S5_WORKTREES)
+        .map(|i| {
+            let dir = b.parent.join(format!("w{i:02}"));
+            repo.git(&[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                &format!("agent/w{i:02}"),
+                dir.to_str().expect("a utf-8 temp path"),
+            ])
+            .expect("worktree add");
+            S5Writer {
+                index: i,
+                dir,
+                seq: 0,
+                writes: 0,
+                churn_writes: 0,
+                switches: 0,
+                failures: 0,
+            }
+        })
+        .collect();
+    let roots = 1 + S5_WORKTREES;
+    b.first_sight(roots);
+    s5("fixture_mb", format!("{:.1}", bytes as f64 / 1_048_576.0));
+    s5("fixture_s", format!("{:.1}", built.elapsed().as_secs_f64()));
+
+    let t0 = Instant::now();
+    let mut pty = s5_spawn(&b);
+    pty.wait_for_text(&format!("nothing pending across {roots} repos"), LONG)
+        .unwrap_or_else(|e| panic!("every root listed: {e}"));
+    pty.wait_for(LONG, watching)
+        .unwrap_or_else(|e| panic!("watching: {e}"));
+    s5("roots", roots);
+    s5(
+        "worktree_badges",
+        // The summary lists each root as `  name  branch  [badge]`; the nav column draws
+        // the badge too but may cut it, so count worktrees by the summary's line.
+        pty.screen(|s| {
+            let (_, cols) = s.size();
+            let rows: Vec<String> = s.rows(0, cols).collect();
+            (1..=S5_WORKTREES)
+                .filter(|i| {
+                    let line = format!("w{i:02}  agent/w{i:02}  [worktree of repo]");
+                    rows.iter().any(|r| r.contains(&line))
+                })
+                .count()
+        }),
+    );
+    let mut sampler = S5Sampler::start(pty.pid().expect("pid"), t0, 0, "launch");
+
+    let stop = AtomicBool::new(false);
+    let churn = AtomicBool::new(false);
+    for cycle in 1..=S5_CYCLES {
+        stop.store(false, Ordering::Relaxed);
+        churn.store(false, Ordering::Relaxed);
+        let quiet = std::thread::scope(|s| {
+            for w in writers.iter_mut() {
+                let (repo, knobs, stop, churn) = (&repo, &knobs, &stop, &churn);
+                s.spawn(move || s5_write_loop(repo, w, knobs, stop, churn));
+            }
+            let ramp = sampler.begin(cycle, "ramp");
+            s5_idle(&pty, ramp.at + knobs.phase(S5_RAMP));
+            s5_phase_end(&sampler, &pty, &ramp, &tools, true);
+
+            churn.store(true, Ordering::Relaxed);
+            let phase = sampler.begin(cycle, "churn");
+            let until = phase.at + knobs.phase(S5_CHURN);
+            let mut next = phase.at + S5_ACCEPT_EVERY;
+            let mut started = 0u32;
+            while Instant::now() < until {
+                if Instant::now() >= next {
+                    if s5_accept(&mut pty) {
+                        started += 1;
+                        sampler.event("accept");
+                    } else {
+                        sampler.event("refused");
+                    }
+                    next += S5_ACCEPT_EVERY;
+                }
+                s5_idle(&pty, until.min(next));
+            }
+            s5_phase_end(&sampler, &pty, &phase, &tools, true);
+            s5(&format!("c{cycle}_churn_accepts_started"), started);
+            churn.store(false, Ordering::Relaxed);
+
+            // The quiet phase starts as the writers are told to stop; the scope's end
+            // joins them before anything in it is measured.
+            let quiet = sampler.begin(cycle, "quiet");
+            stop.store(true, Ordering::Relaxed);
+            quiet
+        });
+        s5_quiet(&sampler, &mut pty, &quiet, knobs.phase(S5_QUIET));
+        s5_phase_end(&sampler, &pty, &quiet, &tools, false);
+    }
+
+    // The relaunch: writers on with nothing accepted, writers joined, quit, start again
+    // over the same state. The launch's `scan_all` is where up to eight roots' batches stack.
+    let relaunch_cycle = S5_CYCLES + 1;
+    stop.store(false, Ordering::Relaxed);
+    std::thread::scope(|s| {
+        for w in writers.iter_mut() {
+            let (repo, knobs, stop, churn) = (&repo, &knobs, &stop, &churn);
+            s.spawn(move || s5_write_loop(repo, w, knobs, stop, churn));
+        }
+        let phase = sampler.begin(relaunch_cycle, "prequit");
+        s5_idle(&pty, phase.at + knobs.phase(S5_RELAUNCH_WRITE));
+        let end = sampler.end(&phase);
+        let header = pty.screen(s5_header);
+        s5_opt("prequit_end_rss_kb", end.end_kb);
+        s5_opt("prequit_peak_rss_kb", end.peak_kb);
+        s5_opt("prequit_end_files", header.map(|h| h.0));
+        s5_opt("prequit_end_hunks", header.map(|h| h.1));
+        stop.store(true, Ordering::Relaxed);
+    });
+    let mut failed_ticks = sampler.finish();
+    drop(sampler);
+    s5_quit(&mut pty);
+    drop(pty);
+
+    let spawned = Instant::now();
+    let mut pty = s5_spawn(&b);
+    let pid = pty.pid().expect("pid");
+    let mut sampler = S5Sampler::start(pid, t0, relaunch_cycle, "relaunch");
+    let phase = sampler.begin(relaunch_cycle, "relaunch");
+    pty.wait_for(LONG, |s| s5_header(s).is_some())
+        .unwrap_or_else(|e| panic!("relaunch first frame: {e}"));
+    s5(
+        "relaunch_first_frame_s",
+        format!("{:.1}", spawned.elapsed().as_secs_f64()),
+    );
+    s5_idle(&pty, spawned + knobs.phase(S5_RELAUNCH_SAMPLE));
+    let end = sampler.end(&phase);
+    s5_opt("relaunch_peak_rss_kb", end.peak_kb);
+    s5_opt("relaunch_end_rss_kb", end.end_kb);
+    s5_opt(
+        "relaunch_cpu_pct_avg",
+        end.cpu_pct_avg.map(|c| format!("{c:.1}")),
+    );
+    let memory = s5_memory(&tools, pid);
+    s5_opt("relaunch_end_footprint_kb", memory[0]);
+    s5_opt("relaunch_end_reclaimable_kb", memory[1]);
+    s5_opt("relaunch_end_heap_inuse_kb", memory[2]);
+    let leaks = s5_tool(
+        &tools,
+        "leaks",
+        &["--nostacks", "--noContent", &pid.to_string()],
+    )
+    .and_then(|t| parse_leaks(&t));
+    s5_opt("leaks_count", leaks.map(|l| l.0));
+    s5_opt("leaks_bytes", leaks.map(|l| l.1));
+    failed_ticks += sampler.finish();
+    drop(sampler);
+    s5_quit(&mut pty);
+
+    let parked = s5_parked(&b.state);
+    s5(
+        "parked_records_max",
+        parked.iter().map(|p| p.0).max().unwrap_or(0),
+    );
+    s5(
+        "parked_trees_distinct",
+        parked.iter().map(|p| p.1).sum::<usize>(),
+    );
+    s5_line(&format!(
+        "--- S5 ledgers (parked records, distinct parked trees) per root: {parked:?}"
+    ));
+    s5(
+        "writer_switches",
+        writers.iter().map(|w| w.switches).sum::<u64>(),
+    );
+    s5(
+        "writer_failures",
+        writers.iter().map(|w| w.failures).sum::<u64>(),
+    );
+    s5_line(&format!(
+        "--- S5 writers: {}; sampler ticks without a number: {failed_ticks}",
+        writers
+            .iter()
+            .map(|w| format!(
+                "w{:02} {} writes {} switches",
+                w.index, w.writes, w.switches
+            ))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    s5("wall_s", run.elapsed().as_secs());
 }
 
 // ---- S5's readers: plain functions over the tools' text, tested below without a run ----
