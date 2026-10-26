@@ -992,8 +992,8 @@ is built to separate (H1 to H6) and the reasoning behind every default are in
 `SKIP: S5 measures the release build only (run: just bench-soak)` and measures nothing.
 
 - **Fixture**, built before anything is measured, under the scenario's `TempDir`s: one
-  repository `W/repo` of 300 committed text files of 3,000 lines each (`fixture_mb` 32.6, in MiB, of text per
-  checkout), plus six linked worktrees `W/w01` to `W/w06` made with `git worktree add -b
+  repository `W/repo` of 300 committed text files of 3,000 lines each, 38 bytes a line:
+  34.2 MB, which is 32.6 MiB, of text per checkout (`fixture_mb` prints MiB, so 32.6), plus six linked worktrees `W/w01` to `W/w06` made with `git worktree add -b
   agent/wNN`, siblings of the repository. An in-process engine takes first sight and asserts
   seven roots; the TUI must then show `nothing pending across 7 repos`, and
   `worktree_badges` counts the worktrees its summary lists with the `[worktree of repo]`
@@ -1002,8 +1002,12 @@ is built to separate (H1 to H6) and the reasoning behind every default are in
   `LASTCALL_STATE_DIR` in the temp dir, no `HERDR_*`, update check and welcome off). The TUI
   runs as `lastcall tui` with the default timings (debounce 750 ms, 3 s cap), not `--poll 1`.
 - **Writers**: one thread per worktree; the main checkout stays idle. Every 250 ms a writer
-  rewrites its next file (round robin) so that one fifth of the lines, a different fifth each
-  time, carry a new stamp. During churn phases only, every 240 writes (about a minute) a writer
+  rewrites its next file (round robin), editing line `j` when `j % stride == seq % stride`
+  (stride 150 by default): 20 lines of a 3,000-line file, 150 apart, a different set and a
+  new stamp each time. Under the diff's 3 lines of context those are 20 separate hunks, so
+  the header's hunks run near 20 times its files and H1 (every diff resident) can be told
+  from H2 (whole blobs per scan). A stride of 5 merges the edits into one whole-file hunk.
+  During churn phases only, every 240 writes (about a minute) a writer
   runs `git add -A`, `git commit` and `git switch -c agent/wNN-<k>`, leaving the old branch, so
   parked records pile up behind the accepts and name distinct trees. A git failure is printed
   (`--- S5 writer …`) and the writer carries on; an `index.lock` in that message would be news.
@@ -1016,16 +1020,31 @@ is built to separate (H1 to H6) and the reasoning behind every default are in
   launch's `scan_all` is where up to eight roots' batches are in flight at once.
 - **Sampling**: a harness thread runs `ps -o rss=,time= -p <pid>` once a second. CPU % is the
   delta of the cumulative CPU time over the wall delta (not `ps -o %cpu`, a decaying average on
-  macOS), so it can exceed 100 on several cores. The 10 ms sampler the other scenarios use is
-  off. At every phase's end, `footprint <pid>` and `heap <pid>` run (macOS only, each
-  time-boxed to 30 s; `n/a` when absent or timed out); each pauses the child for a moment, after
-  the phase's closing sample. `leaks <pid>` runs once, on the relaunched process at the very
-  end.
+  macOS), so it can exceed 100 on several cores. It is lastcall's own user plus system time
+  and excludes its git children, which is also what Activity Monitor shows for the process.
+  The 10 ms sampler the other scenarios use is off, except for the relaunch (below). At every
+  phase's end, `footprint <pid>` then `heap <pid>` run (macOS only, each time-boxed to 30 s;
+  `n/a` when absent or timed out), after the phase's closing sample. On a loaded phase the
+  writers are still writing, so the two tools' readings are **seconds apart** and do not
+  compare with each other; `heap`'s own banner (`Physical footprint:`) and its in-use total
+  are taken while it holds the task suspended, so that pair is one instant. `leaks <pid>`
+  runs once, on the relaunched process at the very end. The tools' output files go to their
+  own temp dir, beside the state dir.
+- **The tools pause the child.** `heap` and `leaks` suspend the target for about a second
+  per GB it maps, so the next phase opens with a catch-up burst (the watcher's queued events
+  scanned at once): the first trace line of a phase can show a CPU spike that belongs to the
+  pause, not to the phase.
+- **Relaunch peak**: the relaunched TUI is spawned with the harness's 10 ms RSS sampler on,
+  and `relaunch_peak_rss_kb` is its maximum read at the end of the 30 s window, before any
+  tool runs: the launch's `scan_all` peak lasts about a second, which the 1 s sampler can
+  miss. The 1 s sampler's own maximum prints beside it as `relaunch_peak_rss_kb_1hz`.
 - **Scale knobs**: `LASTCALL_BENCH_S5_SCALE` (default 1.0) multiplies every phase length and
   the 240-write branch interval (so a short rehearsal still parks records); the 20 s accept
   cadence and the 250 ms write period are the user's and do not scale.
-  `LASTCALL_BENCH_S5_FILES` and `LASTCALL_BENCH_S5_LINES` resize the fixture. At scale 0.2 the
-  run took 225 s in the rehearsal; at 1.0 about 17 minutes plus the fixture.
+  `LASTCALL_BENCH_S5_FILES` and `LASTCALL_BENCH_S5_LINES` resize the fixture, and
+  `LASTCALL_BENCH_S5_STRIDE` (default 150) sets the edit stride; the knobs line and
+  `BENCH S5 stride=` print it. At scale 0.2 the run takes about four minutes; at 1.0 about
+  17 minutes plus the fixture.
 
 ### What it prints
 
@@ -1037,14 +1056,16 @@ All on stderr, `BENCH S5 <metric>=<value>`; `n/a` where a tool is missing or tim
 | `c<n>_<phase>_end_rss_kb`, `_peak_rss_kb` | the RSS sampled as the phase closed, and the largest sample in it |
 | `c<n>_<phase>_cpu_pct_avg` | the child's CPU seconds over the phase divided by its wall time |
 | `c<n>_<phase>_end_footprint_kb` | `footprint`'s `Footprint:` total (its unit read, KB, MB or GB) |
-| `c<n>_<phase>_end_reclaimable_kb` | the `Reclaimable` column summed over the `MALLOC*` rows |
-| `c<n>_<phase>_end_heap_inuse_kb` | `heap`'s `All zones: … (<bytes> bytes)`: what malloc holds as live allocations |
+| `c<n>_<phase>_end_reclaimable_kb` | the `Reclaimable` column summed over the `MALLOC*` rows, from the same `footprint` run |
+| `c<n>_<phase>_end_heap_footprint_kb` | `heap`'s banner `Physical footprint:` (unit glued on: `752K`, `56.2M`), at the instant `heap` suspended the task |
+| `c<n>_<phase>_end_heap_inuse_kb` | `heap`'s `All zones: … (<bytes> bytes)`: what malloc holds as live allocations, the same instant as `heap_footprint` |
 | `c<n>_{ramp,churn}_end_files`, `_end_hunks` | the header's counts as the phase closed |
 | `c<n>_churn_accepts_started` | accepts that actually started (an accept already running refuses another) |
 | `c<n>_quiet_settle_s` | seconds from the final accept to a screen with nothing pending; `SKIP` when that never happens inside the quiet phase |
 | `c<n>_quiet_accepts_started` | accepts the quiet phase started (more than one means rows came back after the first) |
-| `prequit_*`, `relaunch_*` | the same readings for the relaunch; `relaunch_first_frame_s` is spawn to a header with counts (the launch hold over) |
-| `leaks_count`, `leaks_bytes` | `leaks --nostacks --noContent` on the relaunched process |
+| `prequit_*`, `relaunch_*` | the same readings for the relaunch; `relaunch_first_frame_s` is spawn to a header with counts (the launch hold over); `relaunch_peak_rss_kb` is the 10 ms sampler's, `relaunch_peak_rss_kb_1hz` the 1 s sampler's |
+| `stride` | the writers' edit stride (the knob) |
+| `leaks_count`, `leaks_bytes` | `leaks --nostacks --noContent` on the relaunched process: unreachable blocks only |
 | `parked_records_max` | the most parked records any one root's `ledger.json` holds after the run |
 | `parked_trees_distinct` | distinct parked `seen_tree` oids, counted per root and summed (each root has its own tree cache) |
 | `writer_switches`, `writer_failures` | the writers' branch switches and failed writes or git steps |
@@ -1066,18 +1087,26 @@ curve is read as **deltas within one run**:
   steady climb with the same pile shape is growth to explain.
 - **peak against quiet-end within a cycle**: how much of the churn peak the process gives
   back once nothing is pending.
-- **footprint against heap in-use at the same instant**: heap in use low while footprint stays
-  high is the allocator keeping freed regions (H6, retention); both high is live data (H1 to
-  H4) or a leak, and `leaks_*` and the parked counts (H5) say which.
+- **`heap_footprint` against `heap_inuse`, one instant** (both from the same `heap` run):
+  in-use low while the footprint stays high is the allocator keeping freed regions (H6,
+  retention); both high is live data (H1 to H4). Do not pair `footprint`'s total with
+  `heap_inuse` on a loaded phase: they are seconds apart while the writers write.
+- **`leaks` finds unreachable blocks only.** Memory that is still reachable but keeps
+  growing (a cache never trimmed, parked trees) is not a leak to it; that growth is told by
+  the quiet-end trend across cycles and by `parked_records_max` / `parked_trees_distinct`
+  (H5), never by `leaks_count=0`.
 - **relaunch peak against the c3 churn peak**: whether launch's parallel `scan_all` is the
-  worst moment of the run.
-- `cpu_pct` is spawn-bound scanning plus diffing under a stress well above the reported 10 %;
-  read its shape (does it fall in quiet, does it climb cycle to cycle), not its level.
+  worst moment of the run. The churn peaks are 1 s samples, so compare them with
+  `relaunch_peak_rss_kb_1hz` like for like; `relaunch_peak_rss_kb` (10 ms) is the true
+  launch peak.
+- `cpu_pct` is lastcall's own CPU (its git children excluded) under a stress well above the
+  reported 10 %; read its shape (does it fall in quiet, does it climb cycle to cycle), not
+  its level, and discount a spike on a phase's first trace line (the tools' pause, above).
 - On macOS `ps`'s RSS still counts pages malloc has freed and marked reclaimable until the
-  kernel takes them back; `footprint`'s total does not, and the `Reclaimable` column is
+  kernel takes them back; the footprints do not, and `footprint`'s `Reclaimable` column is
   those pages. An RSS several times the footprint, with `reclaimable_kb` near the
-  difference, is that accounting, not live memory (the scale-0.2 rehearsal showed it at
-  every phase end after the first churn).
+  difference, is that accounting, not live memory (the first scale-0.2 rehearsal, at stride
+  5, showed it at every phase end after the first churn).
 - Below scale 0.2 the quiet phase is too short for the still-header wait plus a 5 s retry,
   so `quiet_settle_s` prints `SKIP` there by construction; read it only at 0.2 and above.
 

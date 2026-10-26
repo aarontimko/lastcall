@@ -65,7 +65,9 @@ recipe `just bench-soak` (release build, as `just bench`), and **not** added to
 
 **Writers:** one thread per worktree (the main checkout stays idle). Every
 `S5_WRITE_MS` (default 250 ms) a writer rewrites the next file in its round-robin order
-with a deterministic, ever-changing edit of about a fifth of its lines, so each write
+with a deterministic, ever-changing edit of one line in every `S5_STRIDE` (default 150:
+line `j` is edited when `j % stride == seq % stride`, so 20 lines of a 3,000-line file,
+150 apart, 20 separate hunks under the diff's 3 lines of context), so each write
 both changes content already pending and, until every file has been touched, adds a
 row. During churn phases only, every `S5_BRANCH_EVERY` writes (default 240, about a
 minute) a writer commits what it has and switches to a new branch `agent/wNN-<k>` with
@@ -120,11 +122,12 @@ No new dependency, no `libc`, no `getrusage`.
   counts only;
 - the fixture's size (`fixture_mb`) and the run's wall time.
 
-**Scale knobs:** every default above is a `const`. Three environment variables, read the
+**Scale knobs:** every default above is a `const`. Four environment variables, read the
 way `parallelism_env` reads its own (`test_bench.rs` around 48): `LASTCALL_BENCH_S5_SCALE`
-(a float, default 1.0) multiplies the phase durations, and `LASTCALL_BENCH_S5_FILES` and
-`LASTCALL_BENCH_S5_LINES` override the fixture's size, so a quick rehearsal and a
-user-sized tree share one code path.
+(a float, default 1.0) multiplies the phase durations, `LASTCALL_BENCH_S5_FILES` and
+`LASTCALL_BENCH_S5_LINES` override the fixture's size, and `LASTCALL_BENCH_S5_STRIDE`
+(default 150) the writers' edit stride, so a quick rehearsal and a user-sized tree share
+one code path.
 
 **Reading it:** absolute RSS varies 15 to 33 % between runs (bench.md's own notes), so
 the curve is read as deltas within one run: quiet-end against quiet-end across the three
