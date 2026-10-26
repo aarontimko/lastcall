@@ -50,7 +50,7 @@ recipe `just bench-soak` (release build, as `just bench`), and **not** added to
 
 **Fixture** (built outside every measured region, under a `TempDir`):
 - One repository of `S5_FILES` text files of `S5_LINES` lines each, committed
-  (defaults 300 and 3,000, about 36 MB of text per checkout, so one root's pending batch
+  (defaults 300 and 3,000, about 34 MB of text per checkout, so one root's pending batch
   is tens of MB and above the run-to-run noise bench.md records), plus `S5_WORKTREES`
   linked worktrees made with `git worktree add -b agent/wNN` (default 6) as siblings of
   the repository under the launch directory. The design review confirmed that shape
