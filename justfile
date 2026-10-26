@@ -453,12 +453,26 @@ tryout SCENARIO="list" *ARGS:
 # 1,000-file burst under watch, a 50,000-file drop against the row cap) on the RELEASE
 # build only, one `BENCH <scenario> <metric>=<value>` stderr line per metric. Fixtures are
 # built outside the timed regions under temp dirs the test removes; about four minutes.
+# S5, the worktree soak, is skipped here: it runs alone under `just bench-soak`.
 bench:
     #!/usr/bin/env bash
     set -euo pipefail
     cargo build --release -p lastcall
-    cargo test --release -p lastcall --test test_bench -- --ignored --nocapture --test-threads=1
+    cargo test --release -p lastcall --test test_bench -- --ignored --nocapture --test-threads=1 --skip bench_s5_worktree_soak
     echo "--- bench done: paste the BENCH lines above into docs/dev/bench.md with the machine block, date and commit ---" >&2
+
+# The worktree soak (docs/dev/bench.md, S5; not a gate, not part of `just bench`): one
+# repository and six linked worktrees under writers, three ramp, churn and quiet cycles
+# under the default timings, then a relaunch, on the RELEASE build only. One `BENCH S5
+# <metric>=<value>` stderr line per metric and a `trace` line every 10 s. About 17 minutes
+# plus the fixture. LASTCALL_BENCH_S5_SCALE (default 1.0) multiplies the phase lengths;
+# LASTCALL_BENCH_S5_FILES and LASTCALL_BENCH_S5_LINES resize the fixture (300 x 3,000).
+bench-soak:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --release -p lastcall
+    cargo test --release -p lastcall --test test_bench -- --ignored --nocapture --test-threads=1 --exact bench_s5_worktree_soak
+    echo "--- bench-soak done: paste the BENCH S5 lines above into docs/dev/bench.md (S5) with the machine block, date and commit ---" >&2
 
 # cargo-deny against deny.toml: advisories, licences, bans (install: cargo install cargo-deny).
 audit:
