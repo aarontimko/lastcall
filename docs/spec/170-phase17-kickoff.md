@@ -140,19 +140,19 @@ numbers are recorded as two runs (A and B) with the machine block. A full run is
 
 ## Part A gate
 
-- [ ] `just bench-soak` runs S5 to completion on the release build at scale 1.0 and
+- [x] `just bench-soak` runs S5 to completion on the release build at scale 1.0 and
       prints every metric above; at scale 0.2 it completes in under five minutes;
       the `time=` parser's test is a plain (not ignored) test in `test_bench.rs`, green
       under `just cargo test -p lastcall --test test_bench` (the debug build runs it and
       SKIPs the scenarios).
-- [ ] A debug build prints S5's SKIP line and measures nothing, as the other scenarios.
-- [ ] `just lint` and `just test-unit` green; no file outside `test_bench.rs`, the
+- [x] A debug build prints S5's SKIP line and measures nothing, as the other scenarios.
+- [x] `just lint` and `just test-unit` green; no file outside `test_bench.rs`, the
       `justfile`, `docs/dev/bench.md`, `AGENTS.md` (one line for the recipe) and this
       kickoff changes.
-- [ ] `docs/dev/bench.md` gains an S5 section: what it does, how to read the curve, and
+- [x] `docs/dev/bench.md` gains an S5 section: what it does, how to read the curve, and
       runs A and B with the machine block. The worker writes the section and runs one
       scale-0.2 rehearsal; the orchestrator runs A and B at scale 1.0 and fills the numbers.
-- [ ] The orchestrator reads the curve and writes the Part B addendum: which of H1 to H6
+- [x] The orchestrator reads the curve and writes the Part B addendum: which of H1 to H6
       the numbers support, and the proposed fixes, each labelled by its impact on row and
       hunk tracking.
 
@@ -184,3 +184,69 @@ counted. F5: defaults raised to 300 x 3,000 lines with size knobs. F6: three cyc
 modal appears; accepts started are counted. F11: the cadence is stated and the run is a
 stress. F12: the hedges resolved (seven roots, `serde_json`, `std::env` in tests). F13:
 wall time stated, two runs, read as within-run deltas.
+
+## Code review, folded (2026-10-26)
+
+Fresh-context reviewer over `de7ac76..a0fcc52`, verdict "fixes required" (F1 to F3
+gating); all eight folded by the worker in `a4cdc16` and `a8ea01a`, none rejected. F1: the
+`footprint` and `heap` readings are seconds apart under load, so the H6 pair is `heap`'s
+own `Physical footprint` against its in-use total, one instant. F2: edits every fifth line
+merged into one whole-file hunk, so the edit stride became a knob, default 150 (20
+separate hunks per file). F3: the relaunch peak is read by the 10 ms sampler. F4 to F8:
+reading notes in bench.md, the fixture size stated once, the tools' output out of the
+state dir.
+
+## Part B addendum: what the soak says (2026-10-26)
+
+Runs A and B at stride 150 (20 hunks per file, 36,000 hunks over 1,800 pending files at
+each ramp's end, the sponsor's "tens of thousands of lines") and run C at stride 5 (one
+whole-file hunk per file, about a million changed lines), all at `bf975cb`, scale 1.0;
+the numbers and the summary table are in `docs/dev/bench.md` (S5, runs A and B).
+
+| | verdict | evidence |
+|---|---|---|
+| A leak | **no** | after each quiet phase's accept, malloc's live total is 2.4, 3.7 and 5.2 MB in all three runs, whatever the stride; `leaks` 0 |
+| H1, every diff resident | **confirmed, the main cost** | same 1,800 files pending: live heap 52 to 133 MB at stride 150, 1,046 to 1,112 MB at stride 5; memory follows diff lines, not files |
+| H2, blob batches, launch stacking | **confirmed** | at stride 150 the relaunch (827 and 835 MB RSS) is the run's highest point, above every churn peak (586 to 735 MB) |
+| H3, no diff reuse | **supported** | lastcall's own CPU 27 to 32 % while six worktrees are written (git children excluded), 3 % idle; not isolated from scan spawns |
+| H4, pile copies | **plausible** | at stride 5 the churn peaks (1,978 to 2,306 MB RSS) sit about 1 GB above the ramp end's live data; the accept's pile clone is the likeliest cause; not isolated |
+| H5, parked trees | **negligible** | 42 distinct parked trees, MB-scale at most |
+| H6, allocator retention | **confirmed** | with 2 to 5 MB live, the footprint Activity Monitor shows stays at 132 to 256 MB and RSS at 207 to 620 MB; macOS keeps what malloc freed |
+
+The small quiet-end climb (about 1.4 MB a cycle, identical in every run) matches the undo
+history: each accept-all keeps one entry per root naming every path it accepted, at most
+`UNDO_CAP` = 20 per root, so it stops growing. To confirm in Part B, not a fix.
+
+What this means for the sponsor's 5 to 10 GB: a pile's live cost is roughly five times its
+diff text (changed lines plus three of context each side), held once by the engine and
+once by the screen, copied again during an accept, and macOS keeps the high-water mark.
+Run C reached 2.3 GB RSS with seven roots; a larger repository, more worktrees or larger
+files reach the reported range by the same arithmetic.
+
+### Proposed fixes, by impact on row and hunk tracking
+
+The sponsor's constraint (2026-10-25): no degradation of how rows and hunks are tracked
+and shown; low or zero impact preferred.
+
+1. **Share a pile instead of copying it** (H4). The engine's last pile, the screen's view
+   and an accept's request hold one shared, read-only pile (`Arc<Pile>`) instead of three
+   clones. *Impact: none*; the same data is read by the same code.
+2. **Store a hunk's lines in one buffer** (H1). `Hunk.lines` keeps every line as its own
+   `Vec<u8>`; one byte buffer per hunk plus line offsets holds the same bytes in the same
+   order with one allocation instead of one per line. *Impact: none*; a representation
+   change behind the same accessors, covered by the snapshot and unit tests.
+3. **Reuse a row's diff between scans** (H3). `hunks::diff` is a pure function of the two
+   blobs, so a row whose baseline and current oids (and mode) are unchanged since the last
+   scan takes the last scan's counts and hunks without re-reading either blob. The reuse
+   holds only rows of the last pile, so it adds no memory. *Impact: none* on output;
+   less CPU while agents write.
+4. **Re-measure** with S5 (runs at stride 150 and 5) after 1 to 3, against this baseline.
+
+Not proposed now, each with its reason:
+- **Diffs on demand** (compute hunks only for the files on screen): the largest memory win,
+  but it changes how hunks reach the view, the accept by hunk and the header's hunk count.
+  *Impact: real*; held until 1 to 3 are measured.
+- **A different allocator** (mimalloc or jemalloc) or asking malloc to return memory
+  (`malloc_zone_pressure_relief`): a new dependency, or `unsafe` FFI, which the workspace
+  forbids. 1 to 3 lower the high-water mark instead.
+- **Fewer parallel scans at launch**: launch would take longer; re-measure first.
