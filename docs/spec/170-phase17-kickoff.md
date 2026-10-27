@@ -347,12 +347,12 @@ to S1 to S5's scenarios (S5 is re-run, not edited), a change to the scan's paral
 
 ## Part B gate
 
-- [ ] Fixes 1 to 4 as above, each its own commit (or a few), conventional-commit titles,
+- [x] Fixes 1 to 4 as above, each its own commit (or a few), conventional-commit titles,
       in the order 1, 2, 3, 4.
-- [ ] `just lint`, `just test-unit`, `just test-prepush` and `just test-scenarios` green;
+- [x] `just lint`, `just test-unit`, `just test-prepush` and `just test-scenarios` green;
       `just test-e2e` green with no snapshot rewritten; the `status --json` golden
       unchanged; the pile fixture loads and re-serializes identically.
-- [ ] New tests:
+- [x] New tests:
   - the hunk buffer round-trips every line's tag and bytes (a last line with no `\n`, an
     empty line, a CRLF line), and `truncate_lines` matches the old `truncate`;
   - `hunk_header`, `hunk_body` and `flags::export` give the same bytes as before fix 2
@@ -366,9 +366,9 @@ to S1 to S5's scenarios (S5 is re-run, not edited), a change to the scan's paral
   - fix 1: a pile held by the engine and by the view shares its rows (`Arc::ptr_eq`);
   - fix 4: a root whose blobs span several chunks gives the same pile as one chunk, and a
     whole-batch failure still fails open as before.
-- [ ] `just bench` S1 to S4 within bench.md's run-to-run noise of the last recorded runs,
+- [x] `just bench` S1 to S4 within bench.md's run-to-run noise of the last recorded runs,
       or better.
-- [ ] S5 re-run by the orchestrator: after each fix's commit, once at stride 5 and
+- [x] S5 re-run by the orchestrator: after each fix's commit, once at stride 5 and
       `LASTCALL_BENCH_S5_SCALE=0.34` (attribution: ramp-end live heap, relaunch peak);
       after all four, full runs at stride 150 and stride 5, added to bench.md beside runs
       A to C. Expectation: ramp-end live heap at stride 5 down from about 1,050 MB to
@@ -391,3 +391,48 @@ F7: the reader list corrected (`textbuf.rs` out, `tour.rs` in). F8: hunk bytes r
 only through hunk flags; those are the byte invariants. F9: the expected cut stated, the
 buffer presized. F10: reused rows leave `wanted`. F11: equivalence tests and per-fix
 attribution runs. F12: `Accepted.pile` and accept-by-hunk on the clone list.
+
+## Code review of Part B, folded (2026-10-26)
+
+Fresh-context reviewer over `1b074c3..019a35b`, verdict "safe to push", no blocker or
+major. It tried to make a reused row differ from a fresh render (baseline moves, renames,
+the `Unread` and `Deleted` rows that share their sides, reloads, failed batches, the row
+cap) and could not; a mutated reuse arm failed both equivalence tests. F1 (a pair of blobs
+past 4 GiB could reach the `u32` offset's `expect` when `collapse_size_bytes` is raised
+that far): such a pair now collapses as `Size`, `42a85d9`. F2 (the reuse-off scenario run
+was wired nowhere): `just test-scenarios-no-reuse`, step 5 of `just test-prepush`,
+`803b33d`. F3: below, for the sponsor. F4 to F6 (accept-by-hunk copies one row's hunks
+because the §6 request types hold `Vec<Hunk>`; a dead `?`; a blob shared across two chunks
+is fetched twice): no action.
+
+## Part B results (2026-10-26)
+
+Runs D (stride 150) and E (stride 5) at `803b33d`, scale 1.0, and one attribution run per
+fix at stride 5 and scale 0.34; all in `docs/dev/bench.md` (S5, "Phase 17 Part B").
+
+| | before (A, B / C) | after (D / E) |
+|---|---|---|
+| quiet end, footprint, the Activity Monitor number (MB) | 132 to 206 / 178 to 256 | **43 to 63 / 47 to 83** |
+| same, scale 0.34, stride 5, cycles 1 / 2 / 3 (MB) | 340 / 731 / 1,113 | **51 / 50 / 43** |
+| ramp end, live heap (MB) | 52 to 133 / 1,046 to 1,112 | **18 to 21 / 279 to 334** |
+| churn peak RSS (MB) | 586 to 735 / 1,978 to 2,306 | **118 to 161 / 351 to 408** |
+| relaunch peak RSS (MB) | 827, 835 / 1,508 | **767 / 986** |
+| CPU while six worktrees write (%) | 27 / 32 | **4.8 / 4.4** |
+
+The expectation (live heap at stride 5's ramp end roughly 300 to 400 MB) is met. Fix 3
+carries most of the CPU and the churn peak, fixes 1 and 2 most of the live heap; fix 4
+does not engage at S5's size (each root's batch is under one 64 MiB chunk). `just bench`
+S1 to S4 (run I) are within noise of run H. What remains is the relaunch: up to eight
+roots render whole piles at once, and macOS keeps that high-water mark (after run D's
+relaunch, 18 MB live and 310 MB footprint).
+
+**Judgment calls for the sponsor** (taken under the delegated-rulings practice, two-way
+doors):
+1. Fix 4 (blobs fetched in chunks) was added by the orchestrator after the design review
+   (F5); it changes no output and did not engage in S5.
+2. Code review F3: a scan in which every row is reused fetches nothing, so a store that
+   broke since the last scan is reported at the first scan where some row moves, not at
+   the next scan. Until then the screen shows the last good diffs instead of empty rows.
+3. The reuse-off switch is a test-only variable, `LASTCALL_TEST_NO_DIFF_REUSE`, read in
+   `env.rs` and applied only by the testkit; the binary never reads it, and it is in
+   `docs/dev/testing.md`, not `docs/config.md`.
