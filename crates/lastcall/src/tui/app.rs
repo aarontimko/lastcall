@@ -2481,7 +2481,7 @@ impl App {
                         root.clone(),
                         RestoreRequest::Hunk {
                             rendered: Rendered::of(row),
-                            hunks: row.hunks.clone(),
+                            hunks: row.hunks.to_vec(),
                             index: *index,
                         },
                     ));
@@ -2511,7 +2511,7 @@ impl App {
                         root.clone(),
                         AcceptRequest::Hunk {
                             rendered: Rendered::of(row),
-                            hunks: row.hunks.clone(),
+                            hunks: row.hunks.to_vec(),
                             index: *index,
                         },
                     ));
@@ -5821,7 +5821,7 @@ pub(crate) mod testfix {
                 )
             })
             .collect();
-        p.rows_mut()[0].hunks = vec![h];
+        p.rows_mut()[0].hunks = vec![h].into();
         p
     }
 
@@ -5835,7 +5835,8 @@ pub(crate) mod testfix {
                 h.index = i;
                 h
             })
-            .collect();
+            .collect::<Vec<_>>()
+            .into();
         p
     }
 
@@ -5859,7 +5860,8 @@ pub(crate) mod testfix {
                 h.old_range = *start..*end;
                 h
             })
-            .collect();
+            .collect::<Vec<_>>()
+            .into();
         p
     }
 
@@ -5876,7 +5878,7 @@ pub(crate) mod testfix {
                 r.annotation = Some(Annotation::Upstream);
             } else if i < upstream + collapsed {
                 r.collapsed = Some(lastcall_engine::scan::Collapsed::Glob);
-                r.hunks.clear();
+                r.hunks = Default::default();
             }
             p.rows_mut().push(r);
         }
@@ -5920,7 +5922,7 @@ pub(crate) mod testfix {
     pub fn alpha_collapsed(kind: Collapsed) -> Pile {
         let mut p = pile("alpha");
         p.rows_mut()[0].collapsed = Some(kind);
-        p.rows_mut()[0].hunks.clear();
+        p.rows_mut()[0].hunks = Default::default();
         p
     }
 
@@ -6194,7 +6196,7 @@ mod tests {
                 root("alpha"),
                 AcceptRequest::Hunk {
                     rendered: Rendered::of(held),
-                    hunks: held.hunks.clone(),
+                    hunks: held.hunks.to_vec(),
                     index: 2,
                 }
             )]
@@ -6275,7 +6277,7 @@ mod tests {
                 root("alpha"),
                 AcceptRequest::Hunk {
                     rendered: Rendered::of(held),
-                    hunks: held.hunks.clone(),
+                    hunks: held.hunks.to_vec(),
                     index: 1,
                 }
             )]
@@ -6356,7 +6358,7 @@ mod tests {
         let mut hunks: Vec<(String, Vec<u8>, Hunk)> = Vec::new();
         for (root, p) in &piles {
             for row in p.rows.iter() {
-                for h in &row.hunks {
+                for h in row.hunks.iter() {
                     hunks.push((root.clone(), row.path.clone(), h.clone()));
                 }
             }
@@ -6523,7 +6525,7 @@ mode 100644 → 100755
     #[test]
     fn app_accept_on_a_hunkless_row_is_still_the_whole_row() {
         let mut hunkless = pile("alpha");
-        hunkless.rows_mut()[0].hunks.clear();
+        hunkless.rows_mut()[0].hunks = Default::default();
         let mut app = three_roots();
         app.apply(pile_event("alpha", hunkless));
         app.select(Some(row("alpha", "f1")));
@@ -6822,7 +6824,7 @@ mode 100644 → 100755
         for r in p.rows_mut() {
             if r.path == b"s2" {
                 r.collapsed = Some(Collapsed::Size);
-                r.hunks.clear();
+                r.hunks = Default::default();
             }
         }
         app.apply(pile_event("alpha", p));
@@ -11680,7 +11682,8 @@ mode 100644 → 100755
     fn app_copy_over_the_cap_writes_nothing() {
         let mut app = three_roots();
         let mut big = pile("alpha");
-        big.rows_mut()[0].hunks[0].lines = vec![(Tag::Insert, vec![b'x'; 40 * 1024])].into();
+        std::sync::Arc::make_mut(&mut big.rows_mut()[0].hunks)[0].lines =
+            vec![(Tag::Insert, vec![b'x'; 40 * 1024])].into();
         app.apply(pile_event("alpha", big));
         app.select(Some(row("alpha", "f1")));
         app.handle(Action::Open);
@@ -12936,8 +12939,7 @@ mode 100644 → 100755
         app.handle(Action::Resize(100, 30));
         let mut p = alpha_texts(&["a", &"x".repeat(60)]);
         let second = p.rows[0].hunks[0].clone();
-        p.rows_mut()[0]
-            .hunks
+        std::sync::Arc::make_mut(&mut p.rows_mut()[0].hunks)
             .push(lastcall_engine::hunks::Hunk { index: 1, ..second });
         app.apply(pile_event("alpha", p));
         app.select(Some(row("alpha", "f1")));

@@ -160,7 +160,7 @@ impl Fresh {
                 &self.root,
                 RestoreRequest::Hunk {
                     rendered: Rendered::of(&row),
-                    hunks: row.hunks.clone(),
+                    hunks: row.hunks.to_vec(),
                     index,
                 },
             )

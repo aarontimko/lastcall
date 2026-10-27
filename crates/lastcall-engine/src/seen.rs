@@ -211,7 +211,7 @@ mod tests {
             current: cur.map(|(c, mode)| Entry { oid: oid(c), mode }),
             added: 1,
             deleted: 1,
-            hunks: Vec::new(),
+            hunks: Default::default(),
             annotation: None,
             conflicted: false,
             collapsed: None,

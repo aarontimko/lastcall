@@ -947,6 +947,49 @@ mod tests {
                 // prefix, so `Hunk`'s derived equality still means equal lines.
                 prop_assert_eq!(hunk.lines, Lines::from(kept));
             }
+
+            /// Phase 17 Part B fix 3: a non-collapsed row takes its counts from its diff's
+            /// hunks instead of running a second diff, which is sound only because the two
+            /// agree on every input. The `case_strategy` property above covers unique
+            /// lines; this one draws from a three-line alphabet, so most lines repeat (the
+            /// case where two diffs could pick different alignments), with bare `\r`,
+            /// `\r\n`, blank lines and either side missing its final newline.
+            #[test]
+            fn hunks_counts_are_the_sum_of_the_diffs_hunk_counts(
+                old in text_strategy(),
+                new in text_strategy(),
+            ) {
+                let summed = diff(&old, &new).iter().fold((0, 0), |(a, d), h| {
+                    let (ha, hd) = h.counts();
+                    (a + ha, d + hd)
+                });
+                prop_assert_eq!(counts(&old, &new), summed);
+            }
+        }
+
+        /// A file's bytes as lines from a small alphabet, so repeats are the rule.
+        fn text_strategy() -> impl Strategy<Value = Vec<u8>> {
+            (
+                prop::collection::vec(
+                    prop_oneof![
+                        Just(&b"a\n"[..]),
+                        Just(&b"b\n"[..]),
+                        Just(&b"a\r\n"[..]),
+                        Just(&b"\n"[..]),
+                        Just(&b"\r"[..]),
+                        Just(&b"}\n"[..]),
+                    ],
+                    0..24,
+                ),
+                any::<bool>(),
+            )
+                .prop_map(|(lines, terminated)| {
+                    let mut out = lines.concat();
+                    if !terminated && out.last() == Some(&b'\n') {
+                        out.pop();
+                    }
+                    out
+                })
         }
     }
 }

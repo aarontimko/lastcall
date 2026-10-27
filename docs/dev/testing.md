@@ -73,6 +73,12 @@ re-executes the test binary as a child role and SIGKILLs it at each fault point
 checkout) self-skip with a printed reason when the filesystem or git cannot produce the
 precondition. `just test-integration` runs them too.
 
+`LASTCALL_TEST_NO_DIFF_REUSE=1 just test-scenarios` runs every scenario again with each scan
+rendering every row afresh (Phase 17 Part B fix 3): the testkit's `open_engine_with`, which
+every scenario engine goes through, then sets `EngineOptions::reuse_diffs` to false. The
+variable is read in `env.rs` by a test-only helper; the engine itself never reads it, and
+it is not a config key.
+
 `crates/lastcall-engine/tests/test_integration_accept_loop.rs` (Phase 4 kickoff deliverable
 9(a)) drives the whole reviewer loop through `Engine::accept` — the TUI's path — against a
 fixture "agent" that edits three files and commits behind the reviewer: hunk → file →

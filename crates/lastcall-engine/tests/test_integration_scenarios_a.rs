@@ -289,7 +289,7 @@ fn scenario_gate1_mid_review_mutation_refuses_the_restore_and_keeps_the_mutated_
             &s.root,
             RestoreRequest::Hunk {
                 rendered,
-                hunks: row.hunks.clone(),
+                hunks: row.hunks.to_vec(),
                 index: 0,
             },
         )

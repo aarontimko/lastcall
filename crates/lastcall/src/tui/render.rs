@@ -5259,7 +5259,7 @@ mod tests {
             hunk.lines =
                 vec![(tag, format!("{}\n", "lorem ipsum ".repeat(20)).into_bytes())].into();
             let mut p = pile("alpha");
-            p.rows_mut()[0].hunks = vec![hunk.clone()];
+            p.rows_mut()[0].hunks = vec![hunk.clone()].into();
             app.apply(pile_event("alpha", p));
             app.select(Some(row("alpha", "f1")));
             app.handle(Action::Open);
@@ -5880,7 +5880,7 @@ mod tests {
             }
             if collapsed {
                 r.collapsed = Some(lastcall_engine::scan::Collapsed::Size);
-                r.hunks.clear();
+                r.hunks = Default::default();
             }
             r
         }

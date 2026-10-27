@@ -105,6 +105,16 @@ impl Env {
     }
 }
 
+/// Whether `LASTCALL_TEST_NO_DIFF_REUSE` is set: the testkit's `open_engine_with` then opens
+/// every engine with [`crate::engine::EngineOptions::reuse_diffs`] off, so `just
+/// test-scenarios` also proves the Phase 17 diff reuse changes nothing a scenario sees.
+/// Read here because this file is the engine's only `std::env` reader. **Test-only**:
+/// nothing the engine ships calls it, and the engine never reads the variable itself.
+#[doc(hidden)]
+pub fn test_no_diff_reuse() -> bool {
+    std::env::var_os("LASTCALL_TEST_NO_DIFF_REUSE").is_some_and(|v| !v.is_empty())
+}
+
 /// How many cases the store-backed proptests in `ops::tests::proptests` run: 8 by default
 /// (the unit tier, every commit), `PROPTEST_CASES` when set (the pre-push hook and CI
 /// export 64). Read here, not in `ops.rs`, because this file is the engine's only

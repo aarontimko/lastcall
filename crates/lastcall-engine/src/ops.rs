@@ -5779,6 +5779,7 @@ mod tests {
                     row_cap: DEFAULT_ROW_CAP,
                     retry_on_reseed: false,
                     skip: None,
+                    reuse: None,
                 })
                 .unwrap()
                 .pile
@@ -5896,7 +5897,7 @@ mod tests {
                         prop_assert_eq!(row.change, expected, "{}", name);
                         if let (Some(w), Some(i)) = (was, is) {
                             prop_assert_eq!(
-                                &row.hunks,
+                                &*row.hunks,
                                 &hunks::diff(w, i),
                                 "{}: not exactly the post-snapshot delta",
                                 name
@@ -6077,7 +6078,7 @@ mod tests {
                     let expected = hunks::apply_hunks(&base, &row.hunks, &[k]);
                     let after = d.scan().row(b"f").cloned().expect("the rest is pending");
                     prop_assert_eq!(
-                        &after.hunks,
+                        &*after.hunks,
                         &hunks::diff(&expected, &live),
                         "not the re-diff against the new override"
                     );

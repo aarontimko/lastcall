@@ -9,6 +9,7 @@ use std::time::Duration;
 use lastcall_engine::config::{Config, Loaded, Resolved};
 use lastcall_engine::engine::{AcceptRequest, Engine};
 use lastcall_engine::roots::RootsChanged;
+use lastcall_engine::scan::Collapsed;
 use lastcall_engine::watcher::{EngineEvent, EngineTimings, Watcher, lock};
 use lastcall_testkit::engine::{loaded_for, open_engine};
 use lastcall_testkit::fixture_repo::FixtureRepo;
@@ -391,4 +392,51 @@ fn reload_reopens_a_repository_filed_under_another_parent() {
     );
     // A second pass finds nothing to move.
     assert!(engine.rescan().unwrap().is_empty());
+}
+
+/// Phase 17 Part B fix 3: a scan takes an unmoved row's rendering from the last pile, but
+/// never across a reload that changed the collapse rules. Nothing on disk moves here, so
+/// only the new `collapse_size_bytes` and `collapsed_globs` can change what the rows show.
+#[test]
+fn reload_of_the_collapse_rules_renders_unmoved_rows_afresh() {
+    let repo = FixtureRepo::new("reload-collapse").unwrap();
+    let state = TempDir::new("lc-reload-collapse-state");
+    let env = repo.engine_env(state.path());
+    let mut engine = open_engine(repo.path(), &env, state.path(), Config::default());
+    let root = canon(repo.path());
+    repo.write("mid.txt", "m\n".repeat(400));
+    repo.write("gen.out", "generated\n");
+    let row = |engine: &mut Engine, p: &str| {
+        engine
+            .scan(&root)
+            .unwrap()
+            .row(p.as_bytes())
+            .cloned()
+            .unwrap_or_else(|| panic!("{p} pending"))
+    };
+    for _ in 0..2 {
+        let mid = row(&mut engine, "mid.txt");
+        assert_eq!((mid.collapsed, mid.hunks.len()), (None, 1));
+        assert_eq!(row(&mut engine, "gen.out").collapsed, None);
+    }
+
+    // 800 bytes: under the default limit, at or over 512.
+    let config = Config {
+        collapse_size_bytes: 512,
+        collapsed_globs: vec!["*.out".into()],
+        ..Config::default()
+    };
+    let (loaded, resolved) = loaded_with(std::slice::from_ref(&root), state.path(), config);
+    engine.reload(&loaded, &resolved);
+
+    let mid = row(&mut engine, "mid.txt");
+    assert_eq!(mid.collapsed, Some(Collapsed::Size), "{mid:?}");
+    assert!(mid.hunks.is_empty());
+    assert_eq!((mid.added, mid.deleted), (400, 0));
+    let gen_out = row(&mut engine, "gen.out");
+    assert_eq!(gen_out.collapsed, Some(Collapsed::Glob), "{gen_out:?}");
+    assert!(gen_out.hunks.is_empty());
+    // And the next scan, under the new rules, shows the same.
+    assert_eq!(row(&mut engine, "mid.txt"), mid);
+    assert_eq!(row(&mut engine, "gen.out"), gen_out);
 }
