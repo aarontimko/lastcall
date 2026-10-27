@@ -73,7 +73,8 @@ re-executes the test binary as a child role and SIGKILLs it at each fault point
 checkout) self-skip with a printed reason when the filesystem or git cannot produce the
 precondition. `just test-integration` runs them too.
 
-`LASTCALL_TEST_NO_DIFF_REUSE=1 just test-scenarios` runs every scenario again with each scan
+`just test-scenarios-no-reuse` (step 5 of `just test-prepush`) sets
+`LASTCALL_TEST_NO_DIFF_REUSE=1` and runs every scenario again with each scan
 rendering every row afresh (Phase 17 Part B fix 3): the testkit's `open_engine_with`, which
 every scenario engine goes through, then sets `EngineOptions::reuse_diffs` to false. The
 variable is read in `env.rs` by a test-only helper; the engine itself never reads it, and
