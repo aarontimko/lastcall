@@ -17,7 +17,7 @@ rust-version = "1.98.0"
 lastcall-engine = { path = "crates/lastcall-engine" }
 lastcall-testkit = { path = "crates/lastcall-testkit" }
 
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 toml = "1"
 tokio = { version = "1", features = [

@@ -22,6 +22,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use globset::GlobSet;
 
@@ -192,8 +193,11 @@ pub struct Group {
 /// The pending set of one root after a scan.
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Pile {
-    /// Sorted by path bytes.
-    pub rows: Vec<Row>,
+    /// Sorted by path bytes. Shared, read-only once built (Phase 17 Part B, fix 1): the
+    /// engine's `last_pile`, the screen's view and an accept's request all hold this one
+    /// list, so cloning a pile copies the small fields below and not a single row. Rows are
+    /// built and sorted as a `Vec` and wrapped once; see [`Pile::rows_mut`].
+    pub rows: Arc<Vec<Row>>,
     /// Root-level notices produced by this scan.
     pub notices: Vec<String>,
     /// Changed paths the row cap left unscanned (`0` when nothing was cut). Additive:
@@ -228,6 +232,14 @@ impl Pile {
 
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
+    }
+
+    /// The rows, writable: copy-on-write, so free on a pile nobody else holds yet (the
+    /// scan's own, while the engine annotates and marks it, before it is handed out) and a
+    /// whole-list copy on one that is shared. Nothing outside tests calls it on a pile the
+    /// engine or a view already holds.
+    pub fn rows_mut(&mut self) -> &mut Vec<Row> {
+        Arc::make_mut(&mut self.rows)
     }
 
     pub fn row(&self, path: &[u8]) -> Option<&Row> {
@@ -894,7 +906,7 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
     }
     Ok(ScanOutput {
         pile: Pile {
-            rows,
+            rows: Arc::new(rows),
             notices,
             omitted,
             // Stamped by the engine (`scan_root`), which owns the clock the expiry needs.

@@ -3086,7 +3086,7 @@ mod tests {
         let mut app = three_roots();
         app.handle(Action::Resize(100, 30));
         let mut pile = alpha_collapsed(lastcall_engine::scan::Collapsed::Glob);
-        pile.rows[0].current.as_mut().unwrap().mode = Mode::Executable;
+        pile.rows_mut()[0].current.as_mut().unwrap().mode = Mode::Executable;
         app.apply(pile_event_seq("alpha", 1, pile));
         app.select(Some(row("alpha", "f1")));
         let (frame, _) = frame_of(&app, 100, 30);
@@ -3171,7 +3171,7 @@ mod tests {
         let mut app = three_roots();
         app.handle(Action::Resize(60, 20));
         let mut pile = pile("alpha");
-        pile.rows[0].path = b"crates/lastcall/src/tui/render.rs".to_vec();
+        pile.rows_mut()[0].path = b"crates/lastcall/src/tui/render.rs".to_vec();
         app.apply(pile_event("alpha", pile));
         app.select(Some(Selection::Row(
             root("alpha"),
@@ -3215,7 +3215,7 @@ mod tests {
             let mut app = three_roots();
             app.handle(Action::Resize(w, 20));
             let mut wide = self::pile("alpha");
-            wide.rows[0].path = path.clone();
+            wide.rows_mut()[0].path = path.clone();
             app.apply(pile_event("alpha", wide));
             app.select(Some(Selection::Row(root("alpha"), path.clone())));
             app.handle(Action::Open);
@@ -3268,8 +3268,8 @@ mod tests {
     fn render_counts_at_a_thousand_carry_separators() {
         let mut app = three_roots();
         let mut pile = rows_n(1200, 0, 0);
-        pile.rows[0].added = 100_000;
-        pile.rows[0].deleted = 1_000;
+        pile.rows_mut()[0].added = 100_000;
+        pile.rows_mut()[0].deleted = 1_000;
         app.apply(pile_event("alpha", pile.clone()));
         let (frame, _) = frame_of(&app, 100, 30);
         assert!(
@@ -5258,7 +5258,7 @@ mod tests {
             let hunk = &mut app.selected_row().expect("f1").hunks[0].clone();
             hunk.lines = vec![(tag, format!("{}\n", "lorem ipsum ".repeat(20)).into_bytes())];
             let mut p = pile("alpha");
-            p.rows[0].hunks = vec![hunk.clone()];
+            p.rows_mut()[0].hunks = vec![hunk.clone()];
             app.apply(pile_event("alpha", p));
             app.select(Some(row("alpha", "f1")));
             app.handle(Action::Open);
@@ -5661,7 +5661,7 @@ mod tests {
         let mut up = p.rows[0].clone();
         up.path = b"u1".to_vec();
         up.annotation = Some(lastcall_engine::scan::Annotation::Upstream);
-        p.rows.push(up);
+        p.rows_mut().push(up);
         let mut app = three_roots();
         app.apply(pile_event("alpha", p));
         app.handle(Action::Resize(100, 30));
@@ -5756,7 +5756,7 @@ mod tests {
         let mut pile = alpha_seen();
         let names = ["run-1", "run-2", "run-3", "run-4"];
         for (r, b) in pile
-            .rows
+            .rows_mut()
             .iter_mut()
             .filter(|r| !r.seen_on.is_empty())
             .zip(names)
@@ -5769,7 +5769,7 @@ mod tests {
             frame.contains("3 files, content accepted on run-1, run-2, run-3"),
             "{frame}"
         );
-        pile.rows[3].seen_on = vec!["run-1".to_owned(), "run-4".to_owned()];
+        pile.rows_mut()[3].seen_on = vec!["run-1".to_owned(), "run-4".to_owned()];
         app.apply(pile_event_seq("alpha", 2, pile));
         let (frame, _) = frame_of(&app, 100, 30);
         assert!(frame.contains("content accepted on 4 branches"), "{frame}");
@@ -5809,7 +5809,7 @@ mod tests {
         for name in ["s4", "s5", "s6", "s7", "s8"] {
             let mut r = template.clone();
             r.path = name.as_bytes().to_vec();
-            pile.rows.push(r);
+            pile.rows_mut().push(r);
         }
         app.apply(pile_event_seq("alpha", 1, pile));
         assert_eq!(app.handle(Action::AcceptAll), (Changed::Yes, None));
@@ -5898,7 +5898,7 @@ mod tests {
             );
             prop::collection::vec(shape, 0..10).prop_map(|shapes| {
                 let mut p = pile("alpha");
-                p.rows = vec![
+                *p.rows_mut() = vec![
                     shaped("fixed/del", (true, 0, false, true, false, false)),
                     shaped("fixed/flagged", (true, 0, true, false, false, false)),
                     shaped("fixed/plain", (true, 0, false, false, false, false)),
@@ -5907,7 +5907,7 @@ mod tests {
                     shaped("fixed/collapsed", (true, 0, false, false, false, true)),
                 ];
                 for (i, s) in shapes.into_iter().enumerate() {
-                    p.rows.push(shaped(&format!("r{i:02}"), s));
+                    p.rows_mut().push(shaped(&format!("r{i:02}"), s));
                 }
                 p
             })

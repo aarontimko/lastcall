@@ -270,7 +270,8 @@ pub fn annotate(pile: &mut Pile, class: &Classification, rg: &RepoGit) -> Result
             matches.insert(*i);
         }
     }
-    for (i, row) in pile.rows.iter_mut().enumerate() {
+    // The scan's own pile, not yet handed out: writing its rows copies nothing.
+    for (i, row) in pile.rows_mut().iter_mut().enumerate() {
         if class.upstream_only.contains(&row.path) {
             row.annotation = Some(if matches.contains(&i) {
                 Annotation::Upstream

@@ -2708,7 +2708,7 @@ fn scenario_d27_include_gitignored_lists_chosen_gitignored_files() {
         "a/b/c/z_ignore_deep.md|notes.scratch|z_ignore_top.md",
         "D27 the matches at every depth, never inside an ignored folder"
     );
-    for row in &pile.rows {
+    for row in pile.rows.iter() {
         assert_eq!(row.change, Change::Added, "{}", row.path_lossy());
         assert_eq!(row.annotation, None, "no badge (ruling 4)");
     }
@@ -3044,7 +3044,7 @@ fn scenario_d29_variant_a_coworkers_squash_stays_upstream() {
         "a.rs upstream|b.rs upstream",
         "D29 the coworker's squash pulled"
     );
-    for row in &pile.rows {
+    for row in pile.rows.iter() {
         assert_eq!(row.annotation, Some(Annotation::Upstream));
         assert!(row.seen_on.is_empty(), "upstream is never marked seen");
     }

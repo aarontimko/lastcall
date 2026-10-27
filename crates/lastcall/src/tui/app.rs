@@ -5783,7 +5783,7 @@ pub(crate) mod testfix {
 
     /// `pile` without the rows named.
     pub fn without(mut pile: Pile, paths: &[&str]) -> Pile {
-        pile.rows
+        pile.rows_mut()
             .retain(|r| !paths.iter().any(|p| r.path == p.as_bytes()));
         pile
     }
@@ -5821,7 +5821,7 @@ pub(crate) mod testfix {
                 )
             })
             .collect();
-        p.rows[0].hunks = vec![h];
+        p.rows_mut()[0].hunks = vec![h];
         p
     }
 
@@ -5829,7 +5829,7 @@ pub(crate) mod testfix {
     pub fn alpha_hunks(n: usize) -> Pile {
         let mut p = pile("alpha");
         let first = p.rows[0].hunks[0].clone();
-        p.rows[0].hunks = (0..n)
+        p.rows_mut()[0].hunks = (0..n)
             .map(|i| {
                 let mut h = first.clone();
                 h.index = i;
@@ -5849,7 +5849,7 @@ pub(crate) mod testfix {
     pub fn alpha_ranges(ranges: &[(usize, usize)]) -> Pile {
         let mut p = pile("alpha");
         let first = p.rows[0].hunks[0].clone();
-        p.rows[0].hunks = ranges
+        p.rows_mut()[0].hunks = ranges
             .iter()
             .enumerate()
             .map(|(i, (start, end))| {
@@ -5878,7 +5878,7 @@ pub(crate) mod testfix {
                 r.collapsed = Some(lastcall_engine::scan::Collapsed::Glob);
                 r.hunks.clear();
             }
-            p.rows.push(r);
+            p.rows_mut().push(r);
         }
         p
     }
@@ -5892,7 +5892,7 @@ pub(crate) mod testfix {
             let mut r = template.clone();
             r.path = name.as_bytes().to_vec();
             r.seen_on = vec!["run-1".to_owned()];
-            p.rows.push(r);
+            p.rows_mut().push(r);
         }
         p
     }
@@ -5900,7 +5900,7 @@ pub(crate) mod testfix {
     /// [`alpha_seen`] with a flag on `path`, as the engine's rescan after `m` returns it.
     pub fn alpha_seen_flagged(path: &str) -> Pile {
         let mut p = alpha_seen();
-        for r in &mut p.rows {
+        for r in p.rows_mut() {
             if r.path == path.as_bytes() {
                 r.flags.push(lastcall_engine::ledger::Flag::file(
                     "look",
@@ -5919,8 +5919,8 @@ pub(crate) mod testfix {
     /// scan leaves a collapsed row (Phase 6 deliverable 4).
     pub fn alpha_collapsed(kind: Collapsed) -> Pile {
         let mut p = pile("alpha");
-        p.rows[0].collapsed = Some(kind);
-        p.rows[0].hunks.clear();
+        p.rows_mut()[0].collapsed = Some(kind);
+        p.rows_mut()[0].hunks.clear();
         p
     }
 
@@ -6079,7 +6079,7 @@ mod tests {
 
         // A pile whose row has a new current oid drops it.
         let mut moved = collapsed.clone();
-        moved.rows[0].current.as_mut().unwrap().oid =
+        moved.rows_mut()[0].current.as_mut().unwrap().oid =
             Oid::parse(&"a".repeat(40)).expect("a well-formed oid");
         app.apply(pile_event_seq("alpha", 3, moved));
         assert!(app.expanded.is_none(), "the row's content moved under it");
@@ -6124,7 +6124,7 @@ mod tests {
 
         // The file is rewritten again before `hunks_of` answers.
         let mut moved = collapsed;
-        moved.rows[0].current.as_mut().unwrap().oid =
+        moved.rows_mut()[0].current.as_mut().unwrap().oid =
             Oid::parse(&"c".repeat(40)).expect("a well-formed oid");
         app.apply(pile_event_seq("alpha", 2, moved));
         assert_eq!(app.selection, Some(row("alpha", "f1")), "still selected");
@@ -6306,12 +6306,73 @@ mod tests {
         );
     }
 
+    /// Phase 17 Part B: the recorded pile fixture loads, and writing it back out gives every
+    /// field it was recorded with, unchanged (shared rows, shared hunks and the hunk line
+    /// buffer keep the JSON shape). Fields added since the recording (`undo`, `seen_on`, ...)
+    /// are written with their defaults, so the check is "the recording is contained in the
+    /// output", value for value, plus a round trip that changes nothing.
+    #[test]
+    fn app_pile_fixture_reserializes_as_recorded() {
+        fn contained(rec: &serde_json::Value, out: &serde_json::Value, at: &str) {
+            use serde_json::Value;
+            match (rec, out) {
+                (Value::Object(r), Value::Object(o)) => {
+                    for (k, v) in r {
+                        let Some(w) = o.get(k) else {
+                            panic!("{at}.{k} is recorded but not written back");
+                        };
+                        contained(v, w, &format!("{at}.{k}"));
+                    }
+                }
+                (Value::Array(r), Value::Array(o)) => {
+                    assert_eq!(r.len(), o.len(), "{at}: length");
+                    for (i, (v, w)) in r.iter().zip(o).enumerate() {
+                        contained(v, w, &format!("{at}[{i}]"));
+                    }
+                }
+                _ => assert_eq!(rec, out, "{at}"),
+            }
+        }
+        let recorded: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/piles_three_roots.json"))
+                .unwrap();
+        let loaded: BTreeMap<String, Pile> = serde_json::from_value(recorded.clone()).unwrap();
+        let written = serde_json::to_value(&loaded).unwrap();
+        contained(&recorded, &written, "");
+        let again: BTreeMap<String, Pile> = serde_json::from_value(written.clone()).unwrap();
+        assert_eq!(again, loaded);
+        assert_eq!(serde_json::to_value(&again).unwrap(), written);
+    }
+
+    /// Phase 17 Part B fix 1: the view holds the very row list the engine published, and an
+    /// accept-all request carries that list again rather than a copy of it.
+    #[test]
+    fn app_view_and_accept_all_share_the_published_rows() {
+        // `three_roots` holds alpha's fixture already; this one differs in its undo depth.
+        let published = undo_pile(pile("alpha"), 3);
+        let mut app = three_roots();
+        app.apply(pile_event("alpha", published.clone()));
+        let held = &app.roots[&root("alpha")].pile;
+        assert!(std::sync::Arc::ptr_eq(&held.rows, &published.rows));
+        let requests = app.accept_requests(&AcceptScope::Root(root("alpha")));
+        let [(_, AcceptRequest::All(sent))] = requests.as_slice() else {
+            panic!("one accept-all request: {requests:?}");
+        };
+        assert!(std::sync::Arc::ptr_eq(&sent.rows, &published.rows));
+        // An equal pile from a later scan is the same rows by value: nothing changes.
+        app.apply(pile_event("alpha", undo_pile(pile("alpha"), 3)));
+        assert!(std::sync::Arc::ptr_eq(
+            &app.roots[&root("alpha")].pile.rows,
+            &published.rows
+        ));
+    }
+
     /// The carve-out: a file row with no hunks to point at (binary, collapsed, deleted,
     /// unreadable) keeps `a` = the whole row, in either pane.
     #[test]
     fn app_accept_on_a_hunkless_row_is_still_the_whole_row() {
         let mut hunkless = pile("alpha");
-        hunkless.rows[0].hunks.clear();
+        hunkless.rows_mut()[0].hunks.clear();
         let mut app = three_roots();
         app.apply(pile_event("alpha", hunkless));
         app.select(Some(row("alpha", "f1")));
@@ -6565,14 +6626,14 @@ mod tests {
         assert!(app.nav_in_group);
         // The accept's rescan returns the pile without `s2`.
         let mut p = alpha_seen();
-        p.rows.retain(|r| r.path != b"s2");
+        p.rows_mut().retain(|r| r.path != b"s2");
         app.apply(pile_event("alpha", p));
         assert_eq!(app.selection, Some(row("alpha", "s3")), "the next member");
         assert!(app.seen_open.contains(&root("alpha")), "still open");
         // No member below it: the nearest member above, never the plain rows above the
         // group (a group with no member left is gone, and the old rule applies then).
         let mut p = alpha_seen();
-        p.rows.retain(|r| r.path != b"s2" && r.path != b"s3");
+        p.rows_mut().retain(|r| r.path != b"s2" && r.path != b"s3");
         app.apply(pile_event("alpha", p));
         assert_eq!(app.selection, Some(row("alpha", "s1")));
         // A plain row keeps the old rule: `src/parse.rs` accepted lands on the group row
@@ -6580,7 +6641,7 @@ mod tests {
         app.select(Some(row("alpha", "src/parse.rs")));
         assert!(!app.nav_in_group);
         let mut p = alpha_seen();
-        p.rows.retain(|r| r.path != b"src/parse.rs");
+        p.rows_mut().retain(|r| r.path != b"src/parse.rs");
         app.apply(pile_event("alpha", p));
         assert_eq!(app.selection, Some(seen_group()));
     }
@@ -6607,7 +6668,7 @@ mod tests {
     fn app_seen_e_on_a_collapsed_member_expands_it_first_then_closes_the_group() {
         let mut app = three_roots();
         let mut p = alpha_seen();
-        for r in &mut p.rows {
+        for r in p.rows_mut() {
             if r.path == b"s2" {
                 r.collapsed = Some(Collapsed::Size);
                 r.hunks.clear();
@@ -6715,7 +6776,7 @@ mod tests {
     fn app_seen_a_selected_row_that_folds_moves_the_selection_to_the_group() {
         let mut app = three_roots();
         let mut plain = alpha_seen();
-        for r in &mut plain.rows {
+        for r in plain.rows_mut() {
             r.seen_on.clear();
         }
         app.apply(pile_event("alpha", plain));
@@ -7437,7 +7498,7 @@ mod tests {
     fn app_accepted_deleted_file_says_so() {
         let mut app = three_roots();
         let mut p = pile("alpha");
-        p.rows[0].change = Change::Deleted;
+        p.rows_mut()[0].change = Change::Deleted;
         app.apply(pile_event("alpha", p));
         app.select(Some(row("alpha", "f1")));
         app.handle(Action::AcceptFile);
@@ -7602,7 +7663,7 @@ mod tests {
         app.select(Some(row("alpha", "f1")));
         app.handle(Action::AcceptFile);
         let mut rescanned = pile("alpha");
-        rescanned.rows[0].added = 7;
+        rescanned.rows_mut()[0].added = 7;
         app.accepted(vec![(
             root("alpha"),
             Ok(Accepted {
@@ -7676,7 +7737,7 @@ mod tests {
         let mut app = three_roots();
         app.select(Some(row("alpha", "f1")));
         let mut p = pile("alpha");
-        p.rows.retain(|r| r.path != b"f1");
+        p.rows_mut().retain(|r| r.path != b"f1");
         app.apply(pile_event("alpha", p));
         assert_eq!(app.selection, Some(row("alpha", "f2")), "next row by path");
 
@@ -7689,7 +7750,7 @@ mod tests {
 
         app.select(Some(Selection::Group(root("beta"), GroupKind::Upstream)));
         let mut p = pile("beta");
-        for r in &mut p.rows {
+        for r in p.rows_mut() {
             r.annotation = Some(Annotation::Mixed);
         }
         app.apply(pile_event("beta", p));
@@ -7716,7 +7777,7 @@ mod tests {
         let mut app = three_roots();
         app.select(Some(row("alpha", "src/parse.rs")));
         let mut p = pile("alpha");
-        p.rows.retain(|r| r.path != b"src/parse.rs");
+        p.rows_mut().retain(|r| r.path != b"src/parse.rs");
         app.apply(pile_event("alpha", p));
         assert_eq!(app.selection, Some(row("alpha", "f2")), "the row above");
         app.apply(pile_event("alpha", Pile::default()));
@@ -7771,9 +7832,9 @@ mod tests {
         for name in ["p000", "p001"] {
             let mut extra = after.rows[0].clone();
             extra.path = name.as_bytes().to_vec();
-            after.rows.push(extra);
+            after.rows_mut().push(extra);
         }
-        after.rows.sort_by(|a, b| a.path.cmp(&b.path));
+        after.rows_mut().sort_by(|a, b| a.path.cmp(&b.path));
         app.accepted(vec![accepted_ok("alpha", 2, after)]);
         assert_eq!(app.selection, Some(row("alpha", "p02")));
     }
@@ -9417,10 +9478,10 @@ mod tests {
     /// hunk is the file) or an addition (which has no baseline to go back to).
     fn alpha_as(change: Change) -> Pile {
         let mut p = pile("alpha");
-        p.rows[0].change = change;
+        p.rows_mut()[0].change = change;
         match change {
-            Change::Deleted => p.rows[0].current = None,
-            Change::Added => p.rows[0].baseline = None,
+            Change::Deleted => p.rows_mut()[0].current = None,
+            Change::Added => p.rows_mut()[0].baseline = None,
             _ => {}
         }
         p
@@ -9523,7 +9584,7 @@ mod tests {
         let mut p = alpha_collapsed(Collapsed::Unread {
             over_bytes: 512 * 1024,
         });
-        p.rows[0].current = None;
+        p.rows_mut()[0].current = None;
         app.apply(pile_event_seq("alpha", 1, p));
         app.select(Some(row("alpha", "f1")));
 
@@ -9706,7 +9767,7 @@ mod tests {
 
         let mut symlink = three_roots();
         let mut p = pile("alpha");
-        p.rows[0].current = p.rows[0].current.clone().map(|e| Entry {
+        p.rows_mut()[0].current = p.rows[0].current.clone().map(|e| Entry {
             mode: Mode::Symlink,
             ..e
         });
@@ -9715,7 +9776,7 @@ mod tests {
 
         let mut non_utf8 = three_roots();
         let mut p = pile("alpha");
-        p.rows[0].path = vec![0xff, 0xfe];
+        p.rows_mut()[0].path = vec![0xff, 0xfe];
         non_utf8.apply(pile_event_seq("alpha", 1, p));
         refuses(&mut non_utf8, &[0xff, 0xfe], "a non-UTF-8 path");
     }
@@ -11467,7 +11528,7 @@ mod tests {
     fn app_copy_over_the_cap_writes_nothing() {
         let mut app = three_roots();
         let mut big = pile("alpha");
-        big.rows[0].hunks[0].lines = vec![(Tag::Insert, vec![b'x'; 40 * 1024])];
+        big.rows_mut()[0].hunks[0].lines = vec![(Tag::Insert, vec![b'x'; 40 * 1024])];
         app.apply(pile_event("alpha", big));
         app.select(Some(row("alpha", "f1")));
         app.handle(Action::Open);
@@ -11575,7 +11636,7 @@ mod tests {
         assert_eq!(copied(app.handle(Action::Copy).1), ALPHA_PANE);
 
         let mut big = rows_n(1000, 0, 0);
-        for (i, r) in big.rows.iter_mut().enumerate() {
+        for (i, r) in big.rows_mut().iter_mut().enumerate() {
             r.path = format!("{}/{i:04}.rs", "d".repeat(40)).into_bytes();
         }
         let mut app = three_roots();
@@ -12723,7 +12784,7 @@ mod tests {
         app.handle(Action::Resize(100, 30));
         let mut p = alpha_texts(&["a", &"x".repeat(60)]);
         let second = p.rows[0].hunks[0].clone();
-        p.rows[0]
+        p.rows_mut()[0]
             .hunks
             .push(lastcall_engine::hunks::Hunk { index: 1, ..second });
         app.apply(pile_event("alpha", p));
@@ -13134,7 +13195,7 @@ mod tests {
     }
 
     fn fold_seen(mut p: Pile, names: &[&str]) -> Pile {
-        for r in &mut p.rows {
+        for r in p.rows_mut() {
             if names.iter().any(|n| r.path == n.as_bytes()) {
                 r.seen_on = vec!["run-1".to_owned()];
             }
@@ -13157,8 +13218,8 @@ mod tests {
         let mut p = rows_n(12, 0, 0);
         let mut extra = p.rows[0].clone();
         extra.path = b"p005".to_vec();
-        p.rows.push(extra);
-        p.rows.sort_by(|a, b| a.path.cmp(&b.path));
+        p.rows_mut().push(extra);
+        p.rows_mut().sort_by(|a, b| a.path.cmp(&b.path));
         app.apply(pile_event_seq("alpha", 2, p));
         assert!(app.confirm.is_some(), "the confirm survives the pile");
         let shown = app.range_rows().expect("the run is still shown").1;

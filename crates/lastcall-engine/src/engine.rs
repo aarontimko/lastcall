@@ -5230,6 +5230,28 @@ pub(crate) mod tests {
         let _ = rendered;
     }
 
+    /// Phase 17 Part B fix 1: the pile a scan hands out and the root's `last_pile` are one
+    /// row list, and so are the pile an accept answers with and the one it leaves held.
+    #[test]
+    fn engine_scan_and_last_pile_share_one_row_list() {
+        let repo = FixtureRepo::new("share-rows").unwrap();
+        let state = TempDir::new("lc-share-rows-state");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let r = only_root(&engine);
+        repo.write("a.txt", "one\n");
+        let pile = engine.scan(&r).unwrap();
+        assert_eq!(pile.rows.len(), 1, "{:?}", pile.rows);
+        let held = |e: &Engine| e.root(&r).unwrap().last_pile.clone().unwrap();
+        assert!(Arc::ptr_eq(&pile.rows, &held(&engine).rows));
+        assert!(
+            Arc::ptr_eq(&pile.rows, &pile.clone().rows),
+            "a clone shares"
+        );
+        let acc = engine.accept(&r, AcceptRequest::All(pile.clone())).unwrap();
+        assert!(acc.pile.is_empty(), "{:?}", acc.pile.rows);
+        assert!(Arc::ptr_eq(&acc.pile.rows, &held(&engine).rows));
+    }
+
     /// Phase 14 D: `Engine::reload` replaces the config and rebuilds the glob sets, keeps
     /// every `RootState` (same ledger, same last pile, no discovery pass), and the next scan
     /// uses the new sets: a path newly matching `collapsed_globs` is collapsed, and a

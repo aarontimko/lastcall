@@ -2365,7 +2365,7 @@ impl Ops<'_> {
         // `compact` passes an empty snapshot and no `seen_at`, and pushes nothing.
         let entry = if seen_at.is_some() && !snapshot.rows.is_empty() {
             let mut keys: Vec<String> = Vec::new();
-            for row in &snapshot.rows {
+            for row in snapshot.rows.iter() {
                 if let Ok(k) = std::str::from_utf8(&row.path) {
                     keys.push(k.to_owned());
                 }
@@ -2410,7 +2410,7 @@ impl Ops<'_> {
                 None => {}
             }
         }
-        for row in &snapshot.rows {
+        for row in snapshot.rows.iter() {
             let path = row.path.clone();
             let w = match &row.current {
                 Some(e) => TreeWrite::Set {
@@ -2461,7 +2461,7 @@ impl Ops<'_> {
                 .filter(|(_, o)| o.survives_fold(RootKind::Draft))
                 .map(|(k, _)| k.clone())
                 .collect();
-            for row in &snapshot.rows {
+            for row in snapshot.rows.iter() {
                 if matches!(row.collapsed, Some(crate::scan::Collapsed::Unread { .. }))
                     && let Ok(k) = std::str::from_utf8(&row.path)
                     && self
@@ -3720,7 +3720,7 @@ mod tests {
                 "{p}: compaction at > threshold"
             );
             let mut expected = before;
-            expected.rows.retain(|row| row.path != p.as_bytes());
+            expected.rows_mut().retain(|row| row.path != p.as_bytes());
             let after = h.scan().pile;
             assert_eq!(pile_lines(&after), pile_lines(&expected));
         }
