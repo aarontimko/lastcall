@@ -250,3 +250,75 @@ Not proposed now, each with its reason:
   (`malloc_zone_pressure_relief`): a new dependency, or `unsafe` FFI, which the workspace
   forbids. 1 to 3 lower the high-water mark instead.
 - **Fewer parallel scans at launch**: launch would take longer; re-measure first.
+
+## Part B ruling (2026-10-26)
+
+The sponsor, on the five recommendations put to them (fixes 1 to 3, re-measure before
+deciding on diffs on demand, one pull request for the measurement and the fixes): "1 rec,
+2 rec, 3 rec, 4 rec, 5 rec". On which number they had read: the 5 to 10 GB was the Memory
+column of Activity Monitor, which is the footprint, so it is live or dirty memory and not
+only freed pages the resident set still counts. Fixes 1 to 3 therefore target the number
+the sponsor sees.
+
+The one pull request carries Part A and Part B together from `perf/soak-bench`. It does
+not release: there is no `just release-prep` commit unless the sponsor asks for one.
+
+## Part B deliverable: fixes 1 to 3
+
+Every change below is a representation or reuse change. **What a user sees and what is
+stored must not change**:
+- the TUI snapshots (`just test-e2e`) pass unchanged, with no `snapshots-update`;
+- the `status --json` golden passes unchanged, with no `golden-update`;
+- the state written to disk (ledgers, records, any serialized pile or hunk) is byte-for-byte
+  what it was. Where a type is serialized, its serde shape is kept, by a hand-written
+  `Serialize`/`Deserialize` if the field changes, and a unit test round-trips the old
+  shape;
+- the frozen §5 and §6 contracts are untouched.
+
+**Fix 1, one shared pile.** The pile a scan produces is wrapped once in `Arc` and shared
+by the engine's `RootState.last_pile`, the watcher's `EngineEvent` carrying it, the app's
+`RootView.pile` and `orphan_piles`, and `AcceptRequest::All`. Every place that clones a
+pile today clones the `Arc` instead. Where the app or engine mutates a pile it holds
+(if any), it does so with `Arc::make_mut` or by building a new pile, never by a
+`Mutex`. The worker lists every `pile.clone()` and `.pile.clone()` it found and what each
+became.
+
+**Fix 2, one buffer per hunk.** `Hunk.lines: Vec<(Tag, Vec<u8>)>` becomes one byte buffer
+plus one `(Tag, end offset)` entry per line, behind accessors that give each line as
+`(Tag, &[u8])` in the same order. Every reader (engine, `ops.rs`, `store.rs`, the TUI's
+`render.rs`, `textbuf.rs`, `wrap.rs`, `app.rs`, the tests) moves to the accessors; no
+reader sees the buffer directly. `hunks::diff` builds the buffer directly, without first
+making a `Vec<u8>` per line.
+
+**Fix 3, reuse a row's diff.** A scan that lists a row whose baseline oid, current oid and
+modes are all equal to that path's row in the root's last pile takes the last pile's
+counts and hunks for it (an `Arc` clone or a move, never a deep copy) and neither fetches
+nor diffs the two blobs. Everything else about the row (status, flags, sort position, the
+row cap) is computed as today. The cache is the last pile itself: no new map that
+outlives it. A row whose key differs in any part, a binary or LFS row, and every row of a
+root's first scan are computed as today. The key must include every input `hunks::diff`
+and `hunks::counts` read (the reviewer checks this against the code: if a config value,
+such as a skip rule or a size cap, changes their output, the reuse must also be dropped
+when that value changes, or the value goes in the key).
+
+**Not in Part B:** diffs on demand, a new allocator, any `unsafe`, any new dependency, a
+change to S1 to S5's scenarios (S5 is re-run, not edited), a change to the scan's
+parallelism.
+
+## Part B gate
+
+- [ ] Fixes 1 to 3 as above, each its own commit (or a few), conventional-commit titles.
+- [ ] `just lint`, `just test-unit` and `just test-prepush` green; `just test-e2e` green
+      with no snapshot rewritten; the `status --json` golden unchanged.
+- [ ] New unit tests: the hunk buffer round-trips every line's tag and bytes (including a
+      last line with no `\n`, an empty line and a CRLF line) and its serde shape equals the
+      old one byte for byte; the diff reuse is taken when the key matches and not taken
+      when the baseline oid, the current oid or the mode differs; a pile shared by the
+      engine and the view is one allocation (`Arc::ptr_eq`).
+- [ ] `just bench` S1 to S4 within bench.md's run-to-run noise of the last recorded runs,
+      or better.
+- [ ] S5 re-run by the orchestrator at stride 150 and stride 5, the numbers added to
+      bench.md beside runs A to C, and the comparison written here: heap footprint (the
+      Activity Monitor number), live heap at the ramp's end, churn peak, relaunch peak,
+      CPU while writing.
+- [ ] The sponsor rules on diffs on demand with those numbers in hand.
