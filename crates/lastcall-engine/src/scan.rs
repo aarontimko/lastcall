@@ -504,6 +504,24 @@ fn record_holds(inputs: &ScanInputs<'_>, path: &[u8]) -> bool {
     }
 }
 
+/// The most blob bytes one `cat-file --batch` of the render fetches and holds: the rows are
+/// rendered in chunks taken in order, each chunk's blobs fetched together and dropped
+/// before the next chunk's are. A row whose blobs alone exceed it is a chunk of its own.
+pub const BLOB_CHUNK_BYTES: u64 = 64 * 1024 * 1024;
+
+/// What a blob of unknown size is charged against [`BLOB_CHUNK_BYTES`]: a chunk of such
+/// blobs is bounded by a count (1,024) instead. The scan knows every size in practice,
+/// a baseline's from the resolver's `--batch-check`, a current side's from its `lstat`.
+const UNKNOWN_BLOB_BYTES: u64 = BLOB_CHUNK_BYTES / 1024;
+
+fn blob_chunk_bytes() -> u64 {
+    #[cfg(test)]
+    if let Some(b) = CHUNK_BYTES.with(std::cell::Cell::get) {
+        return b;
+    }
+    BLOB_CHUNK_BYTES
+}
+
 fn is_binary(bytes: &[u8]) -> bool {
     bytes[..bytes.len().min(BINARY_PROBE)].contains(&0)
 }
@@ -514,9 +532,17 @@ thread_local! {
     /// costs a path that is pending under both trees (Phase 13 deliverable B).
     pub(crate) static DIFF_FILES_HOOK: crate::testhook::TestHook<()> =
         const { crate::testhook::TestHook::new() };
-    /// Set: the scan's blob batch fails as a broken store's would, so the fail-open path
-    /// runs on a healthy fixture.
-    pub(crate) static FAIL_BLOB_BATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `Some(n)`: the scan's `n`th blob fetch (from 0, counting only chunks that fetch
+    /// anything) fails as a broken store's would, so the fail-open path runs on a healthy
+    /// fixture.
+    pub(crate) static FAIL_BLOB_BATCH: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    /// `Some(bytes)`: the chunk budget in place of [`BLOB_CHUNK_BYTES`], so a fixture's few
+    /// small blobs span several chunks.
+    pub(crate) static CHUNK_BYTES: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+    /// The blob fetches the scans on this thread have run (one per chunk that fetched).
+    pub(crate) static BLOB_FETCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Blobs the batch comes back without, as if pruned between the resolver's existence
     /// check and the fetch (the only way a fixture reaches "not in the store").
     pub(crate) static DROP_FROM_BATCH: std::cell::RefCell<Vec<Oid>> =
@@ -737,6 +763,9 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
 
     // Current side hashed in one batch per call; a row per path whose sides differ.
     let over_bytes = inputs.collapse_size_bytes;
+    // A current blob's size, from the same `lstat` the hashing used: the render's chunks
+    // are sized from it.
+    let mut cur_sizes: HashMap<Oid, u64> = HashMap::new();
     let mut materialise = |paths: &[Vec<u8>], rows: &mut Vec<Row>| {
         // A file over the limit is handed on as "nothing there", which is how it reaches
         // the hashing pass without being hashed: its row is built from the record alone.
@@ -753,7 +782,10 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
             })
             .collect();
         let currents = store.hash_paths_with(paths, &metas);
-        for (path, current) in paths.iter().zip(currents) {
+        for ((path, current), meta) in paths.iter().zip(currents).zip(&metas) {
+            if let (Current::Present { oid, .. }, MetaOf::Present(m)) = (&current, meta) {
+                cur_sizes.insert(oid.clone(), m.len());
+            }
             let current = if forced_absent.contains(path) {
                 Current::Absent
             } else {
@@ -870,6 +902,9 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
     let omitted = rest.len() - taken;
     notices.append(&mut resolver.notices);
 
+    // What rendering may change, as materialised: put back if a chunk's fetch fails.
+    let materialised: Vec<Option<Collapsed>> = rows.iter().map(|r| r.collapsed).collect();
+
     // 4b. A row whose sides the last pile already rendered takes that rendering ([`Reuse`]):
     // its blobs are neither fetched nor diffed.
     let prior: Vec<Option<&Row>> = rows
@@ -877,58 +912,131 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
         .map(|r| inputs.reuse.and_then(|reuse| reuse.row_for(r)))
         .collect();
 
-    // 4c. Content for every other row through one `cat-file --batch`: rendering must not
-    // cost a process per row (2,000 unseen files are 2,000 rows on every rescan tick).
-    let mut wanted: Vec<Oid> = rows
-        .iter()
-        .zip(&prior)
-        .filter(|(_, prior)| prior.is_none())
-        .map(|(r, _)| r)
-        .filter(|r| !matches!(r.change, Change::Typechange | Change::Unreadable))
-        // An unread row has no content to diff, and its recorded blob may itself be large.
-        .filter(|r| !matches!(r.collapsed, Some(Collapsed::Unread { .. })))
-        .flat_map(|r| [&r.baseline, &r.current])
-        .flatten()
-        .map(|e| e.oid.clone())
-        .collect();
-    wanted.sort();
-    wanted.dedup();
-    let fetched = store.cat_blobs(&wanted);
-    #[cfg(test)]
-    // Only where a real batch would run: `cat_blobs` of nothing spawns no process.
-    let fetched = match FAIL_BLOB_BATCH.with(std::cell::Cell::get) && !wanted.is_empty() {
-        true => Err(StoreError::Other("injected batch failure".into())),
-        false => fetched.map(|mut b| {
-            DROP_FROM_BATCH.with(|d| d.borrow().iter().for_each(|o| drop(b.remove(o))));
-            b
-        }),
+    // 4c. Content for every other row, fetched in chunks of rows taken in order with one
+    // `cat-file --batch` per chunk: rendering must not cost a process per row (2,000
+    // unseen files are 2,000 rows on every rescan tick), nor hold every pending row's two
+    // whole blobs at once (eight roots doing so at launch was a run's highest point).
+    let reads = |r: &Row| {
+        !matches!(r.change, Change::Typechange | Change::Unreadable)
+            // An unread row has no content to diff, and its recorded blob may be large.
+            && !matches!(r.collapsed, Some(Collapsed::Unread { .. }))
     };
-    let blobs = match fetched {
-        Ok(b) => Some(b),
-        Err(e) => {
-            notices.push(format!(
-                "blob contents unreadable ({e}); rows shown without counts or hunks"
-            ));
-            None
+    let oids_of = |r: &'_ Row| -> Vec<Oid> {
+        let mut oids: Vec<Oid> = [&r.baseline, &r.current]
+            .into_iter()
+            .flatten()
+            .map(|e| e.oid.clone())
+            .collect();
+        oids.dedup();
+        oids
+    };
+    let size_of = |oid: &Oid| {
+        resolver
+            .size_of(oid)
+            .or_else(|| cur_sizes.get(oid).copied())
+            .unwrap_or(UNKNOWN_BLOB_BYTES)
+    };
+    // `[start, end)` row ranges. A chunk closes before the row whose blobs not already in
+    // it would take it over the budget; the rows that fetch nothing ride along.
+    let budget = blob_chunk_bytes();
+    let mut chunks: Vec<(usize, usize)> = Vec::new();
+    let (mut start, mut bytes, mut held) = (0usize, 0u64, HashSet::<Oid>::new());
+    for (i, (row, prior)) in rows.iter().zip(&prior).enumerate() {
+        if prior.is_some() || !reads(row) {
+            continue;
         }
-    };
-    // A failed batch fails open every row's content, the reused ones too, exactly as a
-    // scan with nothing to reuse would: what a broken store shows does not depend on what
-    // the last scan saw.
-    let mut rendered: HashSet<Vec<u8>> = HashSet::new();
-    for (row, prior) in rows.iter_mut().zip(prior) {
-        let whole = match (prior, &blobs) {
-            (Some(prev), Some(_)) => {
-                row.added = prev.added;
-                row.deleted = prev.deleted;
-                row.hunks = Arc::clone(&prev.hunks);
-                row.collapsed = prev.collapsed;
-                true
-            }
-            _ => render_content(store, inputs, blobs.as_ref(), row, &mut notices)?,
+        let oids = oids_of(row);
+        let cost = |held: &HashSet<Oid>| -> u64 {
+            oids.iter()
+                .filter(|o| !held.contains(*o))
+                .map(&size_of)
+                .sum()
         };
-        if whole {
-            rendered.insert(row.path.clone());
+        let mut add = cost(&held);
+        if !held.is_empty() && bytes.saturating_add(add) > budget {
+            chunks.push((start, i));
+            (start, bytes) = (i, 0);
+            held.clear();
+            add = cost(&held);
+        }
+        bytes = bytes.saturating_add(add);
+        held.extend(oids);
+    }
+    chunks.push((start, rows.len()));
+    drop(held);
+
+    let notices_before = notices.len();
+    let mut rendered: HashSet<Vec<u8>> = HashSet::new();
+    let mut failed: Option<StoreError> = None;
+    #[cfg(test)]
+    let mut fetch_no = 0usize;
+    for (start, end) in chunks {
+        let mut wanted: Vec<Oid> = rows[start..end]
+            .iter()
+            .zip(&prior[start..end])
+            .filter(|(r, prior)| prior.is_none() && reads(r))
+            .flat_map(|(r, _)| oids_of(r))
+            .collect();
+        wanted.sort();
+        wanted.dedup();
+        let fetched = store.cat_blobs(&wanted);
+        #[cfg(test)]
+        // Only where a real batch runs: `cat_blobs` of nothing spawns no process.
+        let fetched = match wanted.is_empty() {
+            true => fetched,
+            false => {
+                BLOB_FETCHES.with(|n| n.set(n.get() + 1));
+                fetch_no += 1;
+                if FAIL_BLOB_BATCH.with(std::cell::Cell::get) == Some(fetch_no - 1) {
+                    Err(StoreError::Other("injected batch failure".into()))
+                } else {
+                    fetched.map(|mut b| {
+                        DROP_FROM_BATCH.with(|d| d.borrow().iter().for_each(|o| drop(b.remove(o))));
+                        b
+                    })
+                }
+            }
+        };
+        let blobs = match fetched {
+            Ok(b) => b,
+            Err(e) => {
+                failed = Some(e);
+                break;
+            }
+        };
+        for (row, prior) in rows[start..end].iter_mut().zip(&prior[start..end]) {
+            let whole = match prior {
+                Some(prev) => {
+                    row.added = prev.added;
+                    row.deleted = prev.deleted;
+                    row.hunks = Arc::clone(&prev.hunks);
+                    row.collapsed = prev.collapsed;
+                    true
+                }
+                None => render_content(store, inputs, Some(&blobs), row, &mut notices)?,
+            };
+            if whole {
+                rendered.insert(row.path.clone());
+            }
+        }
+        // `blobs` is dropped here, before the next chunk's are fetched.
+    }
+    // A failed fetch, whichever chunk's, fails open the whole scan's content, the rows the
+    // earlier chunks rendered and the reused ones too, exactly as one failed batch did:
+    // what a broken store shows does not depend on where the chunks fell or on what the
+    // last scan saw.
+    if let Some(e) = failed {
+        notices.truncate(notices_before);
+        notices.push(format!(
+            "blob contents unreadable ({e}); rows shown without counts or hunks"
+        ));
+        rendered.clear();
+        for (row, collapsed) in rows.iter_mut().zip(materialised) {
+            row.added = 0;
+            row.deleted = 0;
+            row.hunks = Arc::default();
+            row.collapsed = collapsed;
+            render_content(store, inputs, None, row, &mut notices)?;
         }
     }
 
@@ -2240,10 +2348,10 @@ pub(crate) mod fixture_tests {
         repo.write("f2", "b2\n");
         let first = h.scan();
         repo.write("f2", "b3\n");
-        FAIL_BLOB_BATCH.with(|f| f.set(true));
+        FAIL_BLOB_BATCH.with(|f| f.set(Some(0)));
         let failed = h.scan_reusing(Some(reuse_of(&first)));
         let failed_fresh = h.scan();
-        FAIL_BLOB_BATCH.with(|f| f.set(false));
+        FAIL_BLOB_BATCH.with(|f| f.set(None));
         assert_eq!(failed.pile, failed_fresh.pile);
         assert!(
             failed
@@ -2262,6 +2370,94 @@ pub(crate) mod fixture_tests {
         assert_eq!(next.pile, h.scan().pile);
         assert_eq!(next.pile.row(b"f1").unwrap().added, 1);
         assert_eq!(next.rendered.len(), 2);
+    }
+
+    /// Phase 17 Part B fix 4: rows whose blobs span several chunks render exactly as in
+    /// one chunk (the rows, their order, the notices, the reusable paths) with one fetch
+    /// per chunk; and a fetch failing in any later chunk fails open the whole scan as one
+    /// failed batch does, the rows the earlier chunks rendered and their notices included.
+    #[test]
+    fn scan_blobs_in_several_chunks_render_as_one_chunk() {
+        let repo = FixtureRepo::new("scan-chunks").unwrap();
+        let state = TempDir::new("lc-scan-chunks");
+        let h = Harness::new(&repo, &state);
+        repo.write("f1", "changed\n");
+        repo.write("f2", "b2\nmore\n");
+        repo.write("f3", "\0bin");
+        repo.write("Cargo.lock", "lock\n");
+        repo.write("big.txt", "y\n".repeat(600));
+        for (i, body) in ["one\n", "two\nlines\n", "three\n\n", "no newline"]
+            .iter()
+            .enumerate()
+        {
+            repo.write(&format!("new{i}.txt"), body);
+        }
+        // A side gone from the store, so a middle chunk says something.
+        let f2_base = h
+            .scan()
+            .pile
+            .row(b"f2")
+            .unwrap()
+            .baseline
+            .clone()
+            .unwrap()
+            .oid;
+        DROP_FROM_BATCH.with(|d| d.borrow_mut().push(f2_base));
+        let scan_with = |budget: Option<u64>, fail: Option<usize>| {
+            CHUNK_BYTES.with(|b| b.set(budget));
+            FAIL_BLOB_BATCH.with(|f| f.set(fail));
+            let before = BLOB_FETCHES.with(std::cell::Cell::get);
+            let out = h.scan();
+            CHUNK_BYTES.with(|b| b.set(None));
+            FAIL_BLOB_BATCH.with(|f| f.set(None));
+            (out, BLOB_FETCHES.with(std::cell::Cell::get) - before)
+        };
+
+        let (one, fetches) = scan_with(None, None);
+        assert_eq!(fetches, 1);
+        let rows = one.pile.rows.len();
+        assert!(rows >= 8, "{:?}", one.pile.rows);
+        assert!(
+            one.pile
+                .notices
+                .iter()
+                .any(|n| n.starts_with("f2: baseline unreadable")),
+            "{:?}",
+            one.pile.notices
+        );
+        let mut last = usize::MAX;
+        for budget in [1, 8, 16, 32, 64, 1 << 20] {
+            let (many, fetches) = scan_with(Some(budget), None);
+            assert_eq!(many.pile, one.pile, "budget {budget}");
+            assert_eq!(many.rendered, one.rendered, "budget {budget}");
+            assert!(fetches <= last, "budget {budget}: {fetches} > {last}");
+            last = fetches;
+            if budget == 1 {
+                assert_eq!(fetches, rows, "a row per chunk");
+            }
+        }
+        assert_eq!(last, 1);
+
+        let (failed, _) = scan_with(None, Some(0));
+        assert!(failed.rendered.is_empty());
+        assert_eq!(
+            failed
+                .pile
+                .notices
+                .iter()
+                .filter(|n| n.contains("unreadable"))
+                .collect::<Vec<_>>(),
+            vec![
+                "blob contents unreadable (store: injected batch failure); rows shown without counts or hunks"
+            ]
+        );
+        for at in 0..rows {
+            let (later, fetches) = scan_with(Some(1), Some(at));
+            assert_eq!(fetches, at + 1, "stops at the failed chunk");
+            assert_eq!(later.pile, failed.pile, "chunk {at} failed");
+            assert!(later.rendered.is_empty());
+        }
+        DROP_FROM_BATCH.with(|d| d.borrow_mut().clear());
     }
 
     mod proptests {
@@ -2338,25 +2534,29 @@ pub(crate) mod fixture_tests {
             }
         }
 
-        /// Phase 17 Part B fix 3: over any run of edits, a scan offered the last scan's
-        /// renderings gives exactly the pile, and the reusable paths, of a scan with
-        /// nothing to reuse. Driven through `TestRunner` over one fixture: the property
-        /// holds from whatever state the last case left, so nothing is reset.
+        /// Phase 17 Part B fixes 3 and 4: over any run of edits, a scan offered the last
+        /// scan's renderings, and fetching its blobs in chunks of any budget, gives exactly
+        /// the pile, and the reusable paths, of a scan with nothing to reuse and one chunk.
+        /// Driven through `TestRunner` over one fixture: the property holds from whatever
+        /// state the last case left, so nothing is reset.
         #[test]
         fn scan_reuse_changes_nothing_a_pile_shows() {
             let repo = FixtureRepo::new("scan-reuse-prop").unwrap();
             let state = TempDir::new("lc-scan-reuse-prop");
             let h = std::cell::RefCell::new(Harness::new(&repo, &state));
             let mut runner = proptest::test_runner::TestRunner::new(config());
-            let rounds = prop::collection::vec(prop::collection::vec(step(), 0..4), 1..4);
+            let budget = prop_oneof![Just(None), (1u64..1_400).prop_map(Some)];
+            let rounds = prop::collection::vec((prop::collection::vec(step(), 0..4), budget), 1..4);
             let result = runner.run(&rounds, |rounds| {
                 let mut h = h.borrow_mut();
                 let mut last = h.scan();
-                for round in &rounds {
+                for (round, budget) in &rounds {
                     for s in round {
                         apply(&repo, &mut h, s);
                     }
+                    CHUNK_BYTES.with(|b| b.set(*budget));
                     let reusing = h.scan_reusing(Some(reuse_of(&last)));
+                    CHUNK_BYTES.with(|b| b.set(None));
                     let fresh = h.scan();
                     prop_assert_eq!(&reusing.pile, &fresh.pile);
                     prop_assert_eq!(&reusing.rendered, &fresh.rendered);

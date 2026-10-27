@@ -17,7 +17,7 @@
 //! **HEAD is never consulted here** (§6.2): the ledger records what the user has seen as
 //! content, and `seen_at.head_commit` is an annotation input, never a baseline input.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -984,11 +984,27 @@ impl Baseline {
 /// Object existence, abstracted so the resolution order is unit-testable with a fake store.
 pub trait ObjectLookup {
     fn exists_many(&self, oids: &[Oid]) -> Vec<bool>;
+
+    /// Each present object's size (`None`: missing). A lookup that knows presence only
+    /// reports no size, and the scan then bounds its blob chunks by a row count.
+    fn sizes_many(&self, oids: &[Oid]) -> Vec<Option<Option<u64>>> {
+        self.exists_many(oids)
+            .into_iter()
+            .map(|ok| ok.then_some(None))
+            .collect()
+    }
 }
 
 impl ObjectLookup for crate::store::Store {
     fn exists_many(&self, oids: &[Oid]) -> Vec<bool> {
         crate::store::Store::exists_many(self, oids)
+    }
+
+    fn sizes_many(&self, oids: &[Oid]) -> Vec<Option<Option<u64>>> {
+        crate::store::Store::sizes_many(self, oids)
+            .into_iter()
+            .map(|s| s.map(Some))
+            .collect()
     }
 }
 
@@ -1007,7 +1023,8 @@ pub type TreeEntries = BTreeMap<Vec<u8>, (Mode, Oid)>;
 pub struct BaselineResolver<'a> {
     ledger: &'a Ledger,
     tree: &'a TreeEntries,
-    present: HashSet<Oid>,
+    /// Every referenced oid the store holds, with its size when the lookup knows it.
+    present: HashMap<Oid, Option<u64>>,
     pub notices: Vec<String>,
 }
 
@@ -1034,12 +1051,11 @@ impl<'a> BaselineResolver<'a> {
         }
         want.sort();
         want.dedup();
-        let answers = lookup.exists_many(&want);
+        let answers = lookup.sizes_many(&want);
         let present = want
             .into_iter()
             .zip(answers)
-            .filter(|(_, ok)| *ok)
-            .map(|(o, _)| o)
+            .filter_map(|(o, size)| size.map(|s| (o, s)))
             .collect();
         Self {
             ledger,
@@ -1058,7 +1074,7 @@ impl<'a> BaselineResolver<'a> {
         {
             match &o.blob {
                 Some(Some(oid)) => {
-                    if self.present.contains(oid) {
+                    if self.present.contains_key(oid) {
                         return Baseline::Present {
                             oid: oid.clone(),
                             mode: o.mode.unwrap_or(Mode::Regular),
@@ -1074,7 +1090,7 @@ impl<'a> BaselineResolver<'a> {
             }
         }
         if let Some((mode, oid)) = self.tree.get(path) {
-            if self.present.contains(oid) {
+            if self.present.contains_key(oid) {
                 return Baseline::Present {
                     oid: oid.clone(),
                     mode: *mode,
@@ -1086,6 +1102,12 @@ impl<'a> BaselineResolver<'a> {
             ));
         }
         Baseline::Empty
+    }
+
+    /// The size of a blob this resolver found present, when the lookup reported one (the
+    /// store's `--batch-check` does). `None` for an unknown size or an oid it never saw.
+    pub fn size_of(&self, oid: &Oid) -> Option<u64> {
+        self.present.get(oid).copied().flatten()
     }
 }
 
