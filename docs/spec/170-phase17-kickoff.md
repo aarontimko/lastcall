@@ -263,62 +263,131 @@ the sponsor sees.
 The one pull request carries Part A and Part B together from `perf/soak-bench`. It does
 not release: there is no `just release-prep` commit unless the sponsor asks for one.
 
-## Part B deliverable: fixes 1 to 3
+## Part B deliverable: fixes 1 to 4
 
 Every change below is a representation or reuse change. **What a user sees and what is
 stored must not change**:
 - the TUI snapshots (`just test-e2e`) pass unchanged, with no `snapshots-update`;
 - the `status --json` golden passes unchanged, with no `golden-update`;
-- the state written to disk (ledgers, records, any serialized pile or hunk) is byte-for-byte
-  what it was. Where a type is serialized, its serde shape is kept, by a hand-written
-  `Serialize`/`Deserialize` if the field changes, and a unit test round-trips the old
-  shape;
+- the ledgers and records on disk are byte-for-byte what they were. No ledger, record or
+  `status --json` serializes a `Hunk` or a `Pile` (`status.rs` emits `row.hunks.len()`);
+  hunk bytes reach disk only through a hunk flag, `FlagHunk { header, text }`, built by
+  `hunk_header` and `hunk_body` (`app.rs` around 5433 to 5462) and read by
+  `flags::export`, so those outputs are byte-for-byte invariants of fix 2. The serde
+  derives on `Pile`, `Row` and `Hunk` serve the test fixture
+  `crates/lastcall/tests/fixtures/piles_three_roots.json`: it must still load and
+  re-serialize identically;
 - the frozen §5 and §6 contracts are untouched.
 
-**Fix 1, one shared pile.** The pile a scan produces is wrapped once in `Arc` and shared
-by the engine's `RootState.last_pile`, the watcher's `EngineEvent` carrying it, the app's
-`RootView.pile` and `orphan_piles`, and `AcceptRequest::All`. Every place that clones a
-pile today clones the `Arc` instead. Where the app or engine mutates a pile it holds
-(if any), it does so with `Arc::make_mut` or by building a new pile, never by a
-`Mutex`. The worker lists every `pile.clone()` and `.pile.clone()` it found and what each
-became.
+**Fix 1, one shared row list.** `Pile.rows: Vec<Row>` becomes `Arc<Vec<Row>>`; the small
+per-scan fields (`notices`, `omitted`, `snoozed_until` and the rest) stay plain, so
+`Pile::clone` is cheap and every existing `pile.clone()` (the engine's `last_pile`
+(`engine.rs` around 1412 and 1746), `Accepted.pile` (around 1755), the watcher's
+`EngineEvent::Pile`, the app's `RootView.pile` and `orphan_piles`, `AcceptRequest::All`
+(`app.rs` around 2571 and 2582), accept-by-hunk's row clone (around 2514)) shares the
+rows instead of copying them. The snooze expiry's field write (`app.rs` around 3907) stays
+a field write and copies nothing. Code that builds or sorts rows does so on a `Vec<Row>`
+and wraps it once; nothing calls `Arc::make_mut` on a shared pile. The workspace's `serde`
+gains the `rc` feature (a feature, not a new crate; `Cargo.lock` unchanged) so `Arc`
+fields keep their JSON shape. `std`'s `Arc` equality short-cuts on pointer identity for
+`Eq` types, so `apply_pile`'s whole-pile compare (`app.rs` around 2266) gets cheap for
+shared rows; keep that compare as it is. The worker lists every pile and row clone it
+found and what each became.
 
 **Fix 2, one buffer per hunk.** `Hunk.lines: Vec<(Tag, Vec<u8>)>` becomes one byte buffer
-plus one `(Tag, end offset)` entry per line, behind accessors that give each line as
-`(Tag, &[u8])` in the same order. Every reader (engine, `ops.rs`, `store.rs`, the TUI's
-`render.rs`, `textbuf.rs`, `wrap.rs`, `app.rs`, the tests) moves to the accessors; no
-reader sees the buffer directly. `hunks::diff` builds the buffer directly, without first
-making a `Vec<u8>` per line.
+plus one `(Tag, end offset)` entry per line (`u32` offsets are enough; a hunk over 4 GiB
+is refused by the size collapse long before), behind accessors that give each line as
+`(Tag, &[u8])` in the same order, and a `truncate_lines(n)` for `hunks::truncate`
+(`hunks.rs` around 238, the one mutator). The buffer is built presized (the sum of the
+line lengths is known) so `Vec` doubling gives none of the saving back. Readers outside
+`hunks.rs`: `scan.rs` (around 985), `engine.rs` (around 1601), `ops.rs`, `app.rs` (around
+5437 to 5545), `render.rs` (around 1964 and 2128), `wrap.rs` (around 281), `tour.rs` and
+the tests. `textbuf.rs` does not read hunks and is not touched. Expected effect: today a
+38-byte line costs about 80 bytes; after, about 46 to 56, a 30 to 40 % cut of hunk memory.
 
-**Fix 3, reuse a row's diff.** A scan that lists a row whose baseline oid, current oid and
-modes are all equal to that path's row in the root's last pile takes the last pile's
-counts and hunks for it (an `Arc` clone or a move, never a deep copy) and neither fetches
-nor diffs the two blobs. Everything else about the row (status, flags, sort position, the
-row cap) is computed as today. The cache is the last pile itself: no new map that
-outlives it. A row whose key differs in any part, a binary or LFS row, and every row of a
-root's first scan are computed as today. The key must include every input `hunks::diff`
-and `hunks::counts` read (the reviewer checks this against the code: if a config value,
-such as a skip rule or a size cap, changes their output, the reuse must also be dropped
-when that value changes, or the value goes in the key).
+**Fix 3, reuse a row's diff.** What `render_content` (`scan.rs` around 912 to 995)
+produces from a row's blobs is `(added, deleted, hunks, collapsed)`; that set is what is
+reused, never part of it. A row takes the reuse when all of these hold, else it is
+rendered as today:
+- the same path has a row in the root's last pile, with equal `baseline` and `current`
+  entries (oid and mode each);
+- that earlier row was rendered with its blobs in hand: not from a scan whose batch
+  failed (`scan.rs` around 816 to 823) and with neither side missing from the store
+  (around 943 to 951). The engine keeps this as a set of reusable paths on `RootState`
+  beside `last_pile`, never a serialized field;
+- the `collapsed_globs` and `collapse_size_bytes` the last pile was built with equal
+  today's (a reload, `engine.rs` around 784, can change both); store them, or a
+  generation counter `reload` bumps, beside `last_pile`. `store.filemode()` is fixed for
+  a `Store` and needs no key;
+- the row is not `Collapsed::Unread`, `Typechange` or `Unreadable` (those never read
+  blobs today and keep their own path).
+Reused rows are left out of `wanted` (`scan.rs` around 808), so their blobs are neither
+fetched nor diffed. Their hunks are shared, not copied: `Row.hunks` becomes
+`Arc<Vec<Hunk>>` (with fix 1's `rc` feature keeping the JSON shape), built as a `Vec`
+in `render_content` (the mode-change hunk's push included) and wrapped once. The cache is
+the last pile itself: no new map that outlives it. In the same commit, two cheap wins:
+`render_content` borrows the blobs instead of `b.clone()` (around 945); and, only if a
+property test proves `hunks::counts(old, new)` equals the sum of the diff's hunk counts
+for every input, a non-collapsed row takes its counts from the diff instead of running
+the diff twice (otherwise both calls stay).
 
-**Not in Part B:** diffs on demand, a new allocator, any `unsafe`, any new dependency, a
-change to S1 to S5's scenarios (S5 is re-run, not edited), a change to the scan's
-parallelism.
+**Fix 4, fetch blobs in chunks.** `cat_blobs` returns one map of every pending row's two
+whole blobs for a root (`scan.rs` around 808 to 816), and at launch eight roots do so at
+once: that is the run's highest point (relaunch, 827 to 835 MB RSS at stride 150).
+`render` fetches and renders the rows in chunks of at most `BLOB_CHUNK_BYTES` (a `const`,
+64 MiB, sized from the rows' blob sizes, which the scan knows, else a row count) with one
+`cat-file --batch` call per chunk: the same rows, the same order, the same notices, and
+the chunk's map is dropped before the next is fetched. A whole-batch failure still fails
+open the whole scan's content, as today (`scan.rs` around 816 to 823: zero counts, no
+hunks, one notice), not chunk by chunk, so what a broken store shows is unchanged.
+No change to the scan's parallelism.
+
+**Not in Part B:** diffs on demand, a new allocator, any `unsafe`, any new crate, a change
+to S1 to S5's scenarios (S5 is re-run, not edited), a change to the scan's parallelism.
 
 ## Part B gate
 
-- [ ] Fixes 1 to 3 as above, each its own commit (or a few), conventional-commit titles.
-- [ ] `just lint`, `just test-unit` and `just test-prepush` green; `just test-e2e` green
-      with no snapshot rewritten; the `status --json` golden unchanged.
-- [ ] New unit tests: the hunk buffer round-trips every line's tag and bytes (including a
-      last line with no `\n`, an empty line and a CRLF line) and its serde shape equals the
-      old one byte for byte; the diff reuse is taken when the key matches and not taken
-      when the baseline oid, the current oid or the mode differs; a pile shared by the
-      engine and the view is one allocation (`Arc::ptr_eq`).
+- [ ] Fixes 1 to 4 as above, each its own commit (or a few), conventional-commit titles,
+      in the order 1, 2, 3, 4.
+- [ ] `just lint`, `just test-unit`, `just test-prepush` and `just test-scenarios` green;
+      `just test-e2e` green with no snapshot rewritten; the `status --json` golden
+      unchanged; the pile fixture loads and re-serializes identically.
+- [ ] New tests:
+  - the hunk buffer round-trips every line's tag and bytes (a last line with no `\n`, an
+    empty line, a CRLF line), and `truncate_lines` matches the old `truncate`;
+  - `hunk_header`, `hunk_body` and `flags::export` give the same bytes as before fix 2
+    over the fixture's hunks;
+  - fix 3: a property test scans a randomly edited repository twice, with the reuse on
+    and forced off, and the piles are equal; unit cases where the reuse is not taken
+    (baseline oid, current oid or mode differs; the last scan's batch failed; a side was
+    missing; `collapsed_globs` or `collapse_size_bytes` changed by a reload between the
+    scans) and one integration case for the reload; `just test-scenarios` also passes
+    with the reuse forced off (a test-only switch, not a config key);
+  - fix 1: a pile held by the engine and by the view shares its rows (`Arc::ptr_eq`);
+  - fix 4: a root whose blobs span several chunks gives the same pile as one chunk, and a
+    whole-batch failure still fails open as before.
 - [ ] `just bench` S1 to S4 within bench.md's run-to-run noise of the last recorded runs,
       or better.
-- [ ] S5 re-run by the orchestrator at stride 150 and stride 5, the numbers added to
-      bench.md beside runs A to C, and the comparison written here: heap footprint (the
-      Activity Monitor number), live heap at the ramp's end, churn peak, relaunch peak,
-      CPU while writing.
+- [ ] S5 re-run by the orchestrator: after each fix's commit, once at stride 5 and
+      `LASTCALL_BENCH_S5_SCALE=0.34` (attribution: ramp-end live heap, relaunch peak);
+      after all four, full runs at stride 150 and stride 5, added to bench.md beside runs
+      A to C. Expectation: ramp-end live heap at stride 5 down from about 1,050 MB to
+      roughly 300 to 400 MB, and the relaunch peak lower; a worse number is a finding.
+      The comparison is written here: heap footprint (the Activity Monitor number), live
+      heap at the ramp's end, churn peak, relaunch peak, CPU while writing.
 - [ ] The sponsor rules on diffs on demand with those numbers in hand.
+
+## Design review of Part B, folded (2026-10-26)
+
+Fresh-context reviewer over `7c4e8bd`, verdict "fixes required" (F1 to F4 gating); all
+twelve folded, none rejected. F1: the reuse covers `collapsed` too, and drops on a reload
+that changes the collapse rules. F2: rows from a failed batch or with a missing side are
+never reused. F3: `Row.hunks` becomes `Arc`, serde's `rc` feature keeps the JSON shape.
+F4: the snooze write would deep-copy an `Arc<Pile>`, so the `Arc` moves to the rows. F5:
+the relaunch peak was untouched by fixes 1 to 3, so fix 4 (chunked blob fetch, no output
+change) was added under the delegated-rulings practice and is listed for the sponsor at
+close. F6: borrow the blobs; one diff run when a property test proves the counts equal.
+F7: the reader list corrected (`textbuf.rs` out, `tour.rs` in). F8: hunk bytes reach disk
+only through hunk flags; those are the byte invariants. F9: the expected cut stated, the
+buffer presized. F10: reused rows leave `wanted`. F11: equivalence tests and per-fix
+attribution runs. F12: `Accepted.pile` and accept-by-hunk on the clone list.
