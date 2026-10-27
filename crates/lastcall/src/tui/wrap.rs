@@ -278,7 +278,7 @@ fn body_text(hunk: &Hunk, within: usize) -> Option<String> {
     if within == 0 || within > hunk_height(hunk).saturating_sub(1) {
         return None;
     }
-    Some(super::render::line_text(&hunk.lines[within - 1].1))
+    Some(super::render::line_text(hunk.lines.line(within - 1).1))
 }
 
 /// The gutter mark a text line repeats on every one of its rows.

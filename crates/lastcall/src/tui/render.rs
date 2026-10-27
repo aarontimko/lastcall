@@ -1961,12 +1961,12 @@ fn render_hunks(
             wrap::Part::Blank => continue,
             wrap::Part::Whole => hunk_line(hunk, within, h == current),
             wrap::Part::Slice { start, end, marker } => {
-                let (tag, bytes) = &hunk.lines[within - 1];
+                let (tag, bytes) = hunk.lines.line(within - 1);
                 if expanded.as_ref().is_none_or(|(line, _)| *line != row.line) {
                     expanded = Some((row.line, line_text(bytes)));
                 }
                 let text = expanded.as_ref().map_or("", |(_, text)| text.as_str());
-                hunk_row(*tag, text, *start, *end, marker.as_deref())
+                hunk_row(tag, text, *start, *end, marker.as_deref())
             }
         };
         let row_rect = Rect::new(area.x, area.y + y, area.width, 1);
@@ -2125,7 +2125,7 @@ fn hunk_line(hunk: &Hunk, i: usize, current: bool) -> Line<'static> {
         };
         return Line::from(Span::styled(text, style));
     }
-    let (tag, bytes) = &hunk.lines[i - 1];
+    let (tag, bytes) = hunk.lines.line(i - 1);
     let text = line_text(bytes);
     match tag {
         Tag::Context => Line::from(format!(" {text}")),
@@ -5256,7 +5256,8 @@ mod tests {
             let mut app = wrapped(&["a"]);
             // One long changed line, the only body line of the hunk.
             let hunk = &mut app.selected_row().expect("f1").hunks[0].clone();
-            hunk.lines = vec![(tag, format!("{}\n", "lorem ipsum ".repeat(20)).into_bytes())];
+            hunk.lines =
+                vec![(tag, format!("{}\n", "lorem ipsum ".repeat(20)).into_bytes())].into();
             let mut p = pile("alpha");
             p.rows_mut()[0].hunks = vec![hunk.clone()];
             app.apply(pile_event("alpha", p));
@@ -5566,7 +5567,7 @@ mod tests {
                         index: 0,
                         old_range: 0..1,
                         new_range: 0..1,
-                        lines: vec![(tag, format!("{text}\n").into_bytes())],
+                        lines: vec![(tag, format!("{text}\n").into_bytes())].into(),
                     }];
                     // Tall enough that the cap is never in play.
                     let area = Rect::new(0, 0, w, 400);

@@ -392,7 +392,7 @@ fn scenario_a8_two_hunk_flags_on_one_file_survive_accept_all() {
         text: String::from_utf8_lossy(
             &h.lines
                 .iter()
-                .flat_map(|(_, l)| l.clone())
+                .flat_map(|(_, l)| l.iter().copied())
                 .collect::<Vec<u8>>(),
         )
         .into_owned(),

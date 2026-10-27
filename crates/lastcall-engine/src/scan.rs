@@ -1774,8 +1774,8 @@ pub(crate) mod fixture_tests {
         if h.store.filemode() {
             assert_eq!(f3.change, Change::Mode);
             assert_eq!(f3.hunks.len(), 1, "D1: a synthetic mode hunk");
-            assert_eq!(f3.hunks[0].lines[0].1, b"mode 100644".to_vec());
-            assert_eq!(f3.hunks[0].lines[1].1, b"mode 100755".to_vec());
+            assert_eq!(f3.hunks[0].lines.line(0).1, b"mode 100644".to_vec());
+            assert_eq!(f3.hunks[0].lines.line(1).1, b"mode 100755".to_vec());
         }
         assert_eq!(pile.row(b"new.txt").unwrap().change, Change::Added);
         assert_eq!(
@@ -1795,7 +1795,7 @@ pub(crate) mod fixture_tests {
         let link = pile.row(b"link").unwrap();
         assert_eq!(link.current.as_ref().unwrap().mode, Mode::Symlink);
         assert_eq!(
-            link.hunks[0].lines[0].1,
+            link.hunks[0].lines.line(0).1,
             b"f1".to_vec(),
             "symlink diffs its target"
         );

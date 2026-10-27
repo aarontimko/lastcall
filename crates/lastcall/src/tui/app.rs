@@ -5434,8 +5434,8 @@ pub fn hunk_header(hunk: &Hunk) -> String {
     if hunk.is_mode_change() {
         return format!(
             "mode {} → {}",
-            mode_of(&hunk.lines[0].1),
-            mode_of(&hunk.lines[1].1)
+            mode_of(hunk.lines.line(0).1),
+            mode_of(hunk.lines.line(1).1)
         );
     }
     format!(
@@ -5542,7 +5542,7 @@ pub fn diff_line_text(hunks: &[Hunk], i: usize) -> Option<String> {
         // does the same.
         return (within < hunk_block(hunks, h)).then(String::new);
     }
-    let (tag, bytes) = &hunk.lines[within - 1];
+    let (tag, bytes) = hunk.lines.line(within - 1);
     let prefix = match tag {
         Tag::Context => ' ',
         Tag::Insert => '+',
@@ -6342,6 +6342,157 @@ mod tests {
         let again: BTreeMap<String, Pile> = serde_json::from_value(written.clone()).unwrap();
         assert_eq!(again, loaded);
         assert_eq!(serde_json::to_value(&again).unwrap(), written);
+    }
+
+    /// Every hunk of the recorded pile fixture, plus a mode hunk, quoted as a hunk flag's
+    /// export: the bytes a flag puts on disk come from `hunk_header` and `hunk_body`, and
+    /// the export reads them back.
+    fn fixture_hunk_quotes() -> String {
+        use lastcall_engine::flags::{ExportContext, export};
+        use lastcall_engine::ledger::Flag;
+        let piles: BTreeMap<String, Pile> =
+            serde_json::from_str(include_str!("../../tests/fixtures/piles_three_roots.json"))
+                .unwrap();
+        let mut hunks: Vec<(String, Vec<u8>, Hunk)> = Vec::new();
+        for (root, p) in &piles {
+            for row in p.rows.iter() {
+                for h in &row.hunks {
+                    hunks.push((root.clone(), row.path.clone(), h.clone()));
+                }
+            }
+        }
+        let mode = Hunk::mode_change("100644", "100755");
+        hunks.push(("alpha".to_owned(), b"bin/run".to_vec(), mode));
+        let mut quotes = Vec::new();
+        for (root, path, hunk) in hunks {
+            let ctx = ExportContext {
+                root,
+                of: Some(hunk.index + 1),
+                attribution: None,
+            };
+            let flag = Flag {
+                note: "quoted".into(),
+                created_at: "2026-10-26T00:00:00Z".into(),
+                hunk: Some(FlagHunk {
+                    index: hunk.index,
+                    header: hunk_header(&hunk),
+                    text: hunk_body(&hunk),
+                }),
+                summary: None,
+            };
+            quotes.push(export(&ctx, &path, &flag));
+        }
+        quotes.join("\n\n")
+    }
+
+    /// Phase 17 Part B fix 2: a hunk's lines moved into one buffer, and what a hunk flag
+    /// quotes did not move with them. The expected text was taken from the `Vec`-per-line
+    /// representation before the change.
+    #[test]
+    fn app_hunk_flag_quotes_are_the_bytes_they_were() {
+        let expected = r##"lastcall flag · alpha · f1 · hunk 1 of 1 · 2026-10-26T00:00:00Z
+note: quoted
+
+```diff
+@@ -1,4 +1,4 @@
+-a1
++A1
+ a2
+ a3
+ a4
+```
+
+lastcall flag · alpha · f2 · hunk 1 of 1 · 2026-10-26T00:00:00Z
+note: quoted
+
+```diff
+@@ -1 +1,2 @@
+ b
++agent edit
+```
+
+lastcall flag · alpha · src/parse.rs · hunk 1 of 1 · 2026-10-26T00:00:00Z
+note: quoted
+
+```diff
+@@ -1,4 +1,6 @@
+-//! A tiny line-oriented parser for the fixture's sample config text.
++//! A tiny line-oriented parser for `key = value` text.
++//!
++//! Comment syntax follows the sample files: `#` to the end of the line.
+ 
+ /// One parsed record: a key, its value, and the line it came from.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+```
+
+lastcall flag · alpha · src/parse.rs · hunk 2 of 2 · 2026-10-26T00:00:00Z
+note: quoted
+
+```diff
+@@ -16,7 +18,7 @@
+     let mut out = Vec::new();
+     for (i, raw) in text.lines().enumerate() {
+         let line = raw.trim();
+-        if line.is_empty() || line.starts_with('#') {
++        if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
+             continue;
+         }
+         let Some((key, value)) = line.split_once('=') else {
+```
+
+lastcall flag · alpha · src/parse.rs · hunk 3 of 3 · 2026-10-26T00:00:00Z
+note: quoted
+
+```diff
+@@ -51,4 +53,10 @@
+         assert_eq!(records[0].key, "name");
+         assert_eq!(records[0].line, 3);
+     }
++
++    #[test]
++    fn lookup_takes_the_last_record() {
++        let records = parse("a = 1\na = 2\n");
++        assert_eq!(lookup(&records, "a"), Some("2"));
++    }
+ }
+```
+
+lastcall flag · beta · u1 · hunk 1 of 1 · 2026-10-26T00:00:00Z
+note: quoted
+
+```diff
+@@ -0,0 +1 @@
++up1
+```
+
+lastcall flag · beta · u2 · hunk 1 of 1 · 2026-10-26T00:00:00Z
+note: quoted
+
+```diff
+@@ -0,0 +1,2 @@
++up2
++local edit
+```
+
+lastcall flag · notes · n2.md · hunk 1 of 1 · 2026-10-26T00:00:00Z
+note: quoted
+
+```diff
+@@ -1 +1,3 @@
+ # note 2
++
++edited
+```
+
+lastcall flag · alpha · bin/run · hunk 1 of 1 · 2026-10-26T00:00:00Z
+note: quoted
+
+```diff
+mode 100644 → 100755
+-mode 100644
++mode 100755
+```"##;
+        assert_eq!(fixture_hunk_quotes(), expected);
     }
 
     /// Phase 17 Part B fix 1: the view holds the very row list the engine published, and an
@@ -8802,7 +8953,8 @@ mod tests {
         mode.lines = vec![
             (lastcall_engine::hunks::Tag::Delete, b"mode 100644".to_vec()),
             (lastcall_engine::hunks::Tag::Insert, b"mode 100755".to_vec()),
-        ];
+        ]
+        .into();
         assert!(mode.is_mode_change());
         assert_eq!(hunk_height(&mode), 1);
         // The mode line, then the blank separator, then the second hunk's header.
@@ -11528,7 +11680,7 @@ mod tests {
     fn app_copy_over_the_cap_writes_nothing() {
         let mut app = three_roots();
         let mut big = pile("alpha");
-        big.rows_mut()[0].hunks[0].lines = vec![(Tag::Insert, vec![b'x'; 40 * 1024])];
+        big.rows_mut()[0].hunks[0].lines = vec![(Tag::Insert, vec![b'x'; 40 * 1024])].into();
         app.apply(pile_event("alpha", big));
         app.select(Some(row("alpha", "f1")));
         app.handle(Action::Open);
