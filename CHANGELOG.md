@@ -5,6 +5,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html). A version's s
 exactly what its GitHub release notes carry, so it is written for the people installing the
 binary rather than for the commit log.
 
+## Unreleased
+
+### Changed
+
+- Much less memory and CPU when several agents edit large files across many worktrees.
+  lastcall no longer re-reads and re-diffs a file whose contents did not change since the
+  last scan, holds each pending diff once instead of several times, and stores a diff's
+  lines more compactly. In a test with seven worktrees of a large repository, memory after
+  accepting stayed under 90 MB instead of climbing past 1 GB, and CPU while the agents wrote
+  fell from about 30% to under 5%. What the list and the diffs show is unchanged.
+
 ## 0.7.1 - 2026-10-04
 
 ### Fixed
