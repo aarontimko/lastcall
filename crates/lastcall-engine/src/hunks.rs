@@ -36,8 +36,8 @@ pub enum Tag {
 /// A `Vec<u8>` per line costs its 24-byte header and an allocation rounded up by the
 /// allocator, which for a typical 38-byte source line roughly doubles it; the pile holds
 /// every pending row's hunks for as long as the row is pending. Here a line costs its bytes
-/// plus 8. `u32` offsets bound a hunk at 4 GiB, which the scan's size collapse refuses long
-/// before ([`crate::config`]'s `collapse_size_bytes`).
+/// plus 8. `u32` offsets bound a hunk at 4 GiB; the scan collapses any pair of blobs that
+/// together pass that as `Size`, whatever `collapse_size_bytes` says (`scan::over_size`).
 ///
 /// Lines read back as `(Tag, &[u8])` in the order they were pushed. Serialized as the
 /// `[[tag, [bytes]], …]` array the `Vec` was, so the pile fixture's shape is unchanged.

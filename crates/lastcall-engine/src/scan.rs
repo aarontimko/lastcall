@@ -1176,9 +1176,7 @@ fn render_content<'b>(
     if row.collapsed.is_none() {
         if is_binary(old) || is_binary(new) {
             row.collapsed = Some(Collapsed::Binary);
-        } else if old.len() as u64 >= inputs.collapse_size_bytes
-            || new.len() as u64 >= inputs.collapse_size_bytes
-        {
+        } else if over_size(old.len(), new.len(), inputs.collapse_size_bytes) {
             row.collapsed = Some(Collapsed::Size);
         }
     }
@@ -1214,6 +1212,13 @@ fn render_content<'b>(
     }
     row.hunks = Arc::new(hunks);
     Ok(whole)
+}
+
+/// Whether a pair of blobs collapses as `Size`: either side at or above the configured
+/// limit, or the two together past what one hunk's `u32` offsets can address
+/// ([`hunks::Lines`]), which only a limit raised above 4 GiB can reach.
+fn over_size(old: usize, new: usize, limit: u64) -> bool {
+    old as u64 >= limit || new as u64 >= limit || (old + new) as u64 > u64::from(u32::MAX)
 }
 
 /// `(from, to, similarity)` as reported by `diff -M`.
@@ -1931,6 +1936,20 @@ pub(crate) mod fixture_tests {
             pile: &out.pile,
             rendered: &out.rendered,
         }
+    }
+
+    /// A limit raised past 4 GiB still collapses a pair one hunk's `u32` offsets could not
+    /// hold, rather than panicking in `Lines::push` (code review F1).
+    #[test]
+    fn over_size_caps_a_pair_at_what_one_hunk_can_address() {
+        let four_gib = u32::MAX as usize;
+        let huge = u64::MAX;
+        assert!(!over_size(10, 10, huge));
+        assert!(!over_size(four_gib / 2, four_gib / 2, huge));
+        assert!(over_size(four_gib / 2 + 1, four_gib / 2 + 1, huge));
+        assert!(over_size(1024, 0, 1024));
+        assert!(over_size(0, 1024, 1024));
+        assert!(!over_size(1023, 1023, 1024));
     }
 
     /// `collapse_size_bytes` has read as at-or-above in `docs/config.md` since the key was
