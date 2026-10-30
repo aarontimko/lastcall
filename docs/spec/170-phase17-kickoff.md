@@ -375,7 +375,7 @@ to S1 to S5's scenarios (S5 is re-run, not edited), a change to the scan's paral
       roughly 300 to 400 MB, and the relaunch peak lower; a worse number is a finding.
       The comparison is written here: heap footprint (the Activity Monitor number), live
       heap at the ramp's end, churn peak, relaunch peak, CPU while writing.
-- [ ] The sponsor rules on diffs on demand with those numbers in hand.
+- [x] The sponsor rules on diffs on demand with those numbers in hand: held (below).
 
 ## Design review of Part B, folded (2026-10-26)
 
@@ -436,3 +436,19 @@ doors):
 3. The reuse-off switch is a test-only variable, `LASTCALL_TEST_NO_DIFF_REUSE`, read in
    `env.rs` and applied only by the testkit; the binary never reads it, and it is in
    `docs/dev/testing.md`, not `docs/config.md`.
+
+## Part B closing ruling (2026-10-30)
+
+The sponsor, on the two questions put with the results: "1 rec 2 rec yeah It seems like you
+already had a lot of good performance updates so far and I can see how it goes in real
+workloads".
+
+1. **The relaunch peak: try a smaller chunk, keep it only if the peak drops.** It dropped:
+   `BLOB_CHUNK_BYTES` went from 64 MiB to 8 MiB. Relaunch peak RSS 767 to 213 MB (stride
+   150) and 986 to 376 MB (stride 5); the footprint after the relaunch 310 to 31 MB and 581
+   to 89 MB; S1 to S4's spawn counts identical (`docs/dev/bench.md`, runs J, K and L). The
+   "Part B results" above describe the 64 MiB build: fix 4 now engages at S5's size, and the
+   relaunch is no longer far above the rest of the run.
+2. **Diffs on demand: held.** The sponsor watches real workloads on this build first. It
+   reopens only if a real pile stays at several million pending lines; the trigger is what
+   Activity Monitor shows there.

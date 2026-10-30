@@ -507,7 +507,10 @@ fn record_holds(inputs: &ScanInputs<'_>, path: &[u8]) -> bool {
 /// The most blob bytes one `cat-file --batch` of the render fetches and holds: the rows are
 /// rendered in chunks taken in order, each chunk's blobs fetched together and dropped
 /// before the next chunk's are. A row whose blobs alone exceed it is a chunk of its own.
-pub const BLOB_CHUNK_BYTES: u64 = 64 * 1024 * 1024;
+/// At launch up to eight roots hold a chunk each, and macOS keeps that high-water mark, so
+/// this is the launch's footprint: 8 MiB against 64 MiB took S5's relaunch peak from 986 MB
+/// to 376 MB for no more git processes in S1 to S4 (`docs/dev/bench.md`).
+pub const BLOB_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
 
 /// What a blob of unknown size is charged against [`BLOB_CHUNK_BYTES`]: a chunk of such
 /// blobs is bounded by a count (1,024) instead. The scan knows every size in practice,
