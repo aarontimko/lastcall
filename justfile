@@ -70,23 +70,30 @@ test-e2e:
 test-prepush:
     #!/usr/bin/env bash
     set -euo pipefail
-    echo "--- test-prepush 1/4: just test-integration ---"
+    echo "--- test-prepush 1/5: just test-integration ---"
     just test-integration
-    echo "--- test-prepush 2/4: PROPTEST_CASES=64 cargo test -p lastcall-engine --lib proptests ---"
+    echo "--- test-prepush 2/5: PROPTEST_CASES=64 cargo test -p lastcall-engine --lib proptests ---"
     PROPTEST_CASES=64 cargo test -p lastcall-engine --lib proptests
-    echo "--- test-prepush 3/4: PROPTEST_CASES=64 cargo test -p lastcall --lib proptests ---"
+    echo "--- test-prepush 3/5: PROPTEST_CASES=64 cargo test -p lastcall --lib proptests ---"
     PROPTEST_CASES=64 cargo test -p lastcall --lib proptests
     # The seen oracle is an integration test (it needs a real repository and the real
     # engine), so step 1 runs it at the unit tier's case count and this step is what
     # gives it the pre-push 64.
-    echo "--- test-prepush 4/4: PROPTEST_CASES=64 cargo test -p lastcall-engine --test test_integration_seen_oracle ---"
+    echo "--- test-prepush 4/5: PROPTEST_CASES=64 cargo test -p lastcall-engine --test test_integration_seen_oracle ---"
     PROPTEST_CASES=64 cargo test -p lastcall-engine --test test_integration_seen_oracle
+    echo "--- test-prepush 5/5: just test-scenarios-no-reuse ---"
+    just test-scenarios-no-reuse
     echo "--- test-prepush: green ---"
 
 # All three tiers, in order.
 # The scenario suites (docs/spec/01-scenarios.md, one test per ID) against real git.
 test-scenarios:
     cargo test -p lastcall-engine --test 'test_integration_scenarios*'
+
+# The same suites with the scan's diff reuse switched off, so a reused row and a fresh one
+# are held to the same expected piles (docs/dev/testing.md).
+test-scenarios-no-reuse:
+    LASTCALL_TEST_NO_DIFF_REUSE=1 cargo test -p lastcall-engine --test 'test_integration_scenarios*'
 
 # Rewrite crates/lastcall/tests/golden/status_multi_repo.json from the built binary.
 golden-update:
@@ -453,12 +460,26 @@ tryout SCENARIO="list" *ARGS:
 # 1,000-file burst under watch, a 50,000-file drop against the row cap) on the RELEASE
 # build only, one `BENCH <scenario> <metric>=<value>` stderr line per metric. Fixtures are
 # built outside the timed regions under temp dirs the test removes; about four minutes.
+# S5, the worktree soak, is skipped here: it runs alone under `just bench-soak`.
 bench:
     #!/usr/bin/env bash
     set -euo pipefail
     cargo build --release -p lastcall
-    cargo test --release -p lastcall --test test_bench -- --ignored --nocapture --test-threads=1
+    cargo test --release -p lastcall --test test_bench -- --ignored --nocapture --test-threads=1 --skip bench_s5_worktree_soak
     echo "--- bench done: paste the BENCH lines above into docs/dev/bench.md with the machine block, date and commit ---" >&2
+
+# The worktree soak (docs/dev/bench.md, S5; not a gate, not part of `just bench`): one
+# repository and six linked worktrees under writers, three ramp, churn and quiet cycles
+# under the default timings, then a relaunch, on the RELEASE build only. One `BENCH S5
+# <metric>=<value>` stderr line per metric and a `trace` line every 10 s. About 17 minutes
+# plus the fixture. LASTCALL_BENCH_S5_SCALE (default 1.0) multiplies the phase lengths;
+# LASTCALL_BENCH_S5_FILES and LASTCALL_BENCH_S5_LINES resize the fixture (300 x 3,000).
+bench-soak:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --release -p lastcall
+    cargo test --release -p lastcall --test test_bench -- --ignored --nocapture --test-threads=1 --exact bench_s5_worktree_soak
+    echo "--- bench-soak done: paste the BENCH S5 lines above into docs/dev/bench.md (S5) with the machine block, date and commit ---" >&2
 
 # cargo-deny against deny.toml: advisories, licences, bans (install: cargo install cargo-deny).
 audit:

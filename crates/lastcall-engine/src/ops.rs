@@ -2365,7 +2365,7 @@ impl Ops<'_> {
         // `compact` passes an empty snapshot and no `seen_at`, and pushes nothing.
         let entry = if seen_at.is_some() && !snapshot.rows.is_empty() {
             let mut keys: Vec<String> = Vec::new();
-            for row in &snapshot.rows {
+            for row in snapshot.rows.iter() {
                 if let Ok(k) = std::str::from_utf8(&row.path) {
                     keys.push(k.to_owned());
                 }
@@ -2410,7 +2410,7 @@ impl Ops<'_> {
                 None => {}
             }
         }
-        for row in &snapshot.rows {
+        for row in snapshot.rows.iter() {
             let path = row.path.clone();
             let w = match &row.current {
                 Some(e) => TreeWrite::Set {
@@ -2461,7 +2461,7 @@ impl Ops<'_> {
                 .filter(|(_, o)| o.survives_fold(RootKind::Draft))
                 .map(|(k, _)| k.clone())
                 .collect();
-            for row in &snapshot.rows {
+            for row in snapshot.rows.iter() {
                 if matches!(row.collapsed, Some(crate::scan::Collapsed::Unread { .. }))
                     && let Ok(k) = std::str::from_utf8(&row.path)
                     && self
@@ -3720,7 +3720,7 @@ mod tests {
                 "{p}: compaction at > threshold"
             );
             let mut expected = before;
-            expected.rows.retain(|row| row.path != p.as_bytes());
+            expected.rows_mut().retain(|row| row.path != p.as_bytes());
             let after = h.scan().pile;
             assert_eq!(pile_lines(&after), pile_lines(&expected));
         }
@@ -5779,6 +5779,7 @@ mod tests {
                     row_cap: DEFAULT_ROW_CAP,
                     retry_on_reseed: false,
                     skip: None,
+                    reuse: None,
                 })
                 .unwrap()
                 .pile
@@ -5896,7 +5897,7 @@ mod tests {
                         prop_assert_eq!(row.change, expected, "{}", name);
                         if let (Some(w), Some(i)) = (was, is) {
                             prop_assert_eq!(
-                                &row.hunks,
+                                &*row.hunks,
                                 &hunks::diff(w, i),
                                 "{}: not exactly the post-snapshot delta",
                                 name
@@ -6077,7 +6078,7 @@ mod tests {
                     let expected = hunks::apply_hunks(&base, &row.hunks, &[k]);
                     let after = d.scan().row(b"f").cloned().expect("the rest is pending");
                     prop_assert_eq!(
-                        &after.hunks,
+                        &*after.hunks,
                         &hunks::diff(&expected, &live),
                         "not the re-diff against the new override"
                     );

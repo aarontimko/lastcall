@@ -403,7 +403,7 @@ impl World {
                 let pile = self.scan()?;
                 self.s.accept_all_snapshot(&pile);
                 self.log.push("accept-all".to_owned());
-                for row in &pile.rows {
+                for row in pile.rows.iter() {
                     let Ok(p) = std::str::from_utf8(&row.path) else {
                         continue;
                     };

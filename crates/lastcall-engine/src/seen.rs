@@ -82,7 +82,9 @@ pub fn mark<E>(
     mut list: impl FnMut(&Oid) -> Result<TreeEntries, E>,
 ) -> Result<(), E> {
     cache.prune(ledger);
-    for row in &mut pile.rows {
+    // The scan's own pile, not yet handed out: writing its rows copies nothing.
+    let rows = pile.rows_mut();
+    for row in rows.iter_mut() {
         row.seen_on.clear();
     }
     let norm = |m: Mode| -> Mode {
@@ -92,8 +94,7 @@ pub fn mark<E>(
             m
         }
     };
-    let candidates: Vec<usize> = pile
-        .rows
+    let candidates: Vec<usize> = rows
         .iter()
         .enumerate()
         .filter(|(_, r)| r.current.is_some() && r.annotation.is_none())
@@ -126,7 +127,7 @@ pub fn mark<E>(
         // The tree is listed only when some candidate would read it.
         let needs_tree = candidates
             .iter()
-            .any(|&i| override_of(&pile.rows[i].path).is_none());
+            .any(|&i| override_of(&rows[i].path).is_none());
         if needs_tree
             && let Some(t) = seen_tree
             && !cache.trees.contains_key(t)
@@ -136,7 +137,7 @@ pub fn mark<E>(
                     cache.trees.insert(t.clone(), entries);
                 }
                 Err(e) => {
-                    for row in &mut pile.rows {
+                    for row in rows.iter_mut() {
                         row.seen_on.clear();
                     }
                     return Err(e);
@@ -145,7 +146,7 @@ pub fn mark<E>(
         }
         let tree = seen_tree.and_then(|t| cache.trees.get(t));
         for &i in &candidates {
-            let row = &pile.rows[i];
+            let row = &rows[i];
             let Some(cur) = row.current.as_ref() else {
                 continue;
             };
@@ -161,13 +162,13 @@ pub fn mark<E>(
             };
             let matched =
                 baseline.is_some_and(|(oid, mode)| *oid == cur.oid && norm(mode) == norm(cur.mode));
-            if matched && !pile.rows[i].seen_on.contains(branch) {
-                pile.rows[i].seen_on.push(branch.clone());
+            if matched && !rows[i].seen_on.contains(branch) {
+                rows[i].seen_on.push(branch.clone());
             }
         }
     }
     for &i in &candidates {
-        pile.rows[i].seen_on.sort();
+        rows[i].seen_on.sort();
     }
     Ok(())
 }
@@ -210,7 +211,7 @@ mod tests {
             current: cur.map(|(c, mode)| Entry { oid: oid(c), mode }),
             added: 1,
             deleted: 1,
-            hunks: Vec::new(),
+            hunks: Default::default(),
             annotation: None,
             conflicted: false,
             collapsed: None,
@@ -222,7 +223,7 @@ mod tests {
 
     fn pile(rows: Vec<Row>) -> Pile {
         Pile {
-            rows,
+            rows: rows.into(),
             ..Pile::default()
         }
     }
@@ -713,14 +714,14 @@ mod tests {
             row("c.rs", Some(('c', Mode::Regular))),
             row("d.rs", Some(('c', Mode::Regular))),
         ]);
-        for r in &mut p.rows {
+        for r in p.rows_mut() {
             r.seen_on = vec!["run-1".to_owned()];
         }
-        p.rows[1]
+        p.rows_mut()[1]
             .flags
             .push(crate::ledger::Flag::file("look", "2026-09-26T00:00:00Z"));
-        p.rows[2].annotation = Some(Annotation::Upstream);
-        p.rows[3].seen_on.clear();
+        p.rows_mut()[2].annotation = Some(Annotation::Upstream);
+        p.rows_mut()[3].seen_on.clear();
         let groups = p.groups();
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].kind, crate::scan::GroupKind::Upstream);

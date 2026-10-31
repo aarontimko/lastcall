@@ -9,7 +9,7 @@
 //! tree that no longer resolves in the store (the user ran `git gc`) is treated as `null`
 //! with a notice.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -124,6 +124,11 @@ pub struct EngineOptions {
     /// calling thread — no thread is spawned at all — and the resulting state must be
     /// identical at every value (`engine_parallel_open_and_scan_match_the_sequential_run_exactly`).
     pub parallelism: usize,
+    /// Whether a scan takes a row's rendering from the root's last pile when the row's
+    /// sides have not moved ([`scan::Reuse`], Phase 17 Part B fix 3). Always `true` outside
+    /// tests: it is the tests' switch for proving the reuse changes nothing (the scenario
+    /// suites run with it off under `LASTCALL_TEST_NO_DIFF_REUSE`), not a setting.
+    pub reuse_diffs: bool,
 }
 
 impl Default for EngineOptions {
@@ -133,6 +138,7 @@ impl Default for EngineOptions {
             clock: Arc::new(SystemClock),
             row_cap: DEFAULT_ROW_CAP,
             parallelism: default_parallelism(),
+            reuse_diffs: true,
         }
     }
 }
@@ -143,6 +149,7 @@ impl std::fmt::Debug for EngineOptions {
             .field("compaction_threshold", &self.compaction_threshold)
             .field("row_cap", &self.row_cap)
             .field("parallelism", &self.parallelism)
+            .field("reuse_diffs", &self.reuse_diffs)
             .finish_non_exhaustive()
     }
 }
@@ -232,6 +239,13 @@ pub struct RootState {
     /// Notices from open (kept until the root is reopened).
     pub notices: Vec<String>,
     pub last_pile: Option<Pile>,
+    /// The paths of `last_pile` whose rendering the next scan may take over
+    /// ([`scan::Reuse::rendered`], Phase 17 Part B fix 3). Engine memory only, never
+    /// serialized; it changes exactly when `last_pile` does.
+    pub rendered: HashSet<Vec<u8>>,
+    /// The engine's collapse-rules generation `last_pile` was rendered under; a scan under
+    /// any other generation renders every row afresh.
+    pub rendered_under: u64,
     pub nested_repos: Vec<Vec<u8>>,
     /// Set when a scan changed `nested_repos`; `scan_all` re-runs discovery only then.
     pub nested_changed: bool,
@@ -619,6 +633,10 @@ pub struct Engine {
     /// root; every publisher of a pile carries it so a consumer can drop a pile older than
     /// one it already holds (a `scan_all` result arriving after an accept's rescan).
     scan_seq: u64,
+    /// Bumped by every [`Engine::reload`], which may change `collapsed_globs` and
+    /// `collapse_size_bytes`: a root's last pile is reused only under the rules it was
+    /// rendered under ([`RootState::rendered_under`]).
+    collapse_rules: u64,
 }
 
 /// Take this process's temp index in every root it opened (Phase 5 deliverable 2a).
@@ -669,6 +687,7 @@ impl Engine {
                 .home()
                 .map(|h| std::fs::canonicalize(h).unwrap_or_else(|_| h.to_path_buf())),
             scan_seq: 0,
+            collapse_rules: 0,
         };
         let started = std::time::Instant::now();
         engine.rescan()?;
@@ -785,6 +804,7 @@ impl Engine {
         self.config = loaded.config.clone();
         self.resolved = resolved.clone();
         self.collapsed = build_globs(&self.config.collapsed_globs);
+        self.collapse_rules += 1;
         self.ignore = build_globs(&self.config.watch_ignore_globs);
         self.skip = crate::config::skip_set(&self.config.skip_globs);
         for n in &resolved.notices {
@@ -1170,6 +1190,8 @@ fn open_root_with(ctx: &OpenCtx<'_>, d: &roots::DiscoveredRoot) -> Result<RootSt
         excluded_dirs: d.excluded_dirs.clone(),
         notices,
         last_pile: None,
+        rendered: HashSet::new(),
+        rendered_under: 0,
         nested_repos: Vec::new(),
         nested_changed: false,
         user_email,
@@ -1203,6 +1225,11 @@ struct ScanCtx {
     /// The clock itself, for the branch sync's ledger write (Amendment v1.12): a switch
     /// stamps `seen_at` and `parked_at`.
     clock: Arc<dyn Clock + Send + Sync>,
+    /// [`EngineOptions::reuse_diffs`].
+    reuse_diffs: bool,
+    /// [`Engine`]'s collapse-rules generation, which `collapsed` and `collapse_size_bytes`
+    /// above belong to.
+    collapse_rules: u64,
 }
 
 /// Scan one root, start to finish, mutating **only** that root's state: its nested-repo
@@ -1329,6 +1356,15 @@ fn scan_root_once(
         globs: &ctx.skip,
         prefix: &skip_prefix,
     });
+    // Phase 17 Part B fix 3: the last pile's renderings, under the rules they were made by.
+    let reuse = state
+        .last_pile
+        .as_ref()
+        .filter(|_| ctx.reuse_diffs && state.rendered_under == ctx.collapse_rules)
+        .map(|pile| scan::Reuse {
+            pile,
+            rendered: &state.rendered,
+        });
     let out = scan::scan(&ScanInputs {
         store: &state.store,
         index: &state.index,
@@ -1345,8 +1381,10 @@ fn scan_root_once(
         row_cap: ctx.row_cap,
         retry_on_reseed,
         skip,
+        reuse,
     })?;
     let mut pile = out.pile;
+    let rendered = out.rendered;
     // The two per-root ledger facts the reducer may never read for itself (design review
     // F8), stamped here rather than inside `scan` because the expiry needs a wall clock and
     // the engine owns the injected one.
@@ -1410,6 +1448,8 @@ fn scan_root_once(
         }
     }
     state.last_pile = Some(pile.clone());
+    state.rendered = rendered;
+    state.rendered_under = ctx.collapse_rules;
     Ok(pile)
 }
 
@@ -1422,6 +1462,8 @@ impl Engine {
             row_cap: self.options.row_cap,
             now: self.options.clock.now(),
             clock: self.options.clock.clone(),
+            reuse_diffs: self.options.reuse_diffs,
+            collapse_rules: self.collapse_rules,
         }
     }
 
@@ -3027,7 +3069,7 @@ pub(crate) mod tests {
                 &root,
                 AcceptRequest::Hunk {
                     rendered,
-                    hunks: row.hunks.clone(),
+                    hunks: row.hunks.to_vec(),
                     index: 0,
                 },
             )
@@ -4738,7 +4780,7 @@ pub(crate) mod tests {
             current: None,
             added: 0,
             deleted: 0,
-            hunks: vec![],
+            hunks: Default::default(),
             annotation: None,
             conflicted: false,
             collapsed: Some(crate::scan::Collapsed::Glob),
@@ -5230,6 +5272,28 @@ pub(crate) mod tests {
         let _ = rendered;
     }
 
+    /// Phase 17 Part B fix 1: the pile a scan hands out and the root's `last_pile` are one
+    /// row list, and so are the pile an accept answers with and the one it leaves held.
+    #[test]
+    fn engine_scan_and_last_pile_share_one_row_list() {
+        let repo = FixtureRepo::new("share-rows").unwrap();
+        let state = TempDir::new("lc-share-rows-state");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let r = only_root(&engine);
+        repo.write("a.txt", "one\n");
+        let pile = engine.scan(&r).unwrap();
+        assert_eq!(pile.rows.len(), 1, "{:?}", pile.rows);
+        let held = |e: &Engine| e.root(&r).unwrap().last_pile.clone().unwrap();
+        assert!(Arc::ptr_eq(&pile.rows, &held(&engine).rows));
+        assert!(
+            Arc::ptr_eq(&pile.rows, &pile.clone().rows),
+            "a clone shares"
+        );
+        let acc = engine.accept(&r, AcceptRequest::All(pile.clone())).unwrap();
+        assert!(acc.pile.is_empty(), "{:?}", acc.pile.rows);
+        assert!(Arc::ptr_eq(&acc.pile.rows, &held(&engine).rows));
+    }
+
     /// Phase 14 D: `Engine::reload` replaces the config and rebuilds the glob sets, keeps
     /// every `RootState` (same ledger, same last pile, no discovery pass), and the next scan
     /// uses the new sets: a path newly matching `collapsed_globs` is collapsed, and a
@@ -5280,6 +5344,80 @@ pub(crate) mod tests {
             "{:?}",
             after.rows
         );
+    }
+
+    /// Phase 17 Part B fix 3: a rescan takes an unmoved row's rendering from the last pile
+    /// (the very same hunks), a reload's new `collapse_size_bytes` makes the next scan render
+    /// every row afresh, and `reuse_diffs: false` never reuses at all.
+    #[test]
+    fn engine_rescan_reuses_unmoved_rows_until_a_reload_changes_the_collapse_rules() {
+        let repo = FixtureRepo::new("eng-reuse").unwrap();
+        let state = TempDir::new("lc-eng-reuse");
+        let mut engine = open_engine(&repo, &state, Config::default());
+        let r = only_root(&engine);
+        repo.write("f1", "changed\n");
+        repo.write("mid.txt", "m\n".repeat(400));
+        let row = |pile: &Pile, p: &str| pile.row(p.as_bytes()).cloned().unwrap();
+        let first = engine.scan(&r).unwrap();
+        let second = engine.scan(&r).unwrap();
+        assert_eq!(first, second);
+        for p in ["f1", "mid.txt"] {
+            assert!(
+                Arc::ptr_eq(&row(&first, p).hunks, &row(&second, p).hunks),
+                "{p}: taken over, not re-diffed"
+            );
+        }
+
+        repo.write("f1", "moved\n");
+        let third = engine.scan(&r).unwrap();
+        assert!(!Arc::ptr_eq(
+            &row(&second, "f1").hunks,
+            &row(&third, "f1").hunks
+        ));
+        assert!(Arc::ptr_eq(
+            &row(&second, "mid.txt").hunks,
+            &row(&third, "mid.txt").hunks
+        ));
+
+        // 800 bytes: under the default limit, at or over 512.
+        let (mut loaded, resolved) = loaded_for(&repo, &state, Config::default());
+        loaded.config.collapse_size_bytes = 512;
+        engine.reload(&loaded, &resolved);
+        let fourth = engine.scan(&r).unwrap();
+        let mid = row(&fourth, "mid.txt");
+        assert_eq!(mid.collapsed, Some(crate::scan::Collapsed::Size));
+        assert!(mid.hunks.is_empty(), "{mid:?}");
+        assert_eq!((mid.added, mid.deleted), (400, 0));
+        assert!(!Arc::ptr_eq(
+            &row(&third, "f1").hunks,
+            &row(&fourth, "f1").hunks
+        ));
+        assert_eq!(
+            row(&third, "f1"),
+            row(&fourth, "f1"),
+            "re-rendered, the same"
+        );
+        // Under the new rules from here on: the next scan reuses again.
+        let fifth = engine.scan(&r).unwrap();
+        assert!(Arc::ptr_eq(
+            &row(&fourth, "f1").hunks,
+            &row(&fifth, "f1").hunks
+        ));
+
+        let state_off = TempDir::new("lc-eng-reuse-off");
+        let mut off = open_engine_with(
+            &repo,
+            &state_off,
+            Config::default(),
+            EngineOptions {
+                reuse_diffs: false,
+                ..EngineOptions::default()
+            },
+        );
+        let a = off.scan(&r).unwrap();
+        let b = off.scan(&r).unwrap();
+        assert_eq!(a, b);
+        assert!(!Arc::ptr_eq(&row(&a, "f1").hunks, &row(&b, "f1").hunks));
     }
 
     /// Phase 14 C: a scan and a head inspection of a root whose directory is gone spawn no

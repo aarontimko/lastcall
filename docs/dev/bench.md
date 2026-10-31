@@ -10,7 +10,9 @@ compared against. It is not a gate: nothing here fails a build.
 `crates/lastcall/tests/test_bench.rs` (`cargo test --release -p lastcall --test test_bench
 -- --ignored --nocapture --test-threads=1`). Each scenario prints one
 `BENCH <scenario> <metric>=<value>` line per metric to stderr; the table below is those
-lines, copied. A debug build prints a SKIP line and measures nothing.
+lines, copied. A debug build prints a SKIP line and measures nothing. S5, the worktree
+soak, is skipped by `just bench` and runs alone under `just bench-soak` (its own section,
+"Phase 17 (S5)", below).
 
 - Fixtures are built outside every timed region: the 100 clones and their 4,000 edits, the
   100,000-line file, the 1,000- and 50,000-file drops. Each lives under a `TempDir` that its
@@ -975,6 +977,1138 @@ BENCH S4 rows_shown=10000
 BENCH S4 omitted=40000
 ```
 
+## Phase 17 (S5): the worktree soak (`just bench-soak`)
+
+Not a gate and not part of `just bench` (whose recipe skips it by name): a soak that answers
+one question, how the TUI's resident set and CPU behave while several agents write into
+linked worktrees of one large repository and the reader keeps accepting. The hypotheses it
+is built to separate (H1 to H6) and the reasoning behind every default are in
+`docs/spec/170-phase17-kickoff.md`; this section is how to run it and how to read it.
+
+### What it does
+
+`just bench-soak` builds the release binary and runs one `#[ignore]`d test,
+`bench_s5_worktree_soak` in `crates/lastcall/tests/test_bench.rs`. A debug build prints
+`SKIP: S5 measures the release build only (run: just bench-soak)` and measures nothing.
+
+- **Fixture**, built before anything is measured, under the scenario's `TempDir`s: one
+  repository `W/repo` of 300 committed text files of 3,000 lines each, 38 bytes a line:
+  34.2 MB, which is 32.6 MiB, of text per checkout (`fixture_mb` prints MiB, so 32.6), plus six linked worktrees `W/w01` to `W/w06` made with `git worktree add -b
+  agent/wNN`, siblings of the repository. An in-process engine takes first sight and asserts
+  seven roots; the TUI must then show `nothing pending across 7 repos`, and
+  `worktree_badges` counts the worktrees its summary lists with the `[worktree of repo]`
+  badge (six).
+- **Isolation** as every scenario: `isolated_lastcall` (private `HOME`, config and
+  `LASTCALL_STATE_DIR` in the temp dir, no `HERDR_*`, update check and welcome off). The TUI
+  runs as `lastcall tui` with the default timings (debounce 750 ms, 3 s cap), not `--poll 1`.
+- **Writers**: one thread per worktree; the main checkout stays idle. Every 250 ms a writer
+  rewrites its next file (round robin), editing line `j` when `j % stride == seq % stride`
+  (stride 150 by default): 20 lines of a 3,000-line file, 150 apart, a different set and a
+  new stamp each time. Under the diff's 3 lines of context those are 20 separate hunks, so
+  the header's hunks run near 20 times its files and H1 (every diff resident) can be told
+  from H2 (whole blobs per scan). A stride of 5 merges the edits into one whole-file hunk.
+  During churn phases only, every 240 writes (about a minute) a writer
+  runs `git add -A`, `git commit` and `git switch -c agent/wNN-<k>`, leaving the old branch, so
+  parked records pile up behind the accepts and name distinct trees. A git failure is printed
+  (`--- S5 writer …`) and the writer carries on; an `index.lock` in that message would be news.
+- **Cycle**, three times: **ramp** 90 s (writers on, nothing accepted); **churn** 150 s (writers
+  on, `ctrl-a` every 20 s, `y` only once the `Accept all …?` question is on screen, never
+  blind, because a stray `y` is `copy`); **quiet** 60 s (writers stopped and joined, then the
+  final accept, then idle).
+- **Relaunch**: writers on for 60 s with nothing accepted (`phase=prequit`), writers stopped
+  and joined, `q`, then the TUI started again over the same state and sampled for 30 s: the
+  launch's `scan_all` is where up to eight roots' batches are in flight at once.
+- **Sampling**: a harness thread runs `ps -o rss=,time= -p <pid>` once a second. CPU % is the
+  delta of the cumulative CPU time over the wall delta (not `ps -o %cpu`, a decaying average on
+  macOS), so it can exceed 100 on several cores. It is lastcall's own user plus system time
+  and excludes its git children, which is also what Activity Monitor shows for the process.
+  The 10 ms sampler the other scenarios use is off, except for the relaunch (below). At every
+  phase's end, `footprint <pid>` then `heap <pid>` run (macOS only, each time-boxed to 30 s;
+  `n/a` when absent or timed out), after the phase's closing sample. On a loaded phase the
+  writers are still writing, so the two tools' readings are **seconds apart** and do not
+  compare with each other; `heap`'s own banner (`Physical footprint:`) and its in-use total
+  are taken while it holds the task suspended, so that pair is one instant. `leaks <pid>`
+  runs once, on the relaunched process at the very end. The tools' output files go to their
+  own temp dir, beside the state dir.
+- **The tools pause the child.** `heap` and `leaks` suspend the target for about a second
+  per GB it maps, so the next phase opens with a catch-up burst (the watcher's queued events
+  scanned at once): the first trace line of a phase can show a CPU spike that belongs to the
+  pause, not to the phase.
+- **Relaunch peak**: the relaunched TUI is spawned with the harness's 10 ms RSS sampler on,
+  and `relaunch_peak_rss_kb` is its maximum read at the end of the 30 s window, before any
+  tool runs: the launch's `scan_all` peak lasts about a second, which the 1 s sampler can
+  miss. The 1 s sampler's own maximum prints beside it as `relaunch_peak_rss_kb_1hz`.
+- **Scale knobs**: `LASTCALL_BENCH_S5_SCALE` (default 1.0) multiplies every phase length and
+  the 240-write branch interval (so a short rehearsal still parks records); the 20 s accept
+  cadence and the 250 ms write period are the user's and do not scale.
+  `LASTCALL_BENCH_S5_FILES` and `LASTCALL_BENCH_S5_LINES` resize the fixture, and
+  `LASTCALL_BENCH_S5_STRIDE` (default 150) sets the edit stride; the knobs line and
+  `BENCH S5 stride=` print it. At scale 0.2 the run takes about four minutes; at 1.0 about
+  17 minutes plus the fixture.
+
+### What it prints
+
+All on stderr, `BENCH S5 <metric>=<value>`; `n/a` where a tool is missing or timed out.
+
+| metric | what it is |
+|---|---|
+| `trace t=<s> cycle=<n> phase=<name> rss_kb=<n> cpu_pct=<n>` | the curve: one line every 10 s of the run (`t` from the first spawn), and one at every accept with `event=accept` (`event=refused` when a churn `ctrl-a` started nothing). `cycle=0 phase=launch` is before the first ramp; `cycle=4` is the relaunch (`prequit`, then `relaunch`) |
+| `c<n>_<phase>_end_rss_kb`, `_peak_rss_kb` | the RSS sampled as the phase closed, and the largest sample in it |
+| `c<n>_<phase>_cpu_pct_avg` | the child's CPU seconds over the phase divided by its wall time |
+| `c<n>_<phase>_end_footprint_kb` | `footprint`'s `Footprint:` total (its unit read, KB, MB or GB) |
+| `c<n>_<phase>_end_reclaimable_kb` | the `Reclaimable` column summed over the `MALLOC*` rows, from the same `footprint` run |
+| `c<n>_<phase>_end_heap_footprint_kb` | `heap`'s banner `Physical footprint:` (unit glued on: `752K`, `56.2M`), at the instant `heap` suspended the task |
+| `c<n>_<phase>_end_heap_inuse_kb` | `heap`'s `All zones: … (<bytes> bytes)`: what malloc holds as live allocations, the same instant as `heap_footprint` |
+| `c<n>_{ramp,churn}_end_files`, `_end_hunks` | the header's counts as the phase closed |
+| `c<n>_churn_accepts_started` | accepts that actually started (an accept already running refuses another) |
+| `c<n>_quiet_settle_s` | seconds from the final accept to a screen with nothing pending; `SKIP` when that never happens inside the quiet phase |
+| `c<n>_quiet_accepts_started` | accepts the quiet phase started (more than one means rows came back after the first) |
+| `prequit_*`, `relaunch_*` | the same readings for the relaunch; `relaunch_first_frame_s` is spawn to a header with counts (the launch hold over); `relaunch_peak_rss_kb` is the 10 ms sampler's, `relaunch_peak_rss_kb_1hz` the 1 s sampler's |
+| `stride` | the writers' edit stride (the knob) |
+| `leaks_count`, `leaks_bytes` | `leaks --nostacks --noContent` on the relaunched process: unreachable blocks only |
+| `parked_records_max` | the most parked records any one root's `ledger.json` holds after the run |
+| `parked_trees_distinct` | distinct parked `seen_tree` oids, counted per root and summed (each root has its own tree cache) |
+| `writer_switches`, `writer_failures` | the writers' branch switches and failed writes or git steps |
+| `roots`, `worktree_badges`, `fixture_mb`, `fixture_s`, `wall_s` | the shape, one checkout's text size, the fixture's build time, the whole test's wall time |
+
+**The quiet phase in detail.** After the writers are joined the harness waits for the header
+to hold still for 5 s (at most half the phase), so the final accept covers the writers' last
+writes instead of racing the watcher's scans of them. It then sends `ctrl-a` (+ `y`), and while
+rows remain it sends `ctrl-a` again every 5 s; a refusal while the first accept runs costs
+nothing. `settle_s` runs from the first of those accepts.
+
+### Reading it
+
+Absolute RSS moves 15 to 33 % between runs on this machine (see "Variance" above), so the
+curve is read as **deltas within one run**:
+
+- **quiet-end against quiet-end across the three cycles** (`c1_quiet_end_*`,
+  `c2_quiet_end_*`, `c3_quiet_end_*`). Flat means memory comes back after the accepts; a
+  steady climb with the same pile shape is growth to explain.
+- **peak against quiet-end within a cycle**: how much of the churn peak the process gives
+  back once nothing is pending.
+- **`heap_footprint` against `heap_inuse`, one instant** (both from the same `heap` run):
+  in-use low while the footprint stays high is the allocator keeping freed regions (H6,
+  retention); both high is live data (H1 to H4). Do not pair `footprint`'s total with
+  `heap_inuse` on a loaded phase: they are seconds apart while the writers write.
+- **`leaks` finds unreachable blocks only.** Memory that is still reachable but keeps
+  growing (a cache never trimmed, parked trees) is not a leak to it; that growth is told by
+  the quiet-end trend across cycles and by `parked_records_max` / `parked_trees_distinct`
+  (H5), never by `leaks_count=0`.
+- **relaunch peak against the c3 churn peak**: whether launch's parallel `scan_all` is the
+  worst moment of the run. The churn peaks are 1 s samples, so compare them with
+  `relaunch_peak_rss_kb_1hz` like for like; `relaunch_peak_rss_kb` (10 ms) is the true
+  launch peak.
+- `cpu_pct` is lastcall's own CPU (its git children excluded) under a stress well above the
+  reported 10 %; read its shape (does it fall in quiet, does it climb cycle to cycle), not
+  its level, and discount a spike on a phase's first trace line (the tools' pause, above).
+- On macOS `ps`'s RSS still counts pages malloc has freed and marked reclaimable until the
+  kernel takes them back; the footprints do not, and `footprint`'s `Reclaimable` column is
+  those pages. An RSS several times the footprint, with `reclaimable_kb` near the
+  difference, is that accounting, not live memory (the first scale-0.2 rehearsal, at stride
+  5, showed it at every phase end after the first churn).
+- Below scale 0.2 the quiet phase is too short for the still-header wait plus a 5 s retry,
+  so `quiet_settle_s` prints `SKIP` there by construction; read it only at 0.2 and above.
+
+### Runs A and B
+
+Machine: as "Machine" above (Apple M1 Pro, 10 CPUs, 32 GB; macOS 15.7.4 (24G517); git
+2.37.1 (Apple Git-137.1); rustc / cargo 1.98.0; `[profile.release] strip = "debuginfo"`;
+FSEvents). Date 2026-10-26, commit `bf975cb`, scale 1.0, default sizes (300 files of 3,000
+lines, six worktrees). Runs A and B at the default stride (150); run C at
+`LASTCALL_BENCH_S5_STRIDE=5`, the heavy whole-file shape, for the slope. The maintainer's
+own lastcall was open throughout (idle, 31 MB), the only other load.
+
+| | run A (stride 150) | run B (stride 150) | run C (stride 5) |
+|---|---|---|---|
+| files / hunks pending at c1 ramp end | 1800 / 36000 | 1800 / 36000 | 1800 / 1800 |
+| c1 ramp end, heap in-use (MB) | 52 | 128 | 1,046 |
+| c2 ramp end, heap in-use (MB) | 133 | 86 | 1,112 |
+| c3 ramp end, heap in-use (MB) | 55 | 55 | 1,081 |
+| c1 churn peak RSS (MB) | 735 | 586 | 2,306 |
+| c2 churn peak RSS (MB) | 712 | 675 | 2,111 |
+| c3 churn peak RSS (MB) | 684 | 720 | 1,978 |
+| c1 quiet end, heap in-use (MB) | 2.4 | 2.5 | 2.5 |
+| c2 quiet end, heap in-use (MB) | 3.7 | 3.7 | 3.7 |
+| c3 quiet end, heap in-use (MB) | 5.2 | 5.2 | 5.2 |
+| c1 quiet end, heap footprint (MB) | 132 | 148 | 178 |
+| c2 quiet end, heap footprint (MB) | 206 | 168 | 232 |
+| c3 quiet end, heap footprint (MB) | 206 | 179 | 256 |
+| c1 quiet end, RSS (MB) | 506 | 426 | 209 |
+| c2 quiet end, RSS (MB) | 251 | 620 | 247 |
+| c3 quiet end, RSS (MB) | 423 | 342 | 207 |
+| relaunch peak RSS, 10 ms (MB) | 827 | 835 | 1,508 |
+| relaunch end, heap in-use (MB) | 45 | 45 | 831 |
+| ramp CPU % (c1) | 26.7 | 26.7 | 32.2 |
+| quiet CPU % (c3) | 2.6 | 2.8 | 3.7 |
+| leaks | 0 | 0 | 0 |
+| parked trees, distinct | 42 | 42 | 42 |
+| wall s | 1009 | 1009 | 1038 |
+
+Run A (`wall_s=1009`):
+
+```
+BENCH S5 stride=150
+BENCH S5 fixture_mb=32.6
+BENCH S5 fixture_s=2.0
+BENCH S5 roots=7
+BENCH S5 worktree_badges=6
+BENCH S5 c1_ramp_end_rss_kb=675216
+BENCH S5 c1_ramp_peak_rss_kb=675216
+BENCH S5 c1_ramp_cpu_pct_avg=26.7
+BENCH S5 c1_ramp_end_footprint_kb=167936
+BENCH S5 c1_ramp_end_reclaimable_kb=502000
+BENCH S5 c1_ramp_end_heap_footprint_kb=167834
+BENCH S5 c1_ramp_end_heap_inuse_kb=53325
+BENCH S5 c1_ramp_end_files=1800
+BENCH S5 c1_ramp_end_hunks=36000
+BENCH S5 c1_churn_end_rss_kb=685072
+BENCH S5 c1_churn_peak_rss_kb=753136
+BENCH S5 c1_churn_cpu_pct_avg=21.3
+BENCH S5 c1_churn_end_footprint_kb=133120
+BENCH S5 c1_churn_end_reclaimable_kb=546816
+BENCH S5 c1_churn_end_heap_footprint_kb=132915
+BENCH S5 c1_churn_end_heap_inuse_kb=12423
+BENCH S5 c1_churn_end_files=347
+BENCH S5 c1_churn_end_hunks=6940
+BENCH S5 c1_churn_accepts_started=7
+BENCH S5 c1_quiet_settle_s=2.5
+BENCH S5 c1_quiet_accepts_started=1
+BENCH S5 c1_quiet_end_rss_kb=518352
+BENCH S5 c1_quiet_peak_rss_kb=685744
+BENCH S5 c1_quiet_cpu_pct_avg=4.5
+BENCH S5 c1_quiet_end_footprint_kb=135168
+BENCH S5 c1_quiet_end_reclaimable_kb=378880
+BENCH S5 c1_quiet_end_heap_footprint_kb=135475
+BENCH S5 c1_quiet_end_heap_inuse_kb=2508
+BENCH S5 c2_ramp_end_rss_kb=648064
+BENCH S5 c2_ramp_peak_rss_kb=654752
+BENCH S5 c2_ramp_cpu_pct_avg=27.1
+BENCH S5 c2_ramp_end_footprint_kb=220160
+BENCH S5 c2_ramp_end_reclaimable_kb=428256
+BENCH S5 c2_ramp_end_heap_footprint_kb=219853
+BENCH S5 c2_ramp_end_heap_inuse_kb=136431
+BENCH S5 c2_ramp_end_files=1800
+BENCH S5 c2_ramp_end_hunks=36000
+BENCH S5 c2_churn_end_rss_kb=678896
+BENCH S5 c2_churn_peak_rss_kb=729056
+BENCH S5 c2_churn_cpu_pct_avg=20.2
+BENCH S5 c2_churn_end_footprint_kb=202752
+BENCH S5 c2_churn_end_reclaimable_kb=477056
+BENCH S5 c2_churn_end_heap_footprint_kb=202342
+BENCH S5 c2_churn_end_heap_inuse_kb=10549
+BENCH S5 c2_churn_end_files=197
+BENCH S5 c2_churn_end_hunks=3940
+BENCH S5 c2_churn_accepts_started=7
+BENCH S5 c2_quiet_settle_s=2.5
+BENCH S5 c2_quiet_accepts_started=1
+BENCH S5 c2_quiet_end_rss_kb=257328
+BENCH S5 c2_quiet_peak_rss_kb=679568
+BENCH S5 c2_quiet_cpu_pct_avg=2.9
+BENCH S5 c2_quiet_end_footprint_kb=210944
+BENCH S5 c2_quiet_end_reclaimable_kb=83968
+BENCH S5 c2_quiet_end_heap_footprint_kb=210637
+BENCH S5 c2_quiet_end_heap_inuse_kb=3796
+BENCH S5 c3_ramp_end_rss_kb=655648
+BENCH S5 c3_ramp_peak_rss_kb=655648
+BENCH S5 c3_ramp_cpu_pct_avg=28.5
+BENCH S5 c3_ramp_end_footprint_kb=238592
+BENCH S5 c3_ramp_end_reclaimable_kb=440544
+BENCH S5 c3_ramp_end_heap_footprint_kb=229376
+BENCH S5 c3_ramp_end_heap_inuse_kb=55921
+BENCH S5 c3_ramp_end_files=1800
+BENCH S5 c3_ramp_end_hunks=36000
+BENCH S5 c3_churn_end_rss_kb=433216
+BENCH S5 c3_churn_peak_rss_kb=700128
+BENCH S5 c3_churn_cpu_pct_avg=22.8
+BENCH S5 c3_churn_end_footprint_kb=207872
+BENCH S5 c3_churn_end_reclaimable_kb=262144
+BENCH S5 c3_churn_end_heap_footprint_kb=207974
+BENCH S5 c3_churn_end_heap_inuse_kb=8752
+BENCH S5 c3_churn_end_files=118
+BENCH S5 c3_churn_end_hunks=2360
+BENCH S5 c3_churn_accepts_started=7
+BENCH S5 c3_quiet_settle_s=1.7
+BENCH S5 c3_quiet_accepts_started=1
+BENCH S5 c3_quiet_end_rss_kb=432944
+BENCH S5 c3_quiet_peak_rss_kb=437856
+BENCH S5 c3_quiet_cpu_pct_avg=2.6
+BENCH S5 c3_quiet_end_footprint_kb=210944
+BENCH S5 c3_quiet_end_reclaimable_kb=259072
+BENCH S5 c3_quiet_end_heap_footprint_kb=211046
+BENCH S5 c3_quiet_end_heap_inuse_kb=5327
+BENCH S5 prequit_end_rss_kb=523648
+BENCH S5 prequit_peak_rss_kb=523648
+BENCH S5 prequit_end_files=1303
+BENCH S5 prequit_end_hunks=26060
+BENCH S5 relaunch_first_frame_s=1.4
+BENCH S5 relaunch_peak_rss_kb=846528
+BENCH S5 relaunch_peak_rss_kb_1hz=846528
+BENCH S5 relaunch_end_rss_kb=846528
+BENCH S5 relaunch_cpu_pct_avg=8.6
+BENCH S5 relaunch_end_footprint_kb=397312
+BENCH S5 relaunch_end_reclaimable_kb=444432
+BENCH S5 relaunch_end_heap_footprint_kb=397005
+BENCH S5 relaunch_end_heap_inuse_kb=46162
+BENCH S5 leaks_count=0
+BENCH S5 leaks_bytes=0
+BENCH S5 parked_records_max=7
+BENCH S5 parked_trees_distinct=42
+BENCH S5 writer_switches=42
+BENCH S5 writer_failures=0
+BENCH S5 wall_s=1009
+```
+
+Run B (`wall_s=1009`):
+
+```
+BENCH S5 stride=150
+BENCH S5 fixture_mb=32.6
+BENCH S5 fixture_s=2.0
+BENCH S5 roots=7
+BENCH S5 worktree_badges=6
+BENCH S5 c1_ramp_end_rss_kb=628704
+BENCH S5 c1_ramp_peak_rss_kb=686384
+BENCH S5 c1_ramp_cpu_pct_avg=26.7
+BENCH S5 c1_ramp_end_footprint_kb=185344
+BENCH S5 c1_ramp_end_reclaimable_kb=440560
+BENCH S5 c1_ramp_end_heap_footprint_kb=199987
+BENCH S5 c1_ramp_end_heap_inuse_kb=131584
+BENCH S5 c1_ramp_end_files=1800
+BENCH S5 c1_ramp_end_hunks=36000
+BENCH S5 c1_churn_end_rss_kb=468000
+BENCH S5 c1_churn_peak_rss_kb=600336
+BENCH S5 c1_churn_cpu_pct_avg=21.2
+BENCH S5 c1_churn_end_footprint_kb=147456
+BENCH S5 c1_churn_end_reclaimable_kb=317440
+BENCH S5 c1_churn_end_heap_footprint_kb=147968
+BENCH S5 c1_churn_end_heap_inuse_kb=7573
+BENCH S5 c1_churn_end_files=178
+BENCH S5 c1_churn_end_hunks=3560
+BENCH S5 c1_churn_accepts_started=7
+BENCH S5 c1_quiet_settle_s=2.4
+BENCH S5 c1_quiet_accepts_started=1
+BENCH S5 c1_quiet_end_rss_kb=436112
+BENCH S5 c1_quiet_peak_rss_kb=457904
+BENCH S5 c1_quiet_cpu_pct_avg=3.3
+BENCH S5 c1_quiet_end_footprint_kb=151552
+BENCH S5 c1_quiet_end_reclaimable_kb=280576
+BENCH S5 c1_quiet_end_heap_footprint_kb=151962
+BENCH S5 c1_quiet_end_heap_inuse_kb=2516
+BENCH S5 c2_ramp_end_rss_kb=627504
+BENCH S5 c2_ramp_peak_rss_kb=638432
+BENCH S5 c2_ramp_cpu_pct_avg=27.6
+BENCH S5 c2_ramp_end_footprint_kb=183296
+BENCH S5 c2_ramp_end_reclaimable_kb=441568
+BENCH S5 c2_ramp_end_heap_footprint_kb=183296
+BENCH S5 c2_ramp_end_heap_inuse_kb=87853
+BENCH S5 c2_ramp_end_files=1800
+BENCH S5 c2_ramp_end_hunks=36000
+BENCH S5 c2_churn_end_rss_kb=612224
+BENCH S5 c2_churn_peak_rss_kb=691648
+BENCH S5 c2_churn_cpu_pct_avg=19.9
+BENCH S5 c2_churn_end_footprint_kb=167936
+BENCH S5 c2_churn_end_reclaimable_kb=440688
+BENCH S5 c2_churn_end_heap_footprint_kb=168141
+BENCH S5 c2_churn_end_heap_inuse_kb=11594
+BENCH S5 c2_churn_end_files=273
+BENCH S5 c2_churn_end_hunks=5460
+BENCH S5 c2_churn_accepts_started=7
+BENCH S5 c2_quiet_settle_s=1.6
+BENCH S5 c2_quiet_accepts_started=1
+BENCH S5 c2_quiet_end_rss_kb=634448
+BENCH S5 c2_quiet_peak_rss_kb=634448
+BENCH S5 c2_quiet_cpu_pct_avg=3.0
+BENCH S5 c2_quiet_end_footprint_kb=172032
+BENCH S5 c2_quiet_end_reclaimable_kb=459120
+BENCH S5 c2_quiet_end_heap_footprint_kb=172134
+BENCH S5 c2_quiet_end_heap_inuse_kb=3795
+BENCH S5 c3_ramp_end_rss_kb=658032
+BENCH S5 c3_ramp_peak_rss_kb=689072
+BENCH S5 c3_ramp_cpu_pct_avg=28.3
+BENCH S5 c3_ramp_end_footprint_kb=177152
+BENCH S5 c3_ramp_end_reclaimable_kb=478432
+BENCH S5 c3_ramp_end_heap_footprint_kb=176742
+BENCH S5 c3_ramp_end_heap_inuse_kb=55920
+BENCH S5 c3_ramp_end_files=1800
+BENCH S5 c3_ramp_end_hunks=36000
+BENCH S5 c3_churn_end_rss_kb=353472
+BENCH S5 c3_churn_peak_rss_kb=737536
+BENCH S5 c3_churn_cpu_pct_avg=21.7
+BENCH S5 c3_churn_end_footprint_kb=181248
+BENCH S5 c3_churn_end_reclaimable_kb=178832
+BENCH S5 c3_churn_end_heap_footprint_kb=181555
+BENCH S5 c3_churn_end_heap_inuse_kb=9678
+BENCH S5 c3_churn_end_files=153
+BENCH S5 c3_churn_end_hunks=3060
+BENCH S5 c3_churn_accepts_started=7
+BENCH S5 c3_quiet_settle_s=1.8
+BENCH S5 c3_quiet_accepts_started=1
+BENCH S5 c3_quiet_end_rss_kb=350000
+BENCH S5 c3_quiet_peak_rss_kb=359216
+BENCH S5 c3_quiet_cpu_pct_avg=2.8
+BENCH S5 c3_quiet_end_footprint_kb=183296
+BENCH S5 c3_quiet_end_reclaimable_kb=175760
+BENCH S5 c3_quiet_end_heap_footprint_kb=183706
+BENCH S5 c3_quiet_end_heap_inuse_kb=5320
+BENCH S5 prequit_end_rss_kb=525552
+BENCH S5 prequit_peak_rss_kb=525552
+BENCH S5 prequit_end_files=1332
+BENCH S5 prequit_end_hunks=26640
+BENCH S5 relaunch_first_frame_s=1.4
+BENCH S5 relaunch_peak_rss_kb=855184
+BENCH S5 relaunch_peak_rss_kb_1hz=855184
+BENCH S5 relaunch_end_rss_kb=855184
+BENCH S5 relaunch_cpu_pct_avg=8.5
+BENCH S5 relaunch_end_footprint_kb=407552
+BENCH S5 relaunch_end_reclaimable_kb=443424
+BENCH S5 relaunch_end_heap_footprint_kb=407347
+BENCH S5 relaunch_end_heap_inuse_kb=46177
+BENCH S5 leaks_count=0
+BENCH S5 leaks_bytes=0
+BENCH S5 parked_records_max=7
+BENCH S5 parked_trees_distinct=42
+BENCH S5 writer_switches=42
+BENCH S5 writer_failures=0
+BENCH S5 wall_s=1009
+```
+
+Run C, stride 5 (`wall_s=1038`):
+
+```
+BENCH S5 stride=5
+BENCH S5 fixture_mb=32.6
+BENCH S5 fixture_s=2.4
+BENCH S5 roots=7
+BENCH S5 worktree_badges=6
+BENCH S5 c1_ramp_end_rss_kb=2024256
+BENCH S5 c1_ramp_peak_rss_kb=2024896
+BENCH S5 c1_ramp_cpu_pct_avg=32.2
+BENCH S5 c1_ramp_end_footprint_kb=814080
+BENCH S5 c1_ramp_end_reclaimable_kb=1192352
+BENCH S5 c1_ramp_end_heap_footprint_kb=798515
+BENCH S5 c1_ramp_end_heap_inuse_kb=1071465
+BENCH S5 c1_ramp_end_files=1800
+BENCH S5 c1_ramp_end_hunks=1800
+BENCH S5 c1_churn_end_rss_kb=711696
+BENCH S5 c1_churn_peak_rss_kb=2361712
+BENCH S5 c1_churn_cpu_pct_avg=24.0
+BENCH S5 c1_churn_end_footprint_kb=194560
+BENCH S5 c1_churn_end_reclaimable_kb=524400
+BENCH S5 c1_churn_end_heap_footprint_kb=196813
+BENCH S5 c1_churn_end_heap_inuse_kb=179583
+BENCH S5 c1_churn_end_files=298
+BENCH S5 c1_churn_end_hunks=298
+BENCH S5 c1_churn_accepts_started=7
+BENCH S5 c1_quiet_settle_s=2.5
+BENCH S5 c1_quiet_accepts_started=1
+BENCH S5 c1_quiet_end_rss_kb=213760
+BENCH S5 c1_quiet_peak_rss_kb=739008
+BENCH S5 c1_quiet_cpu_pct_avg=3.9
+BENCH S5 c1_quiet_end_footprint_kb=182272
+BENCH S5 c1_quiet_end_reclaimable_kb=157696
+BENCH S5 c1_quiet_end_heap_footprint_kb=182682
+BENCH S5 c1_quiet_end_heap_inuse_kb=2523
+BENCH S5 c2_ramp_end_rss_kb=1741344
+BENCH S5 c2_ramp_peak_rss_kb=1741344
+BENCH S5 c2_ramp_cpu_pct_avg=31.1
+BENCH S5 c2_ramp_end_footprint_kb=1042432
+BENCH S5 c2_ramp_end_reclaimable_kb=776192
+BENCH S5 c2_ramp_end_heap_footprint_kb=1010483
+BENCH S5 c2_ramp_end_heap_inuse_kb=1138710
+BENCH S5 c2_ramp_end_files=1800
+BENCH S5 c2_ramp_end_hunks=1800
+BENCH S5 c2_churn_end_rss_kb=567024
+BENCH S5 c2_churn_peak_rss_kb=2161264
+BENCH S5 c2_churn_cpu_pct_avg=23.2
+BENCH S5 c2_churn_end_footprint_kb=236544
+BENCH S5 c2_churn_end_reclaimable_kb=435424
+BENCH S5 c2_churn_end_heap_footprint_kb=236954
+BENCH S5 c2_churn_end_heap_inuse_kb=119681
+BENCH S5 c2_churn_end_files=195
+BENCH S5 c2_churn_end_hunks=195
+BENCH S5 c2_churn_accepts_started=7
+BENCH S5 c2_quiet_settle_s=2.5
+BENCH S5 c2_quiet_accepts_started=1
+BENCH S5 c2_quiet_end_rss_kb=253200
+BENCH S5 c2_quiet_peak_rss_kb=585232
+BENCH S5 c2_quiet_cpu_pct_avg=3.4
+BENCH S5 c2_quiet_end_footprint_kb=237568
+BENCH S5 c2_quiet_end_reclaimable_kb=178176
+BENCH S5 c2_quiet_end_heap_footprint_kb=237568
+BENCH S5 c2_quiet_end_heap_inuse_kb=3818
+BENCH S5 c3_ramp_end_rss_kb=1742240
+BENCH S5 c3_ramp_peak_rss_kb=1761664
+BENCH S5 c3_ramp_cpu_pct_avg=32.1
+BENCH S5 c3_ramp_end_footprint_kb=1115136
+BENCH S5 c3_ramp_end_reclaimable_kb=791552
+BENCH S5 c3_ramp_end_heap_footprint_kb=1048576
+BENCH S5 c3_ramp_end_heap_inuse_kb=1107353
+BENCH S5 c3_ramp_end_files=1800
+BENCH S5 c3_ramp_end_hunks=1800
+BENCH S5 c3_churn_end_rss_kb=685856
+BENCH S5 c3_churn_peak_rss_kb=2025136
+BENCH S5 c3_churn_cpu_pct_avg=24.2
+BENCH S5 c3_churn_end_footprint_kb=266240
+BENCH S5 c3_churn_end_reclaimable_kb=490784
+BENCH S5 c3_churn_end_heap_footprint_kb=265830
+BENCH S5 c3_churn_end_heap_inuse_kb=120017
+BENCH S5 c3_churn_end_files=193
+BENCH S5 c3_churn_end_hunks=193
+BENCH S5 c3_churn_accepts_started=7
+BENCH S5 c3_quiet_settle_s=2.6
+BENCH S5 c3_quiet_accepts_started=1
+BENCH S5 c3_quiet_end_rss_kb=211856
+BENCH S5 c3_quiet_peak_rss_kb=716656
+BENCH S5 c3_quiet_cpu_pct_avg=3.7
+BENCH S5 c3_quiet_end_footprint_kb=261120
+BENCH S5 c3_quiet_end_reclaimable_kb=133120
+BENCH S5 c3_quiet_end_heap_footprint_kb=261632
+BENCH S5 c3_quiet_end_heap_inuse_kb=5348
+BENCH S5 prequit_end_rss_kb=1162240
+BENCH S5 prequit_peak_rss_kb=1310608
+BENCH S5 prequit_end_files=1323
+BENCH S5 prequit_end_hunks=1323
+BENCH S5 relaunch_first_frame_s=1.8
+BENCH S5 relaunch_peak_rss_kb=1543680
+BENCH S5 relaunch_peak_rss_kb_1hz=1543040
+BENCH S5 relaunch_end_rss_kb=780688
+BENCH S5 relaunch_cpu_pct_avg=10.4
+BENCH S5 relaunch_end_footprint_kb=1218560
+BENCH S5 relaunch_end_reclaimable_kb=2000
+BENCH S5 relaunch_end_heap_footprint_kb=1258291
+BENCH S5 relaunch_end_heap_inuse_kb=850485
+BENCH S5 leaks_count=0
+BENCH S5 leaks_bytes=0
+BENCH S5 parked_records_max=7
+BENCH S5 parked_trees_distinct=42
+BENCH S5 writer_switches=42
+BENCH S5 writer_failures=0
+BENCH S5 wall_s=1038
+```
+
+The `trace` lines (the per-10 s curve) are left out here; rerun `just bench-soak` to see
+them. The reading of these runs is the Part B addendum of
+`docs/spec/170-phase17-kickoff.md`.
+
+### Phase 17 Part B (runs D and E): the four fixes
+
+Machine block as runs A to C; date 2026-10-26; commit `803b33d` (fixes 1 to 4 of the
+kickoff's Part B plus the code review's two folds). Run D at the default stride (150), run
+E at stride 5, both at scale 1.0, one after the other on a machine whose only other load
+was the maintainer's idle lastcall. Read against runs A and B (stride 150) and run C
+(stride 5) above.
+
+| | A / B (before) | **D (after)** | C (before) | **E (after)** |
+|---|---|---|---|---|
+| stride | 150 | 150 | 5 | 5 |
+| c1 / c2 / c3 ramp end, heap in-use (MB) | 52-128 / 86-133 / 55 | **18 / 20 / 21** | 1,046 / 1,112 / 1,081 | **334 / 279 / 280** |
+| c1 / c2 / c3 churn peak RSS (MB) | 586-735 / 675-712 / 684-720 | **118 / 129 / 161** | 2,306 / 2,111 / 1,978 | **408 / 351 / 385** |
+| c1 / c2 / c3 quiet end, heap footprint (MB) | 132-148 / 168-206 / 179-206 | **43 / 45 / 63** | 178 / 232 / 256 | **65 / 83 / 47** |
+| c1 / c2 / c3 quiet end, heap in-use (MB) | 2.4 / 3.7 / 5.2 | 2.5 / 3.7 / 5.2 | 2.5 / 3.7 / 5.2 | 2.5 / 3.7 / 5.2 |
+| relaunch peak RSS, 10 ms (MB) | 827 / 835 | **767** | 1,508 | **986** |
+| relaunch end, heap footprint (MB) | 388 / 398 | **310** | 1,229 | **581** |
+| relaunch end, heap in-use (MB) | 45 | **18** | 831 | **221** |
+| ramp CPU % (c1) | 26.7 | **4.8** | 32.2 | **4.4** |
+| quiet CPU % (c3) | 2.6 / 2.8 | **1.2** | 3.7 | **1.2** |
+| leaks | 0 | 0 | 0 | 0 |
+| wall s | 1009 | 1006 | 1038 | 1008 |
+
+**Per fix**, stride 5 at `LASTCALL_BENCH_S5_SCALE=0.34` (about 650 files pending at each
+ramp's end), one run per commit, so each fix's share shows:
+
+| commit | c1 ramp end, heap in-use (MB) | c1 churn peak RSS (MB) | c1 / c2 / c3 quiet end, footprint (MB) | c1 ramp CPU % |
+|---|---|---|---|---|
+| `1b074c3`, before | 423 | 1,899 | 340 / 731 / 1,113 | 16.0 |
+| `6257d94`, fix 1: shared rows | 226 | 1,107 | 205 / 198 / 140 | 14.8 |
+| `5e62b29`, fix 2: one buffer per hunk | 155 | 838 | 193 / 175 / 204 | 12.9 |
+| `cf221a3`, fix 3: reuse a row's diff | 130 | 314 | 43 / 48 / 47 | **4.4** |
+| `019a35b`, fix 4: blobs in chunks | 132 | 321 | 51 / 50 / 43 | 4.4 |
+
+Reading them:
+- The quiet-end footprint (Activity Monitor's Memory column) no longer climbs from cycle to
+  cycle; before the fixes it doubled every cycle at stride 5 (340, 731, 1,113 MB).
+- Fix 3 is most of the CPU (16 to 4.4 %) and most of the churn peak: a row whose sides did
+  not move is neither fetched nor diffed again, so a scan of six busy worktrees reads only
+  what changed.
+- Fix 4 shows nothing at this fixture's size: one root's pending blobs (about 200 files of
+  113 KB, two sides) stay under the 64 MiB chunk, so every root is still one chunk. It caps
+  a larger root's batch; S5 does not build one. (The next section lowers the chunk to 8 MiB, which engages it.)
+- **The relaunch is still the high point** (767 and 986 MB RSS). Up to eight roots render
+  their whole piles at once, with the diff's working memory on top of the blobs, and macOS
+  keeps that high-water mark: after the relaunch, live data is 18 MB (stride 150) but the
+  footprint stays at 310 MB. Lowering it needs fewer roots at once at launch, a smaller
+  chunk, or diffs on demand; each is a separate ruling.
+
+`just bench`, the same commit, once (run I), against run H (Phase 11): no scenario moved
+outside its noise, and S2's and S4's peaks fell (`peak_rss_kb` 62,240 to 28,512 and 90,128 to 78,336).
+
+```
+BENCH S1 open_ms=3936
+BENCH S1 open_spawns=1102
+BENCH S1 roots=100
+BENCH S1 rows=4000
+BENCH S1 scan_all_ms=4535
+BENCH S1 scan_all_spawns=1600
+BENCH S1 first_checked_ms=8264
+BENCH S1 first_frame_ms=8264
+BENCH S1 peak_rss_kb=19152
+BENCH S1h open_ms=1962
+BENCH S1h open_spawns=552
+BENCH S1h roots=50
+BENCH S1h rows=4000
+BENCH S1h scan_all_ms=2818
+BENCH S1h scan_all_spawns=800
+BENCH S1h first_checked_ms=4207
+BENCH S1h first_frame_ms=4207
+BENCH S1h peak_rss_kb=17312
+BENCH S2 file_bytes=1100001
+BENCH S2 hunks=2
+BENCH S2 scan_ms=226
+BENCH S2 scan_spawns=16
+BENCH S2 open_ms=15
+BENCH S2 hunk_next_ms=11
+BENCH S2 page_down_ms=15
+BENCH S2 peak_rss_kb=28512
+BENCH S2_default_config open_ms=10
+BENCH S3 files=1000
+BENCH S3 settle_ms=1526
+BENCH S3 peak_rss_kb=11264
+BENCH S3_events files=1000
+BENCH S3_events settle_ms=1523
+BENCH S3_events peak_rss_kb=10640
+BENCH S4 capped_count_ms=3857
+BENCH S4 settle_ms=4760
+BENCH S4 peak_rss_kb=78336
+BENCH S4 scan_ms=1595
+BENCH S4 scan_spawns=15
+BENCH S4 rows_shown=10000
+BENCH S4 omitted=40000
+```
+
+Run D, stride 150 (`wall_s=1006`):
+
+```
+BENCH S5 stride=150
+BENCH S5 fixture_mb=32.6
+BENCH S5 fixture_s=2.2
+BENCH S5 roots=7
+BENCH S5 worktree_badges=6
+BENCH S5 c1_ramp_end_rss_kb=93296
+BENCH S5 c1_ramp_peak_rss_kb=93296
+BENCH S5 c1_ramp_cpu_pct_avg=4.8
+BENCH S5 c1_ramp_end_footprint_kb=32768
+BENCH S5 c1_ramp_end_reclaimable_kb=56368
+BENCH S5 c1_ramp_end_heap_footprint_kb=32666
+BENCH S5 c1_ramp_end_heap_inuse_kb=18903
+BENCH S5 c1_ramp_end_files=1800
+BENCH S5 c1_ramp_end_hunks=36000
+BENCH S5 c1_churn_end_rss_kb=100928
+BENCH S5 c1_churn_peak_rss_kb=120944
+BENCH S5 c1_churn_cpu_pct_avg=6.5
+BENCH S5 c1_churn_end_footprint_kb=43008
+BENCH S5 c1_churn_end_reclaimable_kb=55552
+BENCH S5 c1_churn_end_heap_footprint_kb=42803
+BENCH S5 c1_churn_end_heap_inuse_kb=6129
+BENCH S5 c1_churn_end_files=379
+BENCH S5 c1_churn_end_hunks=7580
+BENCH S5 c1_churn_accepts_started=7
+BENCH S5 c1_quiet_settle_s=1.9
+BENCH S5 c1_quiet_accepts_started=1
+BENCH S5 c1_quiet_end_rss_kb=88192
+BENCH S5 c1_quiet_peak_rss_kb=104016
+BENCH S5 c1_quiet_cpu_pct_avg=1.2
+BENCH S5 c1_quiet_end_footprint_kb=44032
+BENCH S5 c1_quiet_end_reclaimable_kb=42112
+BENCH S5 c1_quiet_end_heap_footprint_kb=43930
+BENCH S5 c1_quiet_end_heap_inuse_kb=2512
+BENCH S5 c2_ramp_end_rss_kb=106384
+BENCH S5 c2_ramp_peak_rss_kb=106384
+BENCH S5 c2_ramp_cpu_pct_avg=4.8
+BENCH S5 c2_ramp_end_footprint_kb=50176
+BENCH S5 c2_ramp_end_reclaimable_kb=56448
+BENCH S5 c2_ramp_end_heap_footprint_kb=50278
+BENCH S5 c2_ramp_end_heap_inuse_kb=20395
+BENCH S5 c2_ramp_end_files=1800
+BENCH S5 c2_ramp_end_hunks=36000
+BENCH S5 c2_churn_end_rss_kb=112960
+BENCH S5 c2_churn_peak_rss_kb=132352
+BENCH S5 c2_churn_cpu_pct_avg=6.6
+BENCH S5 c2_churn_end_footprint_kb=45056
+BENCH S5 c2_churn_end_reclaimable_kb=67040
+BENCH S5 c2_churn_end_heap_footprint_kb=45363
+BENCH S5 c2_churn_end_heap_inuse_kb=5962
+BENCH S5 c2_churn_end_files=226
+BENCH S5 c2_churn_end_hunks=4520
+BENCH S5 c2_churn_accepts_started=7
+BENCH S5 c2_quiet_settle_s=1.6
+BENCH S5 c2_quiet_accepts_started=1
+BENCH S5 c2_quiet_end_rss_kb=109184
+BENCH S5 c2_quiet_peak_rss_kb=113024
+BENCH S5 c2_quiet_cpu_pct_avg=1.1
+BENCH S5 c2_quiet_end_footprint_kb=46080
+BENCH S5 c2_quiet_end_reclaimable_kb=63376
+BENCH S5 c2_quiet_end_heap_footprint_kb=45670
+BENCH S5 c2_quiet_end_heap_inuse_kb=3793
+BENCH S5 c3_ramp_end_rss_kb=89776
+BENCH S5 c3_ramp_peak_rss_kb=115408
+BENCH S5 c3_ramp_cpu_pct_avg=4.5
+BENCH S5 c3_ramp_end_footprint_kb=53248
+BENCH S5 c3_ramp_end_reclaimable_kb=37728
+BENCH S5 c3_ramp_end_heap_footprint_kb=53658
+BENCH S5 c3_ramp_end_heap_inuse_kb=21484
+BENCH S5 c3_ramp_end_files=1800
+BENCH S5 c3_ramp_end_hunks=36000
+BENCH S5 c3_churn_end_rss_kb=159104
+BENCH S5 c3_churn_peak_rss_kb=165104
+BENCH S5 c3_churn_cpu_pct_avg=7.6
+BENCH S5 c3_churn_end_footprint_kb=64512
+BENCH S5 c3_churn_end_reclaimable_kb=96960
+BENCH S5 c3_churn_end_heap_footprint_kb=64102
+BENCH S5 c3_churn_end_heap_inuse_kb=7730
+BENCH S5 c3_churn_end_files=254
+BENCH S5 c3_churn_end_hunks=5080
+BENCH S5 c3_churn_accepts_started=7
+BENCH S5 c3_quiet_settle_s=2.4
+BENCH S5 c3_quiet_accepts_started=1
+BENCH S5 c3_quiet_end_rss_kb=125232
+BENCH S5 c3_quiet_peak_rss_kb=160640
+BENCH S5 c3_quiet_cpu_pct_avg=1.2
+BENCH S5 c3_quiet_end_footprint_kb=64512
+BENCH S5 c3_quiet_end_reclaimable_kb=62768
+BENCH S5 c3_quiet_end_heap_footprint_kb=64307
+BENCH S5 c3_quiet_end_heap_inuse_kb=5307
+BENCH S5 prequit_end_rss_kb=111360
+BENCH S5 prequit_peak_rss_kb=127328
+BENCH S5 prequit_end_files=1365
+BENCH S5 prequit_end_hunks=27300
+BENCH S5 relaunch_first_frame_s=1.4
+BENCH S5 relaunch_peak_rss_kb=785248
+BENCH S5 relaunch_peak_rss_kb_1hz=785248
+BENCH S5 relaunch_end_rss_kb=783824
+BENCH S5 relaunch_cpu_pct_avg=5.6
+BENCH S5 relaunch_end_footprint_kb=317440
+BENCH S5 relaunch_end_reclaimable_kb=462848
+BENCH S5 relaunch_end_heap_footprint_kb=317747
+BENCH S5 relaunch_end_heap_inuse_kb=18918
+BENCH S5 leaks_count=0
+BENCH S5 leaks_bytes=0
+BENCH S5 parked_records_max=7
+BENCH S5 parked_trees_distinct=42
+BENCH S5 writer_switches=42
+BENCH S5 writer_failures=0
+BENCH S5 wall_s=1006
+```
+
+Run E, stride 5 (`wall_s=1008`):
+
+```
+BENCH S5 stride=5
+BENCH S5 fixture_mb=32.6
+BENCH S5 fixture_s=1.9
+BENCH S5 roots=7
+BENCH S5 worktree_badges=6
+BENCH S5 c1_ramp_end_rss_kb=358432
+BENCH S5 c1_ramp_peak_rss_kb=386464
+BENCH S5 c1_ramp_cpu_pct_avg=4.4
+BENCH S5 c1_ramp_end_footprint_kb=329728
+BENCH S5 c1_ramp_end_reclaimable_kb=80208
+BENCH S5 c1_ramp_end_heap_footprint_kb=329421
+BENCH S5 c1_ramp_end_heap_inuse_kb=341851
+BENCH S5 c1_ramp_end_files=1800
+BENCH S5 c1_ramp_end_hunks=1800
+BENCH S5 c1_churn_end_rss_kb=203520
+BENCH S5 c1_churn_peak_rss_kb=417440
+BENCH S5 c1_churn_cpu_pct_avg=6.3
+BENCH S5 c1_churn_end_footprint_kb=61440
+BENCH S5 c1_churn_end_reclaimable_kb=145424
+BENCH S5 c1_churn_end_heap_footprint_kb=61645
+BENCH S5 c1_churn_end_heap_inuse_kb=61737
+BENCH S5 c1_churn_end_files=362
+BENCH S5 c1_churn_end_hunks=362
+BENCH S5 c1_churn_accepts_started=7
+BENCH S5 c1_quiet_settle_s=2.3
+BENCH S5 c1_quiet_accepts_started=1
+BENCH S5 c1_quiet_end_rss_kb=164224
+BENCH S5 c1_quiet_peak_rss_kb=203728
+BENCH S5 c1_quiet_cpu_pct_avg=1.1
+BENCH S5 c1_quiet_end_footprint_kb=66560
+BENCH S5 c1_quiet_end_reclaimable_kb=103328
+BENCH S5 c1_quiet_end_heap_footprint_kb=66560
+BENCH S5 c1_quiet_end_heap_inuse_kb=2512
+BENCH S5 c2_ramp_end_rss_kb=319040
+BENCH S5 c2_ramp_peak_rss_kb=336352
+BENCH S5 c2_ramp_cpu_pct_avg=4.8
+BENCH S5 c2_ramp_end_footprint_kb=262144
+BENCH S5 c2_ramp_end_reclaimable_kb=105488
+BENCH S5 c2_ramp_end_heap_footprint_kb=266752
+BENCH S5 c2_ramp_end_heap_inuse_kb=285540
+BENCH S5 c2_ramp_end_files=1800
+BENCH S5 c2_ramp_end_hunks=1800
+BENCH S5 c2_churn_end_rss_kb=238208
+BENCH S5 c2_churn_peak_rss_kb=359840
+BENCH S5 c2_churn_cpu_pct_avg=7.2
+BENCH S5 c2_churn_end_footprint_kb=88064
+BENCH S5 c2_churn_end_reclaimable_kb=155712
+BENCH S5 c2_churn_end_heap_footprint_kb=88474
+BENCH S5 c2_churn_end_heap_inuse_kb=64838
+BENCH S5 c2_churn_end_files=389
+BENCH S5 c2_churn_end_hunks=389
+BENCH S5 c2_churn_accepts_started=7
+BENCH S5 c2_quiet_settle_s=1.7
+BENCH S5 c2_quiet_accepts_started=1
+BENCH S5 c2_quiet_end_rss_kb=224368
+BENCH S5 c2_quiet_peak_rss_kb=241824
+BENCH S5 c2_quiet_cpu_pct_avg=1.3
+BENCH S5 c2_quiet_end_footprint_kb=84992
+BENCH S5 c2_quiet_end_reclaimable_kb=146064
+BENCH S5 c2_quiet_end_heap_footprint_kb=84890
+BENCH S5 c2_quiet_end_heap_inuse_kb=3795
+BENCH S5 c3_ramp_end_rss_kb=345360
+BENCH S5 c3_ramp_peak_rss_kb=345360
+BENCH S5 c3_ramp_cpu_pct_avg=4.8
+BENCH S5 c3_ramp_end_footprint_kb=279552
+BENCH S5 c3_ramp_end_reclaimable_kb=124992
+BENCH S5 c3_ramp_end_heap_footprint_kb=279962
+BENCH S5 c3_ramp_end_heap_inuse_kb=286823
+BENCH S5 c3_ramp_end_files=1800
+BENCH S5 c3_ramp_end_hunks=1800
+BENCH S5 c3_churn_end_rss_kb=256912
+BENCH S5 c3_churn_peak_rss_kb=394032
+BENCH S5 c3_churn_cpu_pct_avg=6.9
+BENCH S5 c3_churn_end_footprint_kb=36864
+BENCH S5 c3_churn_end_reclaimable_kb=223872
+BENCH S5 c3_churn_end_heap_footprint_kb=36762
+BENCH S5 c3_churn_end_heap_inuse_kb=45323
+BENCH S5 c3_churn_end_files=237
+BENCH S5 c3_churn_end_hunks=237
+BENCH S5 c3_churn_accepts_started=7
+BENCH S5 c3_quiet_settle_s=2.5
+BENCH S5 c3_quiet_accepts_started=1
+BENCH S5 c3_quiet_end_rss_kb=110192
+BENCH S5 c3_quiet_peak_rss_kb=259648
+BENCH S5 c3_quiet_cpu_pct_avg=1.2
+BENCH S5 c3_quiet_end_footprint_kb=48128
+BENCH S5 c3_quiet_end_reclaimable_kb=65680
+BENCH S5 c3_quiet_end_heap_footprint_kb=48128
+BENCH S5 c3_quiet_end_heap_inuse_kb=5301
+BENCH S5 prequit_end_rss_kb=269504
+BENCH S5 prequit_peak_rss_kb=269728
+BENCH S5 prequit_end_files=1327
+BENCH S5 prequit_end_hunks=1327
+BENCH S5 relaunch_first_frame_s=1.4
+BENCH S5 relaunch_peak_rss_kb=1009600
+BENCH S5 relaunch_peak_rss_kb_1hz=1009600
+BENCH S5 relaunch_end_rss_kb=1009600
+BENCH S5 relaunch_cpu_pct_avg=6.3
+BENCH S5 relaunch_end_footprint_kb=594944
+BENCH S5 relaunch_end_reclaimable_kb=410624
+BENCH S5 relaunch_end_heap_footprint_kb=595046
+BENCH S5 relaunch_end_heap_inuse_kb=226779
+BENCH S5 leaks_count=0
+BENCH S5 leaks_bytes=0
+BENCH S5 parked_records_max=7
+BENCH S5 parked_trees_distinct=42
+BENCH S5 writer_switches=42
+BENCH S5 writer_failures=0
+BENCH S5 wall_s=1008
+```
+
+### Phase 17 Part B (runs J and K): the 8 MiB chunk
+
+The sponsor's ruling after runs D and E: try a smaller chunk, and keep it only if the
+relaunch peak drops. Same machine; date 2026-10-30; commit `3529ae7` with only
+`BLOB_CHUNK_BYTES` changed from 64 MiB to 8 MiB. Run J at stride 150, run K at stride 5.
+Both engage the chunk: one root's pending blobs (about 45 MB) now take about six chunks.
+
+| | D, 64 MiB | **J, 8 MiB** | E, 64 MiB | **K, 8 MiB** |
+|---|---|---|---|---|
+| stride | 150 | 150 | 5 | 5 |
+| relaunch peak RSS, 10 ms (MB) | 767 | **213** | 986 | **376** |
+| relaunch end, heap footprint (MB) | 310 | **31** | 581 | **89** |
+| relaunch end, heap in-use (MB) | 18 | 18 | 221 | 221 |
+| relaunch first frame (s) | 1.4 | 1.5 | 1.4 | 1.5 |
+| c1 / c2 / c3 churn peak RSS (MB) | 118 / 129 / 161 | 98 / 104 / 124 | 408 / 351 / 385 | 358 / 355 / 365 |
+| c1 / c2 / c3 quiet end, heap footprint (MB) | 43 / 45 / 63 | 24 / 30 / 37 | 65 / 83 / 47 | 62 / 72 / 78 |
+| c1 ramp CPU % | 4.8 | 4.6 | 4.4 | 4.8 |
+| leaks | 0 | 0 | 0 | 0 |
+
+The relaunch is no longer the run's high point by much: at stride 5 its peak (376 MB) sits
+beside the churn peaks. Live data is unchanged, as it should be: the chunk only changes how
+many blobs are held at once. `just bench` with the same change (run L) against run I: every
+spawn count is identical, and the wall times are within the noise this page records.
+
+```
+BENCH S1 open_ms=4839
+BENCH S1 open_spawns=1102
+BENCH S1 roots=100
+BENCH S1 rows=4000
+BENCH S1 scan_all_ms=4541
+BENCH S1 scan_all_spawns=1600
+BENCH S1 first_checked_ms=9566
+BENCH S1 first_frame_ms=9567
+BENCH S1 peak_rss_kb=19248
+BENCH S1h open_ms=2311
+BENCH S1h open_spawns=552
+BENCH S1h roots=50
+BENCH S1h rows=4000
+BENCH S1h scan_all_ms=3289
+BENCH S1h scan_all_spawns=800
+BENCH S1h first_checked_ms=4727
+BENCH S1h first_frame_ms=4728
+BENCH S1h peak_rss_kb=17488
+BENCH S2 file_bytes=1100001
+BENCH S2 hunks=2
+BENCH S2 scan_ms=205
+BENCH S2 scan_spawns=16
+BENCH S2 open_ms=15
+BENCH S2 hunk_next_ms=16
+BENCH S2 page_down_ms=11
+BENCH S2 peak_rss_kb=30576
+BENCH S2_default_config open_ms=10
+BENCH S3 files=1000
+BENCH S3 settle_ms=1587
+BENCH S3 peak_rss_kb=10848
+BENCH S3_events files=1000
+BENCH S3_events settle_ms=1587
+BENCH S3_events peak_rss_kb=10944
+BENCH S4 capped_count_ms=4409
+BENCH S4 settle_ms=5381
+BENCH S4 peak_rss_kb=92688
+BENCH S4 scan_ms=1739
+BENCH S4 scan_spawns=15
+BENCH S4 rows_shown=10000
+BENCH S4 omitted=40000
+```
+
+Run J, stride 150 (`wall_s=1007`):
+
+```
+BENCH S5 stride=150
+BENCH S5 fixture_mb=32.6
+BENCH S5 fixture_s=2.2
+BENCH S5 roots=7
+BENCH S5 worktree_badges=6
+BENCH S5 c1_ramp_end_rss_kb=97744
+BENCH S5 c1_ramp_peak_rss_kb=97744
+BENCH S5 c1_ramp_cpu_pct_avg=4.6
+BENCH S5 c1_ramp_end_footprint_kb=33792
+BENCH S5 c1_ramp_end_reclaimable_kb=60448
+BENCH S5 c1_ramp_end_heap_footprint_kb=33485
+BENCH S5 c1_ramp_end_heap_inuse_kb=18903
+BENCH S5 c1_ramp_end_files=1800
+BENCH S5 c1_ramp_end_hunks=36000
+BENCH S5 c1_churn_end_rss_kb=91744
+BENCH S5 c1_churn_peak_rss_kb=100256
+BENCH S5 c1_churn_cpu_pct_avg=6.1
+BENCH S5 c1_churn_end_footprint_kb=24576
+BENCH S5 c1_churn_end_reclaimable_kb=63696
+BENCH S5 c1_churn_end_heap_footprint_kb=24269
+BENCH S5 c1_churn_end_heap_inuse_kb=5318
+BENCH S5 c1_churn_end_files=296
+BENCH S5 c1_churn_end_hunks=5920
+BENCH S5 c1_churn_accepts_started=7
+BENCH S5 c1_quiet_settle_s=2.6
+BENCH S5 c1_quiet_accepts_started=1
+BENCH S5 c1_quiet_end_rss_kb=83120
+BENCH S5 c1_quiet_peak_rss_kb=93200
+BENCH S5 c1_quiet_cpu_pct_avg=1.2
+BENCH S5 c1_quiet_end_footprint_kb=24576
+BENCH S5 c1_quiet_end_reclaimable_kb=54496
+BENCH S5 c1_quiet_end_heap_footprint_kb=24269
+BENCH S5 c1_quiet_end_heap_inuse_kb=2498
+BENCH S5 c2_ramp_end_rss_kb=95952
+BENCH S5 c2_ramp_peak_rss_kb=95952
+BENCH S5 c2_ramp_cpu_pct_avg=4.6
+BENCH S5 c2_ramp_end_footprint_kb=35840
+BENCH S5 c2_ramp_end_reclaimable_kb=56960
+BENCH S5 c2_ramp_end_heap_footprint_kb=36045
+BENCH S5 c2_ramp_end_heap_inuse_kb=20203
+BENCH S5 c2_ramp_end_files=1800
+BENCH S5 c2_ramp_end_hunks=36000
+BENCH S5 c2_churn_end_rss_kb=89616
+BENCH S5 c2_churn_peak_rss_kb=106208
+BENCH S5 c2_churn_cpu_pct_avg=6.2
+BENCH S5 c2_churn_end_footprint_kb=29696
+BENCH S5 c2_churn_end_reclaimable_kb=57280
+BENCH S5 c2_churn_end_heap_footprint_kb=30003
+BENCH S5 c2_churn_end_heap_inuse_kb=5832
+BENCH S5 c2_churn_end_files=214
+BENCH S5 c2_churn_end_hunks=4280
+BENCH S5 c2_churn_accepts_started=7
+BENCH S5 c2_quiet_settle_s=2.5
+BENCH S5 c2_quiet_accepts_started=1
+BENCH S5 c2_quiet_end_rss_kb=91568
+BENCH S5 c2_quiet_peak_rss_kb=92496
+BENCH S5 c2_quiet_cpu_pct_avg=1.3
+BENCH S5 c2_quiet_end_footprint_kb=30720
+BENCH S5 c2_quiet_end_reclaimable_kb=59408
+BENCH S5 c2_quiet_end_heap_footprint_kb=30720
+BENCH S5 c2_quiet_end_heap_inuse_kb=3780
+BENCH S5 c3_ramp_end_rss_kb=95936
+BENCH S5 c3_ramp_peak_rss_kb=109888
+BENCH S5 c3_ramp_cpu_pct_avg=4.5
+BENCH S5 c3_ramp_end_footprint_kb=37888
+BENCH S5 c3_ramp_end_reclaimable_kb=56624
+BENCH S5 c3_ramp_end_heap_footprint_kb=37683
+BENCH S5 c3_ramp_end_heap_inuse_kb=21865
+BENCH S5 c3_ramp_end_files=1800
+BENCH S5 c3_ramp_end_hunks=36000
+BENCH S5 c3_churn_end_rss_kb=120992
+BENCH S5 c3_churn_peak_rss_kb=126752
+BENCH S5 c3_churn_cpu_pct_avg=8.1
+BENCH S5 c3_churn_end_footprint_kb=39936
+BENCH S5 c3_churn_end_reclaimable_kb=78992
+BENCH S5 c3_churn_end_heap_footprint_kb=39526
+BENCH S5 c3_churn_end_heap_inuse_kb=7935
+BENCH S5 c3_churn_end_files=244
+BENCH S5 c3_churn_end_hunks=4880
+BENCH S5 c3_churn_accepts_started=7
+BENCH S5 c3_quiet_settle_s=2.4
+BENCH S5 c3_quiet_accepts_started=1
+BENCH S5 c3_quiet_end_rss_kb=64656
+BENCH S5 c3_quiet_peak_rss_kb=123136
+BENCH S5 c3_quiet_cpu_pct_avg=1.4
+BENCH S5 c3_quiet_end_footprint_kb=37888
+BENCH S5 c3_quiet_end_reclaimable_kb=26912
+BENCH S5 c3_quiet_end_heap_footprint_kb=38195
+BENCH S5 c3_quiet_end_heap_inuse_kb=5299
+BENCH S5 prequit_end_rss_kb=89152
+BENCH S5 prequit_peak_rss_kb=91504
+BENCH S5 prequit_end_files=1365
+BENCH S5 prequit_end_hunks=27300
+BENCH S5 relaunch_first_frame_s=1.5
+BENCH S5 relaunch_peak_rss_kb=218624
+BENCH S5 relaunch_peak_rss_kb_1hz=218624
+BENCH S5 relaunch_end_rss_kb=218624
+BENCH S5 relaunch_cpu_pct_avg=6.0
+BENCH S5 relaunch_end_footprint_kb=31744
+BENCH S5 relaunch_end_reclaimable_kb=182304
+BENCH S5 relaunch_end_heap_footprint_kb=31744
+BENCH S5 relaunch_end_heap_inuse_kb=18919
+BENCH S5 leaks_count=0
+BENCH S5 leaks_bytes=0
+BENCH S5 parked_records_max=7
+BENCH S5 parked_trees_distinct=42
+BENCH S5 writer_switches=42
+BENCH S5 writer_failures=0
+BENCH S5 wall_s=1007
+```
+
+Run K, stride 5 (`wall_s=1011`):
+
+```
+BENCH S5 stride=5
+BENCH S5 fixture_mb=32.6
+BENCH S5 fixture_s=2.8
+BENCH S5 roots=7
+BENCH S5 worktree_badges=6
+BENCH S5 c1_ramp_end_rss_kb=329904
+BENCH S5 c1_ramp_peak_rss_kb=329904
+BENCH S5 c1_ramp_cpu_pct_avg=4.8
+BENCH S5 c1_ramp_end_footprint_kb=335872
+BENCH S5 c1_ramp_end_reclaimable_kb=103424
+BENCH S5 c1_ramp_end_heap_footprint_kb=336486
+BENCH S5 c1_ramp_end_heap_inuse_kb=342039
+BENCH S5 c1_ramp_end_files=1800
+BENCH S5 c1_ramp_end_hunks=1800
+BENCH S5 c1_churn_end_rss_kb=261920
+BENCH S5 c1_churn_peak_rss_kb=366816
+BENCH S5 c1_churn_cpu_pct_avg=6.4
+BENCH S5 c1_churn_end_footprint_kb=63488
+BENCH S5 c1_churn_end_reclaimable_kb=205232
+BENCH S5 c1_churn_end_heap_footprint_kb=63078
+BENCH S5 c1_churn_end_heap_inuse_kb=56815
+BENCH S5 c1_churn_end_files=346
+BENCH S5 c1_churn_end_hunks=346
+BENCH S5 c1_churn_accepts_started=7
+BENCH S5 c1_quiet_settle_s=2.5
+BENCH S5 c1_quiet_accepts_started=1
+BENCH S5 c1_quiet_end_rss_kb=246816
+BENCH S5 c1_quiet_peak_rss_kb=262704
+BENCH S5 c1_quiet_cpu_pct_avg=1.2
+BENCH S5 c1_quiet_end_footprint_kb=63488
+BENCH S5 c1_quiet_end_reclaimable_kb=193616
+BENCH S5 c1_quiet_end_heap_footprint_kb=63898
+BENCH S5 c1_quiet_end_heap_inuse_kb=2515
+BENCH S5 c2_ramp_end_rss_kb=342352
+BENCH S5 c2_ramp_peak_rss_kb=350000
+BENCH S5 c2_ramp_cpu_pct_avg=4.7
+BENCH S5 c2_ramp_end_footprint_kb=245760
+BENCH S5 c2_ramp_end_reclaimable_kb=126000
+BENCH S5 c2_ramp_end_heap_footprint_kb=246067
+BENCH S5 c2_ramp_end_heap_inuse_kb=285650
+BENCH S5 c2_ramp_end_files=1800
+BENCH S5 c2_ramp_end_hunks=1800
+BENCH S5 c2_churn_end_rss_kb=242176
+BENCH S5 c2_churn_peak_rss_kb=363664
+BENCH S5 c2_churn_cpu_pct_avg=7.2
+BENCH S5 c2_churn_end_footprint_kb=96256
+BENCH S5 c2_churn_end_reclaimable_kb=159824
+BENCH S5 c2_churn_end_heap_footprint_kb=96358
+BENCH S5 c2_churn_end_heap_inuse_kb=53367
+BENCH S5 c2_churn_end_files=316
+BENCH S5 c2_churn_end_hunks=316
+BENCH S5 c2_churn_accepts_started=7
+BENCH S5 c2_quiet_settle_s=2.4
+BENCH S5 c2_quiet_accepts_started=1
+BENCH S5 c2_quiet_end_rss_kb=145856
+BENCH S5 c2_quiet_peak_rss_kb=263456
+BENCH S5 c2_quiet_cpu_pct_avg=1.5
+BENCH S5 c2_quiet_end_footprint_kb=73728
+BENCH S5 c2_quiet_end_reclaimable_kb=97776
+BENCH S5 c2_quiet_end_heap_footprint_kb=74138
+BENCH S5 c2_quiet_end_heap_inuse_kb=3794
+BENCH S5 c3_ramp_end_rss_kb=284320
+BENCH S5 c3_ramp_peak_rss_kb=360912
+BENCH S5 c3_ramp_cpu_pct_avg=4.8
+BENCH S5 c3_ramp_end_footprint_kb=324608
+BENCH S5 c3_ramp_end_reclaimable_kb=37216
+BENCH S5 c3_ramp_end_heap_footprint_kb=325018
+BENCH S5 c3_ramp_end_heap_inuse_kb=286822
+BENCH S5 c3_ramp_end_files=1800
+BENCH S5 c3_ramp_end_hunks=1800
+BENCH S5 c3_churn_end_rss_kb=211248
+BENCH S5 c3_churn_peak_rss_kb=374192
+BENCH S5 c3_churn_cpu_pct_avg=7.3
+BENCH S5 c3_churn_end_footprint_kb=80896
+BENCH S5 c3_churn_end_reclaimable_kb=147920
+BENCH S5 c3_churn_end_heap_footprint_kb=81101
+BENCH S5 c3_churn_end_heap_inuse_kb=26792
+BENCH S5 c3_churn_end_files=120
+BENCH S5 c3_churn_end_hunks=120
+BENCH S5 c3_churn_accepts_started=7
+BENCH S5 c3_quiet_settle_s=1.9
+BENCH S5 c3_quiet_accepts_started=1
+BENCH S5 c3_quiet_end_rss_kb=203888
+BENCH S5 c3_quiet_peak_rss_kb=224176
+BENCH S5 c3_quiet_cpu_pct_avg=1.4
+BENCH S5 c3_quiet_end_footprint_kb=79872
+BENCH S5 c3_quiet_end_reclaimable_kb=143600
+BENCH S5 c3_quiet_end_heap_footprint_kb=79667
+BENCH S5 c3_quiet_end_heap_inuse_kb=5305
+BENCH S5 prequit_end_rss_kb=265536
+BENCH S5 prequit_peak_rss_kb=266816
+BENCH S5 prequit_end_files=1368
+BENCH S5 prequit_end_hunks=1368
+BENCH S5 relaunch_first_frame_s=1.5
+BENCH S5 relaunch_peak_rss_kb=385264
+BENCH S5 relaunch_peak_rss_kb_1hz=385264
+BENCH S5 relaunch_end_rss_kb=385264
+BENCH S5 relaunch_cpu_pct_avg=6.3
+BENCH S5 relaunch_end_footprint_kb=91136
+BENCH S5 relaunch_end_reclaimable_kb=288768
+BENCH S5 relaunch_end_heap_footprint_kb=91136
+BENCH S5 relaunch_end_heap_inuse_kb=226784
+BENCH S5 leaks_count=0
+BENCH S5 leaks_bytes=0
+BENCH S5 parked_records_max=7
+BENCH S5 parked_trees_distinct=42
+BENCH S5 writer_switches=42
+BENCH S5 writer_failures=0
+BENCH S5 wall_s=1011
+```
+
 ## Known costs
 
 Not scan costs and not scenarios: things a user can *wait* for that no `BENCH` line
@@ -1039,6 +2173,16 @@ Estimated, not measured (no `BENCH` scenario deletes a branch): a listing costs 
 bytes per file, so 20 retired trees of a 5,000-file root are about 10 MB at worst and of a
 50,000-file root about 100 MB, and only trees that differ cost anything, since records at
 one tree share a listing (the code review's F5).
+
+### Blobs fetched in chunks: one process for each 8 MiB of a first scan
+
+Phase 17 Part B's chunk (`BLOB_CHUNK_BYTES`, 8 MiB) spends git processes to hold fewer blobs
+at once: a scan runs one `cat-file --batch` per chunk, so S5's root of about 45 MB of
+pending blobs takes about six instead of one, and a file whose two sides pass 8 MiB takes
+one of its own. Only rows that changed are fetched, so this falls on a root's first scan
+after launch and on what a later scan finds changed, not on every scan. `just bench` S1 to
+S4 never reach a second chunk, so no `BENCH` line shows it apart from S5's first frame (1.4
+to 1.5 s).
 
 ## What the first run found
 

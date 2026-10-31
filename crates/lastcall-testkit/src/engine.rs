@@ -17,13 +17,20 @@ pub fn open_engine(parent: &Path, env: &Env, state_dir: &Path, config: Config) -
 }
 
 /// [`open_engine`] with explicit options (compaction threshold, clock).
+///
+/// Under `LASTCALL_TEST_NO_DIFF_REUSE=1` every engine opened here renders every row afresh
+/// on every scan ([`EngineOptions::reuse_diffs`] off), so `just test-scenarios` can prove
+/// the reuse changes nothing a scenario sees.
 pub fn open_engine_with(
     parent: &Path,
     env: &Env,
     state_dir: &Path,
     config: Config,
-    options: EngineOptions,
+    mut options: EngineOptions,
 ) -> Engine {
+    if lastcall_engine::env::test_no_diff_reuse() {
+        options.reuse_diffs = false;
+    }
     let (loaded, resolved) = loaded_for(parent, state_dir, config);
     Engine::open(&loaded, &resolved, env, options).expect("engine opens")
 }

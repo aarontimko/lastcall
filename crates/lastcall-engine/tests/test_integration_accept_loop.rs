@@ -199,7 +199,7 @@ fn accept_loop_hunk_file_all_survives_the_agents_commits_and_shows_only_the_next
     let (rendered_f1, row_f1) = r.rendered("f1");
     let accepted = r.accept(AcceptRequest::Hunk {
         rendered: rendered_f1,
-        hunks: row_f1.hunks.clone(),
+        hunks: row_f1.hunks.to_vec(),
         index: 0,
     });
     let pile = assert_pile!(r.engine, r.root, "f1|f2|f3", "hunk 1 of f1 accepted");

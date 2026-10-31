@@ -24,6 +24,7 @@ just probe-tui-screen       # the PTY harness's transcript of the live-update de
 just tryout wrap            # a packaged hands-on run: sandbox repos + config + numbered steps, then the TUI (docs/dev/tryout.md)
 just probe-tui-slow         # probe-tui with the scans stretched (scripts/slowgit): the launch hold at scale
 just bench                  # the performance baseline on the release build (docs/dev/bench.md; ~4 min; not a gate)
+just bench-soak             # S5, the worktree soak: memory and CPU under six writing worktrees (docs/dev/bench.md; ~17 min; not a gate)
 just snapshots-update       # rewrite the TUI snapshots, then prove they pass; read every diff
 just test-prepush           # what the pre-push hook runs: integration tier + 64-case proptests
 just hooks-install          # pre-commit = just lint && just test-unit; pre-push = just test-prepush

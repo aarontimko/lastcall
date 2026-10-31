@@ -30,6 +30,175 @@ pub enum Tag {
     Insert,
 }
 
+/// A hunk's lines, each a tag and its bytes, held as **one** byte buffer plus one
+/// `(tag, end offset)` entry per line (Phase 17 Part B fix 2).
+///
+/// A `Vec<u8>` per line costs its 24-byte header and an allocation rounded up by the
+/// allocator, which for a typical 38-byte source line roughly doubles it; the pile holds
+/// every pending row's hunks for as long as the row is pending. Here a line costs its bytes
+/// plus 8. `u32` offsets bound a hunk at 4 GiB; the scan collapses any pair of blobs that
+/// together pass that as `Size`, whatever `collapse_size_bytes` says (`scan::over_size`).
+///
+/// Lines read back as `(Tag, &[u8])` in the order they were pushed. Serialized as the
+/// `[[tag, [bytes]], …]` array the `Vec` was, so the pile fixture's shape is unchanged.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct Lines {
+    bytes: Vec<u8>,
+    /// The end of each line in `bytes`; a line starts where the one before it ends.
+    ends: Vec<(Tag, u32)>,
+}
+
+impl Lines {
+    /// Empty, with room for `lines` lines of `bytes` bytes in all, so a hunk built from
+    /// known lines allocates exactly once per buffer.
+    pub fn with_capacity(lines: usize, bytes: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(bytes),
+            ends: Vec::with_capacity(lines),
+        }
+    }
+
+    pub fn push(&mut self, tag: Tag, line: &[u8]) {
+        self.bytes.extend_from_slice(line);
+        let end = u32::try_from(self.bytes.len()).expect("a hunk's lines fit in 4 GiB");
+        self.ends.push((tag, end));
+    }
+
+    pub fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ends.is_empty()
+    }
+
+    pub fn get(&self, i: usize) -> Option<(Tag, &[u8])> {
+        let (tag, end) = *self.ends.get(i)?;
+        let start = match i {
+            0 => 0,
+            _ => self.ends[i - 1].1,
+        };
+        Some((tag, &self.bytes[start as usize..end as usize]))
+    }
+
+    /// Line `i`, panicking past the end as an index would.
+    pub fn line(&self, i: usize) -> (Tag, &[u8]) {
+        match self.get(i) {
+            Some(line) => line,
+            None => panic!("line {i} of a {}-line hunk", self.len()),
+        }
+    }
+
+    pub fn iter(&self) -> LinesIter<'_> {
+        LinesIter {
+            lines: self,
+            range: 0..self.len(),
+        }
+    }
+
+    /// Keep the first `n` lines (no-op when there are `n` or fewer).
+    pub fn truncate(&mut self, n: usize) {
+        if n >= self.len() {
+            return;
+        }
+        let end = match n {
+            0 => 0,
+            _ => self.ends[n - 1].1 as usize,
+        };
+        self.ends.truncate(n);
+        self.bytes.truncate(end);
+    }
+}
+
+/// [`Lines::iter`]: each line as `(Tag, &[u8])`, front to back.
+#[derive(Clone)]
+pub struct LinesIter<'a> {
+    lines: &'a Lines,
+    range: Range<usize>,
+}
+
+impl<'a> Iterator for LinesIter<'a> {
+    type Item = (Tag, &'a [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let i = self.range.next()?;
+        self.lines.get(i)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.range.size_hint()
+    }
+}
+
+impl DoubleEndedIterator for LinesIter<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        let i = self.range.next_back()?;
+        self.lines.get(i)
+    }
+}
+
+impl ExactSizeIterator for LinesIter<'_> {}
+
+impl<'a> IntoIterator for &'a Lines {
+    type Item = (Tag, &'a [u8]);
+    type IntoIter = LinesIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<'a> FromIterator<(Tag, &'a [u8])> for Lines {
+    fn from_iter<I: IntoIterator<Item = (Tag, &'a [u8])>>(iter: I) -> Self {
+        let mut out = Self::default();
+        for (tag, line) in iter {
+            out.push(tag, line);
+        }
+        out
+    }
+}
+
+impl FromIterator<(Tag, Vec<u8>)> for Lines {
+    fn from_iter<I: IntoIterator<Item = (Tag, Vec<u8>)>>(iter: I) -> Self {
+        iter.into_iter().collect::<Vec<_>>().into()
+    }
+}
+
+impl From<Vec<(Tag, Vec<u8>)>> for Lines {
+    fn from(lines: Vec<(Tag, Vec<u8>)>) -> Self {
+        let bytes = lines.iter().map(|(_, l)| l.len()).sum();
+        let mut out = Self::with_capacity(lines.len(), bytes);
+        for (tag, line) in &lines {
+            out.push(*tag, line);
+        }
+        out
+    }
+}
+
+/// The same `Debug` as the `Vec<(Tag, Vec<u8>)>` it replaced: a list of `(tag, [bytes])`.
+impl std::fmt::Debug for Lines {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+impl serde::Serialize for Lines {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.iter())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Lines {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let lines = Vec::<(Tag, Vec<u8>)>::deserialize(deserializer)?;
+        let bytes: usize = lines.iter().map(|(_, l)| l.len()).sum();
+        if u32::try_from(bytes).is_err() {
+            return Err(serde::de::Error::custom("a hunk's lines exceed 4 GiB"));
+        }
+        Ok(lines.into())
+    }
+}
+
 /// One unified hunk. `old_range`/`new_range` are line indexes into the two buffers.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Hunk {
@@ -37,21 +206,26 @@ pub struct Hunk {
     pub old_range: Range<usize>,
     pub new_range: Range<usize>,
     /// Lines with their terminators (the last line of a buffer may lack `\n`).
-    pub lines: Vec<(Tag, Vec<u8>)>,
+    pub lines: Lines,
 }
 
 impl Hunk {
     /// The synthetic hunk for a mode-only change (D1): `mode 100644 → 100755`.
     pub fn mode_change(old: &str, new: &str) -> Self {
+        let mut lines = Lines::with_capacity(2, 10 + old.len() + new.len());
+        lines.push(Tag::Delete, format!("mode {old}").as_bytes());
+        lines.push(Tag::Insert, format!("mode {new}").as_bytes());
         Self {
             index: 0,
             old_range: 0..0,
             new_range: 0..0,
-            lines: vec![
-                (Tag::Delete, format!("mode {old}").into_bytes()),
-                (Tag::Insert, format!("mode {new}").into_bytes()),
-            ],
+            lines,
         }
+    }
+
+    /// Keep the first `n` lines; [`truncate`]'s one mutation of a hunk's lines.
+    pub fn truncate_lines(&mut self, n: usize) {
+        self.lines.truncate(n);
     }
 
     /// Whether this is the synthetic D1 mode hunk (empty ranges, `mode …` lines).
@@ -105,7 +279,7 @@ impl Hunk {
         self.lines
             .iter()
             .filter(|(t, _)| *t != Tag::Context)
-            .cloned()
+            .map(|(t, l)| (t, l.to_vec()))
             .collect()
     }
 }
@@ -130,6 +304,45 @@ fn ops(old: &[&[u8]], new: &[&[u8]]) -> Vec<DiffOp> {
     capture_diff_slices(Algorithm::Myers, old, new)
 }
 
+/// A buffer's lines as [`split_lines`] gives them.
+type SplitLines<'a> = &'a [&'a [u8]];
+
+/// One group's body lines in unified order: context, then a replacement's deletes before
+/// its inserts.
+fn group_lines<'a>(
+    group: &'a [DiffOp],
+    old_lines: SplitLines<'a>,
+    new_lines: SplitLines<'a>,
+) -> impl Iterator<Item = (Tag, &'a [u8])> + 'a {
+    let tagged = |tag: Tag, lines: SplitLines<'a>| lines.iter().map(move |l| (tag, *l));
+    group.iter().flat_map(move |op| {
+        let (context, deleted, inserted): (SplitLines, SplitLines, SplitLines) = match *op {
+            DiffOp::Equal { old_index, len, .. } => {
+                (&old_lines[old_index..old_index + len], &[], &[])
+            }
+            DiffOp::Delete {
+                old_index, old_len, ..
+            } => (&[], &old_lines[old_index..old_index + old_len], &[]),
+            DiffOp::Insert {
+                new_index, new_len, ..
+            } => (&[], &[], &new_lines[new_index..new_index + new_len]),
+            DiffOp::Replace {
+                old_index,
+                old_len,
+                new_index,
+                new_len,
+            } => (
+                &[],
+                &old_lines[old_index..old_index + old_len],
+                &new_lines[new_index..new_index + new_len],
+            ),
+        };
+        tagged(Tag::Context, context)
+            .chain(tagged(Tag::Delete, deleted))
+            .chain(tagged(Tag::Insert, inserted))
+    })
+}
+
 /// Unified hunks at context 3.
 pub fn diff(old: &[u8], new: &[u8]) -> Vec<Hunk> {
     let old_lines = split_lines(old);
@@ -142,47 +355,18 @@ pub fn diff(old: &[u8], new: &[u8]) -> Vec<Hunk> {
         .into_iter()
         .enumerate()
         .map(|(index, group)| {
-            let mut lines = Vec::new();
             // Ops within a group are contiguous and ordered.
             let (_, first_old, first_new) = group.first().expect("non-empty group").as_tag_tuple();
             let (_, last_old, last_new) = group.last().expect("non-empty group").as_tag_tuple();
             let old_range = first_old.start..last_old.end;
             let new_range = first_new.start..last_new.end;
-            for op in &group {
-                match *op {
-                    DiffOp::Equal { old_index, len, .. } => {
-                        for l in &old_lines[old_index..old_index + len] {
-                            lines.push((Tag::Context, l.to_vec()));
-                        }
-                    }
-                    DiffOp::Delete {
-                        old_index, old_len, ..
-                    } => {
-                        for l in &old_lines[old_index..old_index + old_len] {
-                            lines.push((Tag::Delete, l.to_vec()));
-                        }
-                    }
-                    DiffOp::Insert {
-                        new_index, new_len, ..
-                    } => {
-                        for l in &new_lines[new_index..new_index + new_len] {
-                            lines.push((Tag::Insert, l.to_vec()));
-                        }
-                    }
-                    DiffOp::Replace {
-                        old_index,
-                        old_len,
-                        new_index,
-                        new_len,
-                    } => {
-                        for l in &old_lines[old_index..old_index + old_len] {
-                            lines.push((Tag::Delete, l.to_vec()));
-                        }
-                        for l in &new_lines[new_index..new_index + new_len] {
-                            lines.push((Tag::Insert, l.to_vec()));
-                        }
-                    }
-                }
+            // Two walks over the same lines: the first sizes the buffer, so the second never
+            // regrows it.
+            let walk = || group_lines(&group, &old_lines, &new_lines);
+            let (count, bytes) = walk().fold((0, 0), |(n, b), (_, l)| (n + 1, b + l.len()));
+            let mut lines = Lines::with_capacity(count, bytes);
+            for (tag, l) in walk() {
+                lines.push(tag, l);
             }
             Hunk {
                 index,
@@ -235,7 +419,7 @@ pub fn truncate(hunks: Vec<Hunk>, cap: usize) -> Expanded {
             continue;
         }
         let mut part = hunk;
-        part.lines.truncate(room);
+        part.truncate_lines(room);
         let old_kept = part.lines.iter().filter(|(t, _)| *t != Tag::Insert).count();
         let new_kept = part.lines.iter().filter(|(t, _)| *t != Tag::Delete).count();
         part.old_range = part.old_range.start..part.old_range.start + old_kept;
@@ -288,7 +472,7 @@ pub fn apply_hunks(baseline: &[u8], hunks: &[Hunk], selected: &[usize]) -> Vec<u
             out.extend_from_slice(l);
         }
         for (tag, bytes) in &h.lines {
-            if *tag != Tag::Delete {
+            if tag != Tag::Delete {
                 out.extend_from_slice(bytes);
             }
         }
@@ -411,17 +595,19 @@ mod tests {
         // Hunk 2 has three context lines above it. The naive reading would say line 7.
         assert_eq!(hunks[1].new_range.start + 1, 7, "the context line");
         assert_eq!(hunks[1].editor_line(), 10, "the line that changed");
-        let (_, line) = &hunks[1].lines[hunks[1]
-            .lines
-            .iter()
-            .position(|(t, _)| *t == Tag::Insert)
-            .expect("a replacement inserts")];
+        let (_, line) = hunks[1].lines.line(
+            hunks[1]
+                .lines
+                .iter()
+                .position(|(t, _)| t == Tag::Insert)
+                .expect("a replacement inserts"),
+        );
         assert_eq!(line, b"MIDDLE\n", "and that line is the inserted one");
 
         // Hunk 3 is a pure deletion: the new file has nothing where line 18 was, so the
         // editor opens on the line that now follows the removed run.
         assert!(
-            hunks[2].lines.iter().all(|(t, _)| *t != Tag::Insert),
+            hunks[2].lines.iter().all(|(t, _)| t != Tag::Insert),
             "a pure deletion: {:?}",
             hunks[2]
         );
@@ -433,6 +619,60 @@ mod tests {
 
         // The synthetic mode hunk has no text to open at and answers 1 rather than panic.
         assert_eq!(Hunk::mode_change("100644", "100755").editor_line(), 1);
+    }
+
+    /// Phase 17 Part B fix 2: one buffer gives back every line's tag and bytes, in order,
+    /// with the edges a `Vec` per line never had to think about: an empty line, a
+    /// zero-length line, a CRLF line and a last line with no `\n`.
+    #[test]
+    fn hunks_lines_buffer_round_trips_every_tag_and_byte() {
+        let old: Vec<(Tag, Vec<u8>)> = vec![
+            (Tag::Context, s("fn main() {\n")),
+            (Tag::Delete, s("\n")),
+            (Tag::Insert, s("")),
+            (Tag::Insert, s("    crlf();\r\n")),
+            (Tag::Context, s("}")),
+        ];
+        let lines = Lines::from(old.clone());
+        assert_eq!(lines.len(), 5);
+        assert!(!lines.is_empty());
+        let back: Vec<(Tag, Vec<u8>)> = lines.iter().map(|(t, l)| (t, l.to_vec())).collect();
+        assert_eq!(back, old);
+        let rev: Vec<(Tag, Vec<u8>)> = lines.iter().rev().map(|(t, l)| (t, l.to_vec())).collect();
+        assert_eq!(rev, old.iter().rev().cloned().collect::<Vec<_>>());
+        for (i, (tag, bytes)) in old.iter().enumerate() {
+            assert_eq!(lines.line(i), (*tag, &bytes[..]), "line {i}");
+        }
+        assert_eq!(lines.get(5), None);
+        assert_eq!(lines.iter().len(), 5);
+        // The JSON and the `Debug` are the `Vec`'s, so the pile fixture and any assertion
+        // message read the same.
+        assert_eq!(
+            serde_json::to_string(&lines).unwrap(),
+            serde_json::to_string(&old).unwrap()
+        );
+        let parsed: Lines = serde_json::from_str(&serde_json::to_string(&old).unwrap()).unwrap();
+        assert_eq!(parsed, lines);
+        assert_eq!(format!("{lines:?}"), format!("{old:?}"));
+        assert_eq!(Lines::default().iter().next(), None);
+
+        // And from `diff` itself: a CRLF file whose last line lost its terminator.
+        let hunks = diff(b"a\r\nb\r\nc\r\n", b"a\r\nB\r\nc");
+        let body: Vec<(Tag, Vec<u8>)> = hunks[0]
+            .lines
+            .iter()
+            .map(|(t, l)| (t, l.to_vec()))
+            .collect();
+        assert_eq!(
+            body,
+            vec![
+                (Tag::Context, s("a\r\n")),
+                (Tag::Delete, s("b\r\n")),
+                (Tag::Delete, s("c\r\n")),
+                (Tag::Insert, s("B\r\n")),
+                (Tag::Insert, s("c")),
+            ]
+        );
     }
 
     #[test]
@@ -605,7 +845,7 @@ mod tests {
                 .lines
                 .iter()
                 .filter(|(t, _)| *t != Tag::Delete)
-                .map(|(_, b)| b.clone())
+                .map(|(_, b)| b.to_vec())
                 .collect();
             lines.splice(h.old_range.clone(), replacement);
         }
@@ -652,6 +892,104 @@ mod tests {
                 apply_one_at_a_time(&baseline, &hunks, &subset)
             );
             prop_assert_eq!(apply_hunks(&baseline, &hunks, &[]), baseline.clone());
+        }
+    }
+
+    mod proptests {
+        use super::*;
+
+        fn config() -> ProptestConfig {
+            ProptestConfig {
+                cases: crate::env::proptest_cases(),
+                failure_persistence: None,
+                ..ProptestConfig::default()
+            }
+        }
+
+        fn line_strategy() -> impl Strategy<Value = (Tag, Vec<u8>)> {
+            (
+                prop_oneof![Just(Tag::Context), Just(Tag::Delete), Just(Tag::Insert)],
+                prop_oneof![
+                    prop::collection::vec(any::<u8>(), 0..6),
+                    Just(b"\n".to_vec()),
+                    Just(b"crlf\r\n".to_vec()),
+                ],
+            )
+        }
+
+        proptest! {
+            #![proptest_config(config())]
+
+            /// Phase 17 Part B fix 2: the buffer holds what the `Vec` per line held, and
+            /// `truncate_lines` keeps exactly the prefix `Vec::truncate` kept.
+            #[test]
+            fn hunks_lines_buffer_matches_a_vec_per_line(
+                old in prop::collection::vec(line_strategy(), 0..12),
+                n in 0..14usize,
+            ) {
+                let lines = Lines::from(old.clone());
+                let back: Vec<(Tag, Vec<u8>)> =
+                    lines.iter().map(|(t, l)| (t, l.to_vec())).collect();
+                prop_assert_eq!(&back, &old);
+                prop_assert_eq!(
+                    serde_json::to_string(&lines).unwrap(),
+                    serde_json::to_string(&old).unwrap()
+                );
+
+                let mut hunk = Hunk { index: 0, old_range: 0..0, new_range: 0..0, lines };
+                hunk.truncate_lines(n);
+                let mut kept = old.clone();
+                kept.truncate(n);
+                let back: Vec<(Tag, Vec<u8>)> =
+                    hunk.lines.iter().map(|(t, l)| (t, l.to_vec())).collect();
+                prop_assert_eq!(&back, &kept);
+                // Equal as values too: a truncated buffer is the buffer built from the
+                // prefix, so `Hunk`'s derived equality still means equal lines.
+                prop_assert_eq!(hunk.lines, Lines::from(kept));
+            }
+
+            /// Phase 17 Part B fix 3: a non-collapsed row takes its counts from its diff's
+            /// hunks instead of running a second diff, which is sound only because the two
+            /// agree on every input. The `case_strategy` property above covers unique
+            /// lines; this one draws from a three-line alphabet, so most lines repeat (the
+            /// case where two diffs could pick different alignments), with bare `\r`,
+            /// `\r\n`, blank lines and either side missing its final newline.
+            #[test]
+            fn hunks_counts_are_the_sum_of_the_diffs_hunk_counts(
+                old in text_strategy(),
+                new in text_strategy(),
+            ) {
+                let summed = diff(&old, &new).iter().fold((0, 0), |(a, d), h| {
+                    let (ha, hd) = h.counts();
+                    (a + ha, d + hd)
+                });
+                prop_assert_eq!(counts(&old, &new), summed);
+            }
+        }
+
+        /// A file's bytes as lines from a small alphabet, so repeats are the rule.
+        fn text_strategy() -> impl Strategy<Value = Vec<u8>> {
+            (
+                prop::collection::vec(
+                    prop_oneof![
+                        Just(&b"a\n"[..]),
+                        Just(&b"b\n"[..]),
+                        Just(&b"a\r\n"[..]),
+                        Just(&b"\n"[..]),
+                        Just(&b"\r"[..]),
+                        Just(&b"}\n"[..]),
+                    ],
+                    0..24,
+                ),
+                any::<bool>(),
+            )
+                .prop_map(|(lines, terminated)| {
+                    let mut out = lines.concat();
+                    if !terminated && out.last() == Some(&b'\n') {
+                        out.pop();
+                    }
+                    out
+                })
         }
     }
 }

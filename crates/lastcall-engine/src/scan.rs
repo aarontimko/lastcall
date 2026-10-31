@@ -22,6 +22,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use globset::GlobSet;
 
@@ -122,7 +123,10 @@ pub struct Row {
     pub current: Option<Entry>,
     pub added: usize,
     pub deleted: usize,
-    pub hunks: Vec<Hunk>,
+    /// Shared, read-only once rendered (Phase 17 Part B, fix 3): a row whose sides have not
+    /// moved since the last scan takes that scan's hunks rather than a fresh diff, and an
+    /// accept-by-hunk request carries them without a copy. Built as a `Vec`, wrapped once.
+    pub hunks: Arc<Vec<Hunk>>,
     pub annotation: Option<Annotation>,
     pub conflicted: bool,
     pub collapsed: Option<Collapsed>,
@@ -192,8 +196,11 @@ pub struct Group {
 /// The pending set of one root after a scan.
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Pile {
-    /// Sorted by path bytes.
-    pub rows: Vec<Row>,
+    /// Sorted by path bytes. Shared, read-only once built (Phase 17 Part B, fix 1): the
+    /// engine's `last_pile`, the screen's view and an accept's request all hold this one
+    /// list, so cloning a pile copies the small fields below and not a single row. Rows are
+    /// built and sorted as a `Vec` and wrapped once; see [`Pile::rows_mut`].
+    pub rows: Arc<Vec<Row>>,
     /// Root-level notices produced by this scan.
     pub notices: Vec<String>,
     /// Changed paths the row cap left unscanned (`0` when nothing was cut). Additive:
@@ -228,6 +235,14 @@ impl Pile {
 
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
+    }
+
+    /// The rows, writable: copy-on-write, so free on a pile nobody else holds yet (the
+    /// scan's own, while the engine annotates and marks it, before it is handed out) and a
+    /// whole-list copy on one that is shared. Nothing outside tests calls it on a pile the
+    /// engine or a view already holds.
+    pub fn rows_mut(&mut self) -> &mut Vec<Row> {
+        Arc::make_mut(&mut self.rows)
     }
 
     pub fn row(&self, path: &[u8]) -> Option<&Row> {
@@ -299,6 +314,46 @@ pub struct ScanInputs<'a> {
     /// repository whose parent-relative path matches is dropped where `excluded_dirs` are.
     /// `None` for a repository, whose own files no key may hide, and when the list is empty.
     pub skip: Option<DraftSkip<'a>>,
+    /// The root's last pile, whose renderings a row may take instead of a diff (Phase 17
+    /// Part B, fix 3). `None` renders every row, which is also how the tests force the reuse
+    /// off: the engine passes it only when the collapse rules are the ones that pile was
+    /// rendered under.
+    pub reuse: Option<Reuse<'a>>,
+}
+
+/// What a scan may take from the root's last pile (Phase 17 Part B, fix 3).
+///
+/// A row's rendering, `(added, deleted, hunks, collapsed)`, is a function of its two sides
+/// (oid and mode each), the collapse rules and the store's `core.filemode`, and of nothing
+/// else. So a row whose sides are the ones the last pile's row had takes that row's
+/// rendering whole, when that row was rendered with both blobs in hand (`rendered`): not
+/// from a scan whose blob batch failed, and with neither side missing from the store. The
+/// caller vouches for the collapse rules; `core.filemode` is fixed for a [`Store`].
+#[derive(Debug, Clone, Copy)]
+pub struct Reuse<'a> {
+    pub pile: &'a Pile,
+    /// [`ScanOutput::rendered`] of the scan that built `pile`.
+    pub rendered: &'a HashSet<Vec<u8>>,
+}
+
+impl<'a> Reuse<'a> {
+    /// The last pile's row for `row`'s path, when its rendering is `row`'s too.
+    fn row_for(&self, row: &Row) -> Option<&'a Row> {
+        // The rows that never read blobs keep their own path, as they always have.
+        if matches!(row.change, Change::Typechange | Change::Unreadable)
+            || matches!(row.collapsed, Some(Collapsed::Unread { .. }))
+            || !self.rendered.contains(&row.path)
+        {
+            return None;
+        }
+        // A pile's rows are sorted by path; a miss only costs the reuse.
+        let rows = &self.pile.rows;
+        let i = rows
+            .binary_search_by(|r| r.path.as_slice().cmp(&row.path))
+            .ok()?;
+        let prev = &rows[i];
+        (prev.baseline == row.baseline && prev.current == row.current).then_some(prev)
+    }
 }
 
 /// A watched folder's `skip_globs` test. The patterns are relative to the parent dir the
@@ -351,6 +406,9 @@ pub struct ScanOutput {
     pub hash_calls: u64,
     /// Whether `update-index --refresh` ran (false under `index.lock` contention).
     pub refreshed: bool,
+    /// The paths whose rendering this scan had both blobs in hand for, taken over from
+    /// the last pile included: what the next scan's [`Reuse::rendered`] is.
+    pub rendered: HashSet<Vec<u8>>,
 }
 
 /// Probe whether the root's filesystem is case-insensitive: `lstat` of the root path with
@@ -446,6 +504,27 @@ fn record_holds(inputs: &ScanInputs<'_>, path: &[u8]) -> bool {
     }
 }
 
+/// The most blob bytes one `cat-file --batch` of the render fetches and holds: the rows are
+/// rendered in chunks taken in order, each chunk's blobs fetched together and dropped
+/// before the next chunk's are. A row whose blobs alone exceed it is a chunk of its own.
+/// At launch up to eight roots hold a chunk each, and macOS keeps that high-water mark, so
+/// this is the launch's footprint: 8 MiB against 64 MiB took S5's relaunch peak from 986 MB
+/// to 376 MB for no more git processes in S1 to S4 (`docs/dev/bench.md`).
+pub const BLOB_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
+
+/// What a blob of unknown size is charged against [`BLOB_CHUNK_BYTES`]: a chunk of such
+/// blobs is bounded by a count (1,024) instead. The scan knows every size in practice,
+/// a baseline's from the resolver's `--batch-check`, a current side's from its `lstat`.
+const UNKNOWN_BLOB_BYTES: u64 = BLOB_CHUNK_BYTES / 1024;
+
+fn blob_chunk_bytes() -> u64 {
+    #[cfg(test)]
+    if let Some(b) = CHUNK_BYTES.with(std::cell::Cell::get) {
+        return b;
+    }
+    BLOB_CHUNK_BYTES
+}
+
 fn is_binary(bytes: &[u8]) -> bool {
     bytes[..bytes.len().min(BINARY_PROBE)].contains(&0)
 }
@@ -456,6 +535,21 @@ thread_local! {
     /// costs a path that is pending under both trees (Phase 13 deliverable B).
     pub(crate) static DIFF_FILES_HOOK: crate::testhook::TestHook<()> =
         const { crate::testhook::TestHook::new() };
+    /// `Some(n)`: the scan's `n`th blob fetch (from 0, counting only chunks that fetch
+    /// anything) fails as a broken store's would, so the fail-open path runs on a healthy
+    /// fixture.
+    pub(crate) static FAIL_BLOB_BATCH: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    /// `Some(bytes)`: the chunk budget in place of [`BLOB_CHUNK_BYTES`], so a fixture's few
+    /// small blobs span several chunks.
+    pub(crate) static CHUNK_BYTES: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+    /// The blob fetches the scans on this thread have run (one per chunk that fetched).
+    pub(crate) static BLOB_FETCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Blobs the batch comes back without, as if pruned between the resolver's existence
+    /// check and the fetch (the only way a fixture reaches "not in the store").
+    pub(crate) static DROP_FROM_BATCH: std::cell::RefCell<Vec<Oid>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Run one scan.
@@ -672,6 +766,9 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
 
     // Current side hashed in one batch per call; a row per path whose sides differ.
     let over_bytes = inputs.collapse_size_bytes;
+    // A current blob's size, from the same `lstat` the hashing used: the render's chunks
+    // are sized from it.
+    let mut cur_sizes: HashMap<Oid, u64> = HashMap::new();
     let mut materialise = |paths: &[Vec<u8>], rows: &mut Vec<Row>| {
         // A file over the limit is handed on as "nothing there", which is how it reaches
         // the hashing pass without being hashed: its row is built from the record alone.
@@ -688,7 +785,10 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
             })
             .collect();
         let currents = store.hash_paths_with(paths, &metas);
-        for (path, current) in paths.iter().zip(currents) {
+        for ((path, current), meta) in paths.iter().zip(currents).zip(&metas) {
+            if let (Current::Present { oid, .. }, MetaOf::Present(m)) = (&current, meta) {
+                cur_sizes.insert(oid.clone(), m.len());
+            }
             let current = if forced_absent.contains(path) {
                 Current::Absent
             } else {
@@ -735,7 +835,7 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
                     current: None,
                     added: 0,
                     deleted: 0,
-                    hunks: Vec::new(),
+                    hunks: Arc::default(),
                     annotation: None,
                     conflicted: is_conflicted,
                     collapsed: Some(Collapsed::Unread { over_bytes }),
@@ -778,7 +878,7 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
                 current: cur_entry,
                 added: 0,
                 deleted: 0,
-                hunks: Vec::new(),
+                hunks: Arc::default(),
                 annotation: None,
                 conflicted: is_conflicted,
                 collapsed: None,
@@ -805,30 +905,142 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
     let omitted = rest.len() - taken;
     notices.append(&mut resolver.notices);
 
-    // 4b. Content for every row through one `cat-file --batch`: rendering must not cost a
-    // process per row (2,000 unseen files are 2,000 rows on every rescan tick).
-    let mut wanted: Vec<Oid> = rows
+    // What rendering may change, as materialised: put back if a chunk's fetch fails.
+    let materialised: Vec<Option<Collapsed>> = rows.iter().map(|r| r.collapsed).collect();
+
+    // 4b. A row whose sides the last pile already rendered takes that rendering ([`Reuse`]):
+    // its blobs are neither fetched nor diffed.
+    let prior: Vec<Option<&Row>> = rows
         .iter()
-        .filter(|r| !matches!(r.change, Change::Typechange | Change::Unreadable))
-        // An unread row has no content to diff, and its recorded blob may itself be large.
-        .filter(|r| !matches!(r.collapsed, Some(Collapsed::Unread { .. })))
-        .flat_map(|r| [&r.baseline, &r.current])
-        .flatten()
-        .map(|e| e.oid.clone())
+        .map(|r| inputs.reuse.and_then(|reuse| reuse.row_for(r)))
         .collect();
-    wanted.sort();
-    wanted.dedup();
-    let blobs = match store.cat_blobs(&wanted) {
-        Ok(b) => Some(b),
-        Err(e) => {
-            notices.push(format!(
-                "blob contents unreadable ({e}); rows shown without counts or hunks"
-            ));
-            None
-        }
+
+    // 4c. Content for every other row, fetched in chunks of rows taken in order with one
+    // `cat-file --batch` per chunk: rendering must not cost a process per row (2,000
+    // unseen files are 2,000 rows on every rescan tick), nor hold every pending row's two
+    // whole blobs at once (eight roots doing so at launch was a run's highest point).
+    let reads = |r: &Row| {
+        !matches!(r.change, Change::Typechange | Change::Unreadable)
+            // An unread row has no content to diff, and its recorded blob may be large.
+            && !matches!(r.collapsed, Some(Collapsed::Unread { .. }))
     };
-    for row in &mut rows {
-        render_content(store, inputs, blobs.as_ref(), row, &mut notices)?;
+    let oids_of = |r: &'_ Row| -> Vec<Oid> {
+        let mut oids: Vec<Oid> = [&r.baseline, &r.current]
+            .into_iter()
+            .flatten()
+            .map(|e| e.oid.clone())
+            .collect();
+        oids.dedup();
+        oids
+    };
+    let size_of = |oid: &Oid| {
+        resolver
+            .size_of(oid)
+            .or_else(|| cur_sizes.get(oid).copied())
+            .unwrap_or(UNKNOWN_BLOB_BYTES)
+    };
+    // `[start, end)` row ranges. A chunk closes before the row whose blobs not already in
+    // it would take it over the budget; the rows that fetch nothing ride along.
+    let budget = blob_chunk_bytes();
+    let mut chunks: Vec<(usize, usize)> = Vec::new();
+    let (mut start, mut bytes, mut held) = (0usize, 0u64, HashSet::<Oid>::new());
+    for (i, (row, prior)) in rows.iter().zip(&prior).enumerate() {
+        if prior.is_some() || !reads(row) {
+            continue;
+        }
+        let oids = oids_of(row);
+        let cost = |held: &HashSet<Oid>| -> u64 {
+            oids.iter()
+                .filter(|o| !held.contains(*o))
+                .map(&size_of)
+                .sum()
+        };
+        let mut add = cost(&held);
+        if !held.is_empty() && bytes.saturating_add(add) > budget {
+            chunks.push((start, i));
+            (start, bytes) = (i, 0);
+            held.clear();
+            add = cost(&held);
+        }
+        bytes = bytes.saturating_add(add);
+        held.extend(oids);
+    }
+    chunks.push((start, rows.len()));
+    drop(held);
+
+    let notices_before = notices.len();
+    let mut rendered: HashSet<Vec<u8>> = HashSet::new();
+    let mut failed: Option<StoreError> = None;
+    #[cfg(test)]
+    let mut fetch_no = 0usize;
+    for (start, end) in chunks {
+        let mut wanted: Vec<Oid> = rows[start..end]
+            .iter()
+            .zip(&prior[start..end])
+            .filter(|(r, prior)| prior.is_none() && reads(r))
+            .flat_map(|(r, _)| oids_of(r))
+            .collect();
+        wanted.sort();
+        wanted.dedup();
+        let fetched = store.cat_blobs(&wanted);
+        #[cfg(test)]
+        // Only where a real batch runs: `cat_blobs` of nothing spawns no process.
+        let fetched = match wanted.is_empty() {
+            true => fetched,
+            false => {
+                BLOB_FETCHES.with(|n| n.set(n.get() + 1));
+                fetch_no += 1;
+                if FAIL_BLOB_BATCH.with(std::cell::Cell::get) == Some(fetch_no - 1) {
+                    Err(StoreError::Other("injected batch failure".into()))
+                } else {
+                    fetched.map(|mut b| {
+                        DROP_FROM_BATCH.with(|d| d.borrow().iter().for_each(|o| drop(b.remove(o))));
+                        b
+                    })
+                }
+            }
+        };
+        let blobs = match fetched {
+            Ok(b) => b,
+            Err(e) => {
+                failed = Some(e);
+                break;
+            }
+        };
+        for (row, prior) in rows[start..end].iter_mut().zip(&prior[start..end]) {
+            let whole = match prior {
+                Some(prev) => {
+                    row.added = prev.added;
+                    row.deleted = prev.deleted;
+                    row.hunks = Arc::clone(&prev.hunks);
+                    row.collapsed = prev.collapsed;
+                    true
+                }
+                None => render_content(store, inputs, Some(&blobs), row, &mut notices)?,
+            };
+            if whole {
+                rendered.insert(row.path.clone());
+            }
+        }
+        // `blobs` is dropped here, before the next chunk's are fetched.
+    }
+    // A failed fetch, whichever chunk's, fails open the whole scan's content, the rows the
+    // earlier chunks rendered and the reused ones too, exactly as one failed batch did:
+    // what a broken store shows does not depend on where the chunks fell or on what the
+    // last scan saw.
+    if let Some(e) = failed {
+        notices.truncate(notices_before);
+        notices.push(format!(
+            "blob contents unreadable ({e}); rows shown without counts or hunks"
+        ));
+        rendered.clear();
+        for (row, collapsed) in rows.iter_mut().zip(materialised) {
+            row.added = 0;
+            row.deleted = 0;
+            row.hunks = Arc::default();
+            row.collapsed = collapsed;
+            render_content(store, inputs, None, row, &mut notices)?;
+        }
     }
 
     // 5. D5 rename pairing: only when the pile has both deletions and additions. The
@@ -894,7 +1106,7 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
     }
     Ok(ScanOutput {
         pile: Pile {
-            rows,
+            rows: Arc::new(rows),
             notices,
             omitted,
             // Stamped by the engine (`scan_root`), which owns the clock the expiry needs.
@@ -905,21 +1117,26 @@ pub fn scan(inputs: &ScanInputs<'_>) -> Result<ScanOutput, ScanError> {
         nested_repos,
         hash_calls: store.git().hash_object_calls() - calls_before,
         refreshed,
+        rendered,
     })
 }
 
 /// Hunks, counts and the collapse decision for one row, from the batch-fetched blobs
 /// (`None`: the batch failed; the row keeps its change kind and nothing else).
-fn render_content(
+///
+/// `true` when the row was rendered with both of its blobs in hand, so the next scan may
+/// take this rendering over ([`Reuse`]); `false` for a failed batch, a side missing from
+/// the store, and the rows that never read blobs.
+fn render_content<'b>(
     store: &Store,
     inputs: &ScanInputs<'_>,
-    blobs: Option<&HashMap<Oid, Vec<u8>>>,
+    blobs: Option<&'b HashMap<Oid, Vec<u8>>>,
     row: &mut Row,
     notices: &mut Vec<String>,
-) -> Result<(), ScanError> {
+) -> Result<bool, ScanError> {
     // An unread row already carries its verdict, and it is the truer one.
     if matches!(row.collapsed, Some(Collapsed::Unread { .. })) {
-        return Ok(());
+        return Ok(false);
     }
     if inputs
         .collapsed_globs
@@ -928,25 +1145,28 @@ fn render_content(
         row.collapsed = Some(Collapsed::Glob);
     }
     if matches!(row.change, Change::Typechange | Change::Unreadable) {
-        return Ok(());
+        return Ok(false);
     }
     let Some(blobs) = blobs else {
-        return Ok(());
+        return Ok(false);
     };
-    let mut read = |e: &Option<Entry>, what: &str| -> Vec<u8> {
+    // Borrowed from the batch's map, never copied out of it.
+    let mut whole = true;
+    let mut read = |e: &Option<Entry>, what: &str| -> &'b [u8] {
         match e {
             Some(entry) => match blobs.get(&entry.oid) {
-                Some(b) => b.clone(),
+                Some(b) => b,
                 None => {
                     notices.push(format!(
                         "{}: {what} unreadable (object {} not in the store)",
                         row.path_lossy(),
                         entry.oid
                     ));
-                    Vec::new()
+                    whole = false;
+                    &[]
                 }
             },
-            None => Vec::new(),
+            None => &[],
         }
     };
     let old = read(&row.baseline, "baseline");
@@ -956,39 +1176,52 @@ fn render_content(
         .as_ref()
         .zip(row.current.as_ref())
         .is_some_and(|(b, c)| b.oid == c.oid);
-    if !same_content {
-        let (a, d) = hunks::counts(&old, &new);
-        row.added = a;
-        row.deleted = d;
-    }
     if row.collapsed.is_none() {
-        if is_binary(&old) || is_binary(&new) {
+        if is_binary(old) || is_binary(new) {
             row.collapsed = Some(Collapsed::Binary);
-        } else if old.len() as u64 >= inputs.collapse_size_bytes
-            || new.len() as u64 >= inputs.collapse_size_bytes
-        {
+        } else if over_size(old.len(), new.len(), inputs.collapse_size_bytes) {
             row.collapsed = Some(Collapsed::Size);
         }
     }
     if row.collapsed.is_some() {
-        return Ok(());
+        if !same_content {
+            let (a, d) = hunks::counts(old, new);
+            row.added = a;
+            row.deleted = d;
+        }
+        return Ok(whole);
     }
+    // One diff gives both the hunks and the counts: the hunks' counts sum to
+    // `hunks::counts` exactly (`hunks_counts_are_the_sum_of_the_diffs_hunk_counts`).
+    let mut hunks = Vec::new();
     if !same_content {
-        row.hunks = hunks::diff(&old, &new);
+        hunks = hunks::diff(old, new);
+        (row.added, row.deleted) = hunks.iter().fold((0, 0), |(a, d), h| {
+            let (ha, hd) = h.counts();
+            (a + ha, d + hd)
+        });
     }
     if let (Some(b), Some(c)) = (&row.baseline, &row.current)
         && b.mode != c.mode
         && (store.filemode() || b.mode == Mode::Symlink || c.mode == Mode::Symlink)
     {
         let mut h = Hunk::mode_change(b.mode.as_str(), c.mode.as_str());
-        h.index = row.hunks.len();
-        row.hunks.push(h);
+        h.index = hunks.len();
+        hunks.push(h);
         if same_content {
             row.added = 1;
             row.deleted = 1;
         }
     }
-    Ok(())
+    row.hunks = Arc::new(hunks);
+    Ok(whole)
+}
+
+/// Whether a pair of blobs collapses as `Size`: either side at or above the configured
+/// limit, or the two together past what one hunk's `u32` offsets can address
+/// ([`hunks::Lines`]), which only a limit raised above 4 GiB can reach.
+fn over_size(old: usize, new: usize, limit: u64) -> bool {
+    old as u64 >= limit || new as u64 >= limit || (old + new) as u64 > u64::from(u32::MAX)
 }
 
 /// `(from, to, similarity)` as reported by `diff -M`.
@@ -1220,6 +1453,7 @@ mod tests {
                 row_cap: crate::engine::DEFAULT_ROW_CAP,
                 retry_on_reseed: false,
                 skip,
+                reuse: None,
             })
             .unwrap()
         }
@@ -1671,6 +1905,12 @@ pub(crate) mod fixture_tests {
         }
 
         pub(crate) fn scan(&self) -> ScanOutput {
+            self.scan_reusing(None)
+        }
+
+        /// [`Self::scan`] offered a last pile's renderings (what the engine passes, see
+        /// [`reuse_of`]).
+        pub(crate) fn scan_reusing(&self, reuse: Option<Reuse<'_>>) -> ScanOutput {
             let inputs = ScanInputs {
                 store: &self.store,
                 index: &self.index,
@@ -1687,9 +1927,32 @@ pub(crate) mod fixture_tests {
                 row_cap: crate::engine::DEFAULT_ROW_CAP,
                 retry_on_reseed: false,
                 skip: None,
+                reuse,
             };
             super::scan(&inputs).unwrap()
         }
+    }
+
+    /// What the engine offers the next scan after `out`: its pile and its reusable paths.
+    pub(crate) fn reuse_of(out: &ScanOutput) -> Reuse<'_> {
+        Reuse {
+            pile: &out.pile,
+            rendered: &out.rendered,
+        }
+    }
+
+    /// A limit raised past 4 GiB still collapses a pair one hunk's `u32` offsets could not
+    /// hold, rather than panicking in `Lines::push` (code review F1).
+    #[test]
+    fn over_size_caps_a_pair_at_what_one_hunk_can_address() {
+        let four_gib = u32::MAX as usize;
+        let huge = u64::MAX;
+        assert!(!over_size(10, 10, huge));
+        assert!(!over_size(four_gib / 2, four_gib / 2, huge));
+        assert!(over_size(four_gib / 2 + 1, four_gib / 2 + 1, huge));
+        assert!(over_size(1024, 0, 1024));
+        assert!(over_size(0, 1024, 1024));
+        assert!(!over_size(1023, 1023, 1024));
     }
 
     /// `collapse_size_bytes` has read as at-or-above in `docs/config.md` since the key was
@@ -1762,8 +2025,8 @@ pub(crate) mod fixture_tests {
         if h.store.filemode() {
             assert_eq!(f3.change, Change::Mode);
             assert_eq!(f3.hunks.len(), 1, "D1: a synthetic mode hunk");
-            assert_eq!(f3.hunks[0].lines[0].1, b"mode 100644".to_vec());
-            assert_eq!(f3.hunks[0].lines[1].1, b"mode 100755".to_vec());
+            assert_eq!(f3.hunks[0].lines.line(0).1, b"mode 100644".to_vec());
+            assert_eq!(f3.hunks[0].lines.line(1).1, b"mode 100755".to_vec());
         }
         assert_eq!(pile.row(b"new.txt").unwrap().change, Change::Added);
         assert_eq!(
@@ -1783,7 +2046,7 @@ pub(crate) mod fixture_tests {
         let link = pile.row(b"link").unwrap();
         assert_eq!(link.current.as_ref().unwrap().mode, Mode::Symlink);
         assert_eq!(
-            link.hunks[0].lines[0].1,
+            link.hunks[0].lines.line(0).1,
             b"f1".to_vec(),
             "symlink diffs its target"
         );
@@ -1938,5 +2201,394 @@ pub(crate) mod fixture_tests {
         assert!(f1.current.is_none() && f1.hunks.is_empty());
         assert!(pile.notices.iter().any(|n| n.contains("f1")));
         assert_eq!(pile.row(b"f1/inner").unwrap().change, Change::Added);
+    }
+
+    /// No diff counts this many lines: a row showing it was taken over from `sentinel`.
+    const TAKEN: usize = 999_999;
+
+    /// `pile` with every row's `added` set to [`TAKEN`].
+    fn sentinel(pile: &Pile) -> Pile {
+        let mut p = pile.clone();
+        for r in p.rows_mut() {
+            r.added = TAKEN;
+        }
+        p
+    }
+
+    fn taken(pile: &Pile, path: &str) -> bool {
+        pile.row(path.as_bytes()).expect("a row").added == TAKEN
+    }
+
+    /// Phase 17 Part B fix 3: a row takes the last pile's rendering exactly when its path
+    /// was rendered whole there and both of its sides (oid and mode) are the ones that
+    /// pile's row had. The positive control takes every row; then one input per row moves
+    /// and only the rows nothing moved under are taken.
+    #[test]
+    fn scan_reuse_takes_a_rendering_only_when_both_sides_hold() {
+        let repo = FixtureRepo::new("scan-reuse").unwrap();
+        let state = TempDir::new("lc-scan-reuse");
+        let mut h = Harness::new(&repo, &state);
+        repo.write("base.txt", "v1\n");
+        h.mark_seen();
+        repo.write("base.txt", "v2\n");
+        repo.write("f1", "changed\n");
+        repo.write("f2", "b2\n");
+        repo.write("f3", "c2\n");
+        repo.write("new.txt", "n\n");
+        repo.write("Cargo.lock", "lock\n");
+        let first = h.scan();
+        let all = ["Cargo.lock", "base.txt", "f1", "f2", "f3", "new.txt"];
+        assert_eq!(pile_lines(&first.pile), all);
+        assert_eq!(first.rendered.len(), all.len(), "every row rendered whole");
+        let prior = sentinel(&first.pile);
+
+        let again = h.scan_reusing(Some(Reuse {
+            pile: &prior,
+            rendered: &first.rendered,
+        }));
+        for p in all {
+            assert!(taken(&again.pile, p), "{p}: nothing moved");
+        }
+        assert!(Arc::ptr_eq(
+            &again.pile.row(b"f1").unwrap().hunks,
+            &first.pile.row(b"f1").unwrap().hunks
+        ));
+        assert_eq!(again.rendered, first.rendered);
+
+        // The baseline oid: the seen tree records base.txt as v3; the disk still says v2.
+        repo.write("base.txt", "v3\n");
+        let v3 = h
+            .scan()
+            .pile
+            .row(b"base.txt")
+            .unwrap()
+            .current
+            .clone()
+            .unwrap();
+        repo.write("base.txt", "v2\n");
+        let seen = h
+            .store
+            .write_tree(
+                h.ledger.seen_tree.as_ref(),
+                &[TreeWrite::Set {
+                    path: b"base.txt".to_vec(),
+                    mode: v3.mode,
+                    oid: v3.oid,
+                }],
+            )
+            .unwrap();
+        h.tree_entries = h.store.ls_tree(&seen).unwrap();
+        h.ledger.seen_tree = Some(seen);
+        // The current oid, the current mode, and a path the last scan did not render whole.
+        repo.write("f2", "b3\n");
+        repo.chmod_x("f3", true);
+        let mut rendered = first.rendered.clone();
+        rendered.remove(b"new.txt".as_slice());
+        let moved = h.scan_reusing(Some(Reuse {
+            pile: &prior,
+            rendered: &rendered,
+        }));
+        assert!(!taken(&moved.pile, "base.txt"), "the baseline moved");
+        assert!(!taken(&moved.pile, "f2"), "the current oid moved");
+        assert_eq!(
+            taken(&moved.pile, "f3"),
+            !h.store.filemode(),
+            "the current mode moved (a change only where the store keeps the x bit)"
+        );
+        assert!(
+            !taken(&moved.pile, "new.txt"),
+            "not rendered whole last time"
+        );
+        assert!(taken(&moved.pile, "f1") && taken(&moved.pile, "Cargo.lock"));
+        let fresh = h.scan();
+        for p in ["base.txt", "f2", "f3", "new.txt"] {
+            assert_eq!(
+                moved.pile.row(p.as_bytes()),
+                fresh.pile.row(p.as_bytes()),
+                "{p}: rendered afresh, as a scan with nothing to reuse renders it"
+            );
+        }
+    }
+
+    /// A side missing from the store renders as empty with a notice: not a rendering to
+    /// keep, so the path is left out of `rendered` and the next scan diffs it (and says so)
+    /// again, while a whole row beside it is taken over. The resolver vets every baseline
+    /// blob, so the side goes missing between that check and the fetch (a `git gc` racing
+    /// the scan), which is [`DROP_FROM_BATCH`].
+    #[test]
+    fn scan_a_side_missing_from_the_store_is_never_taken_over() {
+        let repo = FixtureRepo::new("scan-reuse-gone").unwrap();
+        let state = TempDir::new("lc-scan-reuse-gone");
+        let h = Harness::new(&repo, &state);
+        repo.write("f1", "changed\n");
+        repo.write("f2", "b2\n");
+        let first = h.scan();
+        let f2_base = first.pile.row(b"f2").unwrap().baseline.clone().unwrap().oid;
+        assert_eq!(first.rendered.len(), 2);
+
+        DROP_FROM_BATCH.with(|d| d.borrow_mut().push(f2_base));
+        // Offered nothing for f2 to take, so its blobs are fetched, and one is gone.
+        let mut rendered = first.rendered.clone();
+        rendered.remove(b"f2".as_slice());
+        let out = h.scan_reusing(Some(Reuse {
+            pile: &sentinel(&first.pile),
+            rendered: &rendered,
+        }));
+        let says = |o: &ScanOutput| {
+            o.pile
+                .notices
+                .iter()
+                .any(|n| n.starts_with("f2: baseline unreadable"))
+        };
+        assert!(says(&out), "{:?}", out.pile.notices);
+        assert!(!out.rendered.contains(b"f2".as_slice()));
+        assert!(
+            out.rendered.contains(b"f1".as_slice()),
+            "f1 taken over: still whole"
+        );
+        assert!(taken(&out.pile, "f1"));
+
+        let next = h.scan_reusing(Some(Reuse {
+            pile: &sentinel(&out.pile),
+            rendered: &out.rendered,
+        }));
+        DROP_FROM_BATCH.with(|d| d.borrow_mut().clear());
+        assert!(says(&next), "diffed again, so said again");
+        assert!(!taken(&next.pile, "f2"));
+        assert!(taken(&next.pile, "f1"));
+    }
+
+    /// A failed blob batch fails open every row, the ones the last pile could have given
+    /// too, so a broken store shows what it shows with nothing to reuse; and a failed scan
+    /// leaves nothing for the next one to take.
+    #[test]
+    fn scan_a_failed_blob_batch_fails_open_the_reusable_rows_too() {
+        let repo = FixtureRepo::new("scan-reuse-fail").unwrap();
+        let state = TempDir::new("lc-scan-reuse-fail");
+        let h = Harness::new(&repo, &state);
+        repo.write("f1", "changed\n");
+        repo.write("f2", "b2\n");
+        let first = h.scan();
+        repo.write("f2", "b3\n");
+        FAIL_BLOB_BATCH.with(|f| f.set(Some(0)));
+        let failed = h.scan_reusing(Some(reuse_of(&first)));
+        let failed_fresh = h.scan();
+        FAIL_BLOB_BATCH.with(|f| f.set(None));
+        assert_eq!(failed.pile, failed_fresh.pile);
+        assert!(
+            failed
+                .pile
+                .notices
+                .iter()
+                .any(|n| n.starts_with("blob contents unreadable"))
+        );
+        for r in failed.pile.rows.iter() {
+            assert_eq!((r.added, r.deleted), (0, 0), "{r:?}");
+            assert!(r.hunks.is_empty(), "{r:?}");
+        }
+        assert!(failed.rendered.is_empty());
+
+        let next = h.scan_reusing(Some(reuse_of(&failed)));
+        assert_eq!(next.pile, h.scan().pile);
+        assert_eq!(next.pile.row(b"f1").unwrap().added, 1);
+        assert_eq!(next.rendered.len(), 2);
+    }
+
+    /// Phase 17 Part B fix 4: rows whose blobs span several chunks render exactly as in
+    /// one chunk (the rows, their order, the notices, the reusable paths) with one fetch
+    /// per chunk; and a fetch failing in any later chunk fails open the whole scan as one
+    /// failed batch does, the rows the earlier chunks rendered and their notices included.
+    #[test]
+    fn scan_blobs_in_several_chunks_render_as_one_chunk() {
+        let repo = FixtureRepo::new("scan-chunks").unwrap();
+        let state = TempDir::new("lc-scan-chunks");
+        let h = Harness::new(&repo, &state);
+        repo.write("f1", "changed\n");
+        repo.write("f2", "b2\nmore\n");
+        repo.write("f3", "\0bin");
+        repo.write("Cargo.lock", "lock\n");
+        repo.write("big.txt", "y\n".repeat(600));
+        for (i, body) in ["one\n", "two\nlines\n", "three\n\n", "no newline"]
+            .iter()
+            .enumerate()
+        {
+            repo.write(&format!("new{i}.txt"), body);
+        }
+        // A side gone from the store, so a middle chunk says something.
+        let f2_base = h
+            .scan()
+            .pile
+            .row(b"f2")
+            .unwrap()
+            .baseline
+            .clone()
+            .unwrap()
+            .oid;
+        DROP_FROM_BATCH.with(|d| d.borrow_mut().push(f2_base));
+        let scan_with = |budget: Option<u64>, fail: Option<usize>| {
+            CHUNK_BYTES.with(|b| b.set(budget));
+            FAIL_BLOB_BATCH.with(|f| f.set(fail));
+            let before = BLOB_FETCHES.with(std::cell::Cell::get);
+            let out = h.scan();
+            CHUNK_BYTES.with(|b| b.set(None));
+            FAIL_BLOB_BATCH.with(|f| f.set(None));
+            (out, BLOB_FETCHES.with(std::cell::Cell::get) - before)
+        };
+
+        let (one, fetches) = scan_with(None, None);
+        assert_eq!(fetches, 1);
+        let rows = one.pile.rows.len();
+        assert!(rows >= 8, "{:?}", one.pile.rows);
+        assert!(
+            one.pile
+                .notices
+                .iter()
+                .any(|n| n.starts_with("f2: baseline unreadable")),
+            "{:?}",
+            one.pile.notices
+        );
+        let mut last = usize::MAX;
+        for budget in [1, 8, 16, 32, 64, 1 << 20] {
+            let (many, fetches) = scan_with(Some(budget), None);
+            assert_eq!(many.pile, one.pile, "budget {budget}");
+            assert_eq!(many.rendered, one.rendered, "budget {budget}");
+            assert!(fetches <= last, "budget {budget}: {fetches} > {last}");
+            last = fetches;
+            if budget == 1 {
+                assert_eq!(fetches, rows, "a row per chunk");
+            }
+        }
+        assert_eq!(last, 1);
+
+        let (failed, _) = scan_with(None, Some(0));
+        assert!(failed.rendered.is_empty());
+        assert_eq!(
+            failed
+                .pile
+                .notices
+                .iter()
+                .filter(|n| n.contains("unreadable"))
+                .collect::<Vec<_>>(),
+            vec![
+                "blob contents unreadable (store: injected batch failure); rows shown without counts or hunks"
+            ]
+        );
+        for at in 0..rows {
+            let (later, fetches) = scan_with(Some(1), Some(at));
+            assert_eq!(fetches, at + 1, "stops at the failed chunk");
+            assert_eq!(later.pile, failed.pile, "chunk {at} failed");
+            assert!(later.rendered.is_empty());
+        }
+        DROP_FROM_BATCH.with(|d| d.borrow_mut().clear());
+    }
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn config() -> ProptestConfig {
+            ProptestConfig {
+                cases: crate::env::proptest_cases(),
+                failure_persistence: None,
+                ..ProptestConfig::default()
+            }
+        }
+
+        /// Text, more text, binary, over the harness's 1 KiB limit, no final newline, the
+        /// committed `f3`: every length differs, so no rewrite hides behind a racy stat.
+        const CONTENTS: [&[u8]; 6] = [
+            b"a1\na2\nx\n",
+            b"changed\n",
+            b"\0bin",
+            b"",
+            b"no newline",
+            b"c\n",
+        ];
+        const PATHS: [&str; 6] = ["f1", "f2", "f3", "new.txt", "Cargo.lock", "big.txt"];
+
+        #[derive(Debug, Clone)]
+        enum Step {
+            Write(usize, usize),
+            Remove(usize),
+            Exec(usize, bool),
+            MarkSeen,
+            /// The seen tree records one path as `CONTENTS[c]`: its baseline moves alone.
+            SeenAs(usize, usize),
+        }
+
+        fn step() -> impl Strategy<Value = Step> {
+            prop_oneof![
+                4 => (0..PATHS.len(), 0..CONTENTS.len()).prop_map(|(p, c)| Step::Write(p, c)),
+                1 => (0..PATHS.len()).prop_map(Step::Remove),
+                1 => (0..PATHS.len(), any::<bool>()).prop_map(|(p, x)| Step::Exec(p, x)),
+                1 => Just(Step::MarkSeen),
+                2 => (0..PATHS.len(), 0..CONTENTS.len()).prop_map(|(p, c)| Step::SeenAs(p, c)),
+            ]
+        }
+
+        fn apply(repo: &FixtureRepo, h: &mut Harness, step: &Step) {
+            let exists = |p: usize| repo.path().join(PATHS[p]).exists();
+            match *step {
+                Step::Write(p, 3) => {
+                    repo.write(PATHS[p], "y\n".repeat(600));
+                }
+                Step::Write(p, c) => {
+                    repo.write(PATHS[p], CONTENTS[c]);
+                }
+                Step::Remove(p) if exists(p) => repo.remove(PATHS[p]),
+                Step::Exec(p, x) if exists(p) => repo.chmod_x(PATHS[p], x),
+                Step::MarkSeen => h.mark_seen(),
+                Step::SeenAs(p, c) => {
+                    let oid = h.store.hash_bytes(CONTENTS[c]).unwrap();
+                    let set = TreeWrite::Set {
+                        path: PATHS[p].as_bytes().to_vec(),
+                        mode: Mode::Regular,
+                        oid,
+                    };
+                    let seen = h
+                        .store
+                        .write_tree(h.ledger.seen_tree.as_ref(), &[set])
+                        .unwrap();
+                    h.tree_entries = h.store.ls_tree(&seen).unwrap();
+                    h.ledger.seen_tree = Some(seen);
+                }
+                Step::Remove(_) | Step::Exec(..) => {}
+            }
+        }
+
+        /// Phase 17 Part B fixes 3 and 4: over any run of edits, a scan offered the last
+        /// scan's renderings, and fetching its blobs in chunks of any budget, gives exactly
+        /// the pile, and the reusable paths, of a scan with nothing to reuse and one chunk.
+        /// Driven through `TestRunner` over one fixture: the property holds from whatever
+        /// state the last case left, so nothing is reset.
+        #[test]
+        fn scan_reuse_changes_nothing_a_pile_shows() {
+            let repo = FixtureRepo::new("scan-reuse-prop").unwrap();
+            let state = TempDir::new("lc-scan-reuse-prop");
+            let h = std::cell::RefCell::new(Harness::new(&repo, &state));
+            let mut runner = proptest::test_runner::TestRunner::new(config());
+            let budget = prop_oneof![Just(None), (1u64..1_400).prop_map(Some)];
+            let rounds = prop::collection::vec((prop::collection::vec(step(), 0..4), budget), 1..4);
+            let result = runner.run(&rounds, |rounds| {
+                let mut h = h.borrow_mut();
+                let mut last = h.scan();
+                for (round, budget) in &rounds {
+                    for s in round {
+                        apply(&repo, &mut h, s);
+                    }
+                    CHUNK_BYTES.with(|b| b.set(*budget));
+                    let reusing = h.scan_reusing(Some(reuse_of(&last)));
+                    CHUNK_BYTES.with(|b| b.set(None));
+                    let fresh = h.scan();
+                    prop_assert_eq!(&reusing.pile, &fresh.pile);
+                    prop_assert_eq!(&reusing.rendered, &fresh.rendered);
+                    last = reusing;
+                }
+                Ok(())
+            });
+            if let Err(e) = result {
+                panic!("{e}");
+            }
+        }
     }
 }

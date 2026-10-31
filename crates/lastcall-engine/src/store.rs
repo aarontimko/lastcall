@@ -642,6 +642,12 @@ impl Store {
 
     /// Batched `cat-file --batch-check`; an unanswerable query counts as missing.
     pub fn exists_many(&self, oids: &[Oid]) -> Vec<bool> {
+        self.sizes_many(oids).iter().map(Option::is_some).collect()
+    }
+
+    /// [`Self::exists_many`] with what the same `--batch-check` says besides: each present
+    /// object's size in bytes, `None` for a missing one.
+    pub fn sizes_many(&self, oids: &[Oid]) -> Vec<Option<u64>> {
         if oids.is_empty() {
             return Vec::new();
         }
@@ -658,10 +664,13 @@ impl Store {
                 let answers = git::parse_batch_check(&bytes);
                 oids.iter()
                     .enumerate()
-                    .map(|(i, _)| matches!(answers.get(i), Some(BatchCheck::Present { .. })))
+                    .map(|(i, _)| match answers.get(i) {
+                        Some(BatchCheck::Present { size, .. }) => Some(*size),
+                        _ => None,
+                    })
                     .collect()
             }
-            Err(_) => vec![false; oids.len()],
+            Err(_) => vec![None; oids.len()],
         }
     }
 
@@ -1083,6 +1092,24 @@ pub(crate) mod tests {
                 other => panic!("{name:?}: {other:?}"),
             }
         }
+    }
+
+    /// The render's chunks are sized from `sizes_many`: the same one `--batch-check` that
+    /// answers `exists_many`, a present blob's byte length and `None` for a missing one.
+    #[test]
+    fn store_sizes_many_reports_each_blob_length_in_one_batch_check() {
+        let repo = FixtureRepo::new("sizes").unwrap();
+        let state = TempDir::new("lc-sizes");
+        let (store, _) = open_git(&repo, &state);
+        let ten = store.hash_bytes(b"0123456789").unwrap();
+        let empty = store.hash_bytes(b"").unwrap();
+        let missing = Oid::parse(&"ab".repeat(20)).unwrap();
+        let oids = [ten, missing, empty];
+        let before = crate::git::thread_spawn_count();
+        assert_eq!(store.sizes_many(&oids), vec![Some(10), None, Some(0)]);
+        assert_eq!(crate::git::thread_spawn_count() - before, 1);
+        assert_eq!(store.exists_many(&oids), vec![true, false, true]);
+        assert!(store.sizes_many(&[]).is_empty());
     }
 
     #[test]
