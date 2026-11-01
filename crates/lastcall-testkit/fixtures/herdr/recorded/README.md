@@ -1,7 +1,7 @@
 # recorded/
 
-Raw wire captures from the **pinned herdr release** (`just herdr-fetch`, v0.8.2 asset,
-protocol 20), written by `crates/lastcall-engine/tests/test_integration_herdr_real.rs` when
+Raw wire captures from the **herdr v0.8.2 release asset** (protocol 20), the pin at the time,
+written by `crates/lastcall-engine/tests/test_integration_herdr_real.rs` when
 `just herdr-record` runs it with `LASTCALL_RECORD_DIR` set. `just fixtures-sync` derives the
 named fixtures in the parent directory from these files; each `<name>.provenance.md` there
 states the rule.
@@ -16,3 +16,7 @@ states the rule.
 | `subscribe_failure.jsonl` | the one error line for a bogus subscription set |
 
 Re-recording changes the temp-dir cwd and terminal ids; that churn is expected.
+
+These were not re-recorded when the pin moved to v0.9.0 or v0.9.5. A fresh recording from v0.9.5
+on 2026-11-01 has the same JSON shape in every file except one added field nothing reads:
+`snapshot.agents[].completion_seq` in `snapshot_two_panes_after_focus.json`.

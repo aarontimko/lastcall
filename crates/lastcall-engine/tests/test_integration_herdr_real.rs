@@ -648,14 +648,15 @@ impl<T: Transport + Clone> Transport for FilteringTransport<T> {
 /// Starts a real foreground job in `pane` and returns once it runs. herdr 0.9.2 and later drop
 /// a self-reported agent as soon as its pane's shell is the sole foreground job (herdr #4687),
 /// so `pane.report_agent` over a bare shell reads back as `unknown`. A real agent is a real
-/// process, so this makes the scene what it stands for. The marker file, rather than
-/// `pane.read`, keeps these tests inside the pinned surface.
+/// process, so this makes the scene what it stands for. The subshell is the foreground job from
+/// its fork, so the shell is never alone between the marker and the `sleep`. The marker file,
+/// rather than `pane.read`, keeps these tests inside the pinned surface.
 async fn start_foreground_job<T: Transport>(t: &T, pane: &str, dir: &Path) {
     let marker = dir.join(format!("job-running-{}", pane.replace(':', "-")));
     let ok = t
         .request(
             "pane.send_text",
-            json!({ "pane_id": pane, "text": format!("touch '{}' && sleep 600\n", marker.display()) }),
+            json!({ "pane_id": pane, "text": format!("( touch '{}' && exec sleep 600 )\n", marker.display()) }),
         )
         .await
         .expect("pane.send_text");

@@ -472,7 +472,7 @@ diff is the evidence — at the v0.9.0 -> v0.9.5 move it listed exactly four add
 **The pretend agent needs a real process under it.** Since herdr 0.9.2 (herdr #4687) a
 self-reported agent is dropped as soon as its pane's shell is the sole foreground job, and the
 pane reads `unknown`. So the two tests that drive a pane to `done` first start a real job in it
-(`start_foreground_job`, `sleep 600`, gone when the isolated server stops) and wait for its
+(`start_foreground_job`, a subshell that `exec`s `sleep 600`, gone when the isolated server stops) and wait for its
 marker file before `pane.report_agent`. Without it they fail, or pass by timing, on 0.9.2 and
 later.
 
