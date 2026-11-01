@@ -279,6 +279,7 @@ async fn herdr_real_ping_bootstrap_events_and_done_derivation() {
         .subscribe(vec![Subscription::pane_agent_status_changed(&root_pane)])
         .await
         .expect("per-pane status subscription acknowledged");
+    start_foreground_job(&t, &root_pane, &herdr.isolation().base).await;
     for state in ["working", "idle"] {
         let ok = t
             .request(
@@ -644,6 +645,32 @@ impl<T: Transport + Clone> Transport for FilteringTransport<T> {
     }
 }
 
+/// Starts a real foreground job in `pane` and returns once it runs. herdr 0.9.2 and later drop
+/// a self-reported agent as soon as its pane's shell is the sole foreground job (herdr #4687),
+/// so `pane.report_agent` over a bare shell reads back as `unknown`. A real agent is a real
+/// process, so this makes the scene what it stands for. The marker file, rather than
+/// `pane.read`, keeps these tests inside the pinned surface.
+async fn start_foreground_job<T: Transport>(t: &T, pane: &str, dir: &Path) {
+    let marker = dir.join(format!("job-running-{}", pane.replace(':', "-")));
+    let ok = t
+        .request(
+            "pane.send_text",
+            json!({ "pane_id": pane, "text": format!("touch '{}' && sleep 600\n", marker.display()) }),
+        )
+        .await
+        .expect("pane.send_text");
+    assert_eq!(ok["type"], "ok");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !marker.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the job never started in {pane}: no {}",
+            marker.display()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// Drive the root pane of a fresh workspace to `done`, the way section 4 of the Phase 1 test
 /// does: a second tab takes focus, so the completion happens in a tab the user is not
 /// viewing and herdr derives `done` (§5.7). Returns `(workspace_id, root_pane, first_tab)`.
@@ -673,6 +700,7 @@ async fn drive_pane_to_done<T: Transport>(t: &T, cwd: &Path) -> (String, String,
     )
     .await
     .expect("tab.create takes focus away from the agent's tab");
+    start_foreground_job(t, &root_pane, cwd).await;
     for state in ["working", "idle"] {
         let ok = t
             .request(
