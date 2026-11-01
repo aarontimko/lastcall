@@ -8,7 +8,7 @@ use super::wire::{self, Pong};
 
 /// The wire protocol the consumed surface (§5) was hand-checked against, source line by source
 /// line: herdr `master` @ `5158ada` (2026-08-31), whose embedded schema says `"protocol": 21`.
-/// It is deliberately **not** the pinned release's protocol (v0.9.0 answers 22): later
+/// It is deliberately **not** the pinned release's protocol (v0.9.5 answers 22): later
 /// protocols are admitted by the fixture diff (`herdr_real_schema_consumed_surface_unchanged`),
 /// which is a check of the surface we consume, not a re-read of §5. Moving this constant means
 /// redoing that hand check.

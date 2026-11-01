@@ -15,6 +15,7 @@ binary rather than for the commit log.
   lines more compactly. In a test with seven worktrees of a large repository, memory after
   accepting stayed under 90 MB instead of climbing past 1 GB, and CPU while the agents wrote
   fell from about 30% to under 5%. What the list and the diffs show is unchanged.
+- Tested against herdr 0.9.5.
 
 ## 0.7.1 - 2026-10-04
 

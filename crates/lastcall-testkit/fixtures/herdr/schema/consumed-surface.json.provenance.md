@@ -1,7 +1,7 @@
 # Provenance: consumed-surface.json
 
-**Generated from the pinned herdr release tag `v0.9.0`** (the release asset fetched by `just
-herdr-fetch`, which verifies `herdr --version` == `herdr 0.9.0`), never from `master` and never
+**Generated from the pinned herdr release tag `v0.9.5`** (the release asset fetched by `just
+herdr-fetch`, which verifies `herdr --version` == `herdr 0.9.5`), never from `master` and never
 by hand.
 
 Exact command:
@@ -14,23 +14,27 @@ which runs
 
 ```
 cargo run -q -p lastcall-testkit --example herdr_schema_fixture -- \
-    target/herdr/v0.9.0/herdr \
+    target/herdr/v0.9.5/herdr \
     crates/lastcall-testkit/fixtures/herdr/schema/consumed-surface.json
 ```
 
-Generated on **2026-09-11** (Phase 9b deliverable 14 moved the pin v0.8.2 -> v0.9.0). The
-generator reported:
+Generated on **2026-11-01** (the pin moved v0.9.0 -> v0.9.5). The generator reported:
 
 ```
-herdr-schema-fixture: herdr 0.9.0, protocol 22, schema_version 1 -> …/consumed-surface.json
-  (52000 bytes, 11 methods, 15 events, 46 defs)
+herdr-schema-fixture: herdr 0.9.5, protocol 22, schema_version 1 -> …/consumed-surface.json
+  (52706 bytes, 11 methods, 15 events, 46 defs)
 ```
 
-The diff against the v0.8.2 projection is **additive only**, and none of the four additions is
-a field lastcall reads: `request/WorktreeListParams.trust_repository`,
+The diff against the v0.9.0 projection is **additive only**, and none of the additions is a
+field lastcall reads: `restore_error` on `event/PaneInfo` and `success_response/PaneInfo`,
+`success_response/AgentInfo.completion_seq` and
+`success_response/ServerCapabilities.ssh_agent_registration`. `protocol` stays 22 and the
+method, event and def counts are unchanged.
+
+The move before it, v0.8.2 -> v0.9.0 on 2026-09-11 (Phase 9b deliverable 14), was additive too:
+`request/WorktreeListParams.trust_repository`,
 `request/ServerCapabilities.{endpoint_protocol_generation, health_check, surface_interest}`,
-and `protocol` 20 -> 22. Method, event, result and def counts are unchanged (11 / 15 / 11 /
-46), so no consumed type gained, lost or changed a member.
+and `protocol` 20 -> 22.
 
 `herdr api schema --json` reads no socket and starts no server, so generating this file touches
 nothing outside the repo.

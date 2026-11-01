@@ -450,24 +450,31 @@ it, put a logging shim named `curl` first on `PATH` and run the subset: the log 
 | `herdr_real_disconnect_reconnect_converges` (G6) | the cache converges after the server is really stopped and started again |
 | `herdr_real_schema_consumed_surface_unchanged` | the API surface we consume is byte-identical to the pinned fixture |
 
-**The pin is `herdr_version := "v0.9.0"`** (`justfile`), whose asset answers `ping` with
+**The pin is `herdr_version := "v0.9.5"`** (`justfile`), whose asset answers `ping` with
 **protocol 22**. The guard accepts `[20, 21, 22]`: 20 is what the v0.8.2 asset answers, 21 is
-the protocol §5 was hand-checked against (herdr master `5158ada`), 22 is the pin. When the pin
+the protocol §5 was hand-checked against (herdr master `5158ada`), 22 is what v0.9.0 and the
+pin answer. When the pin
 moves, the three behavioural tests are re-run by hand against the **previous** asset as well,
 so the widened guard is proven on both wires rather than asserted:
 
 ```sh
-LASTCALL_TEST_HERDR_BIN=target/herdr/v0.8.2/herdr \
-  cargo test -p lastcall-engine --test test_integration_herdr_real -- --test-threads=1
+LASTCALL_TEST_HERDR_BIN=$PWD/target/herdr/v0.9.0/herdr just cargo test -p lastcall-engine \
+  --test test_integration_herdr_real -- --test-threads=1 --skip herdr_real_schema_consumed_surface_unchanged
 ```
 
 `herdr_real_schema_consumed_surface_unchanged` is **not** part of that second run and cannot
 be: it compares the binary under test against the fixture generated from the *pinned* asset,
 so any other asset is a diff by construction. That is the point of the test, and its printed
-diff is the evidence — at the v0.8.2 -> v0.9.0 move it listed exactly the four additive fields
-in both directions (`WorktreeListParams.trust_repository`,
-`ServerCapabilities.{endpoint_protocol_generation, health_check, surface_interest}`) plus the
-protocol number, and nothing lastcall reads.
+diff is the evidence — at the v0.9.0 -> v0.9.5 move it listed exactly four additive fields
+(`PaneInfo.restore_error` twice, `AgentInfo.completion_seq`,
+`ServerCapabilities.ssh_agent_registration`) and nothing lastcall reads.
+
+**The pretend agent needs a real process under it.** Since herdr 0.9.2 (herdr #4687) a
+self-reported agent is dropped as soon as its pane's shell is the sole foreground job, and the
+pane reads `unknown`. So the two tests that drive a pane to `done` first start a real job in it
+(`start_foreground_job`, `sleep 600`, gone when the isolated server stops) and wait for its
+marker file before `pane.report_agent`. Without it they fail, or pass by timing, on 0.9.2 and
+later.
 
 **G3 is the one that is easy to make vacuous**, and two things keep it honest. The client is
 wrapped in a `FilteringTransport<T: Transport>` that drops the events the flip might
