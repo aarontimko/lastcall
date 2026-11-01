@@ -42,13 +42,15 @@ streaming (ctrl-c to stop)...
 plain shell and note its pane id (`echo $HERDR_PANE_ID`, or `herdr pane list`). Either start a
 real agent there, or fake one with herdr's own CLI. A fake needs a real process under it: since
 herdr 0.9.2 a self-reported agent is dropped as soon as its pane is back at an idle shell. So
-run `sleep 600` in tab B, then report from a second pane in tab A. Ten minutes covers the
-steps below; when the `sleep` ends, hello-herdr printing `pane_agent_detected` with
-`released` and `[<B>] demo idle → unknown` is herdr dropping the fake, not a fault:
+run `sleep 600` in tab B, then report from a second pane in tab A:
 
 ```sh
 herdr pane report-agent <B_pane_id> --source demo --agent demo --state working
 ```
+
+Ten minutes covers the steps below. When the `sleep` ends, hello-herdr printing
+`pane_agent_detected` with `released` and `[<B>] demo idle → unknown` is herdr dropping the
+fake, not a fault.
 
 hello-herdr (in tab A) prints `event: event=pane_agent_detected ...`, `status: subscribed
 <B>`, and `[<B>] demo unknown → working` (a bare shell pane reports `unknown` on the released 0.8.2; a pane with no prior report at all shows `(none)`) — the pane is now
