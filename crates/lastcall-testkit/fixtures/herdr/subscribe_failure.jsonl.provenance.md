@@ -1,6 +1,6 @@
 # Provenance: subscribe_failure.jsonl
 
-**Recorded from the real pinned herdr (v0.8.2 release asset)** by
+**Recorded from the real herdr v0.8.2 release asset, the pin at the time** by
 `crates/lastcall-engine/tests/test_integration_herdr_real.rs` via `just herdr-record`, copied
 verbatim by `just fixtures-sync` from `recorded/subscribe_failure.jsonl`.
 

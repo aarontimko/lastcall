@@ -1,6 +1,6 @@
 # Provenance: snapshot_two_panes.json
 
-**Recorded from the real pinned herdr (v0.8.2 release asset, `just herdr-fetch`; answers
+**Recorded from the real herdr v0.8.2 release asset, the pin at the time (answers
 protocol 20)** by `crates/lastcall-engine/tests/test_integration_herdr_real.rs` via
 `just herdr-record`, then copied verbatim by `just fixtures-sync` from
 `recorded/snapshot_two_panes.json` (the `result` object of a raw `session.snapshot` response,

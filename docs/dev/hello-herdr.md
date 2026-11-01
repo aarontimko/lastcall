@@ -29,9 +29,9 @@ first lines:
 ```
 lastcall hello-herdr (events are hints; snapshots are truth)
 session: /Users/you/.config/herdr/herdr.sock (EnvSocketPath)
-ping: herdr 0.9.0 protocol 22 (supported: 20/21/22)
+ping: herdr 0.9.5 protocol 22 (supported: 20/21/22)
 compat: ok
-connected: herdr 0.9.0 protocol 22
+connected: herdr 0.9.5 protocol 22
 workspaces (1): ...
 panes (2): ...
 agents (0):
@@ -40,17 +40,23 @@ streaming (ctrl-c to stop)...
 
 **Step 1 — make an agent appear in another tab.** Open a second tab (call it tab B) with a
 plain shell and note its pane id (`echo $HERDR_PANE_ID`, or `herdr pane list`). Either start a
-real agent there, or fake one with herdr's own CLI:
+real agent there, or fake one with herdr's own CLI. A fake needs a real process under it: since
+herdr 0.9.2 a self-reported agent is dropped as soon as its pane is back at an idle shell. So
+run `sleep 600` in tab B, then report from a second pane in tab A:
 
 ```sh
-herdr pane report-agent "$HERDR_PANE_ID" --source demo --agent demo --state working
+herdr pane report-agent <B_pane_id> --source demo --agent demo --state working
 ```
+
+Ten minutes covers the steps below. When the `sleep` ends, hello-herdr printing
+`pane_agent_detected` with `released` and `[<B>] demo idle → unknown` is herdr dropping the
+fake, not a fault.
 
 hello-herdr (in tab A) prints `event: event=pane_agent_detected ...`, `status: subscribed
 <B>`, and `[<B>] demo unknown → working` (a bare shell pane reports `unknown` on the released 0.8.2; a pane with no prior report at all shows `(none)`) — the pane is now
 agent-bearing and has its own status subscription.
 
-**Step 2 — complete the work while tab B is *not* focused.** Switch to tab A (hello-herdr's
+**Step 2 — complete the work while tab B is *not* focused.** Stay in tab A (hello-herdr's
 tab), and from the other pane there report completion for tab B's pane:
 
 ```sh
@@ -79,7 +85,7 @@ Paste the transcript into the PR; that is the `[sponsor]` gate item. Ctrl-C to s
 - `herdr api` has only `snapshot` and `schema` subcommands; `pane.report_agent` is reached
   through `herdr pane report-agent`, never `herdr api pane.report_agent`.
 - The published v0.8.2 asset answers **protocol 20**; the spec's "protocol 21" is herdr master
-  after the release; the pinned v0.9.0 asset answers **22**. All three are supported
+  after the release; v0.9.0 and the pinned v0.9.5 asset answer **22**. All three are supported
   (`guard::SUPPORTED_PROTOCOLS`).
 - Standalone outcomes print a notice and exit 1: no session found, several live sessions with
   no `herdr.session` pin in `config.toml`, or a protocol mismatch.

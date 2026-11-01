@@ -91,6 +91,12 @@
         "pane_id": {
           "type": "string"
         },
+        "restore_error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "revision": {
           "format": "uint64",
           "minimum": 0,
@@ -973,6 +979,15 @@
         "agent_status": {
           "$ref": "#/defs/success_response/AgentStatus"
         },
+        "completion_seq": {
+          "description": "The current idle transition completed work, independently of who has viewed it.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "cwd": {
           "type": [
             "string",
@@ -1178,6 +1193,12 @@
         },
         "pane_id": {
           "type": "string"
+        },
+        "restore_error": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "revision": {
           "format": "uint64",
@@ -1414,6 +1435,11 @@
           "type": "boolean"
         },
         "live_handoff": {
+          "type": "boolean"
+        },
+        "ssh_agent_registration": {
+          "default": false,
+          "description": "Supports connection-scoped `server.ssh_agent.register` on the local JSON API.",
           "type": "boolean"
         },
         "surface_interest": {
