@@ -18,7 +18,7 @@ tracing.workspace = true
 portable-pty.workspace = true
 nix.workspace = true
 # The TUI PTY harness's screen parser (docs/spec/92-phase3-kickoff.md, deliverables 10/12).
-vt100 = "0.16.2"
+vt100 = "0.18.1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
