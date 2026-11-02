@@ -452,3 +452,8 @@ workloads".
 2. **Diffs on demand: held.** The sponsor watches real workloads on this build first. It
    reopens only if a real pile stays at several million pending lines; the trigger is what
    Activity Monitor shows there.
+
+## Release (2026-11-01)
+
+Part B's PR (#57) did not release. The fixes ship as `v0.7.2` by the sponsor's ruling ("1
+rec", `docs/spec/00-spec.md` §10 2026-11-01); the release line is in §8 Phase 17.
